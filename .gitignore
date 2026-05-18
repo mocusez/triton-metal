@@ -1,3 +1,7 @@
+# Pixi (OMC-managed dev env for the metal backend bootstrap)
+.pixi/
+pixi.lock
+
 # Triton builds
 build/
 build-*/
@@ -101,3 +105,5 @@ docs/sg_execution_times.rst
 .DS_Store
 
 AGENTS.override.md
+
+.omc

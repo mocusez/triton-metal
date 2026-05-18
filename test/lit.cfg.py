@@ -58,6 +58,8 @@ for d in tool_dirs:
 tools = [
     'triton-opt',
     'triton-llvm-opt',
+    'triton-metal-opt',
+    'triton-metal-translate',
     'mlir-translate',
     'llc',
     ToolSubst('%PYTHON', config.python_executable, unresolved='ignore'),

@@ -1,0 +1,60 @@
+[workspace]
+authors = ["triton-metal contributors"]
+channels = ["conda-forge"]
+name = "triton-dev"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[dependencies]
+python = "3.12.*"
+cmake = ">=3.20,<4"
+ninja = ">=1.11"
+pybind11 = ">=2.13"
+setuptools = ">=40.8"
+wheel = "*"
+pip = "*"
+lit = "*"
+# runtime/test
+numpy = "*"
+pytest = "*"
+# torch is needed for the standard Triton launch protocol
+# (`add_kernel[grid](x, y, out, ...)` with real tensors). See
+# `.omc/specs/deep-interview-metal-standard-launch.md`.
+pytorch = "*"
+
+[tasks]
+# Build Triton (editable) against the pixi-managed Python; uses Triton's own
+# bundled LLVM download path triggered by setup.py.
+install = "pip install -e . --no-build-isolation -v"
+
+# Dump TTGIR for the upstream vector_add tutorial. The kernel may abort at
+# launch time (no GPU) — that's fine; we only need make_ttgir to run before
+# the abort. TRITON_BACKENDS_IN_TREE=1 forces the in-tree backend walker so
+# our stub metal backend is picked up even without entry-point install.
+dump-ttgir = { cmd = "rm -rf /tmp/triton-dump && mkdir -p /tmp/triton-dump && TRITON_BACKENDS_IN_TREE=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton-dump TRITON_ALWAYS_COMPILE=1 python python/tutorials/01-vector-add.py || true", depends-on = ["install"] }
+
+# Verify the dumped TTGIR contains the expected op-name set.
+check-ttgir = { cmd = "python python/test/unit/tools/check_ttgir_shape.py /tmp/triton-dump", depends-on = ["dump-ttgir"] }
+
+# Full acceptance gate.
+verify = { depends-on = ["check-ttgir"] }
+
+# leet-triton runnable examples (each has an `if __name__ == "__main__"` driver
+# that picks MPS / CUDA, builds inputs, calls `solve`, and asserts against a
+# PyTorch reference).
+leet-leaky-relu = "python leet-triton/easy-leaky_Relu.py"
+leet-color-inversion = "python leet-triton/easy-color_inversion.py"
+leet-1d-convolution = "python leet-triton/easy-1D_convolution.py"
+leet-geglu = "python leet-triton/easy-gaussian_error_gated_linear_unit.py"
+leet-interleave-arrays = "python leet-triton/easy-interleave_arrays.py"
+leet-matrix-transpose = "python leet-triton/easy-matrix_transpose.py"
+
+# Run every leet-triton example sequentially.
+leet-all = { depends-on = [
+    "leet-leaky-relu",
+    "leet-color-inversion",
+    "leet-1d-convolution",
+    "leet-geglu",
+    "leet-interleave-arrays",
+    "leet-matrix-transpose",
+] }

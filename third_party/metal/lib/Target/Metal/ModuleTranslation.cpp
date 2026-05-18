@@ -1,0 +1,3704 @@
+//===--- ModuleTranslation.cpp -----------------------------------------------//
+//
+// This source file is part of the metal-dialect open source project
+// See LICENSE.txt for license information
+//
+//===----------------------------------------------------------------------===//
+
+#include "Target/Metal/ModuleTranslation.h"
+#include "Dialect/Metal/IR/MetalOps.h"
+#include "Dialect/Metal/IR/MetalQuantizedHelpers.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace mlir::triton::metal;
+
+struct Indent {
+  Indent(int &level) : level(level) { ++level; }
+  ~Indent() { --level; }
+  int &level;
+};
+
+#define INDENT()                                                               \
+  Indent level_(_curIndent);                                                   \
+  indent();
+
+static llvm::StringRef typeToString(mlir::Type type) {
+  if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(type))
+    switch (intTy.getWidth()) {
+    case 1:
+      return "bool";
+    case 8:
+      return intTy.isSigned() ? "int8_t" : "uint8_t";
+    case 16:
+      return intTy.isSigned() ? "int16_t" : "uint16_t";
+    case 32:
+      // Signless i32 is the MLIR-side bridge for argmax indices.
+      // MSL emits 'int' for it; signed -> int32_t, unsigned -> uint32_t.
+      if (intTy.isSignless())
+        return "int";
+      return intTy.isSigned() ? "int32_t" : "uint32_t";
+    case 64:
+      return intTy.isSigned() ? "int64_t" : "uint64_t";
+    default:
+      llvm_unreachable("wrong type");
+    }
+  if (type.isF16())
+    return "half";
+  if (type.isF32())
+    return "float";
+  if (type.isBF16())
+    return "bfloat";
+  llvm_unreachable("wrong type");
+}
+
+void ModuleTranslation::indent() {
+  for (int i = 0; i < _curIndent; i++)
+    _output << "  ";
+}
+
+llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
+                                                       raw_ostream &output) {
+  bool emittedPreamble = false;
+  for (auto module : m.getOps<mlir::triton::metal::ModuleOp>()) {
+    if (!emittedPreamble) {
+      output << "#include <metal_stdlib>\n";
+      output << "#include <metal_math>\n";
+      // Stage-7: include simdgroup_matrix header only when an `::Mma` matmul is
+      // present in any kernel; preserves Stage-1 ::Scalar byte-identity SHA.
+      // Stage-8: also include when any `metal.sdpa` op is present — all 5 mode
+      // helpers now emit `simdgroup_matrix` MMA tiles.
+      bool hasMma = false;
+      m.walk([&](mlir::triton::metal::MatmulOp matmulOp) {
+        if (matmulOp.getKind() == ::mlir::triton::metal::MatmulKind::Mma) {
+          hasMma = true;
+          return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+      });
+      if (!hasMma) {
+        m.walk([&](mlir::triton::metal::SdpaOp) {
+          hasMma = true;
+          return mlir::WalkResult::interrupt();
+        });
+      }
+      if (hasMma)
+        output << "#include <metal_simdgroup_matrix>\n";
+      output << "using namespace metal;\n\n";
+      // Session L4: MSL stdlib does not ship `erf`, so we emit a polynomial
+      // approximation (Abramowitz & Stegun 7.1.26, max abs error ~1.5e-7)
+      // when any kernel in the module uses `metal.unary_exp ..., erfOp`. The
+      // `metal.unary_exp` switch emits `__triton_erff(<arg>)`.
+      bool hasErf = false;
+      m.walk([&](mlir::triton::metal::UnaryExpOp uop) {
+        if (uop.getUnaryOperator() ==
+            mlir::triton::metal::UnaryExpOperator::erfOp) {
+          hasErf = true;
+          return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+      });
+      if (hasErf) {
+        output << "static inline float __triton_erff(float x) {\n"
+                  "  const float a1 =  0.254829592f;\n"
+                  "  const float a2 = -0.284496736f;\n"
+                  "  const float a3 =  1.421413741f;\n"
+                  "  const float a4 = -1.453152027f;\n"
+                  "  const float a5 =  1.061405429f;\n"
+                  "  const float p  =  0.3275911f;\n"
+                  "  float sign = (x < 0.0f) ? -1.0f : 1.0f;\n"
+                  "  float ax = metal::fabs(x);\n"
+                  "  float t = 1.0f / (1.0f + p * ax);\n"
+                  "  float y = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2)"
+                  " * t + a1) * t * metal::precise::exp(-ax * ax);\n"
+                  "  return sign * y;\n"
+                  "}\n\n";
+      }
+      emittedPreamble = true;
+    }
+    ModuleTranslation translator{module, output};
+    translator.translateKernels();
+    output.flush();
+  }
+  return mlir::success();
+}
+
+void ModuleTranslation::translateVarName(mlir::Value memref) {
+  // Walk through unrealized_conversion_cast wrappers (e.g. the
+  // !tt.ptr → !metal.memref bridge inserted by the matmul track's
+  // tt.dot pre-pass; post-conversion this becomes an identity
+  // !metal.memref → !metal.memref cast that persists).
+  while (auto cast = memref.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast.getInputs().size() != 1) break;
+    memref = cast.getInputs()[0];
+  }
+  auto opInst = memref.getDefiningOp();
+  if (opInst == nullptr) {
+    _output << "v" << _buffers[memref.getAsOpaquePointer()];
+  } else if (isa<mlir::triton::metal::AllocaOp,
+                  mlir::triton::metal::ThreadgroupAllocaOp,
+                  mlir::triton::metal::SimdgroupLoadOp,
+                  mlir::triton::metal::SimdgroupMultiplyAccumulateOp>(opInst)) {
+    _output << "v" << _alloca[opInst];
+  } else {
+    llvm_unreachable("llvm_unreachable");
+  }
+}
+
+void ModuleTranslation::translateKernels() {
+  for (auto &op : _metalModule.getOps()) {
+    if (auto kernelOp = dyn_cast<mlir::triton::metal::KernelOp>(op)) {
+      _varCount = 0;
+      _buffers = {};
+      translateKernel(kernelOp);
+      _output << "\n\n";
+    } else if (isa<mlir::triton::metal::ConstantOp, mlir::triton::metal::ModuleEndOp>(op)) {
+      // do nothing
+    } else {
+      llvm_unreachable("unexpected operation");
+    }
+  }
+}
+
+void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
+  _output << "kernel void " << op.getName() << "(\n";
+  for (auto tuple : llvm::zip(op.getBuffers(), op.getAddressSpaceDevice())) {
+    auto buffer = std::get<0>(tuple);
+    auto memRef = llvm::cast<mlir::triton::metal::MetalMemRefType>(buffer.getType());
+    auto stringType = typeToString(memRef.getType());
+
+    auto isDevice = llvm::cast<BoolAttr>(std::get<1>(tuple)).getValue();
+    _output << (isDevice ? "  device " : "  constant ");
+    _output << stringType << " *v" << _varCount << " [[buffer(" << _varCount
+            << ")]],\n";
+    _varCount++;
+  }
+  _output << "  uint3 id [[thread_position_in_grid]]";
+  // Conditionally add the threadgroup-position parameter only when the
+  // kernel body references it (via metal.threadgroup_id). This keeps
+  // existing single-program fixtures' MSL signatures unchanged. See
+  // `.omc/specs/deep-interview-metal-pid-lowering.md`.
+  bool usesThreadgroupId = false;
+  op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
+    usesThreadgroupId = true;
+    return mlir::WalkResult::interrupt();
+  });
+  if (usesThreadgroupId)
+    _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
+  _output << ")\n";
+
+  auto firstBlock = op.getBodyRegion().getBlocks().begin();
+  for (auto const &it : llvm::enumerate(firstBlock->getArguments()))
+    _buffers[it.value().getAsOpaquePointer()] = it.index();
+
+  translate(op.getBodyRegion());
+}
+
+void ModuleTranslation::printDelim() {
+  if (inWhileCondition) {
+    _output << ",";
+  } else {
+    _output << ";";
+  }
+}
+
+bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
+  auto printable = false;
+  llvm::TypeSwitch<Operation *>(opInst)
+      .Case<mlir::triton::metal::AllocaOp,
+            mlir::triton::metal::ThreadgroupAllocaOp,
+            mlir::triton::metal::BarrierOp,
+            mlir::triton::metal::TgStoreIndexedOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::IfOp,
+            mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
+            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
+            mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
+            mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
+            mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
+            mlir::triton::metal::SimdgroupLoadOp,
+            mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
+            mlir::triton::metal::SimdgroupStoreOp,
+            mlir::scf::IfOp, mlir::scf::ForOp>(
+          [&](auto &op) { printable = true; })
+      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
+        // do nothing
+        printable = false;
+      })
+      .Case<mlir::scf::YieldOp>([&](auto &op) {
+        // Yielding into a result-bearing `scf.if` produces assignment
+        // statements to the temp vars pre-declared before the `if`. Yields in
+        // void `scf.if` are no-ops.
+        printable = false;
+        if (auto parentIf =
+                llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp())) {
+          if (parentIf.getNumResults() > 0)
+            printable = true;
+        }
+      })
+      .Default([&](Operation *) {
+        if (opInst->use_empty()) {
+          printable = true;
+        }
+      });
+  return printable;
+}
+
+void ModuleTranslation::translateStatement(Operation *opInst) {
+  llvm::TypeSwitch<Operation *>(opInst)
+      .Case<mlir::triton::metal::AllocaOp,
+            mlir::triton::metal::ThreadgroupAllocaOp,
+            mlir::triton::metal::BarrierOp,
+            mlir::triton::metal::TgStoreIndexedOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::IfOp,
+            mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
+            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
+            mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
+            mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
+            mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
+            mlir::triton::metal::SimdgroupLoadOp,
+            mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
+            mlir::triton::metal::SimdgroupStoreOp>(
+          [&](auto &op) { translate(op); })
+      .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
+      .Case<mlir::scf::ForOp>([&](auto &op) { translate(op); })
+      .Case<mlir::scf::YieldOp>([&](auto &op) { translate(op); })
+      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
+        // do nothing;
+      })
+      .Default([&](Operation *) {
+        if (opInst->use_empty()) {
+          translateValue(opInst);
+          printDelim();
+        }
+      });
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::AllocaOp op) {
+  auto memRef = llvm::cast<MetalMemRefType>(op.getResult().getType());
+  auto stringType = typeToString(memRef.getType());
+  _output << stringType << " v" << _varCount << "[" << memRef.getSize() << "]";
+  _alloca[op] = _varCount++;
+  _output << ";";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupAllocaOp op) {
+  auto memRef = llvm::cast<MetalMemRefType>(op.getResult().getType());
+  auto stringType = typeToString(memRef.getType());
+  // Emit a declaration in the kernel body with the `threadgroup` address-space
+  // qualifier so all threads in the same threadgroup share the buffer. The
+  // surrounding indent/level is established by the caller. See
+  // `.omc/specs/deep-interview-leet-triton-l3-reduce-axis-2d.md` AC.I5.
+  _output << "threadgroup " << stringType << " v" << _varCount << "["
+          << memRef.getSize() << "]";
+  _alloca[op] = _varCount++;
+  _output << ";";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::BarrierOp op) {
+  (void)op;
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::TgStoreIndexedOp op) {
+  // Emit `<bufVar>[<idx>] = <val>;` for an indexed store into a threadgroup
+  // buffer. Phase A infrastructure for §3.5 staged-transpose (L1d2). See
+  // `.omc/specs/deep-interview-leet-triton-l1d-phase-a-staged-transpose-infra.md`.
+  translateVarName(op.getBuffer());
+  _output << "[";
+  translateValue(op.getIndex().getDefiningOp());
+  _output << "] = ";
+  translateValue(op.getValue().getDefiningOp());
+  printDelim();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::TgLoadIndexedOp op) {
+  // Emit `<bufVar>[<idx>]` as a value expression (called from translateValue).
+  // Phase A infrastructure for §3.5 staged-transpose (L1d2). See
+  // `.omc/specs/deep-interview-leet-triton-l1d-phase-a-staged-transpose-infra.md`.
+  translateVarName(op.getBuffer());
+  _output << "[";
+  translateValue(op.getIndex().getDefiningOp());
+  _output << "]";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
+  translateVarName(op.getMemref());
+  _output << "[";
+  translateValue(op.getIndex().getDefiningOp());
+  _output << "] = ";
+  translateValue(op.getValue().getDefiningOp());
+  printDelim();
+}
+
+//===----------------------------------------------------------------------===//
+// SIMD-group matrix ops (matmul track session 2). Stubs emit the canonical
+// MSL function calls (simdgroup_load_matrix / simdgroup_matrix_multiply_
+// accumulate / simdgroup_store_matrix) so a future tt.dot lowering's MSL is
+// compilable. No conversion pattern uses these ops yet. See
+// `.omc/specs/deep-interview-metal-matmul-session2-simdgroup-scaffold.md`.
+//===----------------------------------------------------------------------===//
+
+static void emitSimdgroupMatrixType(
+    llvm::raw_ostream &os, mlir::triton::metal::MetalSimdgroupMatrixType ty) {
+  os << "simdgroup_" << typeToString(ty.getElem()) << ty.getRows() << "x"
+     << ty.getCols();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::SimdgroupLoadOp op) {
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  emitSimdgroupMatrixType(_output, resTy);
+  _output << " v" << _varCount << " = simdgroup_load_matrix(";
+  translateVarName(op.getMemref());
+  _output << ", ";
+  translateValue(op.getStride().getDefiningOp());
+  _output << ", ulong2(";
+  translateValue(op.getOriginCol().getDefiningOp());
+  _output << ", ";
+  translateValue(op.getOriginRow().getDefiningOp());
+  _output << "))";
+  _alloca[op] = _varCount++;
+  printDelim();
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupMultiplyAccumulateOp op) {
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  emitSimdgroupMatrixType(_output, resTy);
+  _output << " v" << _varCount << " = simdgroup_matrix_multiply_accumulate(";
+  translateVarName(op.getC());
+  _output << ", ";
+  translateVarName(op.getA());
+  _output << ", ";
+  translateVarName(op.getB());
+  _output << ")";
+  _alloca[op] = _varCount++;
+  printDelim();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
+  _output << "simdgroup_store_matrix(";
+  translateVarName(op.getMatrix());
+  _output << ", ";
+  translateVarName(op.getMemref());
+  _output << ", ";
+  translateValue(op.getStride().getDefiningOp());
+  _output << ", ulong2(";
+  translateValue(op.getOriginCol().getDefiningOp());
+  _output << ", ";
+  translateValue(op.getOriginRow().getDefiningOp());
+  _output << "))";
+  printDelim();
+}
+
+void ModuleTranslation::translate(IfOp op) {
+  _output << "if (";
+  translateValue(op.getCondition().getDefiningOp());
+  _output << ") ";
+
+  translate(op.getThenRegion());
+
+  auto &elseRegion = op.getElseRegion();
+  if (elseRegion.getBlocks().size()) {
+    _output << " else ";
+    translate(elseRegion);
+  }
+}
+
+void ModuleTranslation::translate(WhileOp op) {
+  _output << "while (";
+
+  auto &conditionRegion = op.getConditionRegion();
+  {
+    inWhileCondition = true;
+    for (auto &op : conditionRegion.getOps()) {
+      translateStatement(&op);
+      if (isStatementPrintable(&op))
+        _output << " ";
+    }
+    inWhileCondition = false;
+  }
+  auto conditionOp =
+      dyn_cast<YieldWhileOp>(conditionRegion.back().getTerminator());
+  translateValue(conditionOp);
+  _output << ") ";
+
+  auto &bodyRegion = op.getBodyRegion();
+  translate(bodyRegion);
+}
+
+void ModuleTranslation::translate(ReturnOp op) { _output << "return;"; }
+
+void ModuleTranslation::translate(mlir::scf::IfOp op) {
+  // Pre-declare a temp var per result so the assignment inside then/else
+  // (emitted by translate(scf.yield)) has somewhere to land. Single-result
+  // scf.if is supported; multi-result would need a tuple of temps — left to
+  // future work since the masked vector_add path only uses the 1-result form.
+  for (auto res : op.getResults()) {
+    auto idx = _varCount++;
+    _scfIfTemp[op.getOperation()] = idx;
+    _output << typeToString(res.getType()) << " v" << idx << ";\n";
+    indent();
+  }
+  _output << "if (";
+  translateValue(op.getCondition().getDefiningOp());
+  _output << ") ";
+  translate(op.getThenRegion());
+  auto &elseRegion = op.getElseRegion();
+  if (!elseRegion.empty() && !elseRegion.front().empty()) {
+    _output << " else ";
+    translate(elseRegion);
+  }
+}
+
+void ModuleTranslation::translate(mlir::scf::ForOp op) {
+  // Emit `for (int v_iv = lb; v_iv < ub; v_iv += step) { body }`. The
+  // induction var BlockArgument is registered in `_buffers` so any
+  // downstream translateVarName / translateValue on it resolves to the
+  // emitted temp name. Trip-count bounds are translated via the existing
+  // arith.constant path; non-constant bounds fall through to the
+  // generic Operation translator.
+  unsigned idx = _varCount++;
+  _scfForIv[op.getOperation()] = idx;
+  auto iv = op.getInductionVar();
+  _buffers[iv.getAsOpaquePointer()] = idx;
+
+  _output << "for (int v" << idx << " = ";
+  if (auto lbOp = op.getLowerBound().getDefiningOp())
+    translateValue(lbOp);
+  else
+    translateVarName(op.getLowerBound());
+  _output << "; v" << idx << " < ";
+  if (auto ubOp = op.getUpperBound().getDefiningOp())
+    translateValue(ubOp);
+  else
+    translateVarName(op.getUpperBound());
+  _output << "; v" << idx << " += ";
+  if (auto stepOp = op.getStep().getDefiningOp())
+    translateValue(stepOp);
+  else
+    translateVarName(op.getStep());
+  _output << ") ";
+  translate(op.getRegion());
+}
+
+void ModuleTranslation::translate(mlir::scf::YieldOp op) {
+  auto parentIf =
+      llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp());
+  if (!parentIf || parentIf.getNumResults() == 0)
+    return; // no-op for void scf.if
+  // Single-result fast path: assign the yielded value to the temp var.
+  auto it = _scfIfTemp.find(parentIf.getOperation());
+  assert(it != _scfIfTemp.end() &&
+         "scf.yield: parent scf.if has no temp var pre-declared");
+  _output << "v" << it->second << " = ";
+  translateValue(op.getOperand(0).getDefiningOp());
+  _output << ";";
+}
+
+// Emit MSL that loads one packed weight value q (an unsigned integer in
+// [0, 2^bits)) given an output row index `rowExpr`, a K-axis offset `kkExpr`,
+// the K dimension, the bits value, and the Wq buffer name (already
+// translated). The emitter writes into _output via the caller's surrounding
+// statement context. For bits in {2,4,8} we read a uint32 word; for bits in
+// {3,5,6} we assemble bytes from the byte-stream layout into a uint64.
+//
+// The emitted expression resolves to `uint q;` set on the line preceding the
+// caller's use; thus this helper emits a STATEMENT.
+static void emitUnpackStatement(llvm::raw_ostream &out,
+                                const std::string &wqName,
+                                const std::string &rowExpr,
+                                const std::string &kkExpr, int64_t k,
+                                int64_t bits) {
+  int64_t pf = packFactor(bits);
+  int64_t mask = (1 << bits) - 1;
+  if (bits == 2 || bits == 4 || bits == 8) {
+    // uint32 word = wq[row * (K/pf) + kk/pf];
+    out << "uint __qword = " << wqName << "[((" << rowExpr << ") * (" << k
+        << " / " << pf << ")) + ((" << kkExpr << ") / " << pf << ")];\n";
+    out << "      uint q = (__qword >> (((" << kkExpr << ") % " << pf << ") * "
+        << bits << ")) & " << mask << ";";
+  } else {
+    int64_t bpp = bytesPerPack(bits);
+    // byte stream: bytes_per_row = (K/pf) * bpp = K*bits/8 (integer).
+    // base = wq + row*(K/pf)*bpp + (kk/pf)*bpp
+    out << "uint __qbase = ((" << rowExpr << ") * (" << k << " / " << pf
+        << ") * " << bpp << ") + (((" << kkExpr << ") / " << pf << ") * "
+        << bpp << ");\n";
+    out << "      ulong __qword = 0;\n";
+    for (int64_t i = 0; i < bpp; ++i) {
+      out << "      __qword |= ((ulong)" << wqName << "[__qbase + " << i
+          << "]) << " << (i * 8) << ";\n";
+    }
+    out << "      uint q = (uint)((__qword >> (((" << kkExpr << ") % " << pf
+        << ") * " << bits << ")) & " << mask << ");";
+  }
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::QmvOp op) {
+  auto m = op.getM();
+  auto k = op.getK();
+  auto bits = op.getBits();
+  auto gs = op.getGroupSize();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto accTy = typeToString(elemTy);
+
+  // Get var names as strings via a temporary stream — translateVarName uses
+  // _output directly, so capture into a small buffer.
+  std::string wqName, scalesName, biasesName, xName, outName;
+  {
+    llvm::raw_string_ostream s(wqName);
+    auto saved = &_output;
+    // No way to redirect _output cleanly; use auxiliary helper:
+    (void)saved;
+  }
+  // Simpler: re-implement var-name retrieval here using the same lookup that
+  // translateVarName uses (memref maps via _buffers when block argument, via
+  // _alloca otherwise).
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  wqName = nameOf(op.getWq());
+  scalesName = nameOf(op.getScales());
+  biasesName = nameOf(op.getBiases());
+  xName = nameOf(op.getX());
+  outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint row = id.x;\n";
+    indent();
+    _output << "if (row < " << m << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << accTy << " acc = (" << accTy << ")(0);\n";
+      indent();
+      _output << "for (uint kk = 0; kk < " << k << "; ++kk) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint __g = kk / " << gs << ";\n";
+        indent();
+        _output << accTy << " __scale = " << scalesName << "[(row * (" << k
+                << " / " << gs << ")) + __g];\n";
+        indent();
+        _output << accTy << " __bias  = " << biasesName << "[(row * (" << k
+                << " / " << gs << ")) + __g];\n";
+        indent();
+        emitUnpackStatement(_output, wqName, "row", "kk", k, bits);
+        _output << "\n";
+        indent();
+        _output << accTy << " __w = ((" << accTy
+                << ")q * __scale) + __bias;\n";
+        indent();
+        _output << "acc = acc + (__w * " << xName << "[kk]);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << outName << "[row] = acc;";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::QmmOp op) {
+  auto m = op.getM();
+  auto n = op.getN();
+  auto k = op.getK();
+  auto bits = op.getBits();
+  auto gs = op.getGroupSize();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto accTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string wqName = nameOf(op.getWq());
+  std::string scalesName = nameOf(op.getScales());
+  std::string biasesName = nameOf(op.getBiases());
+  std::string xName = nameOf(op.getX());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint row = id.y;\n";
+    indent();
+    _output << "uint col = id.x;\n";
+    indent();
+    _output << "if ((row < " << m << ") && (col < " << n << ")) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << accTy << " acc = (" << accTy << ")(0);\n";
+      indent();
+      _output << "for (uint kk = 0; kk < " << k << "; ++kk) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint __g = kk / " << gs << ";\n";
+        indent();
+        _output << accTy << " __scale = " << scalesName << "[(col * (" << k
+                << " / " << gs << ")) + __g];\n";
+        indent();
+        _output << accTy << " __bias  = " << biasesName << "[(col * (" << k
+                << " / " << gs << ")) + __g];\n";
+        indent();
+        emitUnpackStatement(_output, wqName, "col", "kk", k, bits);
+        _output << "\n";
+        indent();
+        _output << accTy << " __w = ((" << accTy
+                << ")q * __scale) + __bias;\n";
+        indent();
+        _output << "acc = acc + (__w * " << xName << "[(row * " << k
+                << ") + kk]);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << outName << "[(row * " << n << ") + col] = acc;";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ReduceOp op) {
+  auto mOuter = op.getMOuter();
+  auto r = op.getR();
+  auto kind = op.getKind();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string inName = nameOf(op.getIn());
+  std::string outName = nameOf(op.getOut());
+
+  bool isMax = (kind == mlir::triton::metal::MetalReduceKind::max);
+  bool isMean = (kind == mlir::triton::metal::MetalReduceKind::mean);
+  const char *initVal = isMax ? "-INFINITY" : "0.0f";
+  const char *simdOp = isMax ? "simd_max" : "simd_sum";
+  const char *combineFmt = isMax ? "acc = max(acc, v)" : "acc = acc + v";
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "if (gid < " << mOuter << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "float acc = " << initVal << ";\n";
+      indent();
+      _output << "uint base = gid * " << r << ";\n";
+      indent();
+      _output << "for (uint i = lid; i < " << r << "; i += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "float v = float(" << inName << "[base + i]);\n";
+        indent();
+        _output << combineFmt << ";";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "acc = " << simdOp << "(acc);\n";
+      indent();
+      _output << "if (lid == 0u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        if (isMean) {
+          _output << outName << "[gid] = " << outTy << "(acc * (1.0f / float("
+                  << r << ")));";
+        } else {
+          _output << outName << "[gid] = " << outTy << "(acc);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// MLIR side: signless i32 output; MSL emits 'int' (32-bit); IndexValPair::index
+// is uint32_t inside the kernel, cast to (int) at the store site.
+void ModuleTranslation::translate(mlir::triton::metal::ArgmaxOp op) {
+  auto mOuter = op.getMOuter();
+  auto r = op.getR();
+  auto inElemTy = llvm::cast<MetalMemRefType>(op.getIn().getType()).getType();
+  auto valTy = typeToString(inElemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string inName = nameOf(op.getIn());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "struct IndexValPair { uint32_t index; " << valTy << " val; };\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "if (gid < " << mOuter << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "IndexValPair best;\n";
+      indent();
+      _output << "best.index = 0u;\n";
+      indent();
+      _output << "best.val = " << valTy << "(-INFINITY);\n";
+      indent();
+      _output << "uint base = gid * " << r << ";\n";
+      indent();
+      _output << "for (uint i = lid; i < " << r << "; i += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << valTy << " v = " << inName << "[base + i];\n";
+        indent();
+        _output << "if (v > best.val || (v == best.val && i < best.index)) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "best.val = v;\n";
+          indent();
+          _output << "best.index = i;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "for (uint offset = 16u; offset > 0u; offset >>= 1) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "IndexValPair current;\n";
+        indent();
+        if (inElemTy.isBF16()) {
+          // simd_shuffle_down does not support bfloat directly; bitcast
+          // through ushort and back to preserve T-typed val.
+          _output << "current.val = as_type<bfloat>(simd_shuffle_down("
+                     "as_type<ushort>(best.val), offset));\n";
+        } else {
+          _output << "current.val = simd_shuffle_down(best.val, offset);\n";
+        }
+        indent();
+        _output << "current.index = simd_shuffle_down(best.index, offset);\n";
+        indent();
+        _output << "if (best.val < current.val || (best.val == current.val && "
+                   "best.index > current.index)) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "best = current;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "if (lid == 0u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << outName << "[gid] = (int)best.index;";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Emit MSL for the shared softmax/logsumexp max-and-sum body.
+// After this returns, the emitted MSL will have in scope:
+//   - int base = gid * r;
+//   - float maxval;            (per-lane row-max, post-simd_max)
+//   - float normalizer;        (1.0f / simd_sum(...) for softmax;
+//                               raw simd_sum for logsumexp before log())
+// The caller emits the op-specific write (softmax: per-element divide-write;
+// logsumexp: lane-0-only log+maxval store).
+//
+// The emitted body uses a per-thread strided loop (`for (int i = lid; i < r;
+// i += 32)`) — no fixed-size `local_max[]` array (this is a deliberate
+// Stage-4 specialization for a single SIMD group per row).
+//
+// `tElem` is the input dtype string (e.g. "float", "half", "bfloat").
+// `inName` is the already-translated input buffer name (e.g. "v0").
+// `r` is the row length (static).
+//
+// Shared by translate(SoftmaxOp) and (in US-4) translate(LogsumexpOp).
+static void emitMaxSumBody(llvm::raw_ostream &os, int curIndent,
+                           llvm::StringRef tElem, llvm::StringRef inName,
+                           int64_t r) {
+  auto pad = [&](int extra) {
+    for (int i = 0; i < curIndent + extra; ++i)
+      os << "  ";
+  };
+  (void)tElem; // tElem unused — body always accumulates in float (AccT=float).
+
+  // Caller emitted an `indent()` before calling — first line starts in-place.
+  os << "int base = (int)gid * " << r << ";\n";
+  pad(0);
+  os << "float maxval = -INFINITY;\n";
+  pad(0);
+  os << "for (int i = lid; i < " << r << "; i += 32) {\n";
+  pad(1);
+  os << "maxval = max(maxval, float(" << inName << "[base + i]));\n";
+  pad(0);
+  os << "}\n";
+  pad(0);
+  os << "maxval = simd_max(maxval);\n";
+  pad(0);
+  os << "float normalizer = 0.0f;\n";
+  pad(0);
+  os << "for (int i = lid; i < " << r << "; i += 32) {\n";
+  pad(1);
+  os << "normalizer += fast::exp(float(" << inName << "[base + i]) - maxval);\n";
+  pad(0);
+  os << "}\n";
+  pad(0);
+  os << "normalizer = simd_sum(normalizer);";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::SoftmaxOp op) {
+  auto mOuter = op.getMOuter();
+  auto r = op.getR();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string inName = nameOf(op.getIn());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "if (gid < " << mOuter << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      emitMaxSumBody(_output, _curIndent, outTy, inName, r);
+      _output << "\n";
+      indent();
+      _output << "normalizer = 1.0f / normalizer;\n";
+      indent();
+      _output << "for (int i = lid; i < " << r << "; i += 32) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << outName << "[base + i] = " << outTy
+                << "(fast::exp(float(" << inName
+                << "[base + i]) - maxval) * normalizer);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::LogsumexpOp op) {
+  auto mOuter = op.getMOuter();
+  auto r = op.getR();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string inName = nameOf(op.getIn());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "if (gid < " << mOuter << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      emitMaxSumBody(_output, _curIndent, outTy, inName, r);
+      _output << "\n";
+      indent();
+      _output << "if (lid == 0) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << outName << "[gid] = isinf(maxval) ? " << outTy
+                << "(maxval) : " << outTy
+                << "(log(normalizer) + maxval);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::GemvOp op) {
+  auto m = op.getM();
+  auto k = op.getK();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto accTy = typeToString(elemTy);
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint row = id.x;\n";
+    indent();
+    _output << "if (row < " << m << ") {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << accTy << " acc = (" << accTy << ")(0);\n";
+      indent();
+      _output << "for (uint kk = 0; kk < " << k << "; ++kk) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "acc = acc + (";
+        translateVarName(op.getLhs());
+        _output << "[(row * " << k << ") + kk] * ";
+        translateVarName(op.getRhs());
+        _output << "[kk]);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      translateVarName(op.getOut());
+      _output << "[row] = acc;";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-6 dispatch: route `metal.sdpa` to a per-mode emitter helper based on
+// `op.getMode()`. The Causal arm preserves Stage-5 byte-identity.
+void ModuleTranslation::translate(mlir::triton::metal::SdpaOp op) {
+  switch (op.getMode()) {
+  case ::mlir::triton::metal::MaskSinkMode::Causal:
+    emitCausal_(op);
+    break;
+  case ::mlir::triton::metal::MaskSinkMode::BoolMask:
+    emitBoolMask_(op);
+    break;
+  case ::mlir::triton::metal::MaskSinkMode::FloatMask:
+    emitFloatMask_(op);
+    break;
+  case ::mlir::triton::metal::MaskSinkMode::Sinks:
+    emitSinks_(op);
+    break;
+  case ::mlir::triton::metal::MaskSinkMode::NonCausal:
+    emitNonCausal_(op);
+    break;
+  default:
+    op.emitError() << "metal.sdpa unrecognized mode integer "
+                   << static_cast<int>(op.getMode())
+                   << "; cannot emit MSL";
+    return;
+  }
+}
+
+// Stage-8 SDPA MMA-tile emitter helpers.
+// - AccT = float invariant: all accumulators (Q·Kᵀ score, O accumulator) are
+//   `simdgroup_matrix<float, 8, 8>` regardless of T ∈ {f16, f32, bf16}.
+// - 32-wide SIMD group; one SIMD group covers the single 8×8 MMA M-tile per
+//   dispatch. N=1 is internally zero-extended to 8 query rows (only row 0 is
+//   stored at the end); N=8 stores all 8 rows.
+// - K-outer-softmax-inner with running-max + per-fragment alpha rescale.
+// - `o_acc` is a FRAGMENT ARRAY of size D/8 (D-2 fix); per-fragment rescale
+//   via `rescale_scratch` happens BEFORE each k_tile's softmax·V MMA (D-1 fix).
+void ModuleTranslation::emitCausal_(mlir::triton::metal::SdpaOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  auto kLen = op.getKLen();
+  float scale = op.getScale().convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string qName = nameOf(op.getQ());
+  std::string kName = nameOf(op.getK());
+  std::string vName = nameOf(op.getV());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "if (gid == 0u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "alignas(16) threadgroup float q_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float k_t_tile[" << d << "][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float v_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float score_tile[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float alphas_tile[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float rescale_scratch[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float maxval[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float sumexp[8];\n";
+      indent();
+      _output << "if (lid < 8u) { maxval[lid] = -INFINITY; sumexp[lid] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> q_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> k_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> v_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> s_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> o_acc[" << (d / 8) << "];\n";
+      indent();
+      _output << "for (uint t = 0; t < " << (d / 8)
+              << "u; ++t) { o_acc[t] = simdgroup_matrix<float, 8, 8>(0.0f); }\n";
+      indent();
+      _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c / " << d << "u;\n";
+        indent();
+        _output << "uint j = c % " << d << "u;\n";
+        indent();
+        if (n == 1) {
+          _output << "q_tile[i][j] = (i == 0u) ? float(" << qName
+                  << "[j]) : 0.0f;";
+        } else {
+          _output << "q_tile[i][j] = float(" << qName << "[i * " << d
+                  << "u + j]);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (kLen / 8)
+              << "u; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (d * 8) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / 8u;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "k_t_tile[i][j] = float(" << kName
+                  << "[(k_tile * 8u + j) * " << d << "u + i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << "v_tile[i][j] = float(" << vName
+                  << "[(k_tile * 8u + i) * " << d << "u + j]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_matrix<float, 8, 8> s_acc(0.0f);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(q_frag, &q_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_load(k_frag, &k_t_tile[d_tile * 8u][0], 8);\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(s_acc, q_frag, k_frag, s_acc);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "simdgroup_store(s_acc, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "uint kk = k_tile * 8u + j;\n";
+          indent();
+          _output << "float score = score_tile[i][j] * " << scale << "f;\n";
+          indent();
+          _output << "if (kk <= (" << kLen << "u - " << n
+                  << "u + i)) { } else { score = -INFINITY; }\n";
+          indent();
+          _output << "score_tile[i][j] = score;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "if (lid < 8u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = lid;\n";
+          indent();
+          _output << "float row_max = -INFINITY;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) { row_max = max(row_max, score_tile[i][j]); }\n";
+          indent();
+          _output << "float m_new = max(maxval[i], row_max);\n";
+          indent();
+          _output << "float alpha = fast::exp(maxval[i] - m_new);\n";
+          indent();
+          _output << "alphas_tile[i] = alpha;\n";
+          indent();
+          _output << "sumexp[i] = sumexp[i] * alpha;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "float w = fast::exp(score_tile[i][j] - m_new);\n";
+            indent();
+            _output << "sumexp[i] += w;\n";
+            indent();
+            _output << "score_tile[i][j] = w;";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "maxval[i] = m_new;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_store(o_acc[d_tile], &rescale_scratch[0][0], 8);\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "for (uint c = lid; c < 64u; c += 32u) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "uint i = c >> 3;\n";
+            indent();
+            _output << "uint j = c & 7u;\n";
+            indent();
+            _output << "rescale_scratch[i][j] = rescale_scratch[i][j] * alphas_tile[i];";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "simdgroup_load(o_acc[d_tile], &rescale_scratch[0][0], 8);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(s_frag, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(v_frag, &v_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(o_acc[d_tile], s_frag, v_frag, o_acc[d_tile]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "alignas(16) threadgroup float o_tile[8][" << d << "];\n";
+      indent();
+      _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+              << "u; ++d_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "simdgroup_store(o_acc[d_tile], &o_tile[0][d_tile * 8u], "
+                << d << ");";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      if (n == 1) {
+        _output << "for (uint j = lid; j < " << d << "u; j += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << outName << "[j] = " << outTy
+                  << "(o_tile[0][j] / sumexp[0]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      } else {
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << outName << "[i * " << d << "u + j] = " << outTy
+                  << "(o_tile[i][j] / sumexp[i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-8 BoolMask: per-key predicate from extras[0] bool buffer [n, k_len].
+void ModuleTranslation::emitBoolMask_(mlir::triton::metal::SdpaOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  auto kLen = op.getKLen();
+  float scale = op.getScale().convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string qName = nameOf(op.getQ());
+  std::string kName = nameOf(op.getK());
+  std::string vName = nameOf(op.getV());
+  std::string outName = nameOf(op.getOut());
+  std::string maskName = nameOf(op.getExtras()[0]);
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "if (gid == 0u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "alignas(16) threadgroup float q_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float k_t_tile[" << d << "][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float v_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float score_tile[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float alphas_tile[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float rescale_scratch[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float maxval[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float sumexp[8];\n";
+      indent();
+      _output << "if (lid < 8u) { maxval[lid] = -INFINITY; sumexp[lid] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> q_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> k_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> v_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> s_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> o_acc[" << (d / 8) << "];\n";
+      indent();
+      _output << "for (uint t = 0; t < " << (d / 8)
+              << "u; ++t) { o_acc[t] = simdgroup_matrix<float, 8, 8>(0.0f); }\n";
+      indent();
+      _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c / " << d << "u;\n";
+        indent();
+        _output << "uint j = c % " << d << "u;\n";
+        indent();
+        if (n == 1) {
+          _output << "q_tile[i][j] = (i == 0u) ? float(" << qName
+                  << "[j]) : 0.0f;";
+        } else {
+          _output << "q_tile[i][j] = float(" << qName << "[i * " << d
+                  << "u + j]);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (kLen / 8)
+              << "u; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (d * 8) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / 8u;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "k_t_tile[i][j] = float(" << kName
+                  << "[(k_tile * 8u + j) * " << d << "u + i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << "v_tile[i][j] = float(" << vName
+                  << "[(k_tile * 8u + i) * " << d << "u + j]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_matrix<float, 8, 8> s_acc(0.0f);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(q_frag, &q_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_load(k_frag, &k_t_tile[d_tile * 8u][0], 8);\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(s_acc, q_frag, k_frag, s_acc);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "simdgroup_store(s_acc, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "uint kk = k_tile * 8u + j;\n";
+          indent();
+          _output << "float score = score_tile[i][j] * " << scale << "f;\n";
+          indent();
+          _output << "bool mask_val = bool(" << maskName << "[i * " << kLen
+                  << "u + kk]);\n";
+          indent();
+          _output << "if (!mask_val) { score = -INFINITY; }\n";
+          indent();
+          _output << "score_tile[i][j] = score;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "if (lid < 8u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = lid;\n";
+          indent();
+          _output << "float row_max = -INFINITY;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) { row_max = max(row_max, score_tile[i][j]); }\n";
+          indent();
+          _output << "float m_new = max(maxval[i], row_max);\n";
+          indent();
+          _output << "float alpha = fast::exp(maxval[i] - m_new);\n";
+          indent();
+          _output << "alphas_tile[i] = alpha;\n";
+          indent();
+          _output << "sumexp[i] = sumexp[i] * alpha;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "float w = fast::exp(score_tile[i][j] - m_new);\n";
+            indent();
+            _output << "sumexp[i] += w;\n";
+            indent();
+            _output << "score_tile[i][j] = w;";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "maxval[i] = m_new;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_store(o_acc[d_tile], &rescale_scratch[0][0], 8);\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "for (uint c = lid; c < 64u; c += 32u) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "uint i = c >> 3;\n";
+            indent();
+            _output << "uint j = c & 7u;\n";
+            indent();
+            _output << "rescale_scratch[i][j] = rescale_scratch[i][j] * alphas_tile[i];";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "simdgroup_load(o_acc[d_tile], &rescale_scratch[0][0], 8);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(s_frag, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(v_frag, &v_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(o_acc[d_tile], s_frag, v_frag, o_acc[d_tile]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "alignas(16) threadgroup float o_tile[8][" << d << "];\n";
+      indent();
+      _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+              << "u; ++d_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "simdgroup_store(o_acc[d_tile], &o_tile[0][d_tile * 8u], "
+                << d << ");";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      if (n == 1) {
+        _output << "for (uint j = lid; j < " << d << "u; j += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << outName << "[j] = " << outTy
+                  << "(o_tile[0][j] / sumexp[0]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      } else {
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << outName << "[i * " << d << "u + j] = " << outTy
+                  << "(o_tile[i][j] / sumexp[i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-6 FloatMask: additive bias loaded from extras[0] of shape [n, k_len]
+// applied AFTER simd_sum(score) and BEFORE the running-max update.
+// All keys participate (use_key = true).
+void ModuleTranslation::emitFloatMask_(mlir::triton::metal::SdpaOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  auto kLen = op.getKLen();
+  float scale = op.getScale().convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string qName = nameOf(op.getQ());
+  std::string kName = nameOf(op.getK());
+  std::string vName = nameOf(op.getV());
+  std::string outName = nameOf(op.getOut());
+  std::string maskName = nameOf(op.getExtras()[0]);
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "if (gid == 0u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "alignas(16) threadgroup float q_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float k_t_tile[" << d << "][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float v_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float score_tile[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float alphas_tile[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float rescale_scratch[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float maxval[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float sumexp[8];\n";
+      indent();
+      _output << "if (lid < 8u) { maxval[lid] = -INFINITY; sumexp[lid] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> q_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> k_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> v_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> s_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> o_acc[" << (d / 8) << "];\n";
+      indent();
+      _output << "for (uint t = 0; t < " << (d / 8)
+              << "u; ++t) { o_acc[t] = simdgroup_matrix<float, 8, 8>(0.0f); }\n";
+      indent();
+      _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c / " << d << "u;\n";
+        indent();
+        _output << "uint j = c % " << d << "u;\n";
+        indent();
+        if (n == 1) {
+          _output << "q_tile[i][j] = (i == 0u) ? float(" << qName
+                  << "[j]) : 0.0f;";
+        } else {
+          _output << "q_tile[i][j] = float(" << qName << "[i * " << d
+                  << "u + j]);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (kLen / 8)
+              << "u; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (d * 8) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / 8u;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "k_t_tile[i][j] = float(" << kName
+                  << "[(k_tile * 8u + j) * " << d << "u + i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << "v_tile[i][j] = float(" << vName
+                  << "[(k_tile * 8u + i) * " << d << "u + j]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_matrix<float, 8, 8> s_acc(0.0f);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(q_frag, &q_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_load(k_frag, &k_t_tile[d_tile * 8u][0], 8);\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(s_acc, q_frag, k_frag, s_acc);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "simdgroup_store(s_acc, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "uint kk = k_tile * 8u + j;\n";
+          indent();
+          _output << "float score = score_tile[i][j] * " << scale << "f;\n";
+          indent();
+          _output << "score += float(" << maskName << "[i * " << kLen
+                  << "u + kk]);\n";
+          indent();
+          _output << "score_tile[i][j] = score;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "if (lid < 8u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = lid;\n";
+          indent();
+          _output << "float row_max = -INFINITY;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) { row_max = max(row_max, score_tile[i][j]); }\n";
+          indent();
+          _output << "float m_new = max(maxval[i], row_max);\n";
+          indent();
+          _output << "float alpha = fast::exp(maxval[i] - m_new);\n";
+          indent();
+          _output << "alphas_tile[i] = alpha;\n";
+          indent();
+          _output << "sumexp[i] = sumexp[i] * alpha;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "float w = fast::exp(score_tile[i][j] - m_new);\n";
+            indent();
+            _output << "sumexp[i] += w;\n";
+            indent();
+            _output << "score_tile[i][j] = w;";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "maxval[i] = m_new;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_store(o_acc[d_tile], &rescale_scratch[0][0], 8);\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "for (uint c = lid; c < 64u; c += 32u) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "uint i = c >> 3;\n";
+            indent();
+            _output << "uint j = c & 7u;\n";
+            indent();
+            _output << "rescale_scratch[i][j] = rescale_scratch[i][j] * alphas_tile[i];";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "simdgroup_load(o_acc[d_tile], &rescale_scratch[0][0], 8);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(s_frag, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(v_frag, &v_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(o_acc[d_tile], s_frag, v_frag, o_acc[d_tile]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "alignas(16) threadgroup float o_tile[8][" << d << "];\n";
+      indent();
+      _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+              << "u; ++d_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "simdgroup_store(o_acc[d_tile], &o_tile[0][d_tile * 8u], "
+                << d << ");";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      if (n == 1) {
+        _output << "for (uint j = lid; j < " << d << "u; j += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << outName << "[j] = " << outTy
+                  << "(o_tile[0][j] / sumexp[0]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      } else {
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << outName << "[i * " << d << "u + j] = " << outTy
+                  << "(o_tile[i][j] / sumexp[i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-6 Sinks: causal predicate retained; AFTER the KV loop, the per-row
+// sink value (extras[0][gid]) contributes to sumexp (normalizer-only,
+// matching MLX sdpa_vector.h:144-148).
+void ModuleTranslation::emitSinks_(mlir::triton::metal::SdpaOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  auto kLen = op.getKLen();
+  float scale = op.getScale().convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string qName = nameOf(op.getQ());
+  std::string kName = nameOf(op.getK());
+  std::string vName = nameOf(op.getV());
+  std::string outName = nameOf(op.getOut());
+  std::string sinkName = nameOf(op.getExtras()[0]);
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "if (gid == 0u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "alignas(16) threadgroup float q_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float k_t_tile[" << d << "][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float v_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float score_tile[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float alphas_tile[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float rescale_scratch[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float maxval[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float sumexp[8];\n";
+      indent();
+      _output << "if (lid < 8u) { maxval[lid] = -INFINITY; sumexp[lid] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> q_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> k_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> v_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> s_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> o_acc[" << (d / 8) << "];\n";
+      indent();
+      _output << "for (uint t = 0; t < " << (d / 8)
+              << "u; ++t) { o_acc[t] = simdgroup_matrix<float, 8, 8>(0.0f); }\n";
+      indent();
+      _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c / " << d << "u;\n";
+        indent();
+        _output << "uint j = c % " << d << "u;\n";
+        indent();
+        if (n == 1) {
+          _output << "q_tile[i][j] = (i == 0u) ? float(" << qName
+                  << "[j]) : 0.0f;";
+        } else {
+          _output << "q_tile[i][j] = float(" << qName << "[i * " << d
+                  << "u + j]);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (kLen / 8)
+              << "u; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (d * 8) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / 8u;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "k_t_tile[i][j] = float(" << kName
+                  << "[(k_tile * 8u + j) * " << d << "u + i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << "v_tile[i][j] = float(" << vName
+                  << "[(k_tile * 8u + i) * " << d << "u + j]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_matrix<float, 8, 8> s_acc(0.0f);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(q_frag, &q_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_load(k_frag, &k_t_tile[d_tile * 8u][0], 8);\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(s_acc, q_frag, k_frag, s_acc);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "simdgroup_store(s_acc, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "uint kk = k_tile * 8u + j;\n";
+          indent();
+          _output << "float score = score_tile[i][j] * " << scale << "f;\n";
+          indent();
+          _output << "if (kk <= (" << kLen << "u - " << n
+                  << "u + i)) { } else { score = -INFINITY; }\n";
+          indent();
+          _output << "score_tile[i][j] = score;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "if (lid < 8u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = lid;\n";
+          indent();
+          _output << "float row_max = -INFINITY;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) { row_max = max(row_max, score_tile[i][j]); }\n";
+          indent();
+          _output << "float m_new = max(maxval[i], row_max);\n";
+          indent();
+          _output << "float alpha = fast::exp(maxval[i] - m_new);\n";
+          indent();
+          _output << "alphas_tile[i] = alpha;\n";
+          indent();
+          _output << "sumexp[i] = sumexp[i] * alpha;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "float w = fast::exp(score_tile[i][j] - m_new);\n";
+            indent();
+            _output << "sumexp[i] += w;\n";
+            indent();
+            _output << "score_tile[i][j] = w;";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "maxval[i] = m_new;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_store(o_acc[d_tile], &rescale_scratch[0][0], 8);\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "for (uint c = lid; c < 64u; c += 32u) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "uint i = c >> 3;\n";
+            indent();
+            _output << "uint j = c & 7u;\n";
+            indent();
+            _output << "rescale_scratch[i][j] = rescale_scratch[i][j] * alphas_tile[i];";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "simdgroup_load(o_acc[d_tile], &rescale_scratch[0][0], 8);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(s_frag, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(v_frag, &v_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(o_acc[d_tile], s_frag, v_frag, o_acc[d_tile]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "if (lid < 8u) { sumexp[lid] += fast::exp(float(" << sinkName
+              << "[lid]) - maxval[lid]); }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "alignas(16) threadgroup float o_tile[8][" << d << "];\n";
+      indent();
+      _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+              << "u; ++d_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "simdgroup_store(o_acc[d_tile], &o_tile[0][d_tile * 8u], "
+                << d << ");";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      if (n == 1) {
+        _output << "for (uint j = lid; j < " << d << "u; j += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << outName << "[j] = " << outTy
+                  << "(o_tile[0][j] / sumexp[0]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      } else {
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << outName << "[i * " << d << "u + j] = " << outTy
+                  << "(o_tile[i][j] / sumexp[i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-6 NonCausal: causal predicate replaced with `use_key = true`; no
+// extras consumed.
+void ModuleTranslation::emitNonCausal_(mlir::triton::metal::SdpaOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  auto kLen = op.getKLen();
+  float scale = op.getScale().convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string qName = nameOf(op.getQ());
+  std::string kName = nameOf(op.getK());
+  std::string vName = nameOf(op.getV());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "if (gid == 0u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "alignas(16) threadgroup float q_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float k_t_tile[" << d << "][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float v_tile[8][" << d << "];\n";
+      indent();
+      _output << "alignas(16) threadgroup float score_tile[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float alphas_tile[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float rescale_scratch[8][8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float maxval[8];\n";
+      indent();
+      _output << "alignas(16) threadgroup float sumexp[8];\n";
+      indent();
+      _output << "if (lid < 8u) { maxval[lid] = -INFINITY; sumexp[lid] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> q_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> k_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> v_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> s_frag;\n";
+      indent();
+      _output << "simdgroup_matrix<float, 8, 8> o_acc[" << (d / 8) << "];\n";
+      indent();
+      _output << "for (uint t = 0; t < " << (d / 8)
+              << "u; ++t) { o_acc[t] = simdgroup_matrix<float, 8, 8>(0.0f); }\n";
+      indent();
+      _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c / " << d << "u;\n";
+        indent();
+        _output << "uint j = c % " << d << "u;\n";
+        indent();
+        if (n == 1) {
+          _output << "q_tile[i][j] = (i == 0u) ? float(" << qName
+                  << "[j]) : 0.0f;";
+        } else {
+          _output << "q_tile[i][j] = float(" << qName << "[i * " << d
+                  << "u + j]);";
+        }
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (kLen / 8)
+              << "u; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (d * 8) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / 8u;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "k_t_tile[i][j] = float(" << kName
+                  << "[(k_tile * 8u + j) * " << d << "u + i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << "v_tile[i][j] = float(" << vName
+                  << "[(k_tile * 8u + i) * " << d << "u + j]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_matrix<float, 8, 8> s_acc(0.0f);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(q_frag, &q_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_load(k_frag, &k_t_tile[d_tile * 8u][0], 8);\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(s_acc, q_frag, k_frag, s_acc);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "simdgroup_store(s_acc, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "uint kk = k_tile * 8u + j;\n";
+          indent();
+          _output << "float score = score_tile[i][j] * " << scale << "f;\n";
+          indent();
+          _output << "score_tile[i][j] = score;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "if (lid < 8u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = lid;\n";
+          indent();
+          _output << "float row_max = -INFINITY;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) { row_max = max(row_max, score_tile[i][j]); }\n";
+          indent();
+          _output << "float m_new = max(maxval[i], row_max);\n";
+          indent();
+          _output << "float alpha = fast::exp(maxval[i] - m_new);\n";
+          indent();
+          _output << "alphas_tile[i] = alpha;\n";
+          indent();
+          _output << "sumexp[i] = sumexp[i] * alpha;\n";
+          indent();
+          _output << "for (uint j = 0u; j < 8u; ++j) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "float w = fast::exp(score_tile[i][j] - m_new);\n";
+            indent();
+            _output << "sumexp[i] += w;\n";
+            indent();
+            _output << "score_tile[i][j] = w;";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "maxval[i] = m_new;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_store(o_acc[d_tile], &rescale_scratch[0][0], 8);\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "for (uint c = lid; c < 64u; c += 32u) {";
+          {
+            INDENT();
+            _output << "\n";
+            indent();
+            _output << "uint i = c >> 3;\n";
+            indent();
+            _output << "uint j = c & 7u;\n";
+            indent();
+            _output << "rescale_scratch[i][j] = rescale_scratch[i][j] * alphas_tile[i];";
+          }
+          _output << "\n";
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+          indent();
+          _output << "simdgroup_load(o_acc[d_tile], &rescale_scratch[0][0], 8);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(s_frag, &score_tile[0][0], 8);\n";
+        indent();
+        _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+                << "u; ++d_tile) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "simdgroup_load(v_frag, &v_tile[0][d_tile * 8u], " << d
+                  << ");\n";
+          indent();
+          _output << "simdgroup_multiply_accumulate(o_acc[d_tile], s_frag, v_frag, o_acc[d_tile]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "alignas(16) threadgroup float o_tile[8][" << d << "];\n";
+      indent();
+      _output << "for (uint d_tile = 0; d_tile < " << (d / 8)
+              << "u; ++d_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "simdgroup_store(o_acc[d_tile], &o_tile[0][d_tile * 8u], "
+                << d << ");";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      if (n == 1) {
+        _output << "for (uint j = lid; j < " << d << "u; j += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << outName << "[j] = " << outTy
+                  << "(o_tile[0][j] / sumexp[0]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      } else {
+        _output << "for (uint c = lid; c < " << (8 * d) << "u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c / " << d << "u;\n";
+          indent();
+          _output << "uint j = c % " << d << "u;\n";
+          indent();
+          _output << outName << "[i * " << d << "u + j] = " << outTy
+                  << "(o_tile[i][j] / sumexp[i]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Stage-9 Llama-style RMS normalization.
+//
+// y[i,c] = x[i,c] * gamma[c] * rsqrt(mean_c(x[i,c]^2) + eps).
+//
+// Threadgroup layout: flat (32*n, 1, 1); `gid = id.x / 32u` is the row,
+// `lid = id.x & 31u` is the lane within the row's warp. simd_sum natively
+// broadcasts the scalar reduction to all 32 lanes, so every lane redundantly
+// computes `rms_inv` (no explicit simd_broadcast, no lane-0 gate). The write
+// loop mirrors translate(SoftmaxOp) — each lane stores its own D/32 outputs.
+// (Contrast translate(ReduceOp), which DOES gate stores under lid==0 because
+// reductions produce one scalar per row; RMSNorm writes D elements per row.)
+//
+// AccT=float invariant: x is promoted to float BEFORE the square (bf16 safety),
+// the sum-of-squares, eps add, and rsqrt are all in f32; only the final store
+// is cast back to T.
+void ModuleTranslation::translate(mlir::triton::metal::RmsNormOp op) {
+  auto n = op.getN();
+  auto d = op.getD();
+  llvm::APFloat epsAP = op.getEps();
+  float eps = epsAP.convertToFloat();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getO().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string xName = nameOf(op.getX());
+  std::string gName = nameOf(op.getGamma());
+  std::string oName = nameOf(op.getO());
+
+  int64_t dDiv32 = d / 32;
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint gid = id.x / 32u;\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "if (gid < " << n << "u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "uint base = gid * " << d << "u;\n";
+      indent();
+      _output << "float acc = 0.0f;\n";
+      indent();
+      _output << "for (uint k = 0u; k < " << dDiv32 << "u; ++k) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint c = lid + k * 32u;\n";
+        indent();
+        _output << "float xv = float(" << xName << "[base + c]);\n";
+        indent();
+        _output << "acc += xv * xv;";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "acc = simd_sum(acc);\n";
+      indent();
+      _output << "float rms_inv = rsqrt(acc / float(" << d << ") + "
+              << llvm::format("%.6ef", eps) << ");\n";
+      indent();
+      _output << "for (uint k = 0u; k < " << dDiv32 << "u; ++k) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint c = lid + k * 32u;\n";
+        indent();
+        _output << "float xv = float(" << xName << "[base + c]);\n";
+        indent();
+        _output << "float gv = float(" << gName << "[c]);\n";
+        indent();
+        _output << oName << "[base + c] = " << outTy
+                << "(xv * rms_inv * gv);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::MatmulOp op) {
+  switch (op.getKind()) {
+  case ::mlir::triton::metal::MatmulKind::Scalar:
+    emitScalarMatmul_(op);
+    break;
+  case ::mlir::triton::metal::MatmulKind::Mma:
+    emitMmaMatmul_(op);
+    break;
+  default:
+    op.emitError() << "metal.matmul unrecognized kind "
+                   << static_cast<int>(op.getKind());
+    return;
+  }
+}
+
+void ModuleTranslation::emitScalarMatmul_(mlir::triton::metal::MatmulOp op) {
+  auto m = op.getM();
+  auto n = op.getN();
+  auto k = op.getK();
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint row = id.y;\n";
+    indent();
+    _output << "uint col = id.x;\n";
+    indent();
+    _output << "if ((row < " << m << ") && (col < " << n << ")) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "float acc = 0.0f;\n";
+      indent();
+      _output << "for (uint kk = 0; kk < " << k << "; ++kk) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "acc = acc + (";
+        translateVarName(op.getLhs());
+        _output << "[(row * " << k << ") + kk] * ";
+        translateVarName(op.getRhs());
+        _output << "[(kk * " << n << ") + col]);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      translateVarName(op.getOut());
+      _output << "[(row * " << n << ") + col] = acc;";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+// Emit MSL for `metal.matmul` with `kind = ::Mma` using Apple `simdgroup_matrix`
+// intrinsics (Option A per Stage-7 US-1 probe). Per-lane partition mirrors
+// Stage-5/6 SDPA `uint lid = id.x & 31u;` idiom (ModuleTranslation.cpp:923-925).
+// AccT = float invariant: accumulator is always `simdgroup_matrix<float, 8, 8>`
+// regardless of operand element type T ∈ {f16, f32, bf16}.
+void ModuleTranslation::emitMmaMatmul_(mlir::triton::metal::MatmulOp op) {
+  auto m = op.getM();
+  auto n = op.getN();
+  auto k = op.getK();
+  auto elemTy = llvm::cast<MetalMemRefType>(op.getOut().getType()).getType();
+  auto outTy = typeToString(elemTy);
+
+  auto nameOf = [&](mlir::Value memref) -> std::string {
+    std::string buf;
+    llvm::raw_string_ostream s(buf);
+    auto opInst = memref.getDefiningOp();
+    if (opInst == nullptr) {
+      s << "v" << _buffers[memref.getAsOpaquePointer()];
+    } else if (llvm::isa<mlir::triton::metal::AllocaOp>(opInst)) {
+      s << "v" << _alloca[opInst];
+    }
+    return buf;
+  };
+  std::string lhsName = nameOf(op.getLhs());
+  std::string rhsName = nameOf(op.getRhs());
+  std::string outName = nameOf(op.getOut());
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint lid = id.x & 31u;\n";
+    indent();
+    _output << "alignas(16) threadgroup float lhs_tile[8][8];\n";
+    indent();
+    _output << "alignas(16) threadgroup float rhs_tile[8][8];\n";
+    indent();
+    _output << "simdgroup_matrix<float, 8, 8> acc(0.0f);\n";
+    indent();
+    _output << "simdgroup_matrix<float, 8, 8> lhs_frag;\n";
+    indent();
+    _output << "simdgroup_matrix<float, 8, 8> rhs_frag;\n";
+    indent();
+    _output << "uint simd_id = id.x / 32u;\n";
+    indent();
+    _output << "uint m_tile = simd_id / " << (n / 8) << "u;\n";
+    indent();
+    _output << "uint n_tile = simd_id % " << (n / 8) << "u;\n";
+    indent();
+    _output << "if ((m_tile * 8 < " << m << ") && (n_tile * 8 < " << n << ")) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "for (uint k_tile = 0; k_tile < " << (k / 8) << "; ++k_tile) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "lhs_tile[i][j] = float(" << lhsName
+                  << "[((m_tile * 8 + i) * " << k << ") + (k_tile * 8 + j)]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = lid; c < 64u; c += 32u) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uint i = c >> 3;\n";
+          indent();
+          _output << "uint j = c & 7u;\n";
+          indent();
+          _output << "rhs_tile[i][j] = float(" << rhsName
+                  << "[((k_tile * 8 + i) * " << n << ") + (n_tile * 8 + j)]);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "simdgroup_load(lhs_frag, &lhs_tile[0][0], 8);\n";
+        indent();
+        _output << "simdgroup_load(rhs_frag, &rhs_tile[0][0], 8);\n";
+        indent();
+        _output << "simdgroup_multiply_accumulate(acc, lhs_frag, rhs_frag, acc);\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "alignas(16) threadgroup float out_tile[8][8];\n";
+      indent();
+      _output << "simdgroup_store(acc, &out_tile[0][0], 8);\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint c = lid; c < 64u; c += 32u) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint i = c >> 3;\n";
+        indent();
+        _output << "uint j = c & 7u;\n";
+        indent();
+        _output << outName << "[((m_tile * 8 + i) * " << n
+                << ") + (n_tile * 8 + j)] = " << outTy << "(out_tile[i][j]);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::Region &region) {
+  _output << "{";
+  {
+    INDENT();
+    for (auto &op : region.getOps()) {
+      // L1d2b inline-barrier contract — boundary set:
+      //   { metal.barrier, metal.tg_load_indexed, metal.tg_store_indexed }.
+      //
+      // Without this hook, `translateValue(metal.tg_load_indexed)` is invoked
+      // lazily from the consumer's emission path (e.g. inside the
+      // `MaskedStoreLowering`-emitted `scf.if(mask){ store … }` body), which
+      // re-evaluates `<buf>[<idx>]` AFTER the trailing `threadgroup_barrier`
+      // in execution order on every masked-true lane. Apple's Metal shading
+      // compiler miscompiles that configuration (drops stores from non-zero
+      // warps and races warp 0). The fix: force-materialize `tg_load_indexed`
+      // results as named MSL let-bindings at their IR position — before any
+      // subsequent `scf.if` block — and route uses through `_letBound` so
+      // they render as `v<N>` instead of re-inlining the load expression.
+      //
+      // The other two boundary ops (`metal.barrier`, `metal.tg_store_indexed`)
+      // produce no result, so there is nothing to let-bind for them; they are
+      // already emitted as standalone statements (see `isStatementPrintable`
+      // / `translateStatement`) and naturally act as ordering points because
+      // this walk emits statements in IR order without re-ordering.
+      if (auto tgLoad =
+              llvm::dyn_cast<mlir::triton::metal::TgLoadIndexedOp>(&op)) {
+        if (_letBound.find(&op) == _letBound.end()) {
+          _output << "\n";
+          indent();
+          unsigned idx = _varCount++;
+          _output << typeToString(tgLoad.getResult().getType()) << " v" << idx
+                  << " = ";
+          translate(tgLoad);
+          _output << ";";
+          _letBound[&op] = idx;
+          continue;
+        }
+      }
+      if (isStatementPrintable(&op)) {
+        _output << "\n";
+        indent();
+      }
+      translateStatement(&op);
+    }
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translateValue(Operation *opInst) {
+  // L1d2b inline-barrier contract: if this op's result has been
+  // force-materialized as an MSL let-binding (see `translate(Region&)`),
+  // render the use as the let-binding name rather than re-inlining its
+  // value expression. This is what keeps the `tg_load_indexed` expression
+  // OUT of any subsequent `scf.if(mask){ … }` body emitted by
+  // `MaskedStoreLowering` and prevents the downstream Apple-MSL miscompile.
+  {
+    auto it = _letBound.find(opInst);
+    if (it != _letBound.end()) {
+      _output << "v" << it->second;
+      return;
+    }
+  }
+  llvm::TypeSwitch<Operation *>(opInst)
+      .Case<mlir::triton::metal::ConstantOp, mlir::triton::metal::GetElementOp,
+            mlir::triton::metal::TgLoadIndexedOp,
+            mlir::triton::metal::ThreadIdOp,
+            mlir::triton::metal::ThreadgroupIdOp,
+            mlir::triton::metal::CastOp,
+            mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
+            mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
+      .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
+        // Emit `(lhs <pred> rhs)` matching arith.cmpi semantics. Only the
+        // predicates needed by the masked vector-add path are wired; extend
+        // as new fixtures land.
+        using P = mlir::arith::CmpIPredicate;
+        const char *opStr = nullptr;
+        switch (op.getPredicate()) {
+        case P::eq:  opStr = " == "; break;
+        case P::ne:  opStr = " != "; break;
+        case P::slt: opStr = " < ";  break;
+        case P::sle: opStr = " <= "; break;
+        case P::sgt: opStr = " > ";  break;
+        case P::sge: opStr = " >= "; break;
+        case P::ult: opStr = " < ";  break;
+        case P::ule: opStr = " <= "; break;
+        case P::ugt: opStr = " > ";  break;
+        case P::uge: opStr = " >= "; break;
+        }
+        _output << "(";
+        translateValue(op.getLhs().getDefiningOp());
+        _output << opStr;
+        translateValue(op.getRhs().getDefiningOp());
+        _output << ")";
+      })
+      .Case<mlir::arith::CmpFOp>([&](mlir::arith::CmpFOp op) {
+        // Emit `(lhs <pred> rhs)` matching arith.cmpf semantics. Only the
+        // ordered predicates needed by the leaky_relu fixture are wired;
+        // extend as new fixtures land.
+        using P = mlir::arith::CmpFPredicate;
+        const char *opStr = nullptr;
+        switch (op.getPredicate()) {
+        // Ordered preds: MSL `>`/`<`/`==` on `float` return false on NaN,
+        // matching MLIR's ordered semantics.
+        case P::OEQ: opStr = " == "; break;
+        case P::OGT: opStr = " > ";  break;
+        case P::OGE: opStr = " >= "; break;
+        case P::OLT: opStr = " < ";  break;
+        case P::OLE: opStr = " <= "; break;
+        case P::ONE: opStr = " != "; break;
+        // Unordered / non-ordered predicates: deferred. Listed explicitly
+        // so the diagnostic names the predicate that hit.
+        case P::UEQ:
+          llvm_unreachable(
+              "arith.cmpf UEQ (unordered ==) not yet supported on Metal");
+        case P::UGT:
+          llvm_unreachable(
+              "arith.cmpf UGT (unordered >) not yet supported on Metal");
+        case P::UGE:
+          llvm_unreachable(
+              "arith.cmpf UGE (unordered >=) not yet supported on Metal");
+        case P::ULT:
+          llvm_unreachable(
+              "arith.cmpf ULT (unordered <) not yet supported on Metal");
+        case P::ULE:
+          llvm_unreachable(
+              "arith.cmpf ULE (unordered <=) not yet supported on Metal");
+        case P::UNE:
+          llvm_unreachable(
+              "arith.cmpf UNE (unordered !=) not yet supported on Metal");
+        case P::ORD:
+          llvm_unreachable(
+              "arith.cmpf ORD (ordered, neither is NaN) not yet supported on Metal");
+        case P::UNO:
+          llvm_unreachable(
+              "arith.cmpf UNO (unordered, at least one NaN) not yet supported on Metal");
+        case P::AlwaysTrue:
+          llvm_unreachable(
+              "arith.cmpf AlwaysTrue not yet supported on Metal");
+        case P::AlwaysFalse:
+          llvm_unreachable(
+              "arith.cmpf AlwaysFalse not yet supported on Metal");
+        }
+        _output << "(";
+        translateValue(op.getLhs().getDefiningOp());
+        _output << opStr;
+        translateValue(op.getRhs().getDefiningOp());
+        _output << ")";
+      })
+      .Case<mlir::arith::ConstantOp>([&](mlir::arith::ConstantOp op) {
+        // arith.constant (signless integer or float) survives in the masked
+        // path as the upper-bound N of the comparison. Emit as a literal.
+        if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue()))
+          _output << v.getValue();
+        else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
+          _output << v.getValueAsDouble();
+        else
+          llvm_unreachable("Unexpected arith.constant attribute kind");
+      })
+      .Case<mlir::UnrealizedConversionCastOp>(
+          [&](mlir::UnrealizedConversionCastOp op) {
+            // The masked path uses this cast as a ui32→i32 reinterpret so
+            // arith.cmpi (signless) can consume metal.thread_id (ui32). MSL
+            // treats uint and int interchangeably in this expression context;
+            // forward the source value. The BLOCK_SIZE>threads slice also
+            // casts an scf.for induction var (BlockArgument) — handle that
+            // by routing through translateVarName.
+            assert(op.getInputs().size() == 1 &&
+                   "unrealized_conversion_cast: expected single-input form");
+            auto in = op.getInputs()[0];
+            if (auto inOp = in.getDefiningOp())
+              translateValue(inOp);
+            else
+              translateVarName(in);
+          })
+      .Case<mlir::arith::MulIOp>([&](mlir::arith::MulIOp op) {
+        // Used by BLOCK_SIZE>threads idx arithmetic (e.g. `tid * E`).
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " * ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::AddIOp>([&](mlir::arith::AddIOp op) {
+        // Used by BLOCK_SIZE>threads idx arithmetic (e.g. `tid + iv * T`).
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " + ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::SubIOp>([&](mlir::arith::SubIOp op) {
+        // Used by 2D MakeRangeLowering for the global->local tid mapping:
+        // `lid.x = id.x - tgid.x * threadsPerCTA`.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " - ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::DivSIOp>([&](mlir::arith::DivSIOp op) {
+        // Used by 2D MakeRangeLowering: `row = idx / BLOCK_N`. MSL integer
+        // divsion follows C semantics, which matches arith.divsi for the
+        // non-negative thread indices we emit here.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " / ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::RemSIOp>([&](mlir::arith::RemSIOp op) {
+        // Used by 2D MakeRangeLowering: `col = idx % BLOCK_N`.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " % ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::AndIOp>([&](mlir::arith::AndIOp op) {
+        // Used by 2D mask reduction: `(row<M) & (col<N)`. MSL `&` on bools
+        // is short-circuit-free bitwise AND, which matches arith.andi.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " & ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      // L2: Elementwise integer arith emitter cases. Each mirrors the SubI
+      // shape — emit `(lhs <op> rhs)` with the MSL built-in operator.
+      // Signed/unsigned semantics are carried by operand dtype.
+      // See `.omc/specs/deep-interview-leet-triton-l2-int-arith-broad.md`.
+      .Case<mlir::arith::ShRSIOp>([&](mlir::arith::ShRSIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " >> ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::ShLIOp>([&](mlir::arith::ShLIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " << ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::OrIOp>([&](mlir::arith::OrIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " | ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::XOrIOp>([&](mlir::arith::XOrIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " ^ ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::DivUIOp>([&](mlir::arith::DivUIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " / ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::RemUIOp>([&](mlir::arith::RemUIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " % ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::ShRUIOp>([&](mlir::arith::ShRUIOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " >> ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getCondition());
+        _output << " ? ";
+        emit(op.getTrueValue());
+        _output << " : ";
+        emit(op.getFalseValue());
+        _output << ")";
+      })
+      .Case<mlir::scf::IfOp>([&](mlir::scf::IfOp op) {
+        auto it = _scfIfTemp.find(op.getOperation());
+        assert(it != _scfIfTemp.end() &&
+               "scf.if result referenced before pre-declaration");
+        _output << "v" << it->second;
+      })
+      .Default([&](Operation *) { llvm_unreachable("Unexpected operation"); });
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ConstantOp op) {
+  if (auto v = llvm::dyn_cast<BoolAttr>(op.getValue()))
+    _output << (v.getValue() ? "true" : "false");
+  else if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue()))
+    _output << v.getValue();
+  else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
+    _output << v.getValueAsDouble();
+  else
+    llvm_unreachable("Unexpected constant");
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::GetElementOp op) {
+  translateVarName(op.getMemref());
+  _output << "[";
+  translateValue(op.getIndex().getDefiningOp());
+  _output << "]";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ThreadIdOp op) {
+  _output << "id." << op.getDimension();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupIdOp op) {
+  _output << "tgid." << op.getDimension();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::CastOp op) {
+  _output << typeToString(op.getType());
+  _output << "(";
+  translateValue(op.getArgument().getDefiningOp());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
+  auto translateArgument = [&] {
+    translateValue(op.getArgument().getDefiningOp());
+  };
+
+  using OP = mlir::triton::metal::UnaryExpOperator;
+  switch (op.getUnaryOperator()) {
+  case OP::minusOp:
+    _output << "(-";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::notOp:
+    _output << "(!";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::expOp:
+    _output << "metal::precise::exp(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::sqrtOp:
+    _output << "metal::precise::sqrt(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::erfOp:
+    // MSL stdlib has no `metal::erf`; we emit a call to `__triton_erff`,
+    // a polynomial approximation defined in the module preamble when any
+    // kernel uses the `erfOp` case (see `translateModule`).
+    _output << "__triton_erff(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::logOp:
+    _output << "metal::precise::log(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::rsqrtOp:
+    _output << "metal::precise::rsqrt(";
+    translateArgument();
+    _output << ")";
+    break;
+  }
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
+  _output << "(";
+  translateValue(op.getLhs().getDefiningOp());
+  _output << ") ";
+
+  using OP = mlir::triton::metal::BinaryExpOperator;
+  switch (op.getBinaryOperator()) {
+  case OP::addOp:
+    _output << "+";
+    break;
+  case OP::subOp:
+    _output << "-";
+    break;
+  case OP::mulOp:
+    _output << "*";
+    break;
+  case OP::divOp:
+    _output << "/";
+    break;
+  case OP::remOp:
+    _output << "%";
+    break;
+  case OP::eqOp:
+    _output << "==";
+    break;
+  case OP::neOp:
+    _output << "!=";
+    break;
+  case OP::ltOp:
+    _output << "<";
+    break;
+  case OP::leOp:
+    _output << "<=";
+    break;
+  case OP::gtOp:
+    _output << ">";
+    break;
+  case OP::geOp:
+    _output << ">=";
+    break;
+  case OP::andOp:
+    _output << "&&";
+    break;
+  case OP::orOp:
+    _output << "||";
+    break;
+  }
+
+  _output << " (";
+  translateValue(op.getRhs().getDefiningOp());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::YieldWhileOp op) {
+  translateValue(op.getCondition().getDefiningOp());
+}
