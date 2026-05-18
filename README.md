@@ -1,317 +1,166 @@
+# Triton-Metal (Proof of Concept)
 
-| **`Documentation`** | **`Nightly Wheels`** |
-|-------------------- | -------------------- |
-| [![Documentation](https://github.com/triton-lang/triton/actions/workflows/documentation.yml/badge.svg)](https://triton-lang.org/) | [![Wheels](https://github.com/triton-lang/triton/actions/workflows/wheels.yml/badge.svg)](https://github.com/triton-lang/triton/actions/workflows/wheels.yml) |
+> **Status: Proof of Concept.** This fork lowers a subset of Triton kernels onto Apple Silicon GPUs via Metal. It is **not** a drop-in replacement for upstream Triton on CUDA/ROCm. Many ops are unsupported, the compiler pipeline is rough around the edges, and **performance is not yet tuned**. Expect to read source code when something breaks.
 
-# Triton Conference 2025
+This is a research-grade experiment exploring whether the Triton compiler stack can target Apple Metal. If you are looking for production-ready Triton, use the upstream project at [triton-lang/triton](https://github.com/triton-lang/triton).
 
-![Triton Banner](https://github.com/user-attachments/assets/b4b6972a-857c-417f-bf2c-f16f38a358c0)
+---
 
-The 3rd Triton Developer Conference took place on October 21, 2025 at the Microsoft Silicon Valley Campus in Mountain View, California.
+## What this is
 
-### Conference Materials
+A new backend (`third_party/metal/`) that takes Triton kernels through the following lowering pipeline:
 
-Conference recordings and materials are now available online:
-
-- **Conference Videos:** [YouTube Playlist](https://www.youtube.com/playlist?list=PLc_vA1r0qoiQqCdWFDUDqI90oY5EjfGuO)
-- **Conference Slides:** [Google Drive Folder](https://drive.google.com/drive/folders/1KB6tD3UM1J0_eUp-F-JSlGrargLBawIr)
-
-For previous conference materials, see:
-- [2024 Conference Materials](docs/meetups/dev_conference_2024.md)
-- [2023 Conference Materials](docs/meetups/dev-meetup-2023.md)
-
-# Triton
-
-This is the development repository of Triton, a language and compiler for writing highly efficient custom Deep-Learning primitives. The aim of Triton is to provide an open-source environment to write fast code at higher productivity than CUDA, but also with higher flexibility than other existing DSLs.
-
-The foundations of this project are described in the following MAPL2019 publication: [Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations](http://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf). Please consider citing this work if you use Triton!
-
-The [official documentation](https://triton-lang.org) contains installation instructions and tutorials.  See also these third-party [Triton puzzles](https://github.com/srush/Triton-Puzzles), which can all be run using the Triton interpreter -- no GPU required.
-
-# Quick Installation
-
-You can install the latest stable release of Triton from pip:
-
-```shell
-pip install triton
+```
+Triton kernel (Python @triton.jit)
+        │
+        ▼
+   TritonGPU IR  (TTGIR — the existing Triton mid-level dialect)
+        │   third_party/metal/lib/Conversion/TritonGPUToMetal
+        ▼
+   Metal Dialect (MLIR — Triton-Metal-specific ops in third_party/metal/include/Dialect/Metal)
+        │   third_party/metal/lib/Target/Metal
+        ▼
+   MSL (Metal Shading Language source text)
+        │   third_party/metal/lib/Runtime
+        ▼
+   Runner (xcrun metal → .metallib → MTLComputePipelineState → dispatch)
 ```
 
-Binary wheels are available for CPython 3.10-3.14.
+The runtime shells out to `xcrun -sdk macosx metal` at launch time to compile the emitted MSL into a `.metallib`, then dispatches via the Metal API. **Receiving machines must have Xcode (or the Command Line Tools' Metal toolchain) installed.**
 
-# Install from source
+---
 
-```shell
-git clone https://github.com/triton-lang/triton.git
-cd triton
+## Quick start
 
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
+### Prerequisites
 
-Or with a virtualenv:
+- Apple Silicon Mac (M1 or newer; the runtime currently targets `MTLGPUFamilyApple9` with fallback to Apple8..Apple1)
+- macOS 14+ (the SDK gate for Apple9 detection is `__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000`)
+- Xcode 15+ with Command Line Tools (`xcode-select --install`)
+- [pixi](https://pixi.sh) for environment management
 
-```shell
-git clone https://github.com/triton-lang/triton.git
-cd triton
+### Dev environment
 
-python -m venv .venv --prompt triton
-source .venv/bin/activate
-
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
-
-# Building with a custom LLVM
-
-Triton uses LLVM to generate code for GPUs and CPUs.  Normally, the Triton build
-downloads a prebuilt LLVM, but you can also build and use LLVM from source.
-
-LLVM does not have a stable API, so the Triton build will not work at an
-arbitrary LLVM version.
-
-For convenience, use the following command to build LLVM and install Triton with the custom LLVM:
-
-```shell
-make dev-install-llvm
-```
-
-<details>
-<summary>
-Alternatively, follow these steps to build LLVM from source manually.
-</summary>
-
-1. Find the version of LLVM that Triton builds against.  Check
-`cmake/llvm-hash.txt` to see the current version. For example, if it says:
-       49af6502c6dcb4a7f7520178bd14df396f78240c.
-
-   This means that the version of Triton you have builds against
-   [LLVM](https://github.com/llvm/llvm-project) 49af6502.
-
-2. `git checkout` LLVM at this revision.  Optionally, make additional
-   modifications to LLVM.
-
-3. [Build LLVM](https://llvm.org/docs/CMake.html).  For example, you might run:
-
-       $ cd $HOME/llvm-project  # your clone of LLVM.
-       $ mkdir build
-       $ cd build
-       $ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON ../llvm -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld;clang" -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU"
-       $ ninja
-
-4. Grab a snack, this will take a while.
-
-5. Build Triton as above, but set the following environment variables:
-
-       # Modify as appropriate to point to your LLVM build.
-       $ export LLVM_BUILD_DIR=$HOME/llvm-project/build
-
-       $ cd <triton install>
-       $ LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
-         LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
-         LLVM_SYSPATH=$LLVM_BUILD_DIR \
-         pip install -e .
-
-</details>
-
-# Tips for building
-
-- Set `TRITON_BUILD_WITH_CLANG_LLD=true` as an environment variable to use clang
-  and lld.  lld in particular results in faster builds.
-
-- Set `TRITON_BUILD_WITH_CCACHE=true` to build with ccache.
-
-- Set `TRITON_HOME=/some/path` to change the location of the `.triton`
-  directory where Triton's cache is located and downloads are stored
-  during the build. By default, this is the user's home directory. It
-  can be changed anytime.
-
-- If you're running out of memory when building Triton, specify the `MAX_JOBS`
-  environment variable (to the `pip install -e .` command) to limit the
-  number of jobs.
-
-- Pass `--no-build-isolation` to `pip install` to make nop builds faster.
-  Without this, every invocation of `pip install` uses a different symlink to
-  cmake, and this forces ninja to rebuild most of the `.a` files.
-
-- The build system creates a `compile_commands.json` file under the Triton repo
-  directory. This file is used by VSCode IntelliSense and clangd to provide
-  code completion and other features for C++ code.
-
-  If IntelliSense does not work, you can try the following steps:
-
-    - Do a local build. Run command `pip install -e .`.
-    - Get the full path to the `compile_commands.json` file produced by the build:
-      `find ./build -name 'compile_commands.json' | xargs readlink -f`.
-      You might get a full path similar to `/Users/{username}/triton/build/cmake.macosx-11.1-arm64-cpython-3.12/compile_commands.json`.
-    - In VSCode, install the
-      [C/C++
-      extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools),
-      then open the command palette (`Shift + Command + P` on Mac, or `Shift +
-      Ctrl + P` on Windows/Linux) and open `C/C++: Edit Configurations (UI)`.
-    - Open "Advanced Settings" and paste the full path to
-      `compile_commands.json` into the "Compile Commands" textbox.
-
-# Running tests
-
-There currently isn't a turnkey way to run all the Triton tests, but you can
-follow the following recipe:
-
-```shell
-# One-time setup.  Note this will reinstall local Triton because torch
-# overwrites it with the public version.
-$ make dev-install
-
-# To run all tests (requires a GPU)
-$ make test
-
-# Or, to run tests without a gpu
-$ make test-nogpu
-```
-
-# Tips for hacking
-
-For detailed instructions on how to debug Triton's frontend, please refer to this [tutorial](https://triton-lang.org/main/programming-guide/chapter-3/debugging.html). The following includes additional tips for hacking on Triton's backend.
-
-**Configuration knobs**
-
-See [`python/triton/knobs.py`](python/triton/knobs.py) for the full list of configuration knobs. You can set those knobs directly in python or use environment variables to control them. Below are some of the environment variables you can specify (see `knobs.py` for the full list):
-
-- `MLIR_ENABLE_DUMP=1` dumps the IR before every MLIR pass Triton runs, for all
-   kernels. Use `MLIR_ENABLE_DUMP=kernelName` to dump for a specific kernel only.
-  - Triton cache can interfere with the dump. In cases where `MLIR_ENABLE_DUMP=1` does not work, try cleaning your triton cache: `rm -r ~/.triton/cache/*`.
-- `MLIR_DUMP_PATH` specifies where `MLIR_ENABLE_DUMP` will dump to. If unset will dump to stderr.
-- `LLVM_IR_ENABLE_DUMP=1` dumps the IR before every pass run over the LLVM IR.
-- `TRITON_REPRODUCER_PATH=<reproducer_path>` will generate an MLIR reproducer file
-  at `<reproducer_path>` before each MLIR compiler stage. If any of the stages fail,
-  `<reproducer_path>` will be a local MLIR reproducer captured right before the failing pass.
-- `TRITON_INTERPRET=1` uses the Triton interpreter instead of running on the
-  GPU.  You can insert Python breakpoints in your kernel code!
-- `TRITON_ENABLE_LLVM_DEBUG=1` passes `-debug` to LLVM, printing a lot of
-  debugging information to stdout.  If this is too noisy, run with just
-  `TRITON_LLVM_DEBUG_ONLY` instead to limit the output.
-  - An alternative way to reduce output noisiness is running with
-  `LLVM_IR_ENABLE_DUMP=1`, extract the IR before the LLVM pass of interest, and
-  then run LLVM's `opt` standalone, perhaps passing `-debug-only=foo` on the
-  command line.
-
-- `TRITON_LLVM_DEBUG_ONLY=<comma-separated>` is the equivalent of LLVM's
-  `-debug-only` command-line option. This limits the LLVM debug output to
-  specific pass or component names (which are specified using `#define
-  DEBUG_TYPE` throughout LLVM and Triton) in order to allow the debug output to
-  be less noisy. `TRITON_LLVM_DEBUG_ONLY` allows for one or more comma
-  separated values to be specified (eg
-  `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions"` or
-  `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions,regalloc"`).
-- `TRITON_ENABLE_ASAN=1` invokes the LLVM address sanitizer for
-  memory leak and out of bounds access detection. Currently only supported on the AMD
-  backend. This must be run using the ASAN libraries documented [here](https://rocm.docs.amd.com/projects/llvm-project/en/latest/conceptual/using-gpu-sanitizer.html).
-  - When enabling the address sanitizer it is recommended to disable various memory caching strategies
-  both within the ROCm stack and PyTorch. This will give the address sanitizer the best chance at finding the
-  memory fault where it originates. See this [test](https://github.com/triton-lang/triton/blob/main/third_party/amd/python/test/test_address_sanitizer.py) for more details.
-
-- `USE_IR_LOC={ttir,ttgir}` reparses the IR such that the location information
-  will be the line number of the IR file with that particular extension,
-  instead of line number of the python file. This can provide a direct mapping
-  from the IR to llir/ptx. When used with performance tools, it can provide a
-  breakdown on IR instructions.
-- `TRITON_PRINT_AUTOTUNING=1` prints out the best autotuning config and total time
-  spent for each kernel after autotuning is complete.
-- `DISABLE_LLVM_OPT` will disable llvm optimizations for make_llir and make_ptx
-  if its value is true when parsing as Bool. Otherwise, it will be parsed as a list
-  of flags to disable llvm optimizations. One usage case is
-  `DISABLE_LLVM_OPT="disable-lsr"`
-  Loop strength reduction is known to cause up to 10% performance changes for
-  certain kernels with register pressure.
-- `TRITON_ALWAYS_COMPILE=1` forces to compile kernels regardless of cache hit.
-- `MLIR_ENABLE_TIMING` dumps the timing information for each MLIR pass.
-- `LLVM_ENABLE_TIMING` dumps the timing information for each LLVM pass.
-- `TRITON_DEFAULT_FP_FUSION` overrides the default behavior of allowing fp fusion (mul+add->fma).
-- `MLIR_ENABLE_DIAGNOSTICS=<comma-separated>` controls diagnostic emission in MLIR.
-  Options are: `warnings`, `remarks`, `stacktraces`, `operations`.
-  Use comma-separated values to customize output. For example,
-  `MLIR_ENABLE_DIAGNOSTICS=remarks,operations` enables remarks and IR operations,
-  while `MLIR_ENABLE_DIAGNOSTICS=warnings,stacktraces` enables warnings with
-  stacktraces. By default, only errors are shown. Setting `warnings` includes
-  errors and warnings; `remarks` includes errors, warnings, and remarks.
-- `MLIR_ENABLE_REMARK` is deprecated. Please use `MLIR_ENABLE_DIAGNOSTICS=remarks`.
-- `TRITON_KERNEL_DUMP` enables the dumping of the IR from each compilation stage and the final ptx/amdgcn.
-- `TRITON_DUMP_DIR` specifies the directory to save the dumped IR and ptx/amdgcn when `TRITON_KERNEL_DUMP` is set to 1.
-- `TRITON_KERNEL_OVERRIDE` enables the override of the compiled kernel with a user-specified IR/ptx/amdgcn at the beginning of each compilation stage.
-- `TRITON_OVERRIDE_DIR` specifies the directory from which to load the IR/ptx/amdgcn files when `TRITON_KERNEL_OVERRIDE` is set to 1.
-- `TRITON_F32_DEFAULT` sets the default input precision of `tl.dot` when using 32-bit floats, which can be either `ieee`, `tf32`, or `tf32x3`.
-- `TRITON_FRONT_END_DEBUGGING=1` disables exception wrapping when an error occurs in the compiler frontend, allowing the full stack trace to be seen.
-- `TRITON_DISABLE_LINE_INFO=1` removes all line information from the module.
-- `PTXAS_OPTIONS` passes additional command-line options to the PTX assembler `ptxas` (only on NVIDIA).
-- `LLVM_EXTRACT_DI_LOCAL_VARIABLES` emit full debug info, allowing for eval of values in gpu debuggers (ie cuda-gdb, rocm-gdb etc)
-- `TRITON_DEFAULT_BACKEND=<backend>` optionally sets the default backend used by Triton when
-  constructing the active driver (i.e., `triton.runtime.driver.active`).
-
-> [!NOTE]
-> Some of these environment variables don't have a knob in `knobs.py`-- those are only relevant to the C++ layer(s), hence they don't exist in the python layer.
-
-**Kernel Override Steps**
+This repo uses **pixi** to pin Python / CMake / LLVM / PyTorch versions for development. Pixi is a temporary choice — if this backend graduates toward upstream, pixi will be dropped in favor of the upstream build flow.
 
 ```bash
-export TRITON_ALWAYS_COMPILE=1
-export TRITON_KERNEL_DUMP=1
-export TRITON_DUMP_DIR=<dump_dir>
-export TRITON_KERNEL_OVERRIDE=1
-export TRITON_OVERRIDE_DIR=<override_dir>
-# Step 1: Run the kernel once to dump kernel's IRs and ptx/amdgcn in $TRITON_DUMP_DIR
-# Step 2: Copy $TRITON_DUMP_DIR/<kernel_hash> to $TRITON_OVERRIDE_DIR
-# Step 3: Delete the stages that you do not want to override and modify the stage you do want to override
-# Step 4: Run the kernel again to see the overridden result
+# install pixi (one-time)
+curl -fsSL https://pixi.sh/install.sh | bash
+
+# from repo root
+pixi install
+pixi run install   # builds Triton + Metal backend in editable mode
 ```
 
-**Compiler Pipeline Inspection Steps**
-To introspect the pipeline `add_stages`, before running your kernels, simply set
-the add_stages_inspection_hook like so:
+### Build a wheel for local testing
 
-```python
-def inspect_stages(_self, stages, options, language, capability):
-    # inspect or modify add_stages here
-triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
+```bash
+pixi run python setup.py bdist_wheel
+# → dist/triton-*.whl  (~120 MB; bundles all backends + libtriton.so)
 ```
-Examples of how to use this for out of tree plugin passes is [here](lib/Plugins/README.md)
-# Changelog
 
-Version 2.0 is out! New features include:
+Install the wheel into a throwaway venv to verify it is self-contained:
 
-- Many, many bug fixes
-- Performance improvements
-- Backend rewritten to use MLIR
-- Support for kernels that contain back-to-back matmuls (e.g., flash attention)
+```bash
+python3 -m venv /tmp/triton-test
+/tmp/triton-test/bin/pip install --no-deps dist/triton-*.whl
+/tmp/triton-test/bin/python -c "
+import triton
+from triton.backends.metal.driver import MetalDriver
+print(MetalDriver().get_current_target())
+"
+# → GPUTarget(backend='metal', arch=9, warp_size=32)
+```
 
-# Contributing
+### Run the tests
 
-Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/triton-lang/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
+```bash
+# lit-based MLIR tests (no GPU required — CPU-only compiler checks)
+cd $(pixi run python -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
+ninja triton-opt
+lit -v test/Dialect/Metal
 
-# Compatibility
+# pytest GPU smoke tests (Metal/MPS required)
+pixi run pytest python/test/unit/test_metal_backend_*.py -s --tb=short
 
-Supported Platforms:
+# end-to-end LeetGPU-style kernels
+pixi run leet-all
+```
 
-- Linux
+---
 
-Supported Hardware:
+## What works today
 
-- NVIDIA GPUs (Compute Capability 8.0+)
-- AMD GPUs (ROCm 6.2+)
-- Under development: CPUs
+End-to-end correctness verified against PyTorch references on Apple Silicon (M-series, macOS 26.4 in the development environment) for the following LeetGPU "easy" kernels under `leet-triton/`:
 
-# Development Container (Dev Container)
+| Task | Pass |
+|---|---|
+| `easy-leaky_Relu.py` | ✅ |
+| `easy-color_inversion.py` | ✅ |
+| `easy-1D_convolution.py` | ✅ |
+| `easy-gaussian_error_gated_linear_unit.py` | ✅ |
+| `easy-interleave_arrays.py` | ✅ |
+| `easy-matrix_transpose.py` | ✅ |
 
-**Dev Containers** for the Triton project are available from
-the [triton-dev-containers repository](https://github.com/redhat-et/triton-dev-containers).
+Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, simple reductions, broadcast, and 2D dispatch. No medium/hard LeetGPU problems pass yet.
 
-### Key Benefits:
-- **Consistency**: All developers can work with the same development
-  environment, ensuring uniform behavior across different systems.
-- **Isolation**: The container prevents potential conflicts with software
-  installed on your local machine.
-- **Portability**: Easily share the development environment with team members,
-  minimizing onboarding time and setup issues.
+In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 
-### How to Use the Dev Container:
+---
 
-For detailed instructions on how to use the dev containers, please see
-the [dev container user guide](https://github.com/redhat-et/triton-dev-containers/blob/main/.devcontainer/devcontainer.md).
+## Known limitations
+
+- **No autotuning, no perf work.** Generated MSL is single-threadgroup-per-program and makes no use of SIMD-group reductions, threadgroup memory, or vectorized loads. Throughput will be **far** below what Metal-native kernels achieve.
+- **Op coverage is partial.** Many `tl.*` ops are unimplemented; you will hit `NYI` errors on non-trivial kernels.
+- **No `tl.dot` / no matmul lowering.** Tensor-core / SIMD-group-matrix mapping is future work.
+- **Runtime shells out to `xcrun`** at every launch — no MSL caching across processes yet.
+- **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`). For broader distribution it should be re-tagged to the minimum supported macOS.
+- **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
+- **No macOS CI** — verification is currently manual on developer machines.
+
+---
+
+## Future work
+
+- **Performance pass:** SIMD-group primitives, threadgroup memory, vectorized loads, and a coarser tile-to-threadgroup mapping. The current generator leaves >10× on the table for memory-bound kernels.
+- **`tl.dot` lowering** onto Apple SIMD-group matrix instructions (Apple7+).
+- **Broader op coverage:** atomics, more transcendentals, integer reductions, gather/scatter beyond simple masked load.
+- **Compiled-kernel caching:** persist `.metallib` blobs across processes instead of re-invoking `xcrun` on every launch.
+- **Automated correctness suite** covering medium/hard LeetGPU and a subset of upstream Triton tutorials.
+- **Build-system convergence with upstream:** drop pixi, integrate the Metal backend behind the upstream `setup.py` backend-selection flow, and produce a properly-tagged wheel for general distribution.
+- **macOS CI** to gate regressions on Apple Silicon.
+
+---
+
+## Repository layout (Metal-specific)
+
+```
+third_party/metal/
+├── backend/                       Python backend module (driver, compiler, target)
+├── include/Dialect/Metal/IR/      Metal Dialect op/type definitions
+├── include/Target/Metal/          MSL emitter headers
+├── lib/Conversion/
+│   └── TritonGPUToMetal/          TTGIR → Metal Dialect lowering
+├── lib/Dialect/Metal/             Dialect verifiers, canonicalization
+├── lib/Target/Metal/              Metal Dialect → MSL text translation
+└── lib/Runtime/                   xcrun + Metal API runner (Runtime.mm)
+
+python/triton/backends/metal/      Installed Python entry point
+python/test/unit/test_metal_backend_*.py   GPU smoke tests
+test/Dialect/Metal/                lit-based compiler tests
+leet-triton/                       End-to-end LeetGPU-style kernels
+```
+
+---
+
+## Upstream Triton
+
+This fork is based on [triton-lang/triton](https://github.com/triton-lang/triton). For the language reference, tutorials, and CUDA/ROCm support, see the upstream project and its [official documentation](https://triton-lang.org). If you cite Triton in academic work, please cite the original MAPL2019 paper:
+
+> Tillet, P., Kung, H.T., Cox, D. *Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations.* MAPL 2019.
+
+---
+
+## License
+
+Same as upstream Triton — see [LICENSE](LICENSE).
