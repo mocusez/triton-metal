@@ -119,7 +119,18 @@ jobs:
           pytest -s --tb=short \
             python/test/unit/test_metal_backend_target_apple_family.py \
             python/test/unit/test_metal_backend_leaky_relu.py \
-            python/test/unit/test_metal_backend_2d_elementwise_add.py
+            python/test/unit/test_metal_backend_2d_elementwise_add.py \
+            python/test/unit/test_metal_backend_dot_f32_8x8.py
+
+      - name: Run Metal backend lit tests
+        if: success()
+        run: |
+          source ~/.venv/bin/activate
+          python3 -m pip show lit >/dev/null 2>&1 || python3 -m pip install lit
+          export BUILD_DIR=$(PYTHONPATH=./python python3 -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
+          cd "$BUILD_DIR"
+          ninja triton-metal-opt triton-metal-translate
+          lit -v test/Dialect/Metal/
 
       - name: Save ccache
         if: github.ref == 'refs/heads/metal-develop'

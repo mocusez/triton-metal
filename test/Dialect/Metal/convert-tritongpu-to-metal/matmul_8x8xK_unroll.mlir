@@ -61,12 +61,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // MSL end-to-end: same shape in the emitted text.
 // MSL: kernel void matmul_8x8xK_unroll
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_store_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_store(
 // MSL: return

@@ -80,14 +80,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // PASS: metal.simdgroup_multiply_accumulate
 // PASS: metal.simdgroup_store
 
-// MSL end-to-end: at least one simdgroup_load_matrix and simdgroup_store_matrix
+// MSL end-to-end (iter-6): at least one simdgroup_load and simdgroup_store
 // call must have a `ulong2(...)` argument that references `tgid` (the
 // MSL emission of tt.get_program_id materializes as `tgid.x` / `tgid.y`).
 // MSL: kernel void matmul_real_origin
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
 // MSL: tgid
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_store_matrix
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_store(
 // MSL-SAME: tgid

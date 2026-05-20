@@ -57,14 +57,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // PASS: metal.simdgroup_store
 
 // MSL end-to-end: the kernel-arg stride scalars `%stride_am`, `%stride_bn`
-// materialize as `vN[0]` dereferences. At least one simdgroup_load_matrix
+// materialize as `vN[0]` dereferences. At least one simdgroup_load(
 // call should use a dereference (i.e., contain `[0]`) as its stride arg
 // rather than literal `8`.
 // MSL: kernel void matmul_real_stride
-// MSL: simdgroup_load_matrix
+// MSL: simdgroup_load(
 // MSL-SAME: [0]
-// MSL: simdgroup_load_matrix
+// MSL: simdgroup_load(
 // MSL-SAME: [0]
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_store_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_store(

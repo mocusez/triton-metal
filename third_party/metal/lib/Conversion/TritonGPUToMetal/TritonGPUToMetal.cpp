@@ -24,6 +24,7 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -2899,6 +2900,14 @@ static mlir::Value findStrideSplatSource(mlir::Value v, int depth = 0) {
     return findStrideSplatSource(bc.getSrc(), depth + 1);
   if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
     return findStrideSplatSource(ed.getSrc(), depth + 1);
+  // L1d3 iter-5 (Architect Finding #1 defensive arm): Triton occasionally
+  // emits dead arith.extsi/arith.trunci chains for overflow-check guards.
+  // Recurse through them so the stride-splat search can still locate the
+  // kernel-arg scalar at the chain's root.
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtSIOp>())
+    return findStrideSplatSource(ext.getIn(), depth + 1);
+  if (auto trunc = v.getDefiningOp<mlir::arith::TruncIOp>())
+    return findStrideSplatSource(trunc.getIn(), depth + 1);
   return mlir::Value();
 }
 
@@ -3033,12 +3042,39 @@ static OriginPair extractOriginPair(TtMemOp memOp) {
   return p;
 }
 
-// Helper: walk addptr/splat back to the kernel-arg ptr.
+// Helper: walk addptr/splat/broadcast/expand_dims back to the kernel-arg ptr.
+// L1d3 iter-5 fix: Triton's emitted 2D matmul IR builds pointers as
+//   `addptr(broadcast(addptr(splat(kernelArg), row_off)), col_off)`
+// so the previous "walk only addptrs then peel one splat" loop bailed at
+// the broadcast and returned a tensor-typed inner-addptr/broadcast value
+// that was defined AFTER the scf.for (for the store case) — yielding a
+// dominance violation when `bridgePtrToMemref` inserted the
+// unrealized_conversion_cast before the for. Descend through broadcast/
+// expand_dims and continue walking addptr/splat to reach the kernel-arg
+// block argument. Symmetric with `findBaseMemref`'s walker at :1895.
 static mlir::Value unwrapPtrToKernelArg(mlir::Value v) {
-  while (auto addptr = v.getDefiningOp<mlir::triton::AddPtrOp>())
-    v = addptr.getPtr();
-  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
-    return splat.getSrc();
+  while (v) {
+    if (mlir::isa<mlir::BlockArgument>(v)) return v;
+    if (auto addptr = v.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      v = addptr.getPtr();
+      continue;
+    }
+    if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
+      auto src = splat.getSrc();
+      if (mlir::isa<mlir::BlockArgument>(src)) return src;
+      v = src;
+      continue;
+    }
+    if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      v = bc.getSrc();
+      continue;
+    }
+    if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      v = ed.getSrc();
+      continue;
+    }
+    break;
+  }
   return v;
 }
 
@@ -3073,16 +3109,49 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
   if (!forOp) return mlir::failure();
   if (forOp.getNumRegionIterArgs() != 3) return mlir::failure();
 
-  // Strict body shape: exactly 6 ops in order [load, load, dot, addptr, addptr, yield].
-  auto &bodyOps = forOp.getBody()->getOperations();
-  if (bodyOps.size() != 6) return mlir::failure();
-  auto it = bodyOps.begin();
-  auto loadA = mlir::dyn_cast<mlir::triton::LoadOp>(&*it++);
-  auto loadB = mlir::dyn_cast<mlir::triton::LoadOp>(&*it++);
-  auto dotInBody = mlir::dyn_cast<mlir::triton::DotOp>(&*it++);
-  auto addptrA = mlir::dyn_cast<mlir::triton::AddPtrOp>(&*it++);
-  auto addptrB = mlir::dyn_cast<mlir::triton::AddPtrOp>(&*it++);
-  auto yieldOp = mlir::dyn_cast<mlir::scf::YieldOp>(&*it++);
+  // L1d3 iter-5 (Architect Finding #3, Critic-approved, security-reviewer
+  // tightened): permissive op-type walker. Triton-emitted matmul bodies
+  // carry bounds-check arith noise (extsi/cmpi/andi/muli/splat/constant)
+  // around the essential 6 ops, so a strict `bodyOps.size() != 6` check
+  // rejects valid IR. Instead, allow ANY *pure* (memory-effect-free AND
+  // speculatable) op around the canonical [load, load, dot, addptr,
+  // addptr, yield] skeleton. Reject:
+  //   - side-effecting ops (`tt.atomic_*`),
+  //   - speculation-blocking ops that may trap (`arith.divsi`/`divui`/
+  //     `remsi`/`remui` on potential div-by-zero / INT_MIN/-1),
+  //   - and any nested control flow (`getNumRegions() > 0`).
+  // The `mlir::isPure` check covers both — its `isMemoryEffectFree` arm
+  // rejects atomics and its speculatability arm rejects trapping divs.
+  // The latter matters because the rewriter erases the for-body entirely
+  // when unrolling, so any side-effecting body op would be silently
+  // dropped. See `.omc/repros/canonical-3iterarg-dominance-rootcause.md`.
+  mlir::triton::LoadOp loadA, loadB;
+  mlir::triton::DotOp dotInBody;
+  mlir::triton::AddPtrOp addptrA, addptrB;
+  mlir::scf::YieldOp yieldOp;
+  for (auto &op : forOp.getBody()->getOperations()) {
+    if (op.getNumRegions() > 0) return mlir::failure();
+    if (auto l = mlir::dyn_cast<mlir::triton::LoadOp>(op)) {
+      if (!loadA) loadA = l;
+      else if (!loadB) loadB = l;
+      else return mlir::failure();
+    } else if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(op)) {
+      if (dotInBody) return mlir::failure();
+      dotInBody = d;
+    } else if (auto a = mlir::dyn_cast<mlir::triton::AddPtrOp>(op)) {
+      if (!addptrA) addptrA = a;
+      else if (!addptrB) addptrB = a;
+      else return mlir::failure();
+    } else if (auto y = mlir::dyn_cast<mlir::scf::YieldOp>(op)) {
+      yieldOp = y;
+    } else {
+      // `isPure` = `isMemoryEffectFree && isSpeculatable`; correctly
+      // rejects `arith.divsi`/`divui`/`remsi`/`remui` even though they
+      // are memory-effect-free, because their potential trap on div-by-0
+      // (or INT_MIN/-1) makes them non-speculatable.
+      if (!mlir::isPure(&op)) return mlir::failure();
+    }
+  }
   if (!loadA || !loadB || !dotInBody || dotInBody != dot || !addptrA ||
       !addptrB || !yieldOp) return mlir::failure();
   if (loadA.getMask() || loadB.getMask()) return mlir::failure();
@@ -3120,19 +3189,35 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
   int64_t N = (*hi - *lo) / *st;
   if (N < 1 || N > 8) return mlir::failure();
 
-  // Extract BK from addptrA's bump tensor: tt.splat(arith.constant BK).
+  // Extract BK from an addptr's bump tensor. L1d3 iter-5 (Architect Finding
+  // #2, PRIMARY rewriter fix): accept BOTH shapes Triton/lit fixtures emit:
+  //   1. `arith.constant dense<N> : tensor<...xi32>` (Triton's A-bump emit).
+  //   2. `tt.splat(arith.constant N : i32)` (hand-curated lit-fixture shape).
   auto extractBK = [](mlir::triton::AddPtrOp ap) -> std::optional<int64_t> {
-    auto splat = ap.getOffset().getDefiningOp<mlir::triton::SplatOp>();
-    if (!splat) return std::nullopt;
-    auto cst = splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>();
-    if (!cst) return std::nullopt;
-    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
-      return intAttr.getInt();
+    auto offset = ap.getOffset();
+    if (auto cst = offset.getDefiningOp<mlir::arith::ConstantOp>()) {
+      if (auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue())) {
+        if (dense.isSplat())
+          return dense.getSplatValue<mlir::APInt>().getSExtValue();
+      }
+    }
+    if (auto splat = offset.getDefiningOp<mlir::triton::SplatOp>()) {
+      if (auto cst = splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+          return intAttr.getInt();
+      }
+    }
     return std::nullopt;
   };
   auto bkOpt = extractBK(addptrA);
   if (!bkOpt) return mlir::failure();
   int64_t BK = *bkOpt;
+  // L1d3 iter-5 (Architect Synthesis #3, Critic-softened): advisory B-side
+  // BK check. Triton's typical B-bump emits `tt.splat(arith.muli(const,
+  // %stride_bk))` which extractBK cannot resolve as a pure constant — so
+  // fail ONLY when B IS extractable and mismatches A's BK.
+  if (auto bkBOpt = extractBK(addptrB); bkBOpt && *bkBOpt != BK)
+    return mlir::failure();
 
   // Element type + shape gate (same as v1).
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
@@ -3177,9 +3262,17 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
       ConstantOp::create(builder, loc, builder.getIntegerAttr(ui32, 0));
   mlir::Value strideAVal = emitStrideOperand(builder, loc, ui32, strideA);
   mlir::Value strideBVal = emitStrideOperand(builder, loc, ui32, strideB);
-  mlir::Value strideCVal =
-      ConstantOp::create(builder, loc, builder.getIntegerAttr(ui32, 8))
-          .getResult();
+  // iter-7 ships C stride extraction via findStrideSplatSource — mirrors
+  // the A/B pattern above. Walk store.getPtr()'s addptr offset chain;
+  // emitStrideOperand falls back to `metal.constant 8 : ui32` when
+  // extraction returns null (preserves prior behavior for fixtures whose
+  // IR shape doesn't expose a stride splat).
+  auto cStoreAddptr =
+      store.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+  mlir::Value strideC = cStoreAddptr ? findStrideSplatSource(
+                                           cStoreAddptr.getOffset())
+                                     : mlir::Value();
+  mlir::Value strideCVal = emitStrideOperand(builder, loc, ui32, strideC);
   mlir::Value aBaseRowVal = emitOriginOperand(builder, loc, ui32, aBaseRow);
   mlir::Value bBaseColVal = emitOriginOperand(builder, loc, ui32, bBaseCol);
   mlir::Value cRowOrigin = emitOriginOperand(builder, loc, ui32, cOrig.row);
@@ -3380,19 +3473,13 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (!store) return;
   if (store.getMask()) return;
 
-  // Walk a/b/c load ptr operands through tt.addptr (one level) to a kernel
-  // arg `!tt.ptr<f32>`. tt.addptr's `ptr` operand is itself the base ptr
-  // (typically a tt.splat of a kernel block-arg).
-  auto unwrapPtr = [](mlir::Value v) -> mlir::Value {
-    while (auto addptr = v.getDefiningOp<mlir::triton::AddPtrOp>())
-      v = addptr.getPtr();
-    if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
-      return splat.getSrc();
-    return v;
-  };
-  mlir::Value aPtr = unwrapPtr(aLoad.getPtr());
-  mlir::Value bPtr = unwrapPtr(bLoad.getPtr());
-  mlir::Value cPtr = unwrapPtr(store.getPtr());
+  // Walk a/b/c load ptr operands back to the kernel-arg `!tt.ptr<f32>`.
+  // Shares the helper used by the canonical-3-iter_arg path so 2D matmul
+  // pointer shapes (`addptr(broadcast(addptr(splat(arg), row), col))`)
+  // resolve to the kernel block-arg instead of bailing at the broadcast.
+  mlir::Value aPtr = unwrapPtrToKernelArg(aLoad.getPtr());
+  mlir::Value bPtr = unwrapPtrToKernelArg(bLoad.getPtr());
+  mlir::Value cPtr = unwrapPtrToKernelArg(store.getPtr());
 
   mlir::OpBuilder builder(dot);
   auto loc = dot.getLoc();
@@ -3445,6 +3532,80 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (bLoad.use_empty()) bLoad.erase();
 }
 
+// L1d3: dot-feeding ttg.convert_layout preempt. For every tt.dot whose A
+// and B operands are `ttg.convert_layout(#blocked -> #dot_op)` of a
+// `tt.load`, rewire the dot operand to the load directly and erase the cvt
+// when its only use is gone. This makes the dot body match the canonical
+// shape that `tryUnrollCanonical3IterArgDot` (:3066), `tryUnrollKLoopDot`
+// (:3225) and `rewriteSingleDot` (:3356) expect, letting the existing
+// dispatcher reach all 3 paths without modifying the cvt-legalisation
+// gate at :3552-3555.
+//
+// Safety: `DotOp::verify()` returns success when both operand encodings
+// are absent (Ops.cpp:271-272), and `verifyDotOpEncodingCompatibility`
+// returns success when neither operand carries a `DotOperandEncodingAttr`
+// (Dialect.cpp:3163-3164). The pre-walk strips BOTH A and B together
+// (`if (!newA || !newB) return;`), so after rewire both operands carry
+// `#blocked` and both safety nets fire.
+//
+// Note re. dot.getC() (accumulator): only A and B are rewired here. acc
+// is typically an scf.for iter_arg `BlockArgument` (not a defining op).
+// True Variant 3b (cvt on the acc-init OUTSIDE the loop, passed through
+// an iter_arg) requires rewriting the scf.for iter_arg type and is
+// deferred — see ADR follow-up #5 in
+// `.omc/plans/l1d3-matmul-convert-layout-preempt-consensus.md`.
+//
+// Spec/plan: `.omc/specs/deep-interview-l1d3-matmul-convert-layout-preempt.md`
+//            `.omc/specs/l1d3-broader-staged-transpose-dot-bridge.md`
+static void preprocessDotCvtChains(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> deadCvts;
+  moduleOp.walk([&](mlir::triton::DotOp dot) {
+    // Only strip cvts when the downstream matmul track matchers will
+    // accept the dot's element type and shape. These mirror the gates at
+    // TritonGPUToMetal.cpp:3141, :3272, :3367. Without this guard, an
+    // fp16 dot would have its cvts stripped, leaving a non-f32 dot the
+    // matchers reject — which then crashes the legalization pipeline.
+    auto dotResTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+    if (!dotResTy) return;
+    if (!dotResTy.getElementType().isF32()) return;
+    auto dotShape = dotResTy.getShape();
+    if (dotShape.size() != 2 || dotShape[0] != 8 || dotShape[1] != 8)
+      return;
+
+    auto peel = [&](mlir::Value v) -> mlir::Value {
+      auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+      if (!cvt) return mlir::Value();
+      if (!cvt->hasOneUse()) return mlir::Value();
+      auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+      if (!dstTy) return mlir::Value();
+      auto dstEnc = mlir::dyn_cast_or_null<
+          mlir::triton::gpu::DotOperandEncodingAttr>(dstTy.getEncoding());
+      if (!dstEnc) return mlir::Value();
+      auto load = cvt.getSrc().getDefiningOp<mlir::triton::LoadOp>();
+      if (!load) return mlir::Value();
+      return cvt.getSrc();
+    };
+
+    mlir::Value newA = peel(dot.getA());
+    mlir::Value newB = peel(dot.getB());
+    if (!newA || !newB) return;
+
+    auto cvtA = dot.getA().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+    auto cvtB = dot.getB().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+    dot.setOperand(0, newA);
+    dot.setOperand(1, newB);
+    if (cvtA && cvtA.use_empty()) deadCvts.push_back(cvtA);
+    if (cvtB && cvtB.use_empty()) deadCvts.push_back(cvtB);
+  });
+  // Defensive re-check at erasure time guards the unlikely aliased-cvt
+  // (self-dot) case where the same cvt feeds both A and B and would be
+  // pushed twice.
+  for (auto cvt : deadCvts) {
+    if (cvt.use_empty()) cvt.erase();
+  }
+}
+
 static void preprocessDotChains(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::DotOp> dots;
   moduleOp.walk([&](mlir::triton::DotOp dot) { dots.push_back(dot); });
@@ -3486,6 +3647,15 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+
+    // L1d3: rewire dot-feeding ttg.convert_layout(blocked -> dot_op) ops
+    // off their tt.dot operands so they don't survive into the cvt
+    // classifier below (which would emit the L1d3 hard error). The
+    // existing matmul track matchers (preprocessDotChains, rewriteSingleDot,
+    // tryUnrollCanonical3IterArgDot, tryUnrollKLoopDot) then see the
+    // canonical body shape. See
+    // `.omc/specs/deep-interview-l1d3-matmul-convert-layout-preempt.md`.
+    preprocessDotCvtChains(moduleOp);
 
     // Classify non-identity ttg.convert_layout ops:
     //   - in-envelope (rank-2 blocked↔blocked, same shape, same elem-type,

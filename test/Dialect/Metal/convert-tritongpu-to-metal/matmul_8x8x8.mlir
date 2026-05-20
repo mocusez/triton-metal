@@ -45,10 +45,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.simdgroup_store
 // CHECK: metal.return
 
-// MSL end-to-end emission: the canonical Apple SIMD-group function-call
-// substrings appear in the rendered kernel.
+// MSL end-to-end emission: the modern Apple SIMD-group function-call
+// substrings appear in the rendered kernel (iter-6 emitter modernization:
+// `simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`
+// replace the legacy `_matrix`-suffixed names which Metal 17.5 no longer
+// declares).
 // MSL: kernel void matmul_8x8x8
-// MSL-COUNT-3: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_store_matrix
+// MSL-COUNT-3: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_store(
 // MSL: return

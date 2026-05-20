@@ -334,11 +334,17 @@ void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
 }
 
 //===----------------------------------------------------------------------===//
-// SIMD-group matrix ops (matmul track session 2). Stubs emit the canonical
-// MSL function calls (simdgroup_load_matrix / simdgroup_matrix_multiply_
-// accumulate / simdgroup_store_matrix) so a future tt.dot lowering's MSL is
-// compilable. No conversion pattern uses these ops yet. See
-// `.omc/specs/deep-interview-metal-matmul-session2-simdgroup-scaffold.md`.
+// SIMD-group matrix ops (matmul track). Emit the modern Metal 17.5 SIMD-group
+// matrix surface: `simdgroup_load` / `simdgroup_multiply_accumulate` /
+// `simdgroup_store`. The legacy names `simdgroup_load_matrix`,
+// `simdgroup_store_matrix`, and `simdgroup_matrix_multiply_accumulate` are
+// ALL rejected by the current MSL compiler — do not emit them.
+//
+// Emitter is origin-aware: when both `originRow` and `originCol` are literal
+// `0` constants (the staging path in `rewriteSingleDot` etc. arranges this),
+// emit the 3-arg form `simdgroup_load(dst, ptr, stride)` matching the
+// already-shipping flash-attention precedent at line 1212+. Otherwise emit
+// the 5-arg fallback `simdgroup_load(dst, ptr, stride, ulong2(col,row), false)`.
 //===----------------------------------------------------------------------===//
 
 static void emitSimdgroupMatrixType(
@@ -347,19 +353,43 @@ static void emitSimdgroupMatrixType(
      << ty.getCols();
 }
 
+// Returns true iff `v` is defined by an arith.constant or metal.constant
+// with integer value 0.
+static bool isLiteralZero(mlir::Value v) {
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+      return intAttr.getValue().isZero();
+  }
+  if (auto cst = v.getDefiningOp<mlir::triton::metal::ConstantOp>()) {
+    if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+      return intAttr.getValue().isZero();
+  }
+  return false;
+}
+
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupLoadOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
+  // Declare-then-call form so the destination has a stable C++ name for the
+  // out-parameter call.
   emitSimdgroupMatrixType(_output, resTy);
-  _output << " v" << _varCount << " = simdgroup_load_matrix(";
+  unsigned id = _varCount;
+  _output << " v" << id;
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "simdgroup_load(v" << id << ", ";
   translateVarName(op.getMemref());
   _output << ", ";
   translateValue(op.getStride().getDefiningOp());
-  _output << ", ulong2(";
-  translateValue(op.getOriginCol().getDefiningOp());
-  _output << ", ";
-  translateValue(op.getOriginRow().getDefiningOp());
-  _output << "))";
+  if (!(isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol()))) {
+    _output << ", ulong2(";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << ", ";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << "), false";
+  }
+  _output << ")";
   _alloca[op] = _varCount++;
   printDelim();
 }
@@ -368,30 +398,40 @@ void ModuleTranslation::translate(
     mlir::triton::metal::SimdgroupMultiplyAccumulateOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
+  // Declare-then-call form. The C operand aliases the destination
+  // semantically (modern API is dest-first 4-arg).
   emitSimdgroupMatrixType(_output, resTy);
-  _output << " v" << _varCount << " = simdgroup_matrix_multiply_accumulate(";
-  translateVarName(op.getC());
-  _output << ", ";
+  unsigned id = _varCount;
+  _output << " v" << id;
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "simdgroup_multiply_accumulate(v" << id << ", ";
   translateVarName(op.getA());
   _output << ", ";
   translateVarName(op.getB());
+  _output << ", ";
+  translateVarName(op.getC());
   _output << ")";
   _alloca[op] = _varCount++;
   printDelim();
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
-  _output << "simdgroup_store_matrix(";
+  _output << "simdgroup_store(";
   translateVarName(op.getMatrix());
   _output << ", ";
   translateVarName(op.getMemref());
   _output << ", ";
   translateValue(op.getStride().getDefiningOp());
-  _output << ", ulong2(";
-  translateValue(op.getOriginCol().getDefiningOp());
-  _output << ", ";
-  translateValue(op.getOriginRow().getDefiningOp());
-  _output << "))";
+  if (!(isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol()))) {
+    _output << ", ulong2(";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << ", ";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << "), false";
+  }
+  _output << ")";
   printDelim();
 }
 

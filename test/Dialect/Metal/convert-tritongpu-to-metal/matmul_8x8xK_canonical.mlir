@@ -96,13 +96,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // MSL end-to-end: iter 0 uses K-axis origin 0, iter 1 uses K-axis origin 8.
 // MSL: kernel void matmul_canonical
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_load_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_load(
 // MSL-SAME: 0
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_load_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_load(
 // MSL-SAME: 8
-// MSL: simdgroup_load_matrix
-// MSL: simdgroup_matrix_multiply_accumulate
-// MSL: simdgroup_store_matrix
+// MSL: simdgroup_load(
+// MSL: simdgroup_multiply_accumulate(
+// MSL: simdgroup_store(

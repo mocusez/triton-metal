@@ -9,10 +9,8 @@
 #define METAL_MODULETRANSLATION_H
 
 #include "Dialect/Metal/IR/MetalOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "llvm/Support/raw_ostream.h"
 #include <llvm/Support/FileSystem.h>
 #include <map>
 
@@ -114,11 +112,10 @@ private:
   void translate(mlir::triton::metal::BinaryExpOp op);
   void translate(mlir::triton::metal::YieldWhileOp op);
 
-  // SIMD-group matrix scaffolding (matmul track session 2). The stubs emit
-  // real MSL function-call syntax (simdgroup_load_matrix /
-  // simdgroup_matrix_multiply_accumulate / simdgroup_store_matrix) so a
-  // future tt.dot lowering's MSL is compilable; no conversion pattern uses
-  // these ops yet.
+  // SIMD-group matrix translators. Emit the modern Metal 17.5 surface
+  // (`simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`).
+  // The legacy `_matrix`-suffixed names are rejected by the current MSL
+  // compiler — see comment block in ModuleTranslation.cpp.
   void translate(mlir::triton::metal::SimdgroupLoadOp op);
   void translate(mlir::triton::metal::SimdgroupMultiplyAccumulateOp op);
   void translate(mlir::triton::metal::SimdgroupStoreOp op);

@@ -1,11 +1,15 @@
 // RUN: triton-metal-translate --mlir-to-msl %s 2>&1 | FileCheck %s
 //
-// Scaffolding for Matmul Track Session 2: assert that the three new
-// `metal.simdgroup_*` ops emit the canonical MSL function calls
-// (`simdgroup_load_matrix`, `simdgroup_matrix_multiply_accumulate`,
-// `simdgroup_store_matrix`). No conversion pattern uses these ops yet;
-// the lit fixture round-trips a hand-written `metal.kernel` body.
-// See `.omc/specs/deep-interview-metal-matmul-session2-simdgroup-scaffold.md`.
+// iter-6 FA-derived: the three `metal.simdgroup_*` ops emit the MODERN
+// Metal 17.5 MSL function calls (`simdgroup_load`,
+// `simdgroup_multiply_accumulate`, `simdgroup_store`). The legacy
+// `_matrix`-suffixed names (`simdgroup_load_matrix`,
+// `simdgroup_matrix_multiply_accumulate`, `simdgroup_store_matrix`) are
+// no longer accepted by the current MSL compiler. When both origin
+// operands are literal `0` constants — as in this hand-written kernel —
+// the emitter outputs the FA-precedent 3-arg form
+// `simdgroup_load(dst, ptr, stride);` (declare-then-call). Non-zero
+// origins fall back to 5-arg `(dst, ptr, stride, ulong2(col,row), false)`.
 
 module {
   metal.module {
@@ -25,9 +29,13 @@ module {
 }
 
 // CHECK: kernel void simdgroup_smoke
-// CHECK: simdgroup_float8x8 {{.*}} = simdgroup_load_matrix
-// CHECK: simdgroup_float8x8 {{.*}} = simdgroup_load_matrix
-// CHECK: simdgroup_float8x8 {{.*}} = simdgroup_load_matrix
-// CHECK: simdgroup_float8x8 {{.*}} = simdgroup_matrix_multiply_accumulate
-// CHECK: simdgroup_store_matrix
+// CHECK: simdgroup_float8x8 v{{[0-9]+}};
+// CHECK: simdgroup_load(v{{[0-9]+}},
+// CHECK: simdgroup_float8x8 v{{[0-9]+}};
+// CHECK: simdgroup_load(v{{[0-9]+}},
+// CHECK: simdgroup_float8x8 v{{[0-9]+}};
+// CHECK: simdgroup_load(v{{[0-9]+}},
+// CHECK: simdgroup_float8x8 v{{[0-9]+}};
+// CHECK: simdgroup_multiply_accumulate(v{{[0-9]+}},
+// CHECK: simdgroup_store(
 // CHECK: return
