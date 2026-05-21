@@ -100,6 +100,15 @@ struct TileInfo {
   llvm::SmallVector<int64_t, 2> shape; // logical tile dim sizes
 };
 
+// Per-op callers (LoadOp / StoreOp lowerings at :2036, :2394, :2494, :2571) pass
+// tensor<...x!tt.ptr<...>> and need a valid TileInfo. The kernel-level walker
+// findTileInfo (:155) and the duplicate "largest blocked tensor" walker inside
+// the rank-2 pattern dispatcher (:507) each do their own ptr-element skip on
+// the bestSize tiebreaker (see AC1-bis insertions). Dead pointer-arithmetic
+// chains from multi-tile matmul rewrites are removed by the fixed-point DCE
+// pass ("AC4 v6: dead-code eliminate" block at ~:4404) before any caller of
+// findTileInfo (:278 in FuncOpLowering, :2755 in preprocessMaskedStoreSentinels)
+// runs.
 static std::optional<TileInfo> tileFromTensor(mlir::Type t) {
   auto rt = mlir::dyn_cast<mlir::RankedTensorType>(t);
   if (!rt)
@@ -109,18 +118,6 @@ static std::optional<TileInfo> tileFromTensor(mlir::Type t) {
   if (!blocked)
     return std::nullopt;
   if (rt.getRank() < 1)
-    return std::nullopt;
-  // AC4 v6: skip tensors whose elements are pointers (`tensor<…x!tt.ptr<…>>`).
-  // After the matmul matcher rewrites a multi-tile dot, the original C-side
-  // pointer-arithmetic tensor (e.g. `tensor<64x64x!tt.ptr<f32>>`) is dead but
-  // remains in the IR until dialect conversion. findTileInfo would otherwise
-  // pick it as the kernel's largest blocked tensor and wrap the entire
-  // simdgroup-matrix body in a `scf.for(0..elemsPerThread)` loop, executing
-  // each warp's emission redundantly (and triggering MSL compiler XPC
-  // crashes on the bloated source). Pointer-element tensors carry no
-  // per-element computation in the post-matcher body, so they should not
-  // drive the elements-per-thread tile loop.
-  if (mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
     return std::nullopt;
   // Rank-generic: take products across all axes. For 1D this collapses
   // to the original single-axis math. For 2D/3D this gives the flat
@@ -160,6 +157,13 @@ findTileInfo(mlir::triton::FuncOp funcOp) {
     for (auto v : op->getResults()) {
       auto info = tileFromTensor(v.getType());
       if (!info) continue;
+      // AC4-v6 intent: don't let stale tensor<...x!tt.ptr<...>> win the
+      // bestSize tiebreaker. Per-op callers of tileFromTensor need ptr-element
+      // acceptance; this defense lives at the heuristic site, independent of
+      // pass order (see DCE block at ~:4404).
+      if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+          rt && mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+        continue;
       int64_t sz = 1;
       for (auto s : info->shape) sz *= s;
       if (sz > bestSize) {
@@ -506,6 +510,11 @@ struct MakeRangeLowering
               for (auto v : inner->getResults()) {
                 auto info = tileFromTensor(v.getType());
                 if (!info) continue;
+                // AC4-v6 intent (mirrored from findTileInfo): skip
+                // tensor<...x!tt.ptr<...>> in the bestSize tiebreaker.
+                if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+                    rt && mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+                  continue;
                 int64_t sz = 1;
                 for (auto s : info->shape) sz *= s;
                 if (sz > bestSize) {
@@ -4421,6 +4430,18 @@ struct ConvertTritonGPUToMetalPass
           if (op->getNumResults() == 0) return;
           if (!op->use_empty()) return;
           if (!mlir::isOpTriviallyDead(op)) return;
+          // Skip region-bearing ops (e.g. `tt.reduce`, `tt.scan`, `scf.for`).
+          // Their bodies are inspected by `isOpTriviallyDead` for side-effect-
+          // freeness, but the conversion patterns (`ReduceLowering` etc.) run
+          // AFTER this DCE block — reaping the unused tt.reduce here means
+          // the conversion pattern never sees it. AC4-v6's actual target is
+          // the no-region chain (`arith.constant dense<>`, `tt.splat`,
+          // `tt.broadcast`, `tt.addptr`, `tt.expand_dims`) — none of which
+          // carry regions — so this skip is safe for the original concern.
+          // See `.omc/specs/deep-interview-metal-deferred-followups.md` AC5–AC7
+          // and the L3a reduce fixtures in
+          // `test/Dialect/Metal/convert-tritongpu-to-metal/reduce_*.mlir`.
+          if (op->getNumRegions() > 0) return;
           deadOps.push_back(op);
         });
         for (auto *op : deadOps) {

@@ -21,6 +21,12 @@ pytest = "*"
 # (`add_kernel[grid](x, y, out, ...)` with real tensors). See
 # `.omc/specs/deep-interview-metal-standard-launch.md`.
 pytorch = "*"
+# matplotlib + pandas are needed for `triton.testing.perf_report`'s
+# `Mark._run` (`plt.savefig` + DataFrame). Without them, the
+# `test_perf_report_smoke` test in `test_metal_perf_report.py` fails on
+# import.
+matplotlib = "*"
+pandas = "*"
 
 [tasks]
 # Build Triton (editable) against the pixi-managed Python; uses Triton's own

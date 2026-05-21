@@ -28,6 +28,11 @@ module {
   }
 }
 
+// The emitter declares one `simdgroup_float8x8` SSA register per load
+// destination (a, b, c). The multiply-accumulate REUSES the c-load
+// register as both accumulator-in and result, so there is no 4th
+// declaration. The 5-arg `simdgroup_store(dst_reg, ptr, stride)` 3-arg
+// form fires when origins are literal 0 (this fixture's case).
 // CHECK: kernel void simdgroup_smoke
 // CHECK: simdgroup_float8x8 v{{[0-9]+}};
 // CHECK: simdgroup_load(v{{[0-9]+}},
@@ -35,7 +40,6 @@ module {
 // CHECK: simdgroup_load(v{{[0-9]+}},
 // CHECK: simdgroup_float8x8 v{{[0-9]+}};
 // CHECK: simdgroup_load(v{{[0-9]+}},
-// CHECK: simdgroup_float8x8 v{{[0-9]+}};
 // CHECK: simdgroup_multiply_accumulate(v{{[0-9]+}},
 // CHECK: simdgroup_store(
 // CHECK: return

@@ -120,7 +120,8 @@ jobs:
             python/test/unit/test_metal_backend_target_apple_family.py \
             python/test/unit/test_metal_backend_leaky_relu.py \
             python/test/unit/test_metal_backend_2d_elementwise_add.py \
-            python/test/unit/test_metal_backend_dot_f32_8x8.py
+            python/test/unit/test_metal_backend_dot_f32_8x8.py \
+            python/test/unit/test_metal_backend_vector_add_matrix.py
 
       - name: Run Metal backend lit tests
         if: success()

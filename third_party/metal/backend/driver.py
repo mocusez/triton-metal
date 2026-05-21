@@ -10,9 +10,60 @@ Apple Metal. Per-launch arg marshalling bridges torch CPU tensors to
 import functools
 import platform
 import struct
+import time
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
+
+
+# CPU-walltime floor for _PerfCounterEvent.elapsed_time. triton.testing.do_bench
+# computes `estimate_ms = elapsed_time(...)/5` then `int(warmup/estimate_ms)`;
+# division happens before the max(1, ...) guard, so a 0.0 ms result would
+# ZeroDivisionError. The clamp is a defensive floor — real Metal launches
+# (with libmetal H2D/D2H staging) take hundreds of microseconds, well above
+# this floor.
+_ELAPSED_TIME_FLOOR_MS = 1e-6
+
+
+class _PerfCounterEvent:
+    """CPU-walltime Event mimicking torch.cuda.Event(enable_timing=True).
+
+    MetalLauncher.__call__ is synchronous today: it blocks on
+    launch_kernel_with_pipeline + copy_d2h before returning. Host wall-clock
+    around fn() therefore captures launch-to-completion latency for the
+    single-kernel-per-fn shape used by triton.testing.do_bench. The number
+    *includes* per-launch H2D/D2H staging cost on Metal; see the plan's ADR
+    Consequences for why that is the right thing to report today.
+
+    If MetalLauncher ever becomes asynchronous, replace this class (and only
+    this class) with a Metal GPU-timestamp variant. _DeviceInterface.synchronize
+    is the other chokepoint that must change in lockstep.
+    """
+
+    __slots__ = ("_enable_timing", "_t_ns")
+
+    def __init__(self, enable_timing: bool = False):
+        self._enable_timing = enable_timing
+        self._t_ns = None
+
+    def record(self):
+        # Cheap (one perf_counter_ns syscall); enable_timing is gated at
+        # elapsed_time so callers can record() unconditionally if they want.
+        self._t_ns = time.perf_counter_ns()
+
+    def synchronize(self):
+        # No-op while MetalLauncher.__call__ is synchronous. If the launcher
+        # ever becomes async, this must become a real wait (mirroring
+        # _DeviceInterface.synchronize below).
+        pass
+
+    def elapsed_time(self, other) -> float:
+        if not self._enable_timing or not other._enable_timing:
+            raise RuntimeError(
+                "Event.elapsed_time requires enable_timing=True on both events.")
+        if self._t_ns is None or other._t_ns is None:
+            raise RuntimeError("Event.record() must be called before elapsed_time().")
+        return max((other._t_ns - self._t_ns) / 1e6, _ELAPSED_TIME_FLOOR_MS)
 
 
 # libmetal exposes the Darwin runtime callables (load_metallib,
@@ -313,8 +364,33 @@ class MetalDriver(DriverBase):
         return torch.device("cpu")
 
     def get_benchmarker(self):
-        raise NotImplementedError(
-            "MetalDriver does not yet provide a benchmarker (deferred).")
+        # Delegate to triton.testing.do_bench so all backends share the same
+        # warmup/quantile/cache-clear loop. Lazy import to avoid a circular
+        # import during driver construction (triton.testing imports torch
+        # and re-enters the driver module on its first call).
+        import triton.testing
+
+        def _benchmarker(kernel_call, *, quantiles, **kwargs):
+            return triton.testing.do_bench(
+                kernel_call,
+                quantiles=quantiles,
+                **kwargs,
+            )
+
+        return _benchmarker
+
+    def get_empty_cache_for_benchmark(self):
+        # Apple Silicon uses unified memory with no programmer-visible L2
+        # evict primitive analogous to the CUDA pattern. do_bench expects an
+        # opaque token here; returning None pairs with the no-op clear_cache
+        # below. Faking a flush by zero-filling a large MTLBuffer would only
+        # thrash DRAM under UMA and bias the benchmark — see plan ADR.
+        return None
+
+    def clear_cache(self, cache):
+        # See get_empty_cache_for_benchmark — no-op under UMA. Intentionally
+        # ignores `cache` (always None).
+        return None
 
     # ---------------------------------------------------------------------
     # Hooks called by JIT runtime / compile path. The launch path goes
@@ -335,12 +411,21 @@ class MetalDriver(DriverBase):
 
     def get_device_interface(self):
         class _DeviceInterface:
+            # Exposed via `di.Event(enable_timing=True)` by triton.testing.do_bench.
+            # See module-level _PerfCounterEvent for semantics.
+            Event = _PerfCounterEvent
+
             @staticmethod
             def empty_cache():
                 pass
 
             @staticmethod
             def synchronize():
+                # No-op while MetalLauncher.__call__ is synchronous (it blocks
+                # on launch_kernel_with_pipeline + copy_d2h before returning).
+                # If the launcher ever becomes async, this must become a real
+                # wait. _PerfCounterEvent.synchronize is the other chokepoint
+                # that must change in lockstep.
                 pass
 
             @staticmethod
