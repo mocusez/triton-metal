@@ -10,34 +10,60 @@ Apple Metal. Per-launch arg marshalling bridges torch CPU tensors to
 import functools
 import platform
 import struct
-import time
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
 
-# CPU-walltime floor for _PerfCounterEvent.elapsed_time. triton.testing.do_bench
-# computes `estimate_ms = elapsed_time(...)/5` then `int(warmup/estimate_ms)`;
-# division happens before the max(1, ...) guard, so a 0.0 ms result would
-# ZeroDivisionError. The clamp is a defensive floor — real Metal launches
-# (with libmetal H2D/D2H staging) take hundreds of microseconds, well above
-# this floor.
-_ELAPSED_TIME_FLOOR_MS = 1e-6
+# Floor for _PerfCounterEvent.elapsed_time. triton.testing.do_bench computes
+# `estimate_ms = elapsed_time(...) / 5` then `n_warmup = max(1, int(warmup /
+# estimate_ms))` (testing.py:278-282). Two failure modes drive this floor:
+#
+# 1. Kernel-only GPU times on Metal are routinely sub-microsecond for small
+#    sweep sizes (e.g., 2^12 fp32 add ≈ 500ns). An unbounded floor lets
+#    n_warmup explode.
+# 2. CPU-only callables (e.g., the tutorial's `'torch'` provider passes
+#    `lambda: x + y` which runs PyTorch CPU add and never touches the Metal
+#    queue) leave the accumulator unchanged, so `elapsed_time` returns 0.
+#    do_bench's estimate_ms then collapses to the floor regardless of how
+#    long the real call took.
+#
+# Each Metal launch carries ~100µs of CPU-side staging (alloc + memcpy + d2h
+# + free in MetalLauncher.__call__) and each torch CPU add is ~50-70µs of
+# OpenMP work, so an over-low floor pushes the warmup loop into the
+# multi-minute range.
+#
+# Floor of 0.1 ms (= 100µs) caps `n_warmup` at ~1250 and `n_repeat` at ~5000.
+# That keeps `do_bench` runtime per size×provider under ~625ms on this
+# synchronous-launcher path. The cost: kernels measuring under 100µs are
+# reported as 100µs (artificial upper bound on small-size GB/s in the
+# tutorial sweep). Sweep sizes ≥ ~2^21 are unaffected. Once Component 2
+# (GPU-resident tensors / persistent dispatch) lands, the floor can drop
+# because per-call launch overhead drops.
+_ELAPSED_TIME_FLOOR_MS = 0.1
 
 
 class _PerfCounterEvent:
-    """CPU-walltime Event mimicking torch.cuda.Event(enable_timing=True).
+    """GPU-time Event for triton.testing.do_bench on Metal.
 
-    MetalLauncher.__call__ is synchronous today: it blocks on
-    launch_kernel_with_pipeline + copy_d2h before returning. Host wall-clock
-    around fn() therefore captures launch-to-completion latency for the
-    single-kernel-per-fn shape used by triton.testing.do_bench. The number
-    *includes* per-launch H2D/D2H staging cost on Metal; see the plan's ADR
-    Consequences for why that is the right thing to report today.
+    Reads from Runtime.mm's thread-local g_gpu_time_ns_accum, a monotonic
+    counter updated by launch_kernel_with_pipeline after each successful
+    waitUntilCompleted using MTLCommandBuffer.GPUStartTime/GPUEndTime.
+    Excludes per-launch H2D/D2H CPU memcpy (memcpy on UMA shared storage
+    never touches the GPU command queue), so elapsed_time reports
+    kernel-only GPU ms — the same window torch.cuda.Event(enable_timing=True)
+    captures on CUDA.
 
-    If MetalLauncher ever becomes asynchronous, replace this class (and only
-    this class) with a Metal GPU-timestamp variant. _DeviceInterface.synchronize
-    is the other chokepoint that must change in lockstep.
+    The underlying counter never resets; elapsed_time subtracts two
+    independent monotonic reads. This makes the event composable under
+    nesting (e.g., autotuner running do_bench inside a user do_bench).
+    Matches cudaEventElapsedTime semantics.
+
+    If MetalLauncher ever becomes asynchronous, the accumulator-update
+    site in Runtime.mm's launchKernelWithPipeline must move into a
+    MTLCommandBuffer.addCompletedHandler completion block, and
+    _DeviceInterface.synchronize must become a real wait. Both sites
+    carry the invariant comment.
     """
 
     __slots__ = ("_enable_timing", "_t_ns")
@@ -47,14 +73,19 @@ class _PerfCounterEvent:
         self._t_ns = None
 
     def record(self):
-        # Cheap (one perf_counter_ns syscall); enable_timing is gated at
-        # elapsed_time so callers can record() unconditionally if they want.
-        self._t_ns = time.perf_counter_ns()
+        # Snapshot the launcher's thread-local monotonic GPU-time counter.
+        # b._t_ns - a._t_ns is the sum of GPU kernel ns launched between
+        # a.record() and b.record() — naturally correct for nested benchmark
+        # contexts. enable_timing is gated at elapsed_time so callers can
+        # record() unconditionally.
+        self._t_ns = _libmetal.read_gpu_time_ns_total()
 
     def synchronize(self):
-        # No-op while MetalLauncher.__call__ is synchronous. If the launcher
-        # ever becomes async, this must become a real wait (mirroring
-        # _DeviceInterface.synchronize below).
+        # No-op while MetalLauncher.__call__ is synchronous (the launcher
+        # blocks on waitUntilCompleted, so the accumulator is already
+        # current by the time we'd be asked to synchronize). If the launcher
+        # ever becomes async, this must become a real wait — mirroring
+        # _DeviceInterface.synchronize below.
         pass
 
     def elapsed_time(self, other) -> float:
@@ -352,7 +383,7 @@ class MetalDriver(DriverBase):
             "bf16": "__bf16",
             "fp32": "float",
             "fp64": "double",
-        }.get(ty, f"void*")
+        }.get(ty, "void*")
 
     def get_current_target(self):
         return GPUTarget(backend="metal", arch=_get_apple_gpu_family(), warp_size=32)
@@ -422,10 +453,14 @@ class MetalDriver(DriverBase):
             @staticmethod
             def synchronize():
                 # No-op while MetalLauncher.__call__ is synchronous (it blocks
-                # on launch_kernel_with_pipeline + copy_d2h before returning).
-                # If the launcher ever becomes async, this must become a real
-                # wait. _PerfCounterEvent.synchronize is the other chokepoint
-                # that must change in lockstep.
+                # on launch_kernel_with_pipeline + copy_d2h before returning,
+                # and the GPU-time monotonic counter is updated post-
+                # waitUntilCompleted on the same thread). If the launcher
+                # ever becomes async, this must become a real wait, and the
+                # accumulator-update site in Runtime.mm must move into a
+                # MTLCommandBuffer.addCompletedHandler completion block.
+                # _PerfCounterEvent.synchronize is the other chokepoint that
+                # must change in lockstep.
                 pass
 
             @staticmethod

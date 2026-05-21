@@ -50,6 +50,13 @@ struct MetalRuntime {
   }
 };
 
+// Monotonic thread-local GPU-time accumulator (nanoseconds). Updated inside
+// launchKernelWithPipeline after each successful waitUntilCompleted; read
+// (without reset) via readGpuTimeNsTotal. Consumed by Python-side
+// _PerfCounterEvent.record() so that triton.testing.do_bench reports
+// kernel-only GPU time, matching cuda.Event(enable_timing=True) semantics.
+thread_local int64_t g_gpu_time_ns_accum = 0;
+
 // Run `xcrun -sdk macosx metal <input.metal> -o <output.metallib>`
 // synchronously and capture the resulting metallib bytes.
 py::bytes compileMslToMetallib(const std::string &mslText) {
@@ -269,13 +276,41 @@ void launchKernelWithPipeline(uintptr_t psoHandle,
     [enc endEncoding];
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
-    if ([cmdBuf error] != nil) {
+    NSError *cbErr = [cmdBuf error];
+    if (cbErr == nil) {
+      // GPUStartTime/GPUEndTime are CFTimeInterval (double, seconds since
+      // boot), valid only after waitUntilCompleted on a non-errored CB.
+      // Convert to ns and add to the thread-local monotonic counter read
+      // by _PerfCounterEvent. Counter never resets; consumers subtract
+      // two reads — matches cudaEventElapsedTime semantics.
+      //
+      // INVARIANTS:
+      // (a) Synchronous launcher: GPU times are read AFTER waitUntilCompleted
+      //     on the calling thread. If/when an async launcher lands, move this
+      //     update into a addCompletedHandler completion block on the same
+      //     MTLCommandBuffer (which runs on Metal's internal serial dispatch
+      //     queue).
+      // (b) Single thread per record: g_gpu_time_ns_accum is thread_local
+      //     because do_bench calls _PerfCounterEvent.record() and
+      //     launchKernelWithPipeline on the same Python thread. If a future
+      //     harness records on thread A and launches on thread B, the
+      //     recording thread reads 0 — migrate to std::atomic<int64_t> keyed
+      //     by issuing-thread id (or a completion-block accumulator) before
+      //     introducing cross-thread launches.
+      CFTimeInterval start = [cmdBuf GPUStartTime];
+      CFTimeInterval end   = [cmdBuf GPUEndTime];
+      g_gpu_time_ns_accum += static_cast<int64_t>((end - start) * 1e9);
+    } else {
       throw std::runtime_error(
           std::string("Metal runtime: command buffer error: ") +
-          [[[cmdBuf error] localizedDescription] UTF8String]);
+          [[cbErr localizedDescription] UTF8String]);
     }
   }
 }
+
+// Read the thread-local monotonic GPU-time counter (ns). Counter never
+// resets; consumers subtract two reads for an interval.
+int64_t readGpuTimeNsTotal() { return g_gpu_time_ns_accum; }
 
 void launchKernel(const py::bytes &metallib, const std::string &kernelName,
                    const std::vector<uintptr_t> &bufferHandles,
@@ -393,6 +428,11 @@ void registerMetalRuntime(py::module &m) {
   m.def("free_pipeline", &freePipeline);
   m.def("launch_kernel_with_pipeline", &launchKernelWithPipeline);
   m.def("get_apple_gpu_family", &getAppleGpuFamily);
+  m.def("read_gpu_time_ns_total", &readGpuTimeNsTotal,
+        "Read the thread-local monotonic GPU-time counter (ns), updated by "
+        "launchKernelWithPipeline after each successful waitUntilCompleted "
+        "from MTLCommandBuffer.GPUStartTime/GPUEndTime. Counter never resets; "
+        "consumers subtract two reads for an interval.");
 }
 
 } // namespace metal
