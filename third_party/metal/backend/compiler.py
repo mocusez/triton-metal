@@ -102,7 +102,7 @@ class MetalBackend(BaseBackend):
     the terminal stage.
     """
 
-    binary_ext = "metallib" if hasattr(libmetal, "compile_msl_to_metallib") else "msl"
+    binary_ext = "metallib" if hasattr(libmetal, "compile_msl_to_metallib") else "metal"
 
     @staticmethod
     def supports_target(target: GPUTarget) -> bool:
@@ -209,7 +209,7 @@ class MetalBackend(BaseBackend):
     def add_stages(self, stages, options, language=None):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
-        stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
+        stages["metal"] = lambda src, metadata: self.make_msl(src, metadata, options)
         # The metallib stage requires the Darwin-only runtime layer in
         # libtriton (xcrun + Metal framework). On non-Darwin builds the
         # symbol is absent and the compile pipeline stops at MSL.

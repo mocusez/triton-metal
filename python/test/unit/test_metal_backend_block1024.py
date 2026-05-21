@@ -62,7 +62,7 @@ def test_block_size_larger_than_threads_compiles_to_msl():
     target = GPUTarget(backend="metal", arch=80, warp_size=32)
     compiled = triton.compile(src, target=target, options={"num_warps": 4})
 
-    raw = compiled.asm["msl"]
+    raw = compiled.asm["metal"]
     msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
     assert msl, "MSL output is empty"
 

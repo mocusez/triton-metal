@@ -66,7 +66,7 @@ def test_metal_gpu_launch_vector_add():
     target = GPUTarget(backend="metal", arch=80, warp_size=32)
     compiled = triton.compile(src, target=target, options={"num_warps": 4})
 
-    raw = compiled.asm["msl"]
+    raw = compiled.asm["metal"]
     msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
     assert msl, "MSL stage produced empty string"
 

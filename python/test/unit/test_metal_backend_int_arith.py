@@ -183,11 +183,11 @@ def test_int_arith_compiles_end_to_end(op_name, kernel, signature):
     src = ASTSource(fn=kernel, signature=signature, constexprs=constexprs)
     target = GPUTarget(backend="metal", arch=80, warp_size=32)
     compiled = triton.compile(src, target=target, options={"num_warps": 4})
-    assert "msl" in compiled.asm, (
-        f"arith.{op_name}: expected 'msl' stage artifact; got: "
+    assert "metal" in compiled.asm, (
+        f"arith.{op_name}: expected 'metal' stage artifact; got: "
         f"{sorted(compiled.asm.keys())}"
     )
-    raw = compiled.asm["msl"]
+    raw = compiled.asm["metal"]
     msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
     assert msl.strip(), f"arith.{op_name}: empty MSL output"
     # Every MSL kernel must at least contain the kernel signature opener

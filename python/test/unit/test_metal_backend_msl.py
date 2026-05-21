@@ -60,13 +60,13 @@ def test_triton_jit_compiles_to_msl():
     target = GPUTarget(backend="metal", arch=80, warp_size=32)
     compiled = triton.compile(src, target=target, options={"num_warps": 4})
 
-    assert "msl" in compiled.asm, (
-        f"expected 'msl' stage artifact; got: {sorted(compiled.asm.keys())}"
+    assert "metal" in compiled.asm, (
+        f"expected 'metal' stage artifact; got: {sorted(compiled.asm.keys())}"
     )
-    # `binary_ext="msl"` makes the compiler harness read the terminal
+    # `binary_ext="metal"` makes the compiler harness read the terminal
     # artifact as bytes (compiler.py reads files matching the binary_ext
     # as binary). MSL is textual; decode for the substring assertions.
-    raw = compiled.asm["msl"]
+    raw = compiled.asm["metal"]
     msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
     assert msl, "MSL output is empty"
 

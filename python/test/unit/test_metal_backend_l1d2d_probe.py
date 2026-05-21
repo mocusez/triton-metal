@@ -157,7 +157,7 @@ def _dispatch(msl: str, kernel_name: str, threadgroup_size: int,
 def test_l1d2d_cell(cell_id, threadgroup_size, num_threadgroups, doc, request):
     """Run a single cell 10 times, record pass/fail count."""
     msl = _translate_to_msl(cell_id)
-    dump_path = pathlib.Path(f"/tmp/l1d2d_dump/{cell_id}.msl")
+    dump_path = pathlib.Path(f"/tmp/l1d2d_dump/{cell_id}.metal")
     dump_path.parent.mkdir(parents=True, exist_ok=True)
     dump_path.write_text(msl)
 

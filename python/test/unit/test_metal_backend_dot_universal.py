@@ -290,12 +290,12 @@ def _capture_msl(num_warps):
     for root, _dirs, files in os.walk(os.path.expanduser("~/.triton/cache")):
         if "dot_multiwarp_kernel.json" not in files:
             continue
-        if "dot_multiwarp_kernel.msl" not in files:
+        if "dot_multiwarp_kernel.metal" not in files:
             continue
         with open(os.path.join(root, "dot_multiwarp_kernel.json")) as fh:
             if json.load(fh).get("num_warps") != num_warps:
                 continue
-        with open(os.path.join(root, "dot_multiwarp_kernel.msl")) as fh:
+        with open(os.path.join(root, "dot_multiwarp_kernel.metal")) as fh:
             return fh.read()
     return ""
 
