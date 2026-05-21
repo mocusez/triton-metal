@@ -110,6 +110,18 @@ static std::optional<TileInfo> tileFromTensor(mlir::Type t) {
     return std::nullopt;
   if (rt.getRank() < 1)
     return std::nullopt;
+  // AC4 v6: skip tensors whose elements are pointers (`tensor<…x!tt.ptr<…>>`).
+  // After the matmul matcher rewrites a multi-tile dot, the original C-side
+  // pointer-arithmetic tensor (e.g. `tensor<64x64x!tt.ptr<f32>>`) is dead but
+  // remains in the IR until dialect conversion. findTileInfo would otherwise
+  // pick it as the kernel's largest blocked tensor and wrap the entire
+  // simdgroup-matrix body in a `scf.for(0..elemsPerThread)` loop, executing
+  // each warp's emission redundantly (and triggering MSL compiler XPC
+  // crashes on the bloated source). Pointer-element tensors carry no
+  // per-element computation in the post-matcher body, so they should not
+  // drive the elements-per-thread tile loop.
+  if (mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+    return std::nullopt;
   // Rank-generic: take products across all axes. For 1D this collapses
   // to the original single-axis math. For 2D/3D this gives the flat
   // elem_per_thread / threadsPerBlock counts. See
@@ -3025,6 +3037,64 @@ static mlir::Value emitOriginOperand(mlir::OpBuilder &builder,
       .getResult();
 }
 
+// Walk a 2D-matmul pointer SSA chain calling `findOriginScalar` on each
+// addptr's offset until a non-null axis contribution is found. Triton emits
+// 2D matmul pointers as a 2-level chain
+//   `addptr(broadcast(addptr(splat(kernelArg), inner_off)), outer_off)`
+// where one axis' pid contribution lives in `inner_off` and the other in
+// `outer_off`. A flat `findOriginScalar(outerAddptr.getOffset(), axis)` only
+// sees the outer offset and silently returns null for the inner axis — the
+// caller then falls back to `metal.constant 0 : ui32` so every (pid_m, pid_n)
+// threadgroup loads/stores at the same tile origin (Matmul-track iter-8
+// rootcause for `test_dot_f32_8x8[16-16-16]`).
+static mlir::Value findOriginScalarInPtrChain(mlir::Value ptr, int targetAxis) {
+  for (int depth = 0; depth < 8 && ptr; ++depth) {
+    if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (auto r = findOriginScalar(addptr.getOffset(), targetAxis)) return r;
+      ptr = addptr.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      ptr = bc.getSrc();
+      continue;
+    }
+    if (auto ed = ptr.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      ptr = ed.getSrc();
+      continue;
+    }
+    // `tt.splat(kernelArg)` or `BlockArgument` — no further offsets to scan.
+    break;
+  }
+  return mlir::Value();
+}
+
+// Symmetric stride-splat search: walks the same 2-level addptr chain calling
+// `findStrideSplatSource` on each offset. For the canonical-3-iter_arg
+// matmul, the row stride splat lives in the inner addptr's offset while the
+// K-axis broadcast lives in the outer addptr's offset — flat search misses
+// it and the caller falls back to a hardcoded `metal.constant 8 : ui32`,
+// which silently miscompiles for any matrix whose leading dimension is not
+// 8 (e.g. the [16,16,16] case where stride = 16).
+static mlir::Value findStrideSplatSourceInPtrChain(mlir::Value ptr) {
+  for (int depth = 0; depth < 8 && ptr; ++depth) {
+    if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (auto r = findStrideSplatSource(addptr.getOffset())) return r;
+      ptr = addptr.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      ptr = bc.getSrc();
+      continue;
+    }
+    if (auto ed = ptr.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      ptr = ed.getSrc();
+      continue;
+    }
+    break;
+  }
+  return mlir::Value();
+}
+
 // Convenience: extract (origin_row, origin_col) from a load/store ptr op's
 // addptr chain. Either may be null when the pid pattern wasn't found.
 struct OriginPair {
@@ -3034,12 +3104,106 @@ struct OriginPair {
 template <typename TtMemOp>
 static OriginPair extractOriginPair(TtMemOp memOp) {
   OriginPair p;
-  auto addptr = memOp.getPtr().template getDefiningOp<mlir::triton::AddPtrOp>();
-  if (!addptr) return p;
-  auto offset = addptr.getOffset();
-  p.row = findOriginScalar(offset, /*targetAxis=*/0);
-  p.col = findOriginScalar(offset, /*targetAxis=*/1);
+  mlir::Value ptr = memOp.getPtr();
+  p.row = findOriginScalarInPtrChain(ptr, /*targetAxis=*/0);
+  p.col = findOriginScalarInPtrChain(ptr, /*targetAxis=*/1);
   return p;
+}
+
+// AC2: walk a tt.store mask of the canonical 2D form
+//   `arith.andi(cmpi(slt, offs_m_2d, splat(M)), cmpi(slt, offs_n_2d, splat(N)))`
+// and return (M_extent_val, N_extent_val) as kernel-scalar SSA values. The
+// shape is unmasked-axis-aware: the cmpi whose LHS chain reaches the row-axis
+// `offs_m` returns M_extent; the col-axis one returns N_extent. Returns
+// {null, null} on any shape mismatch.
+struct MaskExtents {
+  mlir::Value mExtent;
+  mlir::Value nExtent;
+};
+static MaskExtents extractMaskExtents(mlir::Value mask) {
+  MaskExtents empty;
+  if (!mask) return empty;
+  auto andi = mask.getDefiningOp<mlir::arith::AndIOp>();
+  if (!andi) return empty;
+
+  // Each side: walk through tt.broadcast / tt.expand_dims wrappers to the
+  // underlying cmpi-slt with a tt.splat RHS.
+  auto unwrapToCmpi = [](mlir::Value v) -> mlir::arith::CmpIOp {
+    while (v) {
+      auto def = v.getDefiningOp();
+      if (!def) return {};
+      if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def)) {
+        v = bc.getSrc();
+        continue;
+      }
+      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+        v = ed.getSrc();
+        continue;
+      }
+      break;
+    }
+    return v.getDefiningOp<mlir::arith::CmpIOp>();
+  };
+
+  auto cmpLhs = unwrapToCmpi(andi.getLhs());
+  auto cmpRhs = unwrapToCmpi(andi.getRhs());
+  if (!cmpLhs || !cmpRhs) return empty;
+  if (cmpLhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
+  if (cmpRhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
+
+  // Extract the splat source on each cmpi's RHS — that's the scalar bound.
+  auto extractSplatSrc = [](mlir::arith::CmpIOp cmp) -> mlir::Value {
+    if (auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>())
+      return splat.getSrc();
+    return {};
+  };
+  mlir::Value boundLhs = extractSplatSrc(cmpLhs);
+  mlir::Value boundRhs = extractSplatSrc(cmpRhs);
+  if (!boundLhs || !boundRhs) return empty;
+
+  // Axis disambiguation: the cmpi whose LHS reaches an `expand_dims` with
+  // axis=1 is the row-axis (M_extent); axis=0 is the col-axis (N_extent).
+  auto axisOf = [](mlir::arith::CmpIOp cmp) -> int {
+    auto v = cmp.getLhs();
+    while (v) {
+      auto def = v.getDefiningOp();
+      if (!def) return -1;
+      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def))
+        return ed.getAxis();
+      if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def)) {
+        v = bc.getSrc();
+        continue;
+      }
+      if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp>(def)) {
+        // Walk into either operand. Triton emits `addi(splat(pid_m*8),
+        // make_range)`; prefer the operand that reaches an expand_dims.
+        for (auto operand : def->getOperands()) {
+          v = operand;
+          auto inner = v.getDefiningOp();
+          if (inner && mlir::isa<mlir::triton::ExpandDimsOp,
+                                  mlir::triton::BroadcastOp>(inner))
+            break;
+        }
+        continue;
+      }
+      break;
+    }
+    return -1;
+  };
+  int axisLhs = axisOf(cmpLhs);
+  int axisRhs = axisOf(cmpRhs);
+
+  MaskExtents r;
+  if (axisLhs == 1 && axisRhs == 0) {
+    r.mExtent = boundLhs;
+    r.nExtent = boundRhs;
+  } else if (axisLhs == 0 && axisRhs == 1) {
+    r.mExtent = boundRhs;
+    r.nExtent = boundLhs;
+  } else {
+    return empty;
+  }
+  return r;
 }
 
 // Helper: walk addptr/splat/broadcast/expand_dims back to the kernel-arg ptr.
@@ -3092,6 +3256,28 @@ static mlir::Value emitOneMA(mlir::OpBuilder &builder, mlir::Location loc,
   auto ma = SimdgroupMultiplyAccumulateOp::create(
       builder, loc, matTy, acc, aTile.getResult(), bTile.getResult());
   return ma.getResult();
+}
+
+// AC4 v6: choose (warpsM, warpsN) maximizing `min(warpsM, warpsN)` subject
+// to `warpsM * warpsN == numWarps`, `mTiles % warpsM == 0`, and
+// `nTiles % warpsN == 0`. Returns nullopt when no valid factor pair exists;
+// the matcher fatals on nullopt for the multi-tile path so a misconfigured
+// `(numWarps, M/8, N/8)` is reported at compile time rather than silently
+// dropping output tiles. See `.omc/plans/ac4-multiwarp.md` and
+// `.omc/research/ac4-probe.md`.
+static std::optional<std::pair<int, int>>
+factorWarps(int numWarps, int mTiles, int nTiles) {
+  std::optional<std::pair<int, int>> best;
+  for (int warpsM = 1; warpsM <= numWarps; ++warpsM) {
+    if (numWarps % warpsM != 0) continue;
+    int warpsN = numWarps / warpsM;
+    if (mTiles % warpsM != 0) continue;
+    if (nTiles % warpsN != 0) continue;
+    int score = std::min(warpsM, warpsN);
+    if (!best || score > std::min(best->first, best->second))
+      best = std::make_pair(warpsM, warpsN);
+  }
+  return best;
 }
 
 // Matmul track session 4: try to unroll a K-loop-enclosed tt.dot into N
@@ -3219,19 +3405,36 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
   if (auto bkBOpt = extractBK(addptrB); bkBOpt && *bkBOpt != BK)
     return mlir::failure();
 
-  // Element type + shape gate (same as v1).
+  // Element type + shape gate. AC4 v6: shape gate lifted from `== 8x8` to
+  // `% 8 == 0` so multi-tile dots (per-program M/N grids that decompose into
+  // 8×8 sub-tiles) admit the new triple-unroll body below. The 8×8 case
+  // stays on the legacy single-tile chain (m=n=1 below) for bit-identical
+  // pre-AC4 emission. The partial-tile signal still comes from a masked
+  // `tt.store` for single-tile (m=n=1) shapes only — masked multi-tile bails.
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   if (!resTy) return mlir::failure();
   auto elemTy = resTy.getElementType();
   if (!elemTy.isF32()) return mlir::failure();
   auto shape = resTy.getShape();
-  if (shape.size() != 2 || shape[0] != 8 || shape[1] != 8) return mlir::failure();
+  if (shape.size() != 2 || shape[0] % 8 != 0 || shape[1] % 8 != 0)
+    return mlir::failure();
+  const int64_t mTiles = shape[0] / 8;
+  const int64_t nTiles = shape[1] / 8;
 
   // Locate the store consuming the for's accumulator result.
   if (!forOp.getResult(accIdx).hasOneUse()) return mlir::failure();
   auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
       *forOp.getResult(accIdx).getUsers().begin());
-  if (!store || store.getMask()) return mlir::failure();
+  if (!store) return mlir::failure();
+  // AC2: allow a masked store of the canonical 2D form. If the mask doesn't
+  // decompose into the (offs_m < M) & (offs_n < N) pattern, bail to preserve
+  // correctness — other mask shapes are out of scope for this AC.
+  MaskExtents maskExtents;
+  if (store.getMask()) {
+    maskExtents = extractMaskExtents(store.getMask());
+    if (!maskExtents.mExtent || !maskExtents.nExtent)
+      return mlir::failure();
+  }
 
   // Pull base origins/strides from the iter_arg INITS (which carry the
   // pid-driven address shapes built outside the loop).
@@ -3245,10 +3448,17 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
   mlir::Value bPtr = unwrapPtrToKernelArg(bPtrsInit);
   mlir::Value cPtr = unwrapPtrToKernelArg(store.getPtr());
 
-  mlir::Value strideA = findStrideSplatSource(aInitAddptr.getOffset());
-  mlir::Value strideB = findStrideSplatSource(bInitAddptr.getOffset());
-  mlir::Value aBaseRow = findOriginScalar(aInitAddptr.getOffset(), 0);
-  mlir::Value bBaseCol = findOriginScalar(bInitAddptr.getOffset(), 1);
+  // iter-8 (chain-aware): the canonical Triton 2D-matmul pointer is a
+  // 2-level chain whose row contribution + row stride live in the INNER
+  // addptr (not the outer one consumed by `aInitAddptr.getOffset()`). Walk
+  // the entire chain via the `*InPtrChain` helpers — the flat search would
+  // miss both and silently fall back to origin=0 / stride=8, which works
+  // by accident for the [8,8,8] single-tile case (pid=0, BLOCK_N=8) but
+  // catastrophically miscompiles [16,16,16] grid=(2,2).
+  mlir::Value strideA = findStrideSplatSourceInPtrChain(aPtrsInit);
+  mlir::Value strideB = findStrideSplatSourceInPtrChain(bPtrsInit);
+  mlir::Value aBaseRow = findOriginScalarInPtrChain(aPtrsInit, /*targetAxis=*/0);
+  mlir::Value bBaseCol = findOriginScalarInPtrChain(bPtrsInit, /*targetAxis=*/1);
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
 
   // Emit IR before the scf.for.
@@ -3262,16 +3472,12 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
       ConstantOp::create(builder, loc, builder.getIntegerAttr(ui32, 0));
   mlir::Value strideAVal = emitStrideOperand(builder, loc, ui32, strideA);
   mlir::Value strideBVal = emitStrideOperand(builder, loc, ui32, strideB);
-  // iter-7 ships C stride extraction via findStrideSplatSource — mirrors
-  // the A/B pattern above. Walk store.getPtr()'s addptr offset chain;
-  // emitStrideOperand falls back to `metal.constant 8 : ui32` when
-  // extraction returns null (preserves prior behavior for fixtures whose
-  // IR shape doesn't expose a stride splat).
-  auto cStoreAddptr =
-      store.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
-  mlir::Value strideC = cStoreAddptr ? findStrideSplatSource(
-                                           cStoreAddptr.getOffset())
-                                     : mlir::Value();
+  // iter-8 (chain-aware): the C-store pointer is the same 2-level
+  // `addptr(broadcast(addptr(splat(c_ptr), row_off)), col_off)` chain as A/B;
+  // the row-stride splat lives in the INNER addptr's offset, so the flat
+  // outer-only search used in iter-7 returned null and emitStrideOperand
+  // fell back to `metal.constant 8 : ui32`. Walk the chain instead.
+  mlir::Value strideC = findStrideSplatSourceInPtrChain(store.getPtr());
   mlir::Value strideCVal = emitStrideOperand(builder, loc, ui32, strideC);
   mlir::Value aBaseRowVal = emitOriginOperand(builder, loc, ui32, aBaseRow);
   mlir::Value bBaseColVal = emitOriginOperand(builder, loc, ui32, bBaseCol);
@@ -3282,32 +3488,231 @@ static mlir::LogicalResult tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
   mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
 
-  // C-init load.
-  auto cInitLoad = SimdgroupLoadOp::create(builder, loc, matTy, cBuf,
-                                            cRowOrigin, cColOrigin, strideCVal);
-  mlir::Value acc = cInitLoad.getResult();
-
-  // Unrolled chain with per-iter K-axis origin = i * BK.
-  for (int64_t i = 0; i < N; ++i) {
-    auto kOffset = ConstantOp::create(
-        builder, loc, builder.getIntegerAttr(ui32, i * BK));
-    // A's col origin for iter i (K-axis advances) — A's base col is 0
-    // typically, so iter origin = i*BK.
-    mlir::Value aColIter = kOffset.getResult();
-    // B's row origin for iter i.
-    mlir::Value bRowIter = kOffset.getResult();
-    auto aTile = SimdgroupLoadOp::create(builder, loc, matTy, aBuf,
-                                          aBaseRowVal, aColIter, strideAVal);
-    auto bTile = SimdgroupLoadOp::create(builder, loc, matTy, bBuf, bRowIter,
-                                          bBaseColVal, strideBVal);
-    auto ma = SimdgroupMultiplyAccumulateOp::create(
-        builder, loc, matTy, acc, aTile.getResult(), bTile.getResult());
-    acc = ma.getResult();
+  // C-init helper: use `metal.simdgroup_matrix_zero` when the for-loop's
+  // accumulator iter_arg is initialized to `dense<0.0>` (the canonical
+  // `acc = tl.zeros(...)` Triton pattern). Apple's matmul / FA samples
+  // initialize the accumulator via the constructor `simdgroup_matrix<T,
+  // M, N>(0.0f)`; chained `simdgroup_multiply_accumulate` calls only
+  // accumulate correctly across all output columns when the accumulator
+  // is initialized this way (iter-8 root cause for K_TILES >= 2 cases).
+  // Fall back to `simdgroup_load` from the C buffer at the tile's (row,
+  // col) origin if the iter_arg init is anything else.
+  mlir::Value accInitOp = forOp.getInits()[accIdx];
+  bool accInitIsZero = false;
+  if (auto cst = accInitOp.getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto dense = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue())) {
+      if (dense.isSplat() && dense.getSplatValue<mlir::APFloat>().isZero())
+        accInitIsZero = true;
+    }
   }
+  auto emitAccInit = [&](mlir::Value cTileRow, mlir::Value cTileCol)
+      -> mlir::Value {
+    if (accInitIsZero)
+      return SimdgroupMatrixZeroOp::create(builder, loc, matTy).getResult();
+    return SimdgroupLoadOp::create(builder, loc, matTy, cBuf, cTileRow,
+                                    cTileCol, strideCVal)
+        .getResult();
+  };
 
-  // Final store.
-  SimdgroupStoreOp::create(builder, loc, acc, cBuf, cRowOrigin, cColOrigin,
-                            strideCVal);
+  // AC4 v6 branch: single-tile (m_tiles=n_tiles=1) emits the bit-identical
+  // pre-AC4 chain; multi-tile emits a per-warp triple inline-unroll with
+  // simdgroup_index_in_threadgroup-driven (warpM, warpN) partition.
+  const bool multiTile = (mTiles > 1) || (nTiles > 1);
+  const int64_t numWarps = mlir::triton::gpu::lookupNumWarps(dot);
+  const bool multiWarp = numWarps > 1;
+
+  if (!multiTile) {
+    // Legacy single-tile chain (Bucket A) — bit-identical to pre-AC4.
+    mlir::Value acc = emitAccInit(cRowOrigin, cColOrigin);
+    for (int64_t i = 0; i < N; ++i) {
+      auto kOffset = ConstantOp::create(
+          builder, loc, builder.getIntegerAttr(ui32, i * BK));
+      mlir::Value aColIter = kOffset.getResult();
+      mlir::Value bRowIter = kOffset.getResult();
+      auto aTile = SimdgroupLoadDeviceStagedOp::create(
+          builder, loc, matTy, aBuf, aBaseRowVal, aColIter, strideAVal,
+          mlir::ValueRange{});
+      auto bTile = SimdgroupLoadDeviceStagedOp::create(
+          builder, loc, matTy, bBuf, bRowIter, bBaseColVal, strideBVal,
+          mlir::ValueRange{});
+      auto ma = SimdgroupMultiplyAccumulateOp::create(
+          builder, loc, matTy, acc, aTile.getResult(), bTile.getResult());
+      acc = ma.getResult();
+    }
+    // Final store. AC2: attach `partial_extents = [m_extent, n_extent]`
+    // operands when the tt.store had a (offs_m < M) & (offs_n < N) mask so
+    // the emitter routes through the threadgroup-scratch masked epilogue.
+    llvm::SmallVector<mlir::Value, 2> partialExtents;
+    if (maskExtents.mExtent && maskExtents.nExtent) {
+      auto toUi32 = [&](mlir::Value v) -> mlir::Value {
+        if (v.getType() == ui32) return v;
+        return mlir::UnrealizedConversionCastOp::create(builder, loc, ui32, v)
+            .getResult(0);
+      };
+      partialExtents.push_back(toUi32(maskExtents.mExtent));
+      partialExtents.push_back(toUi32(maskExtents.nExtent));
+    }
+    SimdgroupStoreOp::create(builder, loc, acc, cBuf, cRowOrigin, cColOrigin,
+                              strideCVal, partialExtents);
+  } else {
+    // AC4 v6 multi-tile path.
+    // AC2/AC4 cross-coupling guard: masked + multi-warp is out of scope —
+    // the masked epilogue's threadgroup-scratch staging assumes single-warp
+    // ownership of the C tile, which conflicts with per-warp tile ownership.
+    if (store.getMask() && multiWarp) {
+      llvm::report_fatal_error(
+          "AC2 masked-tail not supported under multi-warp; see "
+          ".omc/plans/ac4-multiwarp.md");
+    }
+    // Multi-tile + masked (single-warp): out of scope for this AC; bail so
+    // the fallback `rewriteSingleDot` path is attempted.
+    if (store.getMask()) return mlir::failure();
+
+    int warpsM = 1, warpsN = 1;
+    if (multiWarp) {
+      auto wf = factorWarps(static_cast<int>(numWarps),
+                            static_cast<int>(mTiles),
+                            static_cast<int>(nTiles));
+      if (!wf) {
+        llvm::report_fatal_error(
+            "AC4: factorWarps failed — no valid (warpsM, warpsN) partition "
+            "for (numWarps, mTiles, nTiles); see .omc/plans/ac4-multiwarp.md");
+      }
+      warpsM = wf->first;
+      warpsN = wf->second;
+    }
+    const int mPerWarp = static_cast<int>(mTiles) / warpsM;
+    const int nPerWarp = static_cast<int>(nTiles) / warpsN;
+
+    // Emit widx and warpM/warpN via arith.divui/remui (signless i32 land).
+    auto i32 = builder.getIntegerType(32);
+    auto toI32 = [&](mlir::Value u) -> mlir::Value {
+      return mlir::UnrealizedConversionCastOp::create(
+                 builder, loc, mlir::TypeRange{i32}, mlir::ValueRange{u})
+          .getResult(0);
+    };
+    auto toUi32 = [&](mlir::Value v) -> mlir::Value {
+      return mlir::UnrealizedConversionCastOp::create(
+                 builder, loc, mlir::TypeRange{ui32}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+    mlir::Value widxI32, warpMI32, warpNI32, widxUi32Hoisted;
+    if (multiWarp) {
+      widxUi32Hoisted =
+          SimdgroupIndexOp::create(builder, loc, ui32).getResult();
+      widxI32 = toI32(widxUi32Hoisted);
+      auto warpsNCst = mlir::arith::ConstantOp::create(
+          builder, loc, builder.getI32IntegerAttr(warpsN));
+      warpMI32 = mlir::arith::DivUIOp::create(builder, loc, widxI32,
+                                                warpsNCst.getResult())
+                     .getResult();
+      warpNI32 = mlir::arith::RemUIOp::create(builder, loc, widxI32,
+                                                warpsNCst.getResult())
+                     .getResult();
+    }
+
+    // Cast base ui32 values to i32 once for arith composition.
+    mlir::Value aBaseRowI32 = toI32(aBaseRowVal);
+    mlir::Value bBaseColI32 = toI32(bBaseColVal);
+    mlir::Value cRowOrigI32 = toI32(cRowOrigin);
+    mlir::Value cColOrigI32 = toI32(cColOrigin);
+
+    auto eight = mlir::arith::ConstantOp::create(
+        builder, loc, builder.getI32IntegerAttr(8));
+
+    // Per-warp owned tile grid: tile_m = warpM + mIter * warpsM,
+    // tile_n = warpN + nIter * warpsN. This interleaves warps across the
+    // M/N grid (matching the plan v5 stride math).
+    for (int mIter = 0; mIter < mPerWarp; ++mIter) {
+      for (int nIter = 0; nIter < nPerWarp; ++nIter) {
+        // tile_m * 8 (i32)
+        mlir::Value mTileIdx;
+        if (multiWarp) {
+          auto mIterCst = mlir::arith::ConstantOp::create(
+              builder, loc, builder.getI32IntegerAttr(mIter * warpsM));
+          mTileIdx = mlir::arith::AddIOp::create(builder, loc, warpMI32,
+                                                  mIterCst.getResult())
+                         .getResult();
+        } else {
+          mTileIdx = mlir::arith::ConstantOp::create(
+                         builder, loc,
+                         builder.getI32IntegerAttr(mIter))
+                         .getResult();
+        }
+        mlir::Value rowOff = mlir::arith::MulIOp::create(builder, loc, mTileIdx,
+                                                          eight.getResult())
+                                 .getResult();
+
+        mlir::Value nTileIdx;
+        if (multiWarp) {
+          auto nIterCst = mlir::arith::ConstantOp::create(
+              builder, loc, builder.getI32IntegerAttr(nIter * warpsN));
+          nTileIdx = mlir::arith::AddIOp::create(builder, loc, warpNI32,
+                                                  nIterCst.getResult())
+                         .getResult();
+        } else {
+          nTileIdx = mlir::arith::ConstantOp::create(
+                         builder, loc,
+                         builder.getI32IntegerAttr(nIter))
+                         .getResult();
+        }
+        mlir::Value colOff = mlir::arith::MulIOp::create(builder, loc, nTileIdx,
+                                                          eight.getResult())
+                                 .getResult();
+
+        mlir::Value aTileRowI32 = mlir::arith::AddIOp::create(
+                                       builder, loc, aBaseRowI32, rowOff)
+                                       .getResult();
+        mlir::Value bTileColI32 = mlir::arith::AddIOp::create(
+                                       builder, loc, bBaseColI32, colOff)
+                                       .getResult();
+        mlir::Value cTileRowI32 = mlir::arith::AddIOp::create(
+                                       builder, loc, cRowOrigI32, rowOff)
+                                       .getResult();
+        mlir::Value cTileColI32 = mlir::arith::AddIOp::create(
+                                       builder, loc, cColOrigI32, colOff)
+                                       .getResult();
+
+        mlir::Value aTileRow = toUi32(aTileRowI32);
+        mlir::Value bTileCol = toUi32(bTileColI32);
+        mlir::Value cTileRow = toUi32(cTileRowI32);
+        mlir::Value cTileCol = toUi32(cTileColI32);
+
+        // Per-(mIter, nIter) accumulator re-init (each output tile owns
+        // its own accumulator).
+        mlir::Value acc = emitAccInit(cTileRow, cTileCol);
+
+        // K-loop unrolled. For multi-warp, attach the hoisted ui32 widx
+        // SSA value as the variadic `warp_index` operand on every staged
+        // load so the per-warp Branch B in the emitter sees the same widx.
+        // Use SmallVector storage to give the ValueRange a stable address —
+        // `ValueRange(const Value &)` is LIFETIME_BOUND and would dangle
+        // if we stored `mlir::ValueRange{widxUi32Hoisted}` in a variable.
+        llvm::SmallVector<mlir::Value, 1> warpIdxStorage;
+        if (multiWarp) warpIdxStorage.push_back(widxUi32Hoisted);
+        for (int64_t i = 0; i < N; ++i) {
+          auto kOffset = ConstantOp::create(
+              builder, loc, builder.getIntegerAttr(ui32, i * BK));
+          mlir::Value kVal = kOffset.getResult();
+          auto aTile = SimdgroupLoadDeviceStagedOp::create(
+              builder, loc, matTy, aBuf, aTileRow, kVal, strideAVal,
+              mlir::ValueRange(warpIdxStorage));
+          auto bTile = SimdgroupLoadDeviceStagedOp::create(
+              builder, loc, matTy, bBuf, kVal, bTileCol, strideBVal,
+              mlir::ValueRange(warpIdxStorage));
+          auto ma = SimdgroupMultiplyAccumulateOp::create(
+              builder, loc, matTy, acc, aTile.getResult(), bTile.getResult());
+          acc = ma.getResult();
+        }
+
+        // Per-tile store. No partial extents in the multi-tile path
+        // (masked + multi-tile bails above).
+        SimdgroupStoreOp::create(builder, loc, acc, cBuf, cTileRow, cTileCol,
+                                  strideCVal,
+                                  llvm::SmallVector<mlir::Value, 2>{});
+      }
+    }
+  }
 
   // Erase originals.
   store.erase();
@@ -3417,9 +3822,10 @@ static mlir::LogicalResult tryUnrollKLoopDot(mlir::triton::DotOp dot) {
     acc = emitOneMA(builder, loc, matTy, aBuf, bBuf, zero.getResult(),
                      strideC.getResult(), acc);
 
-  // Final store.
+  // Final store. No partial_extents: full 8x8 tile path.
   SimdgroupStoreOp::create(builder, loc, acc, cBuf, zero.getResult(),
-                            zero.getResult(), strideC.getResult());
+                            zero.getResult(), strideC.getResult(),
+                            /*partial_extents=*/mlir::ValueRange{});
 
   // Erase originals.
   store.erase();
@@ -3453,7 +3859,8 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   // Session 4: try 1-iter_arg K-loop unroll.
   if (mlir::succeeded(tryUnrollKLoopDot(dot))) return;
 
-  // Single-iter path (session 3a):
+  // Single-iter path. The dot's static result is always 8x8 (BLOCK = 8);
+  // the partial-tile signal comes from a masked `tt.store` below.
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   if (!resTy || resTy.getRank() != 2) return;
   auto elemTy = resTy.getElementType();
@@ -3471,7 +3878,13 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
       *dot.getResult().getUsers().begin());
   if (!store) return;
-  if (store.getMask()) return;
+  // AC2: allow masked stores of the canonical 2D form. If the mask doesn't
+  // decompose into (offs_m < M) & (offs_n < N), bail.
+  MaskExtents maskExtents;
+  if (store.getMask()) {
+    maskExtents = extractMaskExtents(store.getMask());
+    if (!maskExtents.mExtent || !maskExtents.nExtent) return;
+  }
 
   // Walk a/b/c load ptr operands back to the kernel-arg `!tt.ptr<f32>`.
   // Shares the helper used by the canonical-3-iter_arg path so 2D matmul
@@ -3487,17 +3900,20 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   auto ui32 = builder.getIntegerType(32, /*isSigned=*/false);
   auto matTy = MetalSimdgroupMatrixType::get(ctx, /*rows=*/8, /*cols=*/8, elemTy);
 
-  // Session 4c-1: try to extract real per-load strides; fall back to 8.
-  mlir::Value strideAVal =
-      emitStrideOperand(builder, loc, ui32, extractStrideFromAddPtr(aLoad));
-  mlir::Value strideBVal =
-      emitStrideOperand(builder, loc, ui32, extractStrideFromAddPtr(bLoad));
-  // C stride extraction deferred to session 4c-3 (store-side parse).
-  mlir::Value strideCVal =
-      ConstantOp::create(builder, loc, builder.getIntegerAttr(ui32, 8))
-          .getResult();
-  // Session 4c-2: extract origins (pid*BLOCK) from each address chain.
-  // A's K-axis col origin is 0 (no pid); B's K-axis row origin is 0.
+  // Chain-aware stride extraction (matches tryUnrollCanonical3IterArgDot path).
+  // The canonical Triton 2D-matmul pointer is a 2-level
+  // `addptr(broadcast(addptr(splat(arg), row_off)), col_off)` chain whose
+  // row-stride splat lives in the INNER addptr's offset. The flat
+  // `extractStrideFromAddPtr` walks only the outer addptr and returns null
+  // for these shapes, which `emitStrideOperand` falls back to `metal.constant
+  // 8`. For (M,N,K) where N != 8 or M != 8, that hardcoded 8 silently
+  // miscompiles. Walk the full chain instead.
+  mlir::Value strideAVal = emitStrideOperand(
+      builder, loc, ui32, findStrideSplatSourceInPtrChain(aLoad.getPtr()));
+  mlir::Value strideBVal = emitStrideOperand(
+      builder, loc, ui32, findStrideSplatSourceInPtrChain(bLoad.getPtr()));
+  mlir::Value strideCVal = emitStrideOperand(
+      builder, loc, ui32, findStrideSplatSourceInPtrChain(store.getPtr()));
   OriginPair aOrig = extractOriginPair<mlir::triton::LoadOp>(aLoad);
   OriginPair bOrig = extractOriginPair<mlir::triton::LoadOp>(bLoad);
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
@@ -3512,16 +3928,45 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
   mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
 
-  auto aTile = SimdgroupLoadOp::create(builder, loc, matTy, aBuf, aRowOrigin,
-                                         aColOrigin, strideAVal);
-  auto bTile = SimdgroupLoadOp::create(builder, loc, matTy, bBuf, bRowOrigin,
-                                         bColOrigin, strideBVal);
-  auto cInit = SimdgroupLoadOp::create(builder, loc, matTy, cBuf, cRowOrigin,
-                                         cColOrigin, strideCVal);
+  auto aTile = SimdgroupLoadDeviceStagedOp::create(
+      builder, loc, matTy, aBuf, aRowOrigin, aColOrigin, strideAVal,
+      mlir::ValueRange{});
+  auto bTile = SimdgroupLoadDeviceStagedOp::create(
+      builder, loc, matTy, bBuf, bRowOrigin, bColOrigin, strideBVal,
+      mlir::ValueRange{});
+
+  // C-init: emit `metal.simdgroup_matrix_zero` when the dot's accumulator
+  // operand is `dense<0.0>` (the canonical `acc = tl.zeros(...)` Triton
+  // pattern, which after trivial scf.for elimination becomes the dot's
+  // direct C operand). Otherwise fall back to loading from the C buffer.
+  mlir::Value acc;
+  if (auto cst = dot.getC().getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto dense = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue())) {
+      if (dense.isSplat() && dense.getSplatValue<mlir::APFloat>().isZero())
+        acc = SimdgroupMatrixZeroOp::create(builder, loc, matTy).getResult();
+    }
+  }
+  if (!acc) {
+    // f32-only: cBuf is bridged with the accumulator elem type (f32). If a
+    // future non-zero, non-f32 accumulator surface is added, this direct
+    // device load also needs to switch to SimdgroupLoadDeviceStagedOp.
+    acc = SimdgroupLoadOp::create(builder, loc, matTy, cBuf, cRowOrigin,
+                                   cColOrigin, strideCVal).getResult();
+  }
   auto cResult = SimdgroupMultiplyAccumulateOp::create(
-      builder, loc, matTy, cInit.getResult(), aTile.getResult(), bTile.getResult());
+      builder, loc, matTy, acc, aTile.getResult(), bTile.getResult());
+  llvm::SmallVector<mlir::Value, 2> partialExtents;
+  if (maskExtents.mExtent && maskExtents.nExtent) {
+    auto toUi32 = [&](mlir::Value v) -> mlir::Value {
+      if (v.getType() == ui32) return v;
+      return mlir::UnrealizedConversionCastOp::create(builder, loc, ui32, v)
+          .getResult(0);
+    };
+    partialExtents.push_back(toUi32(maskExtents.mExtent));
+    partialExtents.push_back(toUi32(maskExtents.nExtent));
+  }
   SimdgroupStoreOp::create(builder, loc, cResult.getResult(), cBuf, cRowOrigin,
-                            cColOrigin, strideCVal);
+                            cColOrigin, strideCVal, partialExtents);
 
   // Erase originals in reverse-dependency order. The accumulator init op
   // (typically arith.constant dense<0.0>) becomes dead and is cleaned up
@@ -3565,12 +4010,16 @@ static void preprocessDotCvtChains(mlir::ModuleOp moduleOp) {
     // TritonGPUToMetal.cpp:3141, :3272, :3367. Without this guard, an
     // fp16 dot would have its cvts stripped, leaving a non-f32 dot the
     // matchers reject — which then crashes the legalization pipeline.
+    //
+    // AC4 (v6): shape gate lifted from `== 8x8` to `% 8 == 0` so multi-
+    // tile dots (per-program M/N grids) admit the same operand-cvt and
+    // C-side-cvt rewrites. See `.omc/plans/ac4-multiwarp.md` (Option α).
     auto dotResTy =
         mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
     if (!dotResTy) return;
     if (!dotResTy.getElementType().isF32()) return;
     auto dotShape = dotResTy.getShape();
-    if (dotShape.size() != 2 || dotShape[0] != 8 || dotShape[1] != 8)
+    if (dotShape.size() != 2 || dotShape[0] % 8 != 0 || dotShape[1] % 8 != 0)
       return;
 
     auto peel = [&](mlir::Value v) -> mlir::Value {
@@ -3597,6 +4046,84 @@ static void preprocessDotCvtChains(mlir::ModuleOp moduleOp) {
     dot.setOperand(1, newB);
     if (cvtA && cvtA.use_empty()) deadCvts.push_back(cvtA);
     if (cvtB && cvtB.use_empty()) deadCvts.push_back(cvtB);
+
+    // AC4 (v6) BLOCKER #2: peel the C-side cvt that sits between the dot
+    // result (possibly via scf.for iter_arg/yield) and a `tt.store`.
+    // Upstream picks a matmul-optimized #blocked encoding on the dot
+    // result that differs from the store-side encoding at multi-tile
+    // shapes (sizePerThread=[4,4] vs [1,4]); L1d2's envelope classifier
+    // rejects this rank-2 blocked↔blocked cvt because the source
+    // sizePerThread > 1. We can safely re-encode the dot result to match
+    // the store side because the AC4 matcher (next pass) emits
+    // SimdgroupStoreOp with explicit (row, col, stride) origins — the
+    // MLIR-level tensor encoding has no MSL-level consequence.
+    //
+    // Chain (probe-verified): dot → scf.yield → scf.for result → cvt →
+    // tt.store. The scf.for has 3 iter_args; the accumulator's index is
+    // determined dynamically by walking from dot.getResult() back through
+    // the yield. Init-side constant (typically arith.constant dense<0.0>)
+    // gets re-encoded in-place by reshape() on its DenseElementsAttr.
+    if (!dot.getResult().hasOneUse()) return;
+    mlir::OpOperand &dotUse = *dot.getResult().getUses().begin();
+    auto yieldOp = mlir::dyn_cast<mlir::scf::YieldOp>(dotUse.getOwner());
+    if (!yieldOp) return;
+    auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(yieldOp->getParentOp());
+    if (!forOp) return;
+    unsigned itArgIdx = dotUse.getOperandNumber();
+    mlir::Value forResVal = forOp.getResult(itArgIdx);
+    if (!forResVal.hasOneUse()) return;
+    auto cvtC = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(
+        forResVal.getUses().begin()->getOwner());
+    if (!cvtC) return;
+    if (!cvtC->hasOneUse()) return;
+    auto storeOp = mlir::dyn_cast<mlir::triton::StoreOp>(
+        cvtC->use_begin()->getOwner());
+    if (!storeOp) return;
+
+    auto srcCTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(cvtC.getSrc().getType());
+    auto dstCTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(cvtC.getType());
+    if (!srcCTy || !dstCTy) return;
+    if (srcCTy.getEncoding() == dstCTy.getEncoding()) return;
+    auto newEnc = dstCTy.getEncoding();
+    auto newDotTy = mlir::RankedTensorType::get(
+        srcCTy.getShape(), srcCTy.getElementType(), newEnc);
+
+    // (1) dot result.
+    dot.getResult().setType(newDotTy);
+    // (2) scf.for iter_arg.
+    forOp.getRegionIterArgs()[itArgIdx].setType(newDotTy);
+    // (3) scf.for result.
+    forResVal.setType(newDotTy);
+    // (4) init operand. If it's a dense-constant, re-encode in place; if
+    //     it's anything else (rare), insert an outer cvt as a fallback.
+    mlir::Value initVal = forOp.getInitArgs()[itArgIdx];
+    if (auto constOp =
+            initVal.getDefiningOp<mlir::arith::ConstantOp>()) {
+      auto attr = constOp.getValueAttr();
+      if (auto denseAttr =
+              mlir::dyn_cast<mlir::DenseElementsAttr>(attr)) {
+        auto newAttr = denseAttr.reshape(newDotTy);
+        constOp.setValueAttr(newAttr);
+        constOp.getResult().setType(newDotTy);
+      } else {
+        // Fallback: leave init as-is, insert a cvt before scf.for.
+        mlir::OpBuilder b(forOp);
+        auto castedInit =
+            mlir::triton::gpu::ConvertLayoutOp::create(
+                b, forOp.getLoc(), newDotTy, initVal);
+        forOp.getInitArgsMutable()[itArgIdx].assign(castedInit.getResult());
+      }
+    } else {
+      mlir::OpBuilder b(forOp);
+      auto castedInit = mlir::triton::gpu::ConvertLayoutOp::create(
+          b, forOp.getLoc(), newDotTy, initVal);
+      forOp.getInitArgsMutable()[itArgIdx].assign(castedInit.getResult());
+    }
+    // (5) Erase the now-identity cvt.
+    cvtC.getResult().replaceAllUsesWith(cvtC.getSrc());
+    deadCvts.push_back(cvtC);
   });
   // Defensive re-check at erasure time guards the unlikely aliased-cvt
   // (self-dot) case where the same cvt feeds both A and B and would be
@@ -3873,6 +4400,35 @@ struct ConvertTritonGPUToMetalPass
     // resolve them later. See
     // `.omc/specs/deep-interview-metal-matmul-session3-tt-dot-wiring.md`.
     preprocessDotChains(moduleOp);
+
+    // AC4 v6: dead-code eliminate the C-side pointer-arithmetic chain that
+    // fed the original `tt.store` after the matcher rewrote it into
+    // explicit-origin `metal.simdgroup_store` ops. The dead chain includes
+    // `tensor<64x64x!tt.ptr<f32>>` and large `tensor<64x64xi32>` broadcast
+    // values whose presence would otherwise drive `findTileInfo` to pick a
+    // huge elements-per-thread tile (e.g. 32), wrapping the simdgroup body
+    // in `scf.for(0..32)` and exploding the emitted MSL beyond Apple's
+    // compiler resource limits. Iterate to fixed-point so multi-step
+    // chains (broadcast → expand_dims → make_range) all collapse.
+    {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        llvm::SmallVector<mlir::Operation *> deadOps;
+        moduleOp.walk([&](mlir::Operation *op) {
+          if (mlir::isa<mlir::triton::FuncOp, mlir::ModuleOp>(op))
+            return;
+          if (op->getNumResults() == 0) return;
+          if (!op->use_empty()) return;
+          if (!mlir::isOpTriviallyDead(op)) return;
+          deadOps.push_back(op);
+        });
+        for (auto *op : deadOps) {
+          op->erase();
+          changed = true;
+        }
+      }
+    }
 
     // L1d2c Phase B pre-conversion sentinel emission. For every tt.func with
     // a masked tt.store, hoist one `metal.threadgroup_alloca<tpb × T>` per

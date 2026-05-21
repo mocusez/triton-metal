@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -138,8 +139,14 @@ void ModuleTranslation::translateVarName(mlir::Value memref) {
   auto opInst = memref.getDefiningOp();
   if (opInst == nullptr) {
     _output << "v" << _buffers[memref.getAsOpaquePointer()];
+  } else if (isa<mlir::triton::metal::SimdgroupIndexOp>(opInst)) {
+    // AC4 v6: SimdgroupIndexOp uses the kernel parameter `sgid`
+    // (declared via [[simdgroup_index_in_threadgroup]] in translateKernel).
+    _output << "sgid";
   } else if (isa<mlir::triton::metal::AllocaOp,
                   mlir::triton::metal::ThreadgroupAllocaOp,
+                  mlir::triton::metal::SimdgroupMatrixZeroOp,
+                  mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
                   mlir::triton::metal::SimdgroupLoadOp,
                   mlir::triton::metal::SimdgroupMultiplyAccumulateOp>(opInst)) {
     _output << "v" << _alloca[opInst];
@@ -188,6 +195,18 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   });
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
+  // AC4 v6: conditionally add the SIMD-group index parameter when any
+  // SimdgroupIndexOp is referenced in the body. `simdgroup_index_in_threadgroup`
+  // is an MSL parameter attribute (cf. MSL Spec §5.8) — it cannot be referenced
+  // as a free-standing expression. Single-warp kernels skip this parameter
+  // so legacy MSL signatures stay unchanged.
+  bool usesSimdgroupIndex = false;
+  op.walk([&](mlir::triton::metal::SimdgroupIndexOp) {
+    usesSimdgroupIndex = true;
+    return mlir::WalkResult::interrupt();
+  });
+  if (usesSimdgroupIndex)
+    _output << ",\n  uint sgid [[simdgroup_index_in_threadgroup]]";
   _output << ")\n";
 
   auto firstBlock = op.getBodyRegion().getBlocks().begin();
@@ -218,6 +237,8 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
+            mlir::triton::metal::SimdgroupMatrixZeroOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
@@ -258,9 +279,12 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
+            mlir::triton::metal::SimdgroupMatrixZeroOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
-            mlir::triton::metal::SimdgroupStoreOp>(
+            mlir::triton::metal::SimdgroupStoreOp,
+            mlir::triton::metal::SimdgroupIndexOp>(
           [&](auto &op) { translate(op); })
       .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ForOp>([&](auto &op) { translate(op); })
@@ -367,6 +391,125 @@ static bool isLiteralZero(mlir::Value v) {
   return false;
 }
 
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupIndexOp op) {
+  // No statement emission. `simdgroup_index_in_threadgroup` is an MSL
+  // *parameter attribute* (kernel input qualifier), not a free-standing
+  // built-in expression. translateKernel injects the parameter
+  // `uint sgid [[simdgroup_index_in_threadgroup]]` when the kernel body
+  // references SimdgroupIndexOp; uses resolve to `sgid` via the
+  // translateValue/translateVarName cases below. See Metal Shading
+  // Language Specification §5.8 (Attributes for Kernel Function Input).
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupMatrixZeroOp op) {
+  // Emit `simdgroup_<dtype><rows>x<cols> vN(0.0f);` — Apple's matmul +
+  // flash-attention samples (and the FA emitter at line ~1381 of this
+  // file) initialize the accumulator this way. Empirical: initializing
+  // the accumulator via `simdgroup_load` from a pre-zeroed device buffer
+  // instead causes chained `simdgroup_multiply_accumulate` calls to drop
+  // contributions at specific output columns on Apple GPU family 9 /
+  // Metal 17.5 (probe10/probe5/probe6 in iter-8 diagnostics).
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  emitSimdgroupMatrixType(_output, resTy);
+  unsigned id = _varCount;
+  _output << " v" << id << "(0.0f)";
+  _alloca[op] = _varCount++;
+  printDelim();
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupLoadDeviceStagedOp op) {
+  // Emits the FA-style staged load: cooperative device->threadgroup copy,
+  // simdgroup_barrier, then simdgroup_load from the threadgroup buffer.
+  // Apple's matmul + FA samples ALL chain `simdgroup_multiply_accumulate`
+  // only on values loaded from `threadgroup T*`. Direct chained sgmma on
+  // `const device T*`-loaded values silently drops output-column
+  // contributions on Apple GPU family 9 / Metal 17.5 (iter-8 root cause).
+  //
+  // AC4 v6: two branches.
+  //   Branch A (`warp_index` empty): legacy single-warp/bit-identical
+  //   `_stage_<id>[elems]` shared across all warps. Used by single-tile
+  //   (m=n=1) emission and any pre-AC4 caller.
+  //   Branch B (`warp_index` size==1): per-warp slice
+  //   `_stage_<id>[<num_warps>][elems]` indexed by `[v<widx>]` so each
+  //   warp owns a disjoint stage buffer. `<num_warps>` is baked in at
+  //   translate time via `triton::gpu::lookupNumWarps(op)`.
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  unsigned id = _varCount;
+  unsigned elems = resTy.getRows() * resTy.getCols();
+  auto warpIdx = op.getWarpIndex();
+  const bool perWarp = !warpIdx.empty();
+
+  // AC4 v6: entry barrier — ensure the previous use of `_stage_shared` is
+  // complete on all warps before this load overwrites it. The shared
+  // buffer is declared at kernel-body top (see `translate(Region&)`); each
+  // staged load brackets its coop-load with `threadgroup_barrier` so the
+  // buffer can be safely reused 100+ times within a kernel.
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "for (uint c = (id.x & 31u); c < " << elems << "u; c += 32u) {";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint si = c / " << resTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint sj = c % " << resTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    if (perWarp) {
+      // Use translateVarName so SimdgroupIndexOp (and any
+      // UnrealizedConversionCast wrapper) resolves to `sgid`.
+      _output << "_stage_shared[";
+      translateVarName(warpIdx[0]);
+      _output << "][c] = ";
+    } else {
+      _output << "_stage_shared[c] = ";
+    }
+    translateVarName(op.getMemref());
+    _output << "[(";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << " + si) * ";
+    translateValue(op.getStride().getDefiningOp());
+    _output << " + ";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << " + sj]";
+    printDelim();
+  }
+  _output << "\n";
+  indent();
+  _output << "}\n";
+  indent();
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  _output << "\n";
+  indent();
+  emitSimdgroupMatrixType(_output, resTy);
+  _output << " v" << id;
+  printDelim();
+  _output << "\n";
+  indent();
+  if (perWarp) {
+    _output << "simdgroup_load(v" << id << ", &_stage_shared[";
+    translateVarName(warpIdx[0]);
+    _output << "][0], " << resTy.getCols() << ")";
+  } else {
+    _output << "simdgroup_load(v" << id << ", &_stage_shared[0], "
+            << resTy.getCols() << ")";
+  }
+  _alloca[op] = _varCount++;
+  printDelim();
+}
+
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupLoadOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
@@ -379,16 +522,30 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupLoadOp op) {
   _output << "\n";
   indent();
   _output << "simdgroup_load(v" << id << ", ";
-  translateVarName(op.getMemref());
+  // iter-8: emit pointer-arithmetic for the (origin_row, origin_col) offset
+  // instead of the ulong2 origin parameter. Empirical: `simdgroup_load(...,
+  // ulong2(col_off, 0), false)` with non-zero col_off and `device float *`
+  // src produces wrong results on Apple GPU family 9 / Metal 17.5 (probe10:
+  // chained K-loop sgmma accumulator loses contributions at specific
+  // output columns even when the load pattern is in-bounds). Folding the
+  // offset into `&ptr[row*stride + col]` bypasses the ulong2 origin
+  // entirely and the chained-accumulator pattern matches Apple's own
+  // matmul sample (https://developer.apple.com/documentation/metal/optimizing_compute_shaders_with_simdgroup_matrix).
+  if (isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol())) {
+    translateVarName(op.getMemref());
+  } else {
+    _output << "&(";
+    translateVarName(op.getMemref());
+    _output << "[";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << " * ";
+    translateValue(op.getStride().getDefiningOp());
+    _output << " + ";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << "])";
+  }
   _output << ", ";
   translateValue(op.getStride().getDefiningOp());
-  if (!(isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol()))) {
-    _output << ", ulong2(";
-    translateValue(op.getOriginCol().getDefiningOp());
-    _output << ", ";
-    translateValue(op.getOriginRow().getDefiningOp());
-    _output << "), false";
-  }
   _output << ")";
   _alloca[op] = _varCount++;
   printDelim();
@@ -398,14 +555,29 @@ void ModuleTranslation::translate(
     mlir::triton::metal::SimdgroupMultiplyAccumulateOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
-  // Declare-then-call form. The C operand aliases the destination
-  // semantically (modern API is dest-first 4-arg).
-  emitSimdgroupMatrixType(_output, resTy);
-  unsigned id = _varCount;
-  _output << " v" << id;
-  printDelim();
-  _output << "\n";
-  indent();
+  // iter-8 (Apple accumulator pattern): when the C operand has exactly one
+  // use (this sgmma) AND has a defining op with a stored variable name,
+  // reuse the C operand's MSL variable as the destination instead of
+  // declaring a fresh one. Emits `simdgroup_multiply_accumulate(vC, A, B,
+  // vC)` — the in-place form Apple's matmul sample uses
+  // (https://developer.apple.com/documentation/metal/optimizing_compute_shaders_with_simdgroup_matrix).
+  // Empirical: emitting `simdgroup_float8x8 vNew; sgmma(vNew, A, B, vC)`
+  // for a chained K-loop accumulator silently drops some output-column
+  // contributions on Apple GPU family 9 / Metal 17.5 (probe10: only some
+  // columns receive iter-1's contribution).
+  mlir::Operation *cDef = op.getC().getDefiningOp();
+  bool reuseC = cDef && op.getC().hasOneUse() && _alloca.count(cDef);
+  unsigned id;
+  if (reuseC) {
+    id = _alloca[cDef];
+  } else {
+    emitSimdgroupMatrixType(_output, resTy);
+    id = _varCount++;
+    _output << " v" << id;
+    printDelim();
+    _output << "\n";
+    indent();
+  }
   _output << "simdgroup_multiply_accumulate(v" << id << ", ";
   translateVarName(op.getA());
   _output << ", ";
@@ -413,24 +585,114 @@ void ModuleTranslation::translate(
   _output << ", ";
   translateVarName(op.getC());
   _output << ")";
-  _alloca[op] = _varCount++;
+  _alloca[op] = id;
   printDelim();
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
+  // AC2 partial-tile path: when the optional `m_extent`/`n_extent` UI32
+  // operands are present, emit a two-stage epilogue mirroring
+  // SimdgroupLoadDeviceStagedOp:
+  //   1. simdgroup_store into per-threadgroup scratch
+  //   2. threadgroup_barrier(mem_flags::mem_threadgroup)
+  //   3. coop-loop that scalar-copies only the lanes whose `(gi, gj)`
+  //      global coordinates satisfy `gi < m_extent && gj < n_extent` back
+  //      to the destination memref.
+  // Apple's simdgroup_store has no per-lane mask; this is the documented
+  // masked-tail pattern from Apple's matmul samples.
+  auto partialExtents = op.getPartialExtents();
+  if (partialExtents.size() == 2) {
+    mlir::Value mExtentVal = partialExtents[0];
+    mlir::Value nExtentVal = partialExtents[1];
+    auto matTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+        op.getMatrix().getType());
+    unsigned id = _varCount++;
+    unsigned elems = matTy.getRows() * matTy.getCols();
+
+    _output << "threadgroup " << typeToString(matTy.getElem())
+            << " _scratch_" << id << "[" << elems << "]";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "simdgroup_store(";
+    translateVarName(op.getMatrix());
+    _output << ", &_scratch_" << id << "[0], " << matTy.getCols() << ")";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "for (uint c = (id.x & 31u); c < " << elems << "u; c += 32u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "uint si = c / " << matTy.getCols() << "u";
+      printDelim();
+      _output << "\n";
+      indent();
+      _output << "uint sj = c % " << matTy.getCols() << "u";
+      printDelim();
+      _output << "\n";
+      indent();
+      _output << "uint gi = ";
+      translateValue(op.getOriginRow().getDefiningOp());
+      _output << " + si";
+      printDelim();
+      _output << "\n";
+      indent();
+      _output << "uint gj = ";
+      translateValue(op.getOriginCol().getDefiningOp());
+      _output << " + sj";
+      printDelim();
+      _output << "\n";
+      indent();
+      _output << "if (gi < ";
+      translateValue(mExtentVal.getDefiningOp());
+      _output << " && gj < ";
+      translateValue(nExtentVal.getDefiningOp());
+      _output << ") {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        translateVarName(op.getMemref());
+        _output << "[gi * ";
+        translateValue(op.getStride().getDefiningOp());
+        _output << " + gj] = _scratch_" << id << "[c]";
+        printDelim();
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+    return;
+  }
+
   _output << "simdgroup_store(";
   translateVarName(op.getMatrix());
   _output << ", ";
-  translateVarName(op.getMemref());
+  // iter-8: same pointer-arithmetic emission as SimdgroupLoadOp.
+  if (isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol())) {
+    translateVarName(op.getMemref());
+  } else {
+    _output << "&(";
+    translateVarName(op.getMemref());
+    _output << "[";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << " * ";
+    translateValue(op.getStride().getDefiningOp());
+    _output << " + ";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << "])";
+  }
   _output << ", ";
   translateValue(op.getStride().getDefiningOp());
-  if (!(isLiteralZero(op.getOriginRow()) && isLiteralZero(op.getOriginCol()))) {
-    _output << ", ulong2(";
-    translateValue(op.getOriginCol().getDefiningOp());
-    _output << ", ";
-    translateValue(op.getOriginRow().getDefiningOp());
-    _output << "), false";
-  }
   _output << ")";
   printDelim();
 }
@@ -3226,6 +3488,43 @@ void ModuleTranslation::translate(mlir::Region &region) {
   _output << "{";
   {
     INDENT();
+    // AC4 v6: emit a single shared threadgroup stage buffer at the top
+    // of the kernel body when any SimdgroupLoadDeviceStagedOp exists in
+    // the kernel. All staged loads reuse this buffer (each is bracketed
+    // by `threadgroup_barrier` for safe reuse). Without sharing, a
+    // 64×64 multi-tile kernel issues ≥128 staged loads, each with its
+    // own [num_warps][64] buffer (~1 KiB), exceeding Apple's threadgroup
+    // memory budget and crashing the Metal compiler with
+    // XPC_ERROR_CONNECTION_INTERRUPTED. Bit-identity for legacy 8×8
+    // single-tile kernels is preserved up to the buffer name (the
+    // shared buffer holds the same 64-element working set).
+    auto kernelOp =
+        mlir::dyn_cast<mlir::triton::metal::KernelOp>(region.getParentOp());
+    if (kernelOp && !_sharedStageBufferDeclared) {
+      mlir::triton::metal::SimdgroupLoadDeviceStagedOp firstStaged;
+      kernelOp.walk([&](mlir::triton::metal::SimdgroupLoadDeviceStagedOp op) {
+        firstStaged = op;
+        return mlir::WalkResult::interrupt();
+      });
+      if (firstStaged) {
+        auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+            firstStaged.getResult().getType());
+        unsigned elems = resTy.getRows() * resTy.getCols();
+        bool perWarp = !firstStaged.getWarpIndex().empty();
+        _output << "\n";
+        indent();
+        if (perWarp) {
+          int numWarps = mlir::triton::gpu::lookupNumWarps(firstStaged);
+          _output << "threadgroup " << typeToString(resTy.getElem())
+                  << " _stage_shared[" << numWarps << "][" << elems << "]";
+        } else {
+          _output << "threadgroup " << typeToString(resTy.getElem())
+                  << " _stage_shared[" << elems << "]";
+        }
+        printDelim();
+        _sharedStageBufferDeclared = true;
+      }
+    }
     for (auto &op : region.getOps()) {
       // L1d2b inline-barrier contract — boundary set:
       //   { metal.barrier, metal.tg_load_indexed, metal.tg_store_indexed }.
@@ -3602,6 +3901,13 @@ void ModuleTranslation::translateValue(Operation *opInst) {
                "scf.if result referenced before pre-declaration");
         _output << "v" << it->second;
       })
+      .Case<mlir::triton::metal::SimdgroupIndexOp>(
+          [&](mlir::triton::metal::SimdgroupIndexOp op) {
+            // AC4 v6: SimdgroupIndexOp resolves to the kernel parameter
+            // `sgid` (declared via [[simdgroup_index_in_threadgroup]] in
+            // translateKernel). It has no separate statement form.
+            _output << "sgid";
+          })
       .Default([&](Operation *) { llvm_unreachable("Unexpected operation"); });
 }
 

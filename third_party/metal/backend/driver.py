@@ -147,10 +147,20 @@ class MetalLauncher:
         for name, ty in sig.items():
             if ty == "constexpr":
                 constexpr_names.add(name)
-        # Build positional type list excluding constexprs.
+        # Build positional type list excluding constexprs AND specialized
+        # args (Triton drops constants like `stride_ak=1` from the kernel
+        # signature). The mask MUST be in fn_arg_names order so it can
+        # filter the positional `args` at launch time — without it, the
+        # later `zip(args, self._arg_types)` silently truncates and
+        # mis-aligns runtime args with the MSL buffer slots (iter-8c root
+        # cause for `[16,16,16] f32`: stride_bk was read from `v4[0]` but
+        # `v4` was actually bound to stride_ak=1, causing `simdgroup_load`
+        # for B to use stride 1 instead of the real stride).
+        self._arg_mask = [
+            (n in sig and n not in constexpr_names) for n in fn_arg_names
+        ]
         self._arg_types = [
-            sig[n] for n in fn_arg_names
-            if n in sig and n not in constexpr_names
+            sig[n] for n, keep in zip(fn_arg_names, self._arg_mask) if keep
         ]
         # num_warps × warp_size = threadgroup x-dim. Default to 4×32=128.
         nw = getattr(metadata, "num_warps", 4)
@@ -176,8 +186,12 @@ class MetalLauncher:
         # can copy results back + free at the end.
         buffer_handles = []
         tensor_pairs = []  # (handle, tensor) for d2h copy-back
+        # Filter `args` by the precomputed mask so the i-th launched buffer
+        # always corresponds to the i-th MSL `[[buffer(i)]]`, regardless of
+        # which positional args Triton specialized away upstream.
+        filtered_args = [a for a, keep in zip(args, self._arg_mask) if keep]
         try:
-            for i, (arg, ty) in enumerate(zip(args, self._arg_types)):
+            for i, (arg, ty) in enumerate(zip(filtered_args, self._arg_types)):
                 if _is_pointer_type(ty):
                     tensor = arg
                     if hasattr(tensor, "contiguous"):
@@ -188,7 +202,14 @@ class MetalLauncher:
                     host_tensor = tensor.cpu() if tensor.device.type != "cpu" else tensor
                     nbytes = host_tensor.numel() * host_tensor.element_size()
                     buf = _libmetal.alloc_buffer(nbytes)
-                    _libmetal.copy_h2d(buf, bytes(host_tensor.numpy().tobytes()))
+                    # numpy has no bfloat16 dtype, so bit-cast bf16 -> uint16
+                    # for transport. The MSL kernel sees the raw bytes as
+                    # `bfloat` per its arg decl; storage layout is identical.
+                    import torch as _torch
+                    serial = (host_tensor.view(_torch.uint16)
+                              if host_tensor.dtype == _torch.bfloat16
+                              else host_tensor)
+                    _libmetal.copy_h2d(buf, bytes(serial.numpy().tobytes()))
                     buffer_handles.append(buf)
                     tensor_pairs.append((buf, tensor, nbytes))
                 else:
@@ -210,10 +231,17 @@ class MetalLauncher:
             for buf, tensor, nbytes in tensor_pairs:
                 raw = _libmetal.copy_d2h(buf, nbytes)
                 import numpy as np
-                arr = np.frombuffer(raw, dtype=_torch_dtype_to_np(tensor.dtype))
-                arr = arr.reshape(tensor.shape)
-                # In-place copy into the tensor's storage.
-                tensor.copy_(_np_to_torch(arr))
+                import torch as _torch
+                if tensor.dtype == _torch.bfloat16:
+                    # numpy has no bf16; read as uint16 and re-view on torch side.
+                    arr = np.frombuffer(raw, dtype=np.uint16).reshape(tensor.shape)
+                    tmp = _torch.from_numpy(arr.copy()).view(_torch.bfloat16)
+                    tensor.copy_(tmp)
+                else:
+                    arr = np.frombuffer(raw, dtype=_torch_dtype_to_np(tensor.dtype))
+                    arr = arr.reshape(tensor.shape)
+                    # In-place copy into the tensor's storage.
+                    tensor.copy_(_np_to_torch(arr))
         finally:
             for buf in buffer_handles:
                 _libmetal.free_buffer(buf)

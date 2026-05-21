@@ -48,8 +48,18 @@ class MetalOptions:
             "num_warps must be a power of 2")
 
     def hash(self):
-        # Compact, version-bumpable identity for the options dataclass.
-        return "metal-stub-v1"
+        # AC4 v6: include num_warps (and other fields that drive code
+        # emission) so the on-disk cache key correctly distinguishes
+        # nw=1/2/4 compiles of the same source. Pre-AC4 this returned a
+        # constant stub, which made every multi-warp kernel collide with
+        # the first nw=1 compile in the in-process cache.
+        return (
+            f"metal-stub-v2-nw{self.num_warps}-nctas{self.num_ctas}"
+            f"-ns{self.num_stages}-ws{self.warp_size}-arch{self.arch}"
+            f"-precfp{self.default_dot_input_precision}"
+            f"-fpfuse{int(self.enable_fp_fusion)}"
+            f"-saniof{int(self.sanitize_overflow)}"
+        )
 
 
 # Upstream TritonGPU passes only parse target strings prefixed with "cuda:"

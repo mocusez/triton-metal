@@ -39,6 +39,9 @@ target_compile_options(triton-metal-translate PRIVATE ${TRITON_DISABLE_EH_RTTI_F
 target_link_libraries(triton-metal-translate PRIVATE
   MLIRTritonMetal
   MLIRTritonMetalTarget
+  # AC4 v6: pull in Triton/TritonGPU dialect libs since ModuleTranslation
+  # now calls triton::gpu::lookupNumWarps from MLIRTritonMetalTarget.
+  ${triton_libs}
   # MLIR translate infrastructure
   MLIRIR
   MLIRArithDialect

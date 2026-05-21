@@ -99,38 +99,42 @@ def dot_8x8_f32_kernel(
     tl.store(c_ptrs, acc)
 
 
-_ITER78_16_REASON = (
-    "iter-7 strideC fix INSUFFICIENT — empirically validated 2026-05-20. "
-    "iter-7 replaced the hardcoded `strideC = 8` at `TritonGPUToMetal.cpp:3265-3267` "
-    "with `findStrideSplatSource(store.getPtr()->addptr.getOffset())` + "
-    "`emitStrideOperand`, mirroring A/B at lines 3248-3249. Empirical result: "
-    "[16-16-16] still FAILS with 100% mismatch, 10.97 max abs diff at index (2,1) — "
-    "IDENTICAL to pre-fix failure. This means either (a) `findStrideSplatSource` "
-    "returns null for this C-store IR shape and `emitStrideOperand` falls back to "
-    "constant 8 (so the fix is inert), or (b) a different rewriter site emits "
-    "wrong strideC, or (c) the executor's iter-6 hypothesis about C-origin "
-    "extraction being broken is now the leading candidate (only `tgid.y * 8` "
-    "used, missing `tgid.x * 8` for the row axis). Next probe (deferred to "
-    "iter-8): add a temporary `llvm::errs()` dump of strideC + cOrig.row/col "
-    "in `tryUnrollCanonical3IterArgDot` and re-run `pytest [16-16-16] --runxfail`. "
-    "iter-7 code change for strideC is preserved as a strict improvement "
-    "(falls back to identical behavior when extraction null; positive for any "
-    "future case where extraction succeeds)."
-)
+# iter-8 ship state (2026-05-20):
+# - [8,8,8]: PASS
+# - [16,16,16]: PASS (xfail removed)
+#
+# Root cause of the residual iter-7 failure (resolved):
+# `third_party/metal/backend/driver.py`'s `MetalLauncher` built
+# `_arg_types` by filtering both constexpr AND specialized args (Triton
+# inlines `stride=1` as a constant and drops it from the kernel signature),
+# but then iterated `zip(args, self._arg_types)` over the FULL positional
+# args list — Python's zip silently truncated and mis-aligned the args
+# with MSL buffer slots, so `v4` (semantically stride_bk) was being bound
+# to the runtime value of stride_ak=1 instead. The simdgroup_load for B
+# then ran with stride=1 instead of the real stride, reading wrong data
+# and dropping iter-1's contribution at specific output columns. Fixed by
+# introducing `MetalLauncher._arg_mask` and filtering `args` by it before
+# the zip so positional alignment with `_arg_types` is preserved.
+#
+# Supporting iter-8 improvements that landed alongside the launcher fix
+# (correct and necessary for multi-threadgroup pid-driven origin handling):
+# - `findOriginScalarInPtrChain` / `findStrideSplatSourceInPtrChain` walk
+#   Triton's canonical 2-level matmul addptr chain
+#   `addptr(broadcast(addptr(splat(arg), inner_off)), outer_off)`
+#   (TritonGPUToMetal.cpp:3028-3084).
+# - `metal.simdgroup_matrix_zero` op emits `simdgroup_<elem><M>x<N>(0.0f)`
+#   constructor init for the accumulator (Apple's matmul/FA pattern).
+# - `metal.simdgroup_load_device_staged` op stages A/B tiles through
+#   threadgroup memory before simdgroup_load (Apple's FA pattern).
+# - SimdgroupMultiplyAccumulateOp emits `sgmma(acc, A, B, acc)` in-place
+#   accumulator pattern.
 
 
 @pytest.mark.parametrize(
     "M, N, K",
     [
         pytest.param(8, 8, 8),
-        pytest.param(
-            16,
-            16,
-            16,
-            marks=pytest.mark.xfail(
-                strict=True, reason=_ITER78_16_REASON
-            ),
-        ),
+        pytest.param(16, 16, 16),
     ],
 )
 def test_dot_f32_8x8(M, N, K):

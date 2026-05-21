@@ -1392,6 +1392,34 @@ CommandQueueMakeCommandBufferOp::parse(mlir::OpAsmParser &parser,
 }
 
 //===----------------------------------------------------------------------===//
+// SimdgroupLoadDeviceStagedOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult SimdgroupLoadDeviceStagedOp::verify() {
+  auto widx = getWarpIndex();
+  if (widx.size() > 1)
+    return emitOpError()
+           << "warp_index must be empty (single-warp / bit-identical) or "
+              "exactly 1 value (per-warp staged-load); got "
+           << widx.size();
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// SimdgroupStoreOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult SimdgroupStoreOp::verify() {
+  auto extents = getPartialExtents();
+  if (!extents.empty() && extents.size() != 2)
+    return emitOpError()
+           << "partial_extents must be empty (full 8x8 store) or exactly 2 "
+              "values [m_extent, n_extent]; got "
+           << extents.size();
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // TableGen's op method definitions
 //===----------------------------------------------------------------------===//
 

@@ -828,6 +828,69 @@ def CommandBufferWaitUntilCompletedOp : Metal_Op<"command_buffer_wait_until_comp
 // See `.omc/specs/deep-interview-metal-matmul-session2-simdgroup-scaffold.md`.
 //===----------------------------------------------------------------------===//
 
+def SimdgroupLoadDeviceStagedOp : Metal_Op<"simdgroup_load_device_staged"> {
+  let summary = "Stage a tile from device memory through threadgroup memory, then simdgroup_load";
+  let description = [{
+    Cooperative copy of an 8x8 tile from `device T*` into a threadgroup-shared
+    buffer, followed by `simdgroup_load` from that buffer. Apple's matmul +
+    flash-attention samples (and the in-tree FA emitter at
+    ModuleTranslation.cpp:1340-1395) only chain `simdgroup_multiply_accumulate`
+    on simdgroup_matrix values loaded from `threadgroup T*`. Direct chained
+    sgmma on values loaded from `const device T*` silently drops output-column
+    contributions on Apple GPU family 9 / Metal 17.5 (iter-8 root cause for
+    [16,16,16] K_TILES>=2). This op encapsulates the staging block so the
+    matcher emits a single IR node and the emitter expands it into:
+      threadgroup float _stage_N[64];
+      for (uint c = (id.x & 31u); c < 64u; c += 32u) {
+        _stage_N[c] = src[(origin_row + c/8u) * stride + (origin_col + c%8u)];
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_<elem><M>x<N> vN;
+      simdgroup_load(vN, &_stage_N[0], 8);
+  }];
+
+  let arguments = (ins Metal_MemRefType:$memref, UI32:$origin_row,
+                       UI32:$origin_col, UI32:$stride,
+                       Variadic<UI32>:$warp_index);
+  let results = (outs Metal_SimdgroupMatrixType:$result);
+
+  let assemblyFormat = "$memref `[` $origin_row `,` $origin_col `]` `,` $stride"
+                       " (`warp` `[` $warp_index^ `]`)?"
+                       " attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
+}
+
+def SimdgroupIndexOp : Metal_Op<"simdgroup_index", [Pure]> {
+  let summary = "Threadgroup-local SIMD-group (warp) index";
+  let description = [{
+    Returns Apple's `simdgroup_index_in_threadgroup` builtin (UI32).
+    The value is invariant over the kernel region and CSE'able across
+    uses within the same kernel; `Pure` is conservatively correct.
+  }];
+
+  let arguments = (ins);
+  let results = (outs UI32:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def SimdgroupMatrixZeroOp : Metal_Op<"simdgroup_matrix_zero", [Pure]> {
+  let summary = "SIMD-group matrix initialized to zero via constructor";
+  let description = [{
+    Materializes `simdgroup_matrix<T, M, N>(0.0)` directly. The Apple
+    matmul / flash-attention samples initialize the accumulator this way
+    instead of via `simdgroup_load` from a pre-zeroed device buffer; the
+    constructor-init pattern is the only form that chained
+    `simdgroup_multiply_accumulate` calls accumulate correctly across all
+    output columns on Apple GPU family 9 / Metal 17.5.
+  }];
+
+  let arguments = (ins);
+  let results = (outs Metal_SimdgroupMatrixType:$result);
+
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
 def SimdgroupLoadOp : Metal_Op<"simdgroup_load", [Pure]> {
   let summary = "Cooperative SIMD-group load of a matrix tile from device memory";
 
@@ -855,12 +918,27 @@ def SimdgroupMultiplyAccumulateOp
 def SimdgroupStoreOp : Metal_Op<"simdgroup_store"> {
   let summary = "Cooperative SIMD-group store of a matrix tile to device memory";
 
+  let description = [{
+    Stores an 8x8 SIMD-group matrix tile to a memref. When the variadic
+    `partial_extents` operand list is non-empty (must be exactly 2 UI32
+    values `[m_extent, n_extent]`), the lowering emits a two-stage
+    epilogue: simdgroup_store -> per-threadgroup scratch, then a
+    cooperative coop-loop that writes only the lanes whose global
+    `(gi, gj)` satisfy `gi < m_extent && gj < n_extent` back to the
+    destination memref. This is the AC2 masked-tail path for kernels
+    whose `tt.store` carries a `(offs_m < M) & (offs_n < N)` mask.
+  }];
+
   let arguments = (ins Metal_SimdgroupMatrixType:$matrix,
                        Metal_MemRefType:$memref, UI32:$origin_row,
-                       UI32:$origin_col, UI32:$stride);
+                       UI32:$origin_col, UI32:$stride,
+                       Variadic<UI32>:$partial_extents);
 
   let assemblyFormat = "$matrix `,` $memref `[` $origin_row `,` $origin_col `]`"
-                       " `,` $stride attr-dict `:` type(operands)";
+                       " `,` $stride (`partial` `[` $partial_extents^ `]`)?"
+                       " attr-dict `:` type(operands)";
+
+  let hasVerifier = 1;
 }
 
 #endif // METAL_OPS

@@ -39,8 +39,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // Post-pass: simdgroup chain emitted, all dot-feeding cvts eliminated.
+// dense<0.0> C-init becomes simdgroup_matrix_zero; A/B become device-staged.
 // CHECK-LABEL: metal.kernel dot_preempt_single
-// CHECK-COUNT-3: metal.simdgroup_load
+// CHECK-COUNT-2: metal.simdgroup_load_device_staged
+// CHECK: metal.simdgroup_matrix_zero
 // CHECK: metal.simdgroup_multiply_accumulate
 // CHECK: metal.simdgroup_store
 // CHECK: metal.return

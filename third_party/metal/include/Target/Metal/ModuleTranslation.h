@@ -57,6 +57,16 @@ private:
   // because the emitter walks ops in IR order without statement-level
   // re-ordering. See `.omc/specs/deep-interview-leet-triton-l1d2b-...md`.
   std::map<mlir::Operation *, unsigned> _letBound;
+  // AC4 v6: emit ONE threadgroup buffer per kernel that all
+  // SimdgroupLoadDeviceStagedOp calls reuse, instead of one buffer per
+  // call. With 64×64 multi-tile multi-warp kernels each warp issues
+  // O(mTiles/warpsM × nTiles/warpsN × K_TILES × 2) staged loads (≥128);
+  // per-call buffers exceed Apple's threadgroup memory budget and crash
+  // the Metal compiler (XPC_ERROR_CONNECTION_INTERRUPTED). Each staged
+  // load brackets its coop-load with `threadgroup_barrier` so the shared
+  // buffer can be safely reused. Tracked here so the kernel-body walker
+  // emits the declaration exactly once.
+  bool _sharedStageBufferDeclared = false;
   unsigned _varCount = 0;
   bool inWhileCondition = false;
   int _curIndent = 0;
@@ -116,6 +126,9 @@ private:
   // (`simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`).
   // The legacy `_matrix`-suffixed names are rejected by the current MSL
   // compiler — see comment block in ModuleTranslation.cpp.
+  void translate(mlir::triton::metal::SimdgroupIndexOp op);
+  void translate(mlir::triton::metal::SimdgroupMatrixZeroOp op);
+  void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedOp op);
   void translate(mlir::triton::metal::SimdgroupLoadOp op);
   void translate(mlir::triton::metal::SimdgroupMultiplyAccumulateOp op);
   void translate(mlir::triton::metal::SimdgroupStoreOp op);

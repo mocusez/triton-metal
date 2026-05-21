@@ -2,7 +2,8 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
 // Matmul Track Sessions 3a+3b: tt.dot preprocessing rewrites the (load A,
-// load B, dot, store) chain into (metal.simdgroup_load × 3,
+// load B, dot, store) chain into (metal.simdgroup_load_device_staged × 2
+// for A/B, metal.simdgroup_matrix_zero for the dense<0.0> C-init,
 // metal.simdgroup_multiply_accumulate, metal.simdgroup_store), and the
 // MSL emitter renders the chain end-to-end with the canonical Metal
 // function-call substrings. Single-K-iter 8×8×8.
@@ -35,12 +36,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// The new pre-pass replaces the (load, load, dot, store) chain with three
-// simdgroup_load ops (one each for A, B, and the C-init accumulator),
-// one multiply_accumulate, and one simdgroup_store.
+// The pre-pass replaces the (load, load, dot, store) chain with two
+// simdgroup_load_device_staged ops (for A and B, threadgroup-staged), one
+// simdgroup_matrix_zero (the dense<0.0> C-init shortcut), one
+// multiply_accumulate, and one simdgroup_store.
 // CHECK: metal.module
 // CHECK: metal.kernel matmul_8x8x8
-// CHECK-COUNT-3: metal.simdgroup_load
+// CHECK-COUNT-2: metal.simdgroup_load_device_staged
+// CHECK: metal.simdgroup_matrix_zero
 // CHECK: metal.simdgroup_multiply_accumulate
 // CHECK: metal.simdgroup_store
 // CHECK: metal.return
@@ -49,9 +52,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // substrings appear in the rendered kernel (iter-6 emitter modernization:
 // `simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`
 // replace the legacy `_matrix`-suffixed names which Metal 17.5 no longer
-// declares).
+// declares). With device-staged loads each A/B tile triggers one
+// `simdgroup_load(` from the shared threadgroup buffer (2 total); the
+// dense<0.0> C-init is the zero-constructor and emits no simdgroup_load.
 // MSL: kernel void matmul_8x8x8
-// MSL-COUNT-3: simdgroup_load(
+// MSL-COUNT-2: simdgroup_load(
 // MSL: simdgroup_multiply_accumulate(
 // MSL: simdgroup_store(
 // MSL: return
