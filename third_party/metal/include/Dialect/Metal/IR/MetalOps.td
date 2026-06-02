@@ -275,6 +275,23 @@ def ThreadgroupIdOp : Metal_Op<"threadgroup_id", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// ThreadgroupsPerGridOp - maps to MSL [[threadgroups_per_grid]]
+//===----------------------------------------------------------------------===//
+
+def ThreadgroupsPerGridOp : Metal_Op<"threadgroups_per_grid", [Pure]> {
+  let summary = "Number of threadgroups in grid along a dimension (a.k.a. num_programs)";
+
+  let arguments = (ins StrAttr:$dimension);
+  let results = (outs UI32);
+
+  let builders = [OpBuilder<(ins "StringRef":$dimension)>];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$dimension attr-dict `:` type(results)";
+}
+
+//===----------------------------------------------------------------------===//
 // CastOp
 //===----------------------------------------------------------------------===//
 
@@ -341,6 +358,12 @@ def BinaryExpOperatorGt : I64EnumAttrCase<"gtOp", 9>;
 def BinaryExpOperatorGe : I64EnumAttrCase<"geOp", 10>;
 def BinaryExpOperatorAnd : I64EnumAttrCase<"andOp", 11>;
 def BinaryExpOperatorOr : I64EnumAttrCase<"orOp", 12>;
+// Rank-1 reduce extension (spec
+// `.omc/specs/deep-interview-metal-rank1-reduce.md`): emit MSL `max(a, b)`
+// via the function-call form so combinators like `arith.maximumf` / `arith.
+// maxsi` can lower to a single BinaryExp node, mirroring how `addOp`
+// lowers to `(a) + (b)` for `arith.addf` / `arith.addi`.
+def BinaryExpOperatorMax : I64EnumAttrCase<"maxOp", 13>;
 
 def BinaryExpOperator : I64EnumAttr<
     "BinaryExpOperator", "",
@@ -356,7 +379,8 @@ def BinaryExpOperator : I64EnumAttr<
      BinaryExpOperatorGt,
      BinaryExpOperatorGe,
      BinaryExpOperatorAnd,
-     BinaryExpOperatorOr]> {
+     BinaryExpOperatorOr,
+     BinaryExpOperatorMax]> {
   let cppNamespace = "mlir::triton::metal";
 }
 

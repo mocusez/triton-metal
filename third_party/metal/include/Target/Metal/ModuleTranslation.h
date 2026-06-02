@@ -41,6 +41,16 @@ private:
   // The induction var BlockArgument is registered in `_buffers` so
   // `translateVarName(iv)` prints `v<idx>`.
   std::map<mlir::Operation *, unsigned> _scfForIv;
+  // Wall 15: maps an `scf.for` op carrying ONE f32 iter_arg to the temp
+  // index of its emitted MSL accumulator. The init is emitted as
+  // `float v<idx> = init;` before the C-style `for`; the matching
+  // `scf.yield` emits `v<idx> = yielded;` inside the body. The region
+  // iter-arg BlockArgument is registered in `_buffers` mapped to this
+  // idx so reads inside the body resolve to `v<idx>`. Empty for ForOps
+  // with zero iter_args (matmul / vector_add tile loops) — those keep
+  // the existing IV-only emission. See
+  // .omc/plans/tutorial02-wall15-iter-args-translator-consensus.md AC1.
+  std::map<mlir::Operation *, unsigned> _scfForIterArg;
   // L1d2b inline-barrier contract: maps an op whose result has been
   // force-materialized as a named MSL let-binding to that temp's index.
   // Currently populated for `metal.tg_load_indexed` at statement-walk
@@ -112,11 +122,18 @@ private:
   void translate(mlir::Region &region);
 
   void translateValue(Operation *opInst);
+  // Wall 15: dispatch helper for operands that may be either an op-result
+  // (defining op exists → translateValue) or a BlockArgument such as a
+  // region iter-arg or induction variable (no defining op → translateVarName
+  // via the `_buffers` mapping). Callsites that may consume iter-args MUST
+  // route through this helper to avoid null-deref in translateValue.
+  void translateValueOrVarName(mlir::Value v);
   void translate(mlir::triton::metal::ConstantOp op);
   void translate(mlir::triton::metal::GetElementOp op);
   void translate(mlir::triton::metal::TgLoadIndexedOp op);
   void translate(mlir::triton::metal::ThreadIdOp op);
   void translate(mlir::triton::metal::ThreadgroupIdOp op);
+  void translate(mlir::triton::metal::ThreadgroupsPerGridOp op);
   void translate(mlir::triton::metal::CastOp op);
   void translate(mlir::triton::metal::UnaryExpOp op);
   void translate(mlir::triton::metal::BinaryExpOp op);

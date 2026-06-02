@@ -27,6 +27,23 @@ struct Indent {
   Indent level_(_curIndent);                                                   \
   indent();
 
+// `xcrun metal` rejects `-inf` / `inf` / `nan` (the textual output of
+// `APFloat::convertToDouble()` for non-finite floats), so FloatAttr emission
+// sites must route through this helper. Finite values fall through to the
+// existing `<<` formatter to preserve precision contracts elsewhere in the TU.
+static void emitFloatLiteral(llvm::raw_ostream &os, mlir::FloatAttr attr) {
+  const llvm::APFloat &v = attr.getValue();
+  if (v.isNaN()) {
+    os << "NAN";
+    return;
+  }
+  if (v.isInfinity()) {
+    os << (v.isNegative() ? "-INFINITY" : "INFINITY");
+    return;
+  }
+  os << attr.getValueAsDouble();
+}
+
 static llvm::StringRef typeToString(mlir::Type type) {
   if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(type))
     switch (intTy.getWidth()) {
@@ -195,6 +212,18 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   });
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
+  // Conditionally add the threadgroups-per-grid parameter only when the
+  // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
+  // usesThreadgroupId walk above; keeps existing single-program fixtures'
+  // MSL signatures unchanged. See
+  // `.omc/plans/tutorial02-fused-softmax-fix-consensus.md`.
+  bool usesThreadgroupsPerGrid = false;
+  op.walk([&](mlir::triton::metal::ThreadgroupsPerGridOp) {
+    usesThreadgroupsPerGrid = true;
+    return mlir::WalkResult::interrupt();
+  });
+  if (usesThreadgroupsPerGrid)
+    _output << ",\n  uint3 tgpg [[threadgroups_per_grid]]";
   // AC4 v6: conditionally add the SIMD-group index parameter when any
   // SimdgroupIndexOp is referenced in the body. `simdgroup_index_in_threadgroup`
   // is an MSL parameter attribute (cf. MSL Spec §5.8) — it cannot be referenced
@@ -764,6 +793,34 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
   // emitted temp name. Trip-count bounds are translated via the existing
   // arith.constant path; non-constant bounds fall through to the
   // generic Operation translator.
+  //
+  // Wall 15: when the scf.for carries exactly one f32 scalar iter_arg
+  // (the rank-1 reduce accumulator), emit `float v<accIdx> = init;` BEFORE
+  // the C-style for line; map the region iter-arg BlockArgument into
+  // `_buffers` so reads inside the body resolve to v<accIdx>; and record
+  // the mapping in `_scfForIterArg` so the matching scf.yield can emit
+  // `v<accIdx> = yielded;`. Multi-iter_arg or non-f32 iter_arg falls
+  // through to the existing IV-only emission unchanged. See
+  // .omc/plans/tutorial02-wall15-iter-args-translator-consensus.md AC1/AC2.
+  if (op.getNumRegionIterArgs() == 1 &&
+      op.getRegionIterArgs()[0].getType().isF32()) {
+    unsigned accIdx = _varCount++;
+    _scfForIterArg[op.getOperation()] = accIdx;
+    auto iterArg = op.getRegionIterArgs()[0];
+    _buffers[iterArg.getAsOpaquePointer()] = accIdx;
+    // The loop's final result (op.getResult(0)) is the same MSL temp once
+    // the loop exits — register it so downstream `translateVarName` /
+    // `translateValueOrVarName` on the scf.for result renders `v<accIdx>`.
+    _buffers[op.getResult(0).getAsOpaquePointer()] = accIdx;
+    _output << "float v" << accIdx << " = ";
+    if (auto initOp = op.getInitArgs()[0].getDefiningOp())
+      translateValue(initOp);
+    else
+      translateVarName(op.getInitArgs()[0]);
+    _output << ";\n";
+    indent();
+  }
+
   unsigned idx = _varCount++;
   _scfForIv[op.getOperation()] = idx;
   auto iv = op.getInductionVar();
@@ -789,17 +846,35 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
 }
 
 void ModuleTranslation::translate(mlir::scf::YieldOp op) {
-  auto parentIf =
-      llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp());
-  if (!parentIf || parentIf.getNumResults() == 0)
-    return; // no-op for void scf.if
-  // Single-result fast path: assign the yielded value to the temp var.
-  auto it = _scfIfTemp.find(parentIf.getOperation());
-  assert(it != _scfIfTemp.end() &&
-         "scf.yield: parent scf.if has no temp var pre-declared");
-  _output << "v" << it->second << " = ";
-  translateValue(op.getOperand(0).getDefiningOp());
-  _output << ";";
+  // scf::IfOp parent: existing single-result assignment path.
+  if (auto parentIf =
+          llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp())) {
+    if (parentIf.getNumResults() == 0)
+      return; // no-op for void scf.if
+    auto it = _scfIfTemp.find(parentIf.getOperation());
+    assert(it != _scfIfTemp.end() &&
+           "scf.yield: parent scf.if has no temp var pre-declared");
+    _output << "v" << it->second << " = ";
+    translateValueOrVarName(op.getOperand(0));
+    _output << ";";
+    return;
+  }
+  // Wall 15: scf::ForOp parent with one f32 iter_arg — assign the yielded
+  // value back to the iter_arg temp registered in _scfForIterArg. Loops
+  // with zero iter_args (matmul / vector_add tile loops) are no-ops here
+  // and stay byte-identical to the pre-Wall-15 emission.
+  if (auto parentFor =
+          llvm::dyn_cast_or_null<mlir::scf::ForOp>(op->getParentOp())) {
+    if (op.getNumOperands() != 1)
+      return; // zero iter_args or multi-iter_arg: not supported, no-op
+    auto it = _scfForIterArg.find(parentFor.getOperation());
+    if (it == _scfForIterArg.end())
+      return; // not a single-f32-iter_arg loop
+    _output << "v" << it->second << " = ";
+    translateValueOrVarName(op.getOperand(0));
+    _output << ";";
+    return;
+  }
 }
 
 // Emit MSL that loads one packed weight value q (an unsigned integer in
@@ -3571,6 +3646,21 @@ void ModuleTranslation::translate(mlir::Region &region) {
   _output << "}";
 }
 
+// Wall 15: dispatch helper — for operands that may be either an op-result
+// (use `translateValue(definingOp)`) OR a BlockArgument like a region
+// iter-arg / induction variable (use `translateVarName(value)` which
+// renders `v<idx>` from `_buffers`). The pre-Wall-15 op translators
+// (BinaryExpOp etc.) called `translateValue(value.getDefiningOp())`
+// unconditionally and crashed on BlockArgument operands; the re-rolled
+// rank-1 reduce body's combine step has the iter-arg BlockArgument as
+// LHS, so callsites consuming iter-args MUST route through this helper.
+void ModuleTranslation::translateValueOrVarName(mlir::Value v) {
+  if (auto *defOp = v.getDefiningOp())
+    translateValue(defOp);
+  else
+    translateVarName(v);
+}
+
 void ModuleTranslation::translateValue(Operation *opInst) {
   // L1d2b inline-barrier contract: if this op's result has been
   // force-materialized as an MSL let-binding (see `translate(Region&)`),
@@ -3585,11 +3675,24 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       return;
     }
   }
+  // Wall 15: if this op's result has been mapped into `_buffers` (e.g. an
+  // `scf.for` carrying a single f32 iter_arg, whose result is the loop's
+  // final-value MSL temp), render the use as the buffer name. This keeps
+  // downstream consumers (`metal.store`, `metal.binary_exp`, etc.) from
+  // re-translating the scf.for op as an expression.
+  if (opInst->getNumResults() == 1) {
+    auto it = _buffers.find(opInst->getResult(0).getAsOpaquePointer());
+    if (it != _buffers.end()) {
+      _output << "v" << it->second;
+      return;
+    }
+  }
   llvm::TypeSwitch<Operation *>(opInst)
       .Case<mlir::triton::metal::ConstantOp, mlir::triton::metal::GetElementOp,
             mlir::triton::metal::TgLoadIndexedOp,
             mlir::triton::metal::ThreadIdOp,
             mlir::triton::metal::ThreadgroupIdOp,
+            mlir::triton::metal::ThreadgroupsPerGridOp,
             mlir::triton::metal::CastOp,
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
@@ -3677,7 +3780,7 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue()))
           _output << v.getValue();
         else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
-          _output << v.getValueAsDouble();
+          emitFloatLiteral(_output, v);
         else
           llvm_unreachable("Unexpected arith.constant attribute kind");
       })
@@ -3917,7 +4020,7 @@ void ModuleTranslation::translate(mlir::triton::metal::ConstantOp op) {
   else if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue()))
     _output << v.getValue();
   else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
-    _output << v.getValueAsDouble();
+    emitFloatLiteral(_output, v);
   else
     llvm_unreachable("Unexpected constant");
 }
@@ -3935,6 +4038,10 @@ void ModuleTranslation::translate(mlir::triton::metal::ThreadIdOp op) {
 
 void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupIdOp op) {
   _output << "tgid." << op.getDimension();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupsPerGridOp op) {
+  _output << "tgpg." << op.getDimension();
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::CastOp op) {
@@ -3993,11 +4100,23 @@ void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
+  using OP = mlir::triton::metal::BinaryExpOperator;
+  // maxOp lowers to MSL's `max(a, b)` function call (rank-1 reduce spec
+  // `.omc/specs/deep-interview-metal-rank1-reduce.md`). All other ops
+  // lower to an infix C operator.
+  if (op.getBinaryOperator() == OP::maxOp) {
+    _output << "max(";
+    translateValueOrVarName(op.getLhs());
+    _output << ", ";
+    translateValueOrVarName(op.getRhs());
+    _output << ")";
+    return;
+  }
+
   _output << "(";
-  translateValue(op.getLhs().getDefiningOp());
+  translateValueOrVarName(op.getLhs());
   _output << ") ";
 
-  using OP = mlir::triton::metal::BinaryExpOperator;
   switch (op.getBinaryOperator()) {
   case OP::addOp:
     _output << "+";
@@ -4038,10 +4157,12 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   case OP::orOp:
     _output << "||";
     break;
+  case OP::maxOp:
+    llvm_unreachable("maxOp handled above via function-call form");
   }
 
   _output << " (";
-  translateValue(op.getRhs().getDefiningOp());
+  translateValueOrVarName(op.getRhs());
   _output << ")";
 }
 

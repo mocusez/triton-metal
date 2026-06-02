@@ -1,11 +1,12 @@
 name: Wheels
 on:
+  # TEMP: auto-triggers disabled (keep only macOS/Metal CI). Restore block below to re-enable.
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .github/workflows/wheels.yml
-  schedule:
-    - cron: "0 8 * * *"
+  # pull_request:
+  #   paths:
+  #     - .github/workflows/wheels.yml
+  # schedule:
+  #   - cron: "0 8 * * *"
 
 permissions: read-all
 

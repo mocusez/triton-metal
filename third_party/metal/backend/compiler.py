@@ -162,6 +162,16 @@ class MetalBackend(BaseBackend):
             options.num_ctas,
         )
         passes.ttgpuir.add_coalesce(pm)
+        # Phase A/B (`.omc/specs/deep-interview-phase-bcd-rethink.md`):
+        # the dormant `tritongpu-propagate-coalesced-layouts` pass removes
+        # the convert_layout that the upstream Coalesce inserts between
+        # the coalesced load and its consumer when the consumer is a
+        # rank-1 `tt.reduce`. With the target gate set to `metal:`, this
+        # pass is a no-op for non-Metal backends; on Metal it is currently
+        # a no-op for all green tests too because the Coalesce promotion
+        # only fires for BLOCK > tpb regimes (which are xfailed pending a
+        # load-lowering refactor — see `.omc/research/ac5-load-store-audit.md`).
+        passes.ttgpuir.add_propagate_coalesced_layouts(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.common.add_canonicalizer(pm)
@@ -176,7 +186,12 @@ class MetalBackend(BaseBackend):
         # launch path expects (CompiledKernel._init_handles +
         # CudaLauncher-shape attrs). We don't run shared/tmem allocation
         # passes, so these are zero.
-        metadata.setdefault("shared", 0)
+        # Floor `shared` to 1: CUDA-style tutorials (e.g. 02-fused-softmax)
+        # compute occupancy via `SIZE_SMEM // size_smem`, which zero-divides
+        # when the kernel uses no threadgroup memory. We don't run a shared
+        # allocator, so without the floor `shared` stays 0. See
+        # `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC5/R6/R6b.
+        metadata["shared"] = max(metadata.get("shared", 0), 1)
         metadata.setdefault("tmem_size", 0)
         metadata.setdefault("global_scratch_size", 0)
         metadata.setdefault("global_scratch_align", 1)

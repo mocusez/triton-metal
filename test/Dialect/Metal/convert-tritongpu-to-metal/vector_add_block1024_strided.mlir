@@ -47,11 +47,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // METAL: metal.get_element
 // METAL: metal.return
 
-// Post-Lmultiload-Phase-C: 1D canonical short-circuit deleted. MakeRange
-// emits the strided per-iter form `localTid + iv*tpb`; AddPtr accumulates
-// `pid*BLOCK + (localTid + iv*tpb)`. The mask compare still rebuilds
-// against `id.x` directly. See `.omc/specs/deep-interview-lmultiload-
-// phase-c-makerange.md`.
+// Wall 13 fix (.omc/specs/deep-interview-tutorial02-walls-9-to-13.md AC8):
+// MakeRange now emits `localTid + iv*tpb` for BOTH the load index and the
+// mask predicate (was global `id.x + iv*128` pre-fix). For vector_add, the
+// load index combines this with `pid*BLOCK` via AddPtr chained accumulation.
 // MSL: kernel void add_kernel_strided(
 // MSL: device float *v{{[0-9]+}}
 // MSL: device float *v{{[0-9]+}}
@@ -60,6 +59,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
 // MSL: for (int v{{[0-9]+}} = 0; v{{[0-9]+}} < 8; v{{[0-9]+}} += 1)
-// MSL: if (((id.x + (v{{[0-9]+}} * 128)) < v{{[0-9]+}}[0]))
+// MSL: if ((((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)) < v{{[0-9]+}}[0]))
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[((tgid.x * 1024) + ((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)))];
 // MSL: return;

@@ -16,8 +16,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(
@@ -70,3 +70,38 @@ def _run_one(N: int = 4096, K: int = 7, BLOCK: int = 1024) -> None:
 @pytest.mark.parametrize("run_idx", range(5))
 def test_scalar_load_conv1d_shape_bit_exact(run_idx: int) -> None:
     _run_one(N=4096, K=7, BLOCK=1024)
+
+
+# Driver smoke that `tl.load(..., other=-float('inf'))` compiles past
+# `xcrun metal` and that the masked-out tail loads as -inf.
+
+
+@triton.jit
+def _masked_load_neg_inf_other_kernel(
+    in_ptr,
+    out_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(in_ptr + offs, mask=offs < N, other=-float("inf"))
+    tl.store(out_ptr + offs, x)
+
+
+@pytest.mark.parametrize("N,BLOCK", [(100, 128), (200, 256), (700, 1024)])
+def test_masked_load_with_neg_inf_other(N: int, BLOCK: int) -> None:
+    torch.manual_seed(N)
+    inp = torch.randn(N, dtype=torch.float32, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.float32, device="mps")
+    _masked_load_neg_inf_other_kernel[(1,)](inp, out, N, BLOCK)
+
+    # In-range entries match the input bit-exactly.
+    assert torch.equal(out[:N], inp), (
+        f"N={N},BLOCK={BLOCK}: in-range mismatch; max abs err="
+        f"{(out[:N] - inp).abs().max().item()}"
+    )
+    # Out-of-range tail is the masked `other` value: -inf.
+    tail = out[N:]
+    assert torch.all(torch.isinf(tail) & (tail < 0)), (
+        f"N={N},BLOCK={BLOCK}: tail should be -inf, got {tail[:8].tolist()}"
+    )

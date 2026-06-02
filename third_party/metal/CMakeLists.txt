@@ -23,16 +23,14 @@ add_subdirectory(cli)
 
 if(TRITON_BUILD_PYTHON_MODULE)
   set(_TRITON_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/triton_metal.cc)
-  # On Darwin, link the Metal-runtime layer (Objective-C++ wrapping
-  # MTLDevice / MTLBuffer / dispatch). Non-Darwin builds omit it; the
-  # Python-side gate is `hasattr(libmetal, "launch_kernel")`.
+  # On Darwin, link the Metal-runtime layer (C++ over the header-only
+  # metal-cpp bindings wrapping MTLDevice / MTLBuffer / dispatch). Non-Darwin
+  # builds omit it; the Python-side gate is
+  # `hasattr(libmetal, "launch_kernel")`.
   # See `.omc/specs/deep-interview-metal-gpu-launch.md`.
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     list(APPEND _TRITON_METAL_SOURCES
-         ${CMAKE_CURRENT_SOURCE_DIR}/lib/Runtime/Runtime.mm)
-    set_source_files_properties(
-      ${CMAKE_CURRENT_SOURCE_DIR}/lib/Runtime/Runtime.mm
-      PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+         ${CMAKE_CURRENT_SOURCE_DIR}/lib/Runtime/Runtime.cpp)
   endif()
   add_triton_plugin(TritonMetal ${_TRITON_METAL_SOURCES})
   target_link_libraries(TritonMetal PRIVATE

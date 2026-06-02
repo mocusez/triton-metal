@@ -15,6 +15,42 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
 
+def _install_torch_cpu_stream_shim():
+    """Inject no-op `Stream` / `set_stream` attributes on `torch.cpu`.
+
+    CUDA-style tutorials (e.g. `leet-triton/tutorials_python/02-fused-softmax.py`)
+    call `getattr(torch, DEVICE.type).Stream()` and `set_stream(...)`. Metal's
+    `get_active_torch_device()` returns `torch.device("cpu")`, but PyTorch's
+    `torch.cpu` namespace lacks `Stream`/`set_stream`. The shim is a no-op
+    because `triton.testing.do_bench` already drives synchronization via
+    `driver.active.get_device_interface().synchronize()`.
+
+    Function-local `import torch` matches the convention in this module
+    (see other `import torch` sites at driver.py:296, :322, :344, :357, :400).
+    `hasattr`-guarded so a future real `torch.cpu.Stream` is never overwritten.
+    See `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC7/AC7a/R3.
+    """
+    import torch
+    cpu = torch.cpu
+    if not hasattr(cpu, "Stream"):
+        class _NoopStream:
+            def synchronize(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        cpu.Stream = _NoopStream
+    if not hasattr(cpu, "set_stream"):
+        cpu.set_stream = lambda _stream: None
+
+
+_install_torch_cpu_stream_shim()
+
+
 # Floor for _PerfCounterEvent.elapsed_time. triton.testing.do_bench computes
 # `estimate_ms = elapsed_time(...) / 5` then `n_warmup = max(1, int(warmup /
 # estimate_ms))` (testing.py:278-282). Two failure modes drive this floor:
@@ -189,7 +225,13 @@ class MetalUtils:
         # all of them. The launcher receives `function` = pso_handle and uses
         # it directly to launch.
         module = (lib_handle, fn_handle, pso_handle)
-        return module, pso_handle, 0, 0, int(max_threads)
+        # n_regs=32 floor: Apple-GPU register counts are not exposed by the
+        # public Metal API, but CUDA-style tutorials compute occupancy via
+        # `NUM_REGS // (n_regs * WARP_SIZE * num_warps)` which zero-divides on
+        # 0. 32 is a safe placeholder consistent with the existing warpSize=32
+        # lie in get_device_properties. See
+        # `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC4/AC4a.
+        return module, pso_handle, 32, 0, int(max_threads)
 
     def unload_module(self, module):
         if module is None or not _has_runtime():
@@ -208,6 +250,12 @@ class MetalUtils:
         return {
             "max_shared_mem": 32 * 1024,
             "multiprocessor_count": 1,
+            "max_num_regs": 65536,
+            "warpSize": 32,
+            "max_threads_per_sm": 1024,
+            "sm_clock_rate": 1000000,
+            "mem_clock_rate": 1000000,
+            "mem_bus_width": 128,
         }
 
 

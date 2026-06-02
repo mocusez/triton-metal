@@ -308,6 +308,25 @@ llvm::LogicalResult ThreadgroupIdOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ThreadgroupsPerGridOp
+//===----------------------------------------------------------------------===//
+
+void ThreadgroupsPerGridOp::build(OpBuilder &builder, OperationState &result,
+                                  StringRef dimension) {
+  result.addAttribute("dimension", builder.getStringAttr(dimension));
+  result.addTypes(builder.getIntegerType(32, false));
+};
+
+llvm::LogicalResult ThreadgroupsPerGridOp::verify() {
+  auto dim = getDimension();
+  if (dim != "x" && dim != "y" && dim != "z")
+    return emitOpError() << "requires dimension to be `x` or `y` or `z`, "
+                         << "found `" << dim << "`";
+
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // UnaryExpOp
 //===----------------------------------------------------------------------===//
 
@@ -398,6 +417,7 @@ void BinaryExpOp::build(OpBuilder &builder, OperationState &result,
   case OP::mulOp:
   case OP::divOp:
   case OP::remOp:
+  case OP::maxOp:
     result.addTypes(lhs.getType());
     break;
   case OP::eqOp:
@@ -432,6 +452,7 @@ llvm::LogicalResult BinaryExpOp::verify() {
   case OP::mulOp:
   case OP::divOp:
   case OP::remOp:
+  case OP::maxOp:
     if (lhsType != resultType)
       return emitOpError() << "result type mismatch";
     break;
