@@ -3760,7 +3760,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         case P::OLT: opStr = " < ";  break;
         case P::OLE: opStr = " <= "; break;
         case P::ONE: opStr = " != "; break;
-        // Unordered / non-ordered predicates: deferred. Listed explicitly
+        // Unordered not-equal: MSL `a != b` is true when either operand is NaN
+        // or they differ, matching `une` semantics (Triton lowers `x != y` to
+        // this). The `tl.atomic`-guarded subarray-sum kernels use `sum != 0`.
+        case P::UNE: opStr = " != "; break;
+        // Other unordered / non-ordered predicates: deferred. Listed explicitly
         // so the diagnostic names the predicate that hit.
         case P::UEQ:
           llvm_unreachable(
@@ -3777,9 +3781,6 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         case P::ULE:
           llvm_unreachable(
               "arith.cmpf ULE (unordered <=) not yet supported on Metal");
-        case P::UNE:
-          llvm_unreachable(
-              "arith.cmpf UNE (unordered !=) not yet supported on Metal");
         case P::ORD:
           llvm_unreachable(
               "arith.cmpf ORD (ordered, neither is NaN) not yet supported on Metal");

@@ -2522,6 +2522,334 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   return mlir::success();
 }
 
+// Peel shape-only ops (expand_dims / broadcast / convert_layout / reshape) off
+// `v`, returning the underlying tensor value. Used to see through the broadcast
+// cones of `x[None,:]` / `x[:,None]` to the real producer.
+static mlir::Value peelShapeOps(mlir::Value v) {
+  while (mlir::Operation *d = v.getDefiningOp()) {
+    if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                  mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+            d))
+      v = d->getOperand(0);
+    else
+      break;
+  }
+  return v;
+}
+
+// Symbolically evaluate the SCALAR i32 value of an index cone `v` at logical
+// element position `idx` (an i32 scalar). Walks the ORIGINAL Triton cone:
+// make_range(start s) -> idx + s; tt.splat(x) -> x; addi/muli/subi -> scalar
+// arith; shape-only ops -> recurse operand 0. Returns null on any unsupported
+// op. Lets the contiguous-masked-reduce path re-derive a per-element device
+// index / mask bound without the canonical `slt make_range(0) splat` shape.
+static mlir::Value scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
+                                        mlir::ConversionPatternRewriter &rewriter,
+                                        mlir::Location loc, int depth = 0) {
+  if (depth > 24)
+    return {};
+  if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
+    return v; // already a scalar (e.g. a tt.splat src or a program-id)
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return {};
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(def))
+    return scalarizeConeAtIndex(def->getOperand(0), idx, rewriter, loc,
+                                depth + 1);
+  if (auto mr = mlir::dyn_cast<mlir::triton::MakeRangeOp>(def)) {
+    int32_t s = static_cast<int32_t>(mr.getStart());
+    if (s == 0)
+      return idx;
+    auto cS = mlir::arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getI32IntegerAttr(s));
+    return mlir::arith::AddIOp::create(rewriter, loc, idx, cS.getResult())
+        .getResult();
+  }
+  if (auto sp = mlir::dyn_cast<mlir::triton::SplatOp>(def)) {
+    if (!sp.getOperation()->getBlock())
+      return {}; // stale (already converted)
+    return sp.getSrc();
+  }
+  auto recurse2 = [&](mlir::Value a, mlir::Value b,
+                      auto make) -> mlir::Value {
+    mlir::Value L = scalarizeConeAtIndex(a, idx, rewriter, loc, depth + 1);
+    mlir::Value R = scalarizeConeAtIndex(b, idx, rewriter, loc, depth + 1);
+    if (!L || !R)
+      return mlir::Value{};
+    return make(L, R);
+  };
+  if (auto a = mlir::dyn_cast<mlir::arith::AddIOp>(def))
+    return recurse2(a.getLhs(), a.getRhs(), [&](mlir::Value L, mlir::Value R) {
+      return mlir::arith::AddIOp::create(rewriter, loc, L, R).getResult();
+    });
+  if (auto a = mlir::dyn_cast<mlir::arith::MulIOp>(def))
+    return recurse2(a.getLhs(), a.getRhs(), [&](mlir::Value L, mlir::Value R) {
+      return mlir::arith::MulIOp::create(rewriter, loc, L, R).getResult();
+    });
+  if (auto a = mlir::dyn_cast<mlir::arith::SubIOp>(def))
+    return recurse2(a.getLhs(), a.getRhs(), [&](mlir::Value L, mlir::Value R) {
+      return mlir::arith::SubIOp::create(rewriter, loc, L, R).getResult();
+    });
+  return {};
+}
+
+// Contiguous masked full-reduce: `tt.reduce(addf, axis=0)` -> f32 whose source
+// is (through reshape/shape ops) a directly-masked `tt.load` of a tile with a
+// single non-unit dimension — i.e. the leet-triton subarray-sum shape
+// `tl.load(base + offset, mask=row & (col <= bound)).sum()`. The canonical
+// `lowerRank1Reduce` masked path rejects this (reshape + 2D-unit-dim load +
+// compound `sle` mask), so re-derive the per-element device index and mask via
+// `scalarizeConeAtIndex` and run the same threadgroup butterfly. f32 add only.
+// Returns failure (creating NOTHING during the inspection phase) so the caller
+// can fall back to `lowerRank1Reduce`.
+static mlir::LogicalResult
+lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
+                            mlir::ConversionPatternRewriter &rewriter) {
+  auto loc = op.getLoc();
+  auto rtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!rtt || rtt.getRank() != 1 || rtt.isDynamicDim(0) || op.getAxis() != 0)
+    return mlir::failure();
+  if (!rtt.getElementType().isF32())
+    return mlir::failure();
+  // Combine must be addf.
+  mlir::Operation *combine = nullptr;
+  if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
+    for (auto &nested : op->getRegion(0).front())
+      if (!mlir::isa<mlir::triton::ReduceReturnOp>(nested)) {
+        combine = &nested;
+        break;
+      }
+  if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+    return mlir::failure();
+
+  // ---- Inspection phase (NO IR creation) ----
+  mlir::Value loadVal = peelShapeOps(op.getSrcs().front());
+  auto loadOp = loadVal.getDefiningOp<mlir::triton::LoadOp>();
+  if (!loadOp || !loadOp.getMask())
+    return mlir::failure();
+  // Load tile must have exactly one non-unit dim (effectively 1-D).
+  auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(loadVal.getType());
+  if (!loadTy)
+    return mlir::failure();
+  int nonUnit = 0;
+  for (auto s : loadTy.getShape())
+    if (s != 1)
+      ++nonUnit;
+  if (nonUnit != 1)
+    return mlir::failure();
+  // `other` must be absent or 0 (masked lanes contribute the add identity).
+  if (loadOp.getOther()) {
+    auto oc = extractSplatConstantAttr(loadOp.getOther());
+    auto fa = oc ? mlir::dyn_cast<mlir::FloatAttr>(*oc) : mlir::FloatAttr();
+    if (!fa || fa.getValueAsDouble() != 0.0)
+      return mlir::failure();
+  }
+  auto addptr = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+  if (!addptr)
+    return mlir::failure();
+  mlir::Value offsetTensor = addptr.getOffset();
+  // Mask: andi(splat(rowOK_i1), colCmpCone) or a bare colCmpCone.
+  mlir::Value maskRoot = peelShapeOps(loadOp.getMask());
+  mlir::Value rowOK; // optional uniform i1 scalar
+  mlir::Value colCmpVal = maskRoot;
+  if (auto andOp = maskRoot.getDefiningOp<mlir::arith::AndIOp>()) {
+    mlir::Value lhs = peelShapeOps(andOp.getLhs());
+    mlir::Value rhs = peelShapeOps(andOp.getRhs());
+    auto ls = lhs.getDefiningOp<mlir::triton::SplatOp>();
+    auto rs = rhs.getDefiningOp<mlir::triton::SplatOp>();
+    if (ls && !rs) {
+      rowOK = ls.getSrc();
+      colCmpVal = rhs;
+    } else if (rs && !ls) {
+      rowOK = rs.getSrc();
+      colCmpVal = lhs;
+    } else {
+      return mlir::failure();
+    }
+  }
+  auto colCmp = colCmpVal.getDefiningOp<mlir::arith::CmpIOp>();
+  if (!colCmp)
+    return mlir::failure();
+  auto pred = colCmp.getPredicate();
+  if (pred != mlir::arith::CmpIPredicate::slt &&
+      pred != mlir::arith::CmpIPredicate::sle)
+    return mlir::failure();
+  // Require `cmpi {slt|sle} (idxCone) (splat bound)` — bound on the RHS.
+  auto boundSplat =
+      peelShapeOps(colCmp.getRhs()).getDefiningOp<mlir::triton::SplatOp>();
+  if (!boundSplat)
+    return mlir::failure();
+  mlir::Value boundScalar = boundSplat.getSrc();
+  mlir::Value colIdxCone = colCmp.getLhs();
+
+  auto srcBlocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      rtt.getEncoding());
+  if (!srcBlocked)
+    return mlir::failure();
+  int64_t tpb = 1;
+  for (auto t : srcBlocked.getThreadsPerWarp())
+    tpb *= t;
+  for (auto w : srcBlocked.getWarpsPerCTA())
+    tpb *= w;
+  if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+    return mlir::failure();
+  int64_t BLOCK = rtt.getDimSize(0);
+  if (BLOCK <= 0 || BLOCK % tpb != 0)
+    return mlir::failure();
+  int64_t E = BLOCK / tpb;
+  if (E < 1 || E > 1024 || (E & (E - 1)) != 0)
+    return mlir::failure();
+
+  mlir::Value memref = findBaseMemref(loadOp.getPtr(), rewriter);
+  if (!memref)
+    return mlir::failure();
+  mlir::Type loadEltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
+  if (!loadEltTy.isF32())
+    return mlir::failure();
+
+  // ---- Emission phase ----
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto i32 = rewriter.getI32Type();
+  auto addEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
+                                            BinaryExpOperator::addOp);
+  auto emitAdd = [&](mlir::Value a, mlir::Value b) -> mlir::Value {
+    return BinaryExpOp::create(rewriter, loc, a.getType(), addEnum, a, b)
+        .getResult();
+  };
+
+  // localTid = id.x - tgid.x * tpb.
+  auto tidG = ThreadIdOp::create(rewriter, loc, ui32,
+                                 rewriter.getStringAttr("x"));
+  mlir::Value tidI32 = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{i32},
+                           mlir::ValueRange{tidG.getResult()})
+                           .getResult(0);
+  auto tgG = ThreadgroupIdOp::create(rewriter, loc, ui32,
+                                     rewriter.getStringAttr("x"));
+  mlir::Value tgI32 = mlir::UnrealizedConversionCastOp::create(
+                          rewriter, loc, mlir::TypeRange{i32},
+                          mlir::ValueRange{tgG.getResult()})
+                          .getResult(0);
+  auto cTpb = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+  auto tgOff = mlir::arith::MulIOp::create(rewriter, loc, tgI32,
+                                           cTpb.getResult());
+  mlir::Value localTid =
+      mlir::arith::SubIOp::create(rewriter, loc, tidI32, tgOff.getResult())
+          .getResult();
+
+  // Per-thread accumulator: for k in [0, E): acc += masked load of element
+  // (localTid + k*tpb).
+  auto cZeroF = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+  auto cZeroI = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI32IntegerAttr(0));
+  auto cE = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(E)));
+  auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getI32IntegerAttr(1));
+  auto forOp = mlir::scf::ForOp::create(
+      rewriter, loc, cZeroI.getResult(), cE.getResult(), cOne.getResult(),
+      mlir::ValueRange{cZeroF.getResult()});
+  {
+    mlir::OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(forOp.getBody());
+    mlir::Value iv = forOp.getInductionVar();
+    mlir::Value acc = forOp.getRegionIterArgs()[0];
+    // idx = localTid + iv*tpb.
+    auto kOff = mlir::arith::MulIOp::create(rewriter, loc, iv, cTpb.getResult());
+    mlir::Value idx =
+        mlir::arith::AddIOp::create(rewriter, loc, localTid, kOff.getResult())
+            .getResult();
+    mlir::Value addrI32 = scalarizeConeAtIndex(offsetTensor, idx, rewriter, loc);
+    mlir::Value colv = scalarizeConeAtIndex(colIdxCone, idx, rewriter, loc);
+    if (!addrI32 || !colv) {
+      // Inspection passed but a cone op is unsupported: bail. (The partial ops
+      // created here are rolled back by the conversion driver on failure.)
+      return rewriter.notifyMatchFailure(op, "contiguous reduce: cone scalarize");
+    }
+    mlir::Value cond = mlir::arith::CmpIOp::create(rewriter, loc, pred, colv,
+                                                   boundScalar)
+                           .getResult();
+    if (rowOK)
+      cond = mlir::arith::AndIOp::create(rewriter, loc, cond, rowOK).getResult();
+    mlir::Value addrUI32 = mlir::UnrealizedConversionCastOp::create(
+                               rewriter, loc, mlir::TypeRange{ui32},
+                               mlir::ValueRange{addrI32})
+                               .getResult(0);
+    auto scfIf = mlir::scf::IfOp::create(rewriter, loc,
+                                         mlir::TypeRange{loadEltTy}, cond,
+                                         /*addThenBlock=*/true,
+                                         /*addElseBlock=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard g2(rewriter);
+      rewriter.setInsertionPointToStart(&scfIf.getThenRegion().front());
+      auto el = GetElementOp::create(rewriter, loc, loadEltTy, memref, addrUI32);
+      mlir::scf::YieldOp::create(rewriter, loc,
+                                 mlir::ValueRange{el.getResult()});
+    }
+    {
+      mlir::OpBuilder::InsertionGuard g2(rewriter);
+      rewriter.setInsertionPointToStart(&scfIf.getElseRegion().front());
+      auto z = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{z.getResult()});
+    }
+    mlir::Value combined = emitAdd(acc, scfIf.getResult(0));
+    mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{combined});
+  }
+  mlir::Value partial = forOp.getResult(0);
+
+  // Threadgroup butterfly over `tpb` lanes -> buf[0] holds the total.
+  auto bufTy = MetalMemRefType::get(rewriter.getContext(), loadEltTy, tpb);
+  mlir::Value buf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+  mlir::Value tidUI = mlir::UnrealizedConversionCastOp::create(
+                          rewriter, loc, mlir::TypeRange{ui32},
+                          mlir::ValueRange{localTid})
+                          .getResult(0);
+  StoreOp::create(rewriter, loc, partial, buf, tidUI);
+  BarrierOp::create(rewriter, loc);
+  for (int64_t s = tpb / 2; s >= 1; s /= 2) {
+    auto cS = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(s)));
+    auto cond = mlir::arith::CmpIOp::create(
+        rewriter, loc, mlir::arith::CmpIPredicate::slt, localTid,
+        cS.getResult());
+    auto ifOp = mlir::scf::IfOp::create(rewriter, loc, mlir::TypeRange{},
+                                        cond.getResult(),
+                                        /*addThenBlock=*/true,
+                                        /*addElseBlock=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      auto partnerI32 =
+          mlir::arith::AddIOp::create(rewriter, loc, localTid, cS.getResult());
+      mlir::Value partnerUI = mlir::UnrealizedConversionCastOp::create(
+                                  rewriter, loc, mlir::TypeRange{ui32},
+                                  mlir::ValueRange{partnerI32.getResult()})
+                                  .getResult(0);
+      auto pv = GetElementOp::create(rewriter, loc, loadEltTy, buf, partnerUI);
+      auto sv = GetElementOp::create(rewriter, loc, loadEltTy, buf, tidUI);
+      StoreOp::create(rewriter, loc, emitAdd(sv.getResult(), pv.getResult()),
+                      buf, tidUI);
+      mlir::scf::YieldOp::create(rewriter, loc);
+    }
+    BarrierOp::create(rewriter, loc);
+  }
+  auto cZeroIdx = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                  rewriter.getI32IntegerAttr(0));
+  mlir::Value zeroUI = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{ui32},
+                           mlir::ValueRange{cZeroIdx.getResult()})
+                           .getResult(0);
+  mlir::Value result =
+      GetElementOp::create(rewriter, loc, loadEltTy, buf, zeroUI).getResult();
+  rewriter.replaceOp(op, result);
+  return mlir::success();
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2534,8 +2862,13 @@ struct ReduceLowering
         op.getSrcs().front().getType());
     if (!rtt)
       return mlir::failure();
-    if (rtt.getRank() == 1)
+    if (rtt.getRank() == 1) {
+      // Try the contiguous-masked full-reduce path first (subarray-sum shape);
+      // fall back to the canonical rank-1 reduce.
+      if (mlir::succeeded(lowerContiguousMaskedReduce(op, rewriter)))
+        return mlir::success();
       return lowerRank1Reduce(op, adaptor, rewriter);
+    }
     if (rtt.getRank() != 2)
       return mlir::failure();
     if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1))
