@@ -85,6 +85,7 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
     if (!emittedPreamble) {
       output << "#include <metal_stdlib>\n";
       output << "#include <metal_math>\n";
+      output << "#include <metal_atomic>\n";
       // Stage-7: include simdgroup_matrix header only when an `::Mma` matmul is
       // present in any kernel; preserves Stage-1 ::Scalar byte-identity SHA.
       // Stage-8: also include when any `metal.sdpa` op is present — all 5 mode
@@ -260,7 +261,8 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::IfOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
@@ -302,7 +304,8 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::IfOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
@@ -383,6 +386,22 @@ void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
   translateValue(op.getIndex().getDefiningOp());
   _output << "] = ";
   translateValue(op.getValue().getDefiningOp());
+  printDelim();
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
+  // Atomic fadd into device memory with relaxed ordering. Reinterpret the
+  // element address `&buf[idx]` (a `device float*`) as a `device atomic_float*`;
+  // valid for relaxed atomics in the `device` address space on Apple GPUs. The
+  // returned old value is discarded — the conversion guarantees the result is
+  // unused (AtomicRmwLowering rejects atomics whose old value is consumed).
+  _output << "atomic_fetch_add_explicit((device atomic_float*)&";
+  translateVarName(op.getMemref());
+  _output << "[";
+  translateValueOrVarName(op.getIndex());
+  _output << "], ";
+  translateValueOrVarName(op.getValue());
+  _output << ", memory_order_relaxed)";
   printDelim();
 }
 

@@ -96,6 +96,7 @@ private:
   void translate(mlir::triton::metal::BarrierOp op);
   void translate(mlir::triton::metal::TgStoreIndexedOp op);
   void translate(mlir::triton::metal::StoreOp op);
+  void translate(mlir::triton::metal::AtomicRmwOp op);
   void translate(mlir::triton::metal::IfOp op);
   void translate(mlir::triton::metal::WhileOp op);
   void translate(mlir::triton::metal::MatmulOp op);

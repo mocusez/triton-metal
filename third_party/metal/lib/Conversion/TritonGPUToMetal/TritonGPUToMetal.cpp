@@ -3766,6 +3766,123 @@ struct StoreLowering
 };
 
 //===----------------------------------------------------------------------===//
+// tt.atomic_rmw fadd (scalar) → metal.atomic_rmw
+//
+// Models the scalar `tl.atomic_add(ptr, scalar)` form — e.g. the leet-triton
+// subarray-sum kernels accumulating each program's partial into output[0].
+// Only f32 add with an UNUSED old-value result is supported, and the mask must
+// be absent or constant-true (the subarray guards the atomic with an outer
+// `scf.if sum > 0`). The address is the base memref + any scalar tt.addptr
+// offset, reusing the rank-1-reduce helpers. See `metal.atomic_rmw`.
+//===----------------------------------------------------------------------===//
+struct AtomicRmwLowering
+    : public mlir::OpConversionPattern<mlir::triton::AtomicRMWOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::AtomicRMWOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    if (op.getAtomicRmwOp() != mlir::triton::RMWOp::FADD)
+      return rewriter.notifyMatchFailure(op, "atomic_rmw: only fadd supported");
+    // Scalar form only (value/result are scalars, not per-element tensors).
+    if (mlir::isa<mlir::RankedTensorType>(op.getResult().getType()) ||
+        mlir::isa<mlir::RankedTensorType>(op.getVal().getType()))
+      return rewriter.notifyMatchFailure(
+          op, "atomic_rmw: tensor (per-element) form not supported");
+    if (!op.getResult().use_empty())
+      return rewriter.notifyMatchFailure(
+          op, "atomic_rmw: old-value result is consumed (not modeled)");
+    mlir::Value val = adaptor.getVal();
+    if (!val.getType().isF32())
+      return rewriter.notifyMatchFailure(op,
+                                         "atomic_rmw: only f32 add supported");
+    // Accept only an absent or constant-true mask.
+    if (mlir::Value mask = op.getMask()) {
+      auto cst = mask.getDefiningOp<mlir::arith::ConstantOp>();
+      bool isTrue = false;
+      if (cst) {
+        if (auto b = mlir::dyn_cast<mlir::BoolAttr>(cst.getValue()))
+          isTrue = b.getValue();
+        else if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+          isTrue = i.getValue().isOne();
+      }
+      if (!isTrue)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: non-trivial mask not supported");
+    }
+    mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
+    if (!memref)
+      return rewriter.notifyMatchFailure(op,
+                                         "atomic_rmw: base memref not found");
+    auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+    mlir::Value scalarOff =
+        accumulateScalarAddPtrOffsets(op.getPtr(), rewriter, loc);
+    mlir::Value idxUI32;
+    if (scalarOff)
+      idxUI32 = mlir::UnrealizedConversionCastOp::create(
+                    rewriter, loc, mlir::TypeRange{ui32},
+                    mlir::ValueRange{scalarOff})
+                    .getResult(0);
+    else
+      idxUI32 = ConstantOp::create(rewriter, loc,
+                                   rewriter.getIntegerAttr(ui32, 0))
+                    .getResult();
+    auto resTy = getTypeConverter()->convertType(op.getResult().getType());
+
+    // A scalar `tl.atomic_add(ptr, scalar)` is a per-PROGRAM op, but every
+    // Metal thread runs the kernel body — emitting the atomic unguarded would
+    // multiply the contribution by the threadgroup size. Guard it to a single
+    // lane: `localTid = id.x - tgid.x*tpb; if (localTid == 0) { atomic }`.
+    mlir::Operation *m = op->getParentOp();
+    while (m && !m->hasAttr("ttg.num-warps"))
+      m = m->getParentOp();
+    int64_t numWarps = 4, tpw = 32;
+    if (m) {
+      if (auto a = m->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
+        numWarps = a.getInt();
+      if (auto a = m->getAttrOfType<mlir::IntegerAttr>("ttg.threads-per-warp"))
+        tpw = a.getInt();
+    }
+    int64_t tpb = numWarps * tpw;
+    auto i32 = rewriter.getI32Type();
+    auto tidG = ThreadIdOp::create(rewriter, loc, ui32,
+                                   rewriter.getStringAttr("x"));
+    mlir::Value tidI32 = mlir::UnrealizedConversionCastOp::create(
+                             rewriter, loc, mlir::TypeRange{i32},
+                             mlir::ValueRange{tidG.getResult()})
+                             .getResult(0);
+    auto tgG = ThreadgroupIdOp::create(rewriter, loc, ui32,
+                                       rewriter.getStringAttr("x"));
+    mlir::Value tgI32 = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{i32},
+                            mlir::ValueRange{tgG.getResult()})
+                            .getResult(0);
+    auto cTpb = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+    auto tgOff =
+        mlir::arith::MulIOp::create(rewriter, loc, tgI32, cTpb.getResult());
+    auto localTid =
+        mlir::arith::SubIOp::create(rewriter, loc, tidI32, tgOff.getResult());
+    auto cZero = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(0));
+    auto isFirst = mlir::arith::CmpIOp::create(
+        rewriter, loc, mlir::arith::CmpIPredicate::eq, localTid.getResult(),
+        cZero.getResult());
+    auto ifOp = mlir::scf::IfOp::create(rewriter, loc, isFirst.getResult(),
+                                        /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+      AtomicRmwOp::create(rewriter, loc, resTy, val, memref, idxUI32);
+    }
+    // The old-value result is unused (checked above); replace with the value
+    // operand as a type-matched dummy so the op legalizes.
+    rewriter.replaceOp(op, val);
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Masked tt.store → unconditional select-on-value device store (L1d2c Phase B).
 //
 // Apple Metal's MSL compiler exhibits a per-warp lane-aliasing miscompile when
@@ -5930,6 +6047,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
+                 AtomicRmwLowering,
                  ArithMuliLowering, ArithAddILowering,
                  ArithAddFLowering, ArithCmpILowering, ArithCmpFLowering,
                  ArithAndILowering,
