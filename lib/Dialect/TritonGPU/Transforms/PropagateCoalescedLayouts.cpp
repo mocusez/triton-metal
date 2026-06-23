@@ -75,7 +75,23 @@ static bool isSafeRewriteTarget(ConvertLayoutOp cvt) {
   if (!cvt.getResult().hasOneUse())
     return false;
   Operation *user = *cvt.getResult().getUsers().begin();
-  return isa<ReduceOp>(user);
+  if (!isa<ReduceOp>(user))
+    return false;
+  // Rank-1 reduce ONLY. `rewriteReduceOperand` swaps the reduce's operand to
+  // the coalesced layout but does NOT update the reduce's result type. For a
+  // rank-1 input the result is a scalar (no encoding) so the swap is type-safe.
+  // For a rank-2+ input the result is a `#ttg.slice` whose parent encoding is
+  // derived from the operand encoding — swapping the operand changes the
+  // inferred result type, leaving the op's stale slice result type incompatible
+  // and tripping the `verify_each` verifier (a hard pass-manager abort). The
+  // Metal rank-2 axis=1 reduce body is self-contained (it reads the source
+  // tile directly from device memory via the producing `tt.load`), so it does
+  // NOT need this coalesced-operand rewrite. Leaving the down-convert in place
+  // for rank-2 reduces is both crash-free and semantically correct.
+  auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
+  if (!srcTy || srcTy.getRank() != 1)
+    return false;
+  return true;
 }
 
 // Rewrite `reduce`'s operand at index `operandIdx` to use the coalesced

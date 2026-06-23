@@ -13,7 +13,7 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_rank3(%x_ptr: !tt.ptr<f32>) {
     %x = arith.constant dense<0.0> : tensor<8x4x4xf32, #blocked3d>
-    // expected-error @+1 {{multi-axis or rank>2 reduce requires Session L3b (future)}}
+    // expected-error @+1 {{reduce with rank not in {1, 2} not supported (rank-1 added in Option β; rank>2 requires Session L3b)}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32
@@ -24,18 +24,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// Unsupported combine op (maxnumf) → "reduce combine requires Session L3c".
+// Unsupported combine op → "reduce combine requires Session L3c". NB: float
+// `arith.maxnumf` is now ACCEPTED by the pre-pass (tl.max rank-1 needs it), so
+// the still-unsupported combine probed here is integer `arith.maxsi` — its
+// si-compare lowering path is the L3c deliverable.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_maxnumf(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<0.0> : tensor<16x32xf32, #blocked>
-    // expected-error @+1 {{reduce combine requires Session L3c (future)}}
+  tt.func public @reduce_maxsi(%x_ptr: !tt.ptr<i32>) {
+    %x = arith.constant dense<0> : tensor<16x32xi32, #blocked>
+    // expected-error @+1 {{reduce combine requires Session L3c (future) — got arith.maxsi}}
     %r = "tt.reduce"(%x) ({
-    ^bb0(%a: f32, %b: f32):
-      %m = arith.maxnumf %a, %b : f32
-      tt.reduce.return %m : f32
-    }) {axis = 1 : i32} : (tensor<16x32xf32, #blocked>) -> tensor<16xf32, #slice1>
+    ^bb0(%a: i32, %b: i32):
+      %m = arith.maxsi %a, %b : i32
+      tt.reduce.return %m : i32
+    }) {axis = 1 : i32} : (tensor<16x32xi32, #blocked>) -> tensor<16xi32, #slice1>
     tt.return
   }
 }

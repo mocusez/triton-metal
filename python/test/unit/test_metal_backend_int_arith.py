@@ -29,10 +29,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
-from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+from triton.backends.compiler import GPUTarget  # noqa: E402
+from triton.compiler import ASTSource  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -213,4 +213,30 @@ def test_select_f32_runtime_bit_exact():
     _select_kernel[(1, 1, 1)](x, y, out, N, BLOCK=BLOCK)
     mask = torch.arange(BLOCK) < N
     expected = torch.where(mask, x, y)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _scalar_int_to_float_kernel(out_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    val = pid.to(tl.float32)  # scalar arith.sitofp
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    vals = val + tl.zeros((BLOCK,), dtype=tl.float32)
+    tl.store(out_ptr + offs, vals)
+
+
+# Scalar numeric conversion end-to-end. A scalar `program_id(0).to(tl.float32)`
+# lowers to `arith.sitofp` and survives into the kernel body (only tensor
+# conversions are folded into metal ops by the conversion pass). Before the
+# emitter learned the conversion-op family, this crashed at translation with
+# `llvm_unreachable("Unexpected operation")`. The translate-side emission of
+# every conversion op is pinned by the lit fixture
+# `test/Dialect/Metal/metal-translate/arith_scalar_conversions.mlir`; this test
+# pins int->float runtime correctness through the full pipeline.
+def test_scalar_int_to_float_runtime_bit_exact():
+    G, BLOCK = 5, 64
+    out = torch.full((G * BLOCK,), -1.0, dtype=torch.float32)
+    _scalar_int_to_float_kernel[(G,)](out, BLOCK=BLOCK)
+    # Each program g writes its pid (as f32) into out[g*BLOCK : (g+1)*BLOCK].
+    expected = torch.arange(G, dtype=torch.float32).repeat_interleave(BLOCK)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)

@@ -8,200 +8,145 @@ Apple Metal. Per-launch arg marshalling bridges torch CPU tensors to
 """
 
 import functools
+import os
 import platform
-import struct
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
 
-def _install_torch_cpu_stream_shim():
-    """Inject no-op `Stream` / `set_stream` attributes on `torch.cpu`.
+@functools.lru_cache(maxsize=1)
+def _use_mps_runtime() -> bool:
+    """True when the launch path routes through ``torch.mps.compile_shader``
+    for zero-copy dispatch on PyTorch MPS tensors (no host staging, no buffer
+    alloc/free, ordered on the MPS stream). Opt out with
+    ``TRITON_METAL_USE_MPS=0``. Mirror of ``compiler._use_mps_runtime`` — keep
+    the two in lockstep so the compiler's binary_ext and the driver's launch
+    path agree on which runtime is active."""
+    if os.environ.get("TRITON_METAL_USE_MPS", "1") == "0":
+        return False
+    try:
+        import torch
+        return bool(torch.backends.mps.is_available())
+    except Exception:
+        return False
+
+
+def _install_torch_stream_shim():
+    """Inject no-op `Stream` / `set_stream` on the active-device namespace(s).
 
     CUDA-style tutorials (e.g. `leet-triton/tutorials_python/02-fused-softmax.py`)
     call `getattr(torch, DEVICE.type).Stream()` and `set_stream(...)`. Metal's
-    `get_active_torch_device()` returns `torch.device("cpu")`, but PyTorch's
-    `torch.cpu` namespace lacks `Stream`/`set_stream`. The shim is a no-op
+    `get_active_torch_device()` returns `torch.device("mps", 0)` on the MPS path
+    (or `torch.device("cpu")` on the legacy path), but neither `torch.mps` nor
+    `torch.cpu` reliably exposes `Stream`/`set_stream` (this torch build has
+    `torch.mps.synchronize`/`Event` but no `Stream`). The shim is a no-op
     because `triton.testing.do_bench` already drives synchronization via
     `driver.active.get_device_interface().synchronize()`.
 
-    Function-local `import torch` matches the convention in this module
-    (see other `import torch` sites at driver.py:296, :322, :344, :357, :400).
-    `hasattr`-guarded so a future real `torch.cpu.Stream` is never overwritten.
+    Both namespaces are shimmed so the tutorials work regardless of which launch
+    path is active. Function-local `import torch` matches the convention in this
+    module. Each attribute is `hasattr`-guarded so a future real
+    `torch.{mps,cpu}.Stream` is never overwritten.
     See `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC7/AC7a/R3.
     """
     import torch
-    cpu = torch.cpu
-    if not hasattr(cpu, "Stream"):
-        class _NoopStream:
-            def synchronize(self):
-                pass
 
-            def __enter__(self):
-                return self
+    class _NoopStream:
+        def synchronize(self):
+            pass
 
-            def __exit__(self, *exc):
-                return False
+        def __enter__(self):
+            return self
 
-        cpu.Stream = _NoopStream
-    if not hasattr(cpu, "set_stream"):
-        cpu.set_stream = lambda _stream: None
+        def __exit__(self, *exc):
+            return False
 
-
-_install_torch_cpu_stream_shim()
-
-
-# Floor for _PerfCounterEvent.elapsed_time. triton.testing.do_bench computes
-# `estimate_ms = elapsed_time(...) / 5` then `n_warmup = max(1, int(warmup /
-# estimate_ms))` (testing.py:278-282). Two failure modes drive this floor:
-#
-# 1. Kernel-only GPU times on Metal are routinely sub-microsecond for small
-#    sweep sizes (e.g., 2^12 fp32 add ≈ 500ns). An unbounded floor lets
-#    n_warmup explode.
-# 2. CPU-only callables (e.g., the tutorial's `'torch'` provider passes
-#    `lambda: x + y` which runs PyTorch CPU add and never touches the Metal
-#    queue) leave the accumulator unchanged, so `elapsed_time` returns 0.
-#    do_bench's estimate_ms then collapses to the floor regardless of how
-#    long the real call took.
-#
-# Each Metal launch carries ~100µs of CPU-side staging (alloc + memcpy + d2h
-# + free in MetalLauncher.__call__) and each torch CPU add is ~50-70µs of
-# OpenMP work, so an over-low floor pushes the warmup loop into the
-# multi-minute range.
-#
-# Floor of 0.1 ms (= 100µs) caps `n_warmup` at ~1250 and `n_repeat` at ~5000.
-# That keeps `do_bench` runtime per size×provider under ~625ms on this
-# synchronous-launcher path. The cost: kernels measuring under 100µs are
-# reported as 100µs (artificial upper bound on small-size GB/s in the
-# tutorial sweep). Sweep sizes ≥ ~2^21 are unaffected. Once Component 2
-# (GPU-resident tensors / persistent dispatch) lands, the floor can drop
-# because per-call launch overhead drops.
-_ELAPSED_TIME_FLOOR_MS = 0.1
+    for ns in (getattr(torch, "cpu", None), getattr(torch, "mps", None)):
+        if ns is None:
+            continue
+        if not hasattr(ns, "Stream"):
+            ns.Stream = _NoopStream
+        if not hasattr(ns, "set_stream"):
+            ns.set_stream = lambda _stream: None
 
 
-class _PerfCounterEvent:
-    """GPU-time Event for triton.testing.do_bench on Metal.
+_install_torch_stream_shim()
 
-    Reads from Runtime.mm's thread-local g_gpu_time_ns_accum, a monotonic
-    counter updated by launch_kernel_with_pipeline after each successful
-    waitUntilCompleted using MTLCommandBuffer.GPUStartTime/GPUEndTime.
-    Excludes per-launch H2D/D2H CPU memcpy (memcpy on UMA shared storage
-    never touches the GPU command queue), so elapsed_time reports
-    kernel-only GPU ms — the same window torch.cuda.Event(enable_timing=True)
-    captures on CUDA.
 
-    The underlying counter never resets; elapsed_time subtracts two
-    independent monotonic reads. This makes the event composable under
-    nesting (e.g., autotuner running do_bench inside a user do_bench).
-    Matches cudaEventElapsedTime semantics.
 
-    If MetalLauncher ever becomes asynchronous, the accumulator-update
-    site in Runtime.mm's launchKernelWithPipeline must move into a
-    MTLCommandBuffer.addCompletedHandler completion block, and
-    _DeviceInterface.synchronize must become a real wait. Both sites
-    carry the invariant comment.
+
+# Floor for the MPS-path timer. Larger than the legacy 0.1 ms because each
+# do_bench repeat allocates a REAL torch.mps.Event (not a counter read), so the
+# floor also bounds n_repeat = rep / (estimate_ms) and keeps the event count
+# modest. See _MPSFlooredEvent.
+_MPS_ELAPSED_TIME_FLOOR_MS = 0.5
+
+
+class _MPSFlooredEvent:
+    """do_bench timing Event for the MPS path: a thin, robust wrapper over
+    torch.mps.Event(enable_timing=True).
+
+    Two adaptations vs. raw torch.mps.Event:
+      * elapsed_time() is floored to _MPS_ELAPSED_TIME_FLOOR_MS. For the tiny,
+        latency-bound kernels the Metal backend runs, GPU time is sub-µs; an
+        unfloored estimate makes do_bench's n_repeat = rep/estimate_ms explode
+        into thousands of events. Floored, n_repeat stays modest.
+      * elapsed_time() swallows the torch MPS "End event N was not recorded
+        after start event M" RuntimeError. torch's MPS event timing is flaky for
+        sub-µs spans (the two timestamps collapse to one tick and torch reports
+        them out of order) — observed nondeterministically even at small repeat
+        counts. Such a span is below the floor anyway, so we report the floor
+        instead of crashing the whole benchmark.
     """
 
-    __slots__ = ("_enable_timing", "_t_ns")
+    __slots__ = ("_ev",)
 
     def __init__(self, enable_timing: bool = False):
-        self._enable_timing = enable_timing
-        self._t_ns = None
+        import torch
+        self._ev = torch.mps.Event(enable_timing=enable_timing)
 
     def record(self):
-        # Snapshot the launcher's thread-local monotonic GPU-time counter.
-        # b._t_ns - a._t_ns is the sum of GPU kernel ns launched between
-        # a.record() and b.record() — naturally correct for nested benchmark
-        # contexts. enable_timing is gated at elapsed_time so callers can
-        # record() unconditionally.
-        self._t_ns = _libmetal.read_gpu_time_ns_total()
+        self._ev.record()
 
     def synchronize(self):
-        # No-op while MetalLauncher.__call__ is synchronous (the launcher
-        # blocks on waitUntilCompleted, so the accumulator is already
-        # current by the time we'd be asked to synchronize). If the launcher
-        # ever becomes async, this must become a real wait — mirroring
-        # _DeviceInterface.synchronize below.
-        pass
+        self._ev.synchronize()
 
     def elapsed_time(self, other) -> float:
-        if not self._enable_timing or not other._enable_timing:
-            raise RuntimeError(
-                "Event.elapsed_time requires enable_timing=True on both events.")
-        if self._t_ns is None or other._t_ns is None:
-            raise RuntimeError("Event.record() must be called before elapsed_time().")
-        return max((other._t_ns - self._t_ns) / 1e6, _ELAPSED_TIME_FLOOR_MS)
+        try:
+            ms = self._ev.elapsed_time(other._ev)
+        except RuntimeError:
+            # Sub-µs span torch MPS couldn't order; it's below the floor anyway.
+            return _MPS_ELAPSED_TIME_FLOOR_MS
+        return max(ms, _MPS_ELAPSED_TIME_FLOOR_MS)
 
 
-# libmetal exposes the Darwin runtime callables (load_metallib,
-# launch_kernel_with_pipeline, alloc_buffer, copy_h2d/d2h, free_buffer,
-# etc.). On non-Darwin builds, only the dialect / MSL callables are
-# available; the launch path here will then fail when invoked.
+# libmetal exposes the in-process compile path only: `load_dialects` and
+# `ttgir_to_msl` (TTGIR -> Metal dialect -> MSL text). The legacy native
+# runtime (alloc/copy/launch, metallib compile) was removed — kernels launch
+# via torch.mps.compile_shader on the Python side (MetalLauncher, MPS path).
 try:
     from triton._C.libtriton import metal as _libmetal
 except ImportError:  # pragma: no cover - libtriton always present at runtime
     _libmetal = None
 
 
-# Apple GPU family sentinel used when libmetal isn't built in (non-Darwin
-# CI) or the runtime probe returns 0. M3-class is a reasonable middle.
-_APPLE_GPU_FAMILY_FALLBACK = 9
+# Apple GPU family tag for GPUTarget.arch. This is a cache-key / identity tag
+# ONLY: codegen is decoupled from it (warp_size is fixed at 32 and the MSL
+# emitter never branches on GPU family). The native Metal family probe was
+# removed with the legacy runtime, so the tag is a stable constant — it only
+# needs to be consistent for a given machine's compile cache. M3-class.
+_APPLE_GPU_FAMILY = 9
 
 
-@functools.lru_cache(maxsize=None)
 def _get_apple_gpu_family() -> int:
-    """Highest MTLGPUFamilyAppleN supported by the system default device.
-
-    Falls back to ``_APPLE_GPU_FAMILY_FALLBACK`` when libmetal is unbuilt
-    or the native probe returns 0. Cached for the process lifetime; the
-    Apple GPU family cannot change without a process restart.
-    """
-    if _libmetal is not None and hasattr(_libmetal, "get_apple_gpu_family"):
-        try:
-            family = int(_libmetal.get_apple_gpu_family())
-        except Exception:
-            family = 0
-        if family > 0:
-            return family
-    return _APPLE_GPU_FAMILY_FALLBACK
+    return _APPLE_GPU_FAMILY
 
 
-def _has_runtime() -> bool:
-    return _libmetal is not None and hasattr(_libmetal, "launch_kernel_with_pipeline")
-
-
-# Per-position type metadata cached on the launcher. We need to decide,
-# at __call__ time, whether each arg should be packed as a scalar (1-elem
-# MTLBuffer) or whether it's a pointer arg that takes a torch tensor.
+# Decide, at __call__ time, whether each arg is a pointer (takes a torch
+# tensor bound zero-copy) or a scalar (bound by value via compile_shader).
 def _is_pointer_type(ty: str) -> bool:
     return ty.startswith("*")
-
-
-# Map Triton scalar type codes to (struct format, nbytes). Used to pack
-# scalar args into 1-element MTLBuffers (matching the metal.kernel
-# memref-only arg-type discipline).
-_SCALAR_FMT = {
-    "i1": ("?", 1),
-    "i8": ("b", 1),
-    "u8": ("B", 1),
-    "i16": ("h", 2),
-    "u16": ("H", 2),
-    "i32": ("i", 4),
-    "u32": ("I", 4),
-    "i64": ("q", 8),
-    "u64": ("Q", 8),
-    "fp16": ("e", 2),
-    "bf16": ("e", 2),  # struct doesn't have bf16; reuse fp16 as transport
-    "fp32": ("f", 4),
-    "fp64": ("d", 8),
-}
-
-
-def _pack_scalar(ty: str, value) -> bytes:
-    fmt, _ = _SCALAR_FMT.get(ty, (None, None))
-    if fmt is None:
-        raise TypeError(f"MetalLauncher: unsupported scalar type {ty!r}")
-    return struct.pack(fmt, value)
 
 
 class MetalUtils:
@@ -211,36 +156,30 @@ class MetalUtils:
     """
 
     def load_binary(self, name, kernel_bytes, shared_mem, device):
-        if not _has_runtime():
+        # MPS-only: kernel_bytes is the MSL text (binary_ext == "metal").
+        # torch.mps.compile_shader compiles it once per kernel and returns a
+        # ShaderLibrary; getattr(lib, name) is the callable MetalKernel the
+        # launcher invokes directly with MPS tensors (zero-copy). The library
+        # object is the "module" handle (kept alive for the kernel's lifetime);
+        # n_regs=32 clears the CUDA-style occupancy zero-divide and
+        # n_max_threads=1024 clears the num_warps*warp_size threads check
+        # (compiler.py). No metallib, no pso, no native runtime.
+        if not _use_mps_runtime():
             raise RuntimeError(
-                "Metal runtime not available; standard launch requires the "
-                "Darwin libmetal extension to be built into libtriton.")
-        if isinstance(kernel_bytes, (bytearray,)):
-            kernel_bytes = bytes(kernel_bytes)
-        # load_metallib returns (lib_handle, fn_handle, pso_handle, max_threads)
-        lib_handle, fn_handle, pso_handle, max_threads = _libmetal.load_metallib(
-            kernel_bytes, name)
-        # CompiledKernel stores (module, function, n_regs, n_spills, n_max_threads).
-        # We use `module` as a tuple of all 3 handles so unload_module can free
-        # all of them. The launcher receives `function` = pso_handle and uses
-        # it directly to launch.
-        module = (lib_handle, fn_handle, pso_handle)
-        # n_regs=32 floor: Apple-GPU register counts are not exposed by the
-        # public Metal API, but CUDA-style tutorials compute occupancy via
-        # `NUM_REGS // (n_regs * WARP_SIZE * num_warps)` which zero-divides on
-        # 0. 32 is a safe placeholder consistent with the existing warpSize=32
-        # lie in get_device_properties. See
-        # `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC4/AC4a.
-        return module, pso_handle, 32, 0, int(max_threads)
+                "Metal backend is MPS-only: the legacy native runtime was "
+                "removed. Launching requires an MPS-enabled PyTorch on Apple "
+                "Silicon (and TRITON_METAL_USE_MPS != 0).")
+        import torch
+        src = (kernel_bytes.decode() if isinstance(kernel_bytes, (bytes, bytearray))
+               else kernel_bytes)
+        lib = torch.mps.compile_shader(src)
+        kernel = getattr(lib, name)
+        return lib, kernel, 32, 0, 1024
 
     def unload_module(self, module):
-        if module is None or not _has_runtime():
-            return
-        lib_handle, fn_handle, pso_handle = module
-        # Order matters: pipeline first, then function, then library.
-        _libmetal.free_pipeline(pso_handle)
-        _libmetal.free_function(fn_handle)
-        _libmetal.free_library(lib_handle)
+        # MPS hands back a torch ShaderLibrary; Python GC reclaims it, nothing
+        # to free explicitly.
+        return
 
     def get_device_properties(self, device):
         # Triton inspects max_shared_mem; metal's spec varies by GPU but
@@ -299,107 +238,49 @@ class MetalLauncher:
 
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
-        if not _has_runtime():
-            raise RuntimeError(
-                "Metal runtime not available; standard launch requires the "
-                "Darwin libmetal extension to be built into libtriton.")
-        # `function` is the pso_handle from MetalUtils.load_binary.
-        pso_handle = function
-
-        # Enter hook.
+        # Zero-copy MPS launch. `function` is the torch MetalKernel from
+        # MetalUtils.load_binary (a compiled torch.mps.compile_shader entry).
+        # Map Triton's grid (= #threadgroups) and threadgroup size onto
+        # compile_shader's (threads = total grid threads, group_size = threads
+        # per threadgroup): threadgroup_position_in_grid then enumerates
+        # 0..gridX-1 == tl.program_id. MPS tensors bind directly (honoring
+        # storage_offset); Python scalars bind via setBytes into the 1-element
+        # `device T*` slots the emitter declares. No alloc/copy/free, ordered
+        # on PyTorch's MPS stream. The MPS path uses only tensor methods, so no
+        # `torch` module import is needed here.
         if launch_enter_hook is not None:
             launch_enter_hook(launch_metadata)
 
-        # Marshal *args into MTLBuffer handles. Pointer args (torch
-        # tensors) get a fresh MTLBuffer + h2d copy; scalar args get a
-        # 1-element MTLBuffer with packed value. Track allocations so we
-        # can copy results back + free at the end.
-        buffer_handles = []
-        tensor_pairs = []  # (handle, tensor) for d2h copy-back
-        # Filter `args` by the precomputed mask so the i-th launched buffer
-        # always corresponds to the i-th MSL `[[buffer(i)]]`, regardless of
-        # which positional args Triton specialized away upstream.
+        gx, gy, gz = self._threadgroup
+        threads = (int(gridX) * gx, int(gridY) * gy, int(gridZ) * gz)
+        group_size = (gx, gy, gz)
+
         filtered_args = [a for a, keep in zip(args, self._arg_mask) if keep]
-        try:
-            for i, (arg, ty) in enumerate(zip(filtered_args, self._arg_types)):
-                if _is_pointer_type(ty):
-                    tensor = arg
-                    if hasattr(tensor, "contiguous"):
-                        tensor = tensor.contiguous()
-                    # Stage through a CPU view for h2d serialization; .numpy()
-                    # rejects non-CPU tensors (MPS, CUDA). The d2h copy_ on
-                    # the original tensor handles the cross-device return.
-                    host_tensor = tensor.cpu() if tensor.device.type != "cpu" else tensor
-                    nbytes = host_tensor.numel() * host_tensor.element_size()
-                    buf = _libmetal.alloc_buffer(nbytes)
-                    # numpy has no bfloat16 dtype, so bit-cast bf16 -> uint16
-                    # for transport. The MSL kernel sees the raw bytes as
-                    # `bfloat` per its arg decl; storage layout is identical.
-                    import torch as _torch
-                    serial = (host_tensor.view(_torch.uint16)
-                              if host_tensor.dtype == _torch.bfloat16
-                              else host_tensor)
-                    _libmetal.copy_h2d(buf, bytes(serial.numpy().tobytes()))
-                    buffer_handles.append(buf)
-                    tensor_pairs.append((buf, tensor, nbytes))
-                else:
-                    # Scalar: pack to bytes, alloc 1-elem MTLBuffer.
-                    _, nbytes = _SCALAR_FMT[ty]
-                    packed = _pack_scalar(ty, arg)
-                    buf = _libmetal.alloc_buffer(nbytes)
-                    _libmetal.copy_h2d(buf, packed)
-                    buffer_handles.append(buf)
+        call_args = []
+        writeback = []  # (orig, device_tensor) for non-MPS / non-contiguous inputs
+        for arg, ty in zip(filtered_args, self._arg_types):
+            if _is_pointer_type(ty):
+                t = arg
+                dev_t = t if (getattr(t, "device", None) is not None
+                              and t.device.type == "mps") else t.to("mps")
+                if not dev_t.is_contiguous():
+                    dev_t = dev_t.contiguous()
+                call_args.append(dev_t)
+                if dev_t is not t:
+                    writeback.append((t, dev_t))
+            else:
+                call_args.append(arg)
 
-            _libmetal.launch_kernel_with_pipeline(
-                pso_handle, buffer_handles,
-                (int(gridX), int(gridY), int(gridZ)),
-                self._threadgroup,
-            )
+        function(*call_args, threads=threads, group_size=group_size)
 
-            # Copy pointer args back into their tensors (over-copy, since
-            # we can't tell input vs output without an explicit annotation).
-            for buf, tensor, nbytes in tensor_pairs:
-                raw = _libmetal.copy_d2h(buf, nbytes)
-                import numpy as np
-                import torch as _torch
-                if tensor.dtype == _torch.bfloat16:
-                    # numpy has no bf16; read as uint16 and re-view on torch side.
-                    arr = np.frombuffer(raw, dtype=np.uint16).reshape(tensor.shape)
-                    tmp = _torch.from_numpy(arr.copy()).view(_torch.bfloat16)
-                    tensor.copy_(tmp)
-                else:
-                    arr = np.frombuffer(raw, dtype=_torch_dtype_to_np(tensor.dtype))
-                    arr = arr.reshape(tensor.shape)
-                    # In-place copy into the tensor's storage.
-                    tensor.copy_(_np_to_torch(arr))
-        finally:
-            for buf in buffer_handles:
-                _libmetal.free_buffer(buf)
+        # Pure zero-copy path (all inputs already MPS + contiguous) leaves
+        # writeback empty. CPU / non-contiguous inputs are mirrored back in
+        # place so the standard "kernel writes its output arg" contract holds.
+        for orig, dev_t in writeback:
+            orig.copy_(dev_t)
 
-        # Exit hook.
         if launch_exit_hook is not None:
             launch_exit_hook(launch_metadata)
-
-
-def _torch_dtype_to_np(dtype):
-    import numpy as np
-    import torch
-    return {
-        torch.float32: np.float32,
-        torch.float16: np.float16,
-        torch.int32: np.int32,
-        torch.int64: np.int64,
-        torch.int8: np.int8,
-        torch.uint8: np.uint8,
-        torch.bool: np.bool_,
-    }[dtype]
-
-
-def _np_to_torch(arr):
-    import torch
-    # frombuffer arrays are non-writable; .copy() yields a writable copy
-    # so the resulting tensor is fully usable downstream.
-    return torch.from_numpy(arr.copy())
 
 
 class MetalDriver(DriverBase):
@@ -437,9 +318,19 @@ class MetalDriver(DriverBase):
         return GPUTarget(backend="metal", arch=_get_apple_gpu_family(), warp_size=32)
 
     def get_active_torch_device(self):
-        # Tensors live on CPU; the MetalLauncher copies them to MTLBuffer
-        # per launch. MPS-backed tensors are out of scope for this slice.
+        # MPS path: tensors live on the MPS device so the launcher binds them
+        # zero-copy. Without the MPS runtime, tensors live on CPU and the
+        # legacy launcher stages them through MTLBuffers per launch.
+        #
+        # Return the CONCRETE indexed device ("mps:0", not "mps"): a tensor
+        # created with device="mps" reports `.device == mps:0`, so an
+        # index-less `torch.device("mps")` fails the canonical tutorial guard
+        # `assert x.device == DEVICE` and yields `DEVICE.index is None` (which
+        # callers pass to get_device_properties). This mirrors CUDA, whose
+        # active device is indexed (cuda:0).
         import torch
+        if _use_mps_runtime():
+            return torch.device("mps", 0)
         return torch.device("cpu")
 
     def get_benchmarker(self):
@@ -489,30 +380,25 @@ class MetalDriver(DriverBase):
         pass
 
     def get_device_interface(self):
-        class _DeviceInterface:
-            # Exposed via `di.Event(enable_timing=True)` by triton.testing.do_bench.
-            # See module-level _PerfCounterEvent for semantics.
-            Event = _PerfCounterEvent
+        # MPS-only: do_bench's timing and sync ride on torch.mps. torch.mps.Event
+        # supports record()/elapsed_time()/synchronize() (matching the cuda.Event
+        # contract do_bench expects); _MPSFlooredEvent wraps it for the backend's
+        # tiny latency-bound kernels (see its docstring).
+        import torch
+
+        class _MPSDeviceInterface:
+            Event = _MPSFlooredEvent
 
             @staticmethod
             def empty_cache():
-                pass
+                torch.mps.empty_cache()
 
             @staticmethod
             def synchronize():
-                # No-op while MetalLauncher.__call__ is synchronous (it blocks
-                # on launch_kernel_with_pipeline + copy_d2h before returning,
-                # and the GPU-time monotonic counter is updated post-
-                # waitUntilCompleted on the same thread). If the launcher
-                # ever becomes async, this must become a real wait, and the
-                # accumulator-update site in Runtime.mm must move into a
-                # MTLCommandBuffer.addCompletedHandler completion block.
-                # _PerfCounterEvent.synchronize is the other chokepoint that
-                # must change in lockstep.
-                pass
+                torch.mps.synchronize()
 
             @staticmethod
             def get_device_properties(device):
                 return MetalUtils().get_device_properties(device)
 
-        return _DeviceInterface()
+        return _MPSDeviceInterface()

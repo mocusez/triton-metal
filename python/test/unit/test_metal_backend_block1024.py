@@ -4,8 +4,10 @@ Acceptance test for `.omc/specs/deep-interview-metal-block-size-loop.md`
 (AC.B4). Compiles the canonical Triton vector_add with BLOCK_SIZE=1024
 (elem_per_thread=8 on 128 threads) and asserts that the resulting MSL
 contains a per-thread loop, a per-iteration mask check, and the strided
-index expression (`id.x + (iv * 128)`) that matches Triton's default
-sizePerThread=[1] layout.
+index expression that matches Triton's default sizePerThread=[1] layout.
+The strided index is built from the threadgroup-local thread position
+`(id.x - (tgid.x * 128))` (pid-aware addressing) plus the per-iteration
+stride `(iv * 128)`, where 128 == threads-per-block.
 
 Skipped automatically when the metal backend's pybind module isn't built.
 """
@@ -73,9 +75,12 @@ def test_block_size_larger_than_threads_compiles_to_msl():
         "thread_position_in_grid",
         # Tile loop: 8 iterations covering 1024 elements over 128 threads.
         "< 8;",
-        # Strided per-thread index (sizePerThread=[1]); the layout
-        # repeats 8 times across the tensor extent.
-        "(id.x + (",
+        # Strided per-thread index (sizePerThread=[1]); the layout repeats
+        # 8 times across the tensor extent. The base is the threadgroup-local
+        # thread position (pid-aware: global id minus the threadgroup origin),
+        # strided each iteration by threads-per-block (128). Asserted on the
+        # stable token shape, not on SSA value names (v4, v5, ...).
+        "(id.x - (tgid.x * 128))",
         "* 128))",
         # Mask check against n_elements (wrapped scalar arg).
         "< v",

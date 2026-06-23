@@ -87,30 +87,27 @@ class MetalOptions:
 # and confirm every gate is either unreached from the Metal pipeline or
 # selects the conservative branch at 80.
 #
-# Decoupled from GPUTarget.arch, which carries the real Apple GPU family
-# integer (1-9, via Runtime.mm:getAppleGpuFamily). Upstream parser sites:
+# Decoupled from GPUTarget.arch, which carries the Apple GPU family tag
+# (driver._get_apple_gpu_family). Upstream parser sites:
 # Prefetch.cpp:736, Utility.cpp:149, Utility.cpp:1097.
 _TTGPUIR_PARSER_STUB_ARCH = 80
 _TTGPUIR_PARSER_STUB_TRIPLE = f"cuda:{_TTGPUIR_PARSER_STUB_ARCH}"
 
 
 class MetalBackend(BaseBackend):
-    """Metal backend: TTIR -> TTGIR -> MSL text -> .metallib (terminal).
+    """Metal backend: TTIR -> TTGIR -> MSL text (terminal).
 
-    Terminal artifact depends on platform: `.metallib` on Darwin (when
-    the libmetal runtime is built in); otherwise the MSL text remains
-    the terminal stage.
+    MPS-only: the terminal artifact is the MSL text. The driver's load_binary
+    feeds it to torch.mps.compile_shader, which compiles and dispatches on
+    PyTorch MPS tensors (zero-copy). The legacy `.metallib` stage and its
+    native xcrun runtime were removed.
     """
 
-    binary_ext = "metallib" if hasattr(libmetal, "compile_msl_to_metallib") else "metal"
+    binary_ext = "metal"
 
     @staticmethod
     def supports_target(target: GPUTarget) -> bool:
         return target.backend == "metal"
-
-    def __init__(self, target: GPUTarget) -> None:
-        super().__init__(target)
-        self.binary_ext = type(self).binary_ext
 
     def hash(self) -> str:
         return f"metal-{self.target.arch}-{self.target.warp_size}"
@@ -214,22 +211,12 @@ class MetalBackend(BaseBackend):
         metadata["name"] = match.group(1)
         return msl
 
-    @staticmethod
-    def make_metallib(msl, metadata, options):
-        # MSL -> .metallib via the Darwin-only pybind runtime
-        # (libmetal.compile_msl_to_metallib invokes xcrun). On non-Darwin
-        # this stage is absent so triton.compile stops at MSL.
-        return libmetal.compile_msl_to_metallib(msl)
-
     def add_stages(self, stages, options, language=None):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
+        # Terminal artifact is the MSL text; torch.mps.compile_shader (driver
+        # load_binary) owns final compilation + dispatch. No metallib stage.
         stages["metal"] = lambda src, metadata: self.make_msl(src, metadata, options)
-        # The metallib stage requires the Darwin-only runtime layer in
-        # libtriton (xcrun + Metal framework). On non-Darwin builds the
-        # symbol is absent and the compile pipeline stops at MSL.
-        if hasattr(libmetal, "compile_msl_to_metallib"):
-            stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
 
     def pack_metadata(self, metadata):
         return (metadata.num_warps, metadata.num_ctas, getattr(metadata, "shared", 0))

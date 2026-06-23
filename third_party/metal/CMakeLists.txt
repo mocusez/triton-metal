@@ -22,17 +22,12 @@ add_subdirectory(lib)
 add_subdirectory(cli)
 
 if(TRITON_BUILD_PYTHON_MODULE)
-  set(_TRITON_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/triton_metal.cc)
-  # On Darwin, link the Metal-runtime layer (C++ over the header-only
-  # metal-cpp bindings wrapping MTLDevice / MTLBuffer / dispatch). Non-Darwin
-  # builds omit it; the Python-side gate is
-  # `hasattr(libmetal, "launch_kernel")`.
-  # See `.omc/specs/deep-interview-metal-gpu-launch.md`.
-  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    list(APPEND _TRITON_METAL_SOURCES
-         ${CMAKE_CURRENT_SOURCE_DIR}/lib/Runtime/Runtime.cpp)
-  endif()
-  add_triton_plugin(TritonMetal ${_TRITON_METAL_SOURCES})
+  # MPS-only backend: the pybind module exposes just the compile path
+  # (load_dialects + ttgir_to_msl). Kernels launch via torch.mps.compile_shader
+  # on the Python side (backends/metal/driver.py), so there is no native Metal
+  # runtime layer to compile or link — the legacy lib/Runtime/Runtime.cpp (and
+  # its `-framework Metal/Foundation` + metal-cpp dependency) was removed.
+  add_triton_plugin(TritonMetal ${CMAKE_CURRENT_SOURCE_DIR}/triton_metal.cc)
   target_link_libraries(TritonMetal PRIVATE
     Python3::Module
     pybind11::headers
@@ -41,10 +36,4 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRTritonMetalTransforms
     MLIRTritonGPUToMetal
   )
-  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    target_link_libraries(TritonMetal PRIVATE
-      "-framework Metal"
-      "-framework Foundation"
-    )
-  endif()
 endif()

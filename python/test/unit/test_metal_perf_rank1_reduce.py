@@ -1,36 +1,44 @@
-"""Kernel-only latency/throughput bench for rank-1 f32 sum reduce.
+"""Per-launch latency / throughput bench for rank-1 f32 sum reduce (MPS path).
 
-Measures per-kernel GPU latency (µs) and effective GB/s for BLOCK ∈ {512, 1024}
-using triton.testing.do_bench with the Metal _PerfCounterEvent timer.
+Measures per-launch latency (µs) and effective GB/s for BLOCK ∈ {512, 1024}
+using triton.testing.do_bench on PyTorch MPS tensors.
 Saves results to /tmp/optionbeta_rank1_reduce_bench.csv.
 
-## Why GB/s is low for these BLOCK sizes
+## What is measured (and why it is latency-bound, not BW-bound)
 
 The Metal backend currently supports rank-1 reduce only for BLOCK ≤ 1024
 (BLOCK=2048+ fails at `tt.reduce` lowering). A BLOCK=1024 reduce operates on
-1024 × 4B = 4KB of data. Apple Silicon M-series takes ~6–10µs of *kernel-only*
-GPU time for such a tiny dispatch. At those durations:
+1024 × 4B = 4KB of data — entirely cache-resident on Apple Silicon UMA.
 
-    GB/s = 4KB / 8µs ≈ 0.5 GB/s
+On the MPS launch path (the default; see `.omc/plans/pytorch-mps-zero-cost-integration.md`)
+do_bench times kernels with `torch.mps.Event` (driver `get_device_interface`),
+which captures the *GPU-timeline span* of the dispatched launches. For a tiny
+kernel that span is dominated by per-launch dispatch latency (Python JIT runtime
++ MPS dispatch), not GPU compute, which is a fraction of a microsecond. So:
 
-This is not a memory-bandwidth number — it is a kernel-launch-latency number.
-The GPU's peak DRAM bandwidth (~100–400 GB/s on M1/M2/M3) is irrelevant when
-the entire dataset fits in a handful of cache lines and the kernel finishes in
-a fraction of a microsecond.
+    GB/s = 4KB / (hundreds of µs) ≈ 0.003–0.01
 
-## Timer implementation
+is a *correct, expected* dispatch-bound number — NOT a memory-bandwidth figure
+and NOT a timer malfunction. The GPU's peak DRAM bandwidth (~100–400 GB/s on
+M1/M2/M3) is irrelevant when the dataset fits in a handful of cache lines.
 
-do_bench on Metal uses _PerfCounterEvent (driver.py), which accumulates
-MTLCommandBuffer.GPUStartTime/GPUEndTime — kernel-only GPU time, excluding H2D/D2H.
-_ELAPSED_TIME_FLOOR_MS = 0.1ms clamps each do_bench iteration's elapsed_time.
-To escape the floor we batch N_CALLS_PER_ITER=2000 launches per iteration so the
-accumulated GPU time (~12ms) >> 0.1ms, then divide by N to recover per-kernel time.
+The primary signal of this bench is therefore the per-launch latency (µs) and
+that the timer fires with a positive, finite value; GB/s is informational.
+
+## Timer note (MPS vs legacy)
+
+This bench targets the MPS path, where do_bench times via `_MPSFlooredEvent`
+(driver) — a wrapper over `torch.mps.Event` that floors elapsed_time and
+swallows torch's flaky sub-µs ordering error. The legacy native GPU-time
+accumulator was removed with the native runtime. Batching N launches per
+do_bench callable yields a stable per-launch average and amortizes do_bench's
+fixed estimate overhead.
 
 ## Tensors
 
-Tensors use device="cpu" (default on macOS). MetalLauncher copies CPU tensors
-to MTLBuffer (alloc + copy_h2d) per launch and copies results back (copy_d2h)
-after. These transfers are excluded from the GPU timer.
+Tensors live on `device="mps"`, so the launcher binds them zero-copy into their
+own MTLBuffer (no host staging, no per-launch alloc/copy). This is the path the
+Metal backend actually uses at runtime.
 
 Run:
     pixi run --frozen pytest python/test/unit/test_metal_perf_rank1_reduce.py -s --tb=short
@@ -39,6 +47,7 @@ Run:
 from __future__ import annotations
 
 import csv
+import os
 import platform
 
 import pytest
@@ -48,27 +57,37 @@ import triton
 import triton.language as tl
 import triton.testing
 
-libmetal = pytest.importorskip(
+pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
-    pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
-        allow_module_level=True,
-    )
 
+# This bench exercises the MPS launch path (zero-copy dispatch via
+# torch.mps.compile_shader). It is meaningless on the legacy metallib runtime
+# (removed; native GPU-time counter dormant), so require an MPS-enabled torch
+# and skip when the user has opted out with TRITON_METAL_USE_MPS=0.
 pytestmark = pytest.mark.skipif(
-    not (platform.system() == "Darwin" and platform.machine() == "arm64"),
-    reason="Metal backend perf tests run only on Apple Silicon.",
+    not (
+        platform.system() == "Darwin"
+        and platform.machine() == "arm64"
+        and torch.backends.mps.is_available()
+        and os.environ.get("TRITON_METAL_USE_MPS", "1") != "0"
+    ),
+    reason="Metal MPS perf bench runs only on Apple Silicon with an MPS-enabled torch "
+    "(and TRITON_METAL_USE_MPS != 0).",
 )
 
 _NUM_WARPS = 8  # threadgroup = 256 threads
 
-# Batch count for latency measurement. 2000 launches × ~6-10µs GPU time each
-# = ~12-20ms total, well above the 0.1ms _ELAPSED_TIME_FLOOR_MS in driver.py.
-# Per-kernel time = total_ms / N_CALLS_PER_ITER.
-_N_CALLS_PER_ITER = 2000
+# Launches per do_bench callable. The per-launch result is N-invariant
+# (total / N), so N only trades runtime for averaging stability. Kept modest
+# since torch.mps.Event has no elapsed-time floor to escape on this path.
+_N_CALLS_PER_ITER = 500
+
+# Generous upper bound on per-launch latency (~7-10x the observed dispatch
+# latency). Exceeding it points at a timer/compilation issue, not normal
+# Python+MPS dispatch overhead, even under full-suite load.
+_MAX_PER_KERNEL_US = 5000.0
 
 
 @triton.jit
@@ -84,20 +103,14 @@ _BENCH_RESULTS: list[dict] = []
 
 @pytest.mark.parametrize("BLOCK", [512, 1024])
 def test_rank1_reduce_sum_bench(BLOCK):
-    """Measure kernel-only GPU latency (µs) and effective GB/s.
+    """Measure per-launch latency (µs) and effective GB/s on the MPS path.
 
     For BLOCK ≤ 1024 these kernels are latency-bound (not memory-BW-bound):
-    the dataset is 2-4KB, well within L1 cache. Report µs as the primary
-    metric; GB/s is included for completeness but reflects dispatch overhead,
-    not DRAM bandwidth.
-
-    Expected on Apple Silicon M-series:
-      - BLOCK=512:  ~4–10 µs kernel time
-      - BLOCK=1024: ~6–15 µs kernel time
-      - GB/s: 0.1–1.0 (latency-dominated; NOT comparable to DRAM bandwidth)
+    the dataset is 2-4KB, well within cache. Report µs as the primary metric;
+    GB/s is informational and reflects dispatch overhead, not DRAM bandwidth.
     """
-    x = torch.randn((BLOCK,), dtype=torch.float32)
-    out = torch.zeros((1,), dtype=torch.float32)
+    x = torch.randn((BLOCK,), dtype=torch.float32, device="mps")
+    out = torch.zeros((1,), dtype=torch.float32, device="mps")
 
     # Warm the JIT cache before benchmarking.
     _reduce_sum_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
@@ -106,31 +119,28 @@ def test_rank1_reduce_sum_bench(BLOCK):
         for _ in range(_N_CALLS_PER_ITER):
             _reduce_sum_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
 
-    # total_ms = GPU time for N_CALLS_PER_ITER sequential kernel launches.
-    # Divide by N to recover per-kernel GPU time.
+    # total_ms = GPU-timeline span for N_CALLS_PER_ITER sequential launches.
+    # Divide by N to recover per-launch latency.
     total_ms = triton.testing.do_bench(_batch_fn, warmup=10, rep=50)
     per_kernel_us = (total_ms / _N_CALLS_PER_ITER) * 1e3
     bytes_read = BLOCK * 4  # f32 elements read
     gbps = (bytes_read * 1e-9) / (per_kernel_us * 1e-6)
 
     print(
-        f"\nBLOCK={BLOCK}: {per_kernel_us:.2f} µs/kernel  "
-        f"({gbps:.3f} GB/s — latency-bound, not DRAM-BW-bound)"
+        f"\nBLOCK={BLOCK}: {per_kernel_us:.2f} µs/launch  "
+        f"({gbps:.3f} GB/s — dispatch-bound, not DRAM-BW-bound)"
     )
 
-    # Sanity checks: timer must have fired (total_ms > floor*rep) and latency
-    # must be in a plausible range for a tiny Metal kernel dispatch.
-    assert per_kernel_us > 0.0, "Expected positive kernel latency"
-    assert per_kernel_us < 1000.0, (
-        f"per_kernel_us={per_kernel_us:.1f} exceeds 1ms — "
-        "likely timer or compilation issue"
-    )
-    # GB/s floor is intentionally low: these are 2-4KB kernels, latency-bound.
-    # If you see < 0.01 GB/s the timer accumulator likely returned 0.
-    assert gbps > 0.01, (
-        f"GB/s={gbps:.6f} is suspiciously near zero — "
-        f"check _PerfCounterEvent accumulator (read_gpu_time_ns_total). "
-        f"total_ms={total_ms:.4f}, per_kernel_us={per_kernel_us:.4f}"
+    # The torch.mps.Event timer must have fired (non-zero span) and the
+    # per-launch latency must be positive and within a plausible dispatch range.
+    # GB/s is intentionally NOT gated: for a 2-4KB latency-bound kernel its value
+    # (~0.003-0.01) is a correct dispatch-bound number, not a timer fault.
+    assert total_ms > 0.0, "torch.mps.Event timer returned a non-positive span"
+    assert per_kernel_us > 0.0, "Expected positive per-launch latency"
+    assert per_kernel_us < _MAX_PER_KERNEL_US, (
+        f"per_kernel_us={per_kernel_us:.1f} exceeds {_MAX_PER_KERNEL_US:.0f}µs — "
+        "likely a timer or compilation issue, not normal dispatch latency. "
+        f"total_ms={total_ms:.4f}"
     )
 
     _BENCH_RESULTS.append({"BLOCK": BLOCK, "ms": per_kernel_us * 1e-3, "gbps": gbps})

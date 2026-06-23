@@ -38,9 +38,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -182,16 +182,15 @@ def _gate_one():
 N_REPEATS = 10
 
 
-# Phase B honest divergence: C6/C7 are marked xfail(strict=False) because
-# the Apple Metal lane-aliasing miscompile they trigger is NOT addressable
-# from `MaskedStoreLowering`. The defect lives in Apple's MSL
-# `tg_load_indexed` codegen — Phase B routes masked stores through a
-# threadgroup-scratch sentinel with `arith.select`, but empirically the
-# same per-warp-race miscompile fires regardless of the device-store shape
-# (verified with and without scf.if + ternary on value/address). See
-# `.omc/specs/deep-interview-leet-triton-l1d2c-phase-b-fix.md` §
-# "Reporting expectations" item 6 and the MaskedStoreLowering comment in
-# `TritonGPUToMetal.cpp`.
+# RESOLVED 2026-06-03 (XPASS disposition): C6/C7 were marked
+# xfail(strict=False) for a hypothesised Apple Metal `tg_load_indexed`
+# lane-aliasing miscompile. That miscompile no longer reproduces — the
+# current lowering for these single-threadgroup masked-cvt kernels emits no
+# cross-lane `tg_load_indexed` + `threadgroup_barrier` reload (dumped MSL
+# confirmed), so the Apple bug cannot fire. C6/C7 now pass bit-exact and
+# deterministically (30/30). The xfail marks are removed; the cells stay in
+# the sweep as regression guards. See
+# `.omc/specs/deep-interview-leet-triton-l1d2c-phase-b-fix.md`.
 @pytest.mark.parametrize(
     "cell",
     [
@@ -201,30 +200,8 @@ N_REPEATS = 10
         "C3",
         "C4",
         "C5",
-        pytest.param(
-            "C6",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "L1d2c Phase B honest divergence: Apple Metal MSL "
-                    "`tg_load_indexed` lane-aliasing miscompile persists "
-                    "after MaskedStoreLowering's scratch-sentinel + "
-                    "value-select rewrite. Defect is upstream of the "
-                    "device store and out of scope for Phase B."
-                ),
-                strict=False,
-            ),
-        ),
-        pytest.param(
-            "C7",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "L1d2c Phase B honest divergence: same Apple miscompile "
-                    "as C6, with an additional nested `scf.if(pid_z==0)` "
-                    "gate. Phase A confirmed A3 is orthogonal."
-                ),
-                strict=False,
-            ),
-        ),
+        "C6",
+        "C7",
     ],
 )
 def test_l1d2c_phase_a_probe(cell):

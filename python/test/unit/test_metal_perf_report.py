@@ -1,6 +1,6 @@
 """Smoke tests for the Metal-backend triton.testing perf_report path.
 
-Covers the runtime acceptance criteria for the Metal `_PerfCounterEvent`,
+Covers the runtime acceptance criteria for the Metal `_MPSFlooredEvent` timer,
 no-op cache primitives, `get_benchmarker()` wrapper, and a tiny
 `@triton.testing.perf_report` sweep. See `.omc/plans/metal-perf-report.md`.
 """
@@ -8,7 +8,6 @@ no-op cache primitives, `get_benchmarker()` wrapper, and a tiny
 import os
 import pathlib
 import platform
-import time
 
 import pytest
 import torch
@@ -17,10 +16,10 @@ import triton
 import triton.language as tl
 import triton.testing
 
-# Import _PerfCounterEvent directly so the ns->ms math and enable_timing /
-# record guards can be unit-tested without round-tripping through the driver
-# (the driver path is exercised separately below).
-from triton.backends.metal.driver import _PerfCounterEvent
+# Import the MPS timer + floor directly so the floor / error-swallow behavior
+# can be unit-tested without round-tripping through the driver (the driver
+# path is exercised separately below).
+from triton.backends.metal.driver import _MPSFlooredEvent, _MPS_ELAPSED_TIME_FLOOR_MS
 
 
 pytestmark = pytest.mark.skipif(
@@ -29,51 +28,34 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# --- _PerfCounterEvent unit tests -------------------------------------------------
+# --- _MPSFlooredEvent unit tests -------------------------------------------------
 
 
-def test_perf_counter_event_elapsed_ms_positive():
-    # Pure ns-math test of _PerfCounterEvent.elapsed_time arithmetic. Kernel-
-    # driven coverage lives in test_gpu_timer_* below; keeping this test
-    # source-independent means the ns->ms math is verified without depending
-    # on a real Metal runtime.
-    a = _PerfCounterEvent(enable_timing=True)
-    b = _PerfCounterEvent(enable_timing=True)
-    a._t_ns = 0
-    b._t_ns = 200_000  # 200 microseconds
-    dt = a.elapsed_time(b)
-    assert dt > 0.0
-    # 200us -> 0.2 ms; generous outer bounds.
-    assert 0.1 < dt < 100.0
-
-
-def test_perf_counter_event_requires_enable_timing():
-    a = _PerfCounterEvent(enable_timing=False)
-    b = _PerfCounterEvent(enable_timing=False)
+def test_mps_floored_event_clamps_tiny_span_to_floor():
+    # Back-to-back record() with no GPU work between yields a sub-floor (or
+    # unorderable) span; elapsed_time must report at least the floor so
+    # do_bench's n_repeat = rep/estimate_ms doesn't explode.
+    a = _MPSFlooredEvent(enable_timing=True)
+    b = _MPSFlooredEvent(enable_timing=True)
     a.record()
     b.record()
-    with pytest.raises(RuntimeError):
-        a.elapsed_time(b)
+    a.synchronize()
+    b.synchronize()
+    assert a.elapsed_time(b) >= _MPS_ELAPSED_TIME_FLOOR_MS
 
 
-def test_perf_counter_event_requires_record():
-    a = _PerfCounterEvent(enable_timing=True)
-    b = _PerfCounterEvent(enable_timing=True)
-    with pytest.raises(RuntimeError):
-        a.elapsed_time(b)
+def test_mps_floored_event_swallows_runtime_error():
+    # torch MPS raises "End event N was not recorded after start event M" for
+    # sub-µs spans; the wrapper must swallow it and report the floor rather
+    # than crash the whole benchmark.
+    class _Raising:
+        def elapsed_time(self, _other):
+            raise RuntimeError("End event 1 was not recorded after start event 0")
 
-
-def test_perf_counter_event_clamps_zero_to_floor():
-    from triton.backends.metal.driver import _ELAPSED_TIME_FLOOR_MS
-
-    a = _PerfCounterEvent(enable_timing=True)
-    b = _PerfCounterEvent(enable_timing=True)
-    a.record()
-    # Force identical timestamps to exercise the floor without relying on
-    # counter resolution. Pin to the exact constant so a future change to
-    # the floor value or the clamp is caught here.
-    b._t_ns = a._t_ns
-    assert a.elapsed_time(b) == _ELAPSED_TIME_FLOOR_MS
+    a = _MPSFlooredEvent(enable_timing=True)
+    b = _MPSFlooredEvent(enable_timing=True)
+    a._ev = _Raising()  # force the wrapped torch event to raise
+    assert a.elapsed_time(b) == _MPS_ELAPSED_TIME_FLOOR_MS
 
 
 # --- Driver-level cache primitives -----------------------------------------------
@@ -171,32 +153,13 @@ def test_perf_report_smoke(tmp_path):
     assert png_path.exists(), f"PNG not produced at {png_path}"
 
 
-# --- GPU-side timer behavior (AC#2, AC#3, AC#5 from the v3 plan) ----------------
-
-
-def test_gpu_timer_smaller_than_cpu_walltime():
-    """AC#3 — direction-only: GPU-only elapsed_time must be smaller than
-    wallclock-around-the-launcher (which on Metal includes alloc + h2d +
-    launch + wait + d2h + free). Direction-only assertion is robust to CI
-    noise; the absolute magnitude is captured by AC#2 (cross-size scaling)
-    and AC#4 (tutorial CSV delta vs baseline)."""
-    x = torch.rand(2**20, device="cpu")
-    y = torch.rand(2**20, device="cpu")
-    _add(x, y)  # warm JIT + caches
-    # CPU walltime around one full launcher call.
-    t0 = time.perf_counter_ns()
-    _add(x, y)
-    t1 = time.perf_counter_ns()
-    cpu_ms = (t1 - t0) / 1e6
-    # GPU-only via the Event.
-    a = _PerfCounterEvent(enable_timing=True)
-    b = _PerfCounterEvent(enable_timing=True)
-    a.record()
-    _add(x, y)
-    b.record()
-    gpu_ms = a.elapsed_time(b)
-    assert gpu_ms > 0.0
-    assert gpu_ms < cpu_ms, f"gpu_ms={gpu_ms} not less than cpu_ms={cpu_ms}"
+# --- GPU-side timer behavior (AC#2, AC#5 from the v3 plan) ----------------
+#
+# The legacy AC#3 "GPU-only elapsed_time < CPU walltime" test was dropped with
+# the native runtime: it was specific to the legacy staging path (the GPU timer
+# excluded H2D/D2H memcpy, so it was much smaller than wallclock). On the
+# zero-copy MPS path there is no staging and the timer is floored, so that
+# direction-only comparison is no longer meaningful.
 
 
 def test_gpu_timer_cross_size_monotonic():

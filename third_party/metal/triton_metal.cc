@@ -14,10 +14,6 @@
 #include "Dialect/Metal/IR/MetalDialect.h"
 #include "Target/Metal/ModuleTranslation.h"
 
-#ifdef __APPLE__
-#include "Runtime/Runtime.h"
-#endif
-
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -65,11 +61,10 @@ void init_triton_metal(py::module &&m) {
     return buffer;
   });
 
-#ifdef __APPLE__
-  // On Darwin, expose the Metal-runtime callables (compile_msl_to_metallib,
-  // alloc_buffer, free_buffer, copy_h2d, copy_d2h, launch_kernel). The
-  // pytest gates on `hasattr(libmetal, "launch_kernel")` so Linux builds
-  // can still load the metal pybind module for the MSL-text path.
-  mlir::triton::metal::registerMetalRuntime(m);
-#endif
+  // The Metal backend is MPS-only: kernels are launched via
+  // torch.mps.compile_shader (zero-copy on PyTorch MPS tensors), so this
+  // module exposes ONLY the compile path (load_dialects + ttgir_to_msl).
+  // The legacy native runtime (MTLDevice/MTLBuffer alloc + copy + dispatch,
+  // metallib compile) was removed — see the MetalLauncher MPS path in
+  // backends/metal/driver.py.
 }

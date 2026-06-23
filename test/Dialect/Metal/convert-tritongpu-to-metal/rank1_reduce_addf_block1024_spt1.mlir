@@ -32,8 +32,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 }
 
 // --- PROP checks (AC9): exactly one inserted cvt mapping #blocked → spt=[4].
-// PROP: #[[BLOCKED1:.*]] = #ttg.blocked<{sizePerThread = [4],
+// The pass deterministically names the inserted layout `#blocked1`; assert the
+// spt=[4] attribute (order-independent, lives above the func) and that the cvt
+// targets it, then feeds the reduce. (A cross-CHECK-LABEL `[[VAR]]` capture is
+// avoided here — FileCheck does not reliably resolve a variable defined in the
+// pre-label region when it is used after a CHECK-LABEL.)
+// PROP-DAG: #blocked1 = #ttg.blocked<{sizePerThread = [4],
 // PROP-LABEL: tt.func public @rank1_reduce_addf_block1024_spt1
 // PROP: ttg.convert_layout
-// PROP-SAME: -> tensor<1024xf32, #[[BLOCKED1]]>
+// PROP-SAME: -> tensor<1024xf32, #blocked1>
 // PROP-NEXT: tt.reduce

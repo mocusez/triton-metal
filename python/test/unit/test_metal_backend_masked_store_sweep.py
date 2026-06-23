@@ -5,20 +5,17 @@ Per `.omc/specs/deep-interview-leet-triton-l1d2c-phase-b-fix.md` AC.T3:
 sweep (BLOCK_N, num_warps) ∈ {(8,2), (16,8), (32,4)} over a masked-cvt
 kernel; each case PASS bit-exact ×10 runs.
 
-HONEST DIVERGENCE (per spec §"Reporting expectations" item 6): the
-Apple Metal MSL `tg_load_indexed` lane-aliasing miscompile that
-motivates L1d2c Phase B is NOT eliminated by MaskedStoreLowering's
-scratch-sentinel + value-select rewrite (verified empirically; see the
-file-level docstring in `test_metal_backend_transpose.py` and the
-canary lit fixture
-`test/Dialect/Metal/convert-tritongpu-to-metal/masked_store_unconditional.mlir`).
-The sweep cases are therefore marked `xfail(strict=False)` rather than
-expected-pass; AC.T3 is unmet and surfaced as honest divergence.
+RESOLVED 2026-06-03 (XPASS disposition): the in-envelope cases (8x8_nw2,
+16x16_nw8; single-threadgroup, sizePerThread=[1,1]) now pass bit-exact and
+deterministically (30/30) — the lowering no longer emits the cross-lane
+`tg_load_indexed` reload that triggered the Apple Metal lane-aliasing
+miscompile, so AC.T3 is met for these shapes. They are plain-pass and
+retained as regression guards.
 
-These sweep cases stay in the test suite so that any future fix landing
-upstream (Apple compiler update, MSL emitter workaround, or
-`ConvertLayoutLowering` cvt-body redesign) will flip them from xfail to
-pass automatically.
+32x32_nw4 stays xfail, but for a correctly-attributed reason: it is
+BLOCK>tpb (E=8, sizePerThread>1) and `ttg.convert_layout` rejects the
+broader staged-transpose at compile time (deferred to L1d3) — a deliberate
+not-yet-implemented gate, not a runtime miscompile.
 
 The kernel matches the canonical Triton matmul-pre-transpose shape:
 load `tile` from input, transpose via implicit ttg.convert_layout, store
@@ -48,9 +45,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -80,23 +77,37 @@ def _masked_transpose_sweep(
     tl.store(output_ptr + xi * sor + yi * soc, tile, mask=mask)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "L1d2c Phase B honest divergence: Apple Metal MSL "
-        "`tg_load_indexed` lane-aliasing miscompile persists after "
-        "MaskedStoreLowering's scratch-sentinel + value-select rewrite. "
-        "See `test_metal_backend_transpose.py` file docstring and the "
-        "Phase B fix-locus comment in "
-        "`third_party/metal/lib/Conversion/TritonGPUToMetal/TritonGPUToMetal.cpp`."
-    ),
-    strict=False,
-)
+# RESOLVED 2026-06-03 (XPASS disposition): the L1d2c lane-aliasing
+# miscompile no longer reproduces for the single-threadgroup
+# (sizePerThread=[1,1], E=1) shapes — they now lower to a direct
+# address-arithmetic gather/scatter with no cross-lane `tg_load_indexed`
+# reload, and pass bit-exact deterministically (30/30). 8x8_nw2 and
+# 16x16_nw8 are flipped to plain pass. 32x32_nw4 stays xfail for a
+# DIFFERENT, correctly-attributed reason: it is BLOCK>tpb (E=8, spt>1) and
+# `ttg.convert_layout` rejects the broader staged-transpose at compile time
+# (deferred to L1d3) — NOT a runtime miscompile.
 @pytest.mark.parametrize(
     "BLOCK_N,num_warps",
     [
         pytest.param(8, 2, id="8x8_nw2"),
         pytest.param(16, 8, id="16x16_nw8"),
-        pytest.param(32, 4, id="32x32_nw4"),
+        pytest.param(
+            32,
+            4,
+            id="32x32_nw4",
+            marks=pytest.mark.xfail(
+                reason=(
+                    "Broader staged-transpose deferred to L1d3: this case is "
+                    "BLOCK>tpb (32*32=1024 / 128 threads = E=8, sizePerThread>1) "
+                    "and `ttg.convert_layout` rejects it at compile time "
+                    "('broader staged-transpose deferred to L1d3 (... or "
+                    "sizePerThread > 1)') in convert-tritongpu-to-metal. This is "
+                    "a deliberate not-yet-implemented gate, not a runtime "
+                    "miscompile. See `l1d3-broader-staged-transpose-dot-bridge.md`."
+                ),
+                strict=True,
+            ),
+        ),
     ],
 )
 def test_masked_store_sweep_bit_exact(BLOCK_N, num_warps):

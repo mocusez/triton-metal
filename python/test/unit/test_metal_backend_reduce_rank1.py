@@ -13,8 +13,16 @@ Coverage:
 
 Notes:
   - f32 sum+max: all 12 parametrized cases pass.
-  - i32 cases: still xfail — `tt.load`/`tt.store` end-to-end for i32
-    deferred to L2b. Mirrors `test_metal_backend_reduce_sum.py` i32 xfail.
+  - i32 sum: all BLOCK pass. BLOCK <= threads_per_block (256) via the butterfly;
+    BLOCK > 256 via the scf.for tile-loop, whose iter_arg accumulator is now
+    emitted with its real integer type. The init/identity constant is built as
+    a signless `arith.constant` (the verifier rejects signed/unsigned-typed
+    integer constants) and then bridged to ui32 storage.
+  - i32 max: all BLOCK pass. tl.max on i32 emits an `arith.maxsi` combine, now
+    accepted by the convert-tritongpu-to-metal pre-pass and lowered via a
+    signed (si32) butterfly/accumulator. The MSL `max` is emitted as
+    `max(int32_t(a), int32_t(b))` so the comparison is signed even though i32
+    is stored as ui32.
 """
 
 from __future__ import annotations
@@ -30,9 +38,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -61,19 +69,10 @@ def reduce_max_rank1_kernel(
     tl.store(out_ptr + 0, s)
 
 
-_I32_XFAIL_REASON = (
-    "i32 tt.load/tt.store end-to-end deferred to L2b — mirrors "
-    "test_metal_backend_reduce_sum.py i32 xfail. The rank-1 reduce body "
-    "itself supports i32 (ui32-bridged storage like the rank-2 path); "
-    "only the surrounding load/store path is gated."
-)
-
-
 _NUM_WARPS = 8   # threads_per_block = num_warps * 32 = 256
 
 
 def _block_params():
-    # f32 sum+max pass for all BLOCK sizes; i32 xfails preserved (L2b).
     return [pytest.param(BLOCK) for BLOCK in [32, 64, 128, 256, 512, 1024]]
 
 
@@ -100,7 +99,6 @@ def test_reduce_max_rank1_f32(BLOCK):
 
 
 @pytest.mark.parametrize("BLOCK", _block_params())
-@pytest.mark.xfail(reason=_I32_XFAIL_REASON, strict=False)
 def test_reduce_sum_rank1_i32(BLOCK):
     torch.manual_seed(0xC0FFEE)
     x = torch.randint(-100, 100, (BLOCK,), dtype=torch.int32).contiguous()
@@ -111,7 +109,6 @@ def test_reduce_sum_rank1_i32(BLOCK):
 
 
 @pytest.mark.parametrize("BLOCK", _block_params())
-@pytest.mark.xfail(reason=_I32_XFAIL_REASON, strict=False)
 def test_reduce_max_rank1_i32(BLOCK):
     torch.manual_seed(0xC0FFEE)
     x = torch.randint(-100, 100, (BLOCK,), dtype=torch.int32).contiguous()

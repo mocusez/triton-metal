@@ -24,26 +24,25 @@ D7  non-id       present  cross-warp  -> EXPECTED FAIL (L1d2 anchor)
 Cells are hand-crafted .mlir files under
 `test/Dialect/Metal/l1d2d_probe/cell_D{0..7}.mlir`. The harness fires each
 through `triton-metal-opt | triton-metal-translate --mlir-to-msl`,
-compiles to a metallib via `libmetal.compile_msl_to_metallib`, and
-dispatches with deterministic `arange(N)` input. Each cell runs ITERS
-times (>= 10) to surface nondeterministic races.
+compiles it via `torch.mps.compile_shader`, and dispatches on MPS tensors
+with deterministic `arange(N)` input. Each cell runs ITERS times (>= 10) to
+surface nondeterministic races.
 """
 from __future__ import annotations
 
-import os
 import pathlib
-import struct
 import subprocess
 
 import pytest
+import torch
 
-libmetal = pytest.importorskip(
+pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -123,34 +122,24 @@ def _translate_to_msl(cell_id: str) -> str:
 
 def _dispatch(msl: str, kernel_name: str, threadgroup_size: int,
               num_threadgroups: int, in_floats: list[float]) -> list[float]:
-    """Compile MSL -> metallib, allocate IO buffers, launch with
-    grid=(threadgroup_size*num_threadgroups,1,1) and tg=(threadgroup_size,1,1),
-    copy out, return as list of len(in_floats)."""
-    metallib = libmetal.compile_msl_to_metallib(msl)
-    lib_handle, fn_handle, pso_handle, _max_threads = libmetal.load_metallib(
-        metallib, kernel_name
-    )
-    in_bytes = b"".join(struct.pack("<f", x) for x in in_floats)
-    nbytes = len(in_bytes)
+    """Compile MSL via torch.mps.compile_shader and dispatch with
+    threads=(threadgroup_size*num_threadgroups,1,1),
+    group_size=(threadgroup_size,1,1) on MPS tensors; return the output as a
+    list of len(in_floats). The cell kernels take two `device float*` buffers
+    (in, out), bound positionally exactly as the live MetalLauncher binds them.
+    """
+    lib = torch.mps.compile_shader(msl)
+    kfn = getattr(lib, kernel_name)
     n = len(in_floats)
-    in_buf = libmetal.alloc_buffer(nbytes)
-    out_buf = libmetal.alloc_buffer(nbytes)
-    libmetal.copy_h2d(in_buf, in_bytes)
-    libmetal.copy_h2d(out_buf, b"\x00" * nbytes)
-    try:
-        libmetal.launch_kernel_with_pipeline(
-            pso_handle, [in_buf, out_buf],
-            (threadgroup_size * num_threadgroups, 1, 1),
-            (threadgroup_size, 1, 1),
-        )
-        raw = libmetal.copy_d2h(out_buf, nbytes)
-    finally:
-        libmetal.free_buffer(in_buf)
-        libmetal.free_buffer(out_buf)
-        libmetal.free_pipeline(pso_handle)
-        libmetal.free_function(fn_handle)
-        libmetal.free_library(lib_handle)
-    return [struct.unpack_from("<f", raw, 4 * i)[0] for i in range(n)]
+    in_t = torch.tensor(in_floats, dtype=torch.float32, device="mps")
+    out_t = torch.zeros(n, dtype=torch.float32, device="mps")
+    kfn(
+        in_t, out_t,
+        threads=(threadgroup_size * num_threadgroups, 1, 1),
+        group_size=(threadgroup_size, 1, 1),
+    )
+    torch.mps.synchronize()
+    return out_t.cpu().tolist()
 
 
 @pytest.mark.parametrize("cell_id,threadgroup_size,num_threadgroups,doc", CELLS)

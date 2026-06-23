@@ -51,9 +51,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -130,6 +130,11 @@ def transpose_kernel_masked(
     tl.store(output_ptr + xi * sor + yi * soc, tile, mask=mask)
 
 
+# SUPERSEDED 2026-06-03 — see the RESOLVED note just above the @parametrize
+# decorator below. The historical hypothesis (a per-warp lane-aliasing
+# miscompile in Apple's `tg_load_indexed` codegen) is kept for context, but
+# the current lowering no longer emits that shape and the cases now pass.
+#
 # L1d2b honest divergence (`.omc/specs/deep-interview-leet-triton-l1d2b-...md`):
 #
 # L1d2b implements the MSL emitter's *inline-barrier contract* —
@@ -190,25 +195,16 @@ def transpose_kernel_masked(
 # coverage stays in place once the eventual fix lands. The new canary
 # lit fixture is an AC.M2-level regression test for the let-binding
 # hoisting that the runtime case sits on top of.
-@pytest.mark.xfail(
-    reason=(
-        "L1d2c Phase B honest divergence: the spec's MaskedStoreLowering "
-        "select-on-value+address rewrite was implemented (threadgroup "
-        "scratch sentinel hoisted, arith.select at the store site, scf.if "
-        "only around the device store — see TritonGPUToMetal.cpp "
-        "MaskedStoreLowering comment). Empirically the Apple Metal "
-        "lane-aliasing miscompile persists regardless of the device-store "
-        "shape: tested both with and without the device-store scf.if + "
-        "value/address ternaries, same per-warp-race pattern (warp 0 "
-        "first half correct, warp 1 lanes' values land at warp 0's lower "
-        "tail, warp 1's destination rows all zero). The defect is in "
-        "Apple's MSL `tg_load_indexed` codegen and is out of "
-        "MaskedStoreLowering's scope. Phase B ships the AC.F1/AC.S1–S3 "
-        "deliverables; AC.T2 is unmet and surfaced as honest divergence "
-        "per spec §'Reporting expectations' item 6."
-    ),
-    strict=False,
-)
+# RESOLVED 2026-06-03 (XPASS disposition): the L1d2c lane-aliasing
+# miscompile described above no longer reproduces. The single-threadgroup
+# (sizePerThread=[1,1], E=1) masked staged-transpose now lowers to a direct
+# address-arithmetic gather/scatter — the dumped MSL contains no cross-lane
+# `metal.tg_load_indexed` + `threadgroup_barrier` reload (the threadgroup
+# scratch write is dead; the device store reuses the loaded value), so the
+# Apple codegen bug cannot fire. Verified 30/30 deterministic bit-exact
+# passes for both params. Flipped from xfail to plain pass; the test is
+# retained as a regression guard — if a future codegen change reintroduces
+# the cross-lane reload shape and the Apple bug returns, these cases fail.
 @pytest.mark.parametrize(
     "rows,cols,BLOCK_N,num_warps",
     [

@@ -1,23 +1,15 @@
-"""L3a-tileloop: per-thread-owned axis=1 sum reduce on the Metal backend.
+"""Per-thread-owned axis=1 sum reduce on the Metal backend (M*N >> tpb).
 
-Exercises the new register-level reduce branch in `ReduceLowering` that
-activates when `threadsPerCTA[axis_dim] == 1` (the reduce axis is fully
-serial within each thread). This branch emits a per-thread accumulator
-plus an N-way unrolled `arith.addf` / `arith.addi` chain — NO threadgroup
-memory, NO barriers.
+Exercises the rank-2 axis=1 `ReduceLowering` body on the conv1d-style layout
+where the reduce axis is fully serial within each thread
+(`threadsPerCTA[axis_dim] == 1`) and `M*N >> tpb`.
 
-See `.omc/specs/deep-interview-leet-triton-l3a-tileloop-per-thread-reduce.md`.
-
-Honest divergence note (AC.T2 carry-forward): the per-thread branch's
-IR-shape ACs (B1–B5 + lit T1) are landed in this session; runtime bit-
-exactness for the multi-element-per-thread (M*N >> tpb) case requires a
-follow-on session — the MLIR conversion model gives the branch ONE scalar
-SSA value per (thread, tile-iv) pair, and the per-row gather across
-multiple tile-iv values cannot be expressed at the `ReduceLowering` site
-without hoisting the reduce out of the enclosing tile loop or
-reintroducing TG memory (both out of scope per spec non-goals). The cases
-below are therefore marked xfail with that carry-forward reason; the lit
-fixture `reduce_per_thread_owned.mlir` pins the IR shape.
+The L3a-tileloop-2 redesign makes the body self-contained: it walks back to
+the producing `tt.load` and reduces each row directly from device memory into
+a per-row threadgroup buffer (`rowBuf[M]`) hoisted above the tile loop. This
+closed the former carry-forward gap (the old body gave one scalar per
+(thread, tile-iv) pair and could not express the per-row gather), so the
+multi-element-per-thread cases below now produce correct results.
 """
 
 from __future__ import annotations
@@ -33,9 +25,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -55,13 +47,6 @@ def reduce_per_thread_kernel(
     tl.store(out_ptr + offs_m, s)
 
 
-_CARRYFWD_REASON = (
-    "L3a-tileloop runtime bit-exactness for multi-elem-per-thread (M*N >> tpb) "
-    "is a carry-forward to L3a-tileloop-2 — see spec AC.T2 honest-divergence "
-    "note. IR-shape ACs (B1–B5, lit T1) land in this session."
-)
-
-
 @pytest.mark.parametrize(
     "M, N",
     [
@@ -70,7 +55,6 @@ _CARRYFWD_REASON = (
         (256, 128),
     ],
 )
-@pytest.mark.xfail(reason=_CARRYFWD_REASON, strict=False)
 def test_reduce_per_thread_owned_f32(M, N):
     torch.manual_seed(0xC0FFEE)
     x = torch.randn((M, N), dtype=torch.float32).contiguous()

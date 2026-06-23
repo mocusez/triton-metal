@@ -1,70 +1,62 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal --split-input-file %s | FileCheck %s
 //
-// L3-budget chunked-reduce fixture
-// (`.omc/specs/deep-interview-leet-triton-l3-budget-chunked-reduce.md`).
-// In-envelope `tt.reduce` on `tensor<MxNxT>` (axis=1, T ∈ {f32, i32},
-// combine ∈ {arith.addf, arith.addi}) where the tile exceeds the 32 KiB
-// threadgroup-memory budget lowers via the new chunked branch in
-// `ReduceLowering`:
-//   * one `metal.threadgroup_alloca<M*chunk_size x T>` reused across
-//     `N_chunks = ceil(N/chunk_size)` unrolled passes
-//   * each chunk: `(scf.if (col∈[kLo,kHi)) → store)`, `metal.barrier`,
-//     `chunk_size` unrolled `metal.get_element + metal.binary_exp(addOp)`
-//     loads, `metal.binary_exp(addOp)` into the per-row accumulator
-//   * inter-chunk `metal.barrier` between consecutive chunks' alloca
-//     buffer reuse
+// Rank-2 axis=1 reduce over a LARGE tile (M*N >> tpb). The self-contained
+// per-row body (L3a-tileloop-2) handles this with no special "chunking":
+// rowBuf is sized M (the row count), and each thread reduces a grid-strided
+// set of whole rows from device memory. The staging is hoisted above the
+// FuncOpLowering output tile loop (now sized from the reduce OUTPUT, E_out),
+// and the per-row result is read inside that loop. Threadgroup memory is
+// M * sizeof(T) (4 KiB for M=1024) — independent of N — so the old chunked
+// body's 32 KiB over-allocation is gone.
 
 // -----
-// f32 / arith.addf, shape <1024x64xf32>, axis=1.
-// chunk_size = floor(32 KiB / (1024 * 4)) = 8 elements.
-// N_chunks = ceil(64 / 8) = 8.
-// Expected: ONE `metal.threadgroup_alloca<8192 x f32>` + 8 unrolled chunk
-// passes + per-row `metal.binary_exp(addOp)` accumulator.
-//
-// HONEST DIVERGENCE NOTE: the chunked emission below preserves L3a's
-// `M*N == tpb` body model (each thread = 1 logical (row,col) at the
-// reduce site). For the shape <1024x64xf32> in this fixture, the
-// blocked layout is declared with `threadsPerWarp=[2,16],
-// warpsPerCTA=[4,1]` (tpb=128) — this fixture EXERCISES the chunked
-// emission for a synthetic IR shape, not a real conv1d. Real conv1d
-// (M*N >> tpb) requires a follow-up session redesign of L3a's body
-// model.
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+// f32 / arith.addf, shape <1024x64xf32>, axis=1. tpb=128, E_out = 1024/128 = 8.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
+#blocked1 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_chunked_f32_1024x64(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<0.0> : tensor<1024x64xf32, #blocked>
-    %r = "tt.reduce"(%x) ({
+  tt.func public @reduce_chunked_axis1_f32(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {
+    %cst = arith.constant dense<64> : tensor<1024x1xi32, #blocked>
+    %offs_m = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked1>
+    %r0 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #slice1>
+    %r1 = tt.expand_dims %r0 {axis = 1 : i32} : tensor<1024xi32, #slice1> -> tensor<1024x1xi32, #blocked>
+    %r2 = arith.muli %r1, %cst : tensor<1024x1xi32, #blocked>
+    %r3 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %r4 = tt.expand_dims %r3 {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %r5 = tt.broadcast %r2 : tensor<1024x1xi32, #blocked> -> tensor<1024x64xi32, #blocked>
+    %r6 = tt.broadcast %r4 : tensor<1x64xi32, #blocked> -> tensor<1024x64xi32, #blocked>
+    %r7 = arith.addi %r5, %r6 : tensor<1024x64xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<1024x64x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %r7 : tensor<1024x64x!tt.ptr<f32>, #blocked>, tensor<1024x64xi32, #blocked>
+    %x = tt.load %ap : tensor<1024x64x!tt.ptr<f32>, #blocked>
+    %s = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
-      %s = arith.addf %a, %b : f32
-      tt.reduce.return %s : f32
+      %add = arith.addf %a, %b : f32
+      tt.reduce.return %add : f32
     }) {axis = 1 : i32} : (tensor<1024x64xf32, #blocked>) -> tensor<1024xf32, #slice1>
+    %osp = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+    %oap = tt.addptr %osp, %offs_m : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+    %cv = ttg.convert_layout %s : tensor<1024xf32, #slice1> -> tensor<1024xf32, #blocked1>
+    tt.store %oap, %cv : tensor<1024x!tt.ptr<f32>, #blocked1>
     tt.return
   }
 }
-// CHECK-LABEL: metal.kernel reduce_chunked_f32_1024x64
-// AC.S1/AC.S2: exactly ONE alloca sized to M * chunk_size = 1024 * 8 = 8192
-// (NOT 8 separate allocas, NOT M*N = 65536).
-// CHECK: metal.threadgroup_alloca {{.*}} !metal.memref<8192 x f32>
-// CHECK-NOT: metal.threadgroup_alloca {{.*}} !metal.memref<8192 x f32>
-// AC.B2: Each chunk emits an `scf.if (col∈[kLo,kHi)) → metal.store`
-// (8 chunks ⇒ 8 scf.if-wrapped stores). The CHECK below verifies the
-// 1st chunk's wrap; further chunks share the same shape.
+// CHECK-LABEL: metal.kernel reduce_chunked_axis1_f32
+// rowBuf is M = 1024 elements (4 KiB), NOT M*N.
+// CHECK: metal.threadgroup_alloca : !metal.memref<1024 x f32>
+// Hoisted staging: grid-stride row loop, per-row guard, rerolled column scan.
+// CHECK: scf.for
+// CHECK: arith.cmpi slt
 // CHECK: scf.if
-// CHECK: metal.store
+// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// CHECK: metal.get_element
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+// CHECK: scf.yield
+// CHECK: metal.store {{.*}}memref<1024 x f32>
 // CHECK: metal.barrier
-// AC.B2 / AC.B3: 8 unrolled `metal.binary_exp ... addOp` accumulator
-// passes follow (one per chunk; the 8x8 = 64 cumulative addOps include
-// per-chunk scans + inter-chunk accumulator merges).
-// CHECK: metal.binary_exp {{.*}} addOp
+// Output tile loop (E_out = 8) reads rowBuf and stores; M == tpb*E_out so the
+// store is in-bounds (no sub-tpb guard).
+// CHECK: scf.for
+// CHECK: metal.get_element {{.*}}memref<1024 x f32>
+// CHECK: metal.store
 // CHECK: metal.return
-
-// -----
-// Pre-pass reject when per-row size exceeds budget. M=32768 f32 →
-// 128 KiB per row ⇒ chunk_size==0 ⇒ chunking impossible.
-// Tested in `reduce_unsupported.mlir`; this section is a positive smoke
-// for tiny chunk_size (M=4096, N=2048, f32 → chunk_size = 32 KiB /
-// (4096*4) = 2 elements, N_chunks = 1024).
-//
-// HONEST DIVERGENCE: not exercised at this scale to keep test runtime
-// reasonable; verified via the f32_1024x64 case above + AC.T3 pytest.

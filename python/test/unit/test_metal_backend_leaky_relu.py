@@ -9,7 +9,7 @@ Acceptance bar (per `.omc/specs/deep-interview-leaky-relu-metal.md`):
 - Kernel compiles to MSL (compile-only path; always runs when pybind
   module is built).
 - Kernel dispatches without error and produces a finite fp32 output of
-  the correct shape (runtime path; gated by `launch_kernel_with_pipeline`).
+  the correct shape (runtime path; gated by MPS availability).
 - Qualitative leaky-relu behavior: positive inputs pass through, negative
   inputs are scaled by ~0.01.
 """
@@ -71,8 +71,8 @@ def test_leaky_relu_compiles_to_msl():
 
 
 @pytest.mark.skipif(
-    not hasattr(libmetal, "launch_kernel_with_pipeline"),
-    reason="Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+    not torch.backends.mps.is_available(),
+    reason="Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
 )
 def test_leaky_relu_dispatches_and_output_is_sane():
     """Runtime: dispatch leaky_relu and check finiteness + qualitative behavior."""

@@ -124,14 +124,14 @@ def benchmark(size, provider):
     y = torch.rand(size, device=DEVICE, dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
-        # On Metal the active torch device is CPU (see MetalDriver.get_active_torch_device);
-        # this provider therefore benchmarks CPU x+y, not GPU torch.
+        # On Metal the active torch device is MPS (see
+        # MetalDriver.get_active_torch_device); this provider benchmarks the
+        # PyTorch MPS x+y on the same device as the Triton kernel.
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: x + y, quantiles=quantiles)
     if provider == 'triton':
-        # Triton-on-Metal GB/s reports kernel-only GPU bandwidth via
-        # MTLCommandBuffer.GPUStartTime/GPUEndTime accumulated in Runtime.mm
-        # (excludes per-launch H2D/D2H CPU memcpy on UMA shared storage).
-        # Comparable to torch.cuda.Event(enable_timing=True) on CUDA.
+        # Triton-on-Metal times via torch.mps.Event (do_bench's
+        # get_device_interface().Event), measuring the MPS-queue span of the
+        # zero-copy launch — comparable to torch.cuda.Event(enable_timing=True).
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y), quantiles=quantiles)
     gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)

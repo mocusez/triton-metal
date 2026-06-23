@@ -802,8 +802,11 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
   // `v<accIdx> = yielded;`. Multi-iter_arg or non-f32 iter_arg falls
   // through to the existing IV-only emission unchanged. See
   // .omc/plans/tutorial02-wall15-iter-args-translator-consensus.md AC1/AC2.
-  if (op.getNumRegionIterArgs() == 1 &&
-      op.getRegionIterArgs()[0].getType().isF32()) {
+  auto singleIterArgTy = op.getNumRegionIterArgs() == 1
+                             ? op.getRegionIterArgs()[0].getType()
+                             : mlir::Type();
+  if (singleIterArgTy &&
+      (singleIterArgTy.isF32() || singleIterArgTy.isInteger(32))) {
     unsigned accIdx = _varCount++;
     _scfForIterArg[op.getOperation()] = accIdx;
     auto iterArg = op.getRegionIterArgs()[0];
@@ -812,7 +815,10 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
     // the loop exits — register it so downstream `translateVarName` /
     // `translateValueOrVarName` on the scf.for result renders `v<accIdx>`.
     _buffers[op.getResult(0).getAsOpaquePointer()] = accIdx;
-    _output << "float v" << accIdx << " = ";
+    // Emit the accumulator with its real element type: `float` for f32
+    // reduces, `int32_t` / `uint32_t` for the i32 max/sum rank-1 tile-loop
+    // accumulator (BLOCK > threads_per_block).
+    _output << typeToString(iterArg.getType()) << " v" << accIdx << " = ";
     if (auto initOp = op.getInitArgs()[0].getDefiningOp())
       translateValue(initOp);
     else
@@ -3843,6 +3849,77 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         emit(op.getRhs());
         _output << ")";
       })
+      .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
+        // Scalar float add surviving to translation (the conversion pass only
+        // folds TENSOR float arith into metal.binary_exp). MSL `+` on float.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " + ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp op) {
+        // Scalar float subtract, e.g. `1 - p` in tutorial-04 _dropout (the
+        // scalar operand of a metal.binary_exp divOp). MSL `-` on float.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " - ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
+        // Scalar float multiply surviving to translation. MSL `*` on float.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " * ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::DivFOp>([&](mlir::arith::DivFOp op) {
+        // Scalar float divide surviving to translation (tensor divf is folded
+        // to metal.binary_exp divOp by the conversion pass). MSL `/` on float.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(";
+        emit(op.getLhs());
+        _output << " / ";
+        emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+        // Unary float negate. MSL prefix `-`.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        _output << "(-";
+        emit(op.getOperand());
+        _output << ")";
+      })
       .Case<mlir::arith::DivSIOp>([&](mlir::arith::DivSIOp op) {
         // Used by 2D MakeRangeLowering: `row = idx / BLOCK_N`. MSL integer
         // divsion follows C semantics, which matches arith.divsi for the
@@ -3983,6 +4060,25 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         emit(op.getRhs());
         _output << ")";
       })
+      .Case<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
+            mlir::arith::FPToSIOp, mlir::arith::FPToUIOp, mlir::arith::ExtFOp,
+            mlir::arith::TruncFOp, mlir::arith::ExtSIOp, mlir::arith::ExtUIOp,
+            mlir::arith::TruncIOp>([&](auto op) {
+        // Scalar numeric conversion surviving to translation, e.g.
+        // `idx.to(tl.float32)` -> arith.sitofp (tensor conversions are folded
+        // into metal ops by the conversion pass; only scalar ones reach here).
+        // MSL spells every numeric conversion as a constructor cast `T(x)`,
+        // mirroring metal.cast's emission. float->int uses C truncation toward
+        // zero, matching arith.fptosi/fptoui; int->float and width changes are
+        // exact for the value ranges Triton emits here. The generic lambda is
+        // instantiated per op type, so .getIn()/.getType() resolve concretely.
+        _output << typeToString(op.getType()) << "(";
+        if (auto o = op.getIn().getDefiningOp())
+          translateValue(o);
+        else
+          translateVarName(op.getIn());
+        _output << ")";
+      })
       .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
         auto emit = [&](mlir::Value v) {
           if (auto o = v.getDefiningOp())
@@ -4105,11 +4201,16 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   // `.omc/specs/deep-interview-metal-rank1-reduce.md`). All other ops
   // lower to an infix C operator.
   if (op.getBinaryOperator() == OP::maxOp) {
-    _output << "max(";
+    // Emit `max(T(lhs), T(rhs))` where T is the result element type. The
+    // explicit cast forces a SIGNED comparison for i32 signed-max even when an
+    // operand is rendered from ui32 storage (the ui32->si32 MLIR bridge is a
+    // no-op in MSL). For f32 this is `max(float(x), float(y))` — same value.
+    auto ty = typeToString(op.getResult().getType());
+    _output << "max(" << ty << "(";
     translateValueOrVarName(op.getLhs());
-    _output << ", ";
+    _output << "), " << ty << "(";
     translateValueOrVarName(op.getRhs());
-    _output << ")";
+    _output << "))";
     return;
   }
 

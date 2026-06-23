@@ -22,9 +22,9 @@ libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not hasattr(libmetal, "launch_kernel_with_pipeline"):
+if not torch.backends.mps.is_available():
     pytest.skip(
-        "Metal runtime not compiled (non-Darwin build or Xcode CLT absent)",
+        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
 
@@ -45,19 +45,13 @@ def reduce_sum_axis1_kernel(
     tl.store(out_ptr + offs_m, s)
 
 
-# Honest-divergence note (per L3a spec §"Honest divergence policy"): the
-# spec calls for i32 reduce coverage alongside f32. The reduce body
-# itself supports i32 (see lit `reduce_sum_axis.mlir` Section 2). End-to-
-# end i32 kernels however require `tl.load` / `tl.store` on i32 pointers,
-# which the backend explicitly defers to Session L2b (`test_metal_backend
-# _int_arith.py` documents: "uint8/i32 data path is deferred"). We mark
-# the i32 cases as xfail so the parametrize matrix matches the spec
-# without falsely claiming i32 i/o works.
-_I32_XFAIL_REASON = (
-    "i32 tt.load/tt.store deferred to L2b; reduce body itself handles i32 "
-    "per lit reduce_sum_axis.mlir Section 2 (Metal_Type's signless-i32 "
-    "exclusion bridged via ui32 storage in ReduceLowering)"
-)
+# L2b (2026-06-03): end-to-end i32 reduce now works. `tt.load` / `tt.store`
+# on i32 pointers are supported by routing the i32 data buffer through ui32
+# storage (memref element + threadgroup scratch) and bridging back to signless
+# i32 for arith via builtin.unrealized_conversion_cast — see
+# `.omc/specs/l2b-i32-tt-load-store-extension.md`. The reduce body already
+# handled i32 (lit `reduce_sum_axis.mlir` Section 2); the load/store path was
+# the only gap, so the i32 cases below are now plain (non-xfail) passes.
 
 
 @pytest.mark.parametrize(
@@ -65,14 +59,8 @@ _I32_XFAIL_REASON = (
     [
         (8, 16, torch.float32),
         (4, 32, torch.float32),
-        pytest.param(
-            8, 16, torch.int32,
-            marks=pytest.mark.xfail(reason=_I32_XFAIL_REASON, strict=True),
-        ),
-        pytest.param(
-            4, 32, torch.int32,
-            marks=pytest.mark.xfail(reason=_I32_XFAIL_REASON, strict=True),
-        ),
+        (8, 16, torch.int32),
+        (4, 32, torch.int32),
     ],
 )
 def test_reduce_sum_axis1(M, N, dtype):
