@@ -4212,6 +4212,16 @@ void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
     translateArgument();
     _output << ")";
     break;
+  case OP::sinOp:
+    _output << "metal::precise::sin(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::cosOp:
+    _output << "metal::precise::cos(";
+    translateArgument();
+    _output << ")";
+    break;
   }
 }
 

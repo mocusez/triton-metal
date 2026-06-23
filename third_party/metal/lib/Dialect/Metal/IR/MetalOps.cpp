@@ -361,6 +361,8 @@ llvm::LogicalResult UnaryExpOp::verify() {
   case OP::erfOp:
   case OP::logOp:
   case OP::rsqrtOp:
+  case OP::sinOp:
+  case OP::cosOp:
     if (!argType.isF32())
       return emitOpError() << "argument type must be f32";
     break;
@@ -398,6 +400,8 @@ mlir::OpFoldResult UnaryExpOp::fold(FoldAdaptor adaptor) {
   case mlir::triton::metal::UnaryExpOperator::erfOp:
   case mlir::triton::metal::UnaryExpOperator::logOp:
   case mlir::triton::metal::UnaryExpOperator::rsqrtOp:
+  case mlir::triton::metal::UnaryExpOperator::sinOp:
+  case mlir::triton::metal::UnaryExpOperator::cosOp:
     return nullptr;
   }
   return nullptr;

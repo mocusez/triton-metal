@@ -1532,6 +1532,42 @@ struct ArithMulFLowering
   }
 };
 
+// Scalarize a tensor `arith.sitofp` (`idx.to(tl.float32)` etc.). The scalar
+// form is emitted by ModuleTranslation as the MSL constructor cast `T(x)`; here
+// we just rebuild it on the converted scalar operand/result so the tensor op
+// legalizes. Mirrors how the binary arith lowerings scalarize.
+struct ArithSIToFPLowering
+    : public mlir::OpConversionPattern<mlir::arith::SIToFPOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::SIToFPOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resTy = getTypeConverter()->convertType(op.getType());
+    if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
+      return rewriter.notifyMatchFailure(op, "sitofp: result not scalarizable");
+    rewriter.replaceOpWithNewOp<mlir::arith::SIToFPOp>(op, resTy,
+                                                       adaptor.getIn());
+    return mlir::success();
+  }
+};
+
+// Scalarize a tensor `arith.negf` (`-x`). ModuleTranslation emits scalar negf as
+// `(-x)`; rebuild it on the converted scalar operand so the tensor op legalizes.
+struct ArithNegFLowering
+    : public mlir::OpConversionPattern<mlir::arith::NegFOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::NegFOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resTy = getTypeConverter()->convertType(op.getType());
+    if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
+      return rewriter.notifyMatchFailure(op, "negf: result not scalarizable");
+    rewriter.replaceOpWithNewOp<mlir::arith::NegFOp>(op, resTy,
+                                                     adaptor.getOperand());
+    return mlir::success();
+  }
+};
+
 // Wall 9 (.omc/specs/deep-interview-tutorial02-walls-9-to-13.md AC1-AC2):
 // `arith.subf` on rank-1 (and ranked) f32 tensors. Mirror of ArithAddFLowering
 // with BinaryExpOperator::subOp.
@@ -1633,6 +1669,42 @@ struct MathExpLowering
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::expOp);
+    rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, attr,
+                                            adaptor.getOperand());
+    return mlir::success();
+  }
+};
+
+// `tl.sin` / `tl.cos` (RoPE in the adder transformer) → math.{sin,cos} on f32
+// tensors → metal.unary_exp {sin,cos}Op → MSL metal::precise::{sin,cos}.
+struct MathSinLowering
+    : public mlir::OpConversionPattern<mlir::math::SinOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::math::SinOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy || !resultTy.isF32())
+      return mlir::failure();
+    auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
+                                          UnaryExpOperator::sinOp);
+    rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, attr,
+                                            adaptor.getOperand());
+    return mlir::success();
+  }
+};
+
+struct MathCosLowering
+    : public mlir::OpConversionPattern<mlir::math::CosOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::math::CosOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy || !resultTy.isF32())
+      return mlir::failure();
+    auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
+                                          UnaryExpOperator::cosOp);
     rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, attr,
                                             adaptor.getOperand());
     return mlir::success();
@@ -6351,7 +6423,8 @@ struct ConvertTritonGPUToMetalPass
         [&](mlir::Operation *op) {
           if (!mlir::isa<mlir::math::SqrtOp, mlir::math::ErfOp,
                          mlir::math::ExpOp, mlir::math::LogOp,
-                         mlir::math::RsqrtOp>(op))
+                         mlir::math::RsqrtOp, mlir::math::SinOp,
+                         mlir::math::CosOp>(op))
             return true;
           mlir::Type ty = op->getResultTypes().front();
           if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(ty))
@@ -6389,7 +6462,9 @@ struct ConvertTritonGPUToMetalPass
                  ArithShRSILowering, ArithShLILowering, ArithOrILowering,
                  ArithXOrILowering, ArithDivUILowering, ArithRemUILowering,
                  ArithShRUILowering, ArithSelectLowering,
-                 ArithMulFLowering, MathSqrtLowering, MathErfLowering,
+                 ArithMulFLowering, ArithSIToFPLowering, ArithNegFLowering,
+                 MathSinLowering, MathCosLowering,
+                 MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathLogLowering, MathRsqrtLowering,
                  ReduceLowering>(
                  typeConverter, ctx);

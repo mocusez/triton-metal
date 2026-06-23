@@ -335,12 +335,14 @@ def UnaryExpOperatorSqrt : I64EnumAttrCase<"sqrtOp", 3>;
 def UnaryExpOperatorErf : I64EnumAttrCase<"erfOp", 4>;
 def UnaryExpOperatorLog : I64EnumAttrCase<"logOp", 5>;
 def UnaryExpOperatorRsqrt : I64EnumAttrCase<"rsqrtOp", 6>;
+def UnaryExpOperatorSin : I64EnumAttrCase<"sinOp", 7>;
+def UnaryExpOperatorCos : I64EnumAttrCase<"cosOp", 8>;
 
 def UnaryExpOperator : I64EnumAttr<
     "UnaryExpOperator", "",
     [UnaryExpOperatorNot, UnaryExpOperatorMinus, UnaryExpOperatorExp,
      UnaryExpOperatorSqrt, UnaryExpOperatorErf, UnaryExpOperatorLog,
-     UnaryExpOperatorRsqrt]> {
+     UnaryExpOperatorRsqrt, UnaryExpOperatorSin, UnaryExpOperatorCos]> {
   let cppNamespace = "mlir::triton::metal";
 }
 
