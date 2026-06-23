@@ -12,10 +12,13 @@ deterministically (30/30) — the lowering no longer emits the cross-lane
 miscompile, so AC.T3 is met for these shapes. They are plain-pass and
 retained as regression guards.
 
-32x32_nw4 stays xfail, but for a correctly-attributed reason: it is
-BLOCK>tpb (E=8, sizePerThread>1) and `ttg.convert_layout` rejects the
-broader staged-transpose at compile time (deferred to L1d3) — a deliberate
-not-yet-implemented gate, not a runtime miscompile.
+RESOLVED 2026-06-23 (32x32_nw4): the BLOCK>tpb (E=8, sizePerThread>1) case
+now passes bit-exact. The rank-2 producer-cone normalization
+(`normalizeBlockedDivergentCvts` in TritonGPUToMetal.cpp) rewrites the load
+cone from the row-major #blocked to the column-major #blocked1 store layout,
+collapsing the transpose `ttg.convert_layout` to an identity (direct
+gather/scatter) instead of routing it through the deferred L1d3 threadgroup
+staging path. No runtime staging, no cross-lane reload.
 
 The kernel matches the canonical Triton matmul-pre-transpose shape:
 load `tile` from input, transpose via implicit ttg.convert_layout, store
@@ -82,32 +85,18 @@ def _masked_transpose_sweep(
 # (sizePerThread=[1,1], E=1) shapes — they now lower to a direct
 # address-arithmetic gather/scatter with no cross-lane `tg_load_indexed`
 # reload, and pass bit-exact deterministically (30/30). 8x8_nw2 and
-# 16x16_nw8 are flipped to plain pass. 32x32_nw4 stays xfail for a
-# DIFFERENT, correctly-attributed reason: it is BLOCK>tpb (E=8, spt>1) and
-# `ttg.convert_layout` rejects the broader staged-transpose at compile time
-# (deferred to L1d3) — NOT a runtime miscompile.
+# 16x16_nw8 are flipped to plain pass.
+# RESOLVED 2026-06-23 (32x32_nw4): the BLOCK>tpb (E=8, spt>1) case is also a
+# plain pass now — `normalizeBlockedDivergentCvts` rewrites the load cone to
+# the store's #blocked1 layout, collapsing the transpose cvt to a direct
+# gather/scatter (rank-2 generalization of the rank-1 divergent-cvt normalize),
+# so it no longer hits the L1d3 staged-transpose gate.
 @pytest.mark.parametrize(
     "BLOCK_N,num_warps",
     [
         pytest.param(8, 2, id="8x8_nw2"),
         pytest.param(16, 8, id="16x16_nw8"),
-        pytest.param(
-            32,
-            4,
-            id="32x32_nw4",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "Broader staged-transpose deferred to L1d3: this case is "
-                    "BLOCK>tpb (32*32=1024 / 128 threads = E=8, sizePerThread>1) "
-                    "and `ttg.convert_layout` rejects it at compile time "
-                    "('broader staged-transpose deferred to L1d3 (... or "
-                    "sizePerThread > 1)') in convert-tritongpu-to-metal. This is "
-                    "a deliberate not-yet-implemented gate, not a runtime "
-                    "miscompile. See `l1d3-broader-staged-transpose-dot-bridge.md`."
-                ),
-                strict=True,
-            ),
-        ),
+        pytest.param(32, 4, id="32x32_nw4"),
     ],
 )
 def test_masked_store_sweep_bit_exact(BLOCK_N, num_warps):

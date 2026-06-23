@@ -3,10 +3,12 @@
 Covers Phase 1 of `.omc/plans/metal-universal-matmul.md`:
 
 - **AC2** (non-square multiples-of-8 f32): grid in M and/or N, K-tiled or single.
-  Non-multiples-of-8 are xfailed pending the masked-epilogue step (step 6).
+  Runtime M/N not a multiple of 8 also pass via the masked `tt.store` epilogue
+  (`test_dot_f32_mn_partial_tile`).
 - **AC3** (fp16 inputs, f32 accumulator): canonical-3-iter-arg path uses
   threadgroup-staged loads which implicit-cast `half`/`bfloat` -> `float`.
-  bf16 single-dot is xfailed pending single-dot staging.
+  bf16 single-dot passes via `rewriteSingleDot` SimdgroupLoadDeviceStaged staging
+  (`test_dot_bf16_singletile`).
 - **AC5** (K-loop tiled, K_TILES in {1,2,4,8}): the canonical-3-iter-arg
   matcher already covers this once the launcher arg-mask fix is in place.
 

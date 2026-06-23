@@ -5252,31 +5252,55 @@ static void preprocessDotChains(mlir::ModuleOp moduleOp) {
   for (auto dot : dots) rewriteSingleDot(dot);
 }
 
-// Mixed pointer alignment in one elementwise kernel makes Triton's coalescing
-// emit two blocked layouts for the same rank-1 shape: aligned pointers
-// (tt.divisibility = 16) vectorize to sizePerThread > 1 while an unaligned
-// pointer (e.g. an MPS tensor sliced to base[7:]) stays at sizePerThread = 1.
-// The frontend then bridges the compute value to the store with
-// `ttg.convert_layout #blockedN -> #blocked1`. The Metal Load/Store lowerings
-// derive each op's per-(thread, iter) index from its OWN layout
-// (`tileFromTensor`), and the two layouts use DIFFERENT index formulas
-// (sizePerThread > 1 -> contiguous `tid*E + iv`; == 1 -> strided
-// `tid + iv*tpb`), so the convert_layout is a genuine cross-thread repack, not
-// a no-op — naive passthrough would permute the output.
+// Collapse a blocked<->blocked `ttg.convert_layout` whose source is a
+// self-contained producer cone (loads, elementwise arith, addptr / splat /
+// make_range / expand_dims / broadcast, mask cmpi) by rewriting that cone from
+// the source encoding to the DESTINATION encoding. Both encodings are valid
+// bijections over the same logical elements, so once the producers and the
+// consuming op agree on ONE encoding the index math matches and the cvt
+// collapses to an identity (handled by `ConvertLayoutLowering`'s passthrough).
+// The Metal Load/Store lowerings derive each op's per-(thread, iter) index from
+// its OWN layout (`tileFromTensor`), so a divergent cvt is a genuine repack —
+// naive passthrough would permute the output.
 //
-// Instead of staging that repack through threadgroup memory (the deferred L1d3
-// general path), normalize it away: rewrite the cvt's backward producer cone
-// (elementwise arith, loads, addptr/splat/make_range, mask cmpi) from the
-// source encoding to the DESTINATION encoding. Both encodings are valid
-// bijections over the same elements, so once the producers and the consuming
-// store agree on ONE encoding the index math matches and the cvt collapses to
-// an identity (handled by `ConvertLayoutLowering`'s passthrough). Returns true
-// iff the cvt was normalized.
-static bool normalizeRank1DivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
+// Two origins, same fix:
+//   * Rank-1 (mixed pointer alignment): aligned pointers (tt.divisibility = 16)
+//     vectorize to sizePerThread > 1 while an unaligned pointer (e.g. an MPS
+//     tensor sliced to base[7:]) stays at sizePerThread = 1; the frontend
+//     bridges the compute value to the store with `cvt #blockedN -> #blocked1`.
+//   * Rank-2 (masked transpose, `out[x,y] = in[y,x]`): the loaded tile is
+//     bridged from a row-major #blocked (order [1,0]) to a column-major
+//     #blocked1 (order [0,1], sizePerThread swapped, E>1). The cvt source is a
+//     pure gather whose layout is free to choose, so re-encoding the cone to
+//     the dst layout turns the transpose into a direct gather/scatter — no
+//     threadgroup staging (the otherwise-deferred L1d3 general repack path).
+// Returns true iff the cvt was normalized.
+// Remap a producer-cone encoding from the source blocked layout to the
+// destination blocked layout. The blocked encoding itself maps to dstEnc; a
+// rank-(R-1) slice<dim, parent=srcEnc> (the operands of make_range /
+// expand_dims that thread a rank-2 cone's row/col index math) maps to
+// slice<dim, parent=dstEnc>. Returns a null Attribute for encodings outside
+// the cone (scalars, the other side's layout, dot operands, ...).
+static mlir::Attribute
+remapDivergentConeEncoding(mlir::Attribute enc,
+                           mlir::triton::gpu::BlockedEncodingAttr srcEnc,
+                           mlir::triton::gpu::BlockedEncodingAttr dstEnc) {
+  if (enc == srcEnc)
+    return dstEnc;
+  if (auto slice =
+          mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc))
+    if (slice.getParent() == srcEnc)
+      return mlir::triton::gpu::SliceEncodingAttr::get(
+          srcEnc.getContext(), slice.getDim(), dstEnc);
+  return nullptr;
+}
+
+static bool
+normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
   auto dstRtt =
       mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
-  if (!srcRtt || !dstRtt || srcRtt.getRank() != 1 || dstRtt.getRank() != 1 ||
+  if (!srcRtt || !dstRtt || srcRtt.getRank() != dstRtt.getRank() ||
       srcRtt.getShape() != dstRtt.getShape() ||
       srcRtt.getElementType() != dstRtt.getElementType())
     return false;
@@ -5287,14 +5311,16 @@ static bool normalizeRank1DivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   if (!srcEnc || !dstEnc || srcEnc == dstEnc)
     return false;
 
-  // Collect the backward cone of rank-1 srcEnc values feeding the cvt source.
-  llvm::SmallVector<mlir::Value, 16> wl{cvt.getSrc()};
-  llvm::SmallPtrSet<mlir::Value, 16> inCone;
-  llvm::SmallVector<mlir::Value, 16> ordered;
+  // Collect the backward cone of src-encoded values feeding the cvt source:
+  // the blocked encoding plus any slice<parent=srcEnc> (a rank-2 cone threads
+  // its row/col index math through slice-encoded make_range/expand_dims).
+  llvm::SmallVector<mlir::Value, 32> wl{cvt.getSrc()};
+  llvm::SmallPtrSet<mlir::Value, 32> inCone;
+  llvm::SmallVector<mlir::Value, 32> ordered;
   while (!wl.empty()) {
     auto v = wl.pop_back_val();
     auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
-    if (!rt || rt.getRank() != 1 || rt.getEncoding() != srcEnc)
+    if (!rt || !remapDivergentConeEncoding(rt.getEncoding(), srcEnc, dstEnc))
       continue; // scalar operands / other encodings terminate the walk
     if (!inCone.insert(v).second)
       continue;
@@ -5310,7 +5336,7 @@ static bool normalizeRank1DivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   // the cvt itself or another cone op; otherwise an external op depends on the
   // source encoding and rewriting would corrupt it. Bail (leaving the cvt for
   // the classifier) rather than risk a miscompile.
-  llvm::SmallPtrSet<mlir::Operation *, 16> coneOps;
+  llvm::SmallPtrSet<mlir::Operation *, 32> coneOps;
   for (auto v : ordered)
     if (auto *d = v.getDefiningOp())
       coneOps.insert(d);
@@ -5321,21 +5347,31 @@ static bool normalizeRank1DivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
 
   // Rewrite every cone value's encoding to the destination. Operand/result
   // encodings stay mutually consistent because the whole cone moves together;
-  // MLIR does not re-verify between setType calls.
+  // MLIR does not re-verify between setType calls. A tensor-valued
+  // arith.constant (e.g. a masked load's `other`) carries a typed
+  // ElementsAttr that the verifier requires to match the result type, so
+  // re-encode it in place via DenseElementsAttr::reshape (same data, new
+  // encoding) — mirrors the dot-init re-encode at the preprocessDotCvtChains
+  // site above.
   for (auto v : ordered) {
     auto rt = mlir::cast<mlir::RankedTensorType>(v.getType());
-    v.setType(mlir::RankedTensorType::get(rt.getShape(), rt.getElementType(),
-                                          dstEnc));
+    auto newTy = mlir::RankedTensorType::get(
+        rt.getShape(), rt.getElementType(),
+        remapDivergentConeEncoding(rt.getEncoding(), srcEnc, dstEnc));
+    if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()))
+        cst.setValueAttr(dense.reshape(mlir::cast<mlir::ShapedType>(newTy)));
+    v.setType(newTy);
   }
   return true;
 }
 
-static void normalizeRank1DivergentCvts(mlir::ModuleOp moduleOp) {
+static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> cvts;
   moduleOp.walk(
       [&](mlir::triton::gpu::ConvertLayoutOp cvt) { cvts.push_back(cvt); });
   for (auto cvt : cvts)
-    normalizeRank1DivergentCvt(cvt);
+    normalizeBlockedDivergentCvt(cvt);
 }
 
 //===----------------------------------------------------------------------===//
@@ -5383,11 +5419,13 @@ struct ConvertTritonGPUToMetalPass
     // `.omc/specs/deep-interview-l1d3-matmul-convert-layout-preempt.md`.
     preprocessDotCvtChains(moduleOp);
 
-    // Collapse rank-1 blocked↔blocked convert_layout ops that arise from mixed
-    // pointer alignment (aligned sizePerThread>1 vs unaligned sizePerThread=1)
-    // in one elementwise kernel — rewrite each cvt's producer cone to the dest
-    // encoding so the cvt becomes an identity the classifier/lowering accept.
-    normalizeRank1DivergentCvts(moduleOp);
+    // Collapse blocked↔blocked convert_layout ops whose source is a
+    // self-contained gather cone — rank-1 (mixed pointer alignment) and rank-2
+    // (masked transpose, sizePerThread>1) alike — by rewriting each cvt's
+    // producer cone to the dest encoding so the cvt becomes an identity the
+    // classifier/lowering accept (turning the transpose into a direct
+    // gather/scatter, no threadgroup staging).
+    normalizeBlockedDivergentCvts(moduleOp);
 
     // Classify non-identity ttg.convert_layout ops:
     //   - in-envelope (rank-2 blocked↔blocked, same shape, same elem-type,
