@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
@@ -772,6 +773,140 @@ struct MakeRangeLowering
         }
       }
     }
+    // 3D path: a rank-1 make_range whose result is a doubly-nested `#ttg.slice`
+    // over a rank-3 `#ttg.blocked` parent — the `offset[:,None,None]` /
+    // `offset[None,:,None]` / `offset[None,None,:]` broadcast cones of 3D
+    // kernels (e.g. 3D convolution). Emit the per-(thread, tile-iv) coordinate
+    // along the surviving original axis. As in the 2D path, ANY (thread,iv)->
+    // element bijection is valid for elementwise / reduction ops (they do not
+    // constrain physical thread placement) provided every make_range and the
+    // load/store share it. We decompose the flat local index (strided:
+    // localTid + iv*T; contiguous: localTid*E + iv) by the parent `order`.
+    if (auto outerSlice = mlir::dyn_cast_or_null<
+            mlir::triton::gpu::SliceEncodingAttr>(resTy.getEncoding())) {
+      if (auto innerSlice = mlir::dyn_cast_or_null<
+              mlir::triton::gpu::SliceEncodingAttr>(outerSlice.getParent())) {
+        if (auto parent3d = mlir::dyn_cast_or_null<
+                mlir::triton::gpu::BlockedEncodingAttr>(
+                innerSlice.getParent())) {
+          if (parent3d.getOrder().size() == 3) {
+            // Surviving original axis = the one removed by neither slice. The
+            // inner slice indexes the rank-3 dim list; the outer slice then
+            // indexes the rank-2 remainder.
+            llvm::SmallVector<int64_t, 3> remaining{0, 1, 2};
+            int innerDim = static_cast<int>(innerSlice.getDim());
+            int outerDim = static_cast<int>(outerSlice.getDim());
+            if (innerDim >= 0 && innerDim < (int)remaining.size())
+              remaining.erase(remaining.begin() + innerDim);
+            if (outerDim >= 0 && outerDim < (int)remaining.size())
+              remaining.erase(remaining.begin() + outerDim);
+            // Largest non-pointer rank-3 blocked tensor visible in the module
+            // gives the tile shape / thread count (mirrors the 2D walk).
+            mlir::Operation *modOp = op->getParentOfType<mlir::ModuleOp>();
+            std::optional<TileInfo> tile;
+            if (remaining.size() == 1 && modOp) {
+              int64_t bestSize = 0;
+              modOp->walk([&](mlir::Operation *inner) {
+                for (auto v : inner->getResults()) {
+                  auto info = tileFromTensor(v.getType());
+                  if (!info || info->rank != 3)
+                    continue;
+                  if (auto rt =
+                          mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+                      rt && mlir::isa<mlir::triton::PointerType>(
+                                rt.getElementType()))
+                    continue;
+                  int64_t sz = 1;
+                  for (auto s : info->shape)
+                    sz *= s;
+                  if (sz > bestSize) {
+                    bestSize = sz;
+                    tile = info;
+                  }
+                }
+              });
+            }
+            if (tile && tile->rank == 3) {
+              int64_t axis = remaining[0];
+              auto i32 = rewriter.getI32Type();
+              auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+              // localTid = id.x - tgid.x * threadsPerBlock.
+              auto tidGlobal = ThreadIdOp::create(rewriter, loc, ui32,
+                                                  rewriter.getStringAttr("x"));
+              mlir::Value tidI32 =
+                  mlir::UnrealizedConversionCastOp::create(
+                      rewriter, loc, mlir::TypeRange{i32},
+                      mlir::ValueRange{tidGlobal.getResult()})
+                      .getResult(0);
+              auto tgX = ThreadgroupIdOp::create(rewriter, loc, ui32,
+                                                 rewriter.getStringAttr("x"));
+              mlir::Value tgI32 =
+                  mlir::UnrealizedConversionCastOp::create(
+                      rewriter, loc, mlir::TypeRange{i32},
+                      mlir::ValueRange{tgX.getResult()})
+                      .getResult(0);
+              auto tpbConst = mlir::arith::ConstantOp::create(
+                  rewriter, loc,
+                  rewriter.getI32IntegerAttr(tile->threadsPerBlock));
+              auto tgOffset = mlir::arith::MulIOp::create(
+                  rewriter, loc, tgI32, tpbConst.getResult());
+              mlir::Value idxI32 =
+                  mlir::arith::SubIOp::create(rewriter, loc, tidI32,
+                                              tgOffset.getResult())
+                      .getResult();
+              // Fold the tile-loop iv when E>1 (same shape as emitPerIterIndex).
+              auto parentFor = findOutermostScfFor(op);
+              if (parentFor && tile->elemPerThread > 1) {
+                auto iv = parentFor.getInductionVar();
+                if (tile->contiguous) {
+                  auto cE = mlir::arith::ConstantOp::create(
+                      rewriter, loc,
+                      rewriter.getI32IntegerAttr(tile->elemPerThread));
+                  auto mul = mlir::arith::MulIOp::create(rewriter, loc, idxI32,
+                                                         cE.getResult());
+                  idxI32 = mlir::arith::AddIOp::create(rewriter, loc,
+                                                       mul.getResult(), iv)
+                               .getResult();
+                } else {
+                  auto cT = mlir::arith::ConstantOp::create(
+                      rewriter, loc,
+                      rewriter.getI32IntegerAttr(tile->threadsPerBlock));
+                  auto mul = mlir::arith::MulIOp::create(rewriter, loc, iv,
+                                                         cT.getResult());
+                  idxI32 = mlir::arith::AddIOp::create(rewriter, loc, idxI32,
+                                                       mul.getResult())
+                               .getResult();
+                }
+              }
+              // Row-major-by-`order` tile strides; coord = (idx/stride)%shape.
+              auto order = parent3d.getOrder();
+              llvm::SmallVector<int64_t, 3> strides(3, 1);
+              int64_t accStride = 1;
+              for (size_t i = 0; i < order.size(); ++i) {
+                int64_t d = order[i];
+                strides[d] = accStride;
+                accStride *= tile->shape[d];
+              }
+              mlir::Value coord = idxI32;
+              if (strides[axis] != 1) {
+                auto cS = mlir::arith::ConstantOp::create(
+                    rewriter, loc, rewriter.getI32IntegerAttr(strides[axis]));
+                coord = mlir::arith::DivSIOp::create(rewriter, loc, coord,
+                                                     cS.getResult())
+                            .getResult();
+              }
+              auto cM = mlir::arith::ConstantOp::create(
+                  rewriter, loc, rewriter.getI32IntegerAttr(tile->shape[axis]));
+              coord = mlir::arith::RemSIOp::create(rewriter, loc, coord,
+                                                   cM.getResult())
+                          .getResult();
+              rewriter.replaceOp(op, coord);
+              return mlir::success();
+            }
+          }
+        }
+      }
+    }
     // 1D path: emit a real per-thread index value so that downstream
     // arithmetic on arange (`>> 1`, `* k`, `% n`, `& mask`) survives the
     // conversion. Lmultiload Phase C (see `.omc/specs/deep-interview-
@@ -877,6 +1012,51 @@ struct SplatLowering
 // See `.omc/specs/deep-interview-leet-triton-l1d2-staged-transpose-body.md`.
 //===----------------------------------------------------------------------===//
 
+// A ttg.convert_layout is a pure relabel under the Metal scalarizing model —
+// safe to lower as a scalar identity (no cross-thread data movement) — when
+// EITHER:
+//   * at least one side is a SliceEncodingAttr. Slice encodings only arise from
+//     `tt.expand_dims` (broadcast-prep `x[None,:]` / `x[:,None]`) and `tt.reduce`
+//     outputs — index/broadcast relabels, never data transposes. (Covers the
+//     subarray-sum / adder broadcast cones.) OR
+//   * both sides are blocked, sizePerThread is all-1 on both, AND the shape has
+//     at most ONE non-unit dimension — a degenerate convert that can only
+//     permute size-1 axes, so no element actually moves. (Covers the rank>=2
+//     index cones stacked expand_dims produces, e.g. `tensor<1x1x1024>` in
+//     3D subarray-sum.)
+// A GENUINE transpose (both blocked, >=2 non-unit dims, or sizePerThread>1) is
+// NOT identity-safe: the rank-2 sizePerThread=[1,1] case goes to the staged-
+// transpose body below; everything else is rejected (L1d3) by the pre-pass.
+static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
+  auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+  auto dstRtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
+  if (!srcRtt || !dstRtt)
+    return false;
+  if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+          srcRtt.getEncoding()) ||
+      mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+          dstRtt.getEncoding()))
+    return true;
+  auto srcB = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      srcRtt.getEncoding());
+  auto dstB = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      dstRtt.getEncoding());
+  if (!srcB || !dstB)
+    return false;
+  for (auto s : srcB.getSizePerThread())
+    if (s != 1)
+      return false;
+  for (auto s : dstB.getSizePerThread())
+    if (s != 1)
+      return false;
+  int nonUnit = 0;
+  for (auto s : srcRtt.getShape())
+    if (s != 1)
+      ++nonUnit;
+  return nonUnit <= 1;
+}
+
 struct ConvertLayoutLowering
     : public mlir::OpConversionPattern<mlir::triton::gpu::ConvertLayoutOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -888,34 +1068,12 @@ struct ConvertLayoutLowering
       rewriter.replaceOp(op, adaptor.getSrc());
       return mlir::success();
     }
-    // Path 2: post-converter scalarized identity (e.g. L3a slice→blocked).
-    auto *converter = getTypeConverter();
-    if (converter) {
-      auto srcConv = converter->convertType(op.getSrc().getType());
-      auto dstConv = converter->convertType(op.getResult().getType());
-      if (srcConv && dstConv && srcConv == dstConv) {
-        auto srcRtt =
-            mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
-        auto dstRtt =
-            mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
-        // Only treat as identity when neither side is a rank-2 blocked
-        // tensor (those need the staged-transpose body below — under the
-        // scalarizing TypeConverter both sides also collapse to the scalar
-        // element type, so srcConv == dstConv would be a false positive).
-        bool isRank2Blocked =
-            (srcRtt &&
-             mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-                 srcRtt.getEncoding()) &&
-             srcRtt.getRank() == 2) ||
-            (dstRtt &&
-             mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-                 dstRtt.getEncoding()) &&
-             dstRtt.getRank() == 2);
-        if (!isRank2Blocked) {
-          rewriter.replaceOp(op, adaptor.getSrc());
-          return mlir::success();
-        }
-      }
+    // Path 2: scalar-identity relabel (slice broadcast/reduce cones, or a
+    // degenerate blocked↔blocked permuting only size-1 axes). See
+    // `isScalarIdentityConvert`. Genuine transposes fall through to Path 3.
+    if (isScalarIdentityConvert(op)) {
+      rewriter.replaceOp(op, adaptor.getSrc());
+      return mlir::success();
     }
     // Path 3: L1d2 staged-transpose body for in-envelope rank-2 blocked↔
     // blocked cvts with sizePerThread=[1,1] on both sides.
@@ -5452,16 +5610,16 @@ struct ConvertTritonGPUToMetalPass
       // encoding). `ConvertLayoutLowering` handles the post-conversion
       // identity. See
       // `.omc/specs/deep-interview-leet-triton-l3a-reduce-body-axis1.md`.
-      bool sliceToBlockedPassthrough =
-          srcRtt && dstRtt && srcRtt.getRank() == 1 &&
-          dstRtt.getRank() == 1 && srcRtt.getShape() == dstRtt.getShape() &&
-          srcRtt.getElementType() == dstRtt.getElementType() &&
-          mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(
-              srcRtt.getEncoding()) &&
-          mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
-              dstRtt.getEncoding());
-      if (sliceToBlockedPassthrough)
-        return; // Falls through to `ConvertLayoutLowering` post-conv identity.
+      // Scalar-identity relabel — slice-involved broadcast/reduce cones
+      // (`x[None,:]`, `x[:,None]`, reduce output) of any rank, plus degenerate
+      // blocked↔blocked converts that only permute size-1 axes. These collapse
+      // to a no-op under the scalarizing TypeConverter (`ConvertLayoutLowering`
+      // Path 2 / `isScalarIdentityConvert`); the Metal backend re-derives every
+      // per-thread index from `make_range`, so no data moves. Genuine transposes
+      // (both blocked, >=2 non-unit dims) are NOT accepted here and fall through
+      // to the rank-2 staged-transpose envelope below (or the L1d3 reject).
+      if (isScalarIdentityConvert(cvt))
+        return;
       auto srcBlocked =
           srcRtt ? mlir::dyn_cast_or_null<
                        mlir::triton::gpu::BlockedEncodingAttr>(
@@ -5751,7 +5909,17 @@ struct ConvertTritonGPUToMetalPass
           return !ty.isF32();
         });
     target.addLegalDialect<mlir::func::FuncDialect>();
-    target.addLegalDialect<mlir::scf::SCFDialect>();
+    // SCF ops (scf.for / scf.if / scf.yield) are legal ONLY when their
+    // iter-arg / result / block-arg types are already scalar (i.e. after the
+    // tensor->scalar conversion). The dynamic legality + structural rewrites
+    // are supplied by `populateSCFStructuralTypeConversionsAndLegality` added
+    // to `patterns` below. This converts a user-written `scf.for` carrying a
+    // tensor accumulator (e.g. the 3D-conv reduction loop) into one carrying
+    // the per-tile-iteration scalar — folding it into the per-thread scalar
+    // model + the FuncOpLowering tile loop. Without it the tensor-typed loop
+    // survives, the framework bridges it with `unrealized_conversion_cast
+    // tensor<->scalar`, and the MSL emitter hits `llvm_unreachable` (see
+    // ModuleTranslation::translateValue Default).
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
 
     mlir::RewritePatternSet patterns(ctx);
@@ -5778,10 +5946,52 @@ struct ConvertTritonGPUToMetalPass
     // populated by `preprocessMaskedStoreSentinels` above. See L1d2c Phase B.
     patterns.add<MaskedStoreLowering>(typeConverter, ctx, &scratchMap);
 
+    // Structural type conversion for user-written control flow: rewrites the
+    // iter-arg / result / block-arg / yield types of `scf.for` / `scf.if`
+    // through the tensor->scalar TypeConverter and installs the matching
+    // dynamic legality on `target`. A reduction loop accumulating a tensor
+    // (the 3D-conv `for i/j/k: acc += ...`) thereby carries the per-thread
+    // scalar accumulator, nested inside the FuncOpLowering tile loop, which the
+    // MSL emitter already supports (ModuleTranslation Wall-15 single-scalar
+    // iter_arg path).
+    mlir::scf::populateSCFStructuralTypeConversionsAndLegality(
+        typeConverter, patterns, target);
+
     if (mlir::failed(mlir::applyFullConversion(moduleOp, target,
                                                 std::move(patterns)))) {
       signalPassFailure();
       return;
+    }
+
+    // Safety guard against silent miscompiles: the MSL emitter (Wall-15) only
+    // supports an `scf.for` carrying EXACTLY ONE scalar (f32/i32) iter_arg.
+    // After structural conversion a user loop carrying multiple values — or a
+    // non-f32/i32 scalar — would be emitted with its accumulation dropped, so
+    // reject it with a clean diagnostic instead.
+    {
+      bool loopOk = true;
+      moduleOp.walk([&](mlir::scf::ForOp forOp) {
+        unsigned n = forOp.getNumRegionIterArgs();
+        if (n == 0)
+          return;
+        if (n > 1) {
+          forOp.emitOpError(
+              "Metal backend: scf.for with multiple iter_args is not "
+              "supported (only a single scalar reduction accumulator)");
+          loopOk = false;
+          return;
+        }
+        mlir::Type t = forOp.getRegionIterArgs()[0].getType();
+        if (!(t.isF32() || t.isInteger(32))) {
+          forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
+                            "f32/i32 accumulator after conversion");
+          loopOk = false;
+        }
+      });
+      if (!loopOk) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Post-conversion cleanup: the MSL emitter walks each statement via
