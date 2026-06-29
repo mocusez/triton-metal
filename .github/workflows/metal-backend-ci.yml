@@ -52,7 +52,7 @@ jobs:
           echo "datetime=$(date -u -Iseconds)" >> $GITHUB_OUTPUT
 
       - name: Cache build dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.triton/llvm
@@ -62,7 +62,7 @@ jobs:
 
       - name: Restore ccache
         if: github.ref != 'refs/heads/metal-develop'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.ccache
@@ -135,7 +135,7 @@ jobs:
 
       - name: Save ccache
         if: github.ref == 'refs/heads/metal-develop'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.ccache
