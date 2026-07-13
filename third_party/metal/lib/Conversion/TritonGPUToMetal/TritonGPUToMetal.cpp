@@ -2336,34 +2336,53 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
     // `int32_t`/`uint32_t vN = init;` via the same (now type-generic) path.
     // Integer identities route through a signless constant + cast so the
     // arith.constant verifier (signless-only) is satisfied.
-    mlir::Value initConstVal = buildIdentityVal();
-    auto c0I32 = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(0));
-    auto cEI32 = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(E)));
-    auto c1I32 = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(1));
-    auto forOp = mlir::scf::ForOp::create(
-        rewriter, loc, c0I32.getResult(), cEI32.getResult(),
-        c1I32.getResult(), mlir::ValueRange{initConstVal});
+    // Wall 15 + multi-accumulator (metal-multiacc-reduce-plan.md): re-roll the
+    // per-k unroll into an scf.for. When E >= 8, use K=8 independent iter_arg
+    // accumulators to break the serial combine dependency chain (ILP), which
+    // Phase 0 measured at ~1.3-3x on the low-occupancy single-threadgroup
+    // reduce the backend emits. The combiner is associative (add/max), so K-way
+    // reassociation is safe: bit-exact for i32, within test tolerance for f32.
+    // The loop steps by K; iteration j folds flat elements k = j+0..j+K-1 into
+    // accumulators 0..K-1; a balanced tree-combine then reduces the K
+    // accumulators to one scalar. K=1 (E<8) is byte-identical to the prior
+    // single-iter_arg emission.
+    int64_t K = (E >= 8) ? 8 : 1; // E is power-of-2 in [1,64]; K divides E.
 
-    {
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(forOp.getBody());
+    // Hoist the masked `other` value + its validation out of the per-element
+    // body (loop-invariant) so the failure path can abort the whole lowering.
+    // Building the attribute creates no IR ops, so K=1 emission is unchanged.
+    mlir::TypedAttr elseAttr;
+    if (maskBoundN) {
+      elseAttr = otherAttrPre;
+      if (!elseAttr) {
+        if (mlir::isa<mlir::FloatType>(loadEltTy))
+          elseAttr = rewriter.getFloatAttr(loadEltTy, 0.0);
+        else
+          elseAttr = mlir::cast<mlir::TypedAttr>(
+              rewriter.getIntegerAttr(loadEltTy, 0));
+      } else if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(elseAttr)) {
+        if (fa.getType() != loadEltTy)
+          return rewriter.notifyMatchFailure(
+              op, "rank-1 reduce B2.3 masked: other type mismatches load "
+                  "elt");
+      }
+    }
 
-      mlir::Value ivI32 = forOp.getInductionVar();
-      mlir::Value accIterArg = forOp.getRegionIterArgs()[0];
-
+    // Per-element partial: given a flat element index `kFlatI32` (0..E-1) and an
+    // accumulator `acc`, emit the masked/unmasked load + Wall 11 chain and
+    // return combine(acc, elt). Loop-invariant addressing state captured by ref.
+    auto buildPartial = [&](mlir::Value kFlatI32,
+                            mlir::Value acc) -> mlir::Value {
       // Wall 14 cyclic-tile decomposition lifted to runtime arith:
-      //   spt1Direct (spt=1): outer=k, inner=0 ⇒ kOffset = k*tpb
-      //   else: outer=k/spt, inner=k%spt ⇒ kOffset = outer*(tpb*spt) + inner
+      //   spt1Direct (spt=1): kOffset = k*tpb
+      //   else: kOffset = (k/spt)*(tpb*spt) + (k%spt)
       mlir::Value kOffsetI32;
       if (spt1Direct) {
         auto cTpb = mlir::arith::ConstantOp::create(
             rewriter, loc,
             rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
         kOffsetI32 = mlir::arith::MulIOp::create(
-                         rewriter, loc, ivI32, cTpb.getResult())
+                         rewriter, loc, kFlatI32, cTpb.getResult())
                          .getResult();
       } else {
         auto cSpt = mlir::arith::ConstantOp::create(
@@ -2373,9 +2392,9 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
             rewriter, loc,
             rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb * spt)));
         auto outerV = mlir::arith::DivSIOp::create(
-            rewriter, loc, ivI32, cSpt.getResult());
+            rewriter, loc, kFlatI32, cSpt.getResult());
         auto innerV = mlir::arith::RemSIOp::create(
-            rewriter, loc, ivI32, cSpt.getResult());
+            rewriter, loc, kFlatI32, cSpt.getResult());
         auto outerScaled = mlir::arith::MulIOp::create(
             rewriter, loc, outerV.getResult(), cTpbSpt.getResult());
         kOffsetI32 = mlir::arith::AddIOp::create(
@@ -2383,10 +2402,11 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
                          innerV.getResult())
                          .getResult();
       }
-      auto idxI32 = mlir::arith::AddIOp::create(
-          rewriter, loc, tidScaled, kOffsetI32);
+      mlir::Value idxI32 =
+          mlir::arith::AddIOp::create(rewriter, loc, tidScaled, kOffsetI32)
+              .getResult();
       // Wall 13: address index includes scalar tt.addptr chain offset.
-      mlir::Value addrI32 = idxI32.getResult();
+      mlir::Value addrI32 = idxI32;
       if (scalarOff) {
         addrI32 = mlir::arith::AddIOp::create(rewriter, loc, addrI32,
                                                scalarOff)
@@ -2402,22 +2422,9 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
       mlir::Value condKResult;
       if (maskBoundN) {
         // Wall 7 masked path inside the loop body.
-        mlir::TypedAttr elseAttr = otherAttrPre;
-        if (!elseAttr) {
-          if (mlir::isa<mlir::FloatType>(loadEltTy))
-            elseAttr = rewriter.getFloatAttr(loadEltTy, 0.0);
-          else
-            elseAttr = mlir::cast<mlir::TypedAttr>(
-                rewriter.getIntegerAttr(loadEltTy, 0));
-        } else if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(elseAttr)) {
-          if (fa.getType() != loadEltTy)
-            return rewriter.notifyMatchFailure(
-                op, "rank-1 reduce B2.3 masked: other type mismatches load "
-                    "elt");
-        }
         auto condK = mlir::arith::CmpIOp::create(
-            rewriter, loc, mlir::arith::CmpIPredicate::slt,
-            idxI32.getResult(), maskBoundN);
+            rewriter, loc, mlir::arith::CmpIPredicate::slt, idxI32,
+            maskBoundN);
         condKResult = condK.getResult();
         auto scfIf = mlir::scf::IfOp::create(
             rewriter, loc, mlir::TypeRange{loadEltTy}, condK.getResult(),
@@ -2449,26 +2456,69 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
                   mlir::ValueRange{elt})
                   .getResult(0);
       }
-      // Wall 11 chain re-emit + combiner-identity-override (verbatim from
-      // Wall 14, just nested inside the new loop body builder).
+      // Wall 11 chain re-emit + combiner-identity-override.
       if (!chain.empty()) {
         mlir::Value chainElt =
             emitScalarChain(chain, elt, /*spt_idx=*/0, loc, rewriter);
         if (condKResult) {
           mlir::Value identityV = buildIdentityVal();
-          elt = mlir::arith::SelectOp::create(
-                    rewriter, loc, condKResult, chainElt, identityV)
+          elt = mlir::arith::SelectOp::create(rewriter, loc, condKResult,
+                                              chainElt, identityV)
                     .getResult();
         } else {
           elt = chainElt;
         }
       }
       // Combine: accumulator (region iter-arg) op elt.
-      mlir::Value combined = emitCombine(accIterArg, elt);
-      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{combined});
+      return emitCombine(acc, elt);
+    };
+
+    // K identity inits (one per accumulator).
+    llvm::SmallVector<mlir::Value, 8> inits;
+    for (int64_t i = 0; i < K; ++i)
+      inits.push_back(buildIdentityVal());
+    auto c0I32 = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(0));
+    auto cEI32 = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(E)));
+    auto cKI32 = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(K)));
+    auto forOp = mlir::scf::ForOp::create(
+        rewriter, loc, c0I32.getResult(), cEI32.getResult(),
+        cKI32.getResult(), mlir::ValueRange(inits));
+
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+      mlir::Value ivI32 = forOp.getInductionVar();
+      llvm::SmallVector<mlir::Value, 8> newAccs;
+      for (int64_t m = 0; m < K; ++m) {
+        mlir::Value kFlat = ivI32;
+        if (m > 0) {
+          auto cM = mlir::arith::ConstantOp::create(
+              rewriter, loc,
+              rewriter.getI32IntegerAttr(static_cast<int32_t>(m)));
+          kFlat = mlir::arith::AddIOp::create(rewriter, loc, ivI32,
+                                              cM.getResult())
+                      .getResult();
+        }
+        newAccs.push_back(buildPartial(kFlat, forOp.getRegionIterArgs()[m]));
+      }
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange(newAccs));
     }
 
-    inputScalarPT = forOp.getResult(0);
+    // Balanced tree-combine of the K accumulator results into one scalar.
+    llvm::SmallVector<mlir::Value, 8> parts(forOp.getResults().begin(),
+                                            forOp.getResults().end());
+    while (parts.size() > 1) {
+      llvm::SmallVector<mlir::Value, 8> next;
+      for (size_t i = 0; i + 1 < parts.size(); i += 2)
+        next.push_back(emitCombine(parts[i], parts[i + 1]));
+      if (parts.size() & 1)
+        next.push_back(parts.back());
+      parts = next;
+    }
+    inputScalarPT = parts.front();
   } else {
     // BLOCK <= tpb: original Phase B path — adaptor delivers a single
     // per-thread scalar.
@@ -2922,6 +2972,535 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
   return mlir::success();
 }
 
+// Wall 17 Increment 2: evaluate one element (logical index `idxVal`, an i32
+// scalar) of a RANK-1 tensor cone as scalar Metal ops. Used for the per-row /
+// per-column operands a softmax cone broadcasts into the reduce tile
+// (`q0_rope[:,None]` → row index; `seq_idx[None,:]` → col index). Device loads
+// are addressed by replaying the load's index cone via `scalarizeConeAtIndex`.
+// f32 leaves go through metal.binary_exp/unary_exp; integer arith + select +
+// compare use raw scalar arith (all translated by ModuleTranslation). Returns
+// null on an unsupported producer.
+static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
+                                    mlir::ConversionPatternRewriter &rewriter,
+                                    mlir::Location loc, int depth) {
+  if (depth > 24)
+    return nullptr;
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+
+  if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
+    return v; // already a scalar
+
+  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
+    if (!splat.getOperation()->getBlock())
+      return nullptr;
+    return splat.getSrc();
+  }
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return nullptr;
+    return mlir::arith::ConstantOp::create(
+               rewriter, loc, dense.getSplatValue<mlir::TypedAttr>())
+        .getResult();
+  }
+
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return nullptr;
+
+  // Shape-only ops: recurse operand 0 at the same index.
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+          def))
+    return evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc,
+                            depth + 1);
+
+  // make_range: element value = start + idx.
+  if (auto mr = mlir::dyn_cast<mlir::triton::MakeRangeOp>(def)) {
+    int32_t s = static_cast<int32_t>(mr.getStart());
+    if (s == 0)
+      return idxVal;
+    auto cS = mlir::arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getI32IntegerAttr(s));
+    return mlir::arith::AddIOp::create(rewriter, loc, idxVal, cS.getResult())
+        .getResult();
+  }
+
+  // tt.load: address via the index cone, read device[addr].
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    auto addptr = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!addptr)
+      return nullptr;
+    mlir::Value addr =
+        scalarizeConeAtIndex(addptr.getOffset(), idxVal, rewriter, loc, 0);
+    if (!addr)
+      return nullptr;
+    mlir::Value memref = findBaseMemref(load.getPtr(), rewriter);
+    if (!memref)
+      return nullptr;
+    mlir::Type eltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
+    mlir::Value addrUI32 =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{addr})
+            .getResult(0);
+    return GetElementOp::create(rewriter, loc, eltTy, memref, addrUI32)
+        .getResult();
+  }
+
+  // int → float cast.
+  if (auto s2f = mlir::dyn_cast<mlir::arith::SIToFPOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(s2f.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::SIToFPOp::create(rewriter, loc, rewriter.getF32Type(), x)
+        .getResult();
+  }
+
+  // f32 unary math → metal.unary_exp.
+  auto unary = [&](mlir::Value operand, UnaryExpOperator k) -> mlir::Value {
+    mlir::Value x =
+        evalRank1ValueAt(operand, idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(), k);
+    return UnaryExpOp::create(rewriter, loc, x.getType(), attr, x).getResult();
+  };
+  if (auto e = mlir::dyn_cast<mlir::math::ExpOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::expOp);
+  if (auto e = mlir::dyn_cast<mlir::math::SqrtOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::sqrtOp);
+  if (auto e = mlir::dyn_cast<mlir::math::LogOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::logOp);
+  if (auto e = mlir::dyn_cast<mlir::math::SinOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::sinOp);
+  if (auto e = mlir::dyn_cast<mlir::math::CosOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::cosOp);
+  if (auto e = mlir::dyn_cast<mlir::math::ErfOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::erfOp);
+  if (auto e = mlir::dyn_cast<mlir::math::RsqrtOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::rsqrtOp);
+
+  // f32 binary arith → metal.binary_exp (recurse both operands).
+  auto fbinary = [&](mlir::Value lhs, mlir::Value rhs,
+                     BinaryExpOperator k) -> mlir::Value {
+    mlir::Value a = evalRank1ValueAt(lhs, idxVal, rewriter, loc, depth + 1);
+    mlir::Value b = evalRank1ValueAt(rhs, idxVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    auto attr = BinaryExpOperatorAttr::get(rewriter.getContext(), k);
+    return BinaryExpOp::create(rewriter, loc, a.getType(), attr, a, b)
+        .getResult();
+  };
+  if (auto o = mlir::dyn_cast<mlir::arith::AddFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::addOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::SubFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::subOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MulFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MaximumFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+
+  // int binary arith → raw scalar arith.
+  auto ibinary = [&](mlir::Value lhs, mlir::Value rhs,
+                     auto make) -> mlir::Value {
+    mlir::Value a = evalRank1ValueAt(lhs, idxVal, rewriter, loc, depth + 1);
+    mlir::Value b = evalRank1ValueAt(rhs, idxVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return mlir::Value{};
+    return make(a, b);
+  };
+  if (auto o = mlir::dyn_cast<mlir::arith::AddIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::AddIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::SubIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::SubIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::MulIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::MulIOp::create(rewriter, loc, a, b).getResult();
+    });
+
+  // select / compare (tl.where conditions).
+  if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
+    mlir::Value c =
+        evalRank1ValueAt(sel.getCondition(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value t =
+        evalRank1ValueAt(sel.getTrueValue(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value f =
+        evalRank1ValueAt(sel.getFalseValue(), idxVal, rewriter, loc, depth + 1);
+    if (!c || !t || !f)
+      return nullptr;
+    return mlir::arith::SelectOp::create(rewriter, loc, c, t, f).getResult();
+  }
+  if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
+    mlir::Value a =
+        evalRank1ValueAt(cmp.getLhs(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank1ValueAt(cmp.getRhs(), idxVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return mlir::arith::CmpIOp::create(rewriter, loc, cmp.getPredicate(), a, b)
+        .getResult();
+  }
+  if (auto cmp = mlir::dyn_cast<mlir::arith::CmpFOp>(def)) {
+    mlir::Value a =
+        evalRank1ValueAt(cmp.getLhs(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank1ValueAt(cmp.getRhs(), idxVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return mlir::arith::CmpFOp::create(rewriter, loc, cmp.getPredicate(), a, b)
+        .getResult();
+  }
+
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Wall 17 (Case C): rank-2 axis=1 reduce over a COMPUTED tile.
+//
+// The rank-2 device-load reduce body (`ReduceLowering`) reduces by re-reading
+// the tile from a device `tt.load` at `base + r*N + n`. Softmax-style kernels
+// (e.g. leet adder_transformer) instead reduce register-resident COMPUTED
+// values — `score = (q·k)*scale; where(...); tl.max/sum(score, axis=1)` — so
+// there is no single device tensor to re-read.
+//
+// `evalRank2ConeAt` re-derives one element (logical row `r`, column `nVal`) of
+// such a cone as scalar Metal ops, recursing the PRE-conversion tensor IR down
+// to persistent leaves (device loads, splat scalars, dense-splat constants).
+// This is conversion-ordering-safe for the same reason the rank-1 B2.3 walker
+// is: it never consumes an intermediate op's converted scalar — it rebuilds
+// every node from scratch from leaves that survive conversion.
+//
+// `rowBase` is the precomputed per-row flat base (`r*N (+ scalarOff)`); each
+// device load is read at `rowBase + nVal` (Increment 1 assumes every cone load
+// shares the reduce tile's row stride N and per-program scalar offset, which
+// holds for the softmax shape where all operands are `(batch, N)` tiles).
+//
+// Increment 1 producers: tt.load, f32 arith {add,sub,mul,div,maximumf,
+// maxnumf} (BOTH operands recursed — two-tensor products like `q0*k0 + q1*k1`
+// are supported), unary math {exp,sqrt,log,sin,cos,erf,rsqrt}, tt.splat and
+// splat arith.constant. Broadcast/expand_dims (per-row / per-col), tl.where
+// (arith.select + cmp), and prior-reduce-result broadcast are Increment 2.
+// Returns null on any unsupported producer (caller bails to notifyMatchFailure).
+//===----------------------------------------------------------------------===//
+static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
+                                   mlir::Value rowBase, mlir::Value nVal,
+                                   mlir::ConversionPatternRewriter &rewriter,
+                                   mlir::Location loc, int depth) {
+  if (depth > 24)
+    return nullptr;
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+
+  // Scalar splat → its scalar source (a per-tile-uniform value).
+  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
+    if (!splat.getOperation()->getBlock())
+      return nullptr; // stale (already converted)
+    return splat.getSrc();
+  }
+  // Dense-splat constant → materialise the scalar element.
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return nullptr;
+    return mlir::arith::ConstantOp::create(
+               rewriter, loc, dense.getSplatValue<mlir::TypedAttr>())
+        .getResult();
+  }
+
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return nullptr;
+
+  // tt.load leaf: read device[rowBase + nVal] from the load's base memref.
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    if (!load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+      return nullptr;
+    mlir::Value memref = findBaseMemref(load.getPtr(), rewriter);
+    if (!memref)
+      return nullptr;
+    mlir::Type eltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
+    auto idx = mlir::arith::AddIOp::create(rewriter, loc, rowBase, nVal);
+    mlir::Value idxUI32 =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32},
+            mlir::ValueRange{idx.getResult()})
+            .getResult(0);
+    return GetElementOp::create(rewriter, loc, eltTy, memref, idxUI32)
+        .getResult();
+  }
+
+  // Unary math → metal.unary_exp.
+  auto unary = [&](mlir::Value operand,
+                   UnaryExpOperator k) -> mlir::Value {
+    mlir::Value x =
+        evalRank2ConeAt(operand, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(), k);
+    return UnaryExpOp::create(rewriter, loc, x.getType(), attr, x).getResult();
+  };
+  if (auto e = mlir::dyn_cast<mlir::math::ExpOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::expOp);
+  if (auto e = mlir::dyn_cast<mlir::math::SqrtOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::sqrtOp);
+  if (auto e = mlir::dyn_cast<mlir::math::LogOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::logOp);
+  if (auto e = mlir::dyn_cast<mlir::math::SinOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::sinOp);
+  if (auto e = mlir::dyn_cast<mlir::math::CosOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::cosOp);
+  if (auto e = mlir::dyn_cast<mlir::math::ErfOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::erfOp);
+  if (auto e = mlir::dyn_cast<mlir::math::RsqrtOp>(def))
+    return unary(e.getOperand(), UnaryExpOperator::rsqrtOp);
+
+  // Binary f32 arith → metal.binary_exp (recurse BOTH operands).
+  auto binary = [&](mlir::Value lhs, mlir::Value rhs,
+                    BinaryExpOperator k) -> mlir::Value {
+    mlir::Value a =
+        evalRank2ConeAt(lhs, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank2ConeAt(rhs, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    auto attr = BinaryExpOperatorAttr::get(rewriter.getContext(), k);
+    return BinaryExpOp::create(rewriter, loc, a.getType(), attr, a, b)
+        .getResult();
+  };
+  if (auto o = mlir::dyn_cast<mlir::arith::AddFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::addOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::SubFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::subOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MulFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MaximumFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+
+  // tt.broadcast: rank-preserving replication over unit dims. Recurse the
+  // source at the SAME (row, col) — the source's own structure (expand_dims /
+  // make_range / cmpi) carries the real per-row / per-col dependence. (The
+  // broadcast may wrap a computed [1,N] / [M,1] tensor, e.g. `seq<=K` is
+  // compared at [1,N] then broadcast to [M,N].)
+  if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+    return evalRank2ConeAt(bc.getSrc(), rVal, rowBase, nVal, rewriter, loc,
+                           depth + 1);
+  // tt.expand_dims(rank-1, axis): unit dim at `axis`. axis==1 → per-row (rVal);
+  // axis==0 → per-col (nVal). Delegate to the rank-1 evaluator.
+  if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+    auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
+    if (!srcRtt || srcRtt.getRank() != 1)
+      return nullptr;
+    mlir::Value idx = (ed.getAxis() == 1) ? rVal : nVal;
+    return evalRank1ValueAt(ed.getSrc(), idx, rewriter, loc, depth + 1);
+  }
+  // Shape-only cvt / reshape: recurse the source unchanged.
+  if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+          def))
+    return evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal, rewriter,
+                           loc, depth + 1);
+
+  // tl.where → arith.select; comparisons feeding the where condition.
+  if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
+    mlir::Value c = evalRank2ConeAt(sel.getCondition(), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    mlir::Value t = evalRank2ConeAt(sel.getTrueValue(), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    mlir::Value f = evalRank2ConeAt(sel.getFalseValue(), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    if (!c || !t || !f)
+      return nullptr;
+    return mlir::arith::SelectOp::create(rewriter, loc, c, t, f).getResult();
+  }
+  if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
+    mlir::Value a = evalRank2ConeAt(cmp.getLhs(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    mlir::Value b = evalRank2ConeAt(cmp.getRhs(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return mlir::arith::CmpIOp::create(rewriter, loc, cmp.getPredicate(), a, b)
+        .getResult();
+  }
+  if (auto cmp = mlir::dyn_cast<mlir::arith::CmpFOp>(def)) {
+    mlir::Value a = evalRank2ConeAt(cmp.getLhs(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    mlir::Value b = evalRank2ConeAt(cmp.getRhs(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return mlir::arith::CmpFOp::create(rewriter, loc, cmp.getPredicate(), a, b)
+        .getResult();
+  }
+
+  // int binary arith → raw scalar arith.
+  auto ibinary = [&](mlir::Value lhs, mlir::Value rhs,
+                     auto make) -> mlir::Value {
+    mlir::Value a =
+        evalRank2ConeAt(lhs, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank2ConeAt(rhs, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return mlir::Value{};
+    return make(a, b);
+  };
+  if (auto o = mlir::dyn_cast<mlir::arith::AddIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::AddIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::SubIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::SubIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::MulIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::MulIOp::create(rewriter, loc, a, b).getResult();
+    });
+
+  return nullptr;
+}
+
+// Find a representative `tt.load` anywhere in a computed cone — used to derive
+// the per-program scalar offset and to validate the cone is device-rooted.
+static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
+  if (depth > 16)
+    return nullptr;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return nullptr;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def))
+    return load;
+  for (mlir::Value operand : def->getOperands())
+    if (auto l = findFirstLoadInCone(operand, depth + 1))
+      return l;
+  return nullptr;
+}
+
+// Mirrors `scalarizeConeAtIndex`'s accepted index producers (predicate only).
+static bool indexConeSupported(mlir::Value v, int depth) {
+  if (depth > 24)
+    return false;
+  if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
+    return true; // scalar
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+          def))
+    return indexConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::triton::MakeRangeOp>(def))
+    return true;
+  if (auto sp = mlir::dyn_cast<mlir::triton::SplatOp>(def))
+    return sp.getOperation()->getBlock() != nullptr;
+  if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp, mlir::arith::SubIOp>(
+          def))
+    return indexConeSupported(def->getOperand(0), depth + 1) &&
+           indexConeSupported(def->getOperand(1), depth + 1);
+  return false;
+}
+
+// Mirrors `evalRank1ValueAt`'s accepted producers (predicate only).
+static bool rank1ConeSupported(mlir::Value v, int depth) {
+  if (depth > 24)
+    return false;
+  if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
+    return true; // scalar
+  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
+    return splat.getOperation()->getBlock() != nullptr;
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    return dense && dense.isSplat();
+  }
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+          def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::triton::MakeRangeOp>(def))
+    return true;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    auto ap = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+    return ap && indexConeSupported(ap.getOffset(), 0);
+  }
+  if (auto s = mlir::dyn_cast<mlir::arith::SIToFPOp>(def))
+    return rank1ConeSupported(s.getIn(), depth + 1);
+  if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
+                mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
+                mlir::math::RsqrtOp>(def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
+                mlir::arith::DivFOp, mlir::arith::MaximumFOp,
+                mlir::arith::MaxNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
+                mlir::arith::MulIOp, mlir::arith::CmpIOp, mlir::arith::CmpFOp>(
+          def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1);
+  if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
+    return rank1ConeSupported(sel.getCondition(), depth + 1) &&
+           rank1ConeSupported(sel.getTrueValue(), depth + 1) &&
+           rank1ConeSupported(sel.getFalseValue(), depth + 1);
+  return false;
+}
+
+// Predicate mirroring `evalRank2ConeAt`'s accepted producers. Run BEFORE the
+// reduce loop emits anything so an unsupported cone yields a clean
+// notifyMatchFailure instead of relying on conversion rollback.
+static bool rank2ConeSupported(mlir::Value v, int depth) {
+  if (depth > 24)
+    return false;
+  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
+    return splat.getOperation()->getBlock() != nullptr;
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    return dense && dense.isSplat();
+  }
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def))
+    return load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>() != nullptr;
+  if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+    return rank2ConeSupported(bc.getSrc(), depth + 1);
+  if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+    auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
+    return srcRtt && srcRtt.getRank() == 1 &&
+           rank1ConeSupported(ed.getSrc(), depth + 1);
+  }
+  if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
+          def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
+                mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
+                mlir::math::RsqrtOp>(def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
+                mlir::arith::DivFOp, mlir::arith::MaximumFOp,
+                mlir::arith::MaxNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
+                mlir::arith::MulIOp, mlir::arith::CmpIOp, mlir::arith::CmpFOp>(
+          def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1);
+  if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
+    return rank2ConeSupported(sel.getCondition(), depth + 1) &&
+           rank2ConeSupported(sel.getTrueValue(), depth + 1) &&
+           rank2ConeSupported(sel.getFalseValue(), depth + 1);
+  return false;
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2964,9 +3543,17 @@ struct ReduceLowering
     }
     if (!combine)
       return mlir::failure();
-    if (isF32 && !mlir::isa<mlir::arith::AddFOp>(combine))
+    // Combine kinds: f32 sum (arith.addf) / f32 max (arith.maxnumf or
+    // arith.maximumf — Triton's tl.max emits maxnumf) / i32 sum (arith.addi).
+    // Rank-2 i32 max (arith.maxsi) is not yet wired (the L3 pre-pass only
+    // accepts maxsi for rank-1), so it stays rejected here.
+    bool isAddF = mlir::isa<mlir::arith::AddFOp>(combine);
+    bool isMaxF = mlir::isa<mlir::arith::MaximumFOp>(combine) ||
+                  mlir::isa<mlir::arith::MaxNumFOp>(combine);
+    bool isAddI = mlir::isa<mlir::arith::AddIOp>(combine);
+    if (isF32 && !(isAddF || isMaxF))
       return mlir::failure();
-    if (isI32 && !mlir::isa<mlir::arith::AddIOp>(combine))
+    if (isI32 && !isAddI)
       return mlir::failure();
 
     auto loc = op.getLoc();
@@ -3021,21 +3608,45 @@ struct ReduceLowering
             reduceSrc.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
       reduceSrc = cvt.getSrc();
     auto loadOp = reduceSrc.getDefiningOp<mlir::triton::LoadOp>();
-    if (!loadOp)
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: src not produced by tt.load");
-    if (loadOp.getMask())
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: masked load not yet supported");
-    if (!loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+
+    // The per-row column reduction reads its elements from one of two sources:
+    //   * a direct unmasked device `tt.load`  → read device[rowBase + n]; or
+    //   * a COMPUTED cone (Wall 17 Case C, f32 only) → re-derive each element
+    //     via `evalRank2ConeAt`. We still need ONE representative load to
+    //     recover the per-program scalar offset and confirm the cone is
+    //     device-rooted (a pure-splat reduce carries no per-row data).
+    bool computedCone = false;
+    mlir::Value coneRoot;           // = reduceSrc, fed to the cone evaluator
+    mlir::triton::LoadOp reprLoad;  // representative load (scalarOff source)
+    mlir::Value memref;             // direct-path base memref (null for cone)
+    mlir::Type loadEltTy;           // direct-path element type (null for cone)
+    if (loadOp && !loadOp.getMask()) {
+      reprLoad = loadOp;
+    } else {
+      if (!isF32)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: computed-cone src supported for f32 only");
+      if (!rank2ConeSupported(reduceSrc, 0))
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: computed-cone src has an unsupported producer "
+                "(Wall 17 Increment 1: load/arith/math/splat only)");
+      reprLoad = findFirstLoadInCone(reduceSrc, 0);
+      if (!reprLoad)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: computed src has no device load");
+      computedCone = true;
+      coneRoot = reduceSrc;
+    }
+    if (!reprLoad.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
       return rewriter.notifyMatchFailure(
           op, "rank-2 reduce: load missing tt.addptr");
-    mlir::Value memref = findBaseMemref(loadOp.getPtr(), rewriter);
-    if (!memref)
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: base memref not found");
-    auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
-    mlir::Type loadEltTy = memrefTy.getType();
+    if (!computedCone) {
+      memref = findBaseMemref(reprLoad.getPtr(), rewriter);
+      if (!memref)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: base memref not found");
+      loadEltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
+    }
 
     // Output tile info: the post-reduce (#blocked) layout the downstream store
     // consumes. The reduce result itself carries a #ttg.slice encoding (no
@@ -3067,8 +3678,10 @@ struct ReduceLowering
       }
     }
 
-    auto addEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
-                                              BinaryExpOperator::addOp);
+    // Combine enum: addOp for sum, maxOp for f32 max (lowers to MSL max(a,b)).
+    auto combineEnum = BinaryExpOperatorAttr::get(
+        rewriter.getContext(),
+        isMaxF ? BinaryExpOperator::maxOp : BinaryExpOperator::addOp);
     mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
     if (tileLoop && !outTile)
       return rewriter.notifyMatchFailure(
@@ -3113,9 +3726,10 @@ struct ReduceLowering
               .getResult();
 
       // Any scalar tt.addptr chain offset (e.g. row_base*stride for a
-      // multi-program launch); null for the simple direct-load shape.
+      // multi-program launch); null for the simple direct-load shape. For a
+      // computed cone the representative load supplies the per-program offset.
       mlir::Value scalarOff =
-          accumulateScalarAddPtrOffsets(loadOp.getPtr(), rewriter, loc);
+          accumulateScalarAddPtrOffsets(reprLoad.getPtr(), rewriter, loc);
 
       auto cN = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
@@ -3164,9 +3778,14 @@ struct ReduceLowering
             rowBase = mlir::arith::AddIOp::create(rewriter, loc, rowBase,
                                                   scalarOff)
                           .getResult();
-          // Inner column reduction: rowSum = sum_n device[rowBase + n].
-          // Helper to load one column element (rowBase + colOff) from device.
+          // Inner column reduction: rowCombine = combine_n elem(rowBase + n).
+          // For a direct load the element is device[rowBase + n]; for a
+          // computed cone (Wall 17 Case C) it is re-derived per (row, col) by
+          // `evalRank2ConeAt` reading the cone's device loads at rowBase + n.
           auto emitColLoad = [&](mlir::Value colOff) -> mlir::Value {
+            if (computedCone)
+              return evalRank2ConeAt(coneRoot, r, rowBase, colOff, rewriter,
+                                     loc, /*depth=*/0);
             auto colIdx =
                 mlir::arith::AddIOp::create(rewriter, loc, rowBase, colOff);
             mlir::Value colIdxUI32 =
@@ -3183,11 +3802,15 @@ struct ReduceLowering
             // f32: a single scf.for carrying one f32 iter_arg (identity-init
             // 0.0). Reuses Wall 15's translator path so MSL emission is O(1)
             // in N. The 0.0 init is emitted fresh above the for (Wall 15 R9).
-            auto zeroInit = mlir::arith::ConstantOp::create(
-                rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+            // Identity: 0.0 for sum; -FLT_MAX for max (the MSL float-constant
+            // emitter can't render -inf, and max(x, -FLT_MAX) == x for finite x).
+            auto initVal = mlir::arith::ConstantOp::create(
+                rewriter, loc,
+                rewriter.getF32FloatAttr(
+                    isMaxF ? -std::numeric_limits<float>::max() : 0.0f));
             auto colFor = mlir::scf::ForOp::create(
                 rewriter, loc, cColLo.getResult(), cN.getResult(),
-                cOne.getResult(), mlir::ValueRange{zeroInit.getResult()});
+                cOne.getResult(), mlir::ValueRange{initVal.getResult()});
             {
               mlir::OpBuilder::InsertionGuard g3(rewriter);
               rewriter.setInsertionPointToStart(colFor.getBody());
@@ -3195,7 +3818,7 @@ struct ReduceLowering
               mlir::Value acc = colFor.getRegionIterArgs()[0];
               mlir::Value elt = emitColLoad(nIv);
               auto combined = BinaryExpOp::create(rewriter, loc, storeTy,
-                                                  addEnum, acc, elt);
+                                                  combineEnum, acc, elt);
               mlir::scf::YieldOp::create(rewriter, loc,
                                          mlir::ValueRange{combined.getResult()});
             }
@@ -3213,7 +3836,7 @@ struct ReduceLowering
               if (!rowSum)
                 rowSum = elt;
               else
-                rowSum = BinaryExpOp::create(rewriter, loc, storeTy, addEnum,
+                rowSum = BinaryExpOp::create(rewriter, loc, storeTy, combineEnum,
                                              rowSum, elt)
                              .getResult();
             }
@@ -6489,29 +7112,24 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
-    // Safety guard against silent miscompiles: the MSL emitter (Wall-15) only
-    // supports an `scf.for` carrying EXACTLY ONE scalar (f32/i32) iter_arg.
-    // After structural conversion a user loop carrying multiple values — or a
-    // non-f32/i32 scalar — would be emitted with its accumulation dropped, so
-    // reject it with a clean diagnostic instead.
+    // Safety guard against silent miscompiles: the MSL emitter supports an
+    // `scf.for` carrying scalar (f32/i32) iter_args — one (Wall-15 single
+    // reduction accumulator) or several (multi-accumulator reduce, K-way ILP;
+    // metal-multiacc-reduce-plan.md). A loop carrying a NON-f32/i32 value would
+    // be emitted with its accumulation dropped, so reject that with a clean
+    // diagnostic. (Matmul loops carry pointer iter_args but are replaced by the
+    // matmul lowering before this guard, so they never reach here.)
     {
       bool loopOk = true;
       moduleOp.walk([&](mlir::scf::ForOp forOp) {
-        unsigned n = forOp.getNumRegionIterArgs();
-        if (n == 0)
-          return;
-        if (n > 1) {
-          forOp.emitOpError(
-              "Metal backend: scf.for with multiple iter_args is not "
-              "supported (only a single scalar reduction accumulator)");
-          loopOk = false;
-          return;
-        }
-        mlir::Type t = forOp.getRegionIterArgs()[0].getType();
-        if (!(t.isF32() || t.isInteger(32))) {
-          forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
-                            "f32/i32 accumulator after conversion");
-          loopOk = false;
+        for (mlir::Value iterArg : forOp.getRegionIterArgs()) {
+          mlir::Type t = iterArg.getType();
+          if (!(t.isF32() || t.isInteger(32))) {
+            forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
+                              "f32/i32 accumulator after conversion");
+            loopOk = false;
+            break;
+          }
         }
       });
       if (!loopOk) {

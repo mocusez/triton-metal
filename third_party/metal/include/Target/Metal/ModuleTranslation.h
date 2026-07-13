@@ -51,6 +51,14 @@ private:
   // the existing IV-only emission. See
   // .omc/plans/tutorial02-wall15-iter-args-translator-consensus.md AC1.
   std::map<mlir::Operation *, unsigned> _scfForIterArg;
+  // Multi-accumulator reduce (K-way ILP, metal-multiacc-reduce-plan.md): maps
+  // an `scf.for` carrying N>=2 scalar (f32/i32) iter_args to their emitted MSL
+  // temp indices, in order. Each region iter-arg BlockArgument and each loop
+  // result is registered in `_buffers` mapped to its temp so reads/uses resolve
+  // to `v<idx_i>`; the matching `scf.yield` writes all N back. Single-iter_arg
+  // loops keep using `_scfForIterArg` above (byte-identical emission).
+  std::map<mlir::Operation *, llvm::SmallVector<unsigned, 8>>
+      _scfForIterArgsMulti;
   // L1d2b inline-barrier contract: maps an op whose result has been
   // force-materialized as a named MSL let-binding to that temp's index.
   // Currently populated for `metal.tg_load_indexed` at statement-walk

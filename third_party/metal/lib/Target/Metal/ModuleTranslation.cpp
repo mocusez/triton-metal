@@ -844,6 +844,30 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
       translateVarName(op.getInitArgs()[0]);
     _output << ";\n";
     indent();
+  } else if (op.getNumRegionIterArgs() >= 2 &&
+             llvm::all_of(op.getRegionIterArgs(), [](mlir::Value v) {
+               return v.getType().isF32() || v.getType().isInteger(32);
+             })) {
+    // Multi-accumulator reduce loop (K-way ILP): declare one MSL temp per
+    // iter_arg, map each region iter-arg and each loop result to its temp, and
+    // record them so the matching scf.yield writes all K back. Mirrors the
+    // single-iter_arg path above, N times. See metal-multiacc-reduce-plan.md.
+    llvm::SmallVector<unsigned, 8> idxs;
+    for (unsigned i = 0; i < op.getNumRegionIterArgs(); ++i) {
+      unsigned accIdx = _varCount++;
+      idxs.push_back(accIdx);
+      auto iterArg = op.getRegionIterArgs()[i];
+      _buffers[iterArg.getAsOpaquePointer()] = accIdx;
+      _buffers[op.getResult(i).getAsOpaquePointer()] = accIdx;
+      _output << typeToString(iterArg.getType()) << " v" << accIdx << " = ";
+      if (auto initOp = op.getInitArgs()[i].getDefiningOp())
+        translateValue(initOp);
+      else
+        translateVarName(op.getInitArgs()[i]);
+      _output << ";\n";
+      indent();
+    }
+    _scfForIterArgsMulti[op.getOperation()] = idxs;
   }
 
   unsigned idx = _varCount++;
@@ -890,8 +914,18 @@ void ModuleTranslation::translate(mlir::scf::YieldOp op) {
   // and stay byte-identical to the pre-Wall-15 emission.
   if (auto parentFor =
           llvm::dyn_cast_or_null<mlir::scf::ForOp>(op->getParentOp())) {
+    // Multi-accumulator reduce: write all K iter_args back (`v_i = yielded_i;`).
+    auto mit = _scfForIterArgsMulti.find(parentFor.getOperation());
+    if (mit != _scfForIterArgsMulti.end()) {
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        _output << "v" << mit->second[i] << " = ";
+        translateValueOrVarName(op.getOperand(i));
+        _output << "; ";
+      }
+      return;
+    }
     if (op.getNumOperands() != 1)
-      return; // zero iter_args or multi-iter_arg: not supported, no-op
+      return; // zero iter_args or (non-multi) unsupported: not supported, no-op
     auto it = _scfForIterArg.find(parentFor.getOperation());
     if (it == _scfForIterArg.end())
       return; // not a single-f32-iter_arg loop
@@ -3680,6 +3714,18 @@ void ModuleTranslation::translate(mlir::Region &region) {
 // rank-1 reduce body's combine step has the iter-arg BlockArgument as
 // LHS, so callsites consuming iter-args MUST route through this helper.
 void ModuleTranslation::translateValueOrVarName(mlir::Value v) {
+  // A value explicitly materialized as an MSL temp resolves by its own buffer
+  // name first. This is required for a specific result of a MULTI-result op
+  // (e.g. one accumulator of a multi-accumulator reduce scf.for): translating
+  // its defining op as an expression can't pick out which result, and would hit
+  // the translateValue default (UNREACHABLE). Single-result ops in `_buffers`
+  // resolve to the same name they got via translateValue, so this is a no-op
+  // for the pre-existing single-iter_arg path.
+  auto it = _buffers.find(v.getAsOpaquePointer());
+  if (it != _buffers.end()) {
+    _output << "v" << it->second;
+    return;
+  }
   if (auto *defOp = v.getDefiningOp())
     translateValue(defOp);
   else
@@ -3739,10 +3785,13 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         case P::ugt: opStr = " > ";  break;
         case P::uge: opStr = " >= "; break;
         }
+        // Operands may be block arguments (e.g. an scf.for induction var fed
+        // straight into a comparison by the computed-cone reduce evaluator),
+        // so route through translateValueOrVarName, not translateValue.
         _output << "(";
-        translateValue(op.getLhs().getDefiningOp());
+        translateValueOrVarName(op.getLhs());
         _output << opStr;
-        translateValue(op.getRhs().getDefiningOp());
+        translateValueOrVarName(op.getRhs());
         _output << ")";
       })
       .Case<mlir::arith::CmpFOp>([&](mlir::arith::CmpFOp op) {
@@ -3795,9 +3844,9 @@ void ModuleTranslation::translateValue(Operation *opInst) {
               "arith.cmpf AlwaysFalse not yet supported on Metal");
         }
         _output << "(";
-        translateValue(op.getLhs().getDefiningOp());
+        translateValueOrVarName(op.getLhs());
         _output << opStr;
-        translateValue(op.getRhs().getDefiningOp());
+        translateValueOrVarName(op.getRhs());
         _output << ")";
       })
       .Case<mlir::arith::ConstantOp>([&](mlir::arith::ConstantOp op) {

@@ -24,10 +24,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 }
 // CHECK-LABEL: metal.kernel rank1_reduce_addf_block16384
 // Wall 15: single scf.for; the upper bound encodes E=64.
+// Multi-accumulator reduce (K=8, metal-multiacc-reduce-plan.md): the scf.for
+// upper bound encodes E=64 and it steps by 8 with 8 f32 iter_args.
 // CHECK: arith.constant 64 : i32
-// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// CHECK: scf.for {{.*}} step {{.*}} iter_args({{.*}}) -> (f32, f32, f32, f32, f32, f32, f32, f32)
 // CHECK: metal.get_element
-// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+// CHECK-COUNT-8: metal.binary_exp {{.*}}, {{.*}}, addOp
 // CHECK: scf.yield
 // Threadgroup butterfly buffer at tpb=256 (unchanged regardless of E).
 // CHECK: metal.threadgroup_alloca : !metal.memref<256 x f32>

@@ -33,8 +33,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
   }
 }
 // CHECK-LABEL: metal.kernel rank1_reduce_addf_block4096_chain
-// Wall 15: scf.for + iter_args, chain ops nested inside the body.
-// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// Multi-accumulator reduce (K=8, metal-multiacc-reduce-plan.md): scf.for + 8
+// f32 iter_args, with the Wall-11 chain ops nested inside the body (per
+// accumulator). The CHECKs below match the first accumulator's chain.
+// CHECK: scf.for {{.*}} step {{.*}} iter_args({{.*}}) -> (f32, f32, f32, f32, f32, f32, f32, f32)
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, subOp
 // CHECK: metal.unary_exp {{.*}}, expOp
 // CHECK: arith.select
