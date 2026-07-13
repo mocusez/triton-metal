@@ -7,7 +7,9 @@ bindings in `third_party/metal/triton_metal.cc`, exposed as
 `.omc/specs/deep-interview-metal-jit-to-msl-text.md`.
 """
 
+import os
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict
 from types import ModuleType
@@ -62,6 +64,105 @@ class MetalOptions:
         )
 
 
+# ---------------------------------------------------------------------------
+# Compile-option contract (Phase 1 of metal-num-stages-pipelining-plan.md).
+#
+# Historically parse_options silently filtered `opts` to MetalOptions fields and
+# dropped everything else, INCLUDING options the user deliberately set that the
+# Metal backend does not implement (num_stages, maxnreg, ...). A user passing
+# `num_stages=3` believed they got software pipelining; they got a no-op. This
+# layer makes every unsupported-but-set option loud instead of silent.
+#
+# Each MetalOptions field is classified below. The import-time assertion forces
+# any newly-added field to be classified here too — no silent fall-through.
+#
+#   WARN   : setting a non-default value is accepted but ignored -> one warning.
+#   REJECT : setting a non-default value is a hard error (ValueError).
+#   HONORED: consumed by codegen / the frontend / core, or an internal field.
+#
+# "non-default" == "differs from the MetalOptions default", which is exactly the
+# value that produces the backend's actual behavior. See jit.py:698
+# (`backend.parse_options(kwargs)` receives ONLY user-set launch kwargs, so a
+# warning fires precisely when the user explicitly asked for the behavior).
+_OPT_WARN_UNSUPPORTED = {
+    "num_stages": "Metal has no cp.async analog; a Phase 0 spike proved register "
+                  "prefetch pipelining is a no-op on Apple MPS (0.95-1.02x). The "
+                  "loop runs unpipelined; results are unchanged.",
+    "num_ctas": "Metal has no multi-CTA cluster hardware; only num_ctas=1 works.",
+    "enable_fp_fusion": "MSL controls fp contraction at its own compile stage; "
+                        "disabling fusion from Triton is not implemented.",
+    "launch_cooperative_grid": "Metal has no cooperative-grid launch.",
+    "maxnreg": "Metal (MSL text) exposes no per-thread register cap.",
+    "extern_libs": "The Metal backend loads no external libdevice; core libdevice "
+                   "maps to MSL intrinsics (get_module_map returns {}).",
+    "max_num_imprecise_acc_default": "Metal has no fp8 dot path.",
+    "instrumentation_mode": "Metal runs no instrumentation passes.",
+}
+_OPT_REJECT_UNSUPPORTED = {
+    "warp_size": "Apple GPUs have a fixed SIMD width of 32; warp_size must be 32 "
+                 "(codegen is decoupled from it — see driver._get_apple_gpu_family).",
+}
+# Consumed by codegen (num_warps, arch, dot precision), the frontend
+# (sanitize_overflow), Triton core (debug, ir_override), or internal metadata.
+_OPT_HONORED = {
+    "num_warps", "arch", "debug", "sanitize_overflow", "default_dot_input_precision",
+    "allowed_dot_input_precisions", "supported_fp8_dtypes",
+    "deprecated_fp8_dot_operand_dtypes", "backend_name", "ir_override",
+}
+assert (set(_OPT_WARN_UNSUPPORTED) | set(_OPT_REJECT_UNSUPPORTED) | _OPT_HONORED) == \
+    set(MetalOptions.__dataclass_fields__), (
+        "Metal compile-option contract is out of sync with MetalOptions: "
+        f"{set(MetalOptions.__dataclass_fields__).symmetric_difference(set(_OPT_WARN_UNSUPPORTED) | set(_OPT_REJECT_UNSUPPORTED) | _OPT_HONORED)}")
+
+# Once-per-field dedup across compiles (autotuner calls parse_options per Config;
+# the user should see each ignored-option warning once, not per config).
+_OPT_CONTRACT_WARNED: set = set()
+
+
+def _opt_value_is_set(val, default) -> bool:
+    """True when `val` meaningfully deviates from `default`. None and empty
+    containers count as "unset" so e.g. extern_libs={} does not warn."""
+    if val == default:
+        return False
+    if val is None:
+        return False
+    try:
+        if len(val) == 0:
+            return False
+    except TypeError:
+        pass
+    return True
+
+
+def _enforce_option_contract(opts: dict) -> None:
+    """Reject / warn on user-set options the Metal backend cannot honor.
+
+    REJECT first (hard errors take priority over warnings). Unknown keys are
+    dropped as before, unless TRITON_METAL_STRICT_OPTIONS=1, which raises on
+    them for debugging."""
+    fields = MetalOptions.__dataclass_fields__
+    for name, reason in _OPT_REJECT_UNSUPPORTED.items():
+        if name in opts and _opt_value_is_set(opts[name], fields[name].default):
+            raise ValueError(
+                f"[triton-metal] Unsupported compile option `{name}={opts[name]!r}`: "
+                f"{reason}")
+    for name, reason in _OPT_WARN_UNSUPPORTED.items():
+        if name in _OPT_CONTRACT_WARNED:
+            continue
+        if name in opts and _opt_value_is_set(opts[name], fields[name].default):
+            _OPT_CONTRACT_WARNED.add(name)
+            warnings.warn(
+                f"[triton-metal] Compile option `{name}={opts[name]!r}` is not "
+                f"honored by the Metal backend and will be ignored: {reason}",
+                stacklevel=3)
+    if os.environ.get("TRITON_METAL_STRICT_OPTIONS", "0") == "1":
+        unknown = sorted(set(opts) - set(fields))
+        if unknown:
+            raise ValueError(
+                f"[triton-metal] Unknown compile option(s) {unknown} "
+                "(TRITON_METAL_STRICT_OPTIONS=1).")
+
+
 # Upstream TritonGPU passes only parse target strings prefixed with "cuda:"
 # or "hip:". The post-prefix integer is parsed as a real SM compute
 # capability by getNVIDIAComputeCapability (lib/Dialect/TritonGPU/Transforms/
@@ -113,6 +214,9 @@ class MetalBackend(BaseBackend):
         return f"metal-{self.target.arch}-{self.target.warp_size}"
 
     def parse_options(self, opts: dict) -> Any:
+        # Surface (warn) or reject user-set options the Metal backend cannot
+        # honor, instead of silently dropping them. See _enforce_option_contract.
+        _enforce_option_contract(opts)
         args = {k: v for k, v in opts.items() if k in MetalOptions.__dataclass_fields__}
         return MetalOptions(**args)
 
