@@ -121,3 +121,45 @@ def test_add_cpu_tensor_writeback():
     out = torch.empty(N)
     _add_kernel[(triton.cdiv(N, BLOCK),)](x, y, out, N, BLOCK=BLOCK)
     torch.testing.assert_close(out, x + y)
+
+
+# A @triton.jit function's name becomes the MSL entry-point name verbatim, and
+# `kernel` / `device` are reserved MSL keywords -> `kernel void kernel(...)` is a
+# torch.mps.compile_shader SyntaxError. This is exactly what
+# leet-triton/medium-monte_carlo_integration.py hit (its jit fn is literally
+# `kernel`). sanitizeKernelName (ModuleTranslation.cpp) mangles a reserved entry
+# name to `triton_<name>`; compiler.py make_msl re-greps that name into
+# metadata["name"] and driver.py load_binary does getattr(lib, name), so the
+# emitter, the metadata, and the dispatch lookup must all agree. This exercises
+# that whole chain end-to-end; IR-level coverage is
+# test/Dialect/Metal/metal-translate/kernel-name-reserved-word.mlir.
+@triton.jit
+def kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs,
+             tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask),
+             mask=mask)
+
+
+@triton.jit
+def device(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs,
+             tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask),
+             mask=mask)
+
+
+@pytest.mark.parametrize("fn, mangled", [(kernel, "triton_kernel"), (device, "triton_device")])
+def test_reserved_word_kernel_name_runs(fn, mangled):
+    N, BLOCK = 4096, 1024
+    x = torch.randn(N, device="mps")
+    y = torch.randn(N, device="mps")
+    out = torch.empty(N, device="mps")
+    compiled = fn[(triton.cdiv(N, BLOCK),)](x, y, out, N, BLOCK=BLOCK)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, x + y)
+    # The emitted MSL entry point -- and thus metadata["name"] and the
+    # getattr(lib, name) dispatch lookup -- is the mangled, non-reserved name.
+    assert compiled.name == mangled

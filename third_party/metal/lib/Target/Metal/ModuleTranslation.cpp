@@ -12,6 +12,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -42,6 +43,49 @@ static void emitFloatLiteral(llvm::raw_ostream &os, mlir::FloatAttr attr) {
     return;
   }
   os << attr.getValueAsDouble();
+}
+
+// MSL is a C++14 dialect, so the emitted entry-point name must not collide
+// with a reserved keyword. A Triton `@triton.jit` function may legitimately be
+// named `kernel`, `device`, `vertex`, `float`, ... — Python only forbids its
+// OWN keywords as function names, and none of those overlap with the C++/MSL
+// words below. Emitting `kernel void kernel(...)` is a hard MSL syntax error
+// (observed compiling leet-triton/medium-monte_carlo_integration.py through
+// torch.mps.compile_shader). We mangle ONLY on collision (prefix `triton_`) so
+// every non-colliding kernel keeps its exact original name — both the
+// launcher's `metadata["name"]` (compiler.py make_msl re-greps `kernel void
+// <name>` from this text) and its `getattr(lib, name)` (driver.py load_binary)
+// re-derive from the name emitted here, so sanitizing at this single site keeps
+// all three in lockstep.
+static std::string sanitizeKernelName(llvm::StringRef name) {
+  static const llvm::StringSet<> kReserved = {
+      // C++14 keywords (MSL Specification §1.4.3). Python keywords that also
+      // appear here (e.g. `if`, `return`, `class`) can never be a JIT function
+      // name, but harmless to list; the rest (`auto`, `float`, `int`, `static`,
+      // `new`, `switch`, `union`, `template`, `default`, ...) ARE valid Python
+      // identifiers a kernel could be named.
+      "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor",
+      "bool", "break", "case", "catch", "char", "char16_t", "char32_t", "class",
+      "compl", "const", "constexpr", "const_cast", "continue", "decltype",
+      "default", "delete", "do", "double", "dynamic_cast", "else", "enum",
+      "explicit", "export", "extern", "false", "float", "for", "friend", "goto",
+      "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept",
+      "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+      "protected", "public", "register", "reinterpret_cast", "return", "short",
+      "signed", "sizeof", "static", "static_assert", "static_cast", "struct",
+      "switch", "template", "this", "thread_local", "throw", "true", "try",
+      "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual",
+      "void", "volatile", "wchar_t", "while", "xor", "xor_eq",
+      // MSL function / address-space / attribute qualifiers (§4.x) and common
+      // typedefs a function name could shadow.
+      "kernel", "vertex", "fragment", "device", "constant", "threadgroup",
+      "threadgroup_imageblock", "thread", "ray_data", "object_data", "packed",
+      "sample", "sampler", "uniform", "patch", "half", "uchar", "ushort",
+      "uint", "ulong", "size_t", "ptrdiff_t",
+  };
+  if (name.empty() || kReserved.count(name))
+    return "triton_" + name.str();
+  return name.str();
 }
 
 static llvm::StringRef typeToString(mlir::Type type) {
@@ -200,7 +244,7 @@ void ModuleTranslation::translateKernels() {
 }
 
 void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
-  _output << "kernel void " << op.getName() << "(\n";
+  _output << "kernel void " << sanitizeKernelName(op.getName()) << "(\n";
   for (auto tuple : llvm::zip(op.getBuffers(), op.getAddressSpaceDevice())) {
     auto buffer = std::get<0>(tuple);
     auto memRef = llvm::cast<mlir::triton::metal::MetalMemRefType>(buffer.getType());
