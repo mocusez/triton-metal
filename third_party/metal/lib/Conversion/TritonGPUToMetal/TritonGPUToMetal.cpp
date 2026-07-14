@@ -7983,6 +7983,194 @@ static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
 }
 
 //===----------------------------------------------------------------------===//
+// Flash-attention loop matcher (Phase 2).
+//===----------------------------------------------------------------------===//
+//
+// Recognize the online-softmax flash-attention loop (Q@K^T -> masked softmax ->
+// P@V with running-max/sum rescaling) and replace the whole loop + its
+// divide-by-sum epilogue + masked store with a single `metal.flash_attention`
+// op. Runs BEFORE the cvt classifier so the loop's dot-operand
+// convert_layouts (which the matmul track can't absorb — dot B's A operand is a
+// computed `exp`, see metal-flash-attention-plan.md §1a) never reach the L1d3
+// reject. The op's emitter (Phase 1) renders the Phase-0-validated MSL body.
+// Anchored on the leet-triton hard-mult_head_attention.py TTGIR shape.
+
+// Trace a dot operand back through convert_layout / trans to its tt.load.
+static mlir::triton::LoadOp faTraceToLoad(mlir::Value v) {
+  while (v) {
+    auto *def = v.getDefiningOp();
+    if (!def)
+      return nullptr;
+    if (auto ld = mlir::dyn_cast<mlir::triton::LoadOp>(def))
+      return ld;
+    if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::TransOp>(
+            def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+// Does the producer cone of `v` (through convert_layout) contain a tt.trans?
+// Only the Q@K^T dot has a transposed operand; P@V does not.
+static bool faConeHasTrans(mlir::Value v) {
+  auto *def = v.getDefiningOp();
+  while (def) {
+    if (mlir::isa<mlir::triton::TransOp>(def))
+      return true;
+    if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(def)) {
+      def = def->getOperand(0).getDefiningOp();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
+  // (1) exactly 3 iter_args: one rank-2 f32 accumulator + two rank-1 f32 state.
+  if (forOp.getNumRegionIterArgs() != 3)
+    return mlir::failure();
+  mlir::RankedTensorType accTy;
+  int nRank1 = 0;
+  for (mlir::Value init : forOp.getInitArgs()) {
+    auto tt = mlir::dyn_cast<mlir::RankedTensorType>(init.getType());
+    if (!tt || !tt.getElementType().isF32())
+      return mlir::failure();
+    if (tt.getRank() == 2) {
+      if (accTy)
+        return mlir::failure();
+      accTy = tt;
+    } else if (tt.getRank() == 1) {
+      ++nRank1;
+    } else {
+      return mlir::failure();
+    }
+  }
+  if (!accTy || nRank1 != 2)
+    return mlir::failure();
+
+  // (2) exactly two tt.dot and two tt.reduce in the body.
+  llvm::SmallVector<mlir::triton::DotOp> dots;
+  forOp.getBodyRegion().walk([&](mlir::triton::DotOp d) { dots.push_back(d); });
+  if (dots.size() != 2)
+    return mlir::failure();
+  int nReduce = 0;
+  forOp.getBodyRegion().walk([&](mlir::triton::ReduceOp) { ++nReduce; });
+  if (nReduce != 2)
+    return mlir::failure();
+
+  // (3) classify: dotA (Q@K^T) is the one whose B-operand cone has a tt.trans.
+  mlir::triton::DotOp dotA, dotB;
+  if (faConeHasTrans(dots[0].getB()) && !faConeHasTrans(dots[1].getB())) {
+    dotA = dots[0];
+    dotB = dots[1];
+  } else if (faConeHasTrans(dots[1].getB()) && !faConeHasTrans(dots[0].getB())) {
+    dotA = dots[1];
+    dotB = dots[0];
+  } else {
+    return mlir::failure();
+  }
+
+  // (4) trace dot operands to their tt.load leaves.
+  auto qLoad = faTraceToLoad(dotA.getA());
+  auto kLoad = faTraceToLoad(dotA.getB());
+  auto vLoad = faTraceToLoad(dotB.getB());
+  if (!qLoad || !kLoad || !vLoad)
+    return mlir::failure();
+
+  // (5) unique tt.store + unique arith.divsi (d_head = d_model / h) in the func.
+  auto funcOp = forOp->getParentOfType<mlir::triton::FuncOp>();
+  if (!funcOp)
+    return mlir::failure();
+  mlir::triton::StoreOp store;
+  int nStore = 0;
+  funcOp.walk([&](mlir::triton::StoreOp s) {
+    store = s;
+    ++nStore;
+  });
+  if (nStore != 1)
+    return mlir::failure();
+  mlir::arith::DivSIOp dhead;
+  int nDiv = 0;
+  funcOp.walk([&](mlir::arith::DivSIOp d) {
+    dhead = d;
+    ++nDiv;
+  });
+  if (nDiv != 1)
+    return mlir::failure();
+
+  // (6) resolve kernel-arg pointers / scalars.
+  mlir::Value qPtr = unwrapPtrToKernelArg(qLoad.getPtr());
+  mlir::Value kPtr = unwrapPtrToKernelArg(kLoad.getPtr());
+  mlir::Value vPtr = unwrapPtrToKernelArg(vLoad.getPtr());
+  mlir::Value oPtr = unwrapPtrToKernelArg(store.getPtr());
+  if (!qPtr || !kPtr || !vPtr || !oPtr)
+    return mlir::failure();
+  mlir::Value nVal = forOp.getUpperBound();
+  mlir::Value dModelVal = dhead.getLhs();
+  mlir::Value hVal = dhead.getRhs();
+
+  // (7) block sizes from tensor shapes. acc = [BM, BD]; dotA result = [BM, BN].
+  int64_t BM = accTy.getShape()[0];
+  int64_t BD = accTy.getShape()[1];
+  auto sTy = mlir::dyn_cast<mlir::RankedTensorType>(dotA.getType());
+  if (!sTy || sTy.getRank() != 2 || sTy.getShape()[0] != BM)
+    return mlir::failure();
+  int64_t BN = sTy.getShape()[1];
+  // First-cut envelope (Phase 0/1 validated): BM <= 32 (one query row per
+  // lane), all tile dims multiples of 8.
+  if (BM > 32 || BM % 8 || BN % 8 || BD % 8)
+    return mlir::failure();
+
+  // (8) build metal.flash_attention before the loop.
+  mlir::OpBuilder builder(forOp);
+  auto loc = forOp.getLoc();
+  auto f32 = builder.getF32Type();
+  auto ui32Elem = wrapperElementType(nVal.getType());
+  mlir::Value qBuf = bridgePtrToMemref(builder, loc, qPtr, f32);
+  mlir::Value kBuf = bridgePtrToMemref(builder, loc, kPtr, f32);
+  mlir::Value vBuf = bridgePtrToMemref(builder, loc, vPtr, f32);
+  mlir::Value oBuf = bridgePtrToMemref(builder, loc, oPtr, f32);
+  mlir::Value nBuf = bridgePtrToMemref(builder, loc, nVal, ui32Elem);
+  mlir::Value dmBuf = bridgePtrToMemref(builder, loc, dModelVal, ui32Elem);
+  mlir::Value hBuf = bridgePtrToMemref(builder, loc, hVal, ui32Elem);
+  auto faOp = mlir::triton::metal::FlashAttentionOp::create(
+      builder, loc, qBuf, kBuf, vBuf, oBuf, nBuf, dmBuf, hBuf, BM, BN, BD);
+
+  // (9) DCE the now-dead loop / epilogue / loads / offset arithmetic in the
+  // func entry block: everything except the new FA op + terminator becomes
+  // dead once the store (the only writer) is gone. Bottom-up to fixpoint; the
+  // FA op's operand bridge-casts stay live (used by the FA op).
+  mlir::Block *blk = forOp->getBlock();
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (mlir::Operation &op : llvm::make_early_inc_range(llvm::reverse(*blk))) {
+      if (&op == faOp.getOperation() || op.hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      if (op.use_empty()) {
+        op.erase();
+        changed = true;
+      }
+    }
+  }
+  return mlir::success();
+}
+
+static void runFlashAttentionMatcher(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  moduleOp.walk([&](mlir::scf::ForOp f) {
+    if (!f->getParentOfType<mlir::scf::ForOp>())
+      loops.push_back(f); // top-level loops only
+  });
+  for (auto f : loops)
+    (void)tryFlashAttentionLoop(f);
+}
+
+//===----------------------------------------------------------------------===//
 // Pass entry point.
 //===----------------------------------------------------------------------===//
 
@@ -8017,6 +8205,13 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+
+    // Phase 2: recognize the online-softmax flash-attention loop and replace
+    // it + epilogue with a single `metal.flash_attention` op BEFORE any cvt
+    // handling. Its dot-B operand cvts (A operand is a computed `exp`) can't be
+    // absorbed by the matmul track and would otherwise hit the L1d3 reject.
+    // See metal-flash-attention-plan.md.
+    runFlashAttentionMatcher(moduleOp);
 
     // L1d3: rewire dot-feeding ttg.convert_layout(blocked -> dot_op) ops
     // off their tt.dot operands so they don't survive into the cvt
