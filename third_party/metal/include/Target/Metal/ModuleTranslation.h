@@ -119,6 +119,7 @@ private:
   void translate(mlir::triton::metal::SoftmaxOp op);
   void translate(mlir::triton::metal::LogsumexpOp op);
   void translate(mlir::triton::metal::SdpaOp op);
+  void translate(mlir::triton::metal::FlashAttentionOp op);
   void emitCausal_(mlir::triton::metal::SdpaOp op);
   void emitBoolMask_(mlir::triton::metal::SdpaOp op);
   void emitFloatMask_(mlir::triton::metal::SdpaOp op);

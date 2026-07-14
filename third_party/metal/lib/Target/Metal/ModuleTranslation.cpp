@@ -261,13 +261,24 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   // kernel body references it (via metal.threadgroup_id). This keeps
   // existing single-program fixtures' MSL signatures unchanged. See
   // `.omc/specs/deep-interview-metal-pid-lowering.md`.
-  bool usesThreadgroupId = false;
+  // metal.flash_attention needs the threadgroup position (program id) AND the
+  // LOCAL thread index: the single-warp guard must key off
+  // thread_position_in_threadgroup, since thread_position_in_grid is global and
+  // would mis-identify the 2nd query block's warp (Phase-0 finding).
+  bool usesFlashAttention = false;
+  op.walk([&](mlir::triton::metal::FlashAttentionOp) {
+    usesFlashAttention = true;
+    return mlir::WalkResult::interrupt();
+  });
+  bool usesThreadgroupId = usesFlashAttention;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
     return mlir::WalkResult::interrupt();
   });
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
+  if (usesFlashAttention)
+    _output << ",\n  uint3 ltid [[thread_position_in_threadgroup]]";
   // Conditionally add the threadgroups-per-grid parameter only when the
   // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
   // usesThreadgroupId walk above; keeps existing single-program fixtures'
@@ -322,6 +333,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
+            mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -367,6 +379,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
+            mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -1690,6 +1703,157 @@ static void emitMaxSumBody(llvm::raw_ostream &os, int curIndent,
   os << "}\n";
   pad(0);
   os << "normalizer = simd_sum(normalizer);";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
+  // Emits the Phase-0-validated flash-attention body: two matmuls on simdgroup
+  // hardware (Q/K^T/V/P tiles staged in threadgroup, read via simdgroup_load),
+  // the online softmax + O accumulator + running max/sum in the threadgroup
+  // scalar domain. Runs on ONE warp (guard `_fa_active = ltid.x < 32`); idle
+  // warps under num_warps>1 still reach every threadgroup_barrier (barriers are
+  // OUTSIDE the guard). See metal-flash-attention-phase0-spike.py.
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const int64_t mT = BM / 8, nT = BN / 8, dT = BD / 8;
+  const int64_t SZ_Q = BM * BD, SZ_KTV = BD * BN, SZ_S = BM * BN;
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    // Walk conversion casts to the kernel buffer. A pointer arg resolves
+    // directly to its memref block-arg; a scalar arg (n/d_model/h) is
+    // materialized post-conversion as get_element(buffer[0]) — follow that to
+    // the underlying buffer memref so it resolves to v<i> (read as v<i>[0]),
+    // not v0. Without this, _buffers[...] misses and operator[] yields 0.
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    return "v" + std::to_string(it != _buffers.end() ? it->second : 0);
+  };
+  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
+                    V = bufName(op.getV()), O = bufName(op.getOut());
+  const std::string N = bufName(op.getN()) + "[0]";
+  const std::string DM = bufName(op.getDModel()) + "[0]";
+  const std::string H = bufName(op.getH()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+
+  auto &os = _output;
+  os << "\n  // ---- metal.flash_attention (online softmax, simdgroup dots) ----\n";
+  os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_ktbuf[" << S(SZ_KTV) << "];\n";
+  os << "  threadgroup float _fa_vbuf[" << S(SZ_KTV) << "];\n";
+  os << "  threadgroup float _fa_sbuf[" << S(SZ_S) << "];\n";
+  os << "  threadgroup float _fa_pbuf[" << S(SZ_S) << "];\n";
+  os << "  threadgroup float _fa_obuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_otbuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_rmax[" << S(BM) << "];\n";
+  os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
+  os << "  {\n";
+  os << "  uint _fa_lane = ltid.x & 31u;\n";
+  os << "  bool _fa_active = ltid.x < 32u;\n";
+  os << "  uint _fa_N = " << N << ";\n";
+  os << "  uint _fa_dm = " << DM << ";\n";
+  os << "  uint _fa_dhead = " << DM << " / " << H << ";\n";
+  os << "  uint _fa_coloff = tgid.y * _fa_dhead;\n";
+  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  os << "  float _fa_scale = 1.0f / sqrt((float)_fa_dhead);\n";
+  // load Q + zero-init accumulator/state
+  os << "  if (_fa_active) {\n";
+  os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
+  os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint row = _fa_rowoff + q;\n";
+  os << "      _fa_qbuf[c] = (row < _fa_N) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "      _fa_obuf[c] = 0.0f;\n";
+  os << "    }\n";
+  os << "    if (_fa_lane < " << S(BM) << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
+  os << "  }\n";
+  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // main loop over key blocks
+  os << "  for (uint kb = 0; kb < _fa_N; kb += " << S(BN) << "u) {\n";
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
+  os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN) << "u; uint kk = kb + key;\n";
+  os << "        _fa_ktbuf[c] = (kk < _fa_N) ? " << K << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "      }\n";
+  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
+  os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint kk = kb + key;\n";
+  os << "        _fa_vbuf[c] = (kk < _fa_N) ? " << V << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // Dot A: S = Q @ K^T
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+  os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+  os << "        simdgroup_float8x8 acc(0.0f);\n";
+  os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+  os << "          simdgroup_float8x8 a, b;\n";
+  os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD) << "u + ki*8u], " << S(BD) << ");\n";
+  os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
+  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "        }\n";
+  os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // online softmax (one query row per lane)
+  os << "    if (_fa_active) {\n";
+  os << "      uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  os << "      if (row < _fa_N) {\n";
+  os << "        float m_cur = -INFINITY;\n";
+  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk)\n";
+  os << "          if (kb + kk < _fa_N) m_cur = max(m_cur, _fa_sbuf[q*" << S(BN) << "u + kk] * _fa_scale);\n";
+  os << "        float m_old = _fa_rmax[q];\n";
+  os << "        float m_new = max(m_old, m_cur);\n";
+  os << "        float scaler = exp(m_old - m_new);\n";
+  os << "        float denom = 0.0f;\n";
+  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+  os << "          float p = (kb + kk < _fa_N) ? exp(_fa_sbuf[q*" << S(BN) << "u + kk]*_fa_scale - m_new) : 0.0f;\n";
+  os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
+  os << "        }\n";
+  os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
+  os << "        _fa_rmax[q] = m_new;\n";
+  os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*" << S(BD) << "u + d] *= scaler;\n";
+  os << "      } else {\n";
+  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*" << S(BN) << "u + kk] = 0.0f;\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // Dot B: O_tile = P @ V
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+  os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
+  os << "        simdgroup_float8x8 acc(0.0f);\n";
+  os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
+  os << "          simdgroup_float8x8 a, b;\n";
+  os << "          simdgroup_load(a, &_fa_pbuf[(mi*8u)*" << S(BN) << "u + ki*8u], " << S(BN) << ");\n";
+  os << "          simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BD) << "u + di*8u], " << S(BD) << ");\n";
+  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "        }\n";
+  os << "        simdgroup_store(acc, &_fa_otbuf[(mi*8u)*" << S(BD) << "u + di*8u], " << S(BD) << ");\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    if (_fa_active) { for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "  }\n";
+  // epilogue: O = obuf / run_sum, masked store
+  os << "  if (_fa_active) {\n";
+  os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  os << "    if (row < _fa_N) {\n";
+  os << "      float denom = _fa_rsum[q];\n";
+  os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
+  os << "      for (uint d = 0; d < " << S(BD) << "u; ++d)\n";
+  os << "        " << O << "[row * _fa_dm + _fa_coloff + d] = _fa_obuf[q*" << S(BD) << "u + d] * inv;\n";
+  os << "    }\n";
+  os << "  }\n";
+  os << "  }";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::SoftmaxOp op) {

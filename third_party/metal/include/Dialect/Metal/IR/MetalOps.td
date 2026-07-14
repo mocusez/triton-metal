@@ -635,6 +635,40 @@ def SdpaOp : Metal_Op<"sdpa"> {
 }
 
 //===----------------------------------------------------------------------===//
+// FlashAttentionOp
+//===----------------------------------------------------------------------===//
+
+def FlashAttentionOp : Metal_Op<"flash_attention"> {
+  let summary = "Fused online-softmax flash attention (Q@K^T -> softmax -> P@V)";
+  let description = [{
+    Self-contained flash-attention kernel body for one query-row block of one
+    head. Grid: (cdiv(seqlen, BM), num_heads). Both matmuls run on simdgroup
+    hardware (Q/K^T/V/P tiles staged in threadgroup, `simdgroup_load` reads them
+    directly); the online softmax + O accumulator + running max/sum live in the
+    threadgroup scalar domain, so per-row rescale and row max/sum never touch the
+    opaque simdgroup_matrix lane layout. Bit-close to
+    torch.scaled_dot_product_attention (Phase-0 spike).
+
+    Operands are kernel-argument buffers: q/k/v/out are `[seqlen, d_model]`
+    row-major device f32; n/d_model/h are the runtime scalar args
+    (d_head = d_model/h, scale = 1/sqrt(d_head)). Attributes: bm/bn the
+    query/key block sizes, bd the per-head width (== d_head). bm/bn/bd multiples
+    of 8; bm <= 32 (one query row per lane). The FA body runs on one warp; under
+    num_warps>1 the extra warps idle but still reach every threadgroup_barrier.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
+                       Metal_MemRefType:$v, Metal_MemRefType:$out,
+                       Metal_MemRefType:$n, Metal_MemRefType:$d_model,
+                       Metal_MemRefType:$h,
+                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd);
+
+  let assemblyFormat =
+      "$q `,` $k `,` $v `,` $out `,` $n `,` $d_model `,` $h attr-dict"
+      " `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
 // RmsNormOp
 //===----------------------------------------------------------------------===//
 
