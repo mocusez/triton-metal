@@ -256,6 +256,17 @@ threadgroup 标量域**。`simdgroup_matrix` 只是 dot 的瞬态输入/输出�
 - epilogue：`obuf / run_sum`，masked store。
 - **验收**：MHA 确切形状端到端跑通（数值 Phase 4 收）。
 
+> ### ✅ Phase 4（列掩码泛化）已完成（2026-07-14）
+> - **column masking**：`BLOCKSIZE_d = max(16, d_head)`，d_head<16 的头会把 tile pad 到 16 列。
+>   emitter 现在按 `d < d_head`(运行时)掩码 Q/K/V load 与输出 store：pad 列载 0（Dot A 收缩、
+>   Dot B 输出仍正确），且不写回。d_head==BD 时为无操作(原路径不变)。
+> - **threadgroup 预算 guard**：matcher 加 32KiB 预算检查(`3·BM·BD+2·BD·BN+2·BM·BN+2·BM ≤
+>   8192` floats)，BD=64(~48KiB)干净 fall through 到原 reject,不发超预算 kernel。
+> - **验证**：d_head=8 现在 bit-exact(之前数值错 1.37)；d_head∈{8,16,32} pytest 全 PASS；
+>   Metal lit 106、pytest 299,无回归。3 个 commit 已落 metal-develop。
+> - **仍不支持**(kernel 自身或超预算,非 backend 缺陷)：d_head 使 `max(16,d_head)` 非 2 的幂
+>   (如 24 → Triton 前端 `tl.arange` 报错)；d_head=64(超 threadgroup 预算)；BM>32。
+
 ### Phase 4 — 数值对拍 + 泛化（4–6 天）
 - 对拍 `torch.scaled_dot_product_attention`（online vs 一次性 softmax 只差 f32 舍入，容差
   ~1e-3；专测 `-inf` 行、全 masked 行、`exp(run_max-m')` 边界）。
