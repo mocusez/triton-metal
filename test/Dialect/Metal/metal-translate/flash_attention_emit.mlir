@@ -40,8 +40,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: uint _fa_dhead = v5[0] / v6[0];
 // CHECK: float _fa_scale = 1.0f / sqrt((float)_fa_dhead);
 
-// Masked K-tile stage (out-of-range keys read 0).
-// CHECK: _fa_ktbuf[c] = (kk < _fa_N) ? v1[kk * _fa_dm + _fa_coloff + d] : 0.0f;
+// Masked K-tile stage (out-of-range keys AND padded columns d>=d_head read 0).
+// CHECK: _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dhead) ? v1[kk * _fa_dm + _fa_coloff + d] : 0.0f;
 
 // Dot A: S = Q @ K^T on simdgroup hardware, tiles read from threadgroup.
 // CHECK: simdgroup_load(a, &_fa_qbuf[

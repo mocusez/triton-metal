@@ -9,9 +9,11 @@ loop + divide epilogue + masked store and lowers it to one `metal.flash_attentio
 op, whose emitter renders the Phase-0-validated simdgroup body (both matmuls on
 simdgroup hardware; S/P/O + running state in the threadgroup scalar domain).
 
-Compared against `torch.scaled_dot_product_attention` per head. Shapes stay in
-the first-cut envelope: d_head == 16, BLOCKSIZE_N == 32, num_warps == 4 (matches
-the leet driver). N covers block-aligned, masked-tail, and ragged cases.
+Compared against `torch.scaled_dot_product_attention` per head. Envelope:
+BLOCKSIZE_N == 32, num_warps == 4 (matches the leet driver), tile dims multiples
+of 8, threadgroup working set <= 32 KiB. d_head varies: d_head < BLOCKSIZE_d (=
+max(16, d_head)) exercises the padded-column masking (`d < d_head`); d_head ==
+BD is the unpadded path. N covers block-aligned, masked-tail, and ragged cases.
 """
 
 from __future__ import annotations
@@ -93,12 +95,15 @@ def _reference(Q, K, V, N, d_model, h):
 @pytest.mark.parametrize(
     "N, d_model, h",
     [
-        (64, 64, 4),    # block-aligned, d_head=16
+        (64, 64, 4),    # block-aligned, d_head=16 (== BD)
         (48, 64, 4),    # masked tail (48 = 32 + 16)
         (33, 64, 4),    # ragged
-        (128, 128, 8),  # more heads
-        (96, 32, 2),    # fewer heads
+        (128, 128, 8),  # more heads, d_head=16
+        (96, 32, 2),    # fewer heads, d_head=16
         (256, 64, 4),   # many key blocks
+        (64, 64, 8),    # d_head=8 < BD=16 -> padded-column masking
+        (64, 64, 2),    # d_head=32 == BD=32 (no padding)
+        (96, 96, 3),    # d_head=32, ragged N
     ],
 )
 def test_flash_attention_online_softmax(N, d_model, h):

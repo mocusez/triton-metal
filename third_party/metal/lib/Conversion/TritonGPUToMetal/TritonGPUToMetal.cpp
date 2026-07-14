@@ -8120,9 +8120,16 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   if (!sTy || sTy.getRank() != 2 || sTy.getShape()[0] != BM)
     return mlir::failure();
   int64_t BN = sTy.getShape()[1];
-  // First-cut envelope (Phase 0/1 validated): BM <= 32 (one query row per
-  // lane), all tile dims multiples of 8.
+  // Envelope: BM <= 32 (one query row per lane), all tile dims multiples of 8.
+  // BD may exceed the runtime d_head (BLOCKSIZE_d = max(16, d_head)); the
+  // emitter masks the padded columns via `d < d_head`.
   if (BM > 32 || BM % 8 || BN % 8 || BD % 8)
+    return mlir::failure();
+  // Threadgroup budget: qbuf+ktbuf+vbuf+sbuf+pbuf+obuf+otbuf+rmax+rsum floats
+  // must fit Apple's 32 KiB. Rejects e.g. BD=64 (~48 KiB) — falls through to
+  // the existing reject rather than emitting an over-budget kernel.
+  int64_t tgFloats = 3 * BM * BD + 2 * BD * BN + 2 * BM * BN + 2 * BM;
+  if (tgFloats > 8192)
     return mlir::failure();
 
   // (8) build metal.flash_attention before the loop.

@@ -1768,7 +1768,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "  if (_fa_active) {\n";
   os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
   os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint row = _fa_rowoff + q;\n";
-  os << "      _fa_qbuf[c] = (row < _fa_N) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "      _fa_qbuf[c] = (row < _fa_N && d < _fa_dhead) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   os << "    if (_fa_lane < " << S(BM) << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
@@ -1779,11 +1779,11 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "    if (_fa_active) {\n";
   os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
   os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN) << "u; uint kk = kb + key;\n";
-  os << "        _fa_ktbuf[c] = (kk < _fa_N) ? " << K << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dhead) ? " << K << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
   os << "      }\n";
   os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
   os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint kk = kb + key;\n";
-  os << "        _fa_vbuf[c] = (kk < _fa_N) ? " << V << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dhead) ? " << V << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
   os << "      }\n";
   os << "    }\n";
   os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -1849,7 +1849,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "    if (row < _fa_N) {\n";
   os << "      float denom = _fa_rsum[q];\n";
   os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
-  os << "      for (uint d = 0; d < " << S(BD) << "u; ++d)\n";
+  os << "      for (uint d = 0; d < _fa_dhead; ++d)\n";  // d_head <= BD; skip padded cols
   os << "        " << O << "[row * _fa_dm + _fa_coloff + d] = _fa_obuf[q*" << S(BD) << "u + d] * inv;\n";
   os << "    }\n";
   os << "  }\n";
