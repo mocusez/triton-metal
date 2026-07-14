@@ -328,6 +328,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
@@ -374,6 +375,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
@@ -459,6 +461,61 @@ void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
   _output << "] = ";
   translateValue(op.getValue().getDefiningOp());
   printDelim();
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::ThreadgroupPrefixSumOp op) {
+  // Inclusive prefix-sum (cumsum) of inbuf -> outbuf over `block` elements,
+  // tiled over E = block/tpb cyclic iv-blocks (pos = iv*tpb + tid). Per iv-block
+  // an in-place double-barriered Hillis-Steele inclusive scan runs across the
+  // tpb threads (its window is outbuf[base + 0..tpb), contiguous), then a
+  // running `carry` (sum of prior iv-blocks) is added. Validated bit-close to
+  // torch.cumsum (scan_spike.py). Barriers are OUTSIDE any per-thread branch so
+  // all threads reach them (caller guarantees uniform control flow).
+  const int64_t BLOCK = op.getBlock();
+  const int64_t TPB = op.getTpb();
+  const int64_t E = BLOCK / TPB;
+  auto bufName = [&](mlir::Value m) -> std::string {
+    while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        break;
+      m = cast.getInputs()[0];
+    }
+    if (auto def = m.getDefiningOp())
+      if (auto it = _alloca.find(def); it != _alloca.end())
+        return "v" + std::to_string(it->second);
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    return "v" + std::to_string(it != _buffers.end() ? it->second : 0);
+  };
+  const std::string IN = bufName(op.getInbuf());
+  const std::string OUT = bufName(op.getOutbuf());
+  auto S = [](int64_t x) { return std::to_string(x); };
+  auto &os = _output;
+  os << "\n  // ---- metal.threadgroup_prefix_sum (cumsum) ----\n";
+  os << "  {\n";
+  os << "    uint _ps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
+  os << "    float _ps_carry = 0.0f;\n";
+  os << "    for (uint _ps_k = 0u; _ps_k < " << S(E) << "u; ++_ps_k) {\n";
+  os << "      uint _ps_base = _ps_k * " << S(TPB) << "u;\n";
+  os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
+     << "[_ps_base + _ps_tid];\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      for (uint _ps_off = 1u; _ps_off < " << S(TPB)
+     << "u; _ps_off <<= 1) {\n";
+  os << "        float _ps_add = (_ps_tid >= _ps_off) ? " << OUT
+     << "[_ps_base + _ps_tid - _ps_off] : 0.0f;\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "        " << OUT << "[_ps_base + _ps_tid] += _ps_add;\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      }\n";
+  os << "      float _ps_total = " << OUT << "[_ps_base + " << S(TPB - 1)
+     << "u];\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      " << OUT << "[_ps_base + _ps_tid] += _ps_carry;\n";
+  os << "      _ps_carry += _ps_total;\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    }\n";
+  os << "  }\n";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
@@ -1078,7 +1135,10 @@ void ModuleTranslation::translate(mlir::scf::IfOp op) {
     indent();
   }
   _output << "if (";
-  translateValue(op.getCondition().getDefiningOp());
+  // The condition may be a block arg (e.g. an i1 scf.for iter_arg like
+  // speculative decoding's `accepted_all`), so resolve by name when it has no
+  // defining op rather than crashing on a null Operation.
+  translateValueOrVarName(op.getCondition());
   _output << ") ";
   translate(op.getThenRegion());
   auto &elseRegion = op.getElseRegion();
@@ -1108,7 +1168,8 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
                              ? op.getRegionIterArgs()[0].getType()
                              : mlir::Type();
   if (singleIterArgTy &&
-      (singleIterArgTy.isF32() || singleIterArgTy.isInteger(32))) {
+      (singleIterArgTy.isF32() || singleIterArgTy.isInteger(32) ||
+       singleIterArgTy.isInteger(1))) {
     unsigned accIdx = _varCount++;
     _scfForIterArg[op.getOperation()] = accIdx;
     auto iterArg = op.getRegionIterArgs()[0];
@@ -1150,7 +1211,8 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
     }
   } else if (op.getNumRegionIterArgs() >= 2 &&
              llvm::all_of(op.getRegionIterArgs(), [](mlir::Value v) {
-               return v.getType().isF32() || v.getType().isInteger(32);
+               return v.getType().isF32() || v.getType().isInteger(32) ||
+                      v.getType().isInteger(1);
              })) {
     // Multi-accumulator reduce loop (K-way ILP): declare one MSL temp per
     // iter_arg, map each region iter-arg and each loop result to its temp, and
@@ -4413,10 +4475,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::MulIOp>([&](mlir::arith::MulIOp op) {
         // Used by BLOCK_SIZE>threads idx arithmetic (e.g. `tid * E`).
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4427,10 +4490,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::AddIOp>([&](mlir::arith::AddIOp op) {
         // Used by BLOCK_SIZE>threads idx arithmetic (e.g. `tid + iv * T`).
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4442,10 +4506,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // Used by 2D MakeRangeLowering for the global->local tid mapping:
         // `lid.x = id.x - tgid.x * threadsPerCTA`.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4457,10 +4522,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // Scalar float add surviving to translation (the conversion pass only
         // folds TENSOR float arith into metal.binary_exp). MSL `+` on float.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4472,10 +4538,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // Scalar float subtract, e.g. `1 - p` in tutorial-04 _dropout (the
         // scalar operand of a metal.binary_exp divOp). MSL `-` on float.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4486,10 +4553,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
         // Scalar float multiply surviving to translation. MSL `*` on float.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4501,10 +4569,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // Scalar float divide surviving to translation (tensor divf is folded
         // to metal.binary_exp divOp by the conversion pass). MSL `/` on float.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4515,10 +4584,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
         // Unary float negate. MSL prefix `-`.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(-";
         emit(op.getOperand());
@@ -4529,10 +4599,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // divsion follows C semantics, which matches arith.divsi for the
         // non-negative thread indices we emit here.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4543,10 +4614,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::RemSIOp>([&](mlir::arith::RemSIOp op) {
         // Used by 2D MakeRangeLowering: `col = idx % BLOCK_N`.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4558,10 +4630,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // Used by 2D mask reduction: `(row<M) & (col<N)`. MSL `&` on bools
         // is short-circuit-free bitwise AND, which matches arith.andi.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4575,10 +4648,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       // See `.omc/specs/deep-interview-leet-triton-l2-int-arith-broad.md`.
       .Case<mlir::arith::ShRSIOp>([&](mlir::arith::ShRSIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4588,10 +4662,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::ShLIOp>([&](mlir::arith::ShLIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4601,10 +4676,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::OrIOp>([&](mlir::arith::OrIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4614,10 +4690,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::XOrIOp>([&](mlir::arith::XOrIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4627,10 +4704,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::DivUIOp>([&](mlir::arith::DivUIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4640,10 +4718,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::RemUIOp>([&](mlir::arith::RemUIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4657,10 +4736,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // both operands to the op's signedness so the overload isn't ambiguous
         // when one operand is `tgid.x` (uint) and the other signed arithmetic.
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         bool isMin =
             mlir::isa<mlir::arith::MinSIOp, mlir::arith::MinUIOp>(op);
@@ -4675,10 +4755,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::ShRUIOp>([&](mlir::arith::ShRUIOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getLhs());
@@ -4707,10 +4788,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
         auto emit = [&](mlir::Value v) {
-          if (auto o = v.getDefiningOp())
-            translateValue(o);
-          else
-            translateVarName(v);
+          // Route through translateValueOrVarName so a specific result of a
+          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
+          // speculative decoding's `chosen_k`) resolves via _buffers instead of
+          // hitting the translateValue default on the whole op.
+          translateValueOrVarName(v);
         };
         _output << "(";
         emit(op.getCondition());
@@ -4733,7 +4815,11 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             // translateKernel). It has no separate statement form.
             _output << "sgid";
           })
-      .Default([&](Operation *) { llvm_unreachable("Unexpected operation"); });
+      .Default([&](Operation *o) {
+        llvm::errs() << "[metal] translateValue: unexpected op " << o->getName()
+                     << "\n";
+        llvm_unreachable("Unexpected operation");
+      });
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::ConstantOp op) {

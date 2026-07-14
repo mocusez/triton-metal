@@ -3030,6 +3030,13 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
 // maps such leaves -> their getRemappedValue for the duration of that fill.
 static const llvm::DenseMap<mlir::Value, mlir::Value> *g_stagedLeaves = nullptr;
 
+// W-C scan: maps a `tt.scan` (cumsum) RESULT placeholder value -> the
+// threadgroup buffer holding the DISTRIBUTED prefix-sum. ScanLowering fills the
+// buffer + registers this (operands-first, so it runs before any consuming
+// reduce); the rich cone evaluator reads `scanbuf[idxVal]` per element. Pass-
+// lifetime (populated across the whole conversion, not scoped to one reduce).
+static const llvm::DenseMap<mlir::Value, mlir::Value> *g_scanBuffers = nullptr;
+
 // Wall 17 Increment 2: evaluate one element (logical index `idxVal`, an i32
 // scalar) of a RANK-1 tensor cone as scalar Metal ops. Used for the per-row /
 // per-column operands a softmax cone broadcasts into the reduce tile
@@ -3050,6 +3057,20 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     auto it = g_stagedLeaves->find(v);
     if (it != g_stagedLeaves->end())
       return it->second;
+  }
+  // W-C scan: a scan-result placeholder resolves to scanbuf[idxVal].
+  if (g_scanBuffers) {
+    auto it = g_scanBuffers->find(v);
+    if (it != g_scanBuffers->end()) {
+      mlir::Value idxUI32 =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{idxVal})
+              .getResult(0);
+      mlir::Type eltTy =
+          mlir::cast<MetalMemRefType>(it->second.getType()).getType();
+      return GetElementOp::create(rewriter, loc, eltTy, it->second, idxUI32)
+          .getResult();
+    }
   }
 
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
@@ -3079,6 +3100,27 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
           def))
     return evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc,
                             depth + 1);
+
+  // Tensor-yielding scf.if with a UNIFORM (scalar) condition → per-element
+  // select(cond, then[idx], else[idx]). Both branches are re-derived (loads are
+  // guarded/pure), so evaluating the untaken branch is side-effect-free. Used
+  // by speculative decoding's `scf.if is_uniform` scan input.
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(def)) {
+    if (ifOp.getElseRegion().empty())
+      return nullptr;
+    if (mlir::isa<mlir::RankedTensorType>(ifOp.getCondition().getType()))
+      return nullptr; // per-element condition unsupported
+    unsigned resIdx = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    mlir::Value t = evalRank1ValueAt(ifOp.thenYield().getOperand(resIdx), idxVal,
+                                     rewriter, loc, depth + 1);
+    mlir::Value e = evalRank1ValueAt(ifOp.elseYield().getOperand(resIdx), idxVal,
+                                     rewriter, loc, depth + 1);
+    if (!t || !e)
+      return nullptr;
+    return mlir::arith::SelectOp::create(rewriter, loc, ifOp.getCondition(), t,
+                                         e)
+        .getResult();
+  }
 
   // make_range: element value = start + idx.
   if (auto mr = mlir::dyn_cast<mlir::triton::MakeRangeOp>(def)) {
@@ -3547,6 +3589,9 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   // scalar during the inline fill).
   if (g_stagedLeaves && g_stagedLeaves->count(v))
     return true;
+  // W-C scan: a scan-result placeholder (buffer registered) is accepted.
+  if (g_scanBuffers && g_scanBuffers->count(v))
+    return true;
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
     return true; // scalar
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
@@ -3562,6 +3607,16 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
+  // Tensor-yielding scf.if with a scalar (uniform) condition → per-element
+  // select of the two branch yields.
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(def)) {
+    if (ifOp.getElseRegion().empty() ||
+        mlir::isa<mlir::RankedTensorType>(ifOp.getCondition().getType()))
+      return false;
+    unsigned resIdx = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    return rank1ConeSupported(ifOp.thenYield().getOperand(resIdx), depth + 1) &&
+           rank1ConeSupported(ifOp.elseYield().getOperand(resIdx), depth + 1);
+  }
   if (mlir::isa<mlir::triton::MakeRangeOp>(def))
     return true;
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
@@ -3663,6 +3718,158 @@ static void collectStagingLeaves(mlir::Value v, int depth,
   for (auto operand : def->getOperands())
     collectStagingLeaves(operand, depth + 1, out, seen);
 }
+
+// W-C: `tt.scan` (cumsum) — inclusive prefix-sum over a rank-1 f32 tensor.
+//
+// Emits a DISTRIBUTED prefix-sum into a threadgroup buffer `scanbuf[BLOCK]`:
+//   1. fill an `inbuf[BLOCK]` threadgroup buffer with the scan INPUT cone,
+//      re-derived per logical element via `evalRank1ValueAt` (each thread writes
+//      its E = BLOCK/tpb owned positions pos = tid + k*tpb);
+//   2. `metal.threadgroup_prefix_sum inbuf -> scanbuf` (the spike-validated
+//      Hillis-Steele + iv-carry template);
+//   3. replace the scan with a per-thread placeholder `scanbuf[tid]` (a valid
+//      f32 for any per-thread consumer that is dead after its reduce lowers) and
+//      register `g_scanBuffers[placeholder] = scanbuf` so the rich cone
+//      evaluator reads `scanbuf[idx]` per element in the consuming reduce.
+//
+// Envelope: rank-1, f32, `arith.addf` combine, axis=0, reverse=false, BLOCK a
+// multiple of tpb with E = BLOCK/tpb in [1,64] pow2 (mirrors the rank-1 reduce
+// spt-fold envelope). The scan INPUT cone must be `rank1ConeSupported`.
+struct ScanLowering
+    : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
+  ScanLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
+               llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs)
+      : mlir::OpConversionPattern<mlir::triton::ScanOp>(tc, ctx),
+        scanBufs(scanBufs) {}
+  llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor /*adaptor*/,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
+      return rewriter.notifyMatchFailure(op, "scan: single operand/result only");
+    if (op.getAxis() != 0 || op.getReverse())
+      return rewriter.notifyMatchFailure(op, "scan: axis=0 forward only");
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
+    if (!rtt || rtt.getRank() != 1 || !rtt.getElementType().isF32())
+      return rewriter.notifyMatchFailure(op, "scan: rank-1 f32 only");
+
+    // Combine must be a plain f32 add (cumsum).
+    mlir::Operation *combine = nullptr;
+    if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
+      for (auto &nested : op->getRegion(0).front()) {
+        if (mlir::isa<mlir::triton::ScanReturnOp>(nested))
+          continue;
+        combine = &nested;
+        break;
+      }
+    if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+      return rewriter.notifyMatchFailure(op, "scan: only arith.addf (cumsum)");
+
+    auto srcBlocked = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+    if (!srcBlocked)
+      return rewriter.notifyMatchFailure(op, "scan: no blocked encoding");
+    int64_t tpb = 1;
+    for (auto t : srcBlocked.getThreadsPerWarp()) tpb *= t;
+    for (auto w : srcBlocked.getWarpsPerCTA()) tpb *= w;
+    if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+      return rewriter.notifyMatchFailure(op, "scan: tpb not power-of-two");
+    int64_t BLOCK = rtt.getDimSize(0);
+    if (BLOCK <= 0 || BLOCK % tpb != 0)
+      return rewriter.notifyMatchFailure(op, "scan: BLOCK not a multiple of tpb");
+    int64_t E = BLOCK / tpb;
+    if (E < 1 || E > 64 || (E & (E - 1)) != 0)
+      return rewriter.notifyMatchFailure(op, "scan: E=BLOCK/tpb outside [1,64] pow2");
+    // NOTE: sizePerThread is irrelevant here. inbuf is indexed by LOGICAL
+    // position and filled round-robin (thread t writes pos = t + k*tpb, k<E,
+    // covering [0,BLOCK) exactly once); evalRank1ValueAt re-derives each value
+    // from the cone by logical index, and the prefix-sum template runs in
+    // logical order — all independent of how the source layout distributes
+    // elements across threads. So spt=1 and spt>1 (e.g. V=1024 → spt=4) both work.
+
+    mlir::Value scanInput = op.getSrcs().front();
+    if (!rank1ConeSupported(scanInput, 0))
+      return rewriter.notifyMatchFailure(op, "scan: input cone unsupported");
+
+    auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+    auto i32 = rewriter.getI32Type();
+    auto f32 = rewriter.getF32Type();
+
+    // LOCAL thread id = global_tid - tgid*tpb (multi-program safe).
+    mlir::Value tidG =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{i32},
+            mlir::ValueRange{ThreadIdOp::create(rewriter, loc, ui32,
+                                                rewriter.getStringAttr("x"))
+                                 .getResult()})
+            .getResult(0);
+    mlir::Value tgG =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{i32},
+            mlir::ValueRange{ThreadgroupIdOp::create(
+                                 rewriter, loc, ui32,
+                                 rewriter.getStringAttr("x"))
+                                 .getResult()})
+            .getResult(0);
+    auto cTpb = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+    mlir::Value tgOff =
+        mlir::arith::MulIOp::create(rewriter, loc, tgG, cTpb.getResult())
+            .getResult();
+    mlir::Value tidLocal =
+        mlir::arith::SubIOp::create(rewriter, loc, tidG, tgOff).getResult();
+
+    auto bufTy = MetalMemRefType::get(rewriter.getContext(), f32, BLOCK);
+    mlir::Value inbuf =
+        ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+    mlir::Value scanbuf =
+        ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+
+    // Fill inbuf: each thread writes its E owned positions pos = tid + k*tpb.
+    for (int64_t k = 0; k < E; ++k) {
+      mlir::Value pos = tidLocal;
+      if (k > 0) {
+        auto cKtpb = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(k * tpb)));
+        pos = mlir::arith::AddIOp::create(rewriter, loc, tidLocal,
+                                          cKtpb.getResult())
+                  .getResult();
+      }
+      mlir::Value val = evalRank1ValueAt(scanInput, pos, rewriter, loc, 0);
+      if (!val)
+        return rewriter.notifyMatchFailure(op, "scan: input eval failed");
+      mlir::Value posUI =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{pos})
+              .getResult(0);
+      StoreOp::create(rewriter, loc, val, inbuf, posUI);
+    }
+
+    ThreadgroupPrefixSumOp::create(rewriter, loc, inbuf, scanbuf,
+                                   rewriter.getI64IntegerAttr(BLOCK),
+                                   rewriter.getI64IntegerAttr(tpb));
+
+    // Per-thread placeholder (scanbuf[tid]) for any live per-thread consumer;
+    // the consuming reduce re-reads scanbuf[idx] via g_scanBuffers.
+    mlir::Value tidUI =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{tidLocal})
+            .getResult(0);
+    mlir::Value placeholder =
+        GetElementOp::create(rewriter, loc, f32, scanbuf, tidUI).getResult();
+    // Key by the ORIGINAL scan result: a conversion `replaceOp` is lazy, so the
+    // consuming reduce's cone walk (rank1ConeSupported / evalRank1ValueAt) still
+    // sees `op.getResult()`, not the placeholder. The placeholder is only the
+    // remapped operand handed to the (dead) per-thread consumers via adaptor.
+    mlir::Value scanResult = op->getResult(0);
+    (*scanBufs)[scanResult] = scanbuf;
+    rewriter.replaceOp(op, placeholder);
+    return mlir::success();
+  }
+};
 
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
@@ -8495,6 +8702,51 @@ static void structureEarlyReturns(mlir::ModuleOp moduleOp) {
   }
 }
 
+// W-C: flatten a `tt.scan` input that is a tensor-yielding `scf.if` with a
+// UNIFORM (scalar) condition into `tt.scan(select(cond, thenYield, elseYield))`.
+// Speculative decoding's inverse-CDF loop wraps the scan input in
+// `if is_uniform: adj=1 else: adj=q-p` — an scf.if whose (pure, masked) branch
+// bodies are hoisted out so both execute unconditionally and a scalar-condition
+// select picks per element. Done BEFORE the dialect conversion because the SCF
+// structural type conversion rewrites/empties the scf.if regions concurrently,
+// which would race the ScanLowering cone walk. No-op unless the exact shape
+// matches.
+static void flattenUniformScanInputScfIf(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::IfOp> targets;
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    if (scan.getSrcs().size() != 1)
+      return;
+    if (auto ifOp = scan.getSrcs().front().getDefiningOp<mlir::scf::IfOp>())
+      targets.push_back(ifOp);
+  });
+  for (auto ifOp : targets) {
+    if (ifOp.getNumResults() != 1 || ifOp.getElseRegion().empty())
+      continue;
+    if (mlir::isa<mlir::RankedTensorType>(ifOp.getCondition().getType()))
+      continue;
+    if (!ifOp.getThenRegion().hasOneBlock() ||
+        !ifOp.getElseRegion().hasOneBlock())
+      continue;
+    mlir::Value thenVal = ifOp.thenYield().getOperand(0);
+    mlir::Value elseVal = ifOp.elseYield().getOperand(0);
+    mlir::Block *parent = ifOp->getBlock();
+    // Hoist both branch bodies (all but the terminator) to before the scf.if;
+    // they are pure (masked loads / selects), so unconditional execution is safe.
+    mlir::Block &thenBlk = ifOp.getThenRegion().front();
+    parent->getOperations().splice(ifOp->getIterator(), thenBlk.getOperations(),
+                                   thenBlk.begin(), std::prev(thenBlk.end()));
+    mlir::Block &elseBlk = ifOp.getElseRegion().front();
+    parent->getOperations().splice(ifOp->getIterator(), elseBlk.getOperations(),
+                                   elseBlk.begin(), std::prev(elseBlk.end()));
+    mlir::OpBuilder b(ifOp);
+    auto sel = mlir::arith::SelectOp::create(b, ifOp.getLoc(),
+                                             ifOp.getCondition(), thenVal,
+                                             elseVal);
+    ifOp.getResult(0).replaceAllUsesWith(sel.getResult());
+    ifOp.erase();
+  }
+}
+
 static void runFlashAttentionMatcher(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) {
@@ -8545,6 +8797,11 @@ struct ConvertTritonGPUToMetalPass
     // BEFORE any other handling — the MSL emitter is structured-only and has no
     // cf.cond_br lowering. No-op for already-structured kernels.
     structureEarlyReturns(moduleOp);
+
+    // W-C: hoist a `tt.scan` input scf.if (uniform cond) into a select before
+    // the conversion (the SCF structural conversion would otherwise race the
+    // ScanLowering cone walk on the scf.if regions).
+    flattenUniformScanInputScfIf(moduleOp);
 
     // Phase 2: recognize the online-softmax flash-attention loop and replace
     // it + epilogue with a single `metal.flash_attention` op BEFORE any cvt
@@ -8944,6 +9201,13 @@ struct ConvertTritonGPUToMetalPass
     // populated by `preprocessMaskedStoreSentinels` above. See L1d2c Phase B.
     patterns.add<MaskedStoreLowering>(typeConverter, ctx, &scratchMap);
 
+    // W-C scan: ScanLowering fills a threadgroup scanbuf + registers the result
+    // placeholder in `scanBufMap`, consulted by the rich cone evaluator (g_scan-
+    // Buffers) during the consuming reduce. Pass-lifetime; cleared after.
+    llvm::DenseMap<mlir::Value, mlir::Value> scanBufMap;
+    g_scanBuffers = &scanBufMap;
+    patterns.add<ScanLowering>(typeConverter, ctx, &scanBufMap);
+
     // Structural type conversion for user-written control flow: rewrites the
     // iter-arg / result / block-arg / yield types of `scf.for` / `scf.if`
     // through the tensor->scalar TypeConverter and installs the matching
@@ -8955,8 +9219,10 @@ struct ConvertTritonGPUToMetalPass
     mlir::scf::populateSCFStructuralTypeConversionsAndLegality(
         typeConverter, patterns, target);
 
-    if (mlir::failed(mlir::applyFullConversion(moduleOp, target,
-                                                std::move(patterns)))) {
+    auto conversionResult =
+        mlir::applyFullConversion(moduleOp, target, std::move(patterns));
+    g_scanBuffers = nullptr; // scanBufMap goes out of scope below
+    if (mlir::failed(conversionResult)) {
       signalPassFailure();
       return;
     }
@@ -8976,10 +9242,10 @@ struct ConvertTritonGPUToMetalPass
       moduleOp.walk([&](mlir::scf::ForOp forOp) {
         for (mlir::Value iterArg : forOp.getRegionIterArgs()) {
           mlir::Type t = iterArg.getType();
-          if (!(t.isF32() || t.isInteger(32) ||
+          if (!(t.isF32() || t.isInteger(32) || t.isInteger(1) ||
                 mlir::isa<mlir::triton::metal::MetalSimdgroupMatrixType>(t))) {
             forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
-                              "f32/i32 accumulator or simdgroup_matrix after "
+                              "f32/i32/i1 accumulator or simdgroup_matrix after "
                               "conversion");
             loopOk = false;
             break;

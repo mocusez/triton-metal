@@ -674,6 +674,32 @@ def FlashAttentionOp : Metal_Op<"flash_attention"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ThreadgroupPrefixSumOp
+//===----------------------------------------------------------------------===//
+
+def ThreadgroupPrefixSumOp : Metal_Op<"threadgroup_prefix_sum",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Inclusive prefix-sum (cumsum) over a threadgroup buffer";
+  let description = [{
+    Reads `inbuf[0..block)` and writes the inclusive prefix-sum (cumsum) to
+    `outbuf[0..block)`, both `metal.threadgroup_alloca` f32 buffers of size
+    `block`. Tiled over `E = block/tpb` cyclic iv-blocks (logical position
+    `pos = iv*tpb + tid`): each iv-block runs a double-barriered Hillis-Steele
+    inclusive scan across the `tpb` threads via an internal scratch buffer, with
+    a running `carry` = sum of all prior iv-blocks. Validated bit-close to
+    torch.cumsum (scan_spike.py). f32 add only. Side-effecting (not Pure) so it
+    is neither DCE'd nor CSE-merged; barriers inside must be reached by all
+    threads (caller ensures uniform control flow).
+  }];
+
+  let arguments = (ins Metal_MemRefType:$inbuf, Metal_MemRefType:$outbuf,
+                       I64Attr:$block, I64Attr:$tpb);
+
+  let assemblyFormat =
+      "$inbuf `,` $outbuf attr-dict `:` type($inbuf) `,` type($outbuf)";
+}
+
+//===----------------------------------------------------------------------===//
 // RmsNormOp
 //===----------------------------------------------------------------------===//
 
