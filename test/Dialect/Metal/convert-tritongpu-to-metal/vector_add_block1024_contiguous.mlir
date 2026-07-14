@@ -62,7 +62,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
 // MSL: for (int v{{[0-9]+}} = 0; v{{[0-9]+}} < 8; v{{[0-9]+}} += 1)
+// Mask now reads the FULL index cone `pid*1024 + localtid*8 + iv < N` (the
+// address value v6), not the old local-only `localtid*8 + iv` — which was itself
+// wrong for grid>1 (missing the pid*BLOCK program offset).
 // MSL: int v{{[0-9]+}} = ((tgid.x * 1024) + (((id.x - (tgid.x * 128)) * 8) + v{{[0-9]+}}));
-// MSL: if (((((id.x - (tgid.x * 128)) * 8) + v{{[0-9]+}}) < v{{[0-9]+}}[0]))
+// MSL: bool v{{[0-9]+}} = (v{{[0-9]+}} < v{{[0-9]+}}[0]);
+// MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: return;

@@ -76,13 +76,13 @@ def test_dynamic_scalar_n_compiles_to_msl():
             f"--- MSL ---\n{msl}\n"
         )
 
-    # Masked-load shape: a comparison against id.x, a guard `if (...)`
-    # block, and a per-thread store. Post-Lmultiload-Phase-C the 1D
-    # canonical short-circuit is gone, so the store index is the
-    # arithmetic-explicit `pid*BLOCK + (id.x - pid*tpb)` form rather
-    # than the collapsed `id.x`. See `.omc/specs/deep-interview-
-    # lmultiload-phase-c-makerange.md`.
-    assert "id.x <" in msl, f"MSL missing per-thread cmp.\n--- MSL ---\n{msl}\n"
+    # Masked-load shape: a per-thread mask comparison, a guard `if (...)`
+    # block, and a per-thread store. The mask now reads the ACTUAL index cone
+    # `pid*BLOCK + (id.x - pid*tpb) < n` (per-thread correct for grid>1) rather
+    # than the old collapsed global `id.x < n`. See MaskedLoad/StoreLowering.
+    assert "< v" in msl or "< n" in msl, (
+        f"MSL missing per-thread mask cmp.\n--- MSL ---\n{msl}\n"
+    )
     assert "if (" in msl, f"MSL missing guard if-block.\n--- MSL ---\n{msl}\n"
     assert "(id.x - (tgid.x * 128))" in msl, (
         f"MSL missing per-thread localTid term.\n--- MSL ---\n{msl}\n"

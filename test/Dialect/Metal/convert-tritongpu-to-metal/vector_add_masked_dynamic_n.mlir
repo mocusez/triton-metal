@@ -47,13 +47,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // L1d2c Phase B: per-kernel threadgroup scratch sentinel hoisted at
 // function entry (after the wrapper-arg prologue).
 // METAL: metal.threadgroup_alloca : !metal.memref<128 x f32>
+// Load mask (scalarized cone `pid*BLOCK + localtid < N`) is shared by both loads
+// via CSE — one cmpi, reused scf.if condition for the pair.
 // METAL: arith.cmpi slt
 // METAL: scf.if {{.*}} -> (f32)
 // METAL: metal.get_element
 // METAL: scf.yield
 // METAL: metal.constant
 // METAL: scf.yield
-// METAL: arith.cmpi slt
 // METAL: scf.if {{.*}} -> (f32)
 // METAL: metal.get_element
 // METAL: scf.yield
@@ -61,10 +62,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // METAL: scf.yield
 // METAL: metal.binary_exp
 // METAL-SAME: addOp
-// METAL: arith.cmpi slt
 // L1d2c Phase B masked-store rewrite: arith.select on value +
-// unconditional tg_store_indexed (scratch). Device store remains guarded
-// by scf.if (honest divergence — see canary lit fixture for details).
+// unconditional tg_store_indexed (scratch). Device store remains guarded by
+// scf.if. The store REUSES the load's scalarized mask (CSE) — no separate cmpi.
 // METAL: metal.tg_load_indexed
 // METAL: arith.select
 // METAL: metal.tg_store_indexed
@@ -86,18 +86,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: threadgroup_position_in_grid
 // MSL: threadgroup float v{{[0-9]+}}[128];
 // MSL: int v{{[0-9]+}} = ((tgid.x * 128) + (id.x - (tgid.x * 128)));
+// MSL: bool v{{[0-9]+}} = (v{{[0-9]+}} < v{{[0-9]+}}[0]);
 // MSL: float v{{[0-9]+}};
-// MSL: if ((id.x < v{{[0-9]+}}[0]))
+// MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
 // MSL: float v{{[0-9]+}};
-// MSL: if ((id.x < v{{[0-9]+}}[0]))
+// MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
 // MSL: float v{{[0-9]+}} = (v{{[0-9]+}}) + (v{{[0-9]+}});
-// MSL: bool v{{[0-9]+}} = (id.x < v{{[0-9]+}}[0]);
+// Store reuses the shared load mask bool (CSE) for the tg select + guarded store.
+// MSL: v{{[0-9]+}}[{{.*}}] = ({{.*}} ? {{.*}} : {{.*}});
 // MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}}[v{{[0-9]+}}] = v{{[0-9]+}};
 // MSL: return;

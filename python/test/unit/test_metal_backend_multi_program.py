@@ -60,3 +60,29 @@ def test_multi_program_vector_add_grid8():
     # Full N range: every program contributes its 128-elem block; mask
     # is `offsets < N` and N == grid[0]*BLOCK_SIZE so it's always true.
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _per_row_masked_copy_kernel(X, Y, N, BLOCK: tl.constexpr):
+    # Per-row masked elementwise load/store: each program (grid=(M,)) handles one
+    # row X[row, :], masking the padded columns. The mask index is the PER-ROW
+    # column (`cols < N`, no program offset) — distinct from vector-add's
+    # global-flat `pid*BLOCK+arange < n`.
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    x = tl.load(X + row * N + cols, mask=mask, other=0.0)
+    tl.store(Y + row * N + cols, x + 1.0, mask=mask)
+
+
+@pytest.mark.parametrize("M, N", [(1, 100), (4, 100), (8, 300), (3, 700)])
+def test_per_row_masked_copy_multiprogram(M, N):
+    # Regression: the masked-load mask used a GLOBAL flat index (id.x < N) even
+    # for per-row masks, so every program k>=1 (id.x = k*tpb+local >= N) masked
+    # out its whole row and read 0. Now the mask reads the actual per-row cone.
+    torch.manual_seed(M * 100 + N)
+    x = torch.randn((M, N), dtype=torch.float32, device="mps")
+    y = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    _per_row_masked_copy_kernel[(M,)](x, y, N, BLOCK=triton.next_power_of_2(N))
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu(), (x + 1.0).cpu(), atol=0, rtol=0)

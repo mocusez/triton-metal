@@ -49,20 +49,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // L1d2c Phase B: per-kernel threadgroup scratch sentinel hoisted at
 // function entry, sized threadsPerBlock × sizeof(f32) = 128 × 4 B.
 // METAL: metal.threadgroup_alloca : !metal.memref<128 x f32>
-// METAL: metal.threadgroup_id "x"
-// METAL: metal.thread_id "x"
-// METAL: metal.threadgroup_id "x"
+// Load mask = the scalarized index cone `pid*BLOCK + localtid < N` (per-thread
+// correct, reconstructed from the ACTUAL mask cone via the typeconverter, not a
+// global-flat emitPerIterIndex). The two loads share one mask (CSE), so only one
+// cmpi + reused scf.if condition are emitted for the pair.
 // METAL: arith.subi
 // METAL: arith.addi
-// METAL: metal.thread_id "x"
 // METAL: arith.cmpi slt
 // METAL: scf.if {{.*}} -> (f32)
 // METAL: metal.get_element
 // METAL: scf.yield
 // METAL: metal.constant
 // METAL: scf.yield
-// METAL: metal.thread_id "x"
-// METAL: arith.cmpi slt
 // METAL: scf.if {{.*}} -> (f32)
 // METAL: metal.get_element
 // METAL: scf.yield
@@ -70,11 +68,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // METAL: scf.yield
 // METAL: metal.binary_exp
 // METAL-SAME: addOp
-// METAL: metal.thread_id "x"
-// METAL: arith.cmpi slt
 // L1d2c Phase B masked-store rewrite: arith.select on value +
 // unconditional tg_store_indexed (scratch). Device store remains guarded
-// by scf.if (honest divergence — see canary lit fixture for details).
+// by scf.if. The store REUSES the load's scalarized mask (same tt mask value,
+// CSE), so no separate store-mask cmpi is emitted.
 // METAL: metal.tg_load_indexed
 // METAL: arith.select
 // METAL: metal.tg_store_indexed
@@ -90,19 +87,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
 // MSL: threadgroup float v{{[0-9]+}}[128];
+// Load mask index = pid*BLOCK + localtid; shared bool for both loads.
 // MSL: int v{{[0-9]+}} = ((tgid.x * 128) + (id.x - (tgid.x * 128)));
+// MSL: bool v{{[0-9]+}} = (v{{[0-9]+}} < 100);
 // MSL: float v{{[0-9]+}};
-// MSL: if ((id.x < 100))
+// MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
 // MSL: float v{{[0-9]+}};
-// MSL: if ((id.x < 100))
+// MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
 // MSL: float v{{[0-9]+}} = (v{{[0-9]+}}) + (v{{[0-9]+}});
-// MSL: bool v{{[0-9]+}} = (id.x < 100);
+// Store reuses the shared load mask bool (CSE) for both the tg select and the
+// guarded device store.
+// MSL: v{{[0-9]+}}[{{.*}}] = ({{.*}} ? {{.*}} : {{.*}});
 // MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}}[v{{[0-9]+}}] = v{{[0-9]+}};
 // MSL: return;

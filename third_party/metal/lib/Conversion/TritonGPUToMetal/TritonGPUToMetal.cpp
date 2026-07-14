@@ -5070,18 +5070,17 @@ struct MaskedLoadLowering
       // converted scalar mask directly.
       cond = adaptor.getMask();
     } else {
-      // L2b: try the structured 1D matcher first (idx<N or
-      // andi(idx<N, idx<M)). If the mask shape doesn't match (e.g.
-      // color_inversion's `andi(idx<N, (idx%4)!=3)` with a non-tt.splat
-      // bound), fall back to the typeconverter-scalarized mask. The
-      // ArithCmpILowering / ArithAndILowering chain scalarizes the
-      // tensor cmpi/andi into a per-iter scalar `i1`, which is
-      // per-thread-correct under MakeRangeLowering's real per-axis ids.
-      auto shape = matchMaskShape(op.getMask(), rewriter);
-      if (shape)
-        cond = emitTileAwareMask(*shape, *tile, parentFor, rewriter, loc);
-      else
-        cond = adaptor.getMask();
+      // Use the typeconverter-scalarized mask directly: the ArithCmpILowering /
+      // ArithAndILowering chain scalarizes the tensor cmpi/andi into a per-iter
+      // scalar i1 that is per-thread-correct under MakeRangeLowering's LOCAL
+      // per-axis ids, and it reads the ACTUAL mask index cone. The old
+      // `emitTileAwareMask` shortcut reconstructed the index via emitPerIterIndex
+      // (a GLOBAL flat index), which is correct only for vector-add-style masks
+      // whose cone already includes the program offset (`pid*BLOCK + arange`) —
+      // for a per-row mask (`cols < N` with `cols = off + arange`, no pid) it
+      // emitted `id.x < N`, masking out every program k>=1 (each read row 0 /
+      // returned 0). See test_reduce_per_row_multiprogram and layer-norm mean.
+      cond = adaptor.getMask();
     }
 
     auto scfIf = mlir::scf::IfOp::create(rewriter,
@@ -5493,13 +5492,12 @@ struct MaskedStoreLowering
     if (tile->rank == 2) {
       cond = adaptor.getMask();
     } else {
-      // L2b: see MaskedLoadLowering rationale — structured matcher first,
-      // typeconverter-scalarized mask second. Mirrors the 2D path.
-      auto shape = matchMaskShape(op.getMask(), rewriter);
-      if (shape)
-        cond = emitTileAwareMask(*shape, *tile, parentFor, rewriter, loc);
-      else
-        cond = adaptor.getMask();
+      // Use the typeconverter-scalarized mask (reads the ACTUAL per-thread index
+      // cone). The old emitTileAwareMask shortcut used a global-flat index
+      // (emitPerIterIndex), which for a per-row store mask (`cols < N`, no pid)
+      // masked out every program k>=1 at E==1, so their row was never written.
+      // See test_per_row_masked_copy_multiprogram. Mirrors MaskedLoadLowering.
+      cond = adaptor.getMask();
     }
 
     // L2b: route the masked-store value/scratch/device path through the memref
