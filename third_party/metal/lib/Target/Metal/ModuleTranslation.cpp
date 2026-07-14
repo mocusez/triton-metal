@@ -4779,11 +4779,14 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // zero, matching arith.fptosi/fptoui; int->float and width changes are
         // exact for the value ranges Triton emits here. The generic lambda is
         // instantiated per op type, so .getIn()/.getType() resolve concretely.
-        _output << typeToString(op.getType()) << "(";
-        if (auto o = op.getIn().getDefiningOp())
-          translateValue(o);
-        else
-          translateVarName(op.getIn());
+        // C-style cast `(T)(x)`, NOT functional `T(x)`: the latter is a variable
+        // DECLARATION when x is a bare identifier (C++ most-vexing-parse), so a
+        // dead conversion emitted as a statement (e.g. a reduce that re-derives
+        // its cone leaves the original `x.to(f32)` extf use-empty) would become
+        // `float(v3);` == `float v3;` — a redefinition. The C-style form is a
+        // valid no-op as a statement and identical as an expression.
+        _output << "(" << typeToString(op.getType()) << ")(";
+        translateValueOrVarName(op.getIn());
         _output << ")";
       })
       .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {

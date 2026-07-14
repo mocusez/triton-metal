@@ -34,7 +34,10 @@ module {
 }
 
 // CHECK: kernel void conv_casts
-// CHECK-DAG: int(
-// CHECK-DAG: half(
-// CHECK-DAG: float(
+// Numeric conversions emit a C-style cast `(T)(x)` (not functional `T(x)`, which
+// vexing-parses as a variable decl when x is a bare identifier — see the ExtFOp
+// et al. case in translateValue).
+// CHECK-DAG: (int)(
+// CHECK-DAG: (half)(
+// CHECK-DAG: (float)(
 // CHECK-NOT: Unexpected operation

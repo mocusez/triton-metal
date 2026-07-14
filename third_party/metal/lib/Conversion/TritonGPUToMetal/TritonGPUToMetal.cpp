@@ -1552,6 +1552,41 @@ struct ArithSIToFPLowering
   }
 };
 
+// Scalarize a tensor `arith.extf` (float widen, e.g. fp16 load `.to(tl.float32)`)
+// and `arith.truncf` (float narrow, e.g. store an fp32 result to an fp16 output).
+// The MSL emitter spells both as a constructor cast `T(x)` (see the ExtFOp /
+// TruncFOp case in translateValue). fp16-in / fp32-compute is the common shape
+// for layer-norm / softmax / attention kernels.
+struct ArithExtFLowering
+    : public mlir::OpConversionPattern<mlir::arith::ExtFOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::ExtFOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resTy = getTypeConverter()->convertType(op.getType());
+    if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
+      return rewriter.notifyMatchFailure(op, "extf: result not scalarizable");
+    rewriter.replaceOpWithNewOp<mlir::arith::ExtFOp>(op, resTy,
+                                                     adaptor.getIn());
+    return mlir::success();
+  }
+};
+
+struct ArithTruncFLowering
+    : public mlir::OpConversionPattern<mlir::arith::TruncFOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::TruncFOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resTy = getTypeConverter()->convertType(op.getType());
+    if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
+      return rewriter.notifyMatchFailure(op, "truncf: result not scalarizable");
+    rewriter.replaceOpWithNewOp<mlir::arith::TruncFOp>(op, resTy,
+                                                       adaptor.getIn());
+    return mlir::success();
+  }
+};
+
 // Scalarize a tensor `arith.negf` (`-x`). ModuleTranslation emits scalar negf as
 // `(-x)`; rebuild it on the converted scalar operand so the tensor op legalizes.
 struct ArithNegFLowering
@@ -3213,6 +3248,30 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     return mlir::arith::SIToFPOp::create(rewriter, loc, rewriter.getF32Type(), x)
         .getResult();
   }
+  // float widen/narrow (fp16 load `.to(f32)` inside a reduce cone, etc.).
+  auto floatEltOf = [](mlir::Type t) -> mlir::Type {
+    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(t))
+      return rtt.getElementType();
+    return t;
+  };
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(ext.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::ExtFOp::create(rewriter, loc,
+                                       floatEltOf(ext.getType()), x)
+        .getResult();
+  }
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(trunc.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::TruncFOp::create(rewriter, loc,
+                                         floatEltOf(trunc.getType()), x)
+        .getResult();
+  }
 
   // f32 unary math → metal.unary_exp.
   auto unary = [&](mlir::Value operand, UnaryExpOperator k) -> mlir::Value {
@@ -3633,6 +3692,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   }
   if (auto s = mlir::dyn_cast<mlir::arith::SIToFPOp>(def))
     return rank1ConeSupported(s.getIn(), depth + 1);
+  if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp>(def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1);
   if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
                 mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
                 mlir::math::RsqrtOp>(def))
@@ -9192,6 +9253,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithXOrILowering, ArithDivUILowering, ArithRemUILowering,
                  ArithShRUILowering, ArithSelectLowering,
                  ArithMulFLowering, ArithSIToFPLowering, ArithNegFLowering,
+                 ArithExtFLowering, ArithTruncFLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathLogLowering, MathRsqrtLowering,
