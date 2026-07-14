@@ -146,6 +146,16 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
 }
 
 void ModuleTranslation::translateVarName(mlir::Value memref) {
+  // A value explicitly materialized as an MSL temp resolves by its buffer name
+  // first — covers scf.for iter_args / results (W2a runtime-K matmul maps the
+  // simdgroup_matrix loop result into `_buffers`) as well as block args. The
+  // simdgroup op results live in `_alloca` (not `_buffers`), so this does not
+  // shadow the isa-dispatch below.
+  if (auto it = _buffers.find(memref.getAsOpaquePointer());
+      it != _buffers.end()) {
+    _output << "v" << it->second;
+    return;
+  }
   // Walk through unrealized_conversion_cast wrappers (e.g. the
   // !tt.ptr → !metal.memref bridge inserted by the matmul track's
   // tt.dot pre-pass; post-conversion this becomes an identity
@@ -165,6 +175,7 @@ void ModuleTranslation::translateVarName(mlir::Value memref) {
                   mlir::triton::metal::ThreadgroupAllocaOp,
                   mlir::triton::metal::SimdgroupMatrixZeroOp,
                   mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
                   mlir::triton::metal::SimdgroupLoadOp,
                   mlir::triton::metal::SimdgroupMultiplyAccumulateOp>(opInst)) {
     _output << "v" << _alloca[opInst];
@@ -270,9 +281,11 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
+            mlir::triton::metal::SimdgroupFusedStoreOp,
             mlir::scf::IfOp, mlir::scf::ForOp>(
           [&](auto &op) { printable = true; })
       .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
@@ -313,9 +326,11 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
+            mlir::triton::metal::SimdgroupFusedStoreOp,
             mlir::triton::metal::SimdgroupIndexOp>(
           [&](auto &op) { translate(op); })
       .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
@@ -514,15 +529,26 @@ void ModuleTranslation::translate(
     printDelim();
     _output << "\n";
     indent();
+    // W1 transposed-B: write the gathered element to the swapped staging slot
+    // `sj*cols + si` instead of `c == si*cols + sj`, so the subsequent
+    // `simdgroup_load` reads the transpose of the [origin_row, origin_col]
+    // device tile (used for `tl.dot(a, tl.trans(b))`). The device address is
+    // unchanged; only the threadgroup-buffer destination is transposed.
+    const bool transposed = op.getTransposed();
     if (perWarp) {
       // Use translateVarName so SimdgroupIndexOp (and any
       // UnrealizedConversionCast wrapper) resolves to `sgid`.
       _output << "_stage_shared[";
       translateVarName(warpIdx[0]);
-      _output << "][c] = ";
+      _output << "][";
     } else {
-      _output << "_stage_shared[c] = ";
+      _output << "_stage_shared[";
     }
+    if (transposed)
+      _output << "sj * " << resTy.getCols() << "u + si";
+    else
+      _output << "c";
+    _output << "] = ";
     translateVarName(op.getMemref());
     _output << "[(";
     translateValue(op.getOriginRow().getDefiningOp());
@@ -554,6 +580,80 @@ void ModuleTranslation::translate(
     _output << "simdgroup_load(v" << id << ", &_stage_shared[0], "
             << resTy.getCols() << ")";
   }
+  _alloca[op] = _varCount++;
+  printDelim();
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op) {
+  // Masked variant: same coop-load into `_stage_shared`, but each lane writes
+  // `(gi < row_extent && gj < col_extent) ? memref[...] : 0` (K-tail + edges).
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  unsigned id = _varCount;
+  unsigned elems = resTy.getRows() * resTy.getCols();
+  const bool transposed = op.getTransposed();
+
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "for (uint c = (id.x & 31u); c < " << elems << "u; c += 32u) {";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint si = c / " << resTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint sj = c % " << resTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint gi = ";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << " + si";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint gj = ";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << " + sj";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "_stage_shared[";
+    if (transposed)
+      _output << "sj * " << resTy.getCols() << "u + si";
+    else
+      _output << "c";
+    _output << "] = (gi < ";
+    translateValueOrVarName(op.getRowExtent());
+    _output << " && gj < ";
+    translateValueOrVarName(op.getColExtent());
+    _output << ") ? ";
+    translateVarName(op.getMemref());
+    _output << "[gi * ";
+    translateValue(op.getStride().getDefiningOp());
+    _output << " + gj] : 0.0f";
+    printDelim();
+  }
+  _output << "\n";
+  indent();
+  _output << "}\n";
+  indent();
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  _output << "\n";
+  indent();
+  emitSimdgroupMatrixType(_output, resTy);
+  _output << " v" << id;
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "simdgroup_load(v" << id << ", &_stage_shared[0], "
+          << resTy.getCols() << ")";
   _alloca[op] = _varCount++;
   printDelim();
 }
@@ -618,6 +718,15 @@ void ModuleTranslation::translate(
   unsigned id;
   if (reuseC) {
     id = _alloca[cDef];
+  } else if (!cDef && _buffers.count(op.getC().getAsOpaquePointer())) {
+    // W2a runtime-K loop: the C operand is the scf.for accumulator iter_arg
+    // (a BlockArgument mapped to an MSL temp by translate(scf::ForOp)). Reuse
+    // that temp so the chain accumulates in place —
+    // `simdgroup_multiply_accumulate(vAcc, A, B, vAcc)` — which is the
+    // Apple-family-9 correct form (a fresh destination silently drops
+    // output-column contributions; see the SimdgroupMatrixZeroOp comment).
+    reuseC = true;
+    id = _buffers[op.getC().getAsOpaquePointer()];
   } else {
     emitSimdgroupMatrixType(_output, resTy);
     id = _varCount++;
@@ -745,6 +854,97 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
   printDelim();
 }
 
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupFusedStoreOp op) {
+  // W2c fused epilogue: store `base + scale * delta`. Both matrices are staged
+  // to per-threadgroup scratch, then a coop-loop writes
+  // `scratch_base[c] + scale * scratch_delta[c]` back to the destination
+  // (optionally masked by partial_extents = [m_extent, n_extent]).
+  auto matTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getBase().getType());
+  unsigned id = _varCount++;
+  unsigned elems = matTy.getRows() * matTy.getCols();
+  auto partialExtents = op.getPartialExtents();
+  const bool masked = partialExtents.size() == 2;
+  llvm::StringRef ty = typeToString(matTy.getElem());
+
+  _output << "threadgroup " << ty << " _fbase_" << id << "[" << elems << "]";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "threadgroup " << ty << " _fdelta_" << id << "[" << elems << "]";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "simdgroup_store(";
+  translateVarName(op.getBase());
+  _output << ", &_fbase_" << id << "[0], " << matTy.getCols() << ")";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "simdgroup_store(";
+  translateVarName(op.getDelta());
+  _output << ", &_fdelta_" << id << "[0], " << matTy.getCols() << ")";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  _output << "\n";
+  indent();
+  _output << "for (uint c = (id.x & 31u); c < " << elems << "u; c += 32u) {";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint si = c / " << matTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint sj = c % " << matTy.getCols() << "u";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint gi = ";
+    translateValue(op.getOriginRow().getDefiningOp());
+    _output << " + si";
+    printDelim();
+    _output << "\n";
+    indent();
+    _output << "uint gj = ";
+    translateValue(op.getOriginCol().getDefiningOp());
+    _output << " + sj";
+    printDelim();
+    _output << "\n";
+    indent();
+    if (masked) {
+      _output << "if (gi < ";
+      translateValue(partialExtents[0].getDefiningOp());
+      _output << " && gj < ";
+      translateValue(partialExtents[1].getDefiningOp());
+      _output << ") {";
+      INDENT();
+      _output << "\n";
+      indent();
+    }
+    translateVarName(op.getMemref());
+    _output << "[gi * ";
+    translateValue(op.getStride().getDefiningOp());
+    _output << " + gj] = _fbase_" << id << "[c] + ";
+    translateValueOrVarName(op.getScale());
+    _output << " * _fdelta_" << id << "[c]";
+    printDelim();
+    if (masked) {
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
 void ModuleTranslation::translate(IfOp op) {
   _output << "if (";
   translateValue(op.getCondition().getDefiningOp());
@@ -844,6 +1044,27 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
       translateVarName(op.getInitArgs()[0]);
     _output << ";\n";
     indent();
+  } else if (op.getNumRegionIterArgs() >= 1 &&
+             llvm::all_of(op.getRegionIterArgs(), [](mlir::Value v) {
+               return mlir::isa<mlir::triton::metal::MetalSimdgroupMatrixType>(
+                   v.getType());
+             })) {
+    // W2a/W2b runtime-K matmul accumulator(s) — one or several. Each iter_arg
+    // init op (simdgroup_matrix_zero / simdgroup_load) is emitted before the
+    // loop as its own MSL temp; reuse THAT temp as the loop-carried accumulator
+    // so the in-place `simdgroup_multiply_accumulate` chain writes directly
+    // into it. No new declarations, and the matching scf.yield is intentionally
+    // a no-op (not recorded in the iter-arg maps) since the accumulators update
+    // in place.
+    for (unsigned i = 0; i < op.getNumRegionIterArgs(); ++i) {
+      auto iterArg = op.getRegionIterArgs()[i];
+      if (auto *initDef = op.getInitArgs()[i].getDefiningOp();
+          initDef && _alloca.count(initDef)) {
+        unsigned accIdx = _alloca[initDef];
+        _buffers[iterArg.getAsOpaquePointer()] = accIdx;
+        _buffers[op.getResult(i).getAsOpaquePointer()] = accIdx;
+      }
+    }
   } else if (op.getNumRegionIterArgs() >= 2 &&
              llvm::all_of(op.getRegionIterArgs(), [](mlir::Value v) {
                return v.getType().isF32() || v.getType().isInteger(32);
@@ -3640,11 +3861,25 @@ void ModuleTranslation::translate(mlir::Region &region) {
         firstStaged = op;
         return mlir::WalkResult::interrupt();
       });
-      if (firstStaged) {
-        auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
-            firstStaged.getResult().getType());
+      // A kernel may carry only MASKED staged loads (no unmasked). Both share
+      // the single `_stage_shared` buffer; the masked path is single-warp.
+      mlir::triton::metal::MetalSimdgroupMatrixType maskedResTy;
+      if (!firstStaged) {
+        kernelOp.walk(
+            [&](mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op) {
+              maskedResTy =
+                  llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+                      op.getResult().getType());
+              return mlir::WalkResult::interrupt();
+            });
+      }
+      if (firstStaged || maskedResTy) {
+        auto resTy = firstStaged
+                         ? llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+                               firstStaged.getResult().getType())
+                         : maskedResTy;
         unsigned elems = resTy.getRows() * resTy.getCols();
-        bool perWarp = !firstStaged.getWarpIndex().empty();
+        bool perWarp = firstStaged && !firstStaged.getWarpIndex().empty();
         _output << "\n";
         indent();
         if (perWarp) {

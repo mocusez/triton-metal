@@ -897,7 +897,7 @@ def SimdgroupLoadDeviceStagedOp : Metal_Op<"simdgroup_load_device_staged"> {
 
   let arguments = (ins Metal_MemRefType:$memref, UI32:$origin_row,
                        UI32:$origin_col, UI32:$stride,
-                       Variadic<UI32>:$warp_index);
+                       Variadic<UI32>:$warp_index, UnitAttr:$transposed);
   let results = (outs Metal_SimdgroupMatrixType:$result);
 
   let assemblyFormat = "$memref `[` $origin_row `,` $origin_col `]` `,` $stride"
@@ -905,6 +905,29 @@ def SimdgroupLoadDeviceStagedOp : Metal_Op<"simdgroup_load_device_staged"> {
                        " attr-dict `:` functional-type(operands, results)";
 
   let hasVerifier = 1;
+}
+
+def SimdgroupLoadDeviceStagedMaskedOp
+    : Metal_Op<"simdgroup_load_device_staged_masked"> {
+  let summary = "Masked staged load: out-of-bounds elements read as 0";
+
+  let description = [{
+    Masked variant of `simdgroup_load_device_staged`. During the cooperative
+    device->threadgroup copy each lane loads `memref[(origin_row+si)*stride +
+    origin_col+sj]` only when `(origin_row+si) < row_extent && (origin_col+sj) <
+    col_extent`, writing 0 otherwise. Handles the `tl.load(..., mask=(offs_row <
+    ROW) & (offs_k < K), other=0.0)` pattern (K-tail + row/col edges). The
+    `transposed` attr swaps the staging destination index (W1). Single-warp.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$memref, UI32:$origin_row,
+                       UI32:$origin_col, UI32:$stride, UI32:$row_extent,
+                       UI32:$col_extent, UnitAttr:$transposed);
+  let results = (outs Metal_SimdgroupMatrixType:$result);
+
+  let assemblyFormat = "$memref `[` $origin_row `,` $origin_col `]` `,` $stride"
+                       " `mask` `[` $row_extent `,` $col_extent `]`"
+                       " attr-dict `:` functional-type(operands, results)";
 }
 
 def SimdgroupIndexOp : Metal_Op<"simdgroup_index", [Pure]> {
@@ -985,6 +1008,30 @@ def SimdgroupStoreOp : Metal_Op<"simdgroup_store"> {
                        " attr-dict `:` type(operands)";
 
   let hasVerifier = 1;
+}
+
+def SimdgroupFusedStoreOp : Metal_Op<"simdgroup_fused_store"> {
+  let summary = "Store base + scale*delta (fused matmul epilogue) to device memory";
+
+  let description = [{
+    W2c fused-LoRA epilogue. Stores `base + scale * delta` for two 8x8
+    SIMD-group matrices `base` / `delta` and a runtime f32 `scale`. Both
+    matrices are staged to per-threadgroup scratch, then a cooperative coop-loop
+    writes `scratch_base[c] + scale * scratch_delta[c]` back to the destination.
+    When `partial_extents = [m_extent, n_extent]` is present the coop-loop masks
+    lanes to `gi < m_extent && gj < n_extent` (the masked-tail path).
+  }];
+
+  let arguments = (ins Metal_SimdgroupMatrixType:$base,
+                       Metal_SimdgroupMatrixType:$delta, F32:$scale,
+                       Metal_MemRefType:$memref, UI32:$origin_row,
+                       UI32:$origin_col, UI32:$stride,
+                       Variadic<UI32>:$partial_extents);
+
+  let assemblyFormat = "$base `,` $delta `,` $scale `,` $memref"
+                       " `[` $origin_row `,` $origin_col `]` `,` $stride"
+                       " (`partial` `[` $partial_extents^ `]`)?"
+                       " attr-dict `:` type(operands)";
 }
 
 #endif // METAL_OPS

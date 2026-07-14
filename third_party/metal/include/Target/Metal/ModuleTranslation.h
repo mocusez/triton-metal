@@ -155,9 +155,11 @@ private:
   void translate(mlir::triton::metal::SimdgroupIndexOp op);
   void translate(mlir::triton::metal::SimdgroupMatrixZeroOp op);
   void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedOp op);
+  void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op);
   void translate(mlir::triton::metal::SimdgroupLoadOp op);
   void translate(mlir::triton::metal::SimdgroupMultiplyAccumulateOp op);
   void translate(mlir::triton::metal::SimdgroupStoreOp op);
+  void translate(mlir::triton::metal::SimdgroupFusedStoreOp op);
 };
 
 } } // end namespace metal, triton
