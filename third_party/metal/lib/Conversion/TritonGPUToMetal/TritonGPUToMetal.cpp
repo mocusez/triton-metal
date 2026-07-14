@@ -2972,6 +2972,13 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
   return mlir::success();
 }
 
+// Inc 2.5 (prototype): during an inline reduce fill over a loop-dependent cone
+// at M<=tpb, each fill thread reduces its OWN row (r == localTid), so a
+// non-re-emittable per-row leaf (q0_rope, loop-carried acc) resolves to that
+// thread's converted per-thread scalar via getRemappedValue. `g_stagedLeaves`
+// maps such leaves -> their getRemappedValue for the duration of that fill.
+static const llvm::DenseMap<mlir::Value, mlir::Value> *g_stagedLeaves = nullptr;
+
 // Wall 17 Increment 2: evaluate one element (logical index `idxVal`, an i32
 // scalar) of a RANK-1 tensor cone as scalar Metal ops. Used for the per-row /
 // per-column operands a softmax cone broadcasts into the reduce tile
@@ -2986,6 +2993,13 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
   if (depth > 24)
     return nullptr;
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+
+  // Inc 2.5: a staged per-row leaf resolves to the thread's own scalar.
+  if (g_stagedLeaves) {
+    auto it = g_stagedLeaves->find(v);
+    if (it != g_stagedLeaves->end())
+      return it->second;
+  }
 
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
     return v; // already a scalar
@@ -3376,6 +3390,10 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
 static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
   if (depth > 16)
     return nullptr;
+  // Inc 2.5: a staged leaf is opaque (resolved via getRemappedValue); don't
+  // descend into its cone looking for the representative device load.
+  if (g_stagedLeaves && g_stagedLeaves->count(v))
+    return nullptr;
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
     return nullptr;
@@ -3415,6 +3433,10 @@ static bool indexConeSupported(mlir::Value v, int depth) {
 static bool rank1ConeSupported(mlir::Value v, int depth) {
   if (depth > 24)
     return false;
+  // Inc 2.5: a staged per-row leaf is accepted (read from the thread's own
+  // scalar during the inline fill).
+  if (g_stagedLeaves && g_stagedLeaves->count(v))
+    return true;
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
     return true; // scalar
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
@@ -3499,6 +3521,29 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
            rank2ConeSupported(sel.getTrueValue(), depth + 1) &&
            rank2ConeSupported(sel.getFalseValue(), depth + 1);
   return false;
+}
+
+// Inc 2.5: collect the per-row (expand_dims axis=1) leaves in a reduce cone that
+// are NOT re-emittable (loop-carried / computed values like q0_rope). At M<=tpb
+// these are staged via getRemappedValue during an inline fill; re-emittable
+// leaves (seq_idx, masks) stay on the normal path.
+static void collectStagingLeaves(mlir::Value v, int depth,
+                                 llvm::SmallVectorImpl<mlir::Value> &out,
+                                 llvm::SmallPtrSetImpl<void *> &seen) {
+  if (depth > 24)
+    return;
+  auto *def = v.getDefiningOp();
+  if (!def)
+    return;
+  if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+    mlir::Value src = ed.getSrc();
+    if (!rank1ConeSupported(src, 0) &&
+        seen.insert(src.getAsOpaquePointer()).second)
+      out.push_back(src);
+    return;
+  }
+  for (auto operand : def->getOperands())
+    collectStagingLeaves(operand, depth + 1, out, seen);
 }
 
 struct ReduceLowering
@@ -3620,12 +3665,36 @@ struct ReduceLowering
     mlir::triton::LoadOp reprLoad;  // representative load (scalarOff source)
     mlir::Value memref;             // direct-path base memref (null for cone)
     mlir::Type loadEltTy;           // direct-path element type (null for cone)
+    // Inc 2.5: staged per-row leaves (loop-carried / computed values the cone
+    // evaluator can't re-emit). `g_stagedLeaves` is cleared on any return.
+    llvm::DenseMap<mlir::Value, mlir::Value> stagedMap;
+    bool inlineStaged = false;
+    struct StagedResetGuard {
+      ~StagedResetGuard() { g_stagedLeaves = nullptr; }
+    } stagedResetGuard;
     if (loadOp && !loadOp.getMask()) {
       reprLoad = loadOp;
     } else {
       if (!isF32)
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed-cone src supported for f32 only");
+      // Inc 2.5 (M<=tpb): each fill thread reduces its OWN row (r==localTid), so
+      // a non-re-emittable per-row leaf (q0_rope) equals the thread's converted
+      // per-thread scalar (getRemappedValue). Register these so the cone is
+      // accepted and evalRank2ConeAt reads the staged value; the fill is then
+      // emitted INLINE (not hoisted) so the leaf dominates.
+      if (M <= tpb) {
+        llvm::SmallVector<mlir::Value> leaves;
+        llvm::SmallPtrSet<void *, 8> seen;
+        collectStagingLeaves(reduceSrc, 0, leaves, seen);
+        for (auto lf : leaves)
+          if (mlir::Value remapped = rewriter.getRemappedValue(lf))
+            stagedMap[lf] = remapped;
+        if (!stagedMap.empty()) {
+          g_stagedLeaves = &stagedMap;
+          inlineStaged = true;
+        }
+      }
       if (!rank2ConeSupported(reduceSrc, 0))
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed-cone src has an unsupported producer "
@@ -3683,20 +3752,31 @@ struct ReduceLowering
         rewriter.getContext(),
         isMaxF ? BinaryExpOperator::maxOp : BinaryExpOperator::addOp);
     mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
-    if (tileLoop && !outTile)
+    // inlineStaged (M<=tpb) reads rowBuf[localTid] (each thread its own row), so
+    // it needs no output tile layout.
+    if (tileLoop && !outTile && !inlineStaged)
       return rewriter.notifyMatchFailure(
           op, "rank-2 reduce: output tile layout not found");
 
-    // -------- Staging: hoisted above the tile loop (runs once). --------
+    // -------- Staging. --------
+    // The rowBuf threadgroup alloca is ALWAYS hoisted above the outermost loop
+    // (threadgroup memory is function-scope). The FILL is hoisted for a
+    // loop-invariant (device) cone (compute once) but emitted INLINE for a
+    // staged cone (inlineStaged): the staged leaves' getRemappedValue only
+    // dominates inside the loop, and the reduce must recompute each iteration.
     mlir::Value rowBuf;
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
       if (tileLoop)
         rewriter.setInsertionPoint(tileLoop);
-
       auto rowBufTy =
           MetalMemRefType::get(rewriter.getContext(), storeTy, M);
       rowBuf = ThreadgroupAllocaOp::create(rewriter, loc, rowBufTy).getResult();
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      if (tileLoop && !inlineStaged)
+        rewriter.setInsertionPoint(tileLoop);
 
       // localTid = global_tid - tgid * tpb (multi-program safe).
       mlir::Value tidGlobalUI32 =
@@ -3770,9 +3850,17 @@ struct ReduceLowering
         {
           mlir::OpBuilder::InsertionGuard g2(rewriter);
           rewriter.setInsertionPointToStart(&guardIf.getThenRegion().front());
-          // rowBase = r * N (+ scalarOff)
-          auto rowBaseMul =
-              mlir::arith::MulIOp::create(rewriter, loc, r, cN.getResult());
+          // rowBase = (tgid.x*tpb + r) * N (+ scalarOff). The device buffer is
+          // indexed by the GLOBAL row; r is the program-LOCAL row, so add the
+          // per-program offset tgid.x*tpb (== tgOffset). No-op for a
+          // single-program launch (tgOffset == 0). Without this, program k>0's
+          // reduce reads program 0's rows (multi-program adder → wrong scores →
+          // overflow/NaN). rowBuf itself stays LOCAL-indexed by r.
+          mlir::Value globalRow = mlir::arith::AddIOp::create(
+                                      rewriter, loc, r, tgOffset.getResult())
+                                      .getResult();
+          auto rowBaseMul = mlir::arith::MulIOp::create(rewriter, loc, globalRow,
+                                                        cN.getResult());
           mlir::Value rowBase = rowBaseMul.getResult();
           if (scalarOff)
             rowBase = mlir::arith::AddIOp::create(rewriter, loc, rowBase,
@@ -3856,7 +3944,7 @@ struct ReduceLowering
     // result = rowBuf[outIdx], where outIdx is the SAME per-iter index the
     // downstream store uses (a bijection over [0, M)).
     mlir::Value outIdxUI32;
-    if (tileLoop && outTile && outTile->elemPerThread > 1) {
+    if (tileLoop && outTile && outTile->elemPerThread > 1 && !inlineStaged) {
       outIdxUI32 = emitPerIterIndex(*outTile, tileLoop, rewriter, loc);
     } else {
       // No tile loop (M <= tpb): each thread holds one output row. Read
