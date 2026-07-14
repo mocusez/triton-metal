@@ -4191,6 +4191,43 @@ void ModuleTranslation::translate(mlir::Region &region) {
           continue;
         }
       }
+      // General CSE: materialize any MULTI-USE inlineable value op as a named
+      // let-binding `T v<N> = <expr>;` at its IR position, so the expression is
+      // emitted ONCE and every use renders as `v<N>`. Without this, the emitter
+      // re-inlines a value's expression at every use; a deep reuse chain (adder:
+      // embedding->RMSNorm->RoPE->attn->MLP->argmax, each value used 2-3x) then
+      // expands the MSL exponentially (~37 MB, single 36-MB line). Constants are
+      // cheap leaves (no duplication blow-up) so they stay inlined. Emission is
+      // in IR order, so ordering (e.g. relative to barriers) is preserved.
+      if (op.getNumResults() == 1 && !op.getResult(0).use_empty() &&
+          !op.getResult(0).hasOneUse() &&
+          _letBound.find(&op) == _letBound.end() &&
+          // Allowlist of pure inlineable value ops translateValue emits as a
+          // standalone expression. Restricting to these keeps CSE safe (some
+          // other value ops assume they're inlined at a use). Covers adder's
+          // deep arith/math reuse chain that drives the exponential blow-up.
+          llvm::isa<mlir::arith::AddFOp, mlir::arith::SubFOp,
+                    mlir::arith::MulFOp, mlir::arith::DivFOp,
+                    mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
+                    mlir::arith::AddIOp, mlir::arith::SubIOp,
+                    mlir::arith::MulIOp, mlir::arith::CmpIOp,
+                    mlir::arith::CmpFOp, mlir::arith::SelectOp,
+                    mlir::arith::SIToFPOp, mlir::math::ExpOp,
+                    mlir::math::SqrtOp, mlir::math::LogOp, mlir::math::SinOp,
+                    mlir::math::CosOp, mlir::math::ErfOp, mlir::math::RsqrtOp,
+                    mlir::triton::metal::BinaryExpOp,
+                    mlir::triton::metal::UnaryExpOp,
+                    mlir::triton::metal::GetElementOp>(&op)) {
+        _output << "\n";
+        indent();
+        unsigned idx = _varCount++;
+        _output << typeToString(op.getResult(0).getType()) << " v" << idx
+                << " = ";
+        translateValue(&op);
+        _output << ";";
+        _letBound[&op] = idx;
+        continue;
+      }
       if (isStatementPrintable(&op)) {
         _output << "\n";
         indent();

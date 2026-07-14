@@ -173,41 +173,47 @@ module {
 // CHECK:   uint3 id {{\[\[thread_position_in_grid\]\]}})
 // CHECK: {
 // CHECK:   int32_t v3[1];
+// CHECK:   int32_t v4 = v3[0];
 // CHECK:   v3[0] = int32_t(id.x);
-// CHECK:   int32_t v4[1];
-// CHECK:   v4[0] = int32_t(id.y);
 // CHECK:   int32_t v5[1];
-// CHECK:   int32_t v6[1];
-// CHECK:   v5[0] = v1[0];
-// CHECK:   v6[0] = v1[1];
+// CHECK:   int32_t v6 = v5[0];
+// CHECK:   v5[0] = int32_t(id.y);
 // CHECK:   int32_t v7[1];
-// CHECK:   v7[0] = 0;
 // CHECK:   int32_t v8[1];
-// CHECK:   v8[0] = (v3[0]) - (1);
-// CHECK:   while ((v8[0]) <= ((v3[0]) + (1))) {
-// CHECK:     int32_t v9[1];
-// CHECK:     v9[0] = (v4[0]) - (1);
-// CHECK:     while ((v9[0]) <= ((v4[0]) + (1))) {
-// CHECK:       if (((((((v8[0]) >= (0)) && ((v8[0]) < (v5[0]))) && ((v9[0]) >= (0))) && ((v9[0]) < (v6[0]))) && (((v8[0]) != (v3[0])) || ((v9[0]) != (v4[0])))) && (bool(v0[uint32_t(((v8[0]) * (v6[0])) + (v9[0]))]))) {
-// CHECK:         v7[0] = (v7[0]) + (1);
-// CHECK:       }
-// CHECK:       v9[0] = (v9[0]) + (1);
-// CHECK:     }
-// CHECK:     v8[0] = (v8[0]) + (1);
-// CHECK:   }
+// CHECK:   int32_t v9 = v8[0];
+// CHECK:   v7[0] = v1[0];
+// CHECK:   v8[0] = v1[1];
 // CHECK:   int32_t v10[1];
-// CHECK:   v10[0] = ((v3[0]) * (v6[0])) + (v4[0]);
-// CHECK:   if (bool(v0[uint32_t(v10[0])])) {
-// CHECK:     if (((v7[0]) == (2)) || ((v7[0]) == (3))) {
-// CHECK:       v2[uint32_t(v10[0])] = 1;
+// CHECK:   int32_t v11 = v10[0];
+// CHECK:   v10[0] = 0;
+// CHECK:   int32_t v12[1];
+// CHECK:   int32_t v13 = v12[0];
+// CHECK:   v12[0] = (v4) - (1);
+// CHECK:   while ((v13) <= ((v4) + (1))) {
+// CHECK:     int32_t v14[1];
+// CHECK:     int32_t v15 = v14[0];
+// CHECK:     v14[0] = (v6) - (1);
+// CHECK:     while ((v15) <= ((v6) + (1))) {
+// CHECK:       if (((((((v13) >= (0)) && ((v13) < (v7[0]))) && ((v15) >= (0))) && ((v15) < (v9))) && (((v13) != (v4)) || ((v15) != (v6)))) && (bool(v0[uint32_t(((v13) * (v9)) + (v15))]))) {
+// CHECK:         v10[0] = (v11) + (1);
+// CHECK:       }
+// CHECK:       v14[0] = (v15) + (1);
+// CHECK:     }
+// CHECK:     v12[0] = (v13) + (1);
+// CHECK:   }
+// CHECK:   int32_t v16[1];
+// CHECK:   v16[0] = ((v4) * (v9)) + (v6);
+// CHECK:   if (bool(v0[uint32_t(v16[0])])) {
+// CHECK:     if (((v11) == (2)) || ((v11) == (3))) {
+// CHECK:       v2[uint32_t(v16[0])] = 1;
 // CHECK:     } else {
-// CHECK:       v2[uint32_t(v10[0])] = 0;
+// CHECK:       v2[uint32_t(v16[0])] = 0;
 // CHECK:     }
 // CHECK:   } else {
-// CHECK:     if ((v7[0]) == (3)) {
-// CHECK:       v2[uint32_t(v10[0])] = 1;
+// CHECK:     if ((v11) == (3)) {
+// CHECK:       v2[uint32_t(v16[0])] = 1;
 // CHECK:     } else {
-// CHECK:       v2[uint32_t(v10[0])] = 0;
+// CHECK:       v2[uint32_t(v16[0])] = 0;
 // CHECK:     }
 // CHECK:   }
 // CHECK:   return;

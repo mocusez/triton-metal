@@ -59,6 +59,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
 // MSL: for (int v{{[0-9]+}} = 0; v{{[0-9]+}} < 8; v{{[0-9]+}} += 1)
+// MSL: int v{{[0-9]+}} = ((tgid.x * 1024) + ((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)));
 // MSL: if ((((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)) < v{{[0-9]+}}[0]))
-// MSL: v{{[0-9]+}} = v{{[0-9]+}}[((tgid.x * 1024) + ((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)))];
+// MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: return;

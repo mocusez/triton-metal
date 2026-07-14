@@ -94,4 +94,4 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: simdgroup_load(
 // MSL: simdgroup_multiply_accumulate(
 // MSL: simdgroup_store(
-// MSL-SAME: tgid
+// MSL-SAME: v{{[0-9]+}} * 8 + v{{[0-9]+}}

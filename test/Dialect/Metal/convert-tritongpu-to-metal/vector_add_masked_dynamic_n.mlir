@@ -85,16 +85,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
 // MSL: threadgroup float v{{[0-9]+}}[128];
+// MSL: int v{{[0-9]+}} = ((tgid.x * 128) + (id.x - (tgid.x * 128)));
 // MSL: float v{{[0-9]+}};
 // MSL: if ((id.x < v{{[0-9]+}}[0]))
-// MSL: v{{[0-9]+}} = v{{[0-9]+}}[((tgid.x * 128) + (id.x - (tgid.x * 128)))];
+// MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
 // MSL: float v{{[0-9]+}};
 // MSL: if ((id.x < v{{[0-9]+}}[0]))
-// MSL: v{{[0-9]+}} = v{{[0-9]+}}[((tgid.x * 128) + (id.x - (tgid.x * 128)))];
+// MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
-// MSL: if ((id.x < v{{[0-9]+}}[0]))
-// MSL: v{{[0-9]+}}[((tgid.x * 128) + (id.x - (tgid.x * 128)))] = (v{{[0-9]+}}) + (v{{[0-9]+}});
+// MSL: float v{{[0-9]+}} = (v{{[0-9]+}}) + (v{{[0-9]+}});
+// MSL: bool v{{[0-9]+}} = (id.x < v{{[0-9]+}}[0]);
+// MSL: if (v{{[0-9]+}})
+// MSL: v{{[0-9]+}}[v{{[0-9]+}}] = v{{[0-9]+}};
 // MSL: return;

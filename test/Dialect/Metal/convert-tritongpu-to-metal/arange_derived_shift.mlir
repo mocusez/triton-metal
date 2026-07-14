@@ -37,4 +37,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: kernel void arange_shifted(
 // MSL: thread_position_in_grid
 // MSL: threadgroup_position_in_grid
-// MSL: v{{[0-9]+}}[(id.x - (tgid.x * 128))] = v{{[0-9]+}}[((id.x - (tgid.x * 128)) >> 1)];
+// MSL: int v{{[0-9]+}} = (id.x - (tgid.x * 128));
+// MSL: v{{[0-9]+}}[v{{[0-9]+}}] = v{{[0-9]+}}[(v{{[0-9]+}} >> 1)];
