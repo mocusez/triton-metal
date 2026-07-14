@@ -289,6 +289,23 @@ def test_dot_dynamic_k_fused_lora(M, K, scale):
     torch.testing.assert_close(o.cpu(), ref, atol=1e-3, rtol=1e-3)
 
 
+# --- Multi-warp: one program's tile grid is partitioned across simdgroups.
+@pytest.mark.parametrize("BLK,nw", [(32, 4), (64, 8), (64, 4)])
+def test_dot_dynamic_k_transposed_b_multiwarp(BLK, nw):
+    """Runtime-K matmul with num_warps>1 (M-tile rows split across warps)."""
+    M = N = BLK
+    K = 64
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randn((M, K), dtype=torch.float32).contiguous()
+    w = torch.randn((N, K), dtype=torch.float32).contiguous()
+    c = torch.zeros((M, N), dtype=torch.float32).contiguous()
+    recompute_transb_kernel[(1, 1)](
+        x, w, c, K, x.stride(0), x.stride(1), w.stride(0), w.stride(1),
+        c.stride(0), c.stride(1), BLOCK_M=BLK, BLOCK_N=BLK, BLOCK_K=8,
+        num_warps=nw)
+    torch.testing.assert_close(c.cpu(), torch.matmul(x, w.t()), atol=1e-4, rtol=1e-4)
+
+
 # --- Multi-tile output: one program computes a (BM/8)x(BN/8) grid of 8x8 tiles.
 @pytest.mark.parametrize("N,BN", [(16, 16), (32, 32)])
 def test_dot_dynamic_k_transposed_b_multitile(N, BN):

@@ -6477,22 +6477,26 @@ static mlir::Value emitExtentUi32(mlir::OpBuilder &b, mlir::Location loc,
 }
 
 // Emit a staged simdgroup load — masked (out-of-bounds → 0) when both extents
-// are non-null, otherwise the plain single-warp staged load. `transposed`
-// swaps the staging destination (W1).
+// are non-null, otherwise the plain staged load. `transposed` swaps the staging
+// destination (W1). `widx` (optional) selects a per-warp staging buffer for the
+// multi-warp path; masked multi-warp is not yet supported.
 static mlir::Value emitStagedLoad(mlir::OpBuilder &b, mlir::Location loc,
                                   MetalSimdgroupMatrixType matTy,
                                   mlir::Value buf, mlir::Value originRow,
                                   mlir::Value originCol, mlir::Value stride,
                                   bool transposed, mlir::Value rowExtent,
-                                  mlir::Value colExtent) {
+                                  mlir::Value colExtent,
+                                  mlir::Value widx = mlir::Value()) {
   if (rowExtent && colExtent) {
     auto op = SimdgroupLoadDeviceStagedMaskedOp::create(
         b, loc, matTy, buf, originRow, originCol, stride, rowExtent, colExtent);
     if (transposed) op->setAttr("transposed", b.getUnitAttr());
     return op.getResult();
   }
+  llvm::SmallVector<mlir::Value, 1> warpIdx;
+  if (widx) warpIdx.push_back(widx);
   auto op = SimdgroupLoadDeviceStagedOp::create(
-      b, loc, matTy, buf, originRow, originCol, stride, mlir::ValueRange{});
+      b, loc, matTy, buf, originRow, originCol, stride, warpIdx);
   if (transposed) op->setAttr("transposed", b.getUnitAttr());
   return op.getResult();
 }
@@ -6590,7 +6594,8 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
   if (!kAxisUsesInductionVar(loadB.getPtr(), bKAxis, iv))
     return mlir::failure();
 
-  if (mlir::triton::gpu::lookupNumWarps(dot) != 1) return mlir::failure();
+  const int numWarps = mlir::triton::gpu::lookupNumWarps(dot);
+  if (numWarps < 1) return mlir::failure();
 
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   if (!resTy) return mlir::failure();
@@ -6600,15 +6605,25 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
   if (shape.size() != 2 || shape[0] % 8 != 0 || shape[1] % 8 != 0)
     return mlir::failure();
   const int mTiles = shape[0] / 8, nTiles = shape[1] / 8;
+  // Multi-warp: partition the M-tile rows across warps (each warp owns
+  // mTiles/numWarps rows, all N-tiles) so per-warp register pressure stays
+  // bounded. Requires mTiles % numWarps == 0. Multi-warp masked is not yet
+  // supported (the masked staged load has no per-warp buffer).
+  const bool multiWarp = numWarps > 1;
+  if (multiWarp) {
+    if (mTiles % numWarps != 0) return mlir::failure();
+    if (loadA.getMask() || loadB.getMask()) return mlir::failure();
+  }
+  const int mPerWarp = multiWarp ? mTiles / numWarps : mTiles;
   // Register guard: each output tile is a live simdgroup_matrix accumulator
-  // (~2 regs/thread). Large grids (e.g. 64x128 = 128 tiles) overflow the
-  // register file — those need multi-warp, out of scope here.
-  if (mTiles * nTiles > 32) return mlir::failure();
+  // per warp (~2 regs/thread).
+  if (mPerWarp * nTiles > 32) return mlir::failure();
 
   if (!forOp.getResult(0).hasOneUse()) return mlir::failure();
   auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
       *forOp.getResult(0).getUsers().begin());
   if (!store) return mlir::failure();
+  if (multiWarp && store.getMask()) return mlir::failure();
   MaskExtents storeExt;
   if (store.getMask()) {
     storeExt = extractMaskExtents(store.getMask());
@@ -6673,13 +6688,54 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
   std::tie(aRowExt, aColExt) = extentsFor(loadA);
   std::tie(bRowExt, bColExt) = extentsFor(loadB);
 
-  // Per-tile origins (precomputed outside the loop; they dominate the body).
-  llvm::SmallVector<mlir::Value> aRowTile(mTiles), bNTile(nTiles);
-  for (int mi = 0; mi < mTiles; ++mi) aRowTile[mi] = tileOrigin(aBaseRow, mi);
-  for (int ni = 0; ni < nTiles; ++ni) bNTile[ni] = tileOrigin(bNOrigin, ni);
+  // Multi-warp: widx = simdgroup index; each warp owns M-tile rows
+  // {widx + mIter*numWarps : mIter in [0, mPerWarp)}, all N-tiles.
+  auto i32ty = builder.getIntegerType(32);
+  mlir::Value widx, warpMI32;
+  if (multiWarp) {
+    widx = SimdgroupIndexOp::create(builder, loc, ui32).getResult();
+    warpMI32 = mlir::UnrealizedConversionCastOp::create(
+                   builder, loc, mlir::TypeRange{i32ty}, mlir::ValueRange{widx})
+                   .getResult(0);
+  }
+  auto mTileIdxVal = [&](int mIter) -> mlir::Value {
+    if (!multiWarp)
+      return mlir::arith::ConstantOp::create(
+                 builder, loc, builder.getI32IntegerAttr(mIter)).getResult();
+    auto c = mlir::arith::ConstantOp::create(
+        builder, loc, builder.getI32IntegerAttr(mIter * numWarps));
+    return mlir::arith::AddIOp::create(builder, loc, warpMI32, c.getResult())
+        .getResult();
+  };
+  auto originForRuntimeTile =
+      [&](mlir::Value baseScalar, mlir::Value tileIdxVal) -> mlir::Value {
+    auto eight = mlir::arith::ConstantOp::create(builder, loc,
+                                                 builder.getI32IntegerAttr(8));
+    mlir::Value off =
+        mlir::arith::MulIOp::create(builder, loc, tileIdxVal, eight.getResult())
+            .getResult();
+    mlir::Value v =
+        baseScalar
+            ? mlir::arith::AddIOp::create(builder, loc, baseScalar, off).getResult()
+            : off;
+    return toUi32(builder, v);
+  };
+
+  // Per-warp M-tile origins (A/C rows, runtime); N-tile origins are static.
+  llvm::SmallVector<mlir::Value> aRowTile(mPerWarp), cRowTile(mPerWarp);
+  for (int mi = 0; mi < mPerWarp; ++mi) {
+    mlir::Value idx = mTileIdxVal(mi);
+    aRowTile[mi] = originForRuntimeTile(aBaseRow, idx);
+    cRowTile[mi] = originForRuntimeTile(cOrig.row, idx);
+  }
+  llvm::SmallVector<mlir::Value> bNTile(nTiles), cColTile(nTiles);
+  for (int ni = 0; ni < nTiles; ++ni) {
+    bNTile[ni] = tileOrigin(bNOrigin, ni);
+    cColTile[ni] = tileOrigin(cOrig.col, ni);
+  }
 
   llvm::SmallVector<mlir::Value> inits;
-  for (int t = 0; t < mTiles * nTiles; ++t)
+  for (int t = 0; t < mPerWarp * nTiles; ++t)
     inits.push_back(SimdgroupMatrixZeroOp::create(builder, loc, matTy).getResult());
   auto c0 = mlir::arith::ConstantOp::create(builder, loc,
                                             builder.getI32IntegerAttr(0));
@@ -6692,23 +6748,22 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
       [&](mlir::OpBuilder &b, mlir::Location l, mlir::Value ivFresh,
           mlir::ValueRange args) {
         mlir::Value kUi32 = toUi32(b, ivFresh);
-        // Load each A row-tile and B col-tile once, reuse across the grid.
-        llvm::SmallVector<mlir::Value> aTiles(mTiles), bTiles(nTiles);
-        for (int mi = 0; mi < mTiles; ++mi)
+        llvm::SmallVector<mlir::Value> aTiles(mPerWarp), bTiles(nTiles);
+        for (int mi = 0; mi < mPerWarp; ++mi)
           aTiles[mi] = emitStagedLoad(b, l, matTy, aBuf, aRowTile[mi], kUi32,
                                       strideAVal, /*transposed=*/false, aRowExt,
-                                      aColExt);
+                                      aColExt, widx);
         for (int ni = 0; ni < nTiles; ++ni)
           bTiles[ni] =
               bTransposed
                   ? emitStagedLoad(b, l, matTy, bBuf, bNTile[ni], kUi32,
                                    strideBVal, /*transposed=*/true, bRowExt,
-                                   bColExt)
+                                   bColExt, widx)
                   : emitStagedLoad(b, l, matTy, bBuf, kUi32, bNTile[ni],
                                    strideBVal, /*transposed=*/false, bRowExt,
-                                   bColExt);
+                                   bColExt, widx);
         llvm::SmallVector<mlir::Value> newAccs;
-        for (int mi = 0; mi < mTiles; ++mi)
+        for (int mi = 0; mi < mPerWarp; ++mi)
           for (int ni = 0; ni < nTiles; ++ni)
             newAccs.push_back(SimdgroupMultiplyAccumulateOp::create(
                                   b, l, matTy, args[mi * nTiles + ni],
@@ -6722,11 +6777,11 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
     oPartial.push_back(emitExtentUi32(builder, loc, ui32, storeExt.mExtent));
     oPartial.push_back(emitExtentUi32(builder, loc, ui32, storeExt.nExtent));
   }
-  for (int mi = 0; mi < mTiles; ++mi)
+  for (int mi = 0; mi < mPerWarp; ++mi)
     for (int ni = 0; ni < nTiles; ++ni)
       SimdgroupStoreOp::create(builder, loc, loop.getResult(mi * nTiles + ni),
-                                cBuf, tileOrigin(cOrig.row, mi),
-                                tileOrigin(cOrig.col, ni), strideCVal, oPartial);
+                                cBuf, cRowTile[mi], cColTile[ni], strideCVal,
+                                oPartial);
 
   store.erase();
   forOp.erase();
