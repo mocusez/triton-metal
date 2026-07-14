@@ -63,3 +63,37 @@ def test_scalar_store_f32_after_reduce(BLOCK: int) -> None:
     assert err < 1e-3 * BLOCK, (
         f"BLOCK={BLOCK}: got {out[0].item()}, expected {expected.item()}, err={err}"
     )
+
+
+@triton.jit
+def _scalar_i32_copy_guarded_kernel(in_ptr, out_ptr, B, S):
+    """Per-program early-return guard + scalar i32 load/store over a MULTI-LEVEL
+    scalar `tt.addptr` chain (`ptr + pid*S + j` is two nested addptr ops).
+
+    Exercises three lowerings together: (1) `cf.cond_br` early-return
+    structured into `scf.if` (structureEarlyReturns), (2) scalar i32 `tt.load`
+    (ScalarLoadLowering widened to i32 via ui32 storage), (3) scalar i32
+    `tt.store` over an accumulated scalar-addptr offset (StoreLowering)."""
+    pid = tl.program_id(0)
+    if pid >= B:
+        return
+    for j in range(S):
+        v = tl.load(in_ptr + pid * S + j)
+        tl.store(out_ptr + pid * S + j, v + 1)
+
+
+@pytest.mark.parametrize("B, S", [(1, 4), (3, 5), (8, 1)])
+def test_scalar_i32_load_store_guarded(B: int, S: int) -> None:
+    torch.manual_seed(B * 100 + S)
+    inp = torch.randint(-1000, 1000, (B, S), dtype=torch.int32, device="mps")
+    # Launch two EXTRA programs; the `pid >= B` guard must make them return
+    # without touching the sentinel rows.
+    SENT = torch.iinfo(torch.int32).min
+    out = torch.full((B + 2, S), SENT, dtype=torch.int32, device="mps")
+
+    _scalar_i32_copy_guarded_kernel[(B + 2,)](inp, out, B, S)
+
+    # Valid rows: out == in + 1 (scalar i32 load/store, multi-level addptr).
+    torch.testing.assert_close(out[:B].cpu(), (inp + 1).cpu(), atol=0, rtol=0)
+    # Guarded rows: untouched sentinel (cf.cond_br early-return fired).
+    assert (out[B:].cpu() == SENT).all(), "early-return guard did not fire"

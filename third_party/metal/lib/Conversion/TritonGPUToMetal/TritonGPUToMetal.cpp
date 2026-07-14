@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -4363,51 +4364,47 @@ struct ScalarLoadLowering
     } else {
       return mlir::failure();  // tensor / unknown — not our case
     }
-    // L2b note: scalar (bare-ptr) i32 loads are intentionally NOT widened
-    // here — L2b's scope is the TENSOR load/store path. The scalar i32 STORE
-    // path (StoreLowering) is bridged because rank-1 reduce results store
-    // through it, but no current kernel needs a scalar i32 load. This is a
-    // clean match-failure (not a miscompile); widen via castToMemrefStorage +
-    // metalStorageElementType if a leet ever needs it.
-    if (!mlir::isa<mlir::FloatType>(elemTy) ||
-        mlir::cast<mlir::FloatType>(elemTy).getWidth() != 32)
+    // Envelope: f32 or i32. i32 is routed through ui32 storage (see
+    // metalStorageElementType) and bridged back to signless i32 for the result.
+    bool isF32 = mlir::isa<mlir::FloatType>(elemTy) &&
+                 mlir::cast<mlir::FloatType>(elemTy).getWidth() == 32;
+    bool isI32 = elemTy.isInteger(32);
+    if (!isF32 && !isI32)
       return rewriter.notifyMatchFailure(
-          op, "scalar tt.load: only f32 supported in L3a-compiler-A envelope");
+          op, "scalar tt.load: only f32/i32 supported");
     auto loc = op.getLoc();
     auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
-    // Resolve the base memref + scalar index. When the ptr is fed by a
-    // `tt.addptr`, the base memref is `addptr.getPtr()` and the index is
-    // `addptr.getOffset()`. When the ptr is directly the kernel-arg block
-    // argument (offset 0 — Triton folds `addptr(p, 0)` away), the base is
-    // `op.getPtr()` itself and the index is the constant 0.
-    mlir::Value baseForMemref = op.getPtr();
-    mlir::Value offset;
-    if (auto addptr = op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>()) {
-      baseForMemref = addptr.getPtr();
-      offset = addptr.getOffset();
-    }
-    mlir::Value memref = findBaseMemref(baseForMemref, rewriter);
+    // Resolve the base memref + accumulated scalar index across the WHOLE
+    // scalar tt.addptr chain (e.g. `draft_tokens_ptr + b*T + i` is two nested
+    // tt.addptr ops). findBaseMemref walks to the base; accumulateScalar-
+    // AddPtrOffsets sums every scalar offset. Offset 0 (bare kernel-arg ptr,
+    // Triton folded addptr(p,0)) → null accumulator → index constant 0.
+    mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
                                          "memref source not MetalMemRefType");
-    mlir::Value idxUi32;
-    if (offset) {
-      mlir::Value offsetRemapped = rewriter.getRemappedValue(offset);
-      if (!offsetRemapped)
-        offsetRemapped = offset;
-      idxUi32 = mlir::UnrealizedConversionCastOp::create(
-                    rewriter, loc, mlir::TypeRange{ui32},
-                    mlir::ValueRange{offsetRemapped})
-                    .getResult(0);
-    } else {
-      auto zero = mlir::arith::ConstantOp::create(
-          rewriter, loc, rewriter.getI32IntegerAttr(0));
-      idxUi32 = mlir::UnrealizedConversionCastOp::create(
-                    rewriter, loc, mlir::TypeRange{ui32},
-                    mlir::ValueRange{zero.getResult()})
-                    .getResult(0);
-    }
-    rewriter.replaceOpWithNewOp<GetElementOp>(op, elemTy, memref, idxUi32);
+    mlir::Value offset =
+        accumulateScalarAddPtrOffsets(op.getPtr(), rewriter, loc);
+    mlir::Value idxI32 = offset;
+    if (!idxI32)
+      idxI32 = mlir::arith::ConstantOp::create(
+                   rewriter, loc, rewriter.getI32IntegerAttr(0))
+                   .getResult();
+    mlir::Value idxUi32 = mlir::UnrealizedConversionCastOp::create(
+                              rewriter, loc, mlir::TypeRange{ui32},
+                              mlir::ValueRange{idxI32})
+                              .getResult(0);
+    // Read the STORAGE-typed element (f32 → f32; i32 → ui32), then bridge back
+    // to the Triton element type so downstream signless arith sees i32.
+    mlir::Type storageTy = metalStorageElementType(elemTy);
+    mlir::Value el =
+        GetElementOp::create(rewriter, loc, storageTy, memref, idxUi32)
+            .getResult();
+    if (storageTy != elemTy)
+      el = mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{elemTy}, mlir::ValueRange{el})
+               .getResult(0);
+    rewriter.replaceOp(op, el);
     return mlir::success();
   }
 };
@@ -4800,6 +4797,37 @@ struct StoreLowering
       mlir::Value idxUi32 = mlir::UnrealizedConversionCastOp::create(
                                 rewriter, loc, mlir::TypeRange{ui32},
                                 mlir::ValueRange{zero.getResult()})
+                                .getResult(0);
+      mlir::Value sval = castToMemrefStorage(adaptor.getValue(), memref,
+                                             rewriter, loc);
+      StoreOp::create(rewriter, loc, sval, memref, idxUi32);
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+
+    // Scalar pointer fed by a SCALAR tt.addptr chain: `tt.store %p, %val` where
+    // %p = addptr(...addptr(base, off0)..., offN) and every offset is scalar (no
+    // tensor layout). Arises for `tl.store(out_ptr + b*(T+1) + idx, v)` in
+    // sequential per-program kernels (e.g. speculative decoding). Mirrors the
+    // scalar-ptr path above / ScalarLoadLowering: resolve the base memref +
+    // accumulated scalar offset, bridge the value to storage. tileFromTensor is
+    // null for a scalar `!tt.ptr<T>`; the no-addptr case was handled above, so
+    // reaching here with a scalar ptr means a scalar addptr chain.
+    if (!tileFromTensor(op.getPtr().getType())) {
+      mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
+      if (!memref)
+        return rewriter.notifyMatchFailure(
+            op, "scalar-addptr tt.store: memref not found");
+      mlir::Value offset =
+          accumulateScalarAddPtrOffsets(op.getPtr(), rewriter, loc);
+      mlir::Value idxI32 = offset;
+      if (!idxI32)
+        idxI32 = mlir::arith::ConstantOp::create(
+                     rewriter, loc, rewriter.getI32IntegerAttr(0))
+                     .getResult();
+      mlir::Value idxUi32 = mlir::UnrealizedConversionCastOp::create(
+                                rewriter, loc, mlir::TypeRange{ui32},
+                                mlir::ValueRange{idxI32})
                                 .getResult(0);
       mlir::Value sval = castToMemrefStorage(adaptor.getValue(), memref,
                                              rewriter, loc);
@@ -8264,6 +8292,101 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   return mlir::success();
 }
 
+// Structure a top-level early-exit guard `if (cond) return;` into an scf.if so
+// the (structured-only) MSL emitter can handle it. Triton lowers a Python early
+// `return` (e.g. `if pid >= B: return`) to `cf.cond_br %c, ^ret, ^cont` where
+// ^ret is a bare void `tt.return` and ^cont holds the rest of the function.
+// `--lift-cf-to-scf` cannot recover this (a void early-return does not
+// reconverge). We rewrite it to `scf.if <enter-cont-cond> { <cont body> }`
+// followed by a void `tt.return`, then erase the cf.cond_br + the two dead
+// blocks. STRICT no-op unless the exact canonical shape matches, so every
+// already-structured kernel (single block + structured scf) is untouched.
+static void structureEarlyReturns(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::FuncOp> funcs;
+  moduleOp.walk([&](mlir::triton::FuncOp f) { funcs.push_back(f); });
+  for (auto func : funcs) {
+    if (func.getBody().empty())
+      continue;
+    mlir::Block &entry = func.getBody().front();
+    auto condBr =
+        mlir::dyn_cast<mlir::cf::CondBranchOp>(entry.getTerminator());
+    if (!condBr)
+      continue;
+    // No successor block-argument operands (we don't thread values across).
+    if (!condBr.getTrueDestOperands().empty() ||
+        !condBr.getFalseDestOperands().empty())
+      continue;
+
+    auto isVoidReturnOnly = [](mlir::Block *b) {
+      if (b->getNumArguments() != 0 || b->empty())
+        return false;
+      if (&b->front() != &b->back())
+        return false; // exactly one op
+      auto ret = mlir::dyn_cast<mlir::triton::ReturnOp>(&b->front());
+      return ret && ret.getNumOperands() == 0;
+    };
+
+    mlir::Block *trueDest = condBr.getTrueDest();
+    mlir::Block *falseDest = condBr.getFalseDest();
+    mlir::Block *retBlk = nullptr, *contBlk = nullptr;
+    bool enterContWhenTrue = false;
+    if (isVoidReturnOnly(trueDest)) {
+      retBlk = trueDest;
+      contBlk = falseDest;
+      enterContWhenTrue = false; // continue when cond is FALSE
+    } else if (isVoidReturnOnly(falseDest)) {
+      retBlk = falseDest;
+      contBlk = trueDest;
+      enterContWhenTrue = true; // continue when cond is TRUE
+    } else {
+      continue;
+    }
+
+    // The continuation must be a self-contained single block (only pred is the
+    // entry, no block args) ending in a void tt.return. Its inner control flow
+    // is already structured scf, so moving its ops is sound.
+    if (contBlk == retBlk || contBlk->getNumArguments() != 0)
+      continue;
+    if (contBlk->getSinglePredecessor() != &entry ||
+        retBlk->getSinglePredecessor() != &entry)
+      continue;
+    auto contRet =
+        mlir::dyn_cast<mlir::triton::ReturnOp>(contBlk->getTerminator());
+    if (!contRet || contRet.getNumOperands() != 0)
+      continue;
+
+    // --- Rewrite ---
+    // Build `scf.if %cond { thenBody } else { elseBody }` keeping the ORIGINAL
+    // condition polarity — the continuation goes in whichever arm the cond_br
+    // branches to it (then=trueDest, else=falseDest). This avoids negating the
+    // i1 (an `arith.xori %c, true` mis-lowers to MSL bitwise `%c ^ -1`, which is
+    // always truthy). The non-continuation arm is left empty (the early return).
+    mlir::OpBuilder builder(condBr);
+    mlir::Location loc = condBr.getLoc();
+    auto ifOp = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                        condBr.getCondition(),
+                                        /*addThenBlock=*/true,
+                                        /*addElseBlock=*/true);
+    // addThen/ElseBlock=true create EMPTY blocks (no auto scf.yield). Move
+    // contBlk's ops (all but its terminator) into the arm it branched to.
+    mlir::Block *contArm = enterContWhenTrue ? ifOp.thenBlock() : ifOp.elseBlock();
+    mlir::Block *emptyArm = enterContWhenTrue ? ifOp.elseBlock() : ifOp.thenBlock();
+    contArm->getOperations().splice(contArm->end(), contBlk->getOperations(),
+                                    contBlk->begin(),
+                                    std::prev(contBlk->end()));
+    mlir::OpBuilder contBuilder(contArm, contArm->end());
+    mlir::scf::YieldOp::create(contBuilder, loc);
+    mlir::OpBuilder emptyBuilder(emptyArm, emptyArm->end());
+    mlir::scf::YieldOp::create(emptyBuilder, loc);
+    // Final void return in the entry block, after the scf.if.
+    mlir::triton::ReturnOp::create(builder, loc);
+    // Erase the cf terminator and the now-dead blocks.
+    condBr.erase();
+    contBlk->erase();
+    retBlk->erase();
+  }
+}
+
 static void runFlashAttentionMatcher(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) {
@@ -8309,6 +8432,11 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+
+    // Structure top-level early-exit guards (`if cond: return`) into scf.if
+    // BEFORE any other handling — the MSL emitter is structured-only and has no
+    // cf.cond_br lowering. No-op for already-structured kernels.
+    structureEarlyReturns(moduleOp);
 
     // Phase 2: recognize the online-softmax flash-attention loop and replace
     // it + epilogue with a single `metal.flash_attention` op BEFORE any cvt
