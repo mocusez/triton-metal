@@ -141,3 +141,59 @@ def test_reduce_min_rank1_i32(BLOCK):
     reduce_min_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
     expected = torch.min(x.cpu()).to(torch.int32)
     assert out[0].item() == expected.item()
+
+
+# --- W-B: rich rank-1 reduce over a COMPUTED cone (select/cmp/andi/make_range +
+# masked loads + per-program scalar base offset). These are the reduce shapes in
+# medium-speculative_decoding_verification.py; the general per-element cone
+# evaluator `evalRank1ValueAt` re-derives each logical element. BLOCK=1024 > tpb
+# so the spt-fold / scf.for + butterfly path drives the evaluator per element. ---
+
+
+@triton.jit
+def _sum_relu_diff_kernel(p_ptr, q_ptr, out_ptr, V, BLOCK: tl.constexpr):
+    b = tl.program_id(0)
+    idx = tl.arange(0, BLOCK)
+    mask = idx < V
+    p = tl.load(p_ptr + b * V + idx, mask=mask, other=0.0)
+    q = tl.load(q_ptr + b * V + idx, mask=mask, other=0.0)
+    adj = tl.where(q > p, q - p, 0.0)
+    adj = tl.where(mask, adj, 0.0)
+    tl.store(out_ptr + b, tl.sum(adj, axis=0))
+
+
+@pytest.mark.parametrize("B, V", [(1, 100), (4, 777), (3, 1024)])
+def test_reduce_sum_computed_cone(B, V):
+    torch.manual_seed(V)
+    p = torch.rand((B, V), dtype=torch.float32, device="mps")
+    q = torch.rand((B, V), dtype=torch.float32, device="mps")
+    out = torch.zeros((B,), dtype=torch.float32, device="mps")
+    _sum_relu_diff_kernel[(B,)](p, q, out, V, BLOCK=1024, num_warps=4)
+    expected = torch.clamp(q - p, min=0.0).sum(dim=1)
+    torch.testing.assert_close(out.cpu(), expected.cpu(), atol=1e-3, rtol=1e-3)
+
+
+@triton.jit
+def _min_idx_ge_kernel(val_ptr, out_ptr, V, TARGET, BLOCK: tl.constexpr):
+    b = tl.program_id(0)
+    idx = tl.arange(0, BLOCK)
+    mask = idx < V
+    v = tl.load(val_ptr + b * V + idx, mask=mask, other=0.0)
+    cond = (v >= TARGET) & mask          # arith.andi on i1 in the cone
+    sel = tl.where(cond, idx, V)         # min-reduce over selected indices
+    tl.store(out_ptr + b, tl.min(sel, axis=0))
+
+
+@pytest.mark.parametrize("B, V", [(1, 100), (4, 777), (2, 1024)])
+def test_reduce_min_idx_computed_cone(B, V):
+    # Inverse-CDF-style: first index where a running value crosses TARGET, else V.
+    torch.manual_seed(V + 1)
+    val = torch.rand((B, V), dtype=torch.float32, device="mps").cumsum(dim=1)
+    TARGET = 0.5 * val[:, -1].mean().item()
+    out = torch.zeros((B,), dtype=torch.int32, device="mps")
+    _min_idx_ge_kernel[(B,)](val, out, V, TARGET, BLOCK=1024, num_warps=4)
+    idx = torch.arange(V)
+    cond = val.cpu() >= TARGET
+    sel = torch.where(cond, idx[None, :], torch.full_like(idx[None, :], V))
+    expected = sel.min(dim=1).values.to(torch.int32)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
