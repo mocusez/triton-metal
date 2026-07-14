@@ -922,11 +922,13 @@ def SimdgroupLoadDeviceStagedMaskedOp
 
   let arguments = (ins Metal_MemRefType:$memref, UI32:$origin_row,
                        UI32:$origin_col, UI32:$stride, UI32:$row_extent,
-                       UI32:$col_extent, UnitAttr:$transposed);
+                       UI32:$col_extent, Variadic<UI32>:$warp_index,
+                       UnitAttr:$transposed);
   let results = (outs Metal_SimdgroupMatrixType:$result);
 
   let assemblyFormat = "$memref `[` $origin_row `,` $origin_col `]` `,` $stride"
                        " `mask` `[` $row_extent `,` $col_extent `]`"
+                       " (`warp` `[` $warp_index^ `]`)?"
                        " attr-dict `:` functional-type(operands, results)";
 }
 

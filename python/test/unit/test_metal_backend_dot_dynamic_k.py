@@ -306,6 +306,71 @@ def test_dot_dynamic_k_transposed_b_multiwarp(BLK, nw):
     torch.testing.assert_close(c.cpu(), torch.matmul(x, w.t()), atol=1e-4, rtol=1e-4)
 
 
+# --- The verbatim medium-lora_linear.py kernel: swizzle2d program grid, masked
+#     loads + `*` store mask, BLOCK_M=64/N=128/K=32/R=16, default num_warps=4.
+@triton.jit
+def lora_verbatim_kernel(
+    inp, W, A, B, output, M, N, K, R, scale,
+    stride_im, stride_ik, stride_wn, stride_wk, stride_ar, stride_ak,
+    stride_bn, stride_br, stride_om, stride_on,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_R: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_m_blocks = tl.cdiv(M, BLOCK_SIZE_M)
+    num_n_blocks = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m, pid_n = tl.swizzle2d(pid // num_n_blocks, pid % num_n_blocks,
+                                num_m_blocks, num_n_blocks, GROUP_SIZE)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_r = tl.arange(0, BLOCK_SIZE_R)
+    acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_R), dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        mask_w = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        mask_a = (offs_r[:, None] < R) & (offs_k[None, :] < K)
+        x = tl.load(inp + offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik, mask=mask_x, other=0.0)
+        w = tl.load(W + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk, mask=mask_w, other=0.0)
+        a = tl.load(A + offs_r[:, None] * stride_ar + offs_k[None, :] * stride_ak, mask=mask_a, other=0.0)
+        acc0 = tl.dot(x, tl.trans(w), acc0, allow_tf32=False)
+        acc1 = tl.dot(x, tl.trans(a), acc1, allow_tf32=False)
+    mask_b = (offs_n[:, None] < N) & (offs_r[None, :] < R)
+    b = tl.load(B + offs_n[:, None] * stride_bn + offs_r[None, :] * stride_br, mask=mask_b, other=0.0)
+    acc0 += scale * tl.dot(acc1, tl.trans(b), allow_tf32=False)
+    mask_y = (offs_m[:, None] < M) * (offs_n[None, :] < N)
+    tl.store(output + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, acc0, mask=mask_y)
+
+
+@pytest.mark.parametrize("batch,d_in,d_out,rank", [(64, 128, 128, 16),
+                                                   (128, 256, 256, 16),
+                                                   (100, 200, 300, 8)])
+def test_metal_lora_linear_verbatim(batch, d_in, d_out, rank):
+    """The exact medium-lora_linear.py kernel (swizzle2d grid, masks, BLOCK
+    64/128/32/16, default num_warps) end-to-end."""
+    scale = 0.5
+    torch.manual_seed(0)
+    x = torch.randn(batch, d_in, dtype=torch.float32).contiguous()
+    W = torch.randn(d_out, d_in, dtype=torch.float32).contiguous()
+    A = torch.randn(rank, d_in, dtype=torch.float32).contiguous()
+    B = torch.randn(d_out, rank, dtype=torch.float32).contiguous()
+    out = torch.zeros(batch, d_out, dtype=torch.float32).contiguous()
+    BM, BN, BK = 64, 128, 32
+    BR = max(16, triton.next_power_of_2(rank))
+    grid = (triton.cdiv(batch, BM) * triton.cdiv(d_out, BN),)
+    lora_verbatim_kernel[grid](
+        x, W, A, B, out, batch, d_out, d_in, rank, scale,
+        x.stride(0), x.stride(1), W.stride(0), W.stride(1),
+        A.stride(0), A.stride(1), B.stride(0), B.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=BK, BLOCK_SIZE_R=BR,
+        GROUP_SIZE=4)
+    ref = x @ W.t() + scale * ((x @ A.t()) @ B.t())
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("BM,BN,BR,nw", [(32, 32, 8, 4), (64, 64, 16, 4),
                                          (64, 128, 16, 8)])
 def test_dot_dynamic_k_fused_lora_multiwarp(BM, BN, BR, nw):

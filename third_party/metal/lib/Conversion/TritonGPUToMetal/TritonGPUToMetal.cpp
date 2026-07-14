@@ -5388,14 +5388,13 @@ static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0) {
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
     auto src = splat.getSrc();
     if (auto muli = src.getDefiningOp<mlir::arith::MulIOp>()) {
-      auto isPid = [](mlir::Value x) {
-        return x && x.getDefiningOp<mlir::triton::GetProgramIdOp>();
-      };
       auto isConst = [](mlir::Value x) {
         return x && x.getDefiningOp<mlir::arith::ConstantOp>();
       };
-      if ((isPid(muli.getLhs()) && isConst(muli.getRhs())) ||
-          (isPid(muli.getRhs()) && isConst(muli.getLhs())))
+      // Accept `<tile-index> * BLOCK` for ANY tile-index expression — a raw
+      // program_id or a swizzle2d-computed pid (medium-lora_linear.py) — i.e.
+      // one operand is a constant block size. The tile origin is that product.
+      if (isConst(muli.getLhs()) || isConst(muli.getRhs()))
         return src; // the muli result scalar
     }
     return mlir::Value();
@@ -5539,8 +5538,19 @@ struct MaskExtents {
 static MaskExtents extractMaskExtents(mlir::Value mask) {
   MaskExtents empty;
   if (!mask) return empty;
-  auto andi = mask.getDefiningOp<mlir::arith::AndIOp>();
-  if (!andi) return empty;
+  // Accept both `(offs_row < ROW) & (offs_col < K)` (arith.andi) and the
+  // `(offs_row < ROW) * (offs_col < K)` (arith.muli) form some kernels use for
+  // the store mask (e.g. medium-lora_linear.py's `mask_y = ... * ...`).
+  mlir::Value maskLhs, maskRhs;
+  if (auto andi = mask.getDefiningOp<mlir::arith::AndIOp>()) {
+    maskLhs = andi.getLhs();
+    maskRhs = andi.getRhs();
+  } else if (auto muli = mask.getDefiningOp<mlir::arith::MulIOp>()) {
+    maskLhs = muli.getLhs();
+    maskRhs = muli.getRhs();
+  } else {
+    return empty;
+  }
 
   // Each side: walk through tt.broadcast / tt.expand_dims wrappers to the
   // underlying cmpi-slt with a tt.splat RHS.
@@ -5561,8 +5571,8 @@ static MaskExtents extractMaskExtents(mlir::Value mask) {
     return v.getDefiningOp<mlir::arith::CmpIOp>();
   };
 
-  auto cmpLhs = unwrapToCmpi(andi.getLhs());
-  auto cmpRhs = unwrapToCmpi(andi.getRhs());
+  auto cmpLhs = unwrapToCmpi(maskLhs);
+  auto cmpRhs = unwrapToCmpi(maskRhs);
   if (!cmpLhs || !cmpRhs) return empty;
   if (cmpLhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
   if (cmpRhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
@@ -6487,14 +6497,15 @@ static mlir::Value emitStagedLoad(mlir::OpBuilder &b, mlir::Location loc,
                                   bool transposed, mlir::Value rowExtent,
                                   mlir::Value colExtent,
                                   mlir::Value widx = mlir::Value()) {
+  llvm::SmallVector<mlir::Value, 1> warpIdx;
+  if (widx) warpIdx.push_back(widx);
   if (rowExtent && colExtent) {
     auto op = SimdgroupLoadDeviceStagedMaskedOp::create(
-        b, loc, matTy, buf, originRow, originCol, stride, rowExtent, colExtent);
+        b, loc, matTy, buf, originRow, originCol, stride, rowExtent, colExtent,
+        warpIdx);
     if (transposed) op->setAttr("transposed", b.getUnitAttr());
     return op.getResult();
   }
-  llvm::SmallVector<mlir::Value, 1> warpIdx;
-  if (widx) warpIdx.push_back(widx);
   auto op = SimdgroupLoadDeviceStagedOp::create(
       b, loc, matTy, buf, originRow, originCol, stride, warpIdx);
   if (transposed) op->setAttr("transposed", b.getUnitAttr());
@@ -7148,15 +7159,12 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
   // no cross-warp dependency). Requires MT % numWarps == 0; masked multi-warp
   // is not yet supported (masked staged load has no per-warp buffer).
   const bool multiWarp = numWarps > 1;
-  if (multiWarp) {
-    if (MT % numWarps != 0) return mlir::failure();
-    if (sharedA.getMask() || accDots[0].loadB.getMask() ||
-        accDots[1].loadB.getMask() || loadB3.getMask() || store.getMask())
-      return mlir::failure();
-  }
+  // Masked multi-warp is supported here: masked staged loads carry a per-warp
+  // buffer and the epilogue is a per-warp simdgroup_fused_store.
+  if (multiWarp && MT % numWarps != 0) return mlir::failure();
   const int mPerWarp = multiWarp ? MT / numWarps : MT;
   // Register guard: per-warp live simdgroup_matrix accumulators (~2 regs/thread).
-  if (mPerWarp * NT + mPerWarp * RT > 24) return mlir::failure();
+  if (mPerWarp * NT + mPerWarp * RT > 40) return mlir::failure();
 
   // ================= Emit =================
   mlir::OpBuilder builder(forOp);

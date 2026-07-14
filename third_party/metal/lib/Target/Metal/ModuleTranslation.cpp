@@ -593,6 +593,14 @@ void ModuleTranslation::translate(
   unsigned id = _varCount;
   unsigned elems = resTy.getRows() * resTy.getCols();
   const bool transposed = op.getTransposed();
+  const bool perWarp = !op.getWarpIndex().empty();
+  auto warpDim = [&]() {
+    if (perWarp) {
+      _output << "[";
+      translateVarName(op.getWarpIndex()[0]);
+      _output << "]";
+    }
+  };
 
   _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
   printDelim();
@@ -623,7 +631,9 @@ void ModuleTranslation::translate(
     printDelim();
     _output << "\n";
     indent();
-    _output << "_stage_shared[";
+    _output << "_stage_shared";
+    warpDim();
+    _output << "[";
     if (transposed)
       _output << "sj * " << resTy.getCols() << "u + si";
     else
@@ -652,8 +662,9 @@ void ModuleTranslation::translate(
   printDelim();
   _output << "\n";
   indent();
-  _output << "simdgroup_load(v" << id << ", &_stage_shared[0], "
-          << resTy.getCols() << ")";
+  _output << "simdgroup_load(v" << id << ", &_stage_shared";
+  warpDim();
+  _output << "[0], " << resTy.getCols() << ")";
   _alloca[op] = _varCount++;
   printDelim();
 }
@@ -3876,29 +3887,31 @@ void ModuleTranslation::translate(mlir::Region &region) {
         firstStaged = op;
         return mlir::WalkResult::interrupt();
       });
-      // A kernel may carry only MASKED staged loads (no unmasked). Both share
-      // the single `_stage_shared` buffer; the masked path is single-warp.
-      mlir::triton::metal::MetalSimdgroupMatrixType maskedResTy;
+      // A kernel may carry only MASKED staged loads (no unmasked); both share
+      // the single `_stage_shared` buffer, and either may be per-warp.
+      mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp firstMasked;
       if (!firstStaged) {
         kernelOp.walk(
             [&](mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op) {
-              maskedResTy =
-                  llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
-                      op.getResult().getType());
+              firstMasked = op;
               return mlir::WalkResult::interrupt();
             });
       }
-      if (firstStaged || maskedResTy) {
+      if (firstStaged || firstMasked) {
         auto resTy = firstStaged
                          ? llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
                                firstStaged.getResult().getType())
-                         : maskedResTy;
+                         : llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+                               firstMasked.getResult().getType());
         unsigned elems = resTy.getRows() * resTy.getCols();
-        bool perWarp = firstStaged && !firstStaged.getWarpIndex().empty();
+        bool perWarp = firstStaged ? !firstStaged.getWarpIndex().empty()
+                                   : !firstMasked.getWarpIndex().empty();
         _output << "\n";
         indent();
         if (perWarp) {
-          int numWarps = mlir::triton::gpu::lookupNumWarps(firstStaged);
+          int numWarps = firstStaged
+                             ? mlir::triton::gpu::lookupNumWarps(firstStaged)
+                             : mlir::triton::gpu::lookupNumWarps(firstMasked);
           _output << "threadgroup " << typeToString(resTy.getElem())
                   << " _stage_shared[" << numWarps << "][" << elems << "]";
         } else {
@@ -4392,6 +4405,28 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << " % ";
         emit(op.getRhs());
         _output << ")";
+      })
+      .Case<mlir::arith::MinSIOp, mlir::arith::MinUIOp, mlir::arith::MaxSIOp,
+            mlir::arith::MaxUIOp>([&](Operation *op) {
+        // MSL `min`/`max` (used by e.g. tl.swizzle2d's group-size clamp). Cast
+        // both operands to the op's signedness so the overload isn't ambiguous
+        // when one operand is `tgid.x` (uint) and the other signed arithmetic.
+        auto emit = [&](mlir::Value v) {
+          if (auto o = v.getDefiningOp())
+            translateValue(o);
+          else
+            translateVarName(v);
+        };
+        bool isMin =
+            mlir::isa<mlir::arith::MinSIOp, mlir::arith::MinUIOp>(op);
+        bool isSigned =
+            mlir::isa<mlir::arith::MinSIOp, mlir::arith::MaxSIOp>(op);
+        const char *cast = isSigned ? "(int)(" : "(uint)(";
+        _output << (isMin ? "min(" : "max(") << cast;
+        emit(op->getOperand(0));
+        _output << "), " << cast;
+        emit(op->getOperand(1));
+        _output << "))";
       })
       .Case<mlir::arith::ShRUIOp>([&](mlir::arith::ShRUIOp op) {
         auto emit = [&](mlir::Value v) {
