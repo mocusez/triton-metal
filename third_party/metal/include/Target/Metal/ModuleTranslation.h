@@ -85,6 +85,7 @@ private:
   // buffer can be safely reused. Tracked here so the kernel-body walker
   // emits the declaration exactly once.
   bool _sharedStageBufferDeclared = false;
+  bool _fstoreScratchDeclared = false;
   unsigned _varCount = 0;
   bool inWhileCondition = false;
   int _curIndent = 0;

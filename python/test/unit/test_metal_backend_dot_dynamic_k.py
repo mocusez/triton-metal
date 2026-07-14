@@ -306,6 +306,28 @@ def test_dot_dynamic_k_transposed_b_multiwarp(BLK, nw):
     torch.testing.assert_close(c.cpu(), torch.matmul(x, w.t()), atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("BM,BN,BR,nw", [(32, 32, 8, 4), (64, 64, 16, 4),
+                                         (64, 128, 16, 8)])
+def test_dot_dynamic_k_fused_lora_multiwarp(BM, BN, BR, nw):
+    """Fused LoRA, multi-tile output partitioned across warps (M-tile rows).
+    BM=64,BN=128,BR=16 is medium-lora_linear.py's block shape."""
+    M, N, R, K, scale = BM, BN, BR, 64, 0.5
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randn((M, K), dtype=torch.float32).contiguous()
+    w = torch.randn((N, K), dtype=torch.float32).contiguous()
+    a = torch.randn((R, K), dtype=torch.float32).contiguous()
+    b = torch.randn((N, R), dtype=torch.float32).contiguous()
+    o = torch.zeros((M, N), dtype=torch.float32).contiguous()
+    fused_lora_kernel[(1, 1)](
+        x, w, a, b, o, K, scale,
+        x.stride(0), x.stride(1), w.stride(0), w.stride(1),
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        o.stride(0), o.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_R=BR, BLOCK_K=8, num_warps=nw)
+    ref = x @ w.t() + scale * ((x @ a.t()) @ b.t())
+    torch.testing.assert_close(o.cpu(), ref, atol=1e-2, rtol=1e-2)
+
+
 # --- Multi-tile output: one program computes a (BM/8)x(BN/8) grid of 8x8 tiles.
 @pytest.mark.parametrize("N,BN", [(16, 16), (32, 32)])
 def test_dot_dynamic_k_transposed_b_multitile(N, BN):

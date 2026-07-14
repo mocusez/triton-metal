@@ -1010,7 +1010,8 @@ def SimdgroupStoreOp : Metal_Op<"simdgroup_store"> {
   let hasVerifier = 1;
 }
 
-def SimdgroupFusedStoreOp : Metal_Op<"simdgroup_fused_store"> {
+def SimdgroupFusedStoreOp
+    : Metal_Op<"simdgroup_fused_store", [AttrSizedOperandSegments]> {
   let summary = "Store base + scale*delta (fused matmul epilogue) to device memory";
 
   let description = [{
@@ -1026,11 +1027,13 @@ def SimdgroupFusedStoreOp : Metal_Op<"simdgroup_fused_store"> {
                        Metal_SimdgroupMatrixType:$delta, F32:$scale,
                        Metal_MemRefType:$memref, UI32:$origin_row,
                        UI32:$origin_col, UI32:$stride,
-                       Variadic<UI32>:$partial_extents);
+                       Variadic<UI32>:$partial_extents,
+                       Variadic<UI32>:$warp_index);
 
   let assemblyFormat = "$base `,` $delta `,` $scale `,` $memref"
                        " `[` $origin_row `,` $origin_col `]` `,` $stride"
                        " (`partial` `[` $partial_extents^ `]`)?"
+                       " (`warp` `[` $warp_index^ `]`)?"
                        " attr-dict `:` type(operands)";
 }
 

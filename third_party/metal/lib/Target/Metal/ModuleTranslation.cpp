@@ -862,29 +862,40 @@ void ModuleTranslation::translate(
   // (optionally masked by partial_extents = [m_extent, n_extent]).
   auto matTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getBase().getType());
-  unsigned id = _varCount++;
   unsigned elems = matTy.getRows() * matTy.getCols();
   auto partialExtents = op.getPartialExtents();
   const bool masked = partialExtents.size() == 2;
-  llvm::StringRef ty = typeToString(matTy.getElem());
+  // Multi-warp: each warp writes its own output tiles, so it uses its own
+  // `[num_warps]` slice of the shared _fstore scratch (indexed by sgid).
+  const bool perWarp = !op.getWarpIndex().empty();
+  auto warpDim = [&]() {
+    if (perWarp) {
+      _output << "[";
+      translateVarName(op.getWarpIndex()[0]);
+      _output << "]";
+    }
+  };
 
-  _output << "threadgroup " << ty << " _fbase_" << id << "[" << elems << "]";
-  printDelim();
-  _output << "\n";
-  indent();
-  _output << "threadgroup " << ty << " _fdelta_" << id << "[" << elems << "]";
+  // The `_fstore_base`/`_fstore_delta` scratch is declared once at kernel top
+  // and reused across fused stores; entry barrier waits for the previous
+  // store's coop-read before overwriting.
+  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
   printDelim();
   _output << "\n";
   indent();
   _output << "simdgroup_store(";
   translateVarName(op.getBase());
-  _output << ", &_fbase_" << id << "[0], " << matTy.getCols() << ")";
+  _output << ", &_fstore_base";
+  warpDim();
+  _output << "[0], " << matTy.getCols() << ")";
   printDelim();
   _output << "\n";
   indent();
   _output << "simdgroup_store(";
   translateVarName(op.getDelta());
-  _output << ", &_fdelta_" << id << "[0], " << matTy.getCols() << ")";
+  _output << ", &_fstore_delta";
+  warpDim();
+  _output << "[0], " << matTy.getCols() << ")";
   printDelim();
   _output << "\n";
   indent();
@@ -930,9 +941,13 @@ void ModuleTranslation::translate(
     translateVarName(op.getMemref());
     _output << "[gi * ";
     translateValue(op.getStride().getDefiningOp());
-    _output << " + gj] = _fbase_" << id << "[c] + ";
+    _output << " + gj] = _fstore_base";
+    warpDim();
+    _output << "[c] + ";
     translateValueOrVarName(op.getScale());
-    _output << " * _fdelta_" << id << "[c]";
+    _output << " * _fstore_delta";
+    warpDim();
+    _output << "[c]";
     printDelim();
     if (masked) {
       _output << "\n";
@@ -3892,6 +3907,33 @@ void ModuleTranslation::translate(mlir::Region &region) {
         }
         printDelim();
         _sharedStageBufferDeclared = true;
+      }
+      // Fused-store scratch, shared across all simdgroup_fused_store ops (they
+      // run sequentially with barriers) so threadgroup memory does not scale
+      // with the number of output tiles.
+      if (!_fstoreScratchDeclared) {
+        mlir::triton::metal::SimdgroupFusedStoreOp firstFused;
+        kernelOp.walk([&](mlir::triton::metal::SimdgroupFusedStoreOp op) {
+          firstFused = op;
+          return mlir::WalkResult::interrupt();
+        });
+        if (firstFused) {
+          auto ft = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+              firstFused.getBase().getType());
+          unsigned felems = ft.getRows() * ft.getCols();
+          bool fpw = !firstFused.getWarpIndex().empty();
+          auto fty = typeToString(ft.getElem());
+          for (const char *nm : {"_fstore_base", "_fstore_delta"}) {
+            _output << "\n";
+            indent();
+            _output << "threadgroup " << fty << " " << nm;
+            if (fpw)
+              _output << "[" << mlir::triton::gpu::lookupNumWarps(firstFused) << "]";
+            _output << "[" << felems << "]";
+            printDelim();
+          }
+          _fstoreScratchDeclared = true;
+        }
       }
     }
     for (auto &op : region.getOps()) {
