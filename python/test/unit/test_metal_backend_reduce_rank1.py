@@ -174,6 +174,26 @@ def test_reduce_sum_computed_cone(B, V):
 
 
 @triton.jit
+def _per_row_mean_kernel(X, Out, N, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    a = tl.load(X + row * N + cols, mask=cols < N, other=0.0)
+    tl.store(Out + row, tl.sum(a, axis=0) / N)
+
+
+@pytest.mark.parametrize("M, N", [(1, 128), (4, 128), (8, 300), (2, 1024)])
+def test_reduce_per_row_multiprogram(M, N):
+    # Multi-program per-row reduce: each program (grid=(M,)) reduces its OWN row
+    # via the `X + row*N` scalar base offset. Regression for the masked-reduce
+    # path dropping that offset (every program read row 0).
+    torch.manual_seed(M * 1000 + N)
+    x = torch.randn((M, N), dtype=torch.float32).contiguous()
+    out = torch.zeros((M,), dtype=torch.float32).contiguous()
+    _per_row_mean_kernel[(M,)](x, out, N, BLOCK=triton.next_power_of_2(N))
+    torch.testing.assert_close(out.cpu(), x.cpu().mean(dim=1), atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
 def _min_idx_ge_kernel(val_ptr, out_ptr, V, TARGET, BLOCK: tl.constexpr):
     b = tl.program_id(0)
     idx = tl.arange(0, BLOCK)

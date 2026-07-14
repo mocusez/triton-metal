@@ -2972,6 +2972,15 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
         mlir::arith::AddIOp::create(rewriter, loc, localTid, kOff.getResult())
             .getResult();
     mlir::Value addrI32 = scalarizeConeAtIndex(offsetTensor, idx, rewriter, loc);
+    // Add the scalar tt.addptr chain offset (e.g. the per-program row base
+    // `program_id * N`) carried in the load ptr's splat base. `offsetTensor` is
+    // only the per-COLUMN tensor offset; without this, every threadgroup reads
+    // program 0's row (multi-program per-row reduce, e.g. layer-norm mean).
+    if (addrI32)
+      if (mlir::Value soff =
+              accumulateScalarAddPtrOffsets(loadOp.getPtr(), rewriter, loc))
+        addrI32 =
+            mlir::arith::AddIOp::create(rewriter, loc, addrI32, soff).getResult();
     mlir::Value colv = scalarizeConeAtIndex(colIdxCone, idx, rewriter, loc);
     if (!addrI32 || !colv) {
       // Inspection passed but a cone op is unsupported: bail. (The partial ops
