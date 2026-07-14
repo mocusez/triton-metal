@@ -69,6 +69,18 @@ def reduce_max_rank1_kernel(
     tl.store(out_ptr + 0, s)
 
 
+@triton.jit
+def reduce_min_rank1_kernel(
+    x_ptr,
+    out_ptr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    s = tl.min(x, axis=0)
+    tl.store(out_ptr + 0, s)
+
+
 _NUM_WARPS = 8   # threads_per_block = num_warps * 32 = 256
 
 
@@ -115,4 +127,17 @@ def test_reduce_max_rank1_i32(BLOCK):
     out = torch.zeros((1,), dtype=torch.int32).contiguous()
     reduce_max_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
     expected = torch.max(x.cpu()).to(torch.int32)
+    assert out[0].item() == expected.item()
+
+
+@pytest.mark.parametrize("BLOCK", _block_params())
+def test_reduce_min_rank1_i32(BLOCK):
+    # tl.min on i32 emits an arith.minsi combine, accepted by the pre-pass and
+    # lowered via a signed (si32) accumulator with identity INT32_MAX. MSL emits
+    # `min(int32_t(a), int32_t(b))` so the comparison is signed.
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randint(-100, 100, (BLOCK,), dtype=torch.int32).contiguous()
+    out = torch.zeros((1,), dtype=torch.int32).contiguous()
+    reduce_min_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    expected = torch.min(x.cpu()).to(torch.int32)
     assert out[0].item() == expected.item()

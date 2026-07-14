@@ -4836,13 +4836,15 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   // maxOp lowers to MSL's `max(a, b)` function call (rank-1 reduce spec
   // `.omc/specs/deep-interview-metal-rank1-reduce.md`). All other ops
   // lower to an infix C operator.
-  if (op.getBinaryOperator() == OP::maxOp) {
-    // Emit `max(T(lhs), T(rhs))` where T is the result element type. The
-    // explicit cast forces a SIGNED comparison for i32 signed-max even when an
-    // operand is rendered from ui32 storage (the ui32->si32 MLIR bridge is a
-    // no-op in MSL). For f32 this is `max(float(x), float(y))` — same value.
+  if (op.getBinaryOperator() == OP::maxOp ||
+      op.getBinaryOperator() == OP::minOp) {
+    // Emit `max(T(lhs), T(rhs))` / `min(...)` where T is the result element
+    // type. The explicit cast forces a SIGNED comparison for i32 signed-min/max
+    // even when an operand is rendered from ui32 storage (the ui32->si32 MLIR
+    // bridge is a no-op in MSL). For f32 this is `max/min(float(x), float(y))`.
+    const char *fn = op.getBinaryOperator() == OP::minOp ? "min" : "max";
     auto ty = typeToString(op.getResult().getType());
-    _output << "max(" << ty << "(";
+    _output << fn << "(" << ty << "(";
     translateValueOrVarName(op.getLhs());
     _output << "), " << ty << "(";
     translateValueOrVarName(op.getRhs());
@@ -4895,7 +4897,8 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
     _output << "||";
     break;
   case OP::maxOp:
-    llvm_unreachable("maxOp handled above via function-call form");
+  case OP::minOp:
+    llvm_unreachable("min/maxOp handled above via function-call form");
   }
 
   _output << " (";

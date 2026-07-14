@@ -2041,9 +2041,12 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // a si32-typed butterfly/accumulator so MSL's `max` performs a SIGNED
   // comparison (see storeTy and the BinaryExpOp maxOp translator).
   bool isMaxI = mlir::isa<mlir::arith::MaxSIOp>(combine);
+  // Triton's tl.min on signed i32 emits arith.minsi (signed min). Mirrors
+  // isMaxI: si32-typed accumulator + BinaryExpOp minOp, identity INT32_MAX.
+  bool isMinI = mlir::isa<mlir::arith::MinSIOp>(combine);
   if (isF32 && !(isAddF || isMaxF))
     return mlir::failure();
-  if (isI32 && !(isAddI || isMaxI))
+  if (isI32 && !(isAddI || isMaxI || isMinI))
     return mlir::failure();
 
   // Derive tpb from the blocked encoding directly (do NOT use
@@ -2071,7 +2074,7 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // `int32_t` and `max(...)` compares as signed. f32 passes through.
   mlir::Type storeTy = elemTy;
   if (isI32)
-    storeTy = isMaxI ? mlir::Type(si32) : mlir::Type(ui32);
+    storeTy = (isMaxI || isMinI) ? mlir::Type(si32) : mlir::Type(ui32);
 
   // Combine dispatch helper: emits metal.BinaryExpOp for storeTy values.
   // The MSL translator handles metal.BinaryExpOp for all scalar types;
@@ -2087,10 +2090,11 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
                                  rhs)
           .getResult();
     }
-    // arith.maximumf / arith.maxsi → metal.BinaryExpOp maxOp (MSL max(a, b)).
-    auto maxEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
-                                              BinaryExpOperator::maxOp);
-    return BinaryExpOp::create(rewriter, loc, lhs.getType(), maxEnum, lhs, rhs)
+    // arith.maximumf / arith.maxsi → metal.BinaryExpOp maxOp (MSL max(a, b));
+    // arith.minsi → minOp (MSL min(a, b)).
+    auto op = isMinI ? BinaryExpOperator::minOp : BinaryExpOperator::maxOp;
+    auto opEnum = BinaryExpOperatorAttr::get(rewriter.getContext(), op);
+    return BinaryExpOp::create(rewriter, loc, lhs.getType(), opEnum, lhs, rhs)
         .getResult();
   };
 
@@ -2112,8 +2116,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
                  rewriter.getF32FloatAttr(-std::numeric_limits<float>::max()))
           .getResult();
     }
-    // i32 add → 0; i32 signed-max → INT32_MIN (max(x, INT_MIN) == x).
-    int32_t identVal = isMaxI ? std::numeric_limits<int32_t>::min() : 0;
+    // i32 add → 0; i32 signed-max → INT32_MIN (max(x, INT_MIN) == x);
+    // i32 signed-min → INT32_MAX (min(x, INT_MAX) == x).
+    int32_t identVal = 0;
+    if (isMaxI)
+      identVal = std::numeric_limits<int32_t>::min();
+    else if (isMinI)
+      identVal = std::numeric_limits<int32_t>::max();
     auto z = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getI32IntegerAttr(identVal));
     return mlir::UnrealizedConversionCastOp::create(
@@ -8476,6 +8485,15 @@ struct ConvertTritonGPUToMetalPass
         // i32 signed max (Triton tl.max on i32). Wired for rank-1 via
         // lowerRank1Reduce's si32 butterfly/accumulator. Rank-2 i32 max is
         // not yet implemented, so leave it rejected (falls through to L3c).
+        if (rtt.getRank() == 1)
+          if (auto intTy =
+                  mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
+            if (intTy.getWidth() == 32)
+              combineOk = true;
+      } else if (combineName == "arith.minsi") {
+        // i32 signed min (Triton tl.min on i32). Mirrors arith.maxsi — wired for
+        // rank-1 via lowerRank1Reduce's si32 accumulator (identity INT32_MAX).
+        // Rank-2 i32 min not implemented, so leave it rejected (→ L3c).
         if (rtt.getRank() == 1)
           if (auto intTy =
                   mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))

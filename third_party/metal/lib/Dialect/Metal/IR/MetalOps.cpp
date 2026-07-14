@@ -422,6 +422,7 @@ void BinaryExpOp::build(OpBuilder &builder, OperationState &result,
   case OP::divOp:
   case OP::remOp:
   case OP::maxOp:
+  case OP::minOp:
     result.addTypes(lhs.getType());
     break;
   case OP::eqOp:
@@ -457,6 +458,7 @@ llvm::LogicalResult BinaryExpOp::verify() {
   case OP::divOp:
   case OP::remOp:
   case OP::maxOp:
+  case OP::minOp:
     if (lhsType != resultType)
       return emitOpError() << "result type mismatch";
     break;

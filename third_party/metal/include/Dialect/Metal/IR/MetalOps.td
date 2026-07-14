@@ -386,6 +386,10 @@ def BinaryExpOperatorOr : I64EnumAttrCase<"orOp", 12>;
 // maxsi` can lower to a single BinaryExp node, mirroring how `addOp`
 // lowers to `(a) + (b)` for `arith.addf` / `arith.addi`.
 def BinaryExpOperatorMax : I64EnumAttrCase<"maxOp", 13>;
+// Rank-1 reduce min extension: emit MSL `min(a, b)` via the function-call form,
+// mirroring maxOp, so `arith.minsi` / `arith.minnumf` reduce combines lower to a
+// single BinaryExp node (identity INT32_MAX / +FLT_MAX in lowerRank1Reduce).
+def BinaryExpOperatorMin : I64EnumAttrCase<"minOp", 14>;
 
 def BinaryExpOperator : I64EnumAttr<
     "BinaryExpOperator", "",
@@ -402,7 +406,8 @@ def BinaryExpOperator : I64EnumAttr<
      BinaryExpOperatorGe,
      BinaryExpOperatorAnd,
      BinaryExpOperatorOr,
-     BinaryExpOperatorMax]> {
+     BinaryExpOperatorMax,
+     BinaryExpOperatorMin]> {
   let cppNamespace = "mlir::triton::metal";
 }
 
