@@ -33,16 +33,22 @@ struct Indent {
 // sites must route through this helper. Finite values fall through to the
 // existing `<<` formatter to preserve precision contracts elsewhere in the TU.
 static void emitFloatLiteral(llvm::raw_ostream &os, mlir::FloatAttr attr) {
+  // MSL permits an implicit float->half conversion but NOT float->bfloat, so a
+  // bare `0.0` literal cannot be assigned/yielded where a `bfloat` is expected
+  // (e.g. a masked load's `other=0.0`). Wrap bf16 constants in `bfloat(...)`;
+  // f16 (implicit-ok) and f32 stay bare literals.
+  const bool isBf16 = attr.getType().isBF16();
+  if (isBf16)
+    os << "bfloat(";
   const llvm::APFloat &v = attr.getValue();
-  if (v.isNaN()) {
+  if (v.isNaN())
     os << "NAN";
-    return;
-  }
-  if (v.isInfinity()) {
+  else if (v.isInfinity())
     os << (v.isNegative() ? "-INFINITY" : "INFINITY");
-    return;
-  }
-  os << attr.getValueAsDouble();
+  else
+    os << attr.getValueAsDouble();
+  if (isBf16)
+    os << ")";
 }
 
 // MSL is a C++14 dialect, so the emitted entry-point name must not collide

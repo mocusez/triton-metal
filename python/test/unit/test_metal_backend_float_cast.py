@@ -42,10 +42,9 @@ def _cast_roundtrip_kernel(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
     tl.store(y_ptr + offs, y, mask=mask)
 
 
-# bf16 is deferred: MSL rejects an implicit float->bfloat assignment (e.g. the
-# masked-load `other=0.0` constant), a separate constant-emission gap unrelated
-# to extf/truncf. fp16 (the common layer-norm/softmax/attention shape) is here.
-@pytest.mark.parametrize("dtype", [torch.float16])
+# bf16 rides the same extf/truncf path; its float constants (e.g. the masked-load
+# `other=0.0`) are wrapped `bfloat(...)` since MSL forbids implicit float->bfloat.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("N", [64, 200, 1000])
 def test_extf_truncf_roundtrip(dtype, N):
     torch.manual_seed(N)

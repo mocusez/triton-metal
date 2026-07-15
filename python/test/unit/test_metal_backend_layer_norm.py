@@ -69,7 +69,8 @@ def _layer_norm_fwd(X, Y, W, B, Mean, Rstd, stride, N, eps,
 
 # Power-of-2 N: E==1 (128), E>1 (256/512/1024). Non-power-of-2 N hits a separate
 # ttg.convert_layout (spt>1 staged-transpose) limitation, unrelated to layer-norm.
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M, N", [(4, 128), (8, 256), (2, 512), (16, 1024)])
 def test_layer_norm_forward(dtype, M, N):
     torch.manual_seed(M * 1000 + N)
@@ -90,5 +91,5 @@ def test_layer_norm_forward(dtype, M, N):
     mu = xc.mean(1, keepdim=True)
     var = xc.var(1, unbiased=False, keepdim=True)
     ref = (xc - mu) / torch.sqrt(var + eps) * w.cpu().float() + b.cpu().float()
-    tol = 5e-3 if dtype == torch.float16 else 1e-3
+    tol = {torch.float32: 1e-3, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
     torch.testing.assert_close(y.cpu().float(), ref, atol=tol, rtol=tol)
