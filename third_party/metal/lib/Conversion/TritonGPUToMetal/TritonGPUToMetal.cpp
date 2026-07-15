@@ -8451,16 +8451,41 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
 
   // Safety: only rewrite self-contained cones. Every cone value's users must be
   // the cvt itself or another cone op; otherwise an external op depends on the
-  // source encoding and rewriting would corrupt it. Bail (leaving the cvt for
-  // the classifier) rather than risk a miscompile.
+  // source encoding and rewriting it in place would corrupt them.
   llvm::SmallPtrSet<mlir::Operation *, 32> coneOps;
   for (auto v : ordered)
     if (auto *d = v.getDefiningOp())
       coneOps.insert(d);
-  for (auto v : ordered)
+  auto usedExternally = [&](mlir::Value v) {
     for (auto *user : v.getUsers())
       if (user != cvt.getOperation() && !coneOps.count(user))
-        return false;
+        return true;
+    return false;
+  };
+  // A cheap, side-effect-free LEAF (splat / make_range / constant) shared with
+  // ops outside the cone — e.g. `splat(N)` (the mask bound) CSE'd across a
+  // kernel's loops — would otherwise force a bail. CLONE it into a cone-local
+  // copy and redirect the cone's uses to the clone, leaving the original for the
+  // external consumers, so the in-place re-encode below stays a valid repack.
+  for (size_t i = 0; i < ordered.size(); ++i) {
+    mlir::Value v = ordered[i];
+    if (!usedExternally(v))
+      continue;
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def || !mlir::isa<mlir::triton::SplatOp, mlir::triton::MakeRangeOp,
+                           mlir::arith::ConstantOp>(def))
+      return false; // non-leaf shared value — too risky to duplicate
+    mlir::OpBuilder b(def);
+    mlir::Operation *clone = b.clone(*def);
+    mlir::Value cloneV = clone->getResult(0);
+    v.replaceUsesWithIf(cloneV, [&](mlir::OpOperand &use) {
+      mlir::Operation *owner = use.getOwner();
+      return owner == cvt.getOperation() || coneOps.count(owner);
+    });
+    ordered[i] = cloneV; // rewrite the clone (cone-local), not the shared orig
+    coneOps.erase(def);
+    coneOps.insert(clone);
+  }
 
   // Rewrite every cone value's encoding to the destination. Operand/result
   // encodings stay mutually consistent because the whole cone moves together;

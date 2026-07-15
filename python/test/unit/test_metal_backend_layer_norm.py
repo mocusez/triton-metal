@@ -67,11 +67,13 @@ def _layer_norm_fwd(X, Y, W, B, Mean, Rstd, stride, N, eps,
         tl.store(Y + cols, y, mask=mask)
 
 
-# Power-of-2 N: E==1 (128), E>1 (256/512/1024). Non-power-of-2 N hits a separate
-# ttg.convert_layout (spt>1 staged-transpose) limitation, unrelated to layer-norm.
+# Power-of-2 N (E==1 at 128, E>1 at 256/1024) AND non-power-of-2 N (700/333) —
+# the latter coalesces to a divergent spt=4↔spt=1 blocked convert_layout that is
+# normalized away (cloning the CSE-shared mask-bound splat).
 @pytest.mark.parametrize("dtype",
                          [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("M, N", [(4, 128), (8, 256), (2, 512), (16, 1024)])
+@pytest.mark.parametrize("M, N", [(4, 128), (8, 256), (16, 1024), (3, 700),
+                                  (5, 333)])
 def test_layer_norm_forward(dtype, M, N):
     torch.manual_seed(M * 1000 + N)
     dev = "mps"
