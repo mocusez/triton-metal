@@ -26,6 +26,7 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -8779,6 +8780,118 @@ static void structureEarlyReturns(mlir::ModuleOp moduleOp) {
 // structural type conversion rewrites/empties the scf.if regions concurrently,
 // which would race the ScanLowering cone walk. No-op unless the exact shape
 // matches.
+// True if `v`'s producer cone (restricted to ops inside `body`) references
+// `target` — used to confirm the loop-carried delta is independent of the acc.
+static bool coneUsesValue(mlir::Value v, mlir::Value target, mlir::Block *body,
+                          llvm::DenseSet<void *> &seen) {
+  if (v == target)
+    return true;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || def->getBlock() != body)
+    return false;
+  if (!seen.insert(v.getAsOpaquePointer()).second)
+    return false;
+  for (auto o : def->getOperands())
+    if (coneUsesValue(o, target, body, seen))
+      return true;
+  return false;
+}
+
+// Clone the producer cone of `v` that lives inside `oldBody` into the current
+// insertion point of `bb`, remapping via `map` (which pre-seeds oldIv->newIv).
+// Values defined OUTSIDE oldBody (loop-invariant) are used as-is. Post-order so
+// operands are cloned before their users.
+static mlir::Value cloneConeInto(mlir::Value v, mlir::IRMapping &map,
+                                 mlir::OpBuilder &bb, mlir::Block *oldBody) {
+  if (map.contains(v))
+    return map.lookup(v);
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || def->getBlock() != oldBody)
+    return v; // loop-invariant / block arg handled by the pre-seeded map
+  for (mlir::Value operand : def->getOperands())
+    cloneConeInto(operand, map, bb, oldBody);
+  bb.clone(*def, map);
+  return map.lookup(v);
+}
+
+// W: reduce over a LOOP-CARRIED sum accumulator. `sum(scf.for(acc += delta))`
+// (delta independent of acc) is reassociated to a SCALAR-accumulating loop
+// `scf.for(s += sum(delta))` because addf is associative/commutative. This
+// sidesteps the (unrepresentable) reduce over a loop-carried tensor iter_arg at
+// BLOCK>tpb: the inner `sum(delta)` is a normal rank-1 reduce over a device-
+// rooted cone, and the outer accumulation is a scalar scf.for. Layer-norm /
+// RMSNorm mean+variance are exactly this shape. Done BEFORE conversion.
+static void reassociateLoopCarriedSumReduce(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp> reduces;
+  moduleOp.walk([&](mlir::triton::ReduceOp r) { reduces.push_back(r); });
+  for (auto R : reduces) {
+    if (R.getSrcs().size() != 1 || R->getNumResults() != 1)
+      continue;
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(R.getSrcs()[0].getType());
+    if (!rtt || rtt.getRank() != 1 || !rtt.getElementType().isF32())
+      continue;
+    // Reduce combine must be arith.addf (sum).
+    mlir::Operation *combine = nullptr;
+    if (R->getNumRegions() > 0 && !R->getRegion(0).empty())
+      for (auto &n : R->getRegion(0).front())
+        if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
+          combine = &n;
+          break;
+        }
+    if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+      continue;
+    // Source must be an scf.for result whose yield is `addf(iterArg, delta)`.
+    auto forOp = R.getSrcs()[0].getDefiningOp<mlir::scf::ForOp>();
+    if (!forOp || forOp.getNumResults() != 1)
+      continue;
+    unsigned idx = mlir::cast<mlir::OpResult>(R.getSrcs()[0]).getResultNumber();
+    auto yieldOp =
+        mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
+    auto add = yieldOp.getOperand(idx).getDefiningOp<mlir::arith::AddFOp>();
+    if (!add)
+      continue;
+    mlir::Value iterArg = forOp.getRegionIterArg(idx);
+    mlir::Value delta;
+    if (add.getLhs() == iterArg)
+      delta = add.getRhs();
+    else if (add.getRhs() == iterArg)
+      delta = add.getLhs();
+    else
+      continue;
+    llvm::DenseSet<void *> seen;
+    if (coneUsesValue(delta, iterArg, forOp.getBody(), seen))
+      continue; // delta must not depend on the accumulator
+
+    mlir::OpBuilder b(forOp);
+    auto loc = forOp.getLoc();
+    // sinit = sum(init) — clone R over the loop's init value (usually zeros→0).
+    mlir::Operation *sinitR = b.clone(*R.getOperation());
+    sinitR->setOperand(0, forOp.getInitArgs()[idx]);
+    mlir::Value sinit = sinitR->getResult(0);
+
+    auto newFor = mlir::scf::ForOp::create(
+        b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+        mlir::ValueRange{sinit},
+        [&](mlir::OpBuilder &bb, mlir::Location ll, mlir::Value iv,
+            mlir::ValueRange args) {
+          mlir::IRMapping map;
+          map.map(forOp.getInductionVar(), iv);
+          mlir::Value deltaCloned =
+              cloneConeInto(delta, map, bb, forOp.getBody());
+          mlir::Operation *dr = bb.clone(*R.getOperation());
+          dr->setOperand(0, deltaCloned);
+          mlir::Value sNew =
+              mlir::arith::AddFOp::create(bb, ll, args[0], dr->getResult(0))
+                  .getResult();
+          mlir::scf::YieldOp::create(bb, ll, sNew);
+        });
+    R->getResult(0).replaceAllUsesWith(newFor.getResult(0));
+    R.erase();
+    if (forOp->use_empty())
+      forOp.erase();
+  }
+}
+
 static void flattenUniformScanInputScfIf(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::IfOp> targets;
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
@@ -8870,6 +8983,12 @@ struct ConvertTritonGPUToMetalPass
     // the conversion (the SCF structural conversion would otherwise race the
     // ScanLowering cone walk on the scf.if regions).
     flattenUniformScanInputScfIf(moduleOp);
+
+    // Reassociate `sum(scf.for(acc += delta))` into a scalar-accumulating loop
+    // `scf.for(s += sum(delta))` so the reduce is over a device-rooted cone, not
+    // an (unrepresentable) loop-carried tensor iter_arg at BLOCK>tpb. Layer-norm
+    // / RMSNorm mean+variance.
+    reassociateLoopCarriedSumReduce(moduleOp);
 
     // Phase 2: recognize the online-softmax flash-attention loop and replace
     // it + epilogue with a single `metal.flash_attention` op BEFORE any cvt
