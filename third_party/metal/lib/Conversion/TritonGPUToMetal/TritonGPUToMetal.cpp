@@ -369,6 +369,15 @@ static mlir::Value emitLocalTid(mlir::OpBuilder &rewriter, mlir::Location loc,
       .getResult();
 }
 
+static mlir::Value emitLocalTidUI32(mlir::OpBuilder &rewriter,
+                                    mlir::Location loc, int64_t tpb) {
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  return mlir::UnrealizedConversionCastOp::create(
+             rewriter, loc, mlir::TypeRange{ui32},
+             mlir::ValueRange{emitLocalTid(rewriter, loc, tpb)})
+      .getResult(0);
+}
+
 static mlir::Value emitPerIterIndex(const TileInfo &tile,
                                     mlir::scf::ForOp parentFor,
                                     mlir::ConversionPatternRewriter &rewriter,
@@ -3279,6 +3288,21 @@ struct StagedTile {
 };
 static const llvm::DenseMap<mlir::Value, StagedTile> *g_tileBuffers = nullptr;
 
+// Chained reduces: a rank-2 axis=1 `tt.reduce` RESULT -> the threadgroup
+// `rowBuf[M]` it was reduced into. A consuming reduce's cone reads `rowBuf[r]`
+// for the row IT is filling.
+//
+// The Inc-2.5 staging resolves such a leaf through `getRemappedValue`, i.e. the
+// producer's per-thread scalar. That only agrees with the consumer's row when
+// the producer's readback is itself row-per-thread. It is not, once the result
+// is ALSO broadcast back into a 2D tile — a full softmax needs `m` at two
+// different indexings at once (`flat / N` for the materialised `p`, `localTid`
+// for the reduce over it), which one SSA value cannot provide. Reading the
+// buffer directly gives the consumer its own indexing and leaves the producer's
+// per-thread value to the materialised path.
+static const llvm::DenseMap<mlir::Value, mlir::Value> *g_reduceRowBufs =
+    nullptr;
+
 // buf[r*N + n], or null if `v` is not a staged tile.
 static mlir::Value readStagedTile(mlir::Value v, mlir::Value rVal,
                                   mlir::Value nVal,
@@ -3333,6 +3357,20 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     auto it = g_stagedLeaves->find(v);
     if (it != g_stagedLeaves->end())
       return it->second;
+  }
+  // Chained reduce: a prior reduce's result resolves to ITS rowBuf[idxVal].
+  if (g_reduceRowBufs) {
+    auto it = g_reduceRowBufs->find(v);
+    if (it != g_reduceRowBufs->end()) {
+      mlir::Value idxUI32 =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{idxVal})
+              .getResult(0);
+      mlir::Type eltTy =
+          mlir::cast<MetalMemRefType>(it->second.getType()).getType();
+      return GetElementOp::create(rewriter, loc, eltTy, it->second, idxUI32)
+          .getResult();
+    }
   }
   // W-C scan: a scan-result placeholder resolves to scanbuf[idxVal].
   if (g_scanBuffers) {
@@ -3959,6 +3997,8 @@ static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
     return nullptr;
   if (g_tileBuffers && g_tileBuffers->count(v))
     return nullptr;
+  if (g_reduceRowBufs && g_reduceRowBufs->count(v))
+    return nullptr;
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
     return nullptr;
@@ -4001,6 +4041,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   // Inc 2.5: a staged per-row leaf is accepted (read from the thread's own
   // scalar during the inline fill).
   if (g_stagedLeaves && g_stagedLeaves->count(v))
+    return true;
+  if (g_reduceRowBufs && g_reduceRowBufs->count(v))
     return true;
   // W-C scan: a scan-result placeholder (buffer registered) is accepted.
   if (g_scanBuffers && g_scanBuffers->count(v))
@@ -4806,9 +4848,11 @@ static void preprocessLoopCarriedReduceTiles(mlir::ModuleOp moduleOp,
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   ReduceLowering(const mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
-                 const LoopCarriedTileMap *tiles)
-      : OpConversionPattern(tc, ctx), tileMap(tiles) {}
+                 const LoopCarriedTileMap *tiles,
+                 llvm::DenseMap<mlir::Value, mlir::Value> *rowBufs)
+      : OpConversionPattern(tc, ctx), tileMap(tiles), rowBufMap(rowBufs) {}
   const LoopCarriedTileMap *tileMap;
+  llvm::DenseMap<mlir::Value, mlir::Value> *rowBufMap;
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ReduceOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
@@ -5017,26 +5061,44 @@ struct ReduceLowering
     // consumes. The reduce result itself carries a #ttg.slice encoding (no
     // blocked tile); walk forward to the first blocked-typed user (the
     // convert_layout / store value) to recover the per-thread output indexing.
+    //
+    // Take the LARGEST such tensor, not the first. The first is the
+    // `tt.expand_dims` shim the broadcast goes through — `tensor<Mx1xf32>` —
+    // whose shape says nothing about the geometry the consuming threads
+    // actually iterate. Reading the row out of a shape-[M,1] tile gives
+    // `flat / 1`, i.e. the flat index, which for a chained softmax
+    // (`p = exp(x - m[:, None])`) indexed rowBuf[M] with a value in [0, M*N).
+    // `findTileInfo` skips the same 16x1 / 1x16 shims for the same reason.
     std::optional<TileInfo> outTile;
     {
       llvm::SmallVector<mlir::Operation *, 8> wl;
       llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+      int64_t bestSize = 0;
+      auto consider = [&](mlir::Type t) {
+        auto ti = tileFromTensor(t);
+        if (!ti)
+          return false;
+        int64_t sz = 1;
+        for (auto s : ti->shape)
+          sz *= s;
+        if (sz > bestSize) {
+          bestSize = sz;
+          outTile = ti;
+        }
+        return true;
+      };
       for (auto *u : op->getResult(0).getUsers())
         wl.push_back(u);
-      while (!wl.empty() && !outTile) {
+      while (!wl.empty()) {
         auto *u = wl.pop_back_val();
         if (!seen.insert(u).second)
           continue;
         if (auto st = mlir::dyn_cast<mlir::triton::StoreOp>(u)) {
-          if (auto ti = tileFromTensor(st.getValue().getType()))
-            outTile = ti;
+          consider(st.getValue().getType());
           continue;
         }
         for (auto res : u->getResults()) {
-          if (auto ti = tileFromTensor(res.getType())) {
-            outTile = ti;
-            break;
-          }
+          consider(res.getType());
           for (auto *uu : res.getUsers())
             wl.push_back(uu);
         }
@@ -5329,9 +5391,54 @@ struct ReduceLowering
     // -------- Per-row result read (inside the tile loop). --------
     // result = rowBuf[outIdx], where outIdx is the SAME per-iter index the
     // downstream store uses (a bijection over [0, M)).
+    //
+    // When the consumer is a RANK-2 tile the result is being broadcast back
+    // into the tile (`p = exp(x - m[:, None])`), so element (r, n) needs
+    // rowBuf[r] — not rowBuf[flat]. With order=[1,0] the per-iteration flat
+    // index is r*N + n, so the row is flat / N. Reading rowBuf at the flat
+    // index instead walks off the end of an [M] buffer: for a 32x64 tile that
+    // is an index in [0, 2048) into 32 slots, which is how chained softmax
+    // (`m` correct, `s` correct, `p` garbage) came out silently wrong.
     mlir::Value outIdxUI32;
+    const bool outIs2D =
+        outTile && outTile->rank == 2 && outTile->shape.size() == 2;
+    auto rowOfFlat = [&](mlir::Value flatUI32) -> mlir::Value {
+      mlir::Value flatI32 =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{flatUI32})
+              .getResult(0);
+      auto cOutN = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(outTile->shape[1])));
+      mlir::Value row = mlir::arith::DivSIOp::create(rewriter, loc, flatI32,
+                                                     cOutN.getResult())
+                            .getResult();
+      auto cMrow = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+      // Threads past the tile's rows would otherwise read past rowBuf; their
+      // downstream store is already masked off.
+      row = mlir::arith::RemSIOp::create(rewriter, loc, row, cMrow.getResult())
+                .getResult();
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{row})
+          .getResult(0);
+    };
+    //
+    // The row decomposition applies ONLY when a tile loop exists, i.e. when the
+    // thread's tile position really is `tid*E + iv`. Without one, the reduce
+    // result's per-thread value is also what the Inc-2.5 staging hands a
+    // CONSUMING reduce as `getRemappedValue`, and that contract is row ==
+    // localTid (each fill thread owns its own row). Applying `flat / N` there
+    // feeds the next reduce the wrong row — chained softmax's `s` regresses
+    // exactly that way.
     if (tileLoop && outTile && outTile->elemPerThread > 1 && !inlineStaged) {
-      outIdxUI32 = emitPerIterIndex(*outTile, tileLoop, rewriter, loc);
+      mlir::Value flat = emitPerIterIndex(*outTile, tileLoop, rewriter, loc);
+      outIdxUI32 = outIs2D ? rowOfFlat(flat) : flat;
+    } else if (outIs2D && !inlineStaged) {
+      // No tile loop (the tile is exactly tpb elements, E == 1): the thread's
+      // flat tile position IS its local id, so the row is still flat / N.
+      outIdxUI32 = rowOfFlat(emitLocalTidUI32(rewriter, loc,
+                                              outTile->threadsPerBlock));
     } else {
       // No tile loop (M <= tpb): each thread holds one output row. Read
       // rowBuf[tid mod M] so threads with tid >= M (whose downstream store is
@@ -5352,6 +5459,11 @@ struct ReduceLowering
                        mlir::ValueRange{modM.getResult()})
                        .getResult(0);
     }
+    // Register this reduce's rowBuf so a LATER reduce whose cone reads this
+    // result can index it at the row IT is filling (chained softmax).
+    if (rowBufMap)
+      (*rowBufMap)[op->getResult(0)] = rowBuf;
+
     mlir::Value result =
         GetElementOp::create(rewriter, loc, storeTy, rowBuf, outIdxUI32)
             .getResult();
@@ -10723,6 +10835,12 @@ struct ConvertTritonGPUToMetalPass
     LoopCarriedTileMap loopCarriedTiles;
     preprocessLoopCarriedReduceTiles(moduleOp, loopCarriedTiles);
 
+    // Chained reduces: each rank-2 axis=1 reduce registers its rowBuf here as
+    // it lowers, so a LATER reduce whose cone reads the earlier result gets it
+    // at its own row instead of through the producer's per-thread scalar.
+    llvm::DenseMap<mlir::Value, mlir::Value> reduceRowBufs;
+    g_reduceRowBufs = &reduceRowBufs;
+
     TritonGPUToMetalTypeConverter typeConverter(ctx);
 
     mlir::ConversionTarget target(*ctx);
@@ -10797,7 +10915,8 @@ struct ConvertTritonGPUToMetalPass
                  typeConverter, ctx);
     // ReduceLowering needs the (reduce op)->staged tile mapping that
     // `preprocessLoopCarriedReduceTiles` built above.
-    patterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles);
+    patterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles,
+                                 &reduceRowBufs);
     // MaskedStoreLowering needs the (func, elem-type)→scratch mapping
     // populated by `preprocessMaskedStoreSentinels` above. See L1d2c Phase B.
     patterns.add<MaskedStoreLowering>(typeConverter, ctx, &scratchMap);
@@ -10823,6 +10942,7 @@ struct ConvertTritonGPUToMetalPass
     auto conversionResult =
         mlir::applyFullConversion(moduleOp, target, std::move(patterns));
     g_scanBuffers = nullptr; // scanBufMap goes out of scope below
+    g_reduceRowBufs = nullptr;
     if (mlir::failed(conversionResult)) {
       signalPassFailure();
       return;
