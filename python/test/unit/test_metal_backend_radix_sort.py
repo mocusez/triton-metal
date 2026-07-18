@@ -191,3 +191,42 @@ def test_scan_buffer_pooling_local_rank(ndig):
         expected = torch.where(d == b, torch.cumsum(is_b, 0) - is_b, expected)
 
     torch.testing.assert_close(out.to(torch.int64), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ndig", [2, 4, 16])
+def test_scan_buffer_pooling_with_reduce_consumers(ndig):
+    """Cumsums each consumed by a `tl.sum` — the lazy `g_scanBuffers` re-read.
+
+    A reduce is the one consumer that does NOT read the scan result at the scan
+    site; it re-reads the threadgroup buffer during its own emission. Pooling
+    therefore needs the buffer to stay live from the scan until its last
+    consuming reduce, which the live-range colouring in `preprocessScanBuffers`
+    provides. At ndig=16 x BLOCK=1024 a private pair per scan would be 128 KB
+    against a 32 KB threadgroup budget, so this only compiles if they pool.
+    """
+
+    @triton.jit
+    def scanreduce(src, out, shift, NDIG: tl.constexpr, BLOCK: tl.constexpr):
+        o = tl.arange(0, BLOCK)
+        v = tl.load(src + o)
+        d = (v >> shift) & 0xF
+        acc = tl.zeros([BLOCK], dtype=tl.int32)
+        for b in tl.static_range(NDIG):
+            c = tl.cumsum(tl.where(d == b, 1, 0))
+            acc = acc + tl.sum(c)
+        tl.store(out + o, acc)
+
+    BLOCK = 1024
+    shift = 4
+    torch.manual_seed(0x5A17)
+    src = torch.randint(0, 2**31 - 1, (BLOCK,), dtype=torch.int32)
+    out = torch.zeros(BLOCK, dtype=torch.int32)
+
+    scanreduce[(1,)](src, out, shift, NDIG=ndig, BLOCK=BLOCK)
+
+    d = (src.to(torch.int64) >> shift) & 0xF
+    acc = sum(int(torch.cumsum((d == b).to(torch.int64), 0).sum())
+              for b in range(ndig))
+    expected = torch.full((BLOCK,), acc, dtype=torch.int64)
+
+    torch.testing.assert_close(out.to(torch.int64), expected, rtol=0, atol=0)

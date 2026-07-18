@@ -1833,9 +1833,10 @@ struct ArithTruncFLowering
 // which is correct for extui and for trunci-to-bool (C's bool conversion is
 // `!= 0`, matching arith.trunci's low-bit semantics for the 0/1 values Triton
 // produces). It is NOT correct for a SIGN-extending i1 -> iN: arith.extsi
-// defines that as all-ones (-1), while `(int)(bool)` gives +1. Rather than emit
-// a silently-wrong sign, reject that one case and let it stay a hard
-// legalization error.
+// defines that as all-ones (-1), while `(int)(bool)` gives +1. That one case is
+// therefore NOT emitted as a cast at all — it lowers to `select(pred, -1, 0)`,
+// which is exactly arith.extsi's semantics and uses only ops the emitter
+// already handles.
 template <typename OpTy>
 struct ArithIntCastLowering : public mlir::OpConversionPattern<OpTy> {
   using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
@@ -1845,13 +1846,23 @@ struct ArithIntCastLowering : public mlir::OpConversionPattern<OpTy> {
     auto resTy = this->getTypeConverter()->convertType(op.getType());
     if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
       return rewriter.notifyMatchFailure(op, "int cast: result not scalarizable");
-    // Guard the i1 sign-extension mismatch described above.
-    if (std::is_same<OpTy, mlir::arith::ExtSIOp>::value) {
-      auto inTy = adaptor.getIn().getType();
-      if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(inTy))
-        if (intTy.getWidth() == 1)
+    // Sign-extending a predicate: emit the all-ones/zero select instead of a
+    // cast, per the note above.
+    if (mlir::isa<mlir::arith::ExtSIOp>(op.getOperation())) {
+      auto inTy = mlir::dyn_cast<mlir::IntegerType>(adaptor.getIn().getType());
+      if (inTy && inTy.getWidth() == 1) {
+        if (!mlir::isa<mlir::IntegerType>(resTy))
           return rewriter.notifyMatchFailure(
-              op, "extsi from i1: MSL (T)(bool) yields +1, not all-ones");
+              op, "extsi from i1: non-integer result");
+        auto loc = op.getLoc();
+        auto allOnes = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(resTy, -1));
+        auto zero = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(resTy, 0));
+        rewriter.replaceOpWithNewOp<mlir::arith::SelectOp>(
+            op, adaptor.getIn(), allOnes.getResult(), zero.getResult());
+        return mlir::success();
+      }
     }
     rewriter.template replaceOpWithNewOp<OpTy>(op, resTy, adaptor.getIn());
     return mlir::success();
@@ -7514,6 +7525,47 @@ static bool flowsIntoReduce(mlir::Value v, int depth,
   return false;
 }
 
+// The LAST `tt.reduce` in `blk` that transitively consumes `v` — the end of the
+// scan buffer's live range, because a reduce is the one consumer that re-reads
+// `scanbuf` lazily during its OWN emission rather than at the scan site.
+//
+// Sets `escapes` when a consuming reduce sits outside `blk`: positions across
+// blocks are not comparable (`isBeforeInBlock` would be meaningless, and a
+// reduce nested in a loop can re-read on a later trip), so the caller must not
+// trust an interval for that scan.
+//
+// No recursion past a reduce: downstream ops consume the reduce's SCALAR
+// result, not the scan buffer, so they do not extend the range.
+static mlir::Operation *
+latestConsumingReduce(mlir::Value v, mlir::Block *blk, bool &escapes, int depth,
+                      llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
+  if (depth > 32) {
+    escapes = true;
+    return nullptr;
+  }
+  mlir::Operation *latest = nullptr;
+  auto keep = [&](mlir::Operation *r) {
+    if (!latest || latest->isBeforeInBlock(r))
+      latest = r;
+  };
+  for (auto *user : v.getUsers()) {
+    if (mlir::isa<mlir::triton::ReduceOp>(user)) {
+      if (user->getBlock() != blk)
+        escapes = true;
+      else
+        keep(user);
+      continue;
+    }
+    if (!seen.insert(user).second)
+      continue;
+    for (auto res : user->getResults())
+      if (auto *sub =
+              latestConsumingReduce(res, blk, escapes, depth + 1, seen))
+        keep(sub);
+  }
+  return latest;
+}
+
 static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
   moduleOp.walk([&](mlir::triton::FuncOp funcOp) {
     if (funcOp.getBody().empty())
@@ -7522,59 +7574,124 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     llvm::SmallVector<
         std::pair<mlir::triton::ScanOp, std::pair<mlir::Type, int64_t>>, 8>
         scans;
-    bool declinePooling = false;
     funcOp.walk([&](mlir::triton::ScanOp s) {
       auto shape = scanStagingShape(s, builder);
-      if (!shape) {
-        // Out of envelope here means ScanLowering will reject it too and the
-        // kernel fails anyway; nothing to pool.
-        return;
-      }
-      llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-      if (flowsIntoReduce(s->getResult(0), 0, seen))
-        declinePooling = true;
-      scans.push_back({s, *shape});
+      // Out of envelope here means ScanLowering will reject it too and the
+      // kernel fails anyway; nothing to pool.
+      if (shape)
+        scans.push_back({s, *shape});
     });
     // A single scan already costs one pair — pooling would change nothing and
     // this keeps every existing single-cumsum kernel's emission byte-identical.
-    if (scans.size() < 2 || declinePooling)
+    if (scans.size() < 2)
       return;
 
-    // One pair per staging type, sized to the LARGEST scan of that type.
-    llvm::SmallVector<std::pair<mlir::Type, int64_t>, 2> maxLen;
+    auto &entryBlock = funcOp.getBody().front();
+
+    // Live range of each scan's buffer. It ENDS AT THE SCAN ITSELF unless a
+    // `tt.reduce` consumes the result: every other consumer reads the pinned
+    // placeholder (`metal.materialize`) at the scan site, so it holds the value
+    // in a register and never touches the buffer again.
+    struct ScanLive {
+      mlir::triton::ScanOp scan;
+      mlir::Type stageTy;
+      int64_t bufLen;
+      mlir::Operation *liveEnd; // last op that may still read the buffer
+      bool hasReduceConsumer;
+      bool intervalTrusted; // liveEnd comparable against the other scans'
+    };
+    llvm::SmallVector<ScanLive, 8> lives;
+    bool allIntervalsTrusted = true;
     for (auto &e : scans) {
-      bool found = false;
-      for (auto &m : maxLen)
-        if (m.first == e.second.first) {
-          m.second = std::max(m.second, e.second.second);
-          found = true;
-          break;
-        }
-      if (!found)
-        maxLen.push_back(e.second);
+      bool escapes = false;
+      llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+      mlir::Operation *lastRed = latestConsumingReduce(
+          e.first->getResult(0), &entryBlock, escapes, 0, seen);
+      llvm::SmallPtrSet<mlir::Operation *, 16> seen2;
+      bool anyRed = flowsIntoReduce(e.first->getResult(0), 0, seen2);
+      bool trusted = !escapes && e.first->getBlock() == &entryBlock &&
+                     (!lastRed || lastRed->getBlock() == &entryBlock);
+      allIntervalsTrusted &= trusted;
+      lives.push_back({e.first, e.second.first, e.second.second,
+                       lastRed ? lastRed : e.first.getOperation(), anyRed,
+                       trusted});
     }
 
-    auto &entryBlock = funcOp.getBody().front();
+    // Greedy interval colouring over the scans, in block order (walk order is
+    // block order for ops in one block). A slot is reusable once its previous
+    // occupant's live range has ENDED before this scan begins.
+    //
+    // This is what lets `for b in tl.static_range(16): tl.sum(tl.cumsum(...))`
+    // pool down to ONE pair: the intervals [scan_b, reduce_b] are disjoint and
+    // sequential. The earlier blanket "decline if any scan feeds a reduce" gave
+    // that kernel 16 pairs and blew the 32 KB budget.
+    //
+    // When the intervals cannot be trusted (a scan or its consuming reduce sits
+    // outside the entry block — nested in a loop or an if, where a later trip
+    // can re-read), fall back to pooling ONLY the scans no reduce consumes:
+    // those are self-contained (fill, prefix-sum, pinned read, done), so they
+    // stay safe to share no matter what block they live in, while every
+    // reduce-consuming scan keeps a private pair.
+    struct Slot {
+      mlir::Type stageTy;
+      int64_t len;
+      mlir::Operation *liveEnd;
+      bool trustedInterval;
+    };
+    llvm::SmallVector<Slot, 4> slots;
+    llvm::SmallVector<int, 8> slotOf(lives.size(), -1);
+    for (size_t i = 0; i < lives.size(); ++i) {
+      auto &L = lives[i];
+      if (!allIntervalsTrusted && L.hasReduceConsumer)
+        continue; // private allocation
+      for (size_t k = 0; k < slots.size(); ++k) {
+        if (slots[k].stageTy != L.stageTy)
+          continue;
+        // Reuse needs a proven ordering: both this scan and the slot's last
+        // reader must be in the entry block so `isBeforeInBlock` is meaningful.
+        bool free = slots[k].liveEnd == nullptr;
+        if (!free && slots[k].trustedInterval && L.intervalTrusted &&
+            slots[k].liveEnd->getBlock() == &entryBlock &&
+            L.scan->getBlock() == &entryBlock)
+          free = slots[k].liveEnd->isBeforeInBlock(L.scan.getOperation());
+        else if (!free && !L.hasReduceConsumer && !slots[k].liveEnd)
+          free = true;
+        if (free) {
+          slots[k].len = std::max(slots[k].len, L.bufLen);
+          slots[k].liveEnd = L.intervalTrusted ? L.liveEnd : nullptr;
+          slotOf[i] = static_cast<int>(k);
+          break;
+        }
+      }
+      if (slotOf[i] < 0) {
+        // In the untrusted fallback every pooled scan is self-contained, so a
+        // shared slot never carries a live range forward.
+        slots.push_back({L.stageTy, L.bufLen,
+                         allIntervalsTrusted ? L.liveEnd : nullptr,
+                         L.intervalTrusted});
+        slotOf[i] = static_cast<int>(slots.size()) - 1;
+      }
+    }
+
+    // Nothing gained if every scan ended up with its own slot.
+    if (slots.size() >= lives.size())
+      return;
+
     builder.setInsertionPointToStart(&entryBlock);
     auto loc = funcOp.getLoc();
-    llvm::SmallVector<std::pair<mlir::Type, std::pair<mlir::Value, mlir::Value>>,
-                      2>
-        perTypeBufs;
-    for (auto &m : maxLen) {
-      auto bufTy = MetalMemRefType::get(funcOp.getContext(), m.first,
-                                        static_cast<int>(m.second));
+    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 4> slotBufs;
+    for (auto &sl : slots) {
+      auto bufTy = MetalMemRefType::get(funcOp.getContext(), sl.stageTy,
+                                        static_cast<int>(sl.len));
       mlir::Value inbuf =
           ThreadgroupAllocaOp::create(builder, loc, bufTy).getResult();
       mlir::Value scanbuf =
           ThreadgroupAllocaOp::create(builder, loc, bufTy).getResult();
-      perTypeBufs.push_back({m.first, {inbuf, scanbuf}});
+      slotBufs.push_back({inbuf, scanbuf});
     }
-    for (auto &e : scans)
-      for (auto &p : perTypeBufs)
-        if (p.first == e.second.first) {
-          pool[e.first.getOperation()] = p.second;
-          break;
-        }
+    for (size_t i = 0; i < lives.size(); ++i)
+      if (slotOf[i] >= 0)
+        pool[lives[i].scan.getOperation()] = slotBufs[slotOf[i]];
   });
 }
 
