@@ -341,6 +341,34 @@ static mlir::scf::ForOp findOutermostScfFor(mlir::Operation *op) {
   return outermost;
 }
 
+// localTid = thread_id.x - threadgroup_id.x * tpb. Multi-program safe: each
+// threadgroup must address its own slice by a LOCAL offset (Wall 13).
+static mlir::Value emitLocalTid(mlir::OpBuilder &rewriter, mlir::Location loc,
+                                int64_t tpb) {
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto i32 = rewriter.getI32Type();
+  mlir::Value tid =
+      ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
+          .getResult();
+  mlir::Value tidI32 = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{i32},
+                           mlir::ValueRange{tid})
+                           .getResult(0);
+  mlir::Value tg =
+      ThreadgroupIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
+          .getResult();
+  mlir::Value tgI32 = mlir::UnrealizedConversionCastOp::create(
+                          rewriter, loc, mlir::TypeRange{i32},
+                          mlir::ValueRange{tg})
+                          .getResult(0);
+  auto cTpb = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+  auto tgOff =
+      mlir::arith::MulIOp::create(rewriter, loc, tgI32, cTpb.getResult());
+  return mlir::arith::SubIOp::create(rewriter, loc, tidI32, tgOff.getResult())
+      .getResult();
+}
+
 static mlir::Value emitPerIterIndex(const TileInfo &tile,
                                     mlir::scf::ForOp parentFor,
                                     mlir::ConversionPatternRewriter &rewriter,
@@ -3234,6 +3262,50 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
 // maps such leaves -> their getRemappedValue for the duration of that fill.
 static const llvm::DenseMap<mlir::Value, mlir::Value> *g_stagedLeaves = nullptr;
 
+// Inc 2.5 rank-2: a whole [M,N] tile staged in threadgroup memory, read at
+// `buf[r*N + n]`. `g_stagedLeaves` cannot express this — it maps a leaf to ONE
+// per-thread scalar, which is exactly a per-ROW value, so a tile that also
+// varies along the row has no representation there.
+//
+// The case that needs it is a loop-carried tile: `h = A*h + B` inside an
+// scf.for, reduced every trip. The cone evaluator re-emits its expression per
+// (r, n) from leaves that survive conversion, but an iter_arg is a
+// BlockArgument with no defining op, and the recurrence means trip t's value is
+// not re-derivable from anything in device memory. Materialising the tile is
+// the only option.
+struct StagedTile {
+  mlir::Value buf; // !metal.memref<M*N x f32>
+  int64_t n;       // row stride
+};
+static const llvm::DenseMap<mlir::Value, StagedTile> *g_tileBuffers = nullptr;
+
+// buf[r*N + n], or null if `v` is not a staged tile.
+static mlir::Value readStagedTile(mlir::Value v, mlir::Value rVal,
+                                  mlir::Value nVal,
+                                  mlir::ConversionPatternRewriter &rewriter,
+                                  mlir::Location loc) {
+  if (!g_tileBuffers)
+    return nullptr;
+  auto it = g_tileBuffers->find(v);
+  if (it == g_tileBuffers->end())
+    return nullptr;
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto cN = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(it->second.n)));
+  auto rowOff =
+      mlir::arith::MulIOp::create(rewriter, loc, rVal, cN.getResult());
+  auto flat =
+      mlir::arith::AddIOp::create(rewriter, loc, rowOff.getResult(), nVal);
+  mlir::Value idx = mlir::UnrealizedConversionCastOp::create(
+                        rewriter, loc, mlir::TypeRange{ui32},
+                        mlir::ValueRange{flat.getResult()})
+                        .getResult(0);
+  mlir::Type eltTy =
+      mlir::cast<MetalMemRefType>(it->second.buf.getType()).getType();
+  return GetElementOp::create(rewriter, loc, eltTy, it->second.buf, idx)
+      .getResult();
+}
+
 // W-C scan: maps a `tt.scan` (cumsum) RESULT placeholder value -> the
 // threadgroup buffer holding the DISTRIBUTED prefix-sum. ScanLowering fills the
 // buffer + registers this (operands-first, so it runs before any consuming
@@ -3342,17 +3414,52 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     auto addptr = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
     if (!addptr)
       return nullptr;
-    mlir::Value addr =
-        scalarizeConeAtIndex(addptr.getOffset(), idxVal, rewriter, loc, 0);
+    // Sum EVERY offset along the tt.addptr chain, scalarising the tensor-typed
+    // ones at `idxVal`.
+    //
+    // This used to scalarise only the OUTERMOST offset and then add the SCALAR
+    // offsets from the rest of the chain. That drops a tensor offset sitting on
+    // an INNER addptr — which is exactly where the per-element index lives once
+    // the base pointer is hoisted out of a loop:
+    //
+    //   base = tt.addptr(splat(p + pid*S), offs)   <- row/col index, tensor
+    //   addr = tt.addptr(base, splat(t*S))         <- outermost, no index
+    //
+    // The mask is scalarised down a different path and kept its index, so the
+    // read came out silently off-row instead of obviously broken.
+    auto i32 = rewriter.getI32Type();
+    mlir::Value addr;
+    auto addTerm = [&](mlir::Value t) {
+      if (t.getType() != i32)
+        t = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{t})
+                .getResult(0);
+      addr = addr ? mlir::arith::AddIOp::create(rewriter, loc, addr, t)
+                        .getResult()
+                  : t;
+    };
+    {
+      mlir::Value cur = load.getPtr();
+      while (true) {
+        while (auto sp = cur.getDefiningOp<mlir::triton::SplatOp>())
+          cur = sp.getSrc();
+        auto ap = cur.getDefiningOp<mlir::triton::AddPtrOp>();
+        if (!ap)
+          break;
+        mlir::Value off = ap.getOffset();
+        if (mlir::isa<mlir::RankedTensorType>(off.getType())) {
+          mlir::Value s = scalarizeConeAtIndex(off, idxVal, rewriter, loc, 0);
+          if (!s)
+            return nullptr;
+          addTerm(s);
+        } else {
+          addTerm(off);
+        }
+        cur = ap.getPtr();
+      }
+    }
     if (!addr)
       return nullptr;
-    // Add any SCALAR tt.addptr chain offset feeding the ptr (e.g. the per-row /
-    // per-batch base `b*T*V + i*V` in a standalone rank-1 reduce). No-op (null)
-    // when the base is a bare memref, so existing callers are unaffected.
-    if (mlir::Value scalarOff =
-            accumulateScalarAddPtrOffsets(load.getPtr(), rewriter, loc))
-      addr =
-          mlir::arith::AddIOp::create(rewriter, loc, addr, scalarOff).getResult();
     mlir::Value memref = findBaseMemref(load.getPtr(), rewriter);
     if (!memref)
       return nullptr;
@@ -3593,6 +3700,11 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return nullptr;
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
 
+  // A staged [M,N] tile resolves to buf[r*N + n]. Checked FIRST so the walk
+  // never descends into a loop-carried recurrence it cannot re-emit.
+  if (mlir::Value staged = readStagedTile(v, rVal, nVal, rewriter, loc))
+    return staged;
+
   // Scalar splat → its scalar source (a per-tile-uniform value).
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
     if (!splat.getOperation()->getBlock())
@@ -3781,8 +3893,11 @@ static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
   if (depth > 16)
     return nullptr;
   // Inc 2.5: a staged leaf is opaque (resolved via getRemappedValue); don't
-  // descend into its cone looking for the representative device load.
+  // descend into its cone looking for the representative device load. Same for
+  // a staged [M,N] tile, which reads out of threadgroup memory.
   if (g_stagedLeaves && g_stagedLeaves->count(v))
+    return nullptr;
+  if (g_tileBuffers && g_tileBuffers->count(v))
     return nullptr;
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
@@ -3897,6 +4012,10 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
 static bool rank2ConeSupported(mlir::Value v, int depth) {
   if (depth > 24)
     return false;
+  // A staged [M,N] tile is a leaf: it reads out of threadgroup memory, so the
+  // walk stops here and never has to re-emit the recurrence behind it.
+  if (g_tileBuffers && g_tileBuffers->count(v))
+    return true;
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
     return splat.getOperation()->getBlock() != nullptr;
   if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
@@ -4429,9 +4548,207 @@ static bool readsLoopCarriedValue(mlir::Value root, mlir::scf::ForOp loop) {
   return false;
 }
 
+// True if `target` appears in `root`'s backward cone. The walk stops at
+// `barrier` (when set), so this answers "reachable WITHOUT going through
+// `barrier`" — which is the question that matters once `barrier` is a staged
+// leaf the cone evaluator never descends past.
+static bool valueInCone(mlir::Value root, mlir::Value target,
+                        mlir::Value barrier = {}) {
+  llvm::SmallVector<mlir::Value, 16> wl{root};
+  llvm::SmallPtrSet<mlir::Value, 16> seen;
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    if (v == target)
+      return true;
+    if (barrier && v == barrier)
+      continue;
+    if (!seen.insert(v).second)
+      continue;
+    if (auto *def = v.getDefiningOp())
+      for (auto o : def->getOperands())
+        wl.push_back(o);
+  }
+  return false;
+}
+
+// A loop-carried [M,N] f32 tile that the reduce depends on — the SSM selective
+// scan's `h = exp(dt*A)*h + (dt*u)*B`, reduced to `y = sum(C*h, axis=1)` every
+// trip.
+//
+// Not reachable by the Inc-2.5 per-row staging: that maps a leaf to ONE
+// per-thread scalar, and `h` varies along the row as well. Not reachable by the
+// axis-0 reassociation either: that needs the reduce OUTSIDE the loop and the
+// update independent of the accumulator, and this recurrence is multiplicative
+// in `h`. The tile has to be materialised.
+// What the pre-pass hands ReduceLowering for one staged reduce.
+//
+// The split of labour is forced by WHEN each half can run:
+//
+//  * Detection and the buffer must be pre-conversion. By the time the pattern
+//    runs, `populateSCFStructuralTypeConversions` has rebuilt the loop with
+//    per-thread scalar iter_args, and the ORIGINAL body block is detached
+//    (its parentOp is null), so `getParentOfType<scf::ForOp>` no longer leads
+//    anywhere useful. Measured, not assumed.
+//  * The cone VALUES survive that rebuild intact — `iterArg` is still a live
+//    `tensor<MxNxf32>` BlockArgument and the update cone is still tensor-typed
+//    arith — which is why the per-(r, n) emission can stay in the pattern,
+//    where `evalRank2ConeAt` and the row/column loop machinery already live.
+//
+// Same shape as `preprocessMaskedStoreSentinels`'s scratch map: the pre-pass
+// allocates and records, keyed by the consuming op.
+struct StagedTileInfo {
+  mlir::Value buf;             // !metal.memref<M*N x f32>, seeded with h_0
+  mlir::BlockArgument iterArg; // h at trip entry -> buf[r*N + n]
+  mlir::Value yielded;         // h after the update -> buf[r*N + n]
+  int64_t n;
+};
+using LoopCarriedTileMap = llvm::DenseMap<mlir::Operation *, StagedTileInfo>;
+
+// Pre-conversion. Find `scf.for`s carrying a rank-2 f32 tile that a rank-2
+// axis=1 `tt.reduce` inside the body consumes, allocate a threadgroup buffer
+// for each, seed it with the loop's init value, and record the pairing.
+//
+// Restricted to M <= tpb, where the reduce's grid-stride row fill degenerates
+// to one row per thread (r == localTid). Thread r then owns row r of the tile
+// outright — seed, update and read all happen on that one thread — so the
+// buffer needs no barrier at all. Above tpb a row would be shared and the
+// update/read would need synchronising; rejected rather than raced.
+static void preprocessLoopCarriedReduceTiles(mlir::ModuleOp moduleOp,
+                                             LoopCarriedTileMap &tileMap) {
+  moduleOp.walk([&](mlir::triton::FuncOp funcOp) {
+    if (funcOp.getBody().empty())
+      return;
+    llvm::SmallVector<mlir::scf::ForOp> loops;
+    funcOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
+    for (auto loop : loops) {
+      auto yieldOp =
+          mlir::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+      if (!yieldOp)
+        continue;
+      auto iterArgs = loop.getRegionIterArgs();
+      for (unsigned i = 0; i < iterArgs.size(); ++i) {
+        mlir::BlockArgument arg = iterArgs[i];
+        auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
+        if (!rtt || rtt.getRank() != 2 || !rtt.getElementType().isF32())
+          continue;
+        if (i >= yieldOp.getNumOperands())
+          continue;
+        int64_t M = rtt.getDimSize(0), N = rtt.getDimSize(1);
+        if (M <= 0 || N <= 0)
+          continue;
+        auto blocked = mlir::dyn_cast_or_null<
+            mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+        if (!blocked)
+          continue;
+        int64_t tpb = 1;
+        for (auto t : blocked.getThreadsPerWarp())
+          tpb *= t;
+        for (auto w : blocked.getWarpsPerCTA())
+          tpb *= w;
+        if (tpb <= 0 || M > tpb)
+          continue;
+        // h_0 must be materialisable as one scalar; every real init is
+        // `tl.zeros(...)`.
+        auto initCst =
+            loop.getInitArgs()[i].getDefiningOp<mlir::arith::ConstantOp>();
+        auto initDense =
+            initCst ? mlir::dyn_cast<mlir::DenseElementsAttr>(initCst.getValue())
+                    : nullptr;
+        if (!initDense || !initDense.isSplat())
+          continue;
+        mlir::Value yielded = yieldOp.getOperand(i);
+
+        // Which reduces in this body does the tile serve? The reduce must read
+        // the UPDATED tile: one buffer holds one trip of state, and by the time
+        // the reduce runs it holds the post-update value, so a cone reaching
+        // the iter_arg on its own — not merely through `yielded`, which the
+        // evaluator stops at — would silently get the previous trip.
+        llvm::SmallVector<mlir::triton::ReduceOp> targets;
+        loop.getBody()->walk([&](mlir::triton::ReduceOp red) {
+          if (red.getSrcs().size() != 1 || red.getAxis() != 1)
+            return;
+          mlir::Value src = red.getSrcs().front();
+          auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(src.getType());
+          if (!srcRtt || srcRtt.getRank() != 2 ||
+              srcRtt.getDimSize(0) != M || srcRtt.getDimSize(1) != N)
+            return;
+          if (!valueInCone(src, yielded) ||
+              valueInCone(src, arg, /*barrier=*/yielded))
+            return;
+          targets.push_back(red);
+        });
+        if (targets.empty())
+          continue;
+
+        // Alloca at FUNCTION ENTRY (threadgroup memory is function-scope, and
+        // entry placement dominates unconditionally — the reason the previous
+        // attempt at this shape hit "operand does not dominate this use").
+        mlir::OpBuilder builder(funcOp.getContext());
+        auto loc = loop.getLoc();
+        auto ui32 = builder.getIntegerType(32, /*isSigned=*/false);
+        builder.setInsertionPointToStart(&funcOp.getBody().front());
+        auto bufTy = MetalMemRefType::get(funcOp.getContext(),
+                                          rtt.getElementType(), M * N);
+        mlir::Value buf =
+            ThreadgroupAllocaOp::create(builder, loc, bufTy).getResult();
+
+        // Seed BEFORE the loop, so a loop nested in an outer one re-seeds each
+        // outer trip — matching the iter_arg init being re-evaluated there.
+        builder.setInsertionPoint(loop);
+        mlir::Value localTid = emitLocalTid(builder, loc, tpb);
+        auto cM = mlir::arith::ConstantOp::create(
+            builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(M)));
+        auto cN = mlir::arith::ConstantOp::create(
+            builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(N)));
+        auto inBounds = mlir::arith::CmpIOp::create(
+            builder, loc, mlir::arith::CmpIPredicate::slt, localTid,
+            cM.getResult());
+        auto seedIf = mlir::scf::IfOp::create(
+            builder, loc, mlir::TypeRange{}, inBounds.getResult(),
+            /*addThenBlock=*/true, /*addElseBlock=*/false);
+        {
+          mlir::OpBuilder::InsertionGuard g(builder);
+          builder.setInsertionPointToStart(&seedIf.getThenRegion().front());
+          auto seedVal = mlir::arith::ConstantOp::create(
+              builder, loc, initDense.getSplatValue<mlir::TypedAttr>());
+          auto zero = mlir::arith::ConstantOp::create(
+              builder, loc, builder.getI32IntegerAttr(0));
+          auto one = mlir::arith::ConstantOp::create(
+              builder, loc, builder.getI32IntegerAttr(1));
+          auto seedFor = mlir::scf::ForOp::create(
+              builder, loc, zero.getResult(), cN.getResult(), one.getResult());
+          {
+            // ForOp::create supplies the body terminator; IfOp::create with
+            // addThenBlock does NOT, so the then-block's scf.yield is added
+            // explicitly below.
+            mlir::OpBuilder::InsertionGuard g2(builder);
+            builder.setInsertionPointToStart(seedFor.getBody());
+            auto rowOff = mlir::arith::MulIOp::create(builder, loc, localTid,
+                                                      cN.getResult());
+            auto flat = mlir::arith::AddIOp::create(
+                builder, loc, rowOff.getResult(), seedFor.getInductionVar());
+            mlir::Value idx = mlir::UnrealizedConversionCastOp::create(
+                                  builder, loc, mlir::TypeRange{ui32},
+                                  mlir::ValueRange{flat.getResult()})
+                                  .getResult(0);
+            StoreOp::create(builder, loc, seedVal.getResult(), buf, idx);
+          }
+          mlir::scf::YieldOp::create(builder, loc);
+        }
+
+        for (auto red : targets)
+          tileMap[red.getOperation()] = StagedTileInfo{buf, arg, yielded, N};
+      }
+    }
+  });
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ReduceLowering(const mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
+                 const LoopCarriedTileMap *tiles)
+      : OpConversionPattern(tc, ctx), tileMap(tiles) {}
+  const LoopCarriedTileMap *tileMap;
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ReduceOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
@@ -4554,8 +4871,15 @@ struct ReduceLowering
     // evaluator can't re-emit). `g_stagedLeaves` is cleared on any return.
     llvm::DenseMap<mlir::Value, mlir::Value> stagedMap;
     bool inlineStaged = false;
+    // Inc 2.5 rank-2: loop-carried [M,N] tile staged in threadgroup memory.
+    llvm::DenseMap<mlir::Value, StagedTile> tileUpdateMap, tileReadMap;
+    std::optional<StagedTileInfo> carriedTile;
+    mlir::Value tileBuf;
     struct StagedResetGuard {
-      ~StagedResetGuard() { g_stagedLeaves = nullptr; }
+      ~StagedResetGuard() {
+        g_stagedLeaves = nullptr;
+        g_tileBuffers = nullptr;
+      }
     } stagedResetGuard;
     if (loadOp && !loadOp.getMask()) {
       reprLoad = loadOp;
@@ -4578,6 +4902,33 @@ struct ReduceLowering
         if (!stagedMap.empty()) {
           g_stagedLeaves = &stagedMap;
           inlineStaged = true;
+        }
+      }
+      // Inc 2.5 rank-2: a loop-carried [M,N] tile. Stage it in threadgroup
+      // memory and make both cones treat it as a leaf. Two maps, because the
+      // buffer means different things on either side of the update: while
+      // emitting the update the iter_arg reads the PREVIOUS trip's value out of
+      // it; afterwards it holds this trip's value and the reduce reads the
+      // yielded tile from it.
+      if (auto it = tileMap->find(op.getOperation()); it != tileMap->end()) {
+        // The pre-pass already allocated and seeded the buffer; all that is
+        // left is to point both cones at it.
+        carriedTile = it->second;
+        tileBuf = it->second.buf;
+        tileUpdateMap[it->second.iterArg] = StagedTile{it->second.buf, N};
+        tileReadMap[it->second.yielded] = StagedTile{it->second.buf, N};
+      }
+      if (carriedTile) {
+        // The update cone must itself be re-emittable with the iter_arg
+        // resolved out of the buffer.
+        g_tileBuffers = &tileUpdateMap;
+        bool updateOk = rank2ConeSupported(carriedTile->yielded, 0);
+        g_tileBuffers = &tileReadMap;
+        if (!updateOk) {
+          g_tileBuffers = nullptr;
+          return rewriter.notifyMatchFailure(
+              op, "rank-2 reduce: loop-carried tile update has an unsupported "
+                  "producer");
         }
       }
       if (!rank2ConeSupported(reduceSrc, 0))
@@ -4651,7 +5002,12 @@ struct ReduceLowering
     // failing to dominate the read — "operand #0 does not dominate this use".
     // Reject up front: a clear unsupported-shape message beats either a
     // dominance crash or the silently-wrong hoisted reduce this used to emit.
-    if (loopVaryingAddr && !tileLoop.getRegionIterArgs().empty())
+    // ...but only when the loop carries iter_args we have NOT taken ownership
+    // of. With a staged tile the iter_args are exactly what we replaced with
+    // threadgroup memory, and the alloca sits above the loop, so the shape is
+    // handled rather than rejected.
+    if (loopVaryingAddr && !carriedTile &&
+        !tileLoop.getRegionIterArgs().empty())
       return rewriter.notifyMatchFailure(
           op, "rank-2 reduce: tile address varies with an enclosing loop that "
               "also carries iter_args; the fill cannot be hoisted (wrong tile) "
@@ -4669,7 +5025,9 @@ struct ReduceLowering
     // staged cone (inlineStaged): the staged leaves' getRemappedValue only
     // dominates inside the loop, and the reduce must recompute each iteration.
     // A loop-varying address (loopVaryingAddr) is inline for the same reason.
-    const bool fillInLoop = inlineStaged || loopVaryingAddr;
+    // A staged tile is likewise inline: the buffer advances one trip per fill,
+    // so the fill IS the recurrence and must run every iteration.
+    const bool fillInLoop = inlineStaged || loopVaryingAddr || carriedTile;
     mlir::Value rowBuf;
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -4799,6 +5157,41 @@ struct ReduceLowering
             rowBase = mlir::arith::AddIOp::create(rewriter, loc, rowBase,
                                                   scalarOff)
                           .getResult();
+          // Loop-carried tile: advance this row's slice of the staged buffer
+          // BEFORE reducing it. `h_new(r, n)` is re-emitted with the iter_arg
+          // resolving to buf[r*N + n] (the previous trip's value), then written
+          // back to that same slot. In place is safe: every op the rank-2 cone
+          // admits is elementwise in (r, n), or a broadcast of a rank-1 value
+          // indexed by r or n alone, so nothing reads the tile at a position
+          // other than the one being written. Thread r owns row r outright
+          // (M <= tpb), so no barrier separates the write from the read below.
+          if (carriedTile) {
+            auto updFor = mlir::scf::ForOp::create(
+                rewriter, loc, cColLo.getResult(), cN.getResult(),
+                cOne.getResult());
+            mlir::OpBuilder::InsertionGuard g3(rewriter);
+            rewriter.setInsertionPointToStart(updFor.getBody());
+            mlir::Value nIv = updFor.getInductionVar();
+            g_tileBuffers = &tileUpdateMap;
+            mlir::Value hNew =
+                evalRank2ConeAt(carriedTile->yielded, r, rowBase, nIv, rewriter,
+                                loc, /*depth=*/0);
+            g_tileBuffers = &tileReadMap;
+            if (!hNew)
+              return rewriter.notifyMatchFailure(
+                  op, "rank-2 reduce: loop-carried tile update failed to "
+                      "re-emit");
+            auto rowOff =
+                mlir::arith::MulIOp::create(rewriter, loc, r, cN.getResult());
+            auto flat = mlir::arith::AddIOp::create(rewriter, loc,
+                                                    rowOff.getResult(), nIv);
+            mlir::Value idx = mlir::UnrealizedConversionCastOp::create(
+                                  rewriter, loc, mlir::TypeRange{ui32},
+                                  mlir::ValueRange{flat.getResult()})
+                                  .getResult(0);
+            StoreOp::create(rewriter, loc, hNew, tileBuf, idx);
+          }
+
           // Inner column reduction: rowCombine = combine_n elem(rowBase + n).
           // For a direct load the element is device[rowBase + n]; for a
           // computed cone (Wall 17 Case C) it is re-derived per (row, col) by
@@ -10229,6 +10622,13 @@ struct ConvertTritonGPUToMetalPass
     MaskedStoreScratchMap scratchMap;
     preprocessMaskedStoreSentinels(moduleOp, scratchMap);
 
+    // Inc 2.5 rank-2: stage loop-carried [M,N] reduce tiles in threadgroup
+    // memory. Must run pre-conversion — the SCF structural conversion rebuilds
+    // the loop with per-thread scalar iter_args and detaches the original body
+    // block, so the loop structure is only legible from here.
+    LoopCarriedTileMap loopCarriedTiles;
+    preprocessLoopCarriedReduceTiles(moduleOp, loopCarriedTiles);
+
     TritonGPUToMetalTypeConverter typeConverter(ctx);
 
     mlir::ConversionTarget target(*ctx);
@@ -10299,9 +10699,11 @@ struct ConvertTritonGPUToMetalPass
                  ArithExtFLowering, ArithTruncFLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
-                 MathExpLowering, MathLogLowering, MathRsqrtLowering,
-                 ReduceLowering>(
+                 MathExpLowering, MathLogLowering, MathRsqrtLowering>(
                  typeConverter, ctx);
+    // ReduceLowering needs the (reduce op)->staged tile mapping that
+    // `preprocessLoopCarriedReduceTiles` built above.
+    patterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles);
     // MaskedStoreLowering needs the (func, elem-type)→scratch mapping
     // populated by `preprocessMaskedStoreSentinels` above. See L1d2c Phase B.
     patterns.add<MaskedStoreLowering>(typeConverter, ctx, &scratchMap);

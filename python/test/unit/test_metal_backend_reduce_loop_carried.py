@@ -61,3 +61,115 @@ def test_reduce_loop_carried_leaf(M, N, STEPS):
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), _reference(x, STEPS, M, N),
                                atol=1e-4, rtol=1e-4)
+
+
+# --- Loop-carried rank-2 TILE ----------------------------------------------
+#
+# The staged-leaf mechanism above maps a leaf to ONE per-thread scalar, i.e. a
+# per-ROW value. A tile that also varies along the row has no representation
+# there, and an `scf.for` iter_arg is a BlockArgument the cone evaluator cannot
+# re-emit anyway — a scan is not a reduction, so there is no reassociation to
+# fall back on either. The [M,N] tile is therefore materialised in threadgroup
+# memory by a pre-pass (`preprocessLoopCarriedReduceTiles`), which also seeds it
+# with the loop's init and hands ReduceLowering the mapping.
+#
+# Detection must be pre-conversion: by the time the pattern runs, the SCF
+# structural type conversion has rebuilt the loop with per-thread scalar
+# iter_args and detached the original body block.
+#
+# Restricted to M <= tpb, where the reduce's row fill degenerates to one row per
+# thread, so thread r owns row r of the tile outright — seed, update and read
+# all happen on that thread and the buffer needs no barrier.
+
+
+@triton.jit
+def _loop_carried_tile_kernel(c_ptr, y_ptr, STEPS,
+                              M: tl.constexpr, N: tl.constexpr):
+    row = tl.arange(0, M)
+    col = tl.arange(0, N)
+    idx2d = row[:, None] * N + col[None, :]
+    h = tl.zeros((M, N), dtype=tl.float32)     # loop-carried [M,N] tile
+    for t in range(0, STEPS):
+        cc = tl.load(c_ptr + t * M * N + idx2d)
+        h = h * 0.5 + cc
+        tl.store(y_ptr + t * M + row, tl.sum(cc * h, axis=1))
+
+
+def _tile_reference(c, STEPS, M, N):
+    h = torch.zeros(M, N, dtype=torch.float64)
+    out = []
+    cc_all = c.cpu().double()
+    for t in range(STEPS):
+        cc = cc_all[t * M * N:(t + 1) * M * N].reshape(M, N)
+        h = h * 0.5 + cc
+        out.append((cc * h).sum(1))
+    return torch.cat(out)
+
+
+@pytest.mark.parametrize("M, N, STEPS", [(32, 64, 4), (16, 32, 3), (8, 8, 5),
+                                         (128, 16, 2)])
+def test_reduce_loop_carried_tile(M, N, STEPS):
+    torch.manual_seed(0xB0A + M * N + STEPS)
+    c = torch.randn(STEPS * M * N, dtype=torch.float32, device="mps").contiguous()
+    y = torch.zeros(STEPS * M, dtype=torch.float32, device="mps").contiguous()
+    _loop_carried_tile_kernel[(1,)](c, y, STEPS, M, N, num_warps=4)
+    torch.mps.synchronize()
+    ref = _tile_reference(c, STEPS, M, N)
+    err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
+    assert err <= 2e-5, f"rel err {err}"
+
+
+# --- Hoisted base pointer in a re-emitted cone ------------------------------
+#
+# `evalRank1ValueAt` scalarised only the OUTERMOST tt.addptr offset and then
+# added the SCALAR offsets from the rest of the chain. A tensor offset on an
+# INNER addptr — where the per-element index lives whenever the base pointer is
+# hoisted out of the loop — was dropped:
+#
+#   base = tt.addptr(splat(p + pid*S), offs)   <- index, tensor, DROPPED
+#   addr = tt.addptr(base, splat(t*S))         <- outermost, no index
+#
+# The mask is scalarised down a separate path and kept its index, so the read
+# came out silently off-row rather than obviously broken. Every kernel that
+# hoists a row/column base out of its scan loop hits this — the SSM selective
+# scan does it for all four of u/delta/B/C.
+
+
+@triton.jit
+def _hoisted_base_kernel(v_ptr, c_ptr, y_ptr, STEPS, n_valid,
+                         M: tl.constexpr, N: tl.constexpr):
+    row = tl.arange(0, M)
+    col = tl.arange(0, N)
+    v_base = v_ptr + col                       # hoisted OUT of the loop
+    idx2d = row[:, None] * N + col[None, :]
+    h = tl.zeros((M, N), dtype=tl.float32)
+    for t in range(0, STEPS):
+        v = tl.load(v_base + t * N, mask=col < n_valid, other=0.0)
+        cc = tl.load(c_ptr + t * M * N + idx2d)
+        h = h * 0.5 + cc * v[None, :]
+        tl.store(y_ptr + t * M + row, tl.sum(cc * h, axis=1))
+
+
+@pytest.mark.parametrize("M, N, STEPS, n_valid", [(32, 64, 4, 64),
+                                                  (32, 64, 3, 16),
+                                                  (16, 32, 4, 20)])
+def test_reduce_loop_carried_tile_hoisted_base(M, N, STEPS, n_valid):
+    torch.manual_seed(0x1DE + M * N + STEPS + n_valid)
+    v = torch.randn(STEPS * N, dtype=torch.float32, device="mps").contiguous()
+    c = torch.randn(STEPS * M * N, dtype=torch.float32, device="mps").contiguous()
+    y = torch.zeros(STEPS * M, dtype=torch.float32, device="mps").contiguous()
+    _hoisted_base_kernel[(1,)](v, c, y, STEPS, n_valid, M, N, num_warps=4)
+    torch.mps.synchronize()
+
+    h = torch.zeros(M, N, dtype=torch.float64)
+    vc, cc_all = v.cpu().double(), c.cpu().double()
+    out = []
+    for t in range(STEPS):
+        vt = vc[t * N:(t + 1) * N].clone()
+        vt[n_valid:] = 0.0
+        cc = cc_all[t * M * N:(t + 1) * M * N].reshape(M, N)
+        h = h * 0.5 + cc * vt[None, :]
+        out.append((cc * h).sum(1))
+    ref = torch.cat(out)
+    err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
+    assert err <= 2e-5, f"rel err {err}"
