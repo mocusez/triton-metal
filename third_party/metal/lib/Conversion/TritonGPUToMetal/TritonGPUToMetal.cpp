@@ -3725,7 +3725,22 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
   if (!def)
     return nullptr;
 
-  // tt.load leaf: read device[rowBase + nVal] from the load's base memref.
+  // tt.load leaf: re-materialise the address from the load's OWN tt.addptr
+  // chain, evaluated at (rVal, nVal).
+  //
+  // This used to read `device[rowBase + nVal]`, where `rowBase` is derived once
+  // from the reduce's REPRESENTATIVE load. That silently assumes every load in
+  // the cone shares the reduce tile's row stride N and per-program base — false
+  // as soon as a cone load has a different shape. In the SSM scan the reduce
+  // tile is (BLOCK_D, BLOCK_N) while `A` is (d_model, d_state), so A was read
+  // with stride BLOCK_N and carrying `C`'s batch offset; it only came out right
+  // when d_state == BLOCK_N and the launch was single-program, which is exactly
+  // the corner the first tests happened to sit in.
+  //
+  // Walking the load's own chain also subsumes the fabricated `tgid*tpb*N`
+  // program term: an address whose program offset is folded into the row tensor
+  // (`offs_m = pid*BLOCK_M + arange`) yields it naturally from evaluating that
+  // tensor at rVal, so nothing is added on top and nothing double-counts.
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
     if (!load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
       return nullptr;
@@ -3733,11 +3748,56 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     if (!memref)
       return nullptr;
     mlir::Type eltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
-    auto idx = mlir::arith::AddIOp::create(rewriter, loc, rowBase, nVal);
+    auto i32 = rewriter.getI32Type();
+    mlir::Value addr;
+    auto addTerm = [&](mlir::Value t) {
+      if (t.getType() != i32)
+        t = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{t})
+                .getResult(0);
+      addr = addr ? mlir::arith::AddIOp::create(rewriter, loc, addr, t)
+                        .getResult()
+                  : t;
+    };
+    mlir::Value cur = load.getPtr();
+    while (true) {
+      // Peel the shape ops a 2D tile address is built through: the row half is
+      // an (M,1) addptr broadcast to (M,N), so stopping at tt.broadcast would
+      // drop the row term entirely.
+      bool peeled = true;
+      while (peeled) {
+        peeled = false;
+        if (auto sp = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+          cur = sp.getSrc();
+          peeled = true;
+        } else if (auto bc = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
+          cur = bc.getSrc();
+          peeled = true;
+        } else if (auto ed = cur.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+          cur = ed.getSrc();
+          peeled = true;
+        }
+      }
+      auto ap = cur.getDefiningOp<mlir::triton::AddPtrOp>();
+      if (!ap)
+        break;
+      mlir::Value off = ap.getOffset();
+      if (mlir::isa<mlir::RankedTensorType>(off.getType())) {
+        mlir::Value s = evalRank2ConeAt(off, rVal, rowBase, nVal, rewriter, loc,
+                                        depth + 1);
+        if (!s)
+          return nullptr;
+        addTerm(s);
+      } else {
+        addTerm(off);
+      }
+      cur = ap.getPtr();
+    }
+    if (!addr)
+      return nullptr;
     mlir::Value idxUI32 =
         mlir::UnrealizedConversionCastOp::create(
-            rewriter, loc, mlir::TypeRange{ui32},
-            mlir::ValueRange{idx.getResult()})
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{addr})
             .getResult(0);
     return GetElementOp::create(rewriter, loc, eltTy, memref, idxUI32)
         .getResult();

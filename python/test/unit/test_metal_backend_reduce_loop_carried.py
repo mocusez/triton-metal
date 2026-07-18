@@ -173,3 +173,53 @@ def test_reduce_loop_carried_tile_hoisted_base(M, N, STEPS, n_valid):
     ref = torch.cat(out)
     err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
     assert err <= 2e-5, f"rel err {err}"
+
+
+# --- Cone load with its own row stride --------------------------------------
+#
+# evalRank2ConeAt's tt.load leaf used to read `device[rowBase + n]`, where
+# rowBase is derived ONCE from the reduce's representative load. That assumes
+# every load in the cone shares the reduce tile's row stride and per-program
+# base. False as soon as a cone load has a different shape: the SSM scan's
+# reduce tile is (BLOCK_D, BLOCK_N) while its `A` is (d_model, d_state), so A
+# was read with stride BLOCK_N and carrying another buffer's batch offset. The
+# address is now re-materialised from the load's own tt.addptr chain at (r, n).
+
+
+@triton.jit
+def _cone_load_own_stride_kernel(a_ptr, c_ptr, y_ptr, STEPS,
+                                 M: tl.constexpr, N: tl.constexpr,
+                                 STRIDE: tl.constexpr):
+    row = tl.arange(0, M)
+    col = tl.arange(0, N)
+    idx2d = row[:, None] * N + col[None, :]
+    # Row stride STRIDE != N: a view into a WIDER buffer.
+    a = tl.load(a_ptr + row[:, None] * STRIDE + col[None, :])
+    h = tl.zeros((M, N), dtype=tl.float32)
+    for t in range(0, STEPS):
+        cc = tl.load(c_ptr + t * M * N + idx2d)
+        h = h * 0.5 + cc * a
+        tl.store(y_ptr + t * M + row, tl.sum(cc * h, axis=1))
+
+
+@pytest.mark.parametrize("M, N, STEPS, STRIDE", [(32, 64, 4, 96), (16, 32, 3, 40),
+                                                 (32, 16, 4, 64)])
+def test_reduce_loop_carried_tile_cone_load_own_stride(M, N, STEPS, STRIDE):
+    torch.manual_seed(0x5D + M * N + STRIDE)
+    a = torch.randn(M * STRIDE, dtype=torch.float32, device="mps").contiguous()
+    c = torch.randn(STEPS * M * N, dtype=torch.float32, device="mps").contiguous()
+    y = torch.zeros(STEPS * M, dtype=torch.float32, device="mps").contiguous()
+    _cone_load_own_stride_kernel[(1,)](a, c, y, STEPS, M, N, STRIDE, num_warps=4)
+    torch.mps.synchronize()
+
+    ac = a.cpu().double().reshape(M, STRIDE)[:, :N]
+    cc_all = c.cpu().double()
+    h = torch.zeros(M, N, dtype=torch.float64)
+    out = []
+    for t in range(STEPS):
+        cc = cc_all[t * M * N:(t + 1) * M * N].reshape(M, N)
+        h = h * 0.5 + cc * ac
+        out.append((cc * h).sum(1))
+    ref = torch.cat(out)
+    err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
+    assert err <= 2e-5, f"rel err {err}"
