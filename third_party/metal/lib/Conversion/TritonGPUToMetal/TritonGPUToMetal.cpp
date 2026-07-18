@@ -3602,6 +3602,16 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
       return mlir::arith::MulIOp::create(rewriter, loc, a, b).getResult();
     });
+  // Boolean combine of per-element predicates — the rank-2 mask
+  // `(rows<M) & (cols<N)` is `andi(broadcast(cmpi), broadcast(cmpi))`.
+  if (auto o = mlir::dyn_cast<mlir::arith::AndIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::AndIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::OrIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::OrIOp::create(rewriter, loc, a, b).getResult();
+    });
 
   return nullptr;
 }
@@ -3942,6 +3952,195 @@ struct ScanLowering
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Rank-2 axis=0 (per-COLUMN) reduce → rank-1 [N] (Session L3a2).
+//
+// `tt.reduce(tile[BM,BN], axis=0)` sums each column over its BM rows. Unlike
+// the axis=1 reduce (per-row, needs a threadgroup rowBuf + cross-thread
+// cooperation), axis=0's output columns are INDEPENDENT — each is owned by one
+// output thread, which sums `device[offs(m, myCol)]` over m in [0, BM) locally.
+// No threadgroup buffer, no barrier.
+//
+// The tutorial-05 backward's `_layer_norm_bwd_dwdb` reduces a LOOP-CARRIED 2D
+// accumulator (`dw += load_tile`) over axis 0; `reassociateLoopCarriedAxis0-
+// Reduce` rewrites that to `scf.for(s1d += reduce(load_tile, axis=0))` so the
+// reduce here sees a per-iteration direct masked load. f32 sum, E_out==1.
+//
+// The offset/mask are evaluated per (row m, output col) via `evalRank2ConeAt`
+// on the load's own offset and mask cones — so the runtime row stride N and the
+// per-program column base (pid*BN) are recovered from the cone, not extracted.
+static mlir::LogicalResult
+lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
+                      mlir::ConversionPatternRewriter &rewriter) {
+  auto loc = op.getLoc();
+  auto rtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!rtt || rtt.getRank() != 2 || op.getAxis() != 0)
+    return mlir::failure();
+  if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1) ||
+      !rtt.getElementType().isF32())
+    return mlir::failure();
+  mlir::Operation *combine = nullptr;
+  if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
+    for (auto &n : op->getRegion(0).front())
+      if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
+        combine = &n;
+        break;
+      }
+  if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+    return mlir::failure();
+
+  int64_t BM = rtt.getDimSize(0);
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto i32 = rewriter.getI32Type();
+  auto f32 = rewriter.getF32Type();
+
+  // Peel one shape-only cvt hop to the real source.
+  mlir::Value src = op.getSrcs().front();
+  if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    src = cvt.getSrc();
+
+  // Uniform (splat / splat-constant) source: reduce(splat(c), axis=0) == BM*c,
+  // same for every column. Covers the reassociation seed `reduce(zeros)`.
+  {
+    mlir::Value uniformScalar;
+    if (auto sp = src.getDefiningOp<mlir::triton::SplatOp>())
+      uniformScalar = sp.getSrc();
+    else if (auto cst = src.getDefiningOp<mlir::arith::ConstantOp>()) {
+      if (auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()))
+        if (dense.isSplat())
+          uniformScalar = mlir::arith::ConstantOp::create(
+                              rewriter, loc,
+                              dense.getSplatValue<mlir::TypedAttr>())
+                              .getResult();
+    }
+    if (uniformScalar && uniformScalar.getType().isF32()) {
+      auto cBM = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(BM)));
+      mlir::Value r = mlir::arith::MulFOp::create(rewriter, loc, uniformScalar,
+                                                  cBM.getResult())
+                          .getResult();
+      rewriter.replaceOp(op, r);
+      return mlir::success();
+    }
+  }
+
+  auto loadOp = src.getDefiningOp<mlir::triton::LoadOp>();
+  if (!loadOp)
+    return rewriter.notifyMatchFailure(
+        op, "rank-2 axis0 reduce: source is not a device load or uniform splat");
+  auto ap = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+  if (!ap)
+    return rewriter.notifyMatchFailure(op,
+                                       "rank-2 axis0 reduce: load missing addptr");
+  mlir::Value memref = findBaseMemref(loadOp.getPtr(), rewriter);
+  if (!memref)
+    return rewriter.notifyMatchFailure(op,
+                                       "rank-2 axis0 reduce: base memref not found");
+  mlir::Value offs = ap.getOffset();
+  mlir::Value maskV = loadOp.getMask();
+
+  // tpb from the source tile's blocked encoding (mirrors the axis=1 path — a
+  // forward walk to the store is fragile under conversion ordering). The output
+  // has BN columns; require E_out == 1 (BN <= tpb) so each thread owns exactly
+  // one output column c == localTid. Larger BN needs a tile loop — deferred; the
+  // layer-norm backward launches with tpb >= BN.
+  auto srcBlocked =
+      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+          rtt.getEncoding());
+  if (!srcBlocked)
+    return rewriter.notifyMatchFailure(
+        op, "rank-2 axis0 reduce: source not blocked-encoded");
+  int64_t tpb = 1;
+  for (auto t : srcBlocked.getThreadsPerWarp())
+    tpb *= t;
+  for (auto w : srcBlocked.getWarpsPerCTA())
+    tpb *= w;
+  int64_t BN = rtt.getDimSize(1);
+  if (tpb <= 0 || BN > tpb)
+    return rewriter.notifyMatchFailure(
+               op, "rank-2 axis0 reduce: E_out>1 deferred (launch tpb>=BN)");
+
+  // nVal = per-thread output column = localTid = globalTid - tgid*tpb.
+  auto tidG =
+      ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
+  mlir::Value tidI = mlir::UnrealizedConversionCastOp::create(
+                         rewriter, loc, mlir::TypeRange{i32},
+                         mlir::ValueRange{tidG.getResult()})
+                         .getResult(0);
+  auto tgG = ThreadgroupIdOp::create(rewriter, loc, ui32,
+                                     rewriter.getStringAttr("x"));
+  mlir::Value tgI = mlir::UnrealizedConversionCastOp::create(
+                        rewriter, loc, mlir::TypeRange{i32},
+                        mlir::ValueRange{tgG.getResult()})
+                        .getResult(0);
+  auto cTpb = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+  mlir::Value tgOff =
+      mlir::arith::MulIOp::create(rewriter, loc, tgI, cTpb.getResult())
+          .getResult();
+  mlir::Value nVal =
+      mlir::arith::SubIOp::create(rewriter, loc, tidI, tgOff).getResult();
+  mlir::Value dummyRowBase =
+      mlir::arith::ConstantOp::create(rewriter, loc,
+                                      rewriter.getI32IntegerAttr(0))
+          .getResult();
+
+  // s = sum over local row m in [0, BM) of (mask ? device[offs(m, nVal)] : 0).
+  auto cLo = mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getI32IntegerAttr(0));
+  auto cHi = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BM)));
+  auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getI32IntegerAttr(1));
+  auto cZeroF = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getF32FloatAttr(0.0f));
+  auto forOp = mlir::scf::ForOp::create(rewriter, loc, cLo.getResult(),
+                                        cHi.getResult(), cOne.getResult(),
+                                        mlir::ValueRange{cZeroF.getResult()});
+  {
+    mlir::OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(forOp.getBody());
+    mlir::Value m = forOp.getInductionVar();
+    mlir::Value acc = forOp.getRegionIterArgs()[0];
+    mlir::Value addrI =
+        evalRank2ConeAt(offs, m, dummyRowBase, nVal, rewriter, loc, /*depth=*/0);
+    if (!addrI)
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 axis0 reduce: offset cone not evaluable");
+    mlir::Value maskBit;
+    if (maskV) {
+      maskBit = evalRank2ConeAt(maskV, m, dummyRowBase, nVal, rewriter, loc, 0);
+      if (!maskBit)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 axis0 reduce: mask cone not evaluable");
+    }
+    mlir::Value safeAddr = addrI;
+    if (maskBit) {
+      auto z = mlir::arith::ConstantOp::create(rewriter, loc,
+                                               rewriter.getI32IntegerAttr(0));
+      safeAddr = mlir::arith::SelectOp::create(rewriter, loc, maskBit, addrI,
+                                               z.getResult())
+                     .getResult();
+    }
+    mlir::Value idxU = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{ui32},
+                           mlir::ValueRange{safeAddr})
+                           .getResult(0);
+    mlir::Value v =
+        GetElementOp::create(rewriter, loc, f32, memref, idxU).getResult();
+    if (maskBit)
+      v = mlir::arith::SelectOp::create(rewriter, loc, maskBit, v,
+                                        cZeroF.getResult())
+              .getResult();
+    mlir::Value s =
+        mlir::arith::AddFOp::create(rewriter, loc, acc, v).getResult();
+    mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{s});
+  }
+  rewriter.replaceOp(op, forOp.getResult(0));
+  return mlir::success();
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3965,6 +4164,8 @@ struct ReduceLowering
       return mlir::failure();
     if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1))
       return mlir::failure();
+    if (op.getAxis() == 0)
+      return lowerRank2Axis0Reduce(op, rewriter);
     if (op.getAxis() != 1)
       return mlir::failure();
     mlir::Type elemTy = rtt.getElementType();
@@ -8984,6 +9185,90 @@ static void reassociateLoopCarriedSumReduce(mlir::ModuleOp moduleOp) {
   }
 }
 
+// Axis-0 analog: `reduce(scf.for(acc2d += delta2d), axis=0)` [rank-1 N] is
+// reassociated to `scf.for(s1d += reduce(delta2d, axis=0))`. The outer loop now
+// carries the rank-1 [N] partial-column-sum (at E_out==1 it scalarizes to a
+// per-thread scalar, like the forward's scalar carry); the inner
+// `reduce(delta2d, axis=0)` is a rank-2 axis=0 reduce over the per-iteration
+// direct masked load, handled by `lowerRank2Axis0Reduce`. This is tutorial-05's
+// `_layer_norm_bwd_dwdb` (dw/db partial-sum reduction). Done BEFORE conversion.
+static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp> reduces;
+  moduleOp.walk([&](mlir::triton::ReduceOp r) { reduces.push_back(r); });
+  for (auto R : reduces) {
+    if (R.getSrcs().size() != 1 || R->getNumResults() != 1)
+      continue;
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(R.getSrcs()[0].getType());
+    if (!rtt || rtt.getRank() != 2 || !rtt.getElementType().isF32())
+      continue;
+    if (R.getAxis() != 0)
+      continue;
+    mlir::Operation *combine = nullptr;
+    if (R->getNumRegions() > 0 && !R->getRegion(0).empty())
+      for (auto &n : R->getRegion(0).front())
+        if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
+          combine = &n;
+          break;
+        }
+    if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+      continue;
+    // Multi-result loops are fine: `_layer_norm_bwd_dwdb` carries dw AND db in
+    // one scf.for (2 results, 2 axis-0 reduces). Each reduce reassociates its
+    // own result (`idx`) into a fresh single-result loop; the original loop is
+    // erased once all its results are unused (after both reduces are handled).
+    auto forOp = R.getSrcs()[0].getDefiningOp<mlir::scf::ForOp>();
+    if (!forOp)
+      continue;
+    unsigned idx = mlir::cast<mlir::OpResult>(R.getSrcs()[0]).getResultNumber();
+    auto yieldOp =
+        mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
+    auto add = yieldOp.getOperand(idx).getDefiningOp<mlir::arith::AddFOp>();
+    if (!add)
+      continue;
+    mlir::Value iterArg = forOp.getRegionIterArg(idx);
+    mlir::Value delta;
+    if (add.getLhs() == iterArg)
+      delta = add.getRhs();
+    else if (add.getRhs() == iterArg)
+      delta = add.getLhs();
+    else
+      continue;
+    llvm::DenseSet<void *> seen;
+    if (coneUsesValue(delta, iterArg, forOp.getBody(), seen))
+      continue; // delta must not depend on the accumulator
+
+    mlir::OpBuilder b(forOp);
+    auto loc = forOp.getLoc();
+    // sinit = reduce(init, axis=0). Init is the zeros splat; lowerRank2Axis0-
+    // Reduce evaluates a uniform-splat source as BM*c == 0 without a device
+    // read, so no slice-encoded constant is materialized here.
+    mlir::Operation *sinitR = b.clone(*R.getOperation());
+    sinitR->setOperand(0, forOp.getInitArgs()[idx]);
+    mlir::Value sinit = sinitR->getResult(0);
+
+    auto newFor = mlir::scf::ForOp::create(
+        b, loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+        mlir::ValueRange{sinit},
+        [&](mlir::OpBuilder &bb, mlir::Location ll, mlir::Value iv,
+            mlir::ValueRange args) {
+          mlir::IRMapping map;
+          map.map(forOp.getInductionVar(), iv);
+          mlir::Value deltaCloned =
+              cloneConeInto(delta, map, bb, forOp.getBody());
+          mlir::Operation *dr = bb.clone(*R.getOperation());
+          dr->setOperand(0, deltaCloned);
+          mlir::Value sNew =
+              mlir::arith::AddFOp::create(bb, ll, args[0], dr->getResult(0))
+                  .getResult();
+          mlir::scf::YieldOp::create(bb, ll, sNew);
+        });
+    R->getResult(0).replaceAllUsesWith(newFor.getResult(0));
+    R.erase();
+    if (forOp->use_empty())
+      forOp.erase();
+  }
+}
+
 static void flattenUniformScanInputScfIf(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::IfOp> targets;
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
@@ -9081,6 +9366,10 @@ struct ConvertTritonGPUToMetalPass
     // an (unrepresentable) loop-carried tensor iter_arg at BLOCK>tpb. Layer-norm
     // / RMSNorm mean+variance.
     reassociateLoopCarriedSumReduce(moduleOp);
+
+    // Axis-0 analog: `reduce(scf.for(acc2d += delta2d), axis=0)` ->
+    // `scf.for(s1d += reduce(delta2d, axis=0))`. tutorial-05 `_layer_norm_bwd_dwdb`.
+    reassociateLoopCarriedAxis0Reduce(moduleOp);
 
     // Phase 2: recognize the online-softmax flash-attention loop and replace
     // it + epilogue with a single `metal.flash_attention` op BEFORE any cvt
@@ -9229,13 +9518,19 @@ struct ConvertTritonGPUToMetalPass
         reduceOk = false;
         return;
       }
-      // Rank-2 axis=1 ships via the rank-2 ReduceLowering body; axis=0 is
-      // deferred (L3a2). Rank-1 reduces only have axis=0, which is valid.
+      // Rank-2 axis=1 ships via the rank-2 ReduceLowering body. Rank-2 axis=0
+      // (per-column) ships for f32 sum only (lowerRank2Axis0Reduce, Session
+      // L3a2) — after reassociateLoopCarriedAxis0Reduce the inner reduce is a
+      // direct axis=0 device reduce. Other axis=0 combines stay deferred.
       if (rtt.getRank() == 2 && axes == 0) {
-        red.emitOpError(
-            "tt.reduce axis=0 reduce deferred to Session L3a2 (future); "
-            "axis=1 is shipped");
-        reduceOk = false;
+        bool axis0Ok = combineName == "arith.addf" && combineEltTy &&
+                       combineEltTy.isF32();
+        if (!axis0Ok) {
+          red.emitOpError(
+              "tt.reduce axis=0 reduce supports f32 sum only (Session L3a2); "
+              "other combines deferred");
+          reduceOk = false;
+        }
         return;
       }
       // 3) combine must be arith.addf / arith.addi (sum) or arith.maximumf /

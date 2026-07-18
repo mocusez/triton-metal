@@ -21,12 +21,14 @@ spin lock (`while atomic_cas(Lock,0,1): pass ... atomic_xchg(Lock,0)`), is
 instead done LOCK-FREE with `tl.atomic_add`: a global spin lock cannot be ported
 faithfully to Apple GPUs (no cross-threadgroup forward-progress guarantee, so it
 can deadlock). Stage 1 atomically accumulates partial dw/db into GROUP_SIZE_M
-f32 buckets (Metal atomics are f32); Stage 2 atomically reduces the buckets into
-the final dw/db. Both stages launch with num_warps = BLOCK/32 (tpb == BLOCK) so
-elem-per-thread == 1 and the kernel stays a single spt=1 layout: a tensor atomic
-is always spt=1 (atomics can't vectorize), and the backend's single-E tile loop
-can't bridge the mixed-spt divergence coalescing would create at E>1. Verified vs
-torch.autograd across dtypes, non-pow2 N, and M > GROUP_SIZE_M (real atomic
+f32 buckets (Metal atomics are f32); Stage 2 is the VERBATIM tutorial
+`_layer_norm_bwd_dwdb` — a rank-2 axis=0 (per-column) reduce over two
+loop-carried 2D accumulators, now supported on Metal (reassociateLoopCarried-
+Axis0Reduce + lowerRank2Axis0Reduce). Stage 1 launches with num_warps = BLOCK/32
+(tpb == BLOCK, elem-per-thread == 1) because a tensor atomic is always spt=1 and
+the backend's single-E tile loop can't bridge the mixed-spt divergence coalescing
+creates at E>1; Stage 2 runs at BLOCK_SIZE_N=128 == tpb (output E==1). Verified
+vs torch.autograd across dtypes, non-pow2 N, and M > GROUP_SIZE_M (real atomic
 contention).
 """
 
@@ -153,17 +155,26 @@ def _layer_norm_bwd_dx_atomic(DX, DY, DW, DB, X, W, Mean, Rstd, stride, N,
 
 
 @triton.jit
-def _layer_norm_bwd_dwdb_atomic(DW, DB, FINAL_DW, FINAL_DB, N,
-                                BLOCK_SIZE_N: tl.constexpr):
-    # Stage 2: one program per bucket row; atomically reduce buckets into the
-    # final [N] gradients (replaces the tutorial's rank-2 axis=0 reduce).
-    g = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE_N)
-    mask = cols < N
-    dw = tl.load(DW + g * N + cols, mask=mask, other=0.)
-    db = tl.load(DB + g * N + cols, mask=mask, other=0.)
-    tl.atomic_add(FINAL_DW + cols, dw, mask=mask)
-    tl.atomic_add(FINAL_DB + cols, db, mask=mask)
+def _layer_norm_bwd_dwdb(DW, DB, FINAL_DW, FINAL_DB, M, N,
+                         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    # Stage 2, VERBATIM tutorial-05: reduce the GROUP_SIZE_M partial buckets to
+    # the final [N] gradients via a rank-2 axis=0 (per-column) reduce over two
+    # loop-carried 2D accumulators. Runs on Metal via reassociateLoopCarried-
+    # Axis0Reduce + lowerRank2Axis0Reduce (output E==1: BLOCK_SIZE_N == tpb).
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(0, M, BLOCK_SIZE_M):
+        rows = i + tl.arange(0, BLOCK_SIZE_M)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        dw += tl.load(DW + offs, mask=mask, other=0.)
+        db += tl.load(DB + offs, mask=mask, other=0.)
+    sum_dw = tl.sum(dw, axis=0)
+    sum_db = tl.sum(db, axis=0)
+    tl.store(FINAL_DW + cols, sum_dw, mask=cols < N)
+    tl.store(FINAL_DB + cols, sum_db, mask=cols < N)
 
 
 def _layer_norm_backward_metal(x, w, dy, mean, rstd, N):
@@ -188,12 +199,15 @@ def _layer_norm_backward_metal(x, w, dy, mean, rstd, N):
     _layer_norm_bwd_dx_atomic[(M,)](
         dx, dy, _dw, _db, x, w, mean, rstd, x.stride(0), N,
         GROUP_SIZE_M=GROUP_SIZE_M, BLOCK_SIZE_N=BLOCK, num_warps=num_warps)
-    # Only buckets [0, min(GROUP, M)) received any contribution.
+    # Stage 2: verbatim tutorial-05 dw/db reduction (rank-2 axis=0 reduce over
+    # the GROUP_SIZE_M partial buckets). BLOCK_SIZE_N=128 == tpb (num_warps=4)
+    # so the output is E==1; grid tiles the N columns.
     G = min(GROUP_SIZE_M, M)
-    dw = torch.zeros(N, dtype=torch.float32, device="mps")
-    db = torch.zeros(N, dtype=torch.float32, device="mps")
-    _layer_norm_bwd_dwdb_atomic[(G,)](_dw, _db, dw, db, N, BLOCK_SIZE_N=BLOCK,
-                                      num_warps=num_warps)
+    dw = torch.empty(N, dtype=torch.float32, device="mps")
+    db = torch.empty(N, dtype=torch.float32, device="mps")
+    grid = (triton.cdiv(N, 128),)
+    _layer_norm_bwd_dwdb[grid](_dw, _db, dw, db, G, N, BLOCK_SIZE_M=32,
+                               BLOCK_SIZE_N=128, num_warps=4)
     torch.mps.synchronize()
     return dx, dw, db
 

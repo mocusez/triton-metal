@@ -61,18 +61,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// axis=0 reduce (addf, f32) — L3a ships axis=1 only; axis=0 is deferred to a
-// dedicated future session (L3a2). The pre-pass axis check rejects it with
-// the spec-mandated error string.
+// axis=0 reduce — f32 SUM now ships (Session L3a2, lowerRank2Axis0Reduce), but
+// other axis=0 combines (here f32 max) stay deferred. The pre-pass axis check
+// rejects the non-sum combine with the spec-mandated error string.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_sum_axis0_deferred(%x_ptr: !tt.ptr<f32>) {
+  tt.func public @reduce_max_axis0_deferred(%x_ptr: !tt.ptr<f32>) {
     %x = arith.constant dense<0.0> : tensor<16x32xf32, #blocked>
-    // expected-error @+1 {{tt.reduce axis=0 reduce deferred to Session L3a2 (future)}}
+    // expected-error @+1 {{tt.reduce axis=0 reduce supports f32 sum only (Session L3a2)}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
-      %s = arith.addf %a, %b : f32
+      %s = arith.maxnumf %a, %b : f32
       tt.reduce.return %s : f32
     }) {axis = 0 : i32} : (tensor<16x32xf32, #blocked>) -> tensor<32xf32, #slice0>
     tt.return
