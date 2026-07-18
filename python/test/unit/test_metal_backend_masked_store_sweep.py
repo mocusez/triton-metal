@@ -134,3 +134,46 @@ def test_masked_store_sweep_bit_exact(BLOCK_N, num_warps):
             f"{(out - expected).abs().max().item()}\n"
             f"out=\n{out.cpu()}\nexpected=\n{expected.cpu()}"
         )
+
+
+# --- Sub-tile threads clobbering another program's rows ---------------------
+#
+# A store mask is a GLOBAL bound (`pid*BLOCK + arange < n_rows`), not a per-tile
+# one. When the stored tensor has fewer elements than the threadgroup has
+# threads, the threads PAST the tile still satisfy that bound and store a value
+# belonging to some other row — overwriting the output of whichever program owns
+# that row. With BLOCK=32, tpb=128 and n_rows=64 over two programs, program 0's
+# threads 32..63 pass `localTid < 64` and clobber program 1's rows.
+#
+# `StoreLowering` has always emitted a `localTid < numElements` guard for this;
+# `MaskedStoreLowering` did not, relying on the user mask alone. Invisible
+# whenever the mask bound coincides with the tile — single-program launches, or
+# n_rows == BLOCK — which is why the sweeps above stayed green.
+
+
+@triton.jit
+def _masked_store_subtile_kernel(x_ptr, y_ptr, n_rows, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + off, mask=off < n_rows, other=0.0)
+    tl.store(y_ptr + off, v * 2.0, mask=off < n_rows)
+
+
+@pytest.mark.parametrize("BLOCK, n_rows, num_warps", [
+    (32, 64, 4),    # tpb=128, tile=32: threads 32..63 pass a 64-wide mask
+    (32, 128, 4),   # four programs
+    (16, 64, 4),    # tile 16 of 128
+    (32, 64, 1),    # tpb=32 == tile: guard is a no-op, must stay correct
+    (64, 256, 8),   # tpb=256, tile=64
+])
+def test_masked_store_subtile_no_cross_program_clobber(BLOCK, n_rows, num_warps):
+    torch.manual_seed(BLOCK * 1000 + n_rows)
+    x = torch.randn(n_rows, dtype=torch.float32, device="mps")
+    y = torch.zeros(n_rows, dtype=torch.float32, device="mps")
+    grid = (triton.cdiv(n_rows, BLOCK),)
+    _masked_store_subtile_kernel[grid](x, y, n_rows, BLOCK, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(y.cpu(), (x * 2.0).cpu()), (
+        f"BLOCK={BLOCK} n_rows={n_rows} num_warps={num_warps}: "
+        f"max err {(y - x * 2.0).abs().max().item()}"
+    )

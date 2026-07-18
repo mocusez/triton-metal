@@ -6632,6 +6632,40 @@ struct MaskedStoreLowering
       cond = adaptor.getMask();
     }
 
+    // Sub-tpb guard, the same one StoreLowering emits — the user mask does NOT
+    // subsume it.
+    //
+    // A store mask is a GLOBAL bound (`pid*BLOCK + arange < n_rows`), not a
+    // per-tile one. When the stored tensor has fewer elements than the
+    // threadgroup has threads, the threads past the tile still satisfy that
+    // bound and store a value belonging to some OTHER row — clobbering the
+    // output of whichever program owns that row. With BLOCK=32, tpb=128 and
+    // n_rows=64 across two programs, program 0's threads 32..63 pass
+    // `localTid < 64` and overwrite program 1's rows with program 0's results.
+    //
+    // Invisible whenever the mask bound happens to coincide with the tile
+    // (single-program launches, or n_rows == BLOCK), which is why the existing
+    // masked-store coverage stayed green.
+    {
+      int64_t numElements = 1;
+      for (auto s : tile->shape)
+        numElements *= s;
+      if (tile->elemPerThread <= 1 &&
+          numElements < tile->threadsPerBlock) {
+        mlir::Value localTid =
+            emitLocalTid(rewriter, loc, tile->threadsPerBlock);
+        auto cNum = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(numElements)));
+        auto inTile = mlir::arith::CmpIOp::create(
+            rewriter, loc, mlir::arith::CmpIPredicate::slt, localTid,
+            cNum.getResult());
+        cond = mlir::arith::AndIOp::create(rewriter, loc, cond,
+                                           inTile.getResult())
+                   .getResult();
+      }
+    }
+
     // L2b: route the masked-store value/scratch/device path through the memref
     // storage type (ui32 for i32). The scratch alloca was created with this
     // same storage type by preprocessMaskedStoreSentinels, and

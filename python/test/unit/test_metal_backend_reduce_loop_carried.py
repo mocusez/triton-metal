@@ -223,3 +223,55 @@ def test_reduce_loop_carried_tile_cone_load_own_stride(M, N, STEPS, STRIDE):
     ref = torch.cat(out)
     err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
     assert err <= 2e-5, f"rel err {err}"
+
+
+# --- Loop-carried tile across several row-block programs ---------------------
+#
+# Every loop-carried test above launches a single program, so the staged tile
+# only ever had one threadgroup's worth of state. Here the row block comes from
+# program_id(1), matching the SSM selective scan's (batch, d_blocks) launch:
+# each program owns its own threadgroup buffer and its own slice of the output.
+
+
+@triton.jit
+def _loop_carried_tile_multiprog_kernel(c_ptr, y_ptr, STEPS, n_rows,
+                                        M: tl.constexpr, N: tl.constexpr):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    row = pid_m * M + tl.arange(0, M)
+    col = tl.arange(0, N)
+    rmask = row < n_rows
+    h = tl.zeros((M, N), dtype=tl.float32)
+    for t in range(0, STEPS):
+        cc = tl.load(c_ptr + pid_b * STEPS * n_rows * N + t * n_rows * N
+                     + row[:, None] * N + col[None, :])
+        h = h * 0.5 + cc
+        tl.store(y_ptr + pid_b * STEPS * n_rows + t * n_rows + row,
+                 tl.sum(cc * h, axis=1), mask=rmask)
+
+
+@pytest.mark.parametrize("batch, M, N, STEPS, n_rows", [
+    (1, 32, 64, 4, 64),    # two row-blocks
+    (2, 32, 64, 4, 64),    # two row-blocks x two batches
+    (1, 32, 64, 3, 128),   # four row-blocks
+    (1, 16, 32, 4, 64),
+])
+def test_reduce_loop_carried_tile_multiprogram(batch, M, N, STEPS, n_rows):
+    torch.manual_seed(0x2D + n_rows + M)
+    c = torch.randn(batch * STEPS * n_rows * N, dtype=torch.float32,
+                    device="mps").contiguous()
+    y = torch.zeros(batch * STEPS * n_rows, dtype=torch.float32,
+                    device="mps").contiguous()
+    _loop_carried_tile_multiprog_kernel[(batch, n_rows // M)](
+        c, y, STEPS, n_rows, M, N, num_warps=4)
+    torch.mps.synchronize()
+
+    cc = c.cpu().double().reshape(batch, STEPS, n_rows, N)
+    h = torch.zeros(batch, n_rows, N, dtype=torch.float64)
+    out = []
+    for t in range(STEPS):
+        h = h * 0.5 + cc[:, t]
+        out.append((cc[:, t] * h).sum(-1))
+    ref = torch.stack(out, 1).reshape(-1)
+    err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
+    assert err <= 2e-5, f"rel err {err}"
