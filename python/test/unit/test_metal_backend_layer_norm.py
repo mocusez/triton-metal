@@ -1,4 +1,4 @@
-"""Layer-norm forward on the Metal backend (official tutorial 05).
+"""Layer-norm forward AND backward on the Metal backend (official tutorial 05).
 
 The fused forward kernel computes per-row mean and variance by accumulating a
 tensor across a loop (`_mean += x`, `_var += (x-mean)^2`) and reducing it, then
@@ -13,6 +13,21 @@ normalizes. This exercises several Metal-backend features together:
 
 Verified vs a torch reference in both fp32 (tight) and fp16 (loose) across E==1
 (BLOCK==tpb) and E>1 (BLOCK>tpb) row widths.
+
+BACKWARD is a Metal-appropriate port of the tutorial's two-stage design. The dx
+computation is verbatim (two rank-1 reduces feeding an elementwise expression +
+masked store). The dw/db accumulation, which the tutorial guards with a global
+spin lock (`while atomic_cas(Lock,0,1): pass ... atomic_xchg(Lock,0)`), is
+instead done LOCK-FREE with `tl.atomic_add`: a global spin lock cannot be ported
+faithfully to Apple GPUs (no cross-threadgroup forward-progress guarantee, so it
+can deadlock). Stage 1 atomically accumulates partial dw/db into GROUP_SIZE_M
+f32 buckets (Metal atomics are f32); Stage 2 atomically reduces the buckets into
+the final dw/db. Both stages launch with num_warps = BLOCK/32 (tpb == BLOCK) so
+elem-per-thread == 1 and the kernel stays a single spt=1 layout: a tensor atomic
+is always spt=1 (atomics can't vectorize), and the backend's single-E tile loop
+can't bridge the mixed-spt divergence coalescing would create at E>1. Verified vs
+torch.autograd across dtypes, non-pow2 N, and M > GROUP_SIZE_M (real atomic
+contention).
 """
 
 from __future__ import annotations
@@ -95,3 +110,125 @@ def test_layer_norm_forward(dtype, M, N):
     ref = (xc - mu) / torch.sqrt(var + eps) * w.cpu().float() + b.cpu().float()
     tol = {torch.float32: 1e-3, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
     torch.testing.assert_close(y.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+# ===========================================================================
+# Backward (Metal-appropriate two-stage atomic port of tutorial 05).
+# ===========================================================================
+
+
+@triton.jit
+def _layer_norm_bwd_dx_atomic(DX, DY, DW, DB, X, W, Mean, Rstd, stride, N,
+                              GROUP_SIZE_M: tl.constexpr,
+                              BLOCK_SIZE_N: tl.constexpr):
+    # Verbatim dx; lock-free atomic accumulation into f32 dw/db buckets.
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
+    X += row * stride
+    DY += row * stride
+    DX += row * stride
+    lock_id = row % GROUP_SIZE_M
+    DW = DW + lock_id * N + cols
+    DB = DB + lock_id * N + cols
+    x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
+    dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    mean = tl.load(Mean + row)
+    rstd = tl.load(Rstd + row)
+    xhat = (x - mean) * rstd
+    wdy = w * dy
+    xhat = tl.where(mask, xhat, 0.)
+    wdy = tl.where(mask, wdy, 0.)
+    c1 = tl.sum(xhat * wdy, axis=0) / N
+    c2 = tl.sum(wdy, axis=0) / N
+    dx = (wdy - (xhat * c1 + c2)) * rstd
+    tl.store(DX + cols, dx, mask=mask)
+    # Partial sums kept in f32 (Metal atomic_add is f32); the tutorial casts to
+    # w.dtype only to shrink the bucket buffer.
+    partial_dw = dy * xhat
+    partial_db = dy
+    tl.atomic_add(DW, partial_dw, mask=mask)
+    tl.atomic_add(DB, partial_db, mask=mask)
+
+
+@triton.jit
+def _layer_norm_bwd_dwdb_atomic(DW, DB, FINAL_DW, FINAL_DB, N,
+                                BLOCK_SIZE_N: tl.constexpr):
+    # Stage 2: one program per bucket row; atomically reduce buckets into the
+    # final [N] gradients (replaces the tutorial's rank-2 axis=0 reduce).
+    g = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
+    dw = tl.load(DW + g * N + cols, mask=mask, other=0.)
+    db = tl.load(DB + g * N + cols, mask=mask, other=0.)
+    tl.atomic_add(FINAL_DW + cols, dw, mask=mask)
+    tl.atomic_add(FINAL_DB + cols, db, mask=mask)
+
+
+def _layer_norm_backward_metal(x, w, dy, mean, rstd, N):
+    M = x.shape[0]
+    GROUP_SIZE_M = 64
+    if N <= 4096:
+        GROUP_SIZE_M = 128
+    if N <= 1024:
+        GROUP_SIZE_M = 256
+    BLOCK = triton.next_power_of_2(N)
+    # Launch with tpb == BLOCK (num_warps = BLOCK/32) so elem-per-thread == 1 and
+    # the whole kernel stays a single spt=1 layout. A tensor atomic is always
+    # spt=1 (atomics can't vectorize); at E>1 the coalescer would give the
+    # surrounding loads/store spt>1, and the backend's single-E tile loop can't
+    # bridge that mixed-spt divergence. E==1 makes coalescing a no-op. Caps N at
+    # 1024 (32 warps = Metal's 1024-thread threadgroup limit) — fine for the
+    # <=64KB/row layer norms this kernel targets.
+    num_warps = min(max(BLOCK // 32, 1), 32)
+    _dw = torch.zeros((GROUP_SIZE_M, N), dtype=torch.float32, device="mps")
+    _db = torch.zeros((GROUP_SIZE_M, N), dtype=torch.float32, device="mps")
+    dx = torch.empty_like(x)
+    _layer_norm_bwd_dx_atomic[(M,)](
+        dx, dy, _dw, _db, x, w, mean, rstd, x.stride(0), N,
+        GROUP_SIZE_M=GROUP_SIZE_M, BLOCK_SIZE_N=BLOCK, num_warps=num_warps)
+    # Only buckets [0, min(GROUP, M)) received any contribution.
+    G = min(GROUP_SIZE_M, M)
+    dw = torch.zeros(N, dtype=torch.float32, device="mps")
+    db = torch.zeros(N, dtype=torch.float32, device="mps")
+    _layer_norm_bwd_dwdb_atomic[(G,)](_dw, _db, dw, db, N, BLOCK_SIZE_N=BLOCK,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    return dx, dw, db
+
+
+# M > GROUP_SIZE_M at (300,1024) [GROUP=256] and (400,512) exercises real
+# multi-row atomic contention on a shared bucket; non-pow2 N at 700/333.
+@pytest.mark.parametrize("dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M, N", [(4, 128), (8, 256), (16, 1024), (3, 700),
+                                  (5, 333), (300, 1024), (400, 512)])
+def test_layer_norm_backward(dtype, M, N):
+    torch.manual_seed(M * 4099 + N)
+    dev = "mps"
+    x = torch.randn(M, N, dtype=dtype, device=dev)
+    w = torch.randn(N, dtype=dtype, device=dev)
+    b = torch.randn(N, dtype=dtype, device=dev)
+    dy = torch.randn(M, N, dtype=dtype, device=dev)
+    eps = 1e-5
+    mean = x.float().mean(1)
+    rstd = 1.0 / torch.sqrt(x.float().var(1, unbiased=False) + eps)
+
+    dx, dw, db = _layer_norm_backward_metal(x, w, dy, mean, rstd, N)
+
+    # Reference via torch autograd, in fp32 on CPU for a stable oracle.
+    xc = x.cpu().float().detach().requires_grad_(True)
+    wc = w.cpu().float().detach().requires_grad_(True)
+    bc = b.cpu().float().detach().requires_grad_(True)
+    yc = torch.nn.functional.layer_norm(xc, (N,), wc, bc, eps)
+    yc.backward(dy.cpu().float())
+
+    # dw/db sum over M rows, so tolerances scale a bit with M and precision.
+    tol = {torch.float32: (1e-3, 1e-3),
+           torch.float16: (1e-2, 1e-2),
+           torch.bfloat16: (5e-2, 5e-2)}[dtype]
+    atol, rtol = tol
+    torch.testing.assert_close(dx.cpu().float(), xc.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dw.cpu(), wc.grad, atol=atol * M, rtol=rtol)
+    torch.testing.assert_close(db.cpu(), bc.grad, atol=atol * M, rtol=rtol)
