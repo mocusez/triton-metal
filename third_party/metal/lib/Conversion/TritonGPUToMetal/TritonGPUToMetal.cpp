@@ -1534,6 +1534,25 @@ struct ArithMulFLowering
   }
 };
 
+// Elementwise `arith.maxnumf` / `arith.maximumf` (`tl.maximum`) → per-thread
+// metal.binary_exp maxOp. Mirrors ArithAddFLowering; needed by a loop-carried
+// column-max accumulator (`acc = tl.maximum(acc, tile)`) that
+// reassociateLoopCarriedAxis0Reduce turns into a scalar `max(s, reduce(...))`.
+template <typename OpTy>
+struct ArithMaxFLowering : public mlir::OpConversionPattern<OpTy> {
+  using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto maxEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
+                                              BinaryExpOperator::maxOp);
+    rewriter.template replaceOpWithNewOp<BinaryExpOp>(
+        op, adaptor.getLhs().getType(), maxEnum, adaptor.getLhs(),
+        adaptor.getRhs());
+    return mlir::success();
+  }
+};
+
 // Scalarize a tensor `arith.sitofp` (`idx.to(tl.float32)` etc.). The scalar
 // form is emitted by ModuleTranslation as the MSL constructor cast `T(x)`; here
 // we just rebuild it on the converted scalar operand/result so the tensor op
@@ -3977,8 +3996,9 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
       mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
   if (!rtt || rtt.getRank() != 2 || op.getAxis() != 0)
     return mlir::failure();
+  mlir::Type eltTy = rtt.getElementType();
   if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1) ||
-      !rtt.getElementType().isF32())
+      !(eltTy.isF32() || eltTy.isInteger(32)))
     return mlir::failure();
   mlir::Operation *combine = nullptr;
   if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
@@ -3987,21 +4007,92 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
         combine = &n;
         break;
       }
-  if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+  if (!combine)
     return mlir::failure();
+
+  // Combine kind → accumulator element type, identity (== the masked-out per-row
+  // value so masked rows are inert), and the scalar combine op (all
+  // translator-supported). f32 sum/max and i32 sum/max/min.
+  enum { SumF, MaxF, SumI, MaxI, MinI } kind;
+  if (mlir::isa<mlir::arith::AddFOp>(combine))
+    kind = SumF;
+  else if (mlir::isa<mlir::arith::MaxNumFOp>(combine) ||
+           mlir::isa<mlir::arith::MaximumFOp>(combine))
+    kind = MaxF;
+  else if (mlir::isa<mlir::arith::AddIOp>(combine))
+    kind = SumI;
+  else if (mlir::isa<mlir::arith::MaxSIOp>(combine))
+    kind = MaxI;
+  else if (mlir::isa<mlir::arith::MinSIOp>(combine))
+    kind = MinI;
+  else
+    return rewriter.notifyMatchFailure(
+        op, "rank-2 axis0 reduce: unsupported combine");
+  bool isF = (kind == SumF || kind == MaxF);
+  bool isSum = (kind == SumF || kind == SumI);
+  if (isF != eltTy.isF32())
+    return rewriter.notifyMatchFailure(
+        op, "rank-2 axis0 reduce: combine/dtype mismatch");
 
   int64_t BM = rtt.getDimSize(0);
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
   auto i32 = rewriter.getI32Type();
-  auto f32 = rewriter.getF32Type();
+
+  auto makeIdentity = [&]() -> mlir::Value {
+    switch (kind) {
+    case SumF:
+      return mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getF32FloatAttr(0.0f))
+          .getResult();
+    case MaxF:
+      return mlir::arith::ConstantOp::create(
+                 rewriter, loc,
+                 rewriter.getF32FloatAttr(-std::numeric_limits<float>::max()))
+          .getResult();
+    case SumI:
+      return mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getI32IntegerAttr(0))
+          .getResult();
+    case MaxI:
+      return mlir::arith::ConstantOp::create(
+                 rewriter, loc, rewriter.getI32IntegerAttr(INT32_MIN))
+          .getResult();
+    default: // MinI
+      return mlir::arith::ConstantOp::create(
+                 rewriter, loc, rewriter.getI32IntegerAttr(INT32_MAX))
+          .getResult();
+    }
+  };
+  // Sum uses scalar arith (translator-supported). f32 max uses metal.binary_exp
+  // (scalar arith.maxnumf has no scalar translator emit — the rank-1/axis1
+  // reduces spell it the same way). i32 max/min use cmpi+select: metal.binary_exp
+  // rejects signless i32, and select(a>b,a,b) is signed-correct and
+  // translator-supported.
+  auto combineScalar = [&](mlir::Value a, mlir::Value b) -> mlir::Value {
+    if (kind == SumF)
+      return mlir::arith::AddFOp::create(rewriter, loc, a, b).getResult();
+    if (kind == SumI)
+      return mlir::arith::AddIOp::create(rewriter, loc, a, b).getResult();
+    if (kind == MaxF) {
+      auto opEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
+                                               BinaryExpOperator::maxOp);
+      return BinaryExpOp::create(rewriter, loc, a.getType(), opEnum, a, b)
+          .getResult();
+    }
+    auto pred = (kind == MinI) ? mlir::arith::CmpIPredicate::slt
+                               : mlir::arith::CmpIPredicate::sgt;
+    mlir::Value c = mlir::arith::CmpIOp::create(rewriter, loc, pred, a, b)
+                        .getResult();
+    return mlir::arith::SelectOp::create(rewriter, loc, c, a, b).getResult();
+  };
 
   // Peel one shape-only cvt hop to the real source.
   mlir::Value src = op.getSrcs().front();
   if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
     src = cvt.getSrc();
 
-  // Uniform (splat / splat-constant) source: reduce(splat(c), axis=0) == BM*c,
-  // same for every column. Covers the reassociation seed `reduce(zeros)`.
+  // Uniform (splat / splat-constant) source: reduce(splat(c), axis=0) is BM*c
+  // for sum, c for max/min. Covers the reassociation seed `reduce(init)`.
   {
     mlir::Value uniformScalar;
     if (auto sp = src.getDefiningOp<mlir::triton::SplatOp>())
@@ -4014,12 +4105,24 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
                               dense.getSplatValue<mlir::TypedAttr>())
                               .getResult();
     }
-    if (uniformScalar && uniformScalar.getType().isF32()) {
-      auto cBM = mlir::arith::ConstantOp::create(
-          rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(BM)));
-      mlir::Value r = mlir::arith::MulFOp::create(rewriter, loc, uniformScalar,
-                                                  cBM.getResult())
-                          .getResult();
+    if (uniformScalar && uniformScalar.getType() == eltTy) {
+      mlir::Value r = uniformScalar;
+      if (isSum) {
+        if (isF) {
+          auto cBM = mlir::arith::ConstantOp::create(
+              rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(BM)));
+          r = mlir::arith::MulFOp::create(rewriter, loc, uniformScalar,
+                                          cBM.getResult())
+                  .getResult();
+        } else {
+          auto cBM = mlir::arith::ConstantOp::create(
+              rewriter, loc,
+              rewriter.getI32IntegerAttr(static_cast<int32_t>(BM)));
+          r = mlir::arith::MulIOp::create(rewriter, loc, uniformScalar,
+                                          cBM.getResult())
+                  .getResult();
+        }
+      }
       rewriter.replaceOp(op, r);
       return mlir::success();
     }
@@ -4086,18 +4189,19 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
                                       rewriter.getI32IntegerAttr(0))
           .getResult();
 
-  // s = sum over local row m in [0, BM) of (mask ? device[offs(m, nVal)] : 0).
+  // s = combine over local row m in [0, BM) of (mask ? device[offs(m,nVal)]
+  //                                                    : identity).
+  mlir::Type loadEltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
   auto cLo = mlir::arith::ConstantOp::create(rewriter, loc,
                                              rewriter.getI32IntegerAttr(0));
   auto cHi = mlir::arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BM)));
   auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
                                               rewriter.getI32IntegerAttr(1));
-  auto cZeroF = mlir::arith::ConstantOp::create(rewriter, loc,
-                                                rewriter.getF32FloatAttr(0.0f));
+  mlir::Value initV = makeIdentity();
   auto forOp = mlir::scf::ForOp::create(rewriter, loc, cLo.getResult(),
                                         cHi.getResult(), cOne.getResult(),
-                                        mlir::ValueRange{cZeroF.getResult()});
+                                        mlir::ValueRange{initV});
   {
     mlir::OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(forOp.getBody());
@@ -4128,13 +4232,18 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
                            mlir::ValueRange{safeAddr})
                            .getResult(0);
     mlir::Value v =
-        GetElementOp::create(rewriter, loc, f32, memref, idxU).getResult();
+        GetElementOp::create(rewriter, loc, loadEltTy, memref, idxU).getResult();
+    // Bridge the memref storage type (ui32 for an i32 buffer) to the signless
+    // accumulator element type.
+    if (loadEltTy != eltTy)
+      v = mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{eltTy}, mlir::ValueRange{v})
+              .getResult(0);
     if (maskBit)
       v = mlir::arith::SelectOp::create(rewriter, loc, maskBit, v,
-                                        cZeroF.getResult())
+                                        makeIdentity())
               .getResult();
-    mlir::Value s =
-        mlir::arith::AddFOp::create(rewriter, loc, acc, v).getResult();
+    mlir::Value s = combineScalar(acc, v);
     mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{s});
   }
   rewriter.replaceOp(op, forOp.getResult(0));
@@ -9199,7 +9308,10 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
     if (R.getSrcs().size() != 1 || R->getNumResults() != 1)
       continue;
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(R.getSrcs()[0].getType());
-    if (!rtt || rtt.getRank() != 2 || !rtt.getElementType().isF32())
+    if (!rtt || rtt.getRank() != 2)
+      continue;
+    mlir::Type eltTy = rtt.getElementType();
+    if (!(eltTy.isF32() || eltTy.isInteger(32)))
       continue;
     if (R.getAxis() != 0)
       continue;
@@ -9210,7 +9322,14 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
           combine = &n;
           break;
         }
-    if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
+    // Only combines whose loop-carried tensor update op has an elementwise
+    // scalarizing lowering (so the reassociated outer `s = combine(s, reduce)`
+    // legalizes): f32 sum/max and i32 sum. i32 max/min (maxsi/minsi) have no
+    // elementwise lowering, so their loop-carried form stays deferred (a direct
+    // reduce still ships via lowerRank2Axis0Reduce's cmpi+select).
+    if (!combine ||
+        !mlir::isa<mlir::arith::AddFOp, mlir::arith::MaxNumFOp,
+                   mlir::arith::MaximumFOp, mlir::arith::AddIOp>(combine))
       continue;
     // Multi-result loops are fine: `_layer_norm_bwd_dwdb` carries dw AND db in
     // one scf.for (2 results, 2 axis-0 reduces). Each reduce reassociates its
@@ -9222,15 +9341,16 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
     unsigned idx = mlir::cast<mlir::OpResult>(R.getSrcs()[0]).getResultNumber();
     auto yieldOp =
         mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
-    auto add = yieldOp.getOperand(idx).getDefiningOp<mlir::arith::AddFOp>();
-    if (!add)
+    mlir::Operation *upd = yieldOp.getOperand(idx).getDefiningOp();
+    if (!upd || upd->getName() != combine->getName() ||
+        upd->getNumOperands() != 2)
       continue;
     mlir::Value iterArg = forOp.getRegionIterArg(idx);
     mlir::Value delta;
-    if (add.getLhs() == iterArg)
-      delta = add.getRhs();
-    else if (add.getRhs() == iterArg)
-      delta = add.getLhs();
+    if (upd->getOperand(0) == iterArg)
+      delta = upd->getOperand(1);
+    else if (upd->getOperand(1) == iterArg)
+      delta = upd->getOperand(0);
     else
       continue;
     llvm::DenseSet<void *> seen;
@@ -9239,9 +9359,9 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
 
     mlir::OpBuilder b(forOp);
     auto loc = forOp.getLoc();
-    // sinit = reduce(init, axis=0). Init is the zeros splat; lowerRank2Axis0-
-    // Reduce evaluates a uniform-splat source as BM*c == 0 without a device
-    // read, so no slice-encoded constant is materialized here.
+    // sinit = reduce(init, axis=0). Init is the identity splat; lowerRank2-
+    // Axis0Reduce folds a uniform-splat source (BM*c for sum, c for max/min)
+    // without a device read, so no slice-encoded constant is materialized here.
     mlir::Operation *sinitR = b.clone(*R.getOperation());
     sinitR->setOperand(0, forOp.getInitArgs()[idx]);
     mlir::Value sinit = sinitR->getResult(0);
@@ -9257,10 +9377,15 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
               cloneConeInto(delta, map, bb, forOp.getBody());
           mlir::Operation *dr = bb.clone(*R.getOperation());
           dr->setOperand(0, deltaCloned);
-          mlir::Value sNew =
-              mlir::arith::AddFOp::create(bb, ll, args[0], dr->getResult(0))
-                  .getResult();
-          mlir::scf::YieldOp::create(bb, ll, sNew);
+          // sNew = same-kind-combine(args[0], reduce(delta, axis=0)). Build the
+          // op fresh so the result type is inferred from the rank-1 operands
+          // (cloning `upd` would keep its rank-2 [BM,BN] result type).
+          mlir::OperationState st(ll, upd->getName());
+          st.addOperands({args[0], dr->getResult(0)});
+          st.addTypes({args[0].getType()});
+          st.addAttributes(upd->getAttrs());
+          mlir::Operation *sOp = bb.create(st);
+          mlir::scf::YieldOp::create(bb, ll, sOp->getResult(0));
         });
     R->getResult(0).replaceAllUsesWith(newFor.getResult(0));
     R.erase();
@@ -9519,16 +9644,23 @@ struct ConvertTritonGPUToMetalPass
         return;
       }
       // Rank-2 axis=1 ships via the rank-2 ReduceLowering body. Rank-2 axis=0
-      // (per-column) ships for f32 sum only (lowerRank2Axis0Reduce, Session
-      // L3a2) — after reassociateLoopCarriedAxis0Reduce the inner reduce is a
-      // direct axis=0 device reduce. Other axis=0 combines stay deferred.
+      // (per-column) ships via lowerRank2Axis0Reduce (Session L3a2) for f32
+      // sum/max and i32 sum/max/min (after reassociateLoopCarriedAxis0Reduce the
+      // inner reduce is a direct axis=0 device reduce). Output must be E==1
+      // (BN <= tpb); larger BN and other combines stay deferred.
       if (rtt.getRank() == 2 && axes == 0) {
-        bool axis0Ok = combineName == "arith.addf" && combineEltTy &&
-                       combineEltTy.isF32();
-        if (!axis0Ok) {
+        bool fOk = (combineName == "arith.addf" ||
+                    combineName == "arith.maxnumf" ||
+                    combineName == "arith.maximumf") &&
+                   combineEltTy && combineEltTy.isF32();
+        bool iOk = (combineName == "arith.addi" ||
+                    combineName == "arith.maxsi" ||
+                    combineName == "arith.minsi") &&
+                   combineEltTy && combineEltTy.isInteger(32);
+        if (!fOk && !iOk) {
           red.emitOpError(
-              "tt.reduce axis=0 reduce supports f32 sum only (Session L3a2); "
-              "other combines deferred");
+              "tt.reduce axis=0 reduce supports f32 sum/max and i32 "
+              "sum/max/min (Session L3a2); other combines deferred");
           reduceOk = false;
         }
         return;
@@ -9766,6 +9898,8 @@ struct ConvertTritonGPUToMetalPass
                  ArithXOrILowering, ArithDivUILowering, ArithRemUILowering,
                  ArithShRUILowering, ArithSelectLowering,
                  ArithMulFLowering, ArithSIToFPLowering, ArithNegFLowering,
+                 ArithMaxFLowering<mlir::arith::MaxNumFOp>,
+                 ArithMaxFLowering<mlir::arith::MaximumFOp>,
                  ArithExtFLowering, ArithTruncFLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,

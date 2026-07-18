@@ -12,7 +12,13 @@ The tutorial-05 backward's `_layer_norm_bwd_dwdb` reduces a LOOP-CARRIED 2D
 accumulator (`dw += load_tile`, `db += load_tile`) over axis 0;
 `reassociateLoopCarriedAxis0Reduce` rewrites that to `scf.for(s1d += reduce(
 load_tile, axis=0))` (per accumulator) so the reduce sees a per-iteration direct
-masked load. f32 sum, output E==1 (launch tpb >= BN).
+masked load.
+
+Combines: f32 sum/max and i32 sum/max/min. Sum uses scalar arith; f32 max uses
+metal.binary_exp; i32 max/min use cmpi+select (binary_exp rejects signless i32).
+Loop-carried reassociation ships for f32 sum/max and i32 sum (elementwise
+maxnumf/addi lowerings); loop-carried i32 max/min and output E>1 (BN > tpb) stay
+deferred. Output E==1 (launch tpb >= BN).
 """
 
 from __future__ import annotations
@@ -101,3 +107,93 @@ def test_bwd_dwdb_verbatim(M, N):
     torch.mps.synchronize()
     torch.testing.assert_close(fdw.cpu(), dw.cpu().sum(0), atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(fdb.cpu(), db.cpu().sum(0), atol=1e-3, rtol=1e-3)
+
+
+# --- Combines beyond f32 sum (Session L3a2 generalization) -----------------
+# f32 max and i32 sum/max/min. Sum uses scalar arith; f32 max uses
+# metal.binary_exp maxOp; i32 max/min use cmpi+select (binary_exp rejects
+# signless i32). Loop-carried f32 max/i32 sum reassociate (elementwise maxnumf/
+# addi lowerings); loop-carried i32 max/min stay deferred (direct only).
+
+
+@triton.jit
+def _colmax(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # loop-carried column max (handles M > BM).
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.full((BM, BN), -1e30, tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        acc = tl.maximum(acc, tl.load(In + offs, mask=mask, other=-1e30))
+    tl.store(Out + cols, tl.max(acc, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("M, N", [(32, 128), (64, 256), (96, 700), (100, 1024)])
+def test_reduce_axis0_colmax_f32(M, N):
+    torch.manual_seed(M * 7 + N)
+    inp = torch.randn(M, N, device="mps")
+    out = torch.empty(N, device="mps")
+    _colmax[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.cpu().amax(0), atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _colsum_i32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), tl.int32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        acc += tl.load(In + offs, mask=mask, other=0)
+    tl.store(Out + cols, tl.sum(acc, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("M, N", [(32, 128), (64, 256), (96, 700)])
+def test_reduce_axis0_colsum_i32(M, N):
+    torch.manual_seed(M * 11 + N)
+    inp = torch.randint(-500, 500, (M, N), dtype=torch.int32, device="mps")
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colsum_i32[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), inp.cpu().sum(0, dtype=torch.int32))
+
+
+@triton.jit
+def _colmax_i32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # direct i32 column max (M <= BM); cmpi+select combine.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+    x = tl.load(In + offs, mask=mask, other=-2147483648)
+    tl.store(Out + cols, tl.max(x, axis=0), mask=cols < N)
+
+
+@triton.jit
+def _colmin_i32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+    x = tl.load(In + offs, mask=mask, other=2147483647)
+    tl.store(Out + cols, tl.min(x, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("kernel, red",
+                         [(_colmax_i32, lambda t: t.amax(0)),
+                          (_colmin_i32, lambda t: t.amin(0))])
+@pytest.mark.parametrize("M, N", [(32, 128), (16, 256), (32, 700)])
+def test_reduce_axis0_minmax_i32_direct(kernel, red, M, N):
+    torch.manual_seed(M * 17 + N)
+    inp = torch.randint(-500, 500, (M, N), dtype=torch.int32, device="mps")
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    kernel[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), red(inp.cpu()))
