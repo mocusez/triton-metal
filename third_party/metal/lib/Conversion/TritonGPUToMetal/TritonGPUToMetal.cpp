@@ -62,6 +62,32 @@ static mlir::Type metalStorageElementType(mlir::Type t) {
   return t;
 }
 
+// Inverse of `metalStorageElementType`: bit-preserving cast of a value carrying
+// a SIGNED/UNSIGNED integer type back to the signless integer of the same width.
+//
+// Device buffers are typed with the ui32 storage element type (see
+// `wrapperElementType`), so a `metal.get_element` read inside a reduce/scan cone
+// yields a ui32 value. Every `arith.*` integer op — addi, cmpi, select, andi —
+// requires SIGNLESS operands ("operand #0 must be signless-non-zero-bitwidth-
+// integer-like"), so rebuilding an arith node directly on a cone leaf produced a
+// module that failed its own verifier. That is why `tl.sum(tl.where(v > 0, 1, 0))`
+// over an i32 buffer used to abort the pass while the leaf-only `tl.sum(v)` was
+// fine: only the former rebuilds arith ops on top of the leaf.
+//
+// The emitter forwards `unrealized_conversion_cast` as a no-op (MSL treats int
+// and uint interchangeably in expression context), so this is free at runtime
+// and purely a type-system reconciliation.
+static mlir::Value toSignlessInt(mlir::Value value, mlir::OpBuilder &rewriter,
+                                 mlir::Location loc) {
+  auto intTy = llvm::dyn_cast<mlir::IntegerType>(value.getType());
+  if (!intTy || intTy.isSignless())
+    return value;
+  auto signless = mlir::IntegerType::get(value.getContext(), intTy.getWidth());
+  return mlir::UnrealizedConversionCastOp::create(
+             rewriter, loc, mlir::TypeRange{signless}, mlir::ValueRange{value})
+      .getResult(0);
+}
+
 // L2b: bit-preserving cast of `value` to the storage element type of `memref`
 // (a MetalMemRefType) when they differ, via `builtin.unrealized_conversion_cast`.
 // Lets a signless-i32 arith value feed a ui32-typed `metal.store` / scratch op.
@@ -1219,12 +1245,41 @@ struct ConvertLayoutLowering
       rewriter.replaceOp(op, adaptor.getSrc());
       return mlir::success();
     }
-    // Path 3: L1d2 staged-transpose body for in-envelope rank-2 blocked↔
-    // blocked cvts with sizePerThread=[1,1] on both sides.
     auto srcRtt =
         mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
     auto dstRtt =
         mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
+    // Path 2b: rank-1 relabel whose ONLY consumers are `tt.store`s.
+    //
+    // A scatter (`tl.store(dst + idx_tensor, vals)`) arrives as a pair of these
+    // cvts feeding one store. They are a genuine permutation — src has
+    // sizePerThread>1 (`idx = tid*E + iv`), dst is strided (`idx = tid + iv*T`)
+    // — so passing one through in general would hand a consumer another
+    // element's value. StoreLowering does not consume it: it peels back to the
+    // pre-cvt operands and performs the whole store in the SOURCE layout, which
+    // writes the same (address, value) set (see its scatter-peel comment). So
+    // for a store-only consumer set this cvt is genuinely dead, and forwarding
+    // the source is how a dead op gets legalized here — the forwarded value has
+    // no remaining reader.
+    //
+    // The user check is what keeps this sound: any OTHER consumer (an
+    // elementwise op, a reduce cone, a second store shape that does not peel)
+    // means the permutation is observable, and the cvt falls through to Path 3
+    // and is rejected instead.
+    if (srcRtt && dstRtt && srcRtt.getRank() == 1 && dstRtt.getRank() == 1 &&
+        srcRtt.getShape() == dstRtt.getShape() &&
+        srcRtt.getElementType() == dstRtt.getElementType() &&
+        // Vacuously true once the store has already been legalized and erased —
+        // which is the usual ordering, and why this must NOT require a
+        // non-empty use list. A dead relabel has no reader to mislead.
+        llvm::all_of(op.getResult().getUsers(), [](mlir::Operation *u) {
+          return mlir::isa<mlir::triton::StoreOp>(u);
+        })) {
+      rewriter.replaceOp(op, adaptor.getSrc());
+      return mlir::success();
+    }
+    // Path 3: L1d2 staged-transpose body for in-envelope rank-2 blocked↔
+    // blocked cvts with sizePerThread=[1,1] on both sides.
     if (!srcRtt || !dstRtt || srcRtt.getRank() != 2 || dstRtt.getRank() != 2 ||
         srcRtt.getShape() != dstRtt.getShape() ||
         srcRtt.getElementType() != dstRtt.getElementType())
@@ -1766,6 +1821,43 @@ struct ArithTruncFLowering
   }
 };
 
+// Scalarize a tensor integer width cast: `arith.extui` (zero-extend, the shape
+// Triton emits for `tl.cast(<i1 predicate>, tl.int32)` — the per-digit histogram
+// idiom `tl.sum(tl.cast(digits == b, tl.int32))` in a radix sort), `arith.extsi`
+// (sign-extend) and `arith.trunci` (narrow). The MSL emitter already spells all
+// three as the C-style cast `(T)(x)` (see the ExtSIOp/ExtUIOp/TruncIOp case in
+// translateValue), so — exactly like ArithExtFLowering / ArithTruncFLowering —
+// this only has to rebuild the op on the converted scalar operand.
+//
+// i1 is emitted as MSL `bool`, so `(int)(pred)` yields 0/1 == zero-extension,
+// which is correct for extui and for trunci-to-bool (C's bool conversion is
+// `!= 0`, matching arith.trunci's low-bit semantics for the 0/1 values Triton
+// produces). It is NOT correct for a SIGN-extending i1 -> iN: arith.extsi
+// defines that as all-ones (-1), while `(int)(bool)` gives +1. Rather than emit
+// a silently-wrong sign, reject that one case and let it stay a hard
+// legalization error.
+template <typename OpTy>
+struct ArithIntCastLowering : public mlir::OpConversionPattern<OpTy> {
+  using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resTy = this->getTypeConverter()->convertType(op.getType());
+    if (!resTy || mlir::isa<mlir::RankedTensorType>(resTy))
+      return rewriter.notifyMatchFailure(op, "int cast: result not scalarizable");
+    // Guard the i1 sign-extension mismatch described above.
+    if (std::is_same<OpTy, mlir::arith::ExtSIOp>::value) {
+      auto inTy = adaptor.getIn().getType();
+      if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(inTy))
+        if (intTy.getWidth() == 1)
+          return rewriter.notifyMatchFailure(
+              op, "extsi from i1: MSL (T)(bool) yields +1, not all-ones");
+    }
+    rewriter.template replaceOpWithNewOp<OpTy>(op, resTy, adaptor.getIn());
+    return mlir::success();
+  }
+};
+
 // Scalarize a tensor `arith.negf` (`-x`). ModuleTranslation emits scalar negf as
 // `(-x)`; rebuild it on the converted scalar operand so the tensor op legalizes.
 struct ArithNegFLowering
@@ -2032,6 +2124,12 @@ extractSplatConstantAttr(mlir::Value other);
 // per-element cone evaluator + its dry-run support predicate are defined below
 // (near the rank-2 reduce), but `lowerRank1Reduce` (above them) invokes both
 // when the single-load Wall-11 walker fails on a computed cone.
+// Pool of shared (inbuf, scanbuf) threadgroup buffers, keyed by the tt.scan
+// that should use them; populated by `preprocessScanBuffers` (defined below,
+// where the rationale lives) and consumed by `ScanLowering`.
+using ScanBufPool =
+    llvm::DenseMap<mlir::Operation *, std::pair<mlir::Value, mlir::Value>>;
+
 static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
                                     mlir::ConversionPatternRewriter &rewriter,
                                     mlir::Location loc, int depth);
@@ -3635,14 +3733,16 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
   if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
 
-  // int binary arith → raw scalar arith.
+  // int binary arith → raw scalar arith. Operands are normalised to signless
+  // (see `toSignlessInt`): a cone leaf read from a device buffer carries the
+  // ui32 STORAGE type, which every arith integer op rejects.
   auto ibinary = [&](mlir::Value lhs, mlir::Value rhs,
                      auto make) -> mlir::Value {
     mlir::Value a = evalRank1ValueAt(lhs, idxVal, rewriter, loc, depth + 1);
     mlir::Value b = evalRank1ValueAt(rhs, idxVal, rewriter, loc, depth + 1);
     if (!a || !b)
       return mlir::Value{};
-    return make(a, b);
+    return make(toSignlessInt(a, rewriter, loc), toSignlessInt(b, rewriter, loc));
   };
   if (auto o = mlir::dyn_cast<mlir::arith::AddIOp>(def))
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
@@ -3665,6 +3765,56 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
       return mlir::arith::OrIOp::create(rewriter, loc, a, b).getResult();
     });
+  if (auto o = mlir::dyn_cast<mlir::arith::XOrIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::XOrIOp::create(rewriter, loc, a, b).getResult();
+    });
+  // Shifts — the bit-slicing half of a digit extraction (`(v >> shift) & 0xF`,
+  // the radix-sort histogram cone). Without these the walker bailed at the
+  // shift and the whole `tt.reduce` failed to legalize even though `&` was
+  // already handled.
+  if (auto o = mlir::dyn_cast<mlir::arith::ShLIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShLIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::ShRSIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShRSIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::ShRUIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShRUIOp::create(rewriter, loc, a, b).getResult();
+    });
+  // Integer width casts inside a cone (`tl.cast(pred, tl.int32)`). `floatEltOf`
+  // above is type-agnostic — it just peels a tensor type down to its element —
+  // so it serves the integer results here too. Results must be SIGNLESS (arith
+  // ext/trunc reject ui32), which is what Triton's tensor type already carries.
+  auto signlessEltOf = [&](mlir::Type t) -> mlir::Type {
+    auto e = floatEltOf(t);
+    if (auto i = llvm::dyn_cast<mlir::IntegerType>(e))
+      if (!i.isSignless())
+        return mlir::IntegerType::get(e.getContext(), i.getWidth());
+    return e;
+  };
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtUIOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(ext.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::ExtUIOp::create(rewriter, loc, signlessEltOf(ext.getType()),
+                                        toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncIOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(trunc.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::TruncIOp::create(rewriter, loc,
+                                         signlessEltOf(trunc.getType()),
+                                         toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
 
   // select / compare (tl.where conditions).
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
@@ -3676,7 +3826,12 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
         evalRank1ValueAt(sel.getFalseValue(), idxVal, rewriter, loc, depth + 1);
     if (!c || !t || !f)
       return nullptr;
-    return mlir::arith::SelectOp::create(rewriter, loc, c, t, f).getResult();
+    // arith.select requires both arms to share one type; a device-read arm
+    // arrives as ui32 while a rebuilt-constant arm is signless i32.
+    return mlir::arith::SelectOp::create(rewriter, loc, c,
+                                         toSignlessInt(t, rewriter, loc),
+                                         toSignlessInt(f, rewriter, loc))
+        .getResult();
   }
   if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
     mlir::Value a =
@@ -3685,7 +3840,9 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
         evalRank1ValueAt(cmp.getRhs(), idxVal, rewriter, loc, depth + 1);
     if (!a || !b)
       return nullptr;
-    return mlir::arith::CmpIOp::create(rewriter, loc, cmp.getPredicate(), a, b)
+    return mlir::arith::CmpIOp::create(rewriter, loc, cmp.getPredicate(),
+                                       toSignlessInt(a, rewriter, loc),
+                                       toSignlessInt(b, rewriter, loc))
         .getResult();
   }
   if (auto cmp = mlir::dyn_cast<mlir::arith::CmpFOp>(def)) {
@@ -4088,16 +4245,25 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   }
   if (auto s = mlir::dyn_cast<mlir::arith::SIToFPOp>(def))
     return rank1ConeSupported(s.getIn(), depth + 1);
-  if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp>(def))
+  // Integer width casts mirror the ExtUIOp/TruncIOp cases in evalRank1ValueAt.
+  if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp,
+                mlir::arith::ExtUIOp, mlir::arith::TruncIOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
   if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
                 mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
                 mlir::math::RsqrtOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
+  // NOTE: this list must stay in sync with the binary cases in
+  // `evalRank1ValueAt` — this predicate is the dry run that decides whether the
+  // evaluator gets to emit at all, so an op accepted there but missing here is
+  // silently unreachable (that is exactly how `(v >> shift) & 0xF` failed to
+  // legalize even after the evaluator learned shifts).
   if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
                 mlir::arith::DivFOp, mlir::arith::MaximumFOp,
                 mlir::arith::MaxNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
                 mlir::arith::MulIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
+                mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
+                mlir::arith::ShRUIOp,
                 mlir::arith::CmpIOp, mlir::arith::CmpFOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1) &&
            rank1ConeSupported(def->getOperand(1), depth + 1);
@@ -4199,10 +4365,12 @@ static void collectStagingLeaves(mlir::Value v, int depth,
 struct ScanLowering
     : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
   ScanLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
-               llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs)
+               llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
+               const ScanBufPool *bufPool)
       : mlir::OpConversionPattern<mlir::triton::ScanOp>(tc, ctx),
-        scanBufs(scanBufs) {}
+        scanBufs(scanBufs), bufPool(bufPool) {}
   llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs;
+  const ScanBufPool *bufPool;
 
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor /*adaptor*/,
@@ -4213,10 +4381,12 @@ struct ScanLowering
     if (op.getAxis() != 0 || op.getReverse())
       return rewriter.notifyMatchFailure(op, "scan: axis=0 forward only");
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
-    if (!rtt || rtt.getRank() != 1 || !rtt.getElementType().isF32())
-      return rewriter.notifyMatchFailure(op, "scan: rank-1 f32 only");
+    mlir::Type scanEltTy = rtt ? rtt.getElementType() : mlir::Type();
+    const bool scanIsI32 = scanEltTy && scanEltTy.isInteger(32);
+    if (!rtt || rtt.getRank() != 1 || !(scanEltTy.isF32() || scanIsI32))
+      return rewriter.notifyMatchFailure(op, "scan: rank-1 f32/i32 only");
 
-    // Combine must be a plain f32 add (cumsum).
+    // Combine must be a plain add (cumsum) of the matching element type.
     mlir::Operation *combine = nullptr;
     if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
       for (auto &nested : op->getRegion(0).front()) {
@@ -4225,8 +4395,11 @@ struct ScanLowering
         combine = &nested;
         break;
       }
-    if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
-      return rewriter.notifyMatchFailure(op, "scan: only arith.addf (cumsum)");
+    const bool combineIsAdd =
+        combine && (scanIsI32 ? mlir::isa<mlir::arith::AddIOp>(combine)
+                              : mlir::isa<mlir::arith::AddFOp>(combine));
+    if (!combineIsAdd)
+      return rewriter.notifyMatchFailure(op, "scan: only add (cumsum)");
 
     auto srcBlocked = mlir::dyn_cast_or_null<
         mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
@@ -4301,11 +4474,30 @@ struct ScanLowering
     mlir::Value tidLocal =
         mlir::arith::SubIOp::create(rewriter, loc, tidG, tgOff).getResult();
 
-    auto bufTy = MetalMemRefType::get(rewriter.getContext(), f32, bufLen);
-    mlir::Value inbuf =
-        ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
-    mlir::Value scanbuf =
-        ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+    // Staging element type. The metal buffer/element ops reject SIGNLESS i32
+    // (same constraint the rank-1 reduce documents at `storeTy`), so an i32
+    // cumsum stages through ui32. That is exact for a SUM: two's-complement
+    // addition is bit-identical for signed and unsigned operands, so wrapping
+    // negative partial sums round-trip unchanged.
+    mlir::Type stageTy = scanIsI32 ? mlir::Type(ui32) : mlir::Type(f32);
+    // Prefer the function-entry pair `preprocessScanBuffers` reserved for this
+    // scan; only fall back to a private allocation when the function was not
+    // poolable (single scan, or a scan feeding a reduce — see that pre-pass).
+    mlir::Value inbuf, scanbuf;
+    bool pooled = false;
+    if (bufPool) {
+      auto it = bufPool->find(op.getOperation());
+      if (it != bufPool->end()) {
+        inbuf = it->second.first;
+        scanbuf = it->second.second;
+        pooled = true;
+      }
+    }
+    if (!pooled) {
+      auto bufTy = MetalMemRefType::get(rewriter.getContext(), stageTy, bufLen);
+      inbuf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+      scanbuf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+    }
 
     // When the scan sits inside a loop — the FuncOpLowering tile loop, or a
     // user `tl.range` (speculative decoding scans inside `for v_offset`) —
@@ -4316,7 +4508,10 @@ struct ScanLowering
     // write-after-read hazard the rank-1 butterfly and the rank-2 rowBuf fill
     // guard against, and likewise only observable once a threadgroup spans more
     // than one SIMD-group.
-    if (findOutermostScfFor(op))
+    // A POOLED pair adds the same hazard without any loop: the previous scan in
+    // program order read `scanbuf` and this fill is about to overwrite it, so
+    // the barrier is unconditional there.
+    if (pooled || findOutermostScfFor(op))
       BarrierOp::create(rewriter, loc);
 
     // Fill inbuf: each thread writes its E owned positions pos = tid + k*tpb.
@@ -4354,12 +4549,23 @@ struct ScanLowering
       if (!val)
         return rewriter.notifyMatchFailure(op, "scan: input eval failed");
       if (padded) {
-        auto cZeroF = mlir::arith::ConstantOp::create(
-            rewriter, loc, rewriter.getF32FloatAttr(0.0f));
-        val = mlir::arith::SelectOp::create(rewriter, loc, inRange, val,
-                                            cZeroF.getResult())
+        // Add-identity in the cone's own type; `val` is still signless here
+        // (the bridge to the ui32 staging type happens just below).
+        auto zeroAttr =
+            scanIsI32
+                ? mlir::cast<mlir::TypedAttr>(rewriter.getI32IntegerAttr(0))
+                : mlir::cast<mlir::TypedAttr>(rewriter.getF32FloatAttr(0.0f));
+        auto cZero = mlir::arith::ConstantOp::create(rewriter, loc, zeroAttr);
+        val = mlir::arith::SelectOp::create(rewriter, loc, inRange,
+                                            toSignlessInt(val, rewriter, loc),
+                                            cZero.getResult())
                   .getResult();
       }
+      // Bridge signless i32 -> the ui32 staging type the buffer ops require.
+      if (val.getType() != stageTy)
+        val = mlir::UnrealizedConversionCastOp::create(
+                  rewriter, loc, mlir::TypeRange{stageTy}, mlir::ValueRange{val})
+                  .getResult(0);
       mlir::Value posUI =
           mlir::UnrealizedConversionCastOp::create(
               rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{pos})
@@ -4394,8 +4600,17 @@ struct ScanLowering
                   mlir::ValueRange{tidLocal})
                   .getResult(0);
     }
-    mlir::Value placeholder =
-        GetElementOp::create(rewriter, loc, f32, scanbuf, idxUI).getResult();
+    auto placeholderOp =
+        GetElementOp::create(rewriter, loc, stageTy, scanbuf, idxUI);
+    // Pin the read to HERE. `scanbuf` is overwritten by the next pooled scan,
+    // or by the next trip of the tile loop; the emitter inlines a single-use
+    // value at its use site, which would move this read past that overwrite and
+    // hand the consumer the WRONG scan's prefix sums. (Caught by a 2-cumsum
+    // local-rank probe: both `tl.where` arms ended up reading one buffer after
+    // both prefix sums had run.)
+    if (pooled || findOutermostScfFor(op))
+      placeholderOp->setAttr("metal.materialize", rewriter.getUnitAttr());
+    mlir::Value placeholder = placeholderOp.getResult();
     // Key by the ORIGINAL scan result: a conversion `replaceOp` is lazy, so the
     // consuming reduce's cone walk (rank1ConeSupported / evalRank1ValueAt) still
     // sees `op.getResult()`, not the placeholder. The placeholder is only the
@@ -6472,22 +6687,85 @@ struct StoreLowering
       return mlir::success();
     }
 
-    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+    // ---- Scatter store through a layout relabel --------------------------
+    // A data-dependent store — `tl.store(dst + idx_tensor, vals)`, the scatter
+    // phase of a radix sort — reaches here as
+    //
+    //   %p = tt.addptr(splat(dst), %loaded_idx)   : blocked<spt=[4]>
+    //   %pc = ttg.convert_layout %p               : -> blocked<spt=[1]>
+    //   %vc = ttg.convert_layout %vals            : -> blocked<spt=[1]>
+    //   tt.store %pc, %vc
+    //
+    // so the ptr is NOT directly a tt.addptr and the old code rejected it.
+    //
+    // The two layouts assign different logical elements to a given (thread,
+    // tile-loop iteration): the source has sizePerThread>1 (`idx = tid*E + iv`)
+    // while the destination is strided (`idx = tid + iv*T`). So the cvt is a
+    // genuine permutation and CANNOT simply be treated as a no-op.
+    //
+    // It can, however, be side-stepped: a store is just a set of (address,
+    // value) pairs indexed by logical element. Relabelling which thread owns
+    // which element permutes the pairs but does not change the SET, so
+    // performing the store entirely in the SOURCE layout writes exactly the
+    // same bytes. That requires the address and the value to be relabelled
+    // IDENTICALLY — hence the check that both operands come through a cvt out
+    // of the same source encoding (a uniform splat value is also fine, since a
+    // permutation leaves it unchanged). If they disagree, fall through and let
+    // the store be rejected rather than silently pairing a value with another
+    // element's address.
+    mlir::Value storePtr = op.getPtr();
+    mlir::Value convertedPtr = adaptor.getPtr();
+    mlir::Value convertedVal = adaptor.getValue();
+    if (auto cvt =
+            op.getPtr().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+      auto dstRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 &&
+          srcRtt.getShape() == dstRtt.getShape() &&
+          cvt.getSrc().getDefiningOp<mlir::triton::AddPtrOp>()) {
+        mlir::Attribute srcEnc = srcRtt.getEncoding();
+        // The value must land in the same source layout.
+        mlir::Value valSrc;
+        if (auto vc =
+                op.getValue().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+          auto vSrcRtt =
+              mlir::dyn_cast<mlir::RankedTensorType>(vc.getSrc().getType());
+          if (vSrcRtt && vSrcRtt.getEncoding() == srcEnc) {
+            valSrc = vc.getSrc();
+          }
+        } else if (auto vRtt = mlir::dyn_cast<mlir::RankedTensorType>(
+                       op.getValue().getType())) {
+          if (vRtt.getEncoding() == srcEnc)
+            valSrc = op.getValue();
+        }
+        if (valSrc) {
+          mlir::Value remappedPtr = rewriter.getRemappedValue(cvt.getSrc());
+          mlir::Value remappedVal = rewriter.getRemappedValue(valSrc);
+          if (remappedPtr && remappedVal) {
+            storePtr = cvt.getSrc();
+            convertedPtr = remappedPtr;
+            convertedVal = remappedVal;
+          }
+        }
+      }
+    }
+
+    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>())
       return rewriter.notifyMatchFailure(
           op, "tt.store expects a tt.addptr feeding ptr");
-    mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
+    mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
                                          "memref source not MetalMemRefType");
-    auto tile = tileFromTensor(op.getPtr().getType());
+    auto tile = tileFromTensor(storePtr.getType());
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.store operand missing ttg.blocked layout");
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value idx =
-        emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
-    mlir::Value sval =
-        castToMemrefStorage(adaptor.getValue(), memref, rewriter, loc);
+        emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter, loc);
+    mlir::Value sval = castToMemrefStorage(convertedVal, memref, rewriter, loc);
     // Sub-tpb store guard. When the stored tensor has FEWER elements than the
     // threadgroup has threads AND there is no tile loop (E <= 1), the threads
     // whose per-thread element index is >= numElements have no valid output
@@ -6794,21 +7072,91 @@ struct MaskedStoreLowering
     if (!op.getMask())
       return mlir::failure();  // handled by StoreLowering
     auto loc = op.getLoc();
-    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+
+    // ---- Masked scatter through a layout relabel -------------------------
+    // Same shape StoreLowering handles (see its scatter-peel comment): the
+    // radix-sort scatter `tl.store(dst + write_idx, vals, mask=mask)` feeds the
+    // store through `ttg.convert_layout` on ptr and value, so the ptr is not
+    // directly a tt.addptr. Perform the store in the SOURCE layout instead.
+    //
+    // The MASK needs more care than the value. Triton materialises it in the
+    // store's DESTINATION layout, and the two layouts disagree about which
+    // logical element a given (thread, tile-iteration) owns — so the
+    // per-thread mask scalar pairs with a DIFFERENT element than the (address,
+    // value) pair does. Taking `adaptor.getMask()` here would mask the wrong
+    // lanes, and invisibly so whenever the mask is all-true (N an exact
+    // multiple of BLOCK, which is the common case and every obvious test).
+    //
+    // Instead re-derive the mask cone at the SOURCE layout's logical index.
+    // `evalRank1ValueAt` evaluates by LOGICAL element (tl.arange at index i is
+    // just i), so it is layout-agnostic and reconciles the two.
+    mlir::Value storePtr = op.getPtr();
+    mlir::Value convertedPtr = adaptor.getPtr();
+    mlir::Value convertedVal = adaptor.getValue();
+    bool peeledCvt = false;
+    if (auto cvt =
+            op.getPtr().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      auto srcRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+      auto dstRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 &&
+          srcRtt.getShape() == dstRtt.getShape() &&
+          cvt.getSrc().getDefiningOp<mlir::triton::AddPtrOp>()) {
+        mlir::Attribute srcEnc = srcRtt.getEncoding();
+        mlir::Value valSrc;
+        if (auto vc = op.getValue()
+                          .getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+          auto vSrcRtt =
+              mlir::dyn_cast<mlir::RankedTensorType>(vc.getSrc().getType());
+          if (vSrcRtt && vSrcRtt.getEncoding() == srcEnc)
+            valSrc = vc.getSrc();
+        } else if (auto vRtt = mlir::dyn_cast<mlir::RankedTensorType>(
+                       op.getValue().getType())) {
+          if (vRtt.getEncoding() == srcEnc)
+            valSrc = op.getValue();
+        }
+        if (valSrc && rank1ConeSupported(op.getMask(), 0)) {
+          mlir::Value remappedPtr = rewriter.getRemappedValue(cvt.getSrc());
+          mlir::Value remappedVal = rewriter.getRemappedValue(valSrc);
+          if (remappedPtr && remappedVal) {
+            storePtr = cvt.getSrc();
+            convertedPtr = remappedPtr;
+            convertedVal = remappedVal;
+            peeledCvt = true;
+          }
+        }
+      }
+    }
+
+    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>())
       return rewriter.notifyMatchFailure(
           op, "tt.store expects a tt.addptr feeding ptr");
-    mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
+    mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
                                          "memref source not MetalMemRefType");
 
-    auto tile = tileFromTensor(op.getPtr().getType());
+    auto tile = tileFromTensor(storePtr.getType());
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.store operand missing ttg.blocked layout");
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value cond;
-    if (tile->rank == 2) {
+    if (peeledCvt) {
+      // Logical index of the element THIS (thread, iteration) owns in the
+      // source layout, as i32 for the cone evaluator.
+      mlir::Value idxUI = emitPerIterIndex(*tile, parentFor, rewriter, loc);
+      mlir::Value idxI32 =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{rewriter.getI32Type()},
+              mlir::ValueRange{idxUI})
+              .getResult(0);
+      cond = evalRank1ValueAt(op.getMask(), idxI32, rewriter, loc, 0);
+      if (!cond)
+        return rewriter.notifyMatchFailure(
+            op, "masked scatter: mask cone not evaluable at source index");
+    } else if (tile->rank == 2) {
       cond = adaptor.getMask();
     } else {
       // Use the typeconverter-scalarized mask (reads the ACTUAL per-thread index
@@ -6860,7 +7208,7 @@ struct MaskedStoreLowering
     mlir::Type elemTy =
         mlir::cast<MetalMemRefType>(memref.getType()).getType();
     mlir::Value value =
-        castToMemrefStorage(adaptor.getValue(), memref, rewriter, loc);
+        castToMemrefStorage(convertedVal, memref, rewriter, loc);
 
     // Look up the per-kernel threadgroup scratch buffer for this masked
     // store. AC.S1: the alloca was hoisted to function entry by
@@ -6913,7 +7261,7 @@ struct MaskedStoreLowering
 
     // Real device-memory index (unchanged from prior emission).
     mlir::Value realIdx =
-        emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
+        emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter, loc);
 
     // Phase B emission (matches the spec's sketch §"Goal" for the
     // threadgroup-scratch path):
@@ -7076,6 +7424,157 @@ preprocessMaskedStoreSentinels(mlir::ModuleOp moduleOp,
       scratchMap[st.getOperation()] =
           perElemBuf[metalStorageElementType(rtt.getElementType())];
     }
+  });
+}
+
+//===----------------------------------------------------------------------===//
+// Scan buffer pooling.
+//
+// `ScanLowering` stages every `tt.scan` through a PAIR of threadgroup buffers
+// (inbuf + scanbuf), and used to allocate a fresh pair per scan. Threadgroup
+// memory is a hard 32 KB per threadgroup on Apple GPUs, so an unrolled
+// `for b in tl.static_range(16): tl.cumsum(...)` — the per-digit rank in a radix
+// sort — asked for 16 x 2 x BLOCK x 4 B: 128 KB at BLOCK=1024, four times the
+// budget. BLOCK=256 reports that honestly; larger BLOCK instead takes down the
+// AGX backend compiler with XPC_ERROR_CONNECTION_INTERRUPTED, which reads like a
+// codegen bug but is really resource exhaustion (the MSL itself compiles clean
+// through `xcrun metal -c`, which only runs the front end).
+//
+// The scans are strictly SEQUENTIAL, so one pair per (function x staging type)
+// suffices. Allocating at function entry — the same trick
+// `preprocessMaskedStoreSentinels` uses for its scratch buffer — makes the
+// single allocation dominate every scan regardless of loops or branches.
+//
+// Reuse turns each scan's fill into a write-after-read against the PREVIOUS
+// scan's reads, so `ScanLowering` emits an unconditional barrier ahead of a
+// pooled fill.
+//
+// The one shape that must NOT be pooled: a scan whose result feeds a
+// `tt.reduce`. Those consumers do not read the placeholder at the scan site —
+// `g_scanBuffers` makes the reduce re-read `scanbuf[idx]` LAZILY, inside its own
+// emission, which may sit after a later scan has already refilled the buffer.
+// `flowsIntoReduce` detects that and leaves the whole function on the old
+// per-scan allocation.
+//===----------------------------------------------------------------------===//
+// (staging element type, buffer length) for a `tt.scan` that `ScanLowering`
+// will accept; `std::nullopt` for anything out of its envelope, which then
+// keeps its private allocation. Mirrors ScanLowering's own gating.
+static std::optional<std::pair<mlir::Type, int64_t>>
+scanStagingShape(mlir::triton::ScanOp op, mlir::OpBuilder &builder) {
+  if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
+    return std::nullopt;
+  if (op.getAxis() != 0 || op.getReverse())
+    return std::nullopt;
+  auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
+  if (!rtt || rtt.getRank() != 1)
+    return std::nullopt;
+  mlir::Type elt = rtt.getElementType();
+  const bool isI32 = elt.isInteger(32);
+  if (!(elt.isF32() || isI32))
+    return std::nullopt;
+  auto blocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      rtt.getEncoding());
+  if (!blocked)
+    return std::nullopt;
+  int64_t tpb = 1;
+  for (auto t : blocked.getThreadsPerWarp()) tpb *= t;
+  for (auto w : blocked.getWarpsPerCTA()) tpb *= w;
+  if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+    return std::nullopt;
+  int64_t BLOCK = rtt.getDimSize(0);
+  if (BLOCK <= 0)
+    return std::nullopt;
+  int64_t bufLen = std::max(BLOCK, tpb);
+  if (bufLen % tpb != 0)
+    return std::nullopt;
+  int64_t E = bufLen / tpb;
+  if (E < 1 || E > 64 || (E & (E - 1)) != 0)
+    return std::nullopt;
+  mlir::Type stageTy = isI32
+                           ? mlir::Type(builder.getIntegerType(32, false))
+                           : mlir::Type(builder.getF32Type());
+  return std::make_pair(stageTy, bufLen);
+}
+
+// Does `v` reach a `tt.reduce` through any chain of uses? Conservative: an
+// over-deep chain answers "yes" so the pooling is declined rather than guessed.
+static bool flowsIntoReduce(mlir::Value v, int depth,
+                            llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
+  if (depth > 32)
+    return true;
+  for (auto *user : v.getUsers()) {
+    if (mlir::isa<mlir::triton::ReduceOp>(user))
+      return true;
+    if (!seen.insert(user).second)
+      continue;
+    for (auto res : user->getResults())
+      if (flowsIntoReduce(res, depth + 1, seen))
+        return true;
+  }
+  return false;
+}
+
+static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
+  moduleOp.walk([&](mlir::triton::FuncOp funcOp) {
+    if (funcOp.getBody().empty())
+      return;
+    mlir::OpBuilder builder(funcOp.getContext());
+    llvm::SmallVector<
+        std::pair<mlir::triton::ScanOp, std::pair<mlir::Type, int64_t>>, 8>
+        scans;
+    bool declinePooling = false;
+    funcOp.walk([&](mlir::triton::ScanOp s) {
+      auto shape = scanStagingShape(s, builder);
+      if (!shape) {
+        // Out of envelope here means ScanLowering will reject it too and the
+        // kernel fails anyway; nothing to pool.
+        return;
+      }
+      llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+      if (flowsIntoReduce(s->getResult(0), 0, seen))
+        declinePooling = true;
+      scans.push_back({s, *shape});
+    });
+    // A single scan already costs one pair — pooling would change nothing and
+    // this keeps every existing single-cumsum kernel's emission byte-identical.
+    if (scans.size() < 2 || declinePooling)
+      return;
+
+    // One pair per staging type, sized to the LARGEST scan of that type.
+    llvm::SmallVector<std::pair<mlir::Type, int64_t>, 2> maxLen;
+    for (auto &e : scans) {
+      bool found = false;
+      for (auto &m : maxLen)
+        if (m.first == e.second.first) {
+          m.second = std::max(m.second, e.second.second);
+          found = true;
+          break;
+        }
+      if (!found)
+        maxLen.push_back(e.second);
+    }
+
+    auto &entryBlock = funcOp.getBody().front();
+    builder.setInsertionPointToStart(&entryBlock);
+    auto loc = funcOp.getLoc();
+    llvm::SmallVector<std::pair<mlir::Type, std::pair<mlir::Value, mlir::Value>>,
+                      2>
+        perTypeBufs;
+    for (auto &m : maxLen) {
+      auto bufTy = MetalMemRefType::get(funcOp.getContext(), m.first,
+                                        static_cast<int>(m.second));
+      mlir::Value inbuf =
+          ThreadgroupAllocaOp::create(builder, loc, bufTy).getResult();
+      mlir::Value scanbuf =
+          ThreadgroupAllocaOp::create(builder, loc, bufTy).getResult();
+      perTypeBufs.push_back({m.first, {inbuf, scanbuf}});
+    }
+    for (auto &e : scans)
+      for (auto &p : perTypeBufs)
+        if (p.first == e.second.first) {
+          pool[e.first.getOperation()] = p.second;
+          break;
+        }
   });
 }
 
@@ -10650,6 +11149,22 @@ struct ConvertTritonGPUToMetalPass
       if (inEnvelope)
         return; // L1d2: handled by `ConvertLayoutLowering` staged-transpose
                 // body below.
+      // Rank-1 relabel feeding ONLY `tt.store` — the scatter shape
+      // (`tl.store(dst + idx_tensor, vals[, mask])`, radix sort). Store-
+      // Lowering / MaskedStoreLowering peel back to the pre-cvt operands and
+      // perform the store in the SOURCE layout, so no data actually moves
+      // across the relabel; `ConvertLayoutLowering` Path 2b then forwards the
+      // (by-then unread) source. Kept in lockstep with that path's condition —
+      // any non-store consumer makes the permutation observable and must still
+      // be rejected here.
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 && dstRtt.getRank() == 1 &&
+          srcRtt.getShape() == dstRtt.getShape() &&
+          srcRtt.getElementType() == dstRtt.getElementType() && srcBlocked &&
+          dstBlocked &&
+          llvm::all_of(cvt.getResult().getUsers(), [](mlir::Operation *u) {
+            return mlir::isa<mlir::triton::StoreOp>(u);
+          }))
+        return;
       cvt.emitOpError(
           "ttg.convert_layout: broader staged-transpose deferred to L1d3 "
           "(rank≠2 or shape/elem-type change or non-blocked encoding or "
@@ -10903,6 +11418,13 @@ struct ConvertTritonGPUToMetalPass
     MaskedStoreScratchMap scratchMap;
     preprocessMaskedStoreSentinels(moduleOp, scratchMap);
 
+    // Share one (inbuf, scanbuf) threadgroup pair across all the scans of a
+    // function instead of one pair each — 16 unrolled cumsums otherwise ask for
+    // 128 KB against a 32 KB budget. Must run pre-conversion so the allocas land
+    // in the original function's entry block and dominate every scan.
+    ScanBufPool scanBufPool;
+    preprocessScanBuffers(moduleOp, scanBufPool);
+
     // Inc 2.5 rank-2: stage loop-carried [M,N] reduce tiles in threadgroup
     // memory. Must run pre-conversion — the SCF structural conversion rebuilds
     // the loop with per-thread scalar iter_args and detaches the original body
@@ -10984,6 +11506,9 @@ struct ConvertTritonGPUToMetalPass
                  ArithIntMinMaxLowering<mlir::arith::MaxSIOp>,
                  ArithIntMinMaxLowering<mlir::arith::MinSIOp>,
                  ArithExtFLowering, ArithTruncFLowering,
+                 ArithIntCastLowering<mlir::arith::ExtUIOp>,
+                 ArithIntCastLowering<mlir::arith::ExtSIOp>,
+                 ArithIntCastLowering<mlir::arith::TruncIOp>,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathLogLowering, MathRsqrtLowering>(
@@ -11001,7 +11526,7 @@ struct ConvertTritonGPUToMetalPass
     // Buffers) during the consuming reduce. Pass-lifetime; cleared after.
     llvm::DenseMap<mlir::Value, mlir::Value> scanBufMap;
     g_scanBuffers = &scanBufMap;
-    patterns.add<ScanLowering>(typeConverter, ctx, &scanBufMap);
+    patterns.add<ScanLowering>(typeConverter, ctx, &scanBufMap, &scanBufPool);
 
     // Structural type conversion for user-written control flow: rewrites the
     // iter-arg / result / block-arg / yield types of `scf.for` / `scf.if`

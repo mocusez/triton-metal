@@ -496,11 +496,21 @@ void ModuleTranslation::translate(
   const std::string IN = bufName(op.getInbuf());
   const std::string OUT = bufName(op.getOutbuf());
   auto S = [](int64_t x) { return std::to_string(x); };
+  // The accumulator/temporaries must carry the BUFFER's element type, not a
+  // hardcoded float: an integer cumsum (`tl.cumsum` over i32, the per-digit
+  // rank in a radix sort) stages through a ui32 threadgroup buffer, and a float
+  // carry would silently round every partial sum past 2^24.
+  auto bufElemTy = [](mlir::Value m) -> mlir::Type {
+    return llvm::cast<MetalMemRefType>(m.getType()).getType();
+  };
+  const llvm::StringRef ELEM = typeToString(bufElemTy(op.getOutbuf()));
+  const std::string ZERO =
+      llvm::isa<mlir::FloatType>(bufElemTy(op.getOutbuf())) ? "0.0f" : "0";
   auto &os = _output;
   os << "\n  // ---- metal.threadgroup_prefix_sum (cumsum) ----\n";
   os << "  {\n";
   os << "    uint _ps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
-  os << "    float _ps_carry = 0.0f;\n";
+  os << "    " << ELEM << " _ps_carry = " << ZERO << ";\n";
   os << "    for (uint _ps_k = 0u; _ps_k < " << S(E) << "u; ++_ps_k) {\n";
   os << "      uint _ps_base = _ps_k * " << S(TPB) << "u;\n";
   os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
@@ -508,14 +518,14 @@ void ModuleTranslation::translate(
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      for (uint _ps_off = 1u; _ps_off < " << S(TPB)
      << "u; _ps_off <<= 1) {\n";
-  os << "        float _ps_add = (_ps_tid >= _ps_off) ? " << OUT
-     << "[_ps_base + _ps_tid - _ps_off] : 0.0f;\n";
+  os << "        " << ELEM << " _ps_add = (_ps_tid >= _ps_off) ? " << OUT
+     << "[_ps_base + _ps_tid - _ps_off] : " << ZERO << ";\n";
   os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "        " << OUT << "[_ps_base + _ps_tid] += _ps_add;\n";
   os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      }\n";
-  os << "      float _ps_total = " << OUT << "[_ps_base + " << S(TPB - 1)
-     << "u];\n";
+  os << "      " << ELEM << " _ps_total = " << OUT << "[_ps_base + "
+     << S(TPB - 1) << "u];\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      " << OUT << "[_ps_base + _ps_tid] += _ps_carry;\n";
   os << "      _ps_carry += _ps_total;\n";
@@ -4267,8 +4277,15 @@ void ModuleTranslation::translate(mlir::Region &region) {
       // expands the MSL exponentially (~37 MB, single 36-MB line). Constants are
       // cheap leaves (no duplication blow-up) so they stay inlined. Emission is
       // in IR order, so ordering (e.g. relative to barriers) is preserved.
+      // `metal.materialize` forces the let-binding even for a SINGLE-use value.
+      // Set by ScanLowering on a scan-result placeholder that reads a
+      // threadgroup buffer which a later scan (or the next trip of the tile
+      // loop) will overwrite: inlining such a read at its use site moves it
+      // PAST the overwrite and silently returns the wrong scan's data. Binding
+      // it here pins the read to the scan's own position in IR order.
       if (op.getNumResults() == 1 && !op.getResult(0).use_empty() &&
-          !op.getResult(0).hasOneUse() &&
+          (!op.getResult(0).hasOneUse() ||
+           op.hasAttr("metal.materialize")) &&
           _letBound.find(&op) == _letBound.end() &&
           // Allowlist of pure inlineable value ops translateValue emits as a
           // standalone expression. Restricting to these keeps CSE safe (some
