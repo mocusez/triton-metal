@@ -5322,11 +5322,78 @@ struct AtomicRmwLowering
     auto loc = op.getLoc();
     if (op.getAtomicRmwOp() != mlir::triton::RMWOp::FADD)
       return rewriter.notifyMatchFailure(op, "atomic_rmw: only fadd supported");
-    // Scalar form only (value/result are scalars, not per-element tensors).
-    if (mlir::isa<mlir::RankedTensorType>(op.getResult().getType()) ||
-        mlir::isa<mlir::RankedTensorType>(op.getVal().getType()))
-      return rewriter.notifyMatchFailure(
-          op, "atomic_rmw: tensor (per-element) form not supported");
+
+    // ---- Per-element rank-1 tensor form ------------------------------------
+    // `tl.atomic_add(P + cols, v, mask)` where P/v/mask are rank-1 tensors.
+    // This is the lock-free accumulation the layer-norm backward uses in place
+    // of the tutorial's spin lock (Apple GPUs give no cross-threadgroup
+    // forward-progress guarantee, so a global spin lock can deadlock). Model it
+    // on the masked device store (StoreLowering / MaskedStoreLowering): the
+    // typeconverter scalarizes the value/index/mask to the per-thread cone, and
+    // the E>1 tile loop replicates the op in place — so a single guarded
+    // `metal.atomic_rmw` at the scalarized index handles E==1/E>1,
+    // multi-program base offsets, and masking identically to the store. Unlike
+    // the scalar form below (a per-PROGRAM op guarded to `localTid==0`), each
+    // thread here owns its own element and adds unconditionally under the mask.
+    if (mlir::isa<mlir::RankedTensorType>(op.getVal().getType())) {
+      auto rtt = mlir::cast<mlir::RankedTensorType>(op.getVal().getType());
+      if (rtt.getRank() != 1)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: only rank-1 tensor form supported");
+      if (!op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: tensor old-value result consumed (not modeled)");
+      if (!rtt.getElementType().isF32())
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: tensor form only f32 add supported");
+      if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: tensor form expects a tt.addptr feeding ptr");
+      mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
+      if (!memref)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: tensor base memref not found");
+      auto tile = tileFromTensor(op.getPtr().getType());
+      if (!tile)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: tensor ptr missing ttg.blocked layout");
+      // Sub-tpb tiles (numElements < tpb at E<=1): threads whose localTid >=
+      // numElements own no element. A present mask cone (e.g. `cols < N`)
+      // already evaluates false for those lanes, so the mask guard below
+      // excludes them; only the UNMASKED sub-tpb case is genuinely unsafe (an
+      // unconditional atomic would touch OOB — and, zero-copy, live — memory).
+      int64_t numElements = 1;
+      for (auto s : tile->shape)
+        numElements *= s;
+      bool subTpb =
+          tile->elemPerThread <= 1 && numElements < tile->threadsPerBlock;
+      if (subTpb && !op.getMask())
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: unmasked sub-tpb tensor form deferred");
+      auto parentFor = findOutermostScfFor(op);
+      mlir::Value idx =
+          emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
+      mlir::Value sval =
+          castToMemrefStorage(adaptor.getVal(), memref, rewriter, loc);
+      auto resTy = getTypeConverter()->convertType(op.getResult().getType());
+      // Guard the device atomic on the per-thread mask cone so masked-off lanes
+      // (`cols >= N`) never touch a potentially-OOB address. Metal binds tensors
+      // zero-copy, so an OOB atomic would corrupt a different live tensor.
+      if (mlir::Value cond = op.getMask() ? adaptor.getMask() : mlir::Value()) {
+        auto ifOp = mlir::scf::IfOp::create(rewriter, loc, cond,
+                                            /*withElseRegion=*/false);
+        mlir::OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPointToStart(ifOp.thenBlock());
+        AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idx);
+      } else {
+        AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idx);
+      }
+      // Old-value result is unused (checked above); the scalarized value stands
+      // in as a type-matched dummy so the op legalizes (mirrors the scalar path).
+      rewriter.replaceOp(op, sval);
+      return mlir::success();
+    }
+
     if (!op.getResult().use_empty())
       return rewriter.notifyMatchFailure(
           op, "atomic_rmw: old-value result is consumed (not modeled)");
