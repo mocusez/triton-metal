@@ -203,3 +203,34 @@ def test_cumsum_min_idx(B, V):
     ref = torch.where(cs >= target, ai[None, :], torch.full_like(ai[None, :], V))
     ref = ref.min(dim=1).values.to(torch.int32)
     np.testing.assert_array_equal(out.cpu().numpy(), ref.numpy())
+
+
+@triton.jit
+def _cumsum_store_kernel(in_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    x = tl.load(in_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, tl.cumsum(x, axis=0), mask=mask)
+
+
+@pytest.mark.parametrize("BLOCK", [128, 256, 512, 1024])
+@pytest.mark.parametrize("n_frac", [1.0, 0.5])
+def test_cumsum_stored_directly(BLOCK, n_frac):
+    # The scan result consumed by a plain `tl.store` rather than by a reduce.
+    #
+    # Regression: ScanLowering's per-thread placeholder read `scanbuf[tid]`. That
+    # is right only when each thread owns ONE element (BLOCK == tpb == 128). For
+    # BLOCK > tpb the FuncOpLowering tile loop gives each thread E = BLOCK/tpb
+    # elements, and all E of them read the same slot — the store came out as
+    # `out[i] == scan[i // E]` while compiling and running clean. The reduce
+    # consumer (test_cumsum_min_idx) was always correct because it re-reads
+    # scanbuf[idx] through g_scanBuffers, which is why this went unnoticed.
+    n = max(1, int(BLOCK * n_frac))
+    torch.manual_seed(BLOCK + n)
+    inp = torch.randn(n, dtype=torch.float32, device="mps")
+    out = torch.zeros(n, dtype=torch.float32, device="mps")
+    _cumsum_store_kernel[(1,)](inp, out, n, BLOCK=BLOCK, num_warps=4)
+    torch.mps.synchronize()
+    ref = torch.cumsum(inp.cpu().double(), dim=0)
+    np.testing.assert_allclose(
+        out.cpu().double().numpy(), ref.numpy(), rtol=0, atol=2e-5)

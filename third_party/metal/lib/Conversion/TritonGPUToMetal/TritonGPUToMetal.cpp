@@ -4288,6 +4288,18 @@ struct ScanLowering
     mlir::Value scanbuf =
         ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
 
+    // When the scan sits inside a loop — the FuncOpLowering tile loop, or a
+    // user `tl.range` (speculative decoding scans inside `for v_offset`) —
+    // `inbuf`/`scanbuf` are ONE static allocation reused every trip. This
+    // trip's fill would then race the previous trip's reads of scanbuf: the
+    // per-element placeholder read at the bottom sits inside the same loop, and
+    // the prefix-sum template's trailing barrier is the last one before it. Same
+    // write-after-read hazard the rank-1 butterfly and the rank-2 rowBuf fill
+    // guard against, and likewise only observable once a threadgroup spans more
+    // than one SIMD-group.
+    if (findOutermostScfFor(op))
+      BarrierOp::create(rewriter, loc);
+
     // Fill inbuf: each thread writes its E owned positions pos = tid + k*tpb.
     for (int64_t k = 0; k < E; ++k) {
       mlir::Value pos = tidLocal;
@@ -4313,14 +4325,31 @@ struct ScanLowering
                                    rewriter.getI64IntegerAttr(BLOCK),
                                    rewriter.getI64IntegerAttr(tpb));
 
-    // Per-thread placeholder (scanbuf[tid]) for any live per-thread consumer;
-    // the consuming reduce re-reads scanbuf[idx] via g_scanBuffers.
-    mlir::Value tidUI =
-        mlir::UnrealizedConversionCastOp::create(
-            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{tidLocal})
-            .getResult(0);
+    // Per-element placeholder for any live per-thread consumer (e.g. a direct
+    // `tl.store` of the cumsum); the consuming reduce instead re-reads
+    // scanbuf[idx] via g_scanBuffers.
+    //
+    // The index must be THIS ITERATION'S logical element index, not the thread
+    // id. Under the FuncOpLowering tile loop each thread owns E = BLOCK/tpb
+    // elements (idx = tid*E + iv when contiguous), and the placeholder is
+    // re-evaluated once per iteration. Indexing by `tid` made every one of a
+    // thread's E elements read the SAME scanbuf slot, so a stored cumsum came
+    // out as `out[i] == scan[i/E]` — silently wrong for any BLOCK > tpb, which
+    // is every natural cumsum block size (256/512/1024). E == 1 keeps the plain
+    // scanbuf[tid] emission, byte-identical to before.
+    mlir::Value idxUI;
+    auto resTile = tileFromTensor(op.getType(0));
+    mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
+    if (resTile && resTile->elemPerThread > 1 && tileLoop) {
+      idxUI = emitPerIterIndex(*resTile, tileLoop, rewriter, loc);
+    } else {
+      idxUI = mlir::UnrealizedConversionCastOp::create(
+                  rewriter, loc, mlir::TypeRange{ui32},
+                  mlir::ValueRange{tidLocal})
+                  .getResult(0);
+    }
     mlir::Value placeholder =
-        GetElementOp::create(rewriter, loc, f32, scanbuf, tidUI).getResult();
+        GetElementOp::create(rewriter, loc, f32, scanbuf, idxUI).getResult();
     // Key by the ORIGINAL scan result: a conversion `replaceOp` is lazy, so the
     // consuming reduce's cone walk (rank1ConeSupported / evalRank1ValueAt) still
     // sees `op.getResult()`, not the placeholder. The placeholder is only the
