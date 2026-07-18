@@ -1553,6 +1553,23 @@ struct ArithMaxFLowering : public mlir::OpConversionPattern<OpTy> {
   }
 };
 
+// Elementwise i32 `arith.maxsi` / `arith.minsi` (`tl.maximum` / `tl.minimum`
+// on int32) → the same SCALAR op on the per-thread operands. metal.binary_exp
+// rejects signless i32, but ModuleTranslation emits scalar maxsi/minsi as MSL
+// `max((int)a,(int)b)` (signed). Enables loop-carried i32 column-min/max after
+// reassociateLoopCarriedAxis0Reduce.
+template <typename OpTy>
+struct ArithIntMinMaxLowering : public mlir::OpConversionPattern<OpTy> {
+  using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    rewriter.template replaceOpWithNewOp<OpTy>(op, adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return mlir::success();
+  }
+};
+
 // Scalarize a tensor `arith.sitofp` (`idx.to(tl.float32)` etc.). The scalar
 // form is emitted by ModuleTranslation as the MSL constructor cast `T(x)`; here
 // we just rebuild it on the converted scalar operand/result so the tensor op
@@ -4144,10 +4161,13 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   mlir::Value maskV = loadOp.getMask();
 
   // tpb from the source tile's blocked encoding (mirrors the axis=1 path — a
-  // forward walk to the store is fragile under conversion ordering). The output
-  // has BN columns; require E_out == 1 (BN <= tpb) so each thread owns exactly
-  // one output column c == localTid. Larger BN needs a tile loop — deferred; the
-  // layer-norm backward launches with tpb >= BN.
+  // forward walk to the store is fragile under conversion ordering). Require
+  // E_out == 1 (BN <= tpb) so each thread owns exactly one output column
+  // c == localTid. BN > tpb is DEFERRED: at that point coalescing has moved the
+  // output to a sizePerThread>1 layout (not the naive spt=1, E>1 the tile-loop
+  // model assumes), so a per-iteration column index would silently mis-address.
+  // The caller avoids it by launching tpb >= BN (as the layer-norm backward
+  // does) or tiling the columns across the grid.
   auto srcBlocked =
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
           rtt.getEncoding());
@@ -4162,7 +4182,7 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   int64_t BN = rtt.getDimSize(1);
   if (tpb <= 0 || BN > tpb)
     return rewriter.notifyMatchFailure(
-               op, "rank-2 axis0 reduce: E_out>1 deferred (launch tpb>=BN)");
+        op, "rank-2 axis0 reduce: E_out>1 deferred (launch tpb>=BN)");
 
   // nVal = per-thread output column = localTid = globalTid - tgid*tpb.
   auto tidG =
@@ -9322,14 +9342,14 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
           combine = &n;
           break;
         }
-    // Only combines whose loop-carried tensor update op has an elementwise
-    // scalarizing lowering (so the reassociated outer `s = combine(s, reduce)`
-    // legalizes): f32 sum/max and i32 sum. i32 max/min (maxsi/minsi) have no
-    // elementwise lowering, so their loop-carried form stays deferred (a direct
-    // reduce still ships via lowerRank2Axis0Reduce's cmpi+select).
+    // Every combine lowerRank2Axis0Reduce supports also has an elementwise
+    // scalarizing lowering for its loop-carried tensor update op, so the
+    // reassociated outer `s = combine(s, reduce)` legalizes: f32 sum/max
+    // (Arith{Add,Max}FLowering) and i32 sum/max/min (AddI + ArithIntMinMax).
     if (!combine ||
         !mlir::isa<mlir::arith::AddFOp, mlir::arith::MaxNumFOp,
-                   mlir::arith::MaximumFOp, mlir::arith::AddIOp>(combine))
+                   mlir::arith::MaximumFOp, mlir::arith::AddIOp,
+                   mlir::arith::MaxSIOp, mlir::arith::MinSIOp>(combine))
       continue;
     // Multi-result loops are fine: `_layer_norm_bwd_dwdb` carries dw AND db in
     // one scf.for (2 results, 2 axis-0 reduces). Each reduce reassociates its
@@ -9900,6 +9920,8 @@ struct ConvertTritonGPUToMetalPass
                  ArithMulFLowering, ArithSIToFPLowering, ArithNegFLowering,
                  ArithMaxFLowering<mlir::arith::MaxNumFOp>,
                  ArithMaxFLowering<mlir::arith::MaximumFOp>,
+                 ArithIntMinMaxLowering<mlir::arith::MaxSIOp>,
+                 ArithIntMinMaxLowering<mlir::arith::MinSIOp>,
                  ArithExtFLowering, ArithTruncFLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,

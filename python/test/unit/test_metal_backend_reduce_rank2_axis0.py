@@ -14,11 +14,15 @@ accumulator (`dw += load_tile`, `db += load_tile`) over axis 0;
 load_tile, axis=0))` (per accumulator) so the reduce sees a per-iteration direct
 masked load.
 
-Combines: f32 sum/max and i32 sum/max/min. Sum uses scalar arith; f32 max uses
-metal.binary_exp; i32 max/min use cmpi+select (binary_exp rejects signless i32).
-Loop-carried reassociation ships for f32 sum/max and i32 sum (elementwise
-maxnumf/addi lowerings); loop-carried i32 max/min and output E>1 (BN > tpb) stay
-deferred. Output E==1 (launch tpb >= BN).
+Combines: f32 sum/max and i32 sum/max/min, both direct and loop-carried (the
+reassociation reassociates any same-kind loop-carried accumulator whose tensor
+update op has an elementwise scalarizing lowering — arith.add{f,i},
+metal.binary_exp for f32 max, and scalar arith.maxsi/minsi for i32 max/min). Sum
+uses scalar arith; f32 max uses metal.binary_exp; i32 max/min use cmpi+select in
+the reduce body (binary_exp rejects signless i32). Only output E==1 (BN <= tpb):
+BN > tpb is deferred (coalescing moves the output to sizePerThread>1, so a
+per-iteration column index would mis-address — the caller launches tpb >= BN or
+tiles columns across the grid).
 """
 
 from __future__ import annotations
@@ -112,8 +116,8 @@ def test_bwd_dwdb_verbatim(M, N):
 # --- Combines beyond f32 sum (Session L3a2 generalization) -----------------
 # f32 max and i32 sum/max/min. Sum uses scalar arith; f32 max uses
 # metal.binary_exp maxOp; i32 max/min use cmpi+select (binary_exp rejects
-# signless i32). Loop-carried f32 max/i32 sum reassociate (elementwise maxnumf/
-# addi lowerings); loop-carried i32 max/min stay deferred (direct only).
+# signless i32). Both direct and loop-carried (reassociation + elementwise
+# maxnumf / maxsi / minsi lowerings).
 
 
 @triton.jit
@@ -192,6 +196,47 @@ def _colmin_i32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
 @pytest.mark.parametrize("M, N", [(32, 128), (16, 256), (32, 700)])
 def test_reduce_axis0_minmax_i32_direct(kernel, red, M, N):
     torch.manual_seed(M * 17 + N)
+    inp = torch.randint(-500, 500, (M, N), dtype=torch.int32, device="mps")
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    kernel[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), red(inp.cpu()))
+
+
+@triton.jit
+def _colmax_i32_lc(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # loop-carried i32 column max (handles M > BM); ArithIntMinMax elementwise
+    # lowering + cmpi+select reduce body.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.full((BM, BN), -2147483648, tl.int32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        acc = tl.maximum(acc, tl.load(In + offs, mask=mask, other=-2147483648))
+    tl.store(Out + cols, tl.max(acc, axis=0), mask=cols < N)
+
+
+@triton.jit
+def _colmin_i32_lc(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.full((BM, BN), 2147483647, tl.int32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        acc = tl.minimum(acc, tl.load(In + offs, mask=mask, other=2147483647))
+    tl.store(Out + cols, tl.min(acc, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("kernel, red",
+                         [(_colmax_i32_lc, lambda t: t.amax(0)),
+                          (_colmin_i32_lc, lambda t: t.amin(0))])
+@pytest.mark.parametrize("M, N", [(32, 128), (64, 256), (96, 700), (100, 1024)])
+def test_reduce_axis0_minmax_i32_loopcarried(kernel, red, M, N):
+    torch.manual_seed(M * 23 + N)
     inp = torch.randint(-500, 500, (M, N), dtype=torch.int32, device="mps")
     out = torch.empty(N, dtype=torch.int32, device="mps")
     kernel[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
