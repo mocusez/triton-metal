@@ -1857,6 +1857,13 @@ static mlir::Value accumulateScalarAddPtrOffsets(
     mlir::Value origPtrVal, mlir::ConversionPatternRewriter &rewriter,
     mlir::Location loc);
 
+// Same, but also walks tt.broadcast / tt.expand_dims so the per-program scalar
+// term of a 2D tile address is reachable. See the definition for why the rank-2
+// axis=1 reduce needs it.
+static mlir::Value accumulateScalarAddPtrOffsetsThroughShape(
+    mlir::Value origPtrVal, mlir::ConversionPatternRewriter &rewriter,
+    mlir::Location loc);
+
 // Rank-1 tt.reduce lowering. Threadgroup-buffer parallel-tree-reduce body.
 // BLOCK <= tpb regimes use the adaptor scalar (BLOCK < tpb uses identity-fill
 // tail; BLOCK == tpb has no tail). BLOCK > tpb uses the spt-fold path: walks
@@ -2711,7 +2718,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   mlir::Value buf =
       ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
 
-  // Write padded value to buf[tid]; barrier.
+  // Write padded value to buf[tid]; barrier. (BLOCK <= tpb path.)
+  // The leading barrier guards the buffer against a loop-carried
+  // write-after-read hazard: when this reduce sits inside an scf.for, `buf` is
+  // one static allocation reused every trip, so iteration t+1's write below
+  // would otherwise race iteration t's broadcast read of buf[0]. Only
+  // observable at tpb > 32 (a single SIMD-group cannot drift out of lockstep).
+  BarrierOp::create(rewriter, loc);
   StoreOp::create(rewriter, loc, padded, buf, tid);
   BarrierOp::create(rewriter, loc);
 
@@ -3063,6 +3076,11 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
                           rewriter, loc, mlir::TypeRange{ui32},
                           mlir::ValueRange{localTid})
                           .getResult(0);
+  // Leading barrier: same loop-carried hazard as in lowerRank1Reduce, and for
+  // the same reason — `buf` is one static allocation reused on every trip of an
+  // enclosing scf.for, so without it iteration t+1's write races iteration t's
+  // read of buf[0]. Only observable at tpb > 32.
+  BarrierOp::create(rewriter, loc);
   StoreOp::create(rewriter, loc, partial, buf, tidUI);
   BarrierOp::create(rewriter, loc);
   for (int64_t s = tpb / 2; s >= 1; s /= 2) {
@@ -4270,6 +4288,42 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   return mlir::success();
 }
 
+// True if `root`'s expression tree reads `loop`'s induction variable or any of
+// its iter_args, i.e. the value genuinely changes from trip to trip.
+//
+// The rank-2 axis=1 reduce does NOT re-materialise the tile address from the
+// load's offset expression; it fabricates `rowBase = (r + tgid*tpb)*N` and adds
+// only the SCALAR tt.addptr offsets (accumulateScalarAddPtrOffsets drops
+// tensor-typed offsets). That form has no trip term, and the fill is hoisted
+// above the enclosing scf.for, so a trip-varying address would silently reduce
+// trip 0's tile on every iteration. Detect it and bail rather than emit code
+// that is quietly wrong.
+//
+// Lexical containment in the loop is deliberately NOT the test: an address that
+// is merely *computed* inside the loop but loop-invariant stays correct under
+// hoisting. Only a real dependence on the loop-carried values matters.
+static bool readsLoopCarriedValue(mlir::Value root, mlir::scf::ForOp loop) {
+  if (!loop || !root)
+    return false;
+  llvm::SmallPtrSet<mlir::Value, 8> carried;
+  carried.insert(loop.getInductionVar());
+  for (auto a : loop.getRegionIterArgs())
+    carried.insert(a);
+  llvm::SmallVector<mlir::Value, 16> wl{root};
+  llvm::SmallPtrSet<mlir::Value, 16> seen;
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    if (carried.contains(v))
+      return true;
+    if (auto *def = v.getDefiningOp())
+      for (auto o : def->getOperands())
+        wl.push_back(o);
+  }
+  return false;
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -4478,6 +4532,25 @@ struct ReduceLowering
         rewriter.getContext(),
         isMaxF ? BinaryExpOperator::maxOp : BinaryExpOperator::addOp);
     mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
+    // Hoisting the fill above `tileLoop` is only sound when the tile it reduces
+    // is the same on every trip. `findOutermostScfFor` cannot tell a
+    // FuncOpLowering tile loop from a user `for` — when E==1 no tile loop is
+    // created and this IS the user's loop — so ask the address instead. A
+    // trip-varying address must be re-reduced every iteration, exactly like the
+    // staged-cone case; hoisting it would reduce trip 0's tile every time.
+    const bool loopVaryingAddr =
+        tileLoop && readsLoopCarriedValue(reprLoad.getPtr(), tileLoop);
+    // ...but only when the loop carries no iter_args. With iter_args the loop
+    // is rebuilt by its own conversion pattern (its arg types change), which
+    // moves the ops around the inline fill and leaves the hoisted rowBuf alloca
+    // failing to dominate the read — "operand #0 does not dominate this use".
+    // Reject up front: a clear unsupported-shape message beats either a
+    // dominance crash or the silently-wrong hoisted reduce this used to emit.
+    if (loopVaryingAddr && !tileLoop.getRegionIterArgs().empty())
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 reduce: tile address varies with an enclosing loop that "
+              "also carries iter_args; the fill cannot be hoisted (wrong tile) "
+              "nor emitted inline (rowBuf alloca would not dominate)");
     // inlineStaged (M<=tpb) reads rowBuf[localTid] (each thread its own row), so
     // it needs no output tile layout.
     if (tileLoop && !outTile && !inlineStaged)
@@ -4490,6 +4563,8 @@ struct ReduceLowering
     // loop-invariant (device) cone (compute once) but emitted INLINE for a
     // staged cone (inlineStaged): the staged leaves' getRemappedValue only
     // dominates inside the loop, and the reduce must recompute each iteration.
+    // A loop-varying address (loopVaryingAddr) is inline for the same reason.
+    const bool fillInLoop = inlineStaged || loopVaryingAddr;
     mlir::Value rowBuf;
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -4501,7 +4576,7 @@ struct ReduceLowering
     }
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
-      if (tileLoop && !inlineStaged)
+      if (tileLoop && !fillInLoop)
         rewriter.setInsertionPoint(tileLoop);
 
       // localTid = global_tid - tgid * tpb (multi-program safe).
@@ -4534,13 +4609,25 @@ struct ReduceLowering
       // Any scalar tt.addptr chain offset (e.g. row_base*stride for a
       // multi-program launch); null for the simple direct-load shape. For a
       // computed cone the representative load supplies the per-program offset.
-      mlir::Value scalarOff =
-          accumulateScalarAddPtrOffsets(reprLoad.getPtr(), rewriter, loc);
+      // Walks through tt.broadcast/tt.expand_dims so the per-program term of a
+      // 2D tile address is actually found; when it is, it REPLACES the
+      // fabricated tgid*tpb*N below instead of adding to it.
+      mlir::Value scalarOff = accumulateScalarAddPtrOffsetsThroughShape(
+          reprLoad.getPtr(), rewriter, loc);
 
       auto cN = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
       auto cM = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+
+      // When the fill runs inside a loop, `rowBuf` is one static allocation
+      // reused every trip, so this trip's writes below would race the previous
+      // trip's reads of it (the per-row read at the bottom sits inside the same
+      // loop). Same write-after-read hazard the rank-1 butterfly guards
+      // against, and likewise only observable once a threadgroup spans more
+      // than one SIMD-group.
+      if (fillInLoop)
+        BarrierOp::create(rewriter, loc);
 
       // Grid-stride over rows: for ri in [0, ceil(M/tpb)): r = localTid+ri*tpb;
       // if (r < M) rowBuf[r] = sum_n device[base + r*N + n].
@@ -4576,18 +4663,33 @@ struct ReduceLowering
         {
           mlir::OpBuilder::InsertionGuard g2(rewriter);
           rewriter.setInsertionPointToStart(&guardIf.getThenRegion().front());
-          // rowBase = (tgid.x*tpb + r) * N (+ scalarOff). The device buffer is
-          // indexed by the GLOBAL row; r is the program-LOCAL row, so add the
-          // per-program offset tgid.x*tpb (== tgOffset). No-op for a
-          // single-program launch (tgOffset == 0). Without this, program k>0's
-          // reduce reads program 0's rows (multi-program adder → wrong scores →
-          // overflow/NaN). rowBuf itself stays LOCAL-indexed by r.
-          mlir::Value globalRow = mlir::arith::AddIOp::create(
-                                      rewriter, loc, r, tgOffset.getResult())
-                                      .getResult();
-          auto rowBaseMul = mlir::arith::MulIOp::create(rewriter, loc, globalRow,
-                                                        cN.getResult());
-          mlir::Value rowBase = rowBaseMul.getResult();
+          // rowBase: the device buffer is indexed by the GLOBAL row, while r is
+          // the program-LOCAL row, so the per-program base has to come from
+          // somewhere. Two shapes occur, and mixing them double-counts:
+          //
+          //  (a) The address carries the program term as a SCALAR addptr
+          //      (`ptr + pid*S`, the usual `tl.load(p + pid*S + rows*N + cols)`
+          //      form). scalarOff now recovers that real term, so use
+          //      `r*N + scalarOff` verbatim. This is what makes a tile base
+          //      other than pid*M*N (e.g. pid*K*M*N) come out right; the old
+          //      fabricated term silently assumed S == tpb*N.
+          //
+          //  (b) No scalar term — the program offset is folded into the row
+          //      tensor itself (`offs_m = pid*BLOCK_M + arange(...)`). Nothing
+          //      is recoverable here, so keep the fabricated tgid.x*tpb. It is
+          //      a no-op for a single-program launch, and without it program
+          //      k>0 would reduce program 0's rows (multi-program adder →
+          //      wrong scores → overflow/NaN).
+          //
+          // rowBuf itself stays LOCAL-indexed by r in both cases.
+          mlir::Value rowIdx = r;
+          if (!scalarOff)
+            rowIdx = mlir::arith::AddIOp::create(rewriter, loc, r,
+                                                 tgOffset.getResult())
+                         .getResult();
+          mlir::Value rowBase =
+              mlir::arith::MulIOp::create(rewriter, loc, rowIdx, cN.getResult())
+                  .getResult();
           if (scalarOff)
             rowBase = mlir::arith::AddIOp::create(rewriter, loc, rowBase,
                                                   scalarOff)
@@ -4935,6 +5037,56 @@ static mlir::Value accumulateScalarAddPtrOffsets(
   return acc;
 }
 
+// As above, but also walks the SHAPE ops (`tt.broadcast` / `tt.expand_dims`)
+// that a 2D tile address threads between its addptr levels.
+//
+// Triton builds a tile address as
+//   addptr(broadcast(addptr(splat(addptr(arg, pid*S)), rows*N)), cols)
+// so the scalar `pid*S` term sits below a `tt.broadcast`. The plain walker
+// stops there and returns null, which is why the rank-2 axis=1 reduce used to
+// substitute a fabricated `tgid*tpb*N` for the per-program offset — a value
+// that only coincidentally equals `pid*S` when S == tpb*N. Walking the shape
+// ops recovers the real term, so any tile base (e.g. `pid*K*M*N`) is honoured.
+static mlir::Value accumulateScalarAddPtrOffsetsThroughShape(
+    mlir::Value origPtrVal, mlir::ConversionPatternRewriter &rewriter,
+    mlir::Location loc) {
+  auto i32 = rewriter.getI32Type();
+  mlir::Value cur = origPtrVal;
+  mlir::Value acc;
+  while (cur) {
+    if (mlir::isa<mlir::BlockArgument>(cur))
+      break;
+    if (auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      mlir::Value off = addptr.getOffset();
+      if (!mlir::isa<mlir::RankedTensorType>(off.getType())) {
+        if (off.getType() != i32)
+          off = mlir::UnrealizedConversionCastOp::create(
+                    rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{off})
+                    .getResult(0);
+        acc = acc ? mlir::arith::AddIOp::create(rewriter, loc, acc, off)
+                        .getResult()
+                  : off;
+      }
+      cur = addptr.getPtr();
+      continue;
+    }
+    if (auto splat = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+      cur = splat.getSrc();
+      continue;
+    }
+    if (auto bc = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      cur = bc.getSrc();
+      continue;
+    }
+    if (auto ed = cur.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      cur = ed.getSrc();
+      continue;
+    }
+    break;
+  }
+  return acc;
+}
+
 // For 2D rank-2 tensor ops we read the converted scalar offset from
 // `adaptor.getPtr()` (AddPtrLowering replaces tt.addptr with its offset),
 // because the IR's `(pid_m*BLOCK_M+row)*stride + (pid_n*BLOCK_N+col)` arith
@@ -5007,9 +5159,15 @@ struct LoadLowering
     if (op.getMask())
       return mlir::failure();  // handled by MaskedLoadLowering
     auto loc = op.getLoc();
-    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+    // A tensor load normally reads a tile through `tt.addptr`. The one shape
+    // without an addptr is a bare `tt.splat` of a scalar pointer: every lane
+    // then reads the SAME address. Triton produces this whenever the
+    // per-element offset folds to zero — e.g. a BLOCK=1 tile, where
+    // `tl.arange(0, 1) * stride` is constant 0 and the addptr disappears.
+    auto splatPtr = op.getPtr().getDefiningOp<mlir::triton::SplatOp>();
+    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
-          op, "tt.load expects a tt.addptr feeding ptr");
+          op, "tt.load expects a tt.addptr or a splat scalar ptr feeding ptr");
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -5018,9 +5176,27 @@ struct LoadLowering
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.load operand missing ttg.blocked layout");
-    auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
-    mlir::Value idx =
-        emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
+    mlir::Value idx;
+    if (splatPtr) {
+      // Uniform pointer: there is no per-element index to emit. The address is
+      // whatever the scalar tt.addptr chain feeding the splat accumulated
+      // (null → the bare kernel-arg pointer → index 0), exactly as
+      // ScalarLoadLowering does for a scalar `!tt.ptr<T>`.
+      auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+      mlir::Value offI32 =
+          accumulateScalarAddPtrOffsets(op.getPtr(), rewriter, loc);
+      if (!offI32)
+        offI32 = mlir::arith::ConstantOp::create(
+                     rewriter, loc, rewriter.getI32IntegerAttr(0))
+                     .getResult();
+      idx = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{offI32})
+                .getResult(0);
+    } else {
+      auto parentFor =
+          findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
+      idx = emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
+    }
     auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
     // L2b: get_element yields the memref STORAGE type (ui32 for an i32 ptr).
     // When that differs from the tensor's signless element type, bridge back
