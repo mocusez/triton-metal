@@ -186,6 +186,62 @@ static std::optional<TileInfo> tileFromTensor(mlir::Type t) {
   return info;
 }
 
+// Same, but also accepts a rank-(R-1) `#ttg.slice<{dim, parent = #blocked}>`.
+//
+// A 1D vector that gets `tt.expand_dims`'d / `tt.broadcast`'d into a 2D tile
+// (`skip[:, None] * A`) carries a slice encoding, not a blocked one, so plain
+// `tileFromTensor` rejects it and the load fails to legalize. Relaxing
+// `tileFromTensor` itself is NOT an option: its nullopt on slice encodings is
+// load-bearing at the other call sites — `findTileInfo` (:243) would let the
+// parent's M*N size win the tile-loop sizing tiebreaker, and `ReduceLowering`'s
+// outTile walk (:4515) steps OVER the slice-encoded reduce result precisely
+// because of it, landing on the rank-1 #blocked store value; make slice resolve
+// there and the reduce reads rowBuf[M] with an index in [0, M*N).
+//
+// Downstream only `rank` is actually consumed (`emitLoadStoreIndex` branches on
+// it, then passes the scalarized tt.addptr offset straight through — and
+// `MakeRangeLowering` already emits per-thread-correct values for slice
+// encodings via the parent's order-driven div/rem). So `rank`/`shape` stay the
+// op's own rank-1 view, and only the thread geometry comes from the parent.
+//
+// Read the geometry off `slice.getParent()`, never off the slice: a
+// SliceEncodingAttr's own getThreadsPerWarp/getWarpsPerCTA return the
+// dim-REMOVED vectors, so their product is parent_tpb / threadsPerWarp[dim] —
+// not the thread count the launch actually has.
+//
+// LOADS ONLY. Under a slice encoding the value is REPLICATED across the sliced
+// axis (N-to-1 for dim=1), so every replica computes the same address and reads
+// the same value — redundant but correct. A slice-encoded STORE would have a
+// whole replica set writing one address from values that need not agree, so
+// those keep failing to legalize rather than silently racing.
+static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
+  if (auto info = tileFromTensor(t))
+    return info;
+  auto rt = mlir::dyn_cast<mlir::RankedTensorType>(t);
+  if (!rt || rt.getRank() < 1)
+    return std::nullopt;
+  auto slice = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+      rt.getEncoding());
+  if (!slice)
+    return std::nullopt;
+  auto parent = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      slice.getParent());
+  if (!parent)
+    return std::nullopt;
+  int64_t tpb = 1;
+  for (auto t : parent.getThreadsPerWarp()) tpb *= t;
+  for (auto w : parent.getWarpsPerCTA()) tpb *= w;
+  if (tpb == 0)
+    return std::nullopt;
+  int64_t total = 1;
+  for (auto s : rt.getShape()) total *= s;
+  bool contiguous =
+      llvm::any_of(parent.getSizePerThread(), [](auto s) { return s > 1; });
+  TileInfo info{total / tpb, tpb, contiguous, rt.getRank(), {}};
+  for (auto s : rt.getShape()) info.shape.push_back(s);
+  return info;
+}
+
 // True iff `v` has a forward use-chain that reaches a `tt.store` WITHOUT first
 // being consumed by a `tt.reduce`. The reduce is treated as a terminal sink:
 // its result value is a NEW (post-reduce) value and is not traversed.
@@ -1029,6 +1085,41 @@ struct SplatLowering
 // A GENUINE transpose (both blocked, >=2 non-unit dims, or sizePerThread>1) is
 // NOT identity-safe: the rank-2 sizePerThread=[1,1] case goes to the staged-
 // transpose body below; everything else is rejected (L1d3) by the pre-pass.
+// True if a slice-encoded cone bottoms out in a value whose per-thread content
+// depends on the slice layout — a `tt.load` or `tt.make_range`, both of which
+// MakeRangeLowering places by projecting the PARENT tile's index onto the
+// surviving axis (row = idx / N for dim=1). Converting such a value to a plain
+// rank-1 #blocked layout, where thread t holds element t, genuinely moves data;
+// treating that cvt as a scalar identity hands every lane element `t / N`.
+//
+// `tt.reduce` / `tt.scan` results are NOT such leaves and terminate the walk:
+// ReduceLowering reads its result out of rowBuf under the DESTINATION layout's
+// indexing already, so bridging it with an identity cvt is correct — that is
+// the case the identity rule was written for.
+static bool sliceConeHasLayoutDependentLeaf(mlir::Value root) {
+  llvm::SmallVector<mlir::Value, 16> wl{root};
+  llvm::SmallPtrSet<mlir::Value, 16> seen;
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+    if (!rt || !mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+                   rt.getEncoding()))
+      continue;
+    auto *def = v.getDefiningOp();
+    if (!def)
+      continue;
+    if (mlir::isa<mlir::triton::ReduceOp, mlir::triton::ScanOp>(def))
+      continue;
+    if (mlir::isa<mlir::triton::LoadOp, mlir::triton::MakeRangeOp>(def))
+      return true;
+    for (auto operand : def->getOperands())
+      wl.push_back(operand);
+  }
+  return false;
+}
+
 static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
   auto dstRtt =
@@ -1038,8 +1129,22 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
   if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
           srcRtt.getEncoding()) ||
       mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
-          dstRtt.getEncoding()))
+          dstRtt.getEncoding())) {
+    // The comment above assumes slice encodings only ever arise from
+    // tt.expand_dims and tt.reduce outputs — pure index/broadcast relabels. A
+    // slice-encoded tt.load breaks that assumption. `normalizeBlockedDivergentCvt`
+    // re-encodes those cones so the cvt really does become an identity; if it
+    // bailed (a shared non-cloneable value, an unhandled boundary), refuse the
+    // identity shortcut so the kernel gets a clean rejection instead of
+    // silently reading element `t / N` in every lane.
+    if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            srcRtt.getEncoding()) &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            dstRtt.getEncoding()) &&
+        sliceConeHasLayoutDependentLeaf(op.getSrc()))
+      return false;
     return true;
+  }
   auto srcB = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
       srcRtt.getEncoding());
   auto dstB = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
@@ -5172,10 +5277,10 @@ struct LoadLowering
     if (!memref)
       return rewriter.notifyMatchFailure(op,
                                          "memref source not MetalMemRefType");
-    auto tile = tileFromTensor(op.getPtr().getType());
+    auto tile = tileFromLoadPtrTensor(op.getPtr().getType());
     if (!tile)
       return rewriter.notifyMatchFailure(
-          op, "tt.load operand missing ttg.blocked layout");
+          op, "tt.load operand missing ttg.blocked / ttg.slice layout");
     mlir::Value idx;
     if (splatPtr) {
       // Uniform pointer: there is no per-element index to emit. The address is
@@ -5564,10 +5669,10 @@ struct MaskedLoadLowering
             "masked tt.load: only float, i8 and i32 element types supported");
     }
 
-    auto tile = tileFromTensor(op.getPtr().getType());
+    auto tile = tileFromLoadPtrTensor(op.getPtr().getType());
     if (!tile)
       return rewriter.notifyMatchFailure(
-          op, "tt.load operand missing ttg.blocked layout");
+          op, "tt.load operand missing ttg.blocked / ttg.slice layout");
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value cond;
     if (tile->rank == 2) {
@@ -8971,18 +9076,44 @@ static void preprocessDotChains(mlir::ModuleOp moduleOp) {
 // expand_dims that thread a rank-2 cone's row/col index math) maps to
 // slice<dim, parent=dstEnc>. Returns a null Attribute for encodings outside
 // the cone (scalars, the other side's layout, dot operands, ...).
+// `srcEnc` may itself be a slice: a rank-1 value that feeds BOTH a 2D tile
+// (via tt.expand_dims, which forces the slice encoding) and a live rank-1
+// store reaches the store through `cvt slice<dim,parent=B> -> #blocked1`. The
+// two layouts disagree about which element a thread holds — under
+// slice<dim=1,parent=B> thread t holds row t/N, under #blocked1 it holds row t
+// — so that cvt is a real data relabel and the cone must be re-encoded.
 static mlir::Attribute
-remapDivergentConeEncoding(mlir::Attribute enc,
-                           mlir::triton::gpu::BlockedEncodingAttr srcEnc,
-                           mlir::triton::gpu::BlockedEncodingAttr dstEnc) {
+remapDivergentConeEncoding(mlir::Attribute enc, mlir::Attribute srcEnc,
+                           mlir::Attribute dstEnc) {
   if (enc == srcEnc)
     return dstEnc;
-  if (auto slice =
-          mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc))
-    if (slice.getParent() == srcEnc)
-      return mlir::triton::gpu::SliceEncodingAttr::get(
-          srcEnc.getContext(), slice.getDim(), dstEnc);
+  auto srcBlocked =
+      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(srcEnc);
+  auto dstBlocked =
+      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(dstEnc);
+  if (srcBlocked && dstBlocked)
+    if (auto slice =
+            mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc))
+      if (slice.getParent() == srcBlocked)
+        return mlir::triton::gpu::SliceEncodingAttr::get(
+            srcBlocked.getContext(), slice.getDim(), dstBlocked);
   return nullptr;
+}
+
+// A cone value we must NOT re-encode, because its type is not ours to choose:
+// `tt.reduce`'s result encoding is inferred from its 2D source (axis=1 over
+// #blocked yields exactly slice<dim=1, parent=that blocked>), so re-typing it
+// makes the op invalid. Such values become BOUNDARIES: the cone is re-encoded
+// around them and a fresh `cvt` bridges each one back in.
+//
+// Leaving a cvt there is correct rather than a punt: `ReduceLowering` reads its
+// result out of `rowBuf[emitPerIterIndex(*outTile)]`, and `outTile` is taken
+// from the first blocked-typed user — i.e. the reduce already emits its output
+// under the DESTINATION layout's indexing. The bridge cvt is a genuine scalar
+// identity, which is the one case `isScalarIdentityConvert` was written for.
+static bool isConeBoundaryValue(mlir::Value v) {
+  auto *def = v.getDefiningOp();
+  return !def || mlir::isa<mlir::triton::ReduceOp, mlir::triton::ScanOp>(def);
 }
 
 static bool
@@ -8994,24 +9125,41 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
       srcRtt.getShape() != dstRtt.getShape() ||
       srcRtt.getElementType() != dstRtt.getElementType())
     return false;
-  auto srcEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
-      srcRtt.getEncoding());
+  mlir::Attribute srcEnc = srcRtt.getEncoding();
   auto dstEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
       dstRtt.getEncoding());
-  if (!srcEnc || !dstEnc || srcEnc == dstEnc)
+  if (!dstEnc || !srcEnc || srcEnc == dstEnc)
+    return false;
+  // src is either a blocked layout (the original rank-2 transpose / rank-1
+  // compute-to-store repack) or a slice of one (the rank-1 value that also
+  // feeds a 2D tile). Anything else is not ours.
+  if (!mlir::isa<mlir::triton::gpu::BlockedEncodingAttr,
+                 mlir::triton::gpu::SliceEncodingAttr>(srcEnc))
     return false;
 
   // Collect the backward cone of src-encoded values feeding the cvt source:
-  // the blocked encoding plus any slice<parent=srcEnc> (a rank-2 cone threads
-  // its row/col index math through slice-encoded make_range/expand_dims).
+  // the src encoding plus, when src is blocked, any slice<parent=srcEnc> (a
+  // rank-2 cone threads its row/col index math through slice-encoded
+  // make_range/expand_dims).
+  //
+  // `boundaries` are cone values whose type we may not rewrite (tt.reduce /
+  // tt.scan results, block arguments). They terminate the walk and get a
+  // bridging cvt after the re-encode below.
   llvm::SmallVector<mlir::Value, 32> wl{cvt.getSrc()};
   llvm::SmallPtrSet<mlir::Value, 32> inCone;
   llvm::SmallVector<mlir::Value, 32> ordered;
+  llvm::SmallVector<mlir::Value, 4> boundaries;
+  llvm::SmallPtrSet<mlir::Value, 4> boundarySet;
   while (!wl.empty()) {
     auto v = wl.pop_back_val();
     auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
     if (!rt || !remapDivergentConeEncoding(rt.getEncoding(), srcEnc, dstEnc))
       continue; // scalar operands / other encodings terminate the walk
+    if (isConeBoundaryValue(v)) {
+      if (boundarySet.insert(v).second)
+        boundaries.push_back(v);
+      continue;
+    }
     if (!inCone.insert(v).second)
       continue;
     ordered.push_back(v);
@@ -9040,13 +9188,41 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   // kernel's loops — would otherwise force a bail. CLONE it into a cone-local
   // copy and redirect the cone's uses to the clone, leaving the original for the
   // external consumers, so the in-place re-encode below stays a valid repack.
+  //
+  // For a SLICE source the list also admits tt.addptr / tt.load. When one 1D
+  // load feeds BOTH a 2D tile and a live 1D store, the two consumers genuinely
+  // need different thread->element maps, so no single encoding serves both —
+  // duplicating the load is the only correct answer, and it is exactly what
+  // Triton itself does when no reduce result forces the two paths to share an
+  // encoding. A load is a pure read: the copy is redundant traffic, never a
+  // semantic change.
+  //
+  // Kept OFF the blocked->blocked path on purpose. That path's contract is that
+  // a cone shared with an outside consumer is NOT self-contained and must fall
+  // through to the reject/staged-transpose classification; making its loads
+  // clonable normalizes cones that are supposed to be rejected (the
+  // convert_layout_reject_nontrivial / staged_transpose fixtures pin exactly
+  // that boundary).
+  const bool srcIsSlice =
+      mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(srcEnc);
   for (size_t i = 0; i < ordered.size(); ++i) {
     mlir::Value v = ordered[i];
     if (!usedExternally(v))
       continue;
     mlir::Operation *def = v.getDefiningOp();
-    if (!def || !mlir::isa<mlir::triton::SplatOp, mlir::triton::MakeRangeOp,
-                           mlir::arith::ConstantOp>(def))
+    // For a slice source, ANY pure single-result op is cloneable (the index
+    // math — addi/muli/cmpi over make_range — is routinely CSE'd between the
+    // live rank-1 cone and the 2D tile cone, so restricting to leaves bails on
+    // every real kernel), plus tt.load, which has read effects but is
+    // idempotent.
+    bool cloneable =
+        def && (mlir::isa<mlir::triton::SplatOp, mlir::triton::MakeRangeOp,
+                          mlir::arith::ConstantOp>(def) ||
+                (srcIsSlice && def->getNumResults() == 1 &&
+                 def->getNumRegions() == 0 &&
+                 (mlir::isMemoryEffectFree(def) ||
+                  mlir::isa<mlir::triton::LoadOp>(def))));
+    if (!cloneable)
       return false; // non-leaf shared value — too risky to duplicate
     mlir::OpBuilder b(def);
     mlir::Operation *clone = b.clone(*def);
@@ -9077,6 +9253,28 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
       if (auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()))
         cst.setValueAttr(dense.reshape(mlir::cast<mlir::ShapedType>(newTy)));
     v.setType(newTy);
+  }
+
+  // Bridge each boundary back in. Its own type stayed put (a tt.reduce result
+  // encoding is inferred from the reduce's 2D source and is not ours to
+  // rewrite), so the now-dst-encoded cone ops that consume it need a cvt. Only
+  // uses INSIDE the cone are redirected — the boundary's other consumers keep
+  // reading it in its original layout.
+  for (auto b : boundaries) {
+    auto rt = mlir::cast<mlir::RankedTensorType>(b.getType());
+    auto bridgeTy = mlir::RankedTensorType::get(
+        rt.getShape(), rt.getElementType(),
+        remapDivergentConeEncoding(rt.getEncoding(), srcEnc, dstEnc));
+    mlir::OpBuilder bldr(cvt.getContext());
+    if (auto *def = b.getDefiningOp())
+      bldr.setInsertionPointAfter(def);
+    else
+      bldr.setInsertionPointToStart(b.getParentBlock());
+    auto bridge = mlir::triton::gpu::ConvertLayoutOp::create(
+        bldr, b.getLoc(), bridgeTy, b);
+    b.replaceUsesWithIf(bridge.getResult(), [&](mlir::OpOperand &use) {
+      return coneOps.count(use.getOwner());
+    });
   }
   return true;
 }

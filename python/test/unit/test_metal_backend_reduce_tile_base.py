@@ -157,3 +157,78 @@ def test_uniform_splat_load_feeding_reduce(BLOCK):
     torch.mps.synchronize()
     ref = x.cpu().double()[0] * BLOCK
     assert (out.cpu().double()[0] - ref).abs() <= 2e-5 * max(abs(ref.item()), 1.0)
+
+
+# --- 3. Slice-encoded rank-1 loads -----------------------------------------
+#
+# A 1D vector that gets expand_dims'd/broadcast into a 2D tile carries
+# `#ttg.slice<{dim, parent = #blocked2D}>`, not a blocked encoding, so its
+# `tt.load` failed to legalize outright ("missing ttg.blocked layout").
+#
+# The subtle half is the LIVE path. Under slice<dim=1,parent=B> thread t holds
+# row t/N; under the rank-1 #blocked1 the store wants, it holds row t. When
+# both consumers exist Triton usually just duplicates the load — but if a
+# `tt.reduce` result (inherently slice-encoded) is combined with the value, the
+# two paths are forced to share an encoding and only a `ttg.convert_layout`
+# separates them. That cvt was classified as a scalar identity, so every lane
+# ended up reading element t/N, i.e. element 0 for any N >= tpb.
+
+
+@triton.jit
+def _slice_load_two_consumers_kernel(skip_ptr, a_ptr, t_ptr, y_ptr, d_model,
+                                     BD: tl.constexpr, BN: tl.constexpr):
+    d_off, n_off = tl.arange(0, BD), tl.arange(0, BN)
+    d_mask = d_off < d_model
+    skip = tl.load(skip_ptr + d_off, mask=d_mask, other=0.0)
+    idx2d = d_off[:, None] * BN + n_off[None, :]
+    a = tl.load(a_ptr + idx2d)
+    # Consumer A: into the 2D tile (this is what forces the slice encoding).
+    tl.store(t_ptr + idx2d, tl.expand_dims(skip, 1) * a)
+    # Consumer B: live rank-1 store.
+    tl.store(y_ptr + d_off, skip * 2.0, mask=d_mask)
+
+
+@pytest.mark.parametrize("BD, BN, num_warps", [(32, 64, 4), (16, 32, 2),
+                                               (64, 16, 4)])
+def test_slice_encoded_load_two_consumers(BD, BN, num_warps):
+    torch.manual_seed(BD * BN)
+    skip = torch.randn(BD, dtype=torch.float32, device="mps")
+    a = torch.randn(BD * BN, dtype=torch.float32, device="mps")
+    t = torch.zeros(BD * BN, dtype=torch.float32, device="mps")
+    y = torch.zeros(BD, dtype=torch.float32, device="mps")
+    _slice_load_two_consumers_kernel[(1,)](skip, a, t, y, BD, BD=BD, BN=BN,
+                                           num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(t.cpu(), (skip.cpu()[:, None] * a.cpu().reshape(BD, BN)).reshape(-1))
+    torch.testing.assert_close(y.cpu(), skip.cpu() * 2.0)
+
+
+@triton.jit
+def _slice_load_plus_reduce_kernel(a_ptr, skip_ptr, y_ptr, d_model,
+                                   BD: tl.constexpr, BN: tl.constexpr):
+    d_off, n_off = tl.arange(0, BD), tl.arange(0, BN)
+    d_mask = d_off < d_model
+    a = tl.load(a_ptr + d_off[:, None] * BN + n_off[None, :])
+    s = tl.sum(a, axis=1)
+    skip = tl.load(skip_ptr + d_off, mask=d_mask, other=0.0)
+    # `s` is slice-encoded, so this addf drags `skip` into the slice encoding
+    # too and the store needs a real (data-moving) convert_layout.
+    tl.store(y_ptr + d_off, s + skip, mask=d_mask)
+
+
+@pytest.mark.parametrize("BD, BN, num_warps", [(32, 64, 4), (16, 32, 2),
+                                               (64, 16, 4), (32, 8, 1)])
+def test_slice_encoded_load_added_to_reduce_result(BD, BN, num_warps):
+    torch.manual_seed(BD * BN + 1)
+    a = torch.randn(BD * BN, dtype=torch.float32, device="mps")
+    skip = torch.randn(BD, dtype=torch.float32, device="mps")
+    y = torch.zeros(BD, dtype=torch.float32, device="mps")
+    _slice_load_plus_reduce_kernel[(1,)](a, skip, y, BD, BD=BD, BN=BN,
+                                         num_warps=num_warps)
+    torch.mps.synchronize()
+    ref = a.cpu().double().reshape(BD, BN).sum(1) + skip.cpu().double()
+    err = (y.cpu().double() - ref).abs().max() / ref.abs().max()
+    assert err <= 2e-5, f"rel err {err}"
+    # Guard the specific failure mode: every lane collapsing to element 0.
+    assert not torch.allclose(y.cpu() - a.cpu().reshape(BD, BN).sum(1),
+                              skip.cpu()[0].expand(BD), atol=1e-4)
