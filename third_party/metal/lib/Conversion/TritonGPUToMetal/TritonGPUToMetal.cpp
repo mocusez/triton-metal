@@ -4238,9 +4238,28 @@ struct ScanLowering
     if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
       return rewriter.notifyMatchFailure(op, "scan: tpb not power-of-two");
     int64_t BLOCK = rtt.getDimSize(0);
-    if (BLOCK <= 0 || BLOCK % tpb != 0)
+    if (BLOCK <= 0)
+      return rewriter.notifyMatchFailure(op, "scan: empty tile");
+    // Sub-tpb tiles (BLOCK < tpb) are PADDED up to one full tpb window instead
+    // of getting a partial-window prefix-sum template. The tail positions
+    // [BLOCK, tpb) are filled with 0.0 — the identity for the addf combine — so
+    // every prefix of a position < BLOCK is unaffected and the template runs
+    // completely unchanged. That matters: a partial window would mean guarding
+    // the template's buffer writes, and on Metal a threadgroup_barrier inside
+    // divergent control flow is UB, so the guard and the barriers would have to
+    // be interleaved by hand. Padding sidesteps the hazard entirely.
+    //
+    // BLOCK < tpb is otherwise reachable ONLY here: tpb = 32 * num_warps, so
+    // BLOCK >= 32 can always be made to fit by lowering num_warps, but a
+    // sub-warp BLOCK (1..16) cannot. tt.load / tt.store / tt.reduce already
+    // handle sub-tpb tiles (see the store's `needGuard` path); tt.scan was the
+    // one op that did not, which made num_warps decide whether a kernel with a
+    // small cumsum compiled at all.
+    const int64_t bufLen = std::max(BLOCK, tpb);
+    const bool padded = BLOCK < bufLen;
+    if (bufLen % tpb != 0)
       return rewriter.notifyMatchFailure(op, "scan: BLOCK not a multiple of tpb");
-    int64_t E = BLOCK / tpb;
+    int64_t E = bufLen / tpb;
     if (E < 1 || E > 64 || (E & (E - 1)) != 0)
       return rewriter.notifyMatchFailure(op, "scan: E=BLOCK/tpb outside [1,64] pow2");
     // NOTE: sizePerThread is irrelevant here. inbuf is indexed by LOGICAL
@@ -4282,7 +4301,7 @@ struct ScanLowering
     mlir::Value tidLocal =
         mlir::arith::SubIOp::create(rewriter, loc, tidG, tgOff).getResult();
 
-    auto bufTy = MetalMemRefType::get(rewriter.getContext(), f32, BLOCK);
+    auto bufTy = MetalMemRefType::get(rewriter.getContext(), f32, bufLen);
     mlir::Value inbuf =
         ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
     mlir::Value scanbuf =
@@ -4311,9 +4330,36 @@ struct ScanLowering
                                           cKtpb.getResult())
                   .getResult();
       }
-      mlir::Value val = evalRank1ValueAt(scanInput, pos, rewriter, loc, 0);
+      // Padded tail: `pos` may land in [BLOCK, tpb), where the cone has no
+      // element — evaluating it there would emit a device load past the end of
+      // the source tensor. Evaluate at a clamped-to-zero index instead and
+      // select the add-identity, branchless: no scf.if, so the barriers around
+      // this fill stay uniform for the whole threadgroup.
+      mlir::Value inRange;
+      mlir::Value evalPos = pos;
+      if (padded) {
+        auto cBlock = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BLOCK)));
+        auto cZeroI = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(0));
+        inRange = mlir::arith::CmpIOp::create(
+                      rewriter, loc, mlir::arith::CmpIPredicate::slt, pos,
+                      cBlock.getResult())
+                      .getResult();
+        evalPos = mlir::arith::SelectOp::create(rewriter, loc, inRange, pos,
+                                                cZeroI.getResult())
+                      .getResult();
+      }
+      mlir::Value val = evalRank1ValueAt(scanInput, evalPos, rewriter, loc, 0);
       if (!val)
         return rewriter.notifyMatchFailure(op, "scan: input eval failed");
+      if (padded) {
+        auto cZeroF = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+        val = mlir::arith::SelectOp::create(rewriter, loc, inRange, val,
+                                            cZeroF.getResult())
+                  .getResult();
+      }
       mlir::Value posUI =
           mlir::UnrealizedConversionCastOp::create(
               rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{pos})
@@ -4322,7 +4368,7 @@ struct ScanLowering
     }
 
     ThreadgroupPrefixSumOp::create(rewriter, loc, inbuf, scanbuf,
-                                   rewriter.getI64IntegerAttr(BLOCK),
+                                   rewriter.getI64IntegerAttr(bufLen),
                                    rewriter.getI64IntegerAttr(tpb));
 
     // Per-element placeholder for any live per-thread consumer (e.g. a direct

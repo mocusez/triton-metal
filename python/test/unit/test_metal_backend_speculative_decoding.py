@@ -213,7 +213,7 @@ def _cumsum_store_kernel(in_ptr, out_ptr, n, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, tl.cumsum(x, axis=0), mask=mask)
 
 
-@pytest.mark.parametrize("BLOCK", [128, 256, 512, 1024])
+@pytest.mark.parametrize("BLOCK", [8, 16, 32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("n_frac", [1.0, 0.5])
 def test_cumsum_stored_directly(BLOCK, n_frac):
     # The scan result consumed by a plain `tl.store` rather than by a reduce.
@@ -230,6 +230,30 @@ def test_cumsum_stored_directly(BLOCK, n_frac):
     inp = torch.randn(n, dtype=torch.float32, device="mps")
     out = torch.zeros(n, dtype=torch.float32, device="mps")
     _cumsum_store_kernel[(1,)](inp, out, n, BLOCK=BLOCK, num_warps=4)
+    torch.mps.synchronize()
+    ref = torch.cumsum(inp.cpu().double(), dim=0)
+    np.testing.assert_allclose(
+        out.cpu().double().numpy(), ref.numpy(), rtol=0, atol=2e-5)
+
+@pytest.mark.parametrize("BLOCK, num_warps", [
+    (8, 1), (16, 1), (32, 1), (64, 2),      # BLOCK == tpb, or sub-warp
+    (8, 4), (16, 4), (32, 4), (64, 4),      # BLOCK < tpb (128): padded window
+])
+def test_cumsum_sub_tpb_window(BLOCK, num_warps):
+    # BLOCK < tpb, where tpb = 32 * num_warps.
+    #
+    # tt.scan used to require BLOCK % tpb == 0, so a small cumsum failed to
+    # legalize outright at the default num_warps=4 (tpb=128) — num_warps, a pure
+    # perf knob, decided whether the kernel compiled. A sub-warp BLOCK (1..16)
+    # was unreachable at ANY num_warps, since tpb is at least one warp.
+    #
+    # Sub-tpb tiles are now padded up to a full tpb window with 0.0, the identity
+    # for the addf combine, so prefixes below BLOCK are unaffected and the
+    # prefix-sum template is reused verbatim (no divergent barrier).
+    torch.manual_seed(BLOCK * 31 + num_warps)
+    inp = torch.randn(BLOCK, dtype=torch.float32, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.float32, device="mps")
+    _cumsum_store_kernel[(1,)](inp, out, BLOCK, BLOCK=BLOCK, num_warps=num_warps)
     torch.mps.synchronize()
     ref = torch.cumsum(inp.cpu().double(), dim=0)
     np.testing.assert_allclose(

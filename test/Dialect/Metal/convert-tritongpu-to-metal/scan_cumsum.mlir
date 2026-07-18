@@ -49,6 +49,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %0, %1 : !tt.ptr<i32> loc(#loc18)
     tt.return loc(#loc)
   } loc(#loc)
+
+  // Sub-tpb tile: BLOCK=16 with tpb=128 (num_warps=4). The buffers are sized to
+  // a full tpb window and the tail [16, 128) is filled with the addf identity,
+  // so the prefix-sum template is reused verbatim — no partial-window variant,
+  // hence no threadgroup_barrier inside divergent control flow (UB on Metal).
+  // Before this, BLOCK % tpb != 0 failed to legalize, which meant num_warps (a
+  // perf knob) decided whether a small cumsum compiled at all, and a sub-warp
+  // BLOCK was unreachable at every num_warps.
+  tt.func public @k_sub_tpb(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %n: i32) attributes {noinline = false} {
+    %x = arith.constant dense<0.000000e+00> : tensor<16xf32, #blocked>
+    %off = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked>
+    %m = tt.splat %n : i32 -> tensor<16xi32, #blocked>
+    %m_0 = arith.cmpi slt, %off, %m : tensor<16xi32, #blocked>
+    %x_1 = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %x_2 = tt.addptr %x_1, %off : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    %x_3 = tt.load %x_2, %m_0, %x : tensor<16x!tt.ptr<f32>, #blocked>
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    %cs = "tt.scan"(%x_3) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.scan.return %s : f32
+    }) : (tensor<16xf32, #blocked>) -> tensor<16xf32, #blocked>
+    tt.store %o_0, %cs, %m_0 : tensor<16x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 } loc(#loc)
 #loc1 = loc("/tmp/dump_scan_ttgir.py":10:9)
 #loc2 = loc("/tmp/dump_scan_ttgir.py":7:9)
@@ -83,4 +109,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.threadgroup_alloca : !metal.memref<1024 x f32>
 // CHECK: metal.threadgroup_alloca : !metal.memref<1024 x f32>
 // CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 1024 : i64, tpb = 128 : i64}
+
+// Sub-tpb: buffers and the prefix-sum window are the padded tpb size (128), not
+// the tile size (16), and the fill selects the addf identity past element 16.
+// CHECK-LABEL: metal.kernel k_sub_tpb
+// CHECK: metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: arith.select
+// CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 128 : i64, tpb = 128 : i64}
 // CHECK-NOT: tt.scan
