@@ -1104,4 +1104,51 @@ def SimdgroupFusedStoreOp
                        " attr-dict `:` type(operands)";
 }
 
+//===----------------------------------------------------------------------===//
+// ScalarDotOp
+//===----------------------------------------------------------------------===//
+
+def ScalarDotOp : Metal_Op<"scalar_dot"> {
+  let summary = "Per-thread scalar GEMM (correctness fallback for tt.dot).";
+
+  let description = [{
+    Correctness-first lowering of a standalone `tt.dot` whose fused-epilogue
+    shape the SIMD-group matmul matchers cannot consume (e.g. a `dot` feeding
+    an `alpha*out + beta*C` epilogue rather than a bare `tt.store`). The result
+    is a rank-2 `tensor<MxNxf32, #blocked>` value that flows into the ordinary
+    per-thread tile-loop model: `ScalarDotLowering` scalarizes it to one output
+    element per (thread, tile-loop iteration) and emits an `scf.for` reduction
+
+      acc = c_init;
+      for (k = 0; k < stride_a; ++k)
+        acc += a_buf[gRow*stride_a + k] * b_buf[k*stride_b + gCol];
+
+    where `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` are the
+    global output coordinates recovered from `emitPerIterIndex`. The reduction
+    trip count is `stride_a` — for a contiguous row-major A tile the row stride
+    equals the (masked) K extent, so the zero-padded columns beyond real-K are
+    never read. When `partial_extents = [m_extent, n_extent]` is present the
+    reduction is guarded by `gRow < m_extent && gCol < n_extent` so out-of-range
+    tail-tile rows/cols never issue an out-of-bounds device read (their result
+    is discarded by the epilogue's masked store).
+
+    NOTE: this is O(M*N*K) scalar work with no matrix-unit reuse — a correctness
+    path, not a performance path. `a_buf`/`b_buf` are the device kernel-arg
+    buffers; `c_init` is the dot accumulator init (typically `dense<0.0>`).
+  }];
+
+  let arguments = (ins Metal_MemRefType:$a_buf, Metal_MemRefType:$b_buf,
+                       UI32:$row_origin, UI32:$col_origin,
+                       UI32:$stride_a, UI32:$stride_b,
+                       AnyType:$c_init,
+                       Variadic<UI32>:$partial_extents);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$a_buf `,` $b_buf `[` $row_origin `,` $col_origin `]`"
+                       " `,` $stride_a `,` $stride_b `,` $c_init"
+                       " (`partial` `[` $partial_extents^ `]`)?"
+                       " attr-dict `:` functional-type(operands, results)";
+}
+
 #endif // METAL_OPS

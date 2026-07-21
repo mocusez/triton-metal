@@ -10004,6 +10004,733 @@ static mlir::LogicalResult tryUnrollKLoopDot(mlir::triton::DotOp dot) {
   return mlir::success();
 }
 
+//===----------------------------------------------------------------------===//
+// Scalar-GEMM correctness fallback (`metal.scalar_dot`).
+//
+// The SIMD-group matchers above all fuse `dot -> tt.store`; a `tt.dot` feeding
+// a general epilogue (`alpha*out + beta*C -> truncf -> masked store`, e.g.
+// leet-triton/medium-general_matrix_multiplication.py) matches none of them and
+// its `#blocked -> #dot_op` operand cvts hit the L1d3 rejection. This fallback
+// lowers such a standalone dot to a per-thread scalar reduction that flows into
+// the ordinary tile-loop epilogue unchanged. Correctness path only — O(M*N*K)
+// scalar work, no matrix-unit reuse.
+//===----------------------------------------------------------------------===//
+
+// expand_dims axis of a pointer-offset contribution, traversing
+// addi/muli/broadcast/expand_dims/extsi. Unlike `findExpandDimsAxis` this walks
+// through `arith.addi`, so it resolves the `(expand_dims(arange) + splat(pid*B))`
+// shape this kernel emits (origin added AFTER the expand_dims).
+static std::optional<int> sdAxisOf(mlir::Value v, int depth = 0) {
+  if (depth > 8 || !v) return std::nullopt;
+  if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
+    return static_cast<int>(ed.getAxis());
+  if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
+    return sdAxisOf(bc.getSrc(), depth + 1);
+  if (auto muli = v.getDefiningOp<mlir::arith::MulIOp>()) {
+    if (auto a = sdAxisOf(muli.getLhs(), depth + 1)) return a;
+    return sdAxisOf(muli.getRhs(), depth + 1);
+  }
+  if (auto addi = v.getDefiningOp<mlir::arith::AddIOp>()) {
+    if (auto a = sdAxisOf(addi.getLhs(), depth + 1)) return a;
+    return sdAxisOf(addi.getRhs(), depth + 1);
+  }
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtSIOp>())
+    return sdAxisOf(ext.getIn(), depth + 1);
+  return std::nullopt;
+}
+
+// The constexpr stride multiplier (a splat dense-int constant) applied within a
+// contribution, e.g. `arith.muli(rowIdx, dense<K>) -> K`. Returns nullopt for a
+// contiguous (stride-1) contribution with no constant multiplier.
+static std::optional<int64_t> sdConstStride(mlir::Value v, int depth = 0) {
+  if (depth > 8 || !v) return std::nullopt;
+  auto splatC = [](mlir::Value x) -> std::optional<int64_t> {
+    auto c = x.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!c) return std::nullopt;
+    if (auto d = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue()))
+      if (d.isSplat()) return d.getSplatValue<mlir::APInt>().getSExtValue();
+    return std::nullopt;
+  };
+  if (auto muli = v.getDefiningOp<mlir::arith::MulIOp>()) {
+    if (auto c = splatC(muli.getRhs())) return c;
+    if (auto c = splatC(muli.getLhs())) return c;
+    if (auto c = sdConstStride(muli.getLhs(), depth + 1)) return c;
+    return sdConstStride(muli.getRhs(), depth + 1);
+  }
+  if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
+    return sdConstStride(bc.getSrc(), depth + 1);
+  if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
+    return sdConstStride(ed.getSrc(), depth + 1);
+  if (auto addi = v.getDefiningOp<mlir::arith::AddIOp>()) {
+    if (auto c = sdConstStride(addi.getLhs(), depth + 1)) return c;
+    return sdConstStride(addi.getRhs(), depth + 1);
+  }
+  return std::nullopt;
+}
+
+// Split a canonical 2-level 2D pointer chain
+//   addptr(broadcast(addptr(splat(arg), INNER)), OUTER)
+// into its axis-1 (leading/row) and axis-0 (trailing/col) offset contributions
+// and its root kernel-arg pointer.
+struct SdPtrParts {
+  mlir::Value rowContrib;  // expand_dims axis == 1
+  mlir::Value colContrib;  // expand_dims axis == 0
+  mlir::Value rootArg;
+};
+static SdPtrParts sdSplitPtr(mlir::Value ptr) {
+  SdPtrParts p;
+  for (int depth = 0; depth < 16 && ptr; ++depth) {
+    if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      auto off = addptr.getOffset();
+      auto ax = sdAxisOf(off);
+      if (ax == 1 && !p.rowContrib)
+        p.rowContrib = off;
+      else if (ax == 0 && !p.colContrib)
+        p.colContrib = off;
+      ptr = addptr.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      ptr = bc.getSrc();
+      continue;
+    }
+    if (auto sp = ptr.getDefiningOp<mlir::triton::SplatOp>()) {
+      p.rootArg = sp.getSrc();
+      break;
+    }
+    break;
+  }
+  return p;
+}
+
+// Forward BFS from `v` to the first `tt.store` reachable through the epilogue
+// (convert_layout / elementwise arith). Returns null if none.
+static mlir::triton::StoreOp sdFindStore(mlir::Value v) {
+  llvm::SmallVector<mlir::Operation *, 8> wl;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (auto *u : v.getUsers()) wl.push_back(u);
+  while (!wl.empty()) {
+    auto *u = wl.pop_back_val();
+    if (!seen.insert(u).second) continue;
+    if (auto st = mlir::dyn_cast<mlir::triton::StoreOp>(u)) return st;
+    for (auto res : u->getResults())
+      for (auto *uu : res.getUsers()) wl.push_back(uu);
+  }
+  return {};
+}
+
+// Peel a dot operand back through convert_layout / extf / trans to its load.
+static mlir::triton::LoadOp sdPeelToLoad(mlir::Value v) {
+  for (int i = 0; i < 8 && v; ++i) {
+    if (auto ld = v.getDefiningOp<mlir::triton::LoadOp>()) return ld;
+    if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      v = cvt.getSrc();
+      continue;
+    }
+    if (auto ext = v.getDefiningOp<mlir::arith::ExtFOp>()) {
+      v = ext.getIn();
+      continue;
+    }
+    if (auto tr = v.getDefiningOp<mlir::triton::TransOp>()) {
+      v = tr.getSrc();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+// Detect a sole-use `#blocked1 -> #blocked` result cvt on `dotResult` so the
+// scalar_dot is produced directly in the store-side encoding, folding the cvt.
+// Sets `resCvt`/`replaceTarget`/`resultTensorTy`.
+static void sdDetectResultCvt(mlir::Value dotResult,
+                              mlir::RankedTensorType dotTy,
+                              mlir::triton::gpu::ConvertLayoutOp &resCvt,
+                              mlir::Value &replaceTarget,
+                              mlir::RankedTensorType &resultTensorTy) {
+  replaceTarget = dotResult;
+  resultTensorTy = dotTy;
+  if (!dotResult.hasOneUse()) return;
+  auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(
+      *dotResult.getUsers().begin());
+  if (!cvt) return;
+  auto cvtTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+  if (cvtTy && cvtTy.getShape() == dotTy.getShape() &&
+      cvtTy.getElementType() == dotTy.getElementType()) {
+    resCvt = cvt;
+    replaceTarget = cvt.getResult();
+    resultTensorTy = cvtTy;
+  }
+}
+
+// True iff `v` is a provably-zero dot accumulator init (`tl.zeros` /
+// `(...)*0.0`): a dense-zero float constant, or a float mul/add cone that
+// bottoms out in one. This gates the SIMD-group fast path, whose accumulator
+// starts at `simdgroup_matrix_zero`.
+static bool sdIsZeroInit(mlir::Value v, int depth = 0) {
+  if (depth > 6 || !v) return false;
+  if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto d = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue()))
+      return d.isSplat() && d.getSplatValue<mlir::APFloat>().isZero();
+  // (x * 0) == 0 ; (0 + 0) == 0
+  if (auto mul = v.getDefiningOp<mlir::arith::MulFOp>())
+    return sdIsZeroInit(mul.getLhs(), depth + 1) ||
+           sdIsZeroInit(mul.getRhs(), depth + 1);
+  if (auto add = v.getDefiningOp<mlir::arith::AddFOp>())
+    return sdIsZeroInit(add.getLhs(), depth + 1) &&
+           sdIsZeroInit(add.getRhs(), depth + 1);
+  return false;
+}
+
+// Shared emitter: from the A/B loads (their pointer chains give strides and the
+// root device buffers), the accumulator init `cInit`, and the store consuming
+// `replaceTarget` (for origins + mask extents), build a `metal.scalar_dot`
+// before `insertBefore` and rewire `replaceTarget`'s uses to it. Returns the op
+// or null (nothing durable mutated on failure — the bridge/const ops it may
+// have created are dead and DCE'd).
+static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
+                                   mlir::triton::LoadOp aLoad,
+                                   mlir::triton::LoadOp bLoad,
+                                   mlir::Value cInit,
+                                   mlir::Value replaceTarget,
+                                   mlir::RankedTensorType resultTensorTy) {
+  // Strides: A/B leading-dim (row) const multiplier. For contiguous row-major
+  // inputs the A row stride equals the (masked) K extent, so it doubles as the
+  // reduction trip count and the zero-padded K columns are never read.
+  SdPtrParts aParts = sdSplitPtr(aLoad.getPtr());
+  SdPtrParts bParts = sdSplitPtr(bLoad.getPtr());
+  if (!aParts.rowContrib || !bParts.rowContrib || !aParts.rootArg ||
+      !bParts.rootArg)
+    return {};
+  auto strideAOpt = sdConstStride(aParts.rowContrib);
+  auto strideBOpt = sdConstStride(bParts.rowContrib);
+  if (!strideAOpt || !strideBOpt || *strideAOpt <= 0 || *strideBOpt <= 0)
+    return {};
+  auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(aLoad.getType());
+  auto bTy = mlir::dyn_cast<mlir::RankedTensorType>(bLoad.getType());
+  if (!aTy || !bTy) return {};
+
+  // Origins (pid*BLOCK) from the store's contributions — the output row/col
+  // origins equal A's row origin and B's col origin respectively.
+  auto store = sdFindStore(replaceTarget);
+  mlir::Value rowOriginScalar, colOriginScalar;
+  MaskExtents maskExtents;
+  if (store) {
+    SdPtrParts cParts = sdSplitPtr(store.getPtr());
+    if (cParts.rowContrib)
+      rowOriginScalar = findPidOriginInContribution(cParts.rowContrib);
+    if (cParts.colContrib)
+      colOriginScalar = findPidOriginInContribution(cParts.colContrib);
+    if (store.getMask()) maskExtents = extractMaskExtents(store.getMask());
+  }
+
+  mlir::OpBuilder builder(insertBefore);
+  auto loc = insertBefore->getLoc();
+  auto ui32 = builder.getIntegerType(32, /*isSigned=*/false);
+  mlir::Value aBuf =
+      bridgePtrToMemref(builder, loc, aParts.rootArg, aTy.getElementType());
+  mlir::Value bBuf =
+      bridgePtrToMemref(builder, loc, bParts.rootArg, bTy.getElementType());
+  auto emitConstUi32 = [&](int64_t c) -> mlir::Value {
+    return ConstantOp::create(builder, loc, builder.getIntegerAttr(ui32, c))
+        .getResult();
+  };
+  mlir::Value rowOrigin = emitOriginOperand(builder, loc, ui32, rowOriginScalar);
+  mlir::Value colOrigin = emitOriginOperand(builder, loc, ui32, colOriginScalar);
+  mlir::Value strideA = emitConstUi32(*strideAOpt);
+  mlir::Value strideB = emitConstUi32(*strideBOpt);
+
+  llvm::SmallVector<mlir::Value, 2> partialExtents;
+  if (maskExtents.mExtent && maskExtents.nExtent) {
+    auto toUi32 = [&](mlir::Value v) -> mlir::Value {
+      if (v.getType() == ui32) return v;
+      return mlir::UnrealizedConversionCastOp::create(builder, loc, ui32, v)
+          .getResult(0);
+    };
+    partialExtents.push_back(toUi32(maskExtents.mExtent));
+    partialExtents.push_back(toUi32(maskExtents.nExtent));
+  }
+
+  auto scalarDot = ScalarDotOp::create(builder, loc, resultTensorTy, aBuf, bBuf,
+                                       rowOrigin, colOrigin, strideA, strideB,
+                                       cInit, partialExtents);
+  // Zero-init dot accumulator -> eligible for the SIMD-group fast path (the
+  // accumulator starts at simdgroup_matrix_zero; tail M/N and ragged K are
+  // handled by masked staged loads whose extents ScalarDotLowering derives from
+  // the store mask when present, else the full tile bounds). The warp count is
+  // recovered in the pattern from the tile's threadsPerBlock.
+  if (sdIsZeroInit(cInit))
+    scalarDot->setAttr("metal.simdgroup", builder.getUnitAttr());
+  replaceTarget.replaceAllUsesWith(scalarDot.getResult());
+  return scalarDot;
+}
+
+// Erase a now-dead dot-operand cone (convert_layout -> extf -> load).
+static void sdEraseCone(mlir::Value v) {
+  for (int i = 0; i < 8 && v; ++i) {
+    auto *def = v.getDefiningOp();
+    if (!def || !def->use_empty()) break;
+    mlir::Value next;
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def))
+      next = cvt.getSrc();
+    else if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(def))
+      next = ext.getIn();
+    else if (mlir::isa<mlir::triton::LoadOp>(def))
+      next = {};
+    else
+      break;
+    def->erase();
+    v = next;
+  }
+}
+
+// A standalone (non-loop) rank-2 f32 dot whose dims are multiples of 8 and
+// larger than a single 8x8 tile (iters==1 in the source: K <= TILE).
+static bool sdDotEligible(mlir::triton::DotOp dot) {
+  if (!dot) return false;
+  if (dot->getParentOfType<mlir::scf::ForOp>()) return false;
+  auto rt = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+  if (!rt || rt.getRank() != 2 || !rt.getElementType().isF32()) return false;
+  auto s = rt.getShape();
+  if (s[0] % 8 != 0 || s[1] % 8 != 0) return false;
+  if (s[0] == 8 && s[1] == 8) return false;
+  return true;
+}
+
+static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
+  if (!sdDotEligible(dot)) return mlir::failure();
+  auto resTy = mlir::cast<mlir::RankedTensorType>(dot.getType());
+  auto aLoad = sdPeelToLoad(dot.getA());
+  auto bLoad = sdPeelToLoad(dot.getB());
+  if (!aLoad || !bLoad) return mlir::failure();
+
+  mlir::triton::gpu::ConvertLayoutOp resCvt;
+  mlir::Value replaceTarget;
+  mlir::RankedTensorType resultTensorTy;
+  sdDetectResultCvt(dot.getResult(), resTy, resCvt, replaceTarget,
+                    resultTensorTy);
+
+  auto cvtA = dot.getA().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+  auto cvtB = dot.getB().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+  if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
+                       resultTensorTy))
+    return mlir::failure();
+
+  if (resCvt) resCvt.erase();
+  dot.erase();
+  if (cvtA) sdEraseCone(cvtA.getResult());
+  if (cvtB) sdEraseCone(cvtB.getResult());
+  return mlir::success();
+}
+
+// Loop variant: a single-dot recompute K-loop (K > TILE, iters > 1) whose
+// accumulator result feeds the SAME `cvt -> alpha/beta epilogue`. The whole
+// reduction (all iters * TILE) collapses to one scalar_dot over [0, stride_a),
+// replacing the loop. Defers a bare `dot -> tt.store` loop to the existing
+// SIMD-group recompute matcher (`tryRuntimeKLoopRecomputeDot`).
+static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp) {
+  llvm::SmallVector<mlir::triton::DotOp> dots;
+  forOp.getBodyRegion().walk([&](mlir::triton::DotOp d) { dots.push_back(d); });
+  if (dots.size() != 1) return mlir::failure();
+  auto dot = dots[0];
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+  if (!resTy || resTy.getRank() != 2 || !resTy.getElementType().isF32())
+    return mlir::failure();
+  auto s = resTy.getShape();
+  if (s[0] % 8 != 0 || s[1] % 8 != 0) return mlir::failure();
+
+  // Single accumulator iter_arg. The dot yields into it, possibly with a
+  // convert_layout on each side when the loop carries the accumulator in the
+  // epilogue `#blocked` encoding rather than the dot `#blocked1` encoding (the
+  // K-not-a-multiple-of-TILE shape does this).
+  if (forOp.getNumResults() != 1) return mlir::failure();
+  auto peelCvt = [](mlir::Value v) -> mlir::Value {
+    if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      return cvt.getSrc();
+    return v;
+  };
+  auto yield =
+      mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (yield.getNumOperands() != 1 ||
+      peelCvt(yield.getOperand(0)) != dot.getResult())
+    return mlir::failure();
+  if (peelCvt(dot.getC()) != forOp.getRegionIterArg(0)) return mlir::failure();
+
+  auto aLoad = sdPeelToLoad(dot.getA());
+  auto bLoad = sdPeelToLoad(dot.getB());
+  if (!aLoad || !bLoad) return mlir::failure();
+
+  // The loop result feeds the epilogue, optionally via a `#blocked1 -> #blocked`
+  // cvt (when the loop carried #blocked1). A bare `dot -> tt.store` loop (no
+  // epilogue arith) is deferred to the SIMD-group recompute path.
+  mlir::Value loopRes = forOp.getResult(0);
+  auto loopResTy = mlir::cast<mlir::RankedTensorType>(loopRes.getType());
+  mlir::triton::gpu::ConvertLayoutOp resCvt;
+  mlir::Value replaceTarget;
+  mlir::RankedTensorType resultTensorTy;
+  sdDetectResultCvt(loopRes, loopResTy, resCvt, replaceTarget, resultTensorTy);
+  mlir::Value afterRes = resCvt ? resCvt.getResult() : loopRes;
+  if (llvm::any_of(afterRes.getUsers(), [](mlir::Operation *u) {
+        return mlir::isa<mlir::triton::StoreOp>(u);
+      }))
+    return mlir::failure();
+
+  mlir::Value cInit = forOp.getInitArgs()[0];
+  if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
+                       resultTensorTy))
+    return mlir::failure();
+
+  if (resCvt) resCvt.erase();
+  forOp.erase();
+  return mlir::success();
+}
+
+// Rewrite every scalar-GEMM-eligible dot (standalone + single-dot epilogue
+// loop) BEFORE the convert_layout legality walk, so their out-of-envelope
+// operand/result cvts are gone by the time the walk (and applyFullConversion)
+// runs. Emits `metal.scalar_dot` (lowered by `ScalarDotLowering`).
+static void preprocessScalarDots(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::DotOp> standalone;
+  moduleOp.walk([&](mlir::triton::DotOp d) {
+    if (sdDotEligible(d)) standalone.push_back(d);
+  });
+  for (auto d : standalone) (void)tryScalarDotFallback(d);
+
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  moduleOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
+  for (auto f : loops) (void)tryScalarDotLoopFallback(f);
+}
+
+// Lowers `metal.scalar_dot` (created by `tryScalarDotFallback`) to a per-thread
+// scalar reduction inside the tile loop. Under the tensor->scalar TypeConverter
+// the result is one f32 per (thread, tile-loop iteration); this thread's output
+// element is `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` where
+// `lin = emitPerIterIndex` gives the row-major local-tile index. The reduction
+//   acc = c_init; for k in [0, stride_a): acc += a[gRow*stride_a+k]*b[k*stride_b+gCol]
+// uses `stride_a` (A's row stride == masked-K extent) as the trip count, so
+// zero-padded K columns are never read. On tail tiles the whole reduction is
+// guarded by `gRow < m_extent && gCol < n_extent` to avoid OOB device reads.
+struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(ScalarDotOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
+    if (!resTy || resTy.getRank() != 2)
+      return rewriter.notifyMatchFailure(op, "scalar_dot: non-2D result");
+    auto elemTy = resTy.getElementType();
+    if (!elemTy.isF32())
+      return rewriter.notifyMatchFailure(op, "scalar_dot: non-f32 result");
+    auto tileInfo = tileFromTensor(resTy);
+    if (!tileInfo)
+      return rewriter.notifyMatchFailure(op, "scalar_dot: no tile info");
+
+    auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+    auto i32 = rewriter.getI32Type();
+    auto toI32 = [&](mlir::Value v) -> mlir::Value {
+      if (v.getType() == i32) return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+    auto toUi32 = [&](mlir::Value v) -> mlir::Value {
+      if (v.getType() == ui32) return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+
+    // Per-thread local-tile linear index (row-major), matching the epilogue.
+    auto parentFor = findOutermostScfFor(op);
+    mlir::Value linUi32;
+    if (tileInfo->elemPerThread > 1) {
+      linUi32 = emitPerIterIndex(*tileInfo, parentFor, rewriter, loc);
+    } else {
+      linUi32 = emitLocalTidUI32(rewriter, loc, tileInfo->threadsPerBlock);
+    }
+
+    // ---- SIMD-group fast path ----------------------------------------------
+    // When the dot accumulator is zero, compute the tile with
+    // `simdgroup_multiply_accumulate` (Apple 8x8 matrix units) instead of the
+    // per-thread scalar K-loop. The warp-cooperative cone runs ONCE (guarded by
+    // `iv == 0`); the (mTiles x nTiles) 8x8 tiles are partitioned across warps
+    // (each warp owns a disjoint subset, so scratch writes never race). Masked
+    // staged loads zero out-of-bounds A/B (tail M/N and ragged K). IMPORTANT:
+    // the staged load itself issues a threadgroup_barrier and stages into a
+    // PER-WARP buffer, so ALL warps must execute the same load sequence in
+    // lockstep — the tiles are selected by the runtime warp index, never a
+    // warp-divergent `if`. Each output tile is stored row-major into threadgroup
+    // scratch; every thread then reloads its element for the epilogue.
+    int64_t M = resTy.getShape()[0], N = resTy.getShape()[1];
+    const int mTiles = static_cast<int>(M / 8);
+    const int nTiles = static_cast<int>(N / 8);
+    int numWarps = std::max<int64_t>(1, tileInfo->threadsPerBlock / 32);
+    std::optional<std::pair<int, int>> wf =
+        (numWarps == 1) ? std::make_optional(std::make_pair(1, 1))
+                        : factorWarps(numWarps, mTiles, nTiles);
+    // `TRITON_METAL_SCALAR_DOT` forces the scalar reduction — an escape hatch
+    // for debugging / A-B perf comparison, exercised by the scalar lit test.
+    if (op->hasAttr("metal.simdgroup") && !::getenv("TRITON_METAL_SCALAR_DOT") &&
+        tileInfo->elemPerThread > 1 &&
+        parentFor && M % 8 == 0 && N % 8 == 0 && wf) {
+      const int warpsM = wf->first, warpsN = wf->second;
+      const int mPerWarp = mTiles / warpsM, nPerWarp = nTiles / warpsN;
+      auto matTy = MetalSimdgroupMatrixType::get(rewriter.getContext(), 8, 8, elemTy);
+
+      mlir::Value strideAui = adaptor.getStrideA();          // ui32, == realK
+      mlir::Value strideBui = adaptor.getStrideB();
+      mlir::Value rowOrigI32 = toI32(adaptor.getRowOrigin());
+      mlir::Value colOrigI32 = toI32(adaptor.getColOrigin());
+      mlir::Value strideAI = toI32(strideAui);
+      // Row/col extents for masked loads: realM/realN from the store mask when
+      // present, else the tile's max (rowOrigin+M / colOrigin+N) so the full
+      // in-bounds tile is never masked. The K axis is always bounded by strideA.
+      mlir::Value extentM, extentN;
+      if (adaptor.getPartialExtents().size() == 2) {
+        extentM = adaptor.getPartialExtents()[0];
+        extentN = adaptor.getPartialExtents()[1];
+      } else {
+        auto cM = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+        auto cNv = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
+        extentM = toUi32(mlir::arith::AddIOp::create(rewriter, loc, rowOrigI32,
+                                                     cM.getResult())
+                             .getResult());
+        extentN = toUi32(mlir::arith::AddIOp::create(rewriter, loc, colOrigI32,
+                                                     cNv.getResult())
+                             .getResult());
+      }
+
+      // Row-major M*N scratch tile shared by the threadgroup.
+      auto bufTy = MetalMemRefType::get(rewriter.getContext(), elemTy,
+                                        static_cast<int>(M * N));
+      mlir::Value scratch =
+          ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+      auto eight = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(8));
+
+      // if (iv == 0) { <cone>; barrier }
+      mlir::Value iv = parentFor.getInductionVar();
+      auto zeroI32 = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(0));
+      auto ivIsZero = mlir::arith::CmpIOp::create(
+          rewriter, loc, mlir::arith::CmpIPredicate::eq, iv, zeroI32.getResult());
+      auto ifIv = mlir::scf::IfOp::create(rewriter, loc, ivIsZero.getResult(),
+                                          /*withElseRegion=*/false);
+      {
+        mlir::OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPointToStart(&ifIv.getThenRegion().front());
+        // Per-warp (warpM, warpN) from the runtime simdgroup index.
+        mlir::Value widxUi = SimdgroupIndexOp::create(rewriter, loc, ui32).getResult();
+        mlir::Value widxI32 = toI32(widxUi);
+        auto warpsNc = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(warpsN));
+        mlir::Value warpM = (warpsN == 1)
+            ? widxI32
+            : mlir::arith::DivUIOp::create(rewriter, loc, widxI32,
+                                           warpsNc.getResult()).getResult();
+        mlir::Value warpN = (warpsN == 1)
+            ? zeroI32.getResult()
+            : mlir::arith::RemUIOp::create(rewriter, loc, widxI32,
+                                           warpsNc.getResult()).getResult();
+        // Storage keeps the widx ValueRange address stable for the staged loads.
+        llvm::SmallVector<mlir::Value, 1> widxStore{widxUi};
+        for (int mIter = 0; mIter < mPerWarp; ++mIter) {
+          // tile_m = warpM + mIter*warpsM  (interleaved warp tiling)
+          mlir::Value mTileIdx = warpM;
+          if (mIter != 0 || warpsM != 1) {
+            auto c = mlir::arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(mIter * warpsM));
+            mTileIdx = mlir::arith::AddIOp::create(rewriter, loc, warpM,
+                                                   c.getResult()).getResult();
+          }
+          mlir::Value rowOff =
+              mlir::arith::MulIOp::create(rewriter, loc, mTileIdx,
+                                          eight.getResult()).getResult();
+          mlir::Value aTileRow = toUi32(
+              mlir::arith::AddIOp::create(rewriter, loc, rowOrigI32, rowOff)
+                  .getResult());
+          mlir::Value locRow = toUi32(rowOff);
+          for (int nIter = 0; nIter < nPerWarp; ++nIter) {
+            mlir::Value nTileIdx = warpN;
+            if (nIter != 0 || warpsN != 1) {
+              auto c = mlir::arith::ConstantOp::create(
+                  rewriter, loc, rewriter.getI32IntegerAttr(nIter * warpsN));
+              nTileIdx = mlir::arith::AddIOp::create(rewriter, loc, warpN,
+                                                     c.getResult()).getResult();
+            }
+            mlir::Value colOff =
+                mlir::arith::MulIOp::create(rewriter, loc, nTileIdx,
+                                            eight.getResult()).getResult();
+            mlir::Value bTileCol = toUi32(
+                mlir::arith::AddIOp::create(rewriter, loc, colOrigI32, colOff)
+                    .getResult());
+            mlir::Value locCol = toUi32(colOff);
+            // K-reduction carrying an 8x8 simdgroup accumulator.
+            mlir::Value accZero =
+                SimdgroupMatrixZeroOp::create(rewriter, loc, matTy).getResult();
+            auto kZero = mlir::arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(0));
+            auto kStep = mlir::arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(8));
+            auto kLoop = mlir::scf::ForOp::create(rewriter, loc, kZero.getResult(),
+                                                  strideAI, kStep.getResult(),
+                                                  mlir::ValueRange{accZero});
+            {
+              mlir::OpBuilder::InsertionGuard g3(rewriter);
+              rewriter.setInsertionPointToStart(kLoop.getBody());
+              mlir::Value kUi = toUi32(kLoop.getInductionVar());
+              mlir::Value acc = kLoop.getRegionIterArgs()[0];
+              mlir::Value widx = (numWarps > 1) ? mlir::Value(widxStore[0])
+                                                : mlir::Value();
+              // A[aTileRow, k]: masked to (realM rows, realK cols).
+              mlir::Value aTile =
+                  emitStagedLoad(rewriter, loc, matTy, adaptor.getABuf(),
+                                 aTileRow, kUi, strideAui, /*transposed=*/false,
+                                 extentM, strideAui, widx);
+              // B[k, bTileCol]: masked to (realK rows, realN cols).
+              mlir::Value bTile =
+                  emitStagedLoad(rewriter, loc, matTy, adaptor.getBBuf(), kUi,
+                                 bTileCol, strideBui, /*transposed=*/false,
+                                 strideAui, extentN, widx);
+              mlir::Value newAcc =
+                  SimdgroupMultiplyAccumulateOp::create(rewriter, loc, matTy, acc,
+                                                        aTile, bTile)
+                      .getResult();
+              mlir::scf::YieldOp::create(rewriter, loc,
+                                         mlir::ValueRange{newAcc});
+            }
+            // Store the tile into scratch at LOCAL (tile_m*8, tile_n*8), stride N.
+            mlir::Value scratchStride = ConstantOp::create(
+                rewriter, loc, rewriter.getIntegerAttr(ui32, N)).getResult();
+            SimdgroupStoreOp::create(rewriter, loc, kLoop.getResult(0), scratch,
+                                     locRow, locCol, scratchStride,
+                                     llvm::SmallVector<mlir::Value, 2>{});
+          }
+        }
+        BarrierOp::create(rewriter, loc);
+      }
+      // Every thread reloads its output element from scratch.
+      mlir::Value result =
+          TgLoadIndexedOp::create(rewriter, loc, elemTy, scratch, linUi32)
+              .getResult();
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+    // ---- scalar fallback path ----------------------------------------------
+    mlir::Value linI32 = toI32(linUi32);
+    auto cN = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(
+                           static_cast<int32_t>(resTy.getShape()[1])));
+    mlir::Value linRow =
+        mlir::arith::DivSIOp::create(rewriter, loc, linI32, cN.getResult())
+            .getResult();
+    mlir::Value linCol =
+        mlir::arith::RemSIOp::create(rewriter, loc, linI32, cN.getResult())
+            .getResult();
+    mlir::Value gRow = mlir::arith::AddIOp::create(
+                           rewriter, loc, toI32(adaptor.getRowOrigin()), linRow)
+                           .getResult();
+    mlir::Value gCol = mlir::arith::AddIOp::create(
+                           rewriter, loc, toI32(adaptor.getColOrigin()), linCol)
+                           .getResult();
+    mlir::Value strideAI32 = toI32(adaptor.getStrideA());
+    mlir::Value strideBI32 = toI32(adaptor.getStrideB());
+    mlir::Value cInit = adaptor.getCInit();
+
+    // Device element types of A/B (may be f16/bf16); each read is extf'd to f32.
+    auto aMemTy = mlir::dyn_cast<MetalMemRefType>(adaptor.getABuf().getType());
+    auto bMemTy = mlir::dyn_cast<MetalMemRefType>(adaptor.getBBuf().getType());
+    if (!aMemTy || !bMemTy)
+      return rewriter.notifyMatchFailure(op, "scalar_dot: non-memref A/B buf");
+    mlir::Type aElem = aMemTy.getType();
+    mlir::Type bElem = bMemTy.getType();
+    auto extToF32 = [&](mlir::OpBuilder &b, mlir::Value v,
+                        mlir::Type ty) -> mlir::Value {
+      if (ty == elemTy) return v;
+      return mlir::arith::ExtFOp::create(b, loc, elemTy, v).getResult();
+    };
+
+    // The reduction, emitted as an scf.for over [0, stride_a).
+    auto emitReduce = [&](mlir::OpBuilder &b) -> mlir::Value {
+      auto lb = mlir::arith::ConstantOp::create(b, loc,
+                                                b.getI32IntegerAttr(0));
+      auto step = mlir::arith::ConstantOp::create(b, loc,
+                                                  b.getI32IntegerAttr(1));
+      auto kLoop = mlir::scf::ForOp::create(
+          b, loc, lb.getResult(), strideAI32, step.getResult(),
+          mlir::ValueRange{cInit});
+      {
+        mlir::OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(kLoop.getBody());
+        mlir::Value k = kLoop.getInductionVar();
+        mlir::Value acc = kLoop.getRegionIterArgs()[0];
+        // aIdx = gRow*stride_a + k ; bIdx = k*stride_b + gCol
+        mlir::Value aIdx =
+            mlir::arith::AddIOp::create(
+                b, loc,
+                mlir::arith::MulIOp::create(b, loc, gRow, strideAI32)
+                    .getResult(),
+                k)
+                .getResult();
+        mlir::Value bIdx =
+            mlir::arith::AddIOp::create(
+                b, loc,
+                mlir::arith::MulIOp::create(b, loc, k, strideBI32).getResult(),
+                gCol)
+                .getResult();
+        auto aVal = GetElementOp::create(b, loc, aElem, adaptor.getABuf(),
+                                         toUi32(aIdx));
+        auto bVal = GetElementOp::create(b, loc, bElem, adaptor.getBBuf(),
+                                         toUi32(bIdx));
+        mlir::Value aF = extToF32(b, aVal.getResult(), aElem);
+        mlir::Value bF = extToF32(b, bVal.getResult(), bElem);
+        auto prod = mlir::arith::MulFOp::create(b, loc, aF, bF);
+        auto newAcc = mlir::arith::AddFOp::create(b, loc, acc,
+                                                  prod.getResult());
+        mlir::scf::YieldOp::create(b, loc,
+                                   mlir::ValueRange{newAcc.getResult()});
+      }
+      return kLoop.getResult(0);
+    };
+
+    mlir::Value result;
+    if (adaptor.getPartialExtents().size() == 2) {
+      // Tail-tile guard: only reduce when (gRow < M && gCol < N); otherwise the
+      // element is discarded by the epilogue's masked store, so yield c_init.
+      mlir::Value mExt = toI32(adaptor.getPartialExtents()[0]);
+      mlir::Value nExt = toI32(adaptor.getPartialExtents()[1]);
+      auto rowOk = mlir::arith::CmpIOp::create(
+          rewriter, loc, mlir::arith::CmpIPredicate::slt, gRow, mExt);
+      auto colOk = mlir::arith::CmpIOp::create(
+          rewriter, loc, mlir::arith::CmpIPredicate::slt, gCol, nExt);
+      auto cond = mlir::arith::AndIOp::create(rewriter, loc, rowOk.getResult(),
+                                              colOk.getResult());
+      auto scfIf = mlir::scf::IfOp::create(
+          rewriter, loc, mlir::TypeRange{elemTy}, cond.getResult(),
+          /*addThenBlock=*/true, /*addElseBlock=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPointToStart(&scfIf.getThenRegion().front());
+        mlir::scf::YieldOp::create(rewriter, loc,
+                                   mlir::ValueRange{emitReduce(rewriter)});
+      }
+      {
+        mlir::OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPointToStart(&scfIf.getElseRegion().front());
+        mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{cInit});
+      }
+      result = scfIf.getResult(0);
+    } else {
+      result = emitReduce(rewriter);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
 static void rewriteSingleDot(mlir::triton::DotOp dot) {
   // Matmul track session 4c-3: try canonical 3-iter_arg unroll first
   // (real Triton matmul shape with a_ptrs/b_ptrs/acc iter_args).
@@ -10016,6 +10743,10 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (mlir::succeeded(tryRuntimeKLoopRecomputeDot(dot))) return;
   // Session 4: try 1-iter_arg K-loop unroll.
   if (mlir::succeeded(tryUnrollKLoopDot(dot))) return;
+
+  // NOTE: standalone multi-tile dots with a general epilogue are handled
+  // earlier by `preprocessScalarDots` (before the convert_layout legality
+  // walk), so they never reach here.
 
   // Single-iter path. The dot's static result is always 8x8 (BLOCK = 8);
   // the partial-tile signal comes from a masked `tt.store` below.
@@ -11196,6 +11927,14 @@ struct ConvertTritonGPUToMetalPass
     // `.omc/specs/deep-interview-l1d3-matmul-convert-layout-preempt.md`.
     preprocessDotCvtChains(moduleOp);
 
+    // Scalar-GEMM correctness fallback: rewrite standalone / single-loop f32
+    // dots with a general (alpha*out + beta*C) epilogue to `metal.scalar_dot`
+    // BEFORE the convert_layout legality walk, so their out-of-envelope
+    // operand (`#blocked -> #dot_op`) and result (`#blocked1 -> #blocked`,
+    // sizePerThread > 1) cvts are gone before the classifier runs. See
+    // `tryScalarDotFallback` / `tryScalarDotLoopFallback` / `ScalarDotLowering`.
+    preprocessScalarDots(moduleOp);
+
     // Collapse blocked↔blocked convert_layout ops whose source is a
     // self-contained gather cone — rank-1 (mixed pointer alignment) and rank-2
     // (masked transpose, sizePerThread>1) alike — by rewriting each cvt's
@@ -11599,6 +12338,10 @@ struct ConvertTritonGPUToMetalPass
     // tensor<->scalar`, and the MSL emitter hits `llvm_unreachable` (see
     // ModuleTranslation::translateValue Default).
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // `metal.scalar_dot` (the GEMM correctness fallback) is a transient op that
+    // MUST be lowered to a per-thread scalar reduction; mark it illegal so
+    // `ScalarDotLowering` fires despite the Metal dialect being legal above.
+    target.addIllegalOp<ScalarDotOp>();
 
     mlir::RewritePatternSet patterns(ctx);
     patterns.add<FuncOpLowering, ReturnOpLowering, GetProgramIdLowering,
@@ -11626,6 +12369,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithIntCastLowering<mlir::arith::ExtUIOp>,
                  ArithIntCastLowering<mlir::arith::ExtSIOp>,
                  ArithIntCastLowering<mlir::arith::TruncIOp>,
+                 ScalarDotLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathLogLowering, MathRsqrtLowering>(
