@@ -10324,11 +10324,21 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
 }
 
 // Loop variant: a single-dot recompute K-loop (K > TILE, iters > 1) whose
-// accumulator result feeds the SAME `cvt -> alpha/beta epilogue`. The whole
-// reduction (all iters * TILE) collapses to one scalar_dot over [0, stride_a),
-// replacing the loop. Defers a bare `dot -> tt.store` loop to the existing
-// SIMD-group recompute matcher (`tryRuntimeKLoopRecomputeDot`).
-static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp) {
+// accumulator result feeds either a `cvt -> alpha/beta epilogue` or (when
+// `allowStoreConsumer`) a bare `tt.store`. The whole reduction (all iters *
+// TILE) collapses to one scalar_dot over [0, stride_a), replacing the loop.
+//
+// Tier ordering: the EARLY pass (`preprocessScalarDots`, pre-legality-walk)
+// runs with `allowStoreConsumer=false`, so a bare `dot -> tt.store` loop is
+// deferred to the fast SIMD-group matchers (`tryRuntimeKLoopRecomputeDot` et
+// al.) that run later. The LATE finalizer (`finalizeScalarDots`, post-Tier-1)
+// runs with `allowStoreConsumer=true` and claims every bare-store loop those
+// matchers left standing — the total correctness fallback (e.g. the static-
+// bound, tile-index-addressed, 64x64 masked loop in
+// leet-triton/medium-matrix_power.py, which no SIMD matcher accepts).
+static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
+                                                    bool allowStoreConsumer =
+                                                        false) {
   llvm::SmallVector<mlir::triton::DotOp> dots;
   forOp.getBodyRegion().walk([&](mlir::triton::DotOp d) { dots.push_back(d); });
   if (dots.size() != 1) return mlir::failure();
@@ -10370,7 +10380,8 @@ static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp) {
   mlir::RankedTensorType resultTensorTy;
   sdDetectResultCvt(loopRes, loopResTy, resCvt, replaceTarget, resultTensorTy);
   mlir::Value afterRes = resCvt ? resCvt.getResult() : loopRes;
-  if (llvm::any_of(afterRes.getUsers(), [](mlir::Operation *u) {
+  if (!allowStoreConsumer &&
+      llvm::any_of(afterRes.getUsers(), [](mlir::Operation *u) {
         return mlir::isa<mlir::triton::StoreOp>(u);
       }))
     return mlir::failure();
@@ -10399,6 +10410,26 @@ static void preprocessScalarDots(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
   for (auto f : loops) (void)tryScalarDotLoopFallback(f);
+}
+
+// Total correctness fallback (Tier 2), run AFTER the fast SIMD-group matchers
+// (`preprocessDotChains` / `rewriteSingleDot`) have taken every dot they can.
+// Any single-accumulator K-loop dot still standing — a bare `dot -> tt.store`
+// loop that no SIMD matcher accepted (e.g. the static-bound, tile-index,
+// masked 64x64 reduction in leet-triton/medium-matrix_power.py) — collapses to
+// `metal.scalar_dot`. This closes the tier gap where the early
+// `preprocessScalarDots` pass abstains (deferring bare-store loops to Tier 1)
+// but Tier 1 then rejects the shape, leaving the `tt.dot` to fail legalization.
+//
+// Safe to create scalar_dot this late: a dot surviving here has had its
+// operand `#blocked -> #dot_op` cvts rewired off by `preprocessDotCvtChains`
+// and carries no epilogue result cvt (epilogue dots were claimed early), so no
+// out-of-envelope cvt survives into the (already-run) legality walk.
+static void finalizeScalarDots(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  moduleOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
+  for (auto f : loops)
+    (void)tryScalarDotLoopFallback(f, /*allowStoreConsumer=*/true);
 }
 
 // Lowers `metal.scalar_dot` (created by `tryScalarDotFallback`) to a per-thread
@@ -12265,6 +12296,15 @@ struct ConvertTritonGPUToMetalPass
         }
       }
     }
+
+    // Tier-2 total correctness fallback for dots: after the fast SIMD-group
+    // matchers (preprocessDotChains above) have claimed every dot they can,
+    // collapse any single-accumulator K-loop dot still standing to
+    // `metal.scalar_dot`. Runs BEFORE the masked-store sentinel pass below so
+    // the emitted scalar_dot store gets the same downstream treatment as the
+    // early-pass scalar_dots. Closes the tier gap (bare-store loops the SIMD
+    // matchers reject, e.g. leet-triton/medium-matrix_power.py).
+    finalizeScalarDots(moduleOp);
 
     // L1d2c Phase B pre-conversion sentinel emission. For every tt.func with
     // a masked tt.store, hoist one `metal.threadgroup_alloca<tpb × T>` per
