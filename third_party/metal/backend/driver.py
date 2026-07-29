@@ -87,7 +87,7 @@ class _MPSFlooredEvent:
     """do_bench timing Event for the MPS path: a thin, robust wrapper over
     torch.mps.Event(enable_timing=True).
 
-    Two adaptations vs. raw torch.mps.Event:
+    Three adaptations vs. raw torch.mps.Event:
       * elapsed_time() is floored to _MPS_ELAPSED_TIME_FLOOR_MS. For the tiny,
         latency-bound kernels the Metal backend runs, GPU time is sub-µs; an
         unfloored estimate makes do_bench's n_repeat = rep/estimate_ms explode
@@ -98,6 +98,27 @@ class _MPSFlooredEvent:
         them out of order) — observed nondeterministically even at small repeat
         counts. Such a span is below the floor anyway, so we report the floor
         instead of crashing the whole benchmark.
+      * BOTH synchronize() and elapsed_time() force a DEVICE-WIDE
+        torch.mps.synchronize() rather than the per-event
+        torch.mps.Event.synchronize().
+
+    That last one is a deadlock guard, not a nicety. On torch 2.10.0 a
+    per-event `synchronize()` does NOT leave the event queryable, and the
+    following `elapsed_time()` then blocks forever inside
+    `at::mps::MPSEventPool::elapsedTime`'s condition_variable — and it blocks
+    while HOLDING THE GIL, so every Python thread in the process freezes with
+    it. pytest-timeout, faulthandler and signal.alarm are all powerless; only an
+    external SIGKILL clears it. Measured: `record(); record(); ev.synchronize()
+    x2; elapsed_time()` hangs, and so does the same sequence with real GPU work
+    between the records — the discriminator is the sync flavour, not whether
+    work was submitted. Swapping in a device-wide sync returns a normal value
+    (a sub-floor 0.078 ms for the empty span). Note the deadlock is directional:
+    torch *raises* the RuntimeError above for the reversed operand order but
+    hangs for the forward one, which is why the `except` alone never saved us.
+
+    A device sync in elapsed_time() is nearly free where it matters: do_bench
+    already calls `di.synchronize()` before reading its timestamps, so the syncs
+    inside the `times = [s.elapsed_time(e) ...]` loop are no-ops.
     """
 
     __slots__ = ("_ev",)
@@ -110,9 +131,15 @@ class _MPSFlooredEvent:
         self._ev.record()
 
     def synchronize(self):
-        self._ev.synchronize()
+        import torch
+        # Device-wide, NOT self._ev.synchronize() — see the class docstring.
+        torch.mps.synchronize()
 
     def elapsed_time(self, other) -> float:
+        import torch
+        # Unconditional: a caller that never synchronized (or synchronized only
+        # per-event) would otherwise wedge the whole process, unkillably.
+        torch.mps.synchronize()
         try:
             ms = self._ev.elapsed_time(other._ev)
         except RuntimeError:

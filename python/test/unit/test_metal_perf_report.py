@@ -35,6 +35,12 @@ def test_mps_floored_event_clamps_tiny_span_to_floor():
     # Back-to-back record() with no GPU work between yields a sub-floor (or
     # unorderable) span; elapsed_time must report at least the floor so
     # do_bench's n_repeat = rep/estimate_ms doesn't explode.
+    #
+    # NOTE: this exact sequence used to DEADLOCK (torch 2.10.0) — a per-event
+    # synchronize() leaves the event unqueryable and elapsed_time() then blocks
+    # forever holding the GIL. _MPSFlooredEvent now forces a device-wide sync.
+    # This test only passes/hangs, it cannot fail cleanly, so the fast-failing
+    # guard below is the real regression fence.
     a = _MPSFlooredEvent(enable_timing=True)
     b = _MPSFlooredEvent(enable_timing=True)
     a.record()
@@ -42,6 +48,47 @@ def test_mps_floored_event_clamps_tiny_span_to_floor():
     a.synchronize()
     b.synchronize()
     assert a.elapsed_time(b) >= _MPS_ELAPSED_TIME_FLOOR_MS
+
+
+def test_mps_floored_event_forces_device_wide_sync(monkeypatch):
+    """Fast-failing fence for the deadlock the test above can only hang on.
+
+    torch 2.10.0's `at::mps::MPSEventPool::elapsedTime` blocks on a condition
+    variable forever unless a DEVICE-WIDE `torch.mps.synchronize()` has run —
+    the per-event `torch.mps.Event.synchronize()` is not enough, with or without
+    real GPU work between the two `record()`s. It blocks while holding the GIL,
+    so pytest-timeout / faulthandler / signal.alarm cannot break in: a
+    regression wedges the whole run and only an external SIGKILL clears it.
+
+    So assert the device-wide sync directly, with a spy that still delegates to
+    the real one. Both calls below are made safe first by an unspied real sync,
+    which is what lets a regression FAIL here instead of hanging.
+    """
+    import torch
+
+    real_sync = torch.mps.synchronize
+    calls = []
+
+    def spy():
+        calls.append(1)
+        real_sync()
+
+    a = _MPSFlooredEvent(enable_timing=True)
+    b = _MPSFlooredEvent(enable_timing=True)
+    a.record()
+    b.record()
+    real_sync()  # makes the elapsed_time() below safe even if the fix regressed
+
+    monkeypatch.setattr(torch.mps, "synchronize", spy)
+
+    a.synchronize()
+    assert calls, ("_MPSFlooredEvent.synchronize() must call the device-wide "
+                   "torch.mps.synchronize(), not torch.mps.Event.synchronize()")
+
+    calls.clear()
+    a.elapsed_time(b)
+    assert calls, ("_MPSFlooredEvent.elapsed_time() must force a device-wide "
+                   "torch.mps.synchronize() before reading timestamps")
 
 
 def test_mps_floored_event_swallows_runtime_error():
