@@ -1159,7 +1159,15 @@ struct SplatLowering
 // ReduceLowering reads its result out of rowBuf under the DESTINATION layout's
 // indexing already, so bridging it with an identity cvt is correct — that is
 // the case the identity rule was written for.
-static bool sliceConeHasLayoutDependentLeaf(mlir::Value root) {
+//
+// `follow` decides which values stay in the cone. Two callers:
+//   * slice -> blocked: follow every slice-encoded value (below).
+//   * blocked -> slice: follow the SOURCE blocked encoding. Same hazard,
+//     mirrored — a rank-1 `#blocked` make_range/load hands thread t element t,
+//     while the slice destination wants the parent tile's projection of t.
+static bool
+coneHasLayoutDependentLeaf(mlir::Value root,
+                           llvm::function_ref<bool(mlir::Attribute)> follow) {
   llvm::SmallVector<mlir::Value, 16> wl{root};
   llvm::SmallPtrSet<mlir::Value, 16> seen;
   while (!wl.empty()) {
@@ -1167,8 +1175,7 @@ static bool sliceConeHasLayoutDependentLeaf(mlir::Value root) {
     if (!seen.insert(v).second)
       continue;
     auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
-    if (!rt || !mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
-                   rt.getEncoding()))
+    if (!rt || !rt.getEncoding() || !follow(rt.getEncoding()))
       continue;
     auto *def = v.getDefiningOp();
     if (!def)
@@ -1204,8 +1211,32 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
             srcRtt.getEncoding()) &&
         mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
             dstRtt.getEncoding()) &&
-        sliceConeHasLayoutDependentLeaf(op.getSrc()))
+        coneHasLayoutDependentLeaf(
+            op.getSrc(), [](mlir::Attribute e) {
+              return mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(e);
+            }))
       return false;
+    // Mirror direction: a rank-1 `#blocked` cone bridged INTO a 2D tile
+    // (`cvt #blockedRank1 -> slice<dim, parent=#blockedRank2>`). Under
+    // #blockedRank1 thread t holds element t; under the slice it must hold the
+    // parent tile's projection of the per-(thread, tile-iv) flat index
+    // (`flat % BLOCK_N` for dim=0). Passing this through as a scalar identity
+    // leaves the tile's column index a raw lane id — no `% BLOCK_N`, no tile-
+    // loop `iv * T` term — so every thread with `lane >= N` masks itself off
+    // and only the first row of each tile-loop iteration is ever stored. That
+    // is a silent wrong answer, not a crash, so refuse it here;
+    // `normalizeBlockedDivergentCvt` re-encodes the cone in the common case and
+    // this only fires when it bailed.
+    if (mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            srcRtt.getEncoding()) &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            dstRtt.getEncoding())) {
+      auto srcEnc = srcRtt.getEncoding();
+      if (coneHasLayoutDependentLeaf(
+              op.getSrc(),
+              [&](mlir::Attribute e) { return e == srcEnc; }))
+        return false;
+    }
     return true;
   }
   auto srcB = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
@@ -11191,8 +11222,7 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
       srcRtt.getElementType() != dstRtt.getElementType())
     return false;
   mlir::Attribute srcEnc = srcRtt.getEncoding();
-  auto dstEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
-      dstRtt.getEncoding());
+  mlir::Attribute dstEnc = dstRtt.getEncoding();
   if (!dstEnc || !srcEnc || srcEnc == dstEnc)
     return false;
   // src is either a blocked layout (the original rank-2 transpose / rank-1
@@ -11201,6 +11231,32 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   if (!mlir::isa<mlir::triton::gpu::BlockedEncodingAttr,
                  mlir::triton::gpu::SliceEncodingAttr>(srcEnc))
     return false;
+  // dst is normally a blocked layout. The one slice-typed destination we take
+  // is the MIRROR of the "rank-1 value that also feeds a 2D tile" case above:
+  // a rank-1 #blocked cone bridged INTO a 2D tile by
+  // `cvt #blockedRank1 -> slice<dim, parent=#blockedRank2>` (what the frontend
+  // emits for `x[None, :]` when `x` also has rank-1 uses, or simply whenever
+  // the tile did not vectorize — a runtime dim without `tt.divisibility = 16`
+  // gets sizePerThread=[1,1] and a separate rank-1 layout for the range).
+  //
+  // Those two layouts disagree about which element a thread holds — under
+  // #blockedRank1 thread t holds element t, under slice<dim,parent> it holds
+  // the parent tile's projection (`flat % N` for dim=0) — so the cvt is a real
+  // relabel and the cone must be re-encoded. Treating it as a scalar identity
+  // (what `isScalarIdentityConvert` did before the guard below) leaves the
+  // column index as a raw lane id: no `% BLOCK_N`, no tile-loop `iv * T` term.
+  if (!mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(dstEnc)) {
+    auto dstSlice =
+        mlir::dyn_cast<mlir::triton::gpu::SliceEncodingAttr>(dstEnc);
+    if (!dstSlice || !mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(srcEnc))
+      return false;
+    // Only a rank-1 -> rank-2-tile-axis bridge. A doubly-nested slice (the 3D
+    // index-cone path) has a slice parent and is left to its own lowering.
+    auto dstParent = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(dstSlice.getParent());
+    if (!dstParent || dstParent.getOrder().size() != 2 || srcRtt.getRank() != 1)
+      return false;
+  }
 
   // Collect the backward cone of src-encoded values feeding the cvt source:
   // the src encoding plus, when src is blocked, any slice<parent=srcEnc> (a
@@ -11268,8 +11324,14 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
   // clonable normalizes cones that are supposed to be rejected (the
   // convert_layout_reject_nontrivial / staged_transpose fixtures pin exactly
   // that boundary).
-  const bool srcIsSlice =
-      mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(srcEnc);
+  //
+  // The blocked->slice bridge admitted above is the same rank-1/2D-tile split,
+  // just pointing the other way, so it gets the same allowance: `offs_d` feeds
+  // the rank-1 `bias_ptr + offs_d` load AND the tile's column index, and no one
+  // encoding serves both.
+  const bool sliceBridge =
+      mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(srcEnc) ||
+      mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(dstEnc);
   for (size_t i = 0; i < ordered.size(); ++i) {
     mlir::Value v = ordered[i];
     if (!usedExternally(v))
@@ -11283,7 +11345,7 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
     bool cloneable =
         def && (mlir::isa<mlir::triton::SplatOp, mlir::triton::MakeRangeOp,
                           mlir::arith::ConstantOp>(def) ||
-                (srcIsSlice && def->getNumResults() == 1 &&
+                (sliceBridge && def->getNumResults() == 1 &&
                  def->getNumRegions() == 0 &&
                  (mlir::isMemoryEffectFree(def) ||
                   mlir::isa<mlir::triton::LoadOp>(def))));
@@ -11348,7 +11410,27 @@ static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> cvts;
   moduleOp.walk(
       [&](mlir::triton::gpu::ConvertLayoutOp cvt) { cvts.push_back(cvt); });
-  for (auto cvt : cvts)
+  // REVERSE order — consumers before producers. A rank-1 range reaching a 2D
+  // tile arrives as a CHAIN when the tile did not vectorize:
+  //     cvt #blockedRank1 -> slice<dim, parent=Pmid>     (inner)
+  //     expand_dims                    -> 1xN, Pmid
+  //     cvt Pmid -> Pfinal                               (outer)
+  // Taking the outer one first collapses `Pmid` into `Pfinal` while its cone is
+  // still just {expand_dims, inner-cvt result} — two values whose only users
+  // are each other — so nothing needs cloning. The inner cvt is then a direct
+  // `#blockedRank1 -> slice<dim, parent=Pfinal>` bridge and re-encodes the
+  // range against the layout the store actually uses.
+  //
+  // Forward order gets the same answer only when the rank-1 cone happens to be
+  // clonable: the inner pass first drags the whole cone (make_range, addptr,
+  // tt.load) into `Pmid`, and the outer pass then has to re-clone whatever of
+  // it is shared — but the outer pass is blocked->blocked, where cloning is
+  // deliberately restricted to leaves, so any shared index arithmetic (e.g.
+  // `weight_ptr + offs_d * K + k`, CSE'd across an unrolled `tl.static_range`)
+  // makes it bail. It then leaves `Pmid` in place, and `Pmid`'s order ([0,1] vs
+  // the store's [1,0]) flips MakeRangeLowering's div/rem: the column index
+  // comes out as `flat / BLOCK_N` instead of `flat % BLOCK_N`.
+  for (auto cvt : llvm::reverse(cvts))
     normalizeBlockedDivergentCvt(cvt);
 }
 
