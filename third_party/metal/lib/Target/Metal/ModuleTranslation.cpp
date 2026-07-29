@@ -1883,7 +1883,12 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   // online softmax (one query row per lane)
   os << "    if (_fa_active) {\n";
   os << "      uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
-  os << "      if (row < _fa_N) {\n";
+  // `q` runs over all 32 lanes but every per-row buffer below is sized by BM
+  // (_fa_rmax/_fa_rsum: BM floats; _fa_pbuf: BM*BN; _fa_obuf: BM*BD). BM == 32
+  // happens to be in bounds; BM < 32 writes past the end of every one of them.
+  // Guard on `q < BM` FIRST — `row < _fa_N` does not imply it. The Q-load /
+  // rmax-init block above is already lane-guarded; this mirrors it.
+  os << "      if (q < " << S(BM) << "u && row < _fa_N) {\n";
   os << "        float m_cur = -INFINITY;\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk)\n";
   os << "          if (kb + kk < _fa_N) m_cur = max(m_cur, _fa_sbuf[q*" << S(BN) << "u + kk] * _fa_scale);\n";
@@ -1898,7 +1903,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
   os << "        _fa_rmax[q] = m_new;\n";
   os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*" << S(BD) << "u + d] *= scaler;\n";
-  os << "      } else {\n";
+  os << "      } else if (q < " << S(BM) << "u) {\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*" << S(BN) << "u + kk] = 0.0f;\n";
   os << "      }\n";
   os << "    }\n";
@@ -1924,7 +1929,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   // epilogue: O = obuf / run_sum, masked store
   os << "  if (_fa_active) {\n";
   os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
-  os << "    if (row < _fa_N) {\n";
+  os << "    if (q < " << S(BM) << "u && row < _fa_N) {\n"; // see BM<32 note above
   os << "      float denom = _fa_rsum[q];\n";
   os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
   os << "      for (uint d = 0; d < _fa_dhead; ++d)\n";  // d_head <= BD; skip padded cols

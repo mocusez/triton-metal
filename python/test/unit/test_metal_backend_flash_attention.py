@@ -120,3 +120,40 @@ def test_flash_attention_online_softmax(N, d_model, h):
 
     expected = _reference(Q, K, V, N, d_model, h)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "N, d_model, h",
+    [
+        (64, 64, 4),   # block-aligned
+        (48, 64, 4),   # masked tail
+        (33, 64, 4),   # ragged
+        (96, 96, 3),   # d_head=32 > BLOCKSIZE_N
+    ],
+)
+def test_flash_attention_block16_lane_guard(N, d_model, h):
+    """BLOCKSIZE_N == 16, i.e. bm < 32 — the FA emitter's per-row buffers.
+
+    The emitter runs the online-softmax stage on one warp with `q = _fa_lane`
+    ranging over all 32 lanes, but `_fa_rmax`/`_fa_rsum` hold bm floats,
+    `_fa_pbuf` bm*bn and `_fa_obuf` bm*bd. At bm == 32 that is exactly in
+    bounds, which is why the bm == 32 cases above never caught it; at bm == 16
+    lanes 16..31 write past the end of every one of them (both the `row < N`
+    arm and its pbuf-zeroing else arm). Measured before the `q < bm` guard:
+    maxerr 1.7e+04 on (64, 64, 4). See metal-sliding-window-attention-plan.md
+    §1c — the sliding-window driver uses BLOCK_M = 16, so this had to be fixed
+    before that kernel could work regardless of the matcher gates.
+    """
+    torch.manual_seed(0xB16 + N * 7 + d_model + h)
+    Q = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(N, d_model, dtype=torch.float32, device="mps").contiguous()
+
+    BLOCKSIZE_N = 16
+    BLOCKSIZE_d = max(16, d_model // h)
+    grid = (triton.cdiv(N, BLOCKSIZE_N), h)
+    mha_kernel[grid](Q, K, V, out, N, d_model, h, BLOCKSIZE_N, BLOCKSIZE_d, num_warps=4)
+
+    expected = _reference(Q, K, V, N, d_model, h)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
