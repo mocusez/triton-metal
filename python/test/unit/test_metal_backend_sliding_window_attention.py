@@ -136,7 +136,11 @@ def _reference(Q, K, V, M, d, window_size):
         (48, 32, 16),   # d == BLOCK_D, no column padding
         (32, 12, 4),    # d < BLOCK_D (=16) -> padded-column masking
         (64, 16, 0),    # diagonal only; denom == 1 for every row
-        (64, 16, 2),    # smallest band that comes through as a real argument
+        (64, 16, 1),    # tridiagonal. Triton drops an argument equal to 1 from
+                        # the kernel signature and folds it into a `dense<1>`
+                        # constant, so this band width arrives as the op's
+                        # `window_const` attribute, not as a buffer operand.
+        (64, 16, 2),    # the smallest band that still comes through as an arg
         (32, 16, 64),   # window >= N -> degenerates to full attention
         (128, 16, 3),   # window < BLOCK_N -> whole key blocks fall outside the
                         # band, so the running max stays -inf across them. This

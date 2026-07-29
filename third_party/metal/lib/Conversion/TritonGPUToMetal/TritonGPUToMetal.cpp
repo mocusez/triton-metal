@@ -11467,6 +11467,12 @@ struct FaTemplate {
   mlir::Value dHeadVal;  // feature width (divsi result, or == dModelVal)
   mlir::Value hVal;      // head count, null when there is no head split
   mlir::Value windowVal; // band half-width, null for full attention
+  // Triton drops a kernel argument equal to 1 from the signature altogether and
+  // folds it into a `dense<1>` constant, so a band of width 1 has no buffer to
+  // point at. It travels as an attribute on the op instead.
+  int64_t windowConst = 0;
+  bool hasWindowConst = false;
+  mlir::Value windowKey; // SSA identity of the band width, for mask-set compares
   bool hasHeadSplit = false;
   bool loopFormB = false; // `for s in range(cdiv(N,BN))` rather than `range(0,N,BN)`
   int accIdx = -1, sumIdx = -1, maxIdx = -1;
@@ -11511,6 +11517,28 @@ struct FaTemplate {
       break;
     }
     return v;
+  }
+
+  // The right-hand side of a bounds/band comparison: the splat of a runtime
+  // scalar, OR a splat constant. Triton folds an argument equal to 1 out of the
+  // kernel signature entirely and materializes it as `dense<1>`, so a band of
+  // width 1 never reaches us as a buffer. The returned value is only an
+  // IDENTITY for comparing mask sets; callers resolve it to an operand or an
+  // attribute afterwards.
+  mlir::Value boundOf(mlir::Value v) {
+    mlir::Value p = peel(v);
+    if (auto sp = p.getDefiningOp<mlir::triton::SplatOp>()) {
+      mark(sp);
+      return sp.getSrc();
+    }
+    auto cst = p.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!cst)
+      return {};
+    auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return {};
+    mark(cst);
+    return cst.getResult();
   }
 
   // Splat source after peeling, or null.
@@ -11684,16 +11712,16 @@ struct FaTemplate {
       if (classifyIdx(sub.getLhs()) != Idx::Row ||
           classifyIdx(sub.getRhs()) != Idx::Key)
         return false;
-      mlir::Value w = splatSrc(cmp.getRhs());
+      mlir::Value w = boundOf(cmp.getRhs());
       if (!w)
         return false;
-      if (windowVal && windowVal != w)
+      if (windowKey && windowKey != w)
         return false; // two different band widths in one kernel
-      windowVal = w;
+      windowKey = w;
       mark(cmp);
       mark(absOp);
       mark(sub);
-      terms.push_back({Idx::Window, w});
+      terms.push_back({Idx::Window, windowKey});
       return true;
     }
     return false;
@@ -12182,14 +12210,33 @@ bool FaTemplate::verify() {
 
   // --- the effective softmax mask the emitter implements.
   llvm::SmallVector<Term, 4> want{{Idx::Row, mVal}, {Idx::Key, nVal}};
-  if (windowVal)
-    want.push_back({Idx::Window, windowVal});
+  if (windowKey)
+    want.push_back({Idx::Window, windowKey});
   if (!setEq(pMask, want))
     return no("softmax numerator mask is not exactly the bounds (and band) mask");
   if (!isSubsetOf(maxMask, want))
     return no("running-max mask is not a subset of the softmax mask");
-  if (!isKernelArg(windowVal) && windowVal)
-    return no("band width is not a kernel argument");
+
+  // Resolve the band width to either an operand (a kernel scalar) or an
+  // attribute (a folded constant, which is how `window_size = 1` arrives).
+  if (windowKey) {
+    if (isKernelArg(windowKey)) {
+      windowVal = windowKey;
+    } else if (auto c = windowKey.getDefiningOp<mlir::arith::ConstantOp>()) {
+      auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue());
+      if (!dense || !dense.isSplat())
+        return no("band width constant is not a splat integer");
+      windowConst = dense.getSplatValue<llvm::APInt>().getSExtValue();
+      // A negative band selects no keys at all, so every row's denominator is
+      // 0. The emitter writes 0 there; the source kernel computes 0/0 = NaN.
+      // Refuse rather than quietly disagree.
+      if (windowConst < 0)
+        return no("band width is a negative constant");
+      hasWindowConst = true;
+    } else {
+      return no("band width is neither a kernel argument nor a folded constant");
+    }
+  }
 
   // --- addresses: base + major*d_model + head column.
   if (!matchAddress(qLd.getPtr(), Idx::Row, qPtr))
@@ -12446,7 +12493,9 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
           : mlir::Value();
   auto faOp = mlir::triton::metal::FlashAttentionOp::create(
       builder, loc, qBuf, kBuf, vBuf, oBuf, mBuf, nBuf, dmBuf, hBuf, wBuf, BM,
-      BN, BD);
+      BN, BD, /*window_const=*/mlir::IntegerAttr());
+  if (tmpl.hasWindowConst)
+    faOp.setWindowConst(tmpl.windowConst);
 
   // (9) DCE the now-dead loop / epilogue / loads / offset arithmetic in the
   // func entry block: everything except the new FA op + terminator becomes

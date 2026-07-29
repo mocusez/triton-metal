@@ -667,7 +667,11 @@ def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
 
     `window` is OPTIONAL. Present: a sliding-window band mask
     `|row - key| <= window` is applied to both the running max and the softmax
-    numerator, so out-of-band keys contribute nothing. Absent: full attention.
+    numerator, so out-of-band keys contribute nothing. Absent: full attention,
+    UNLESS `window_const` is set — Triton drops a kernel argument equal to 1
+    from the signature and folds it into a `dense<1>` constant, so a band of
+    width 1 has no buffer to point at and arrives as the attribute instead.
+    At most one of the two may be set.
 
     Attributes: bm/bn the query/key block sizes, bd the per-head tile width
     (>= d_head; padded columns are masked by `d < d_head`). bm/bn/bd multiples
@@ -681,7 +685,8 @@ def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
                        Metal_MemRefType:$d_model,
                        Optional<Metal_MemRefType>:$h,
                        Optional<Metal_MemRefType>:$window,
-                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd);
+                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
+                       OptionalAttr<I64Attr>:$window_const);
 
   let assemblyFormat =
       "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_model"

@@ -1842,10 +1842,11 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   // Optional: absent `h` means no head split (d_head == d_model, column offset
   // 0); absent `window` means full attention.
   const bool hasHeads = op.getH() != nullptr;
-  const bool hasWindow = op.getWindow() != nullptr;
+  const bool hasWindow =
+      op.getWindow() != nullptr || op.getWindowConst().has_value();
   const std::string H = hasHeads ? bufName(op.getH()) + "[0]" : std::string();
   const std::string W =
-      hasWindow ? bufName(op.getWindow()) + "[0]" : std::string();
+      op.getWindow() ? bufName(op.getWindow()) + "[0]" : std::string();
   auto S = [](int64_t x) { return std::to_string(x); };
   // Band predicate for a (query row, key) pair. Signed on purpose: the window
   // arrives through a `device uint32_t*` buffer, and comparing the unsigned
@@ -1881,7 +1882,9 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
     os << "  uint _fa_dhead = _fa_dm;\n";
     os << "  uint _fa_coloff = 0u;\n";
   }
-  if (hasWindow)
+  if (op.getWindowConst())
+    os << "  int _fa_win = " << *op.getWindowConst() << ";\n";
+  else if (hasWindow)
     os << "  int _fa_win = (int)" << W << ";\n";
   os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
   os << "  float _fa_scale = 1.0f / sqrt((float)_fa_dhead);\n";

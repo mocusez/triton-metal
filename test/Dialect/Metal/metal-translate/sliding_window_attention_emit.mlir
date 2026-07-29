@@ -16,6 +16,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       metal.flash_attention %q, %k, %v, %o, %m, %n, %dm window %w {bm = 16 : i64, bn = 16 : i64, bd = 16 : i64} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>
       metal.return
     }
+    // Same op with the band width as a FOLDED CONSTANT instead of a buffer:
+    // Triton removes a kernel argument equal to 1 from the signature, so a
+    // tridiagonal band (window_size = 1) has nothing to point at and travels
+    // as the `window_const` attribute. Note there is no v7 in this kernel.
+    metal.kernel swa_const_kernel address_space_device [true, true, true, true, true, true, true] {
+    ^bb0(%q2: !metal.memref<? x f32>, %k2: !metal.memref<? x f32>, %v2: !metal.memref<? x f32>, %o2: !metal.memref<? x f32>, %m2: !metal.memref<? x ui32>, %n2: !metal.memref<? x ui32>, %dm2: !metal.memref<? x ui32>):
+      metal.flash_attention %q2, %k2, %v2, %o2, %m2, %n2, %dm2 {bm = 16 : i64, bn = 16 : i64, bd = 16 : i64, window_const = 1 : i64} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>
+      metal.return
+    }
     metal.module_end
   }
 }
@@ -67,3 +76,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: if (q < 16u && row < _fa_M) {
 // CHECK: v3[row * _fa_dm + _fa_coloff + d] = _fa_obuf[q*16u + d] * inv;
 
+// The folded-constant band: a literal, and the band predicate is still emitted
+// on both softmax passes.
+// CHECK: kernel void swa_const_kernel(
+// CHECK: int _fa_win = 1;
+// CHECK: if (kb + kk < _fa_N && (abs((int)row - (int)(kb + kk)) <= _fa_win)) m_cur = max(m_cur,
+// CHECK: float p = (kb + kk < _fa_N && (abs((int)row - (int)(kb + kk)) <= _fa_win)) ? exp(
