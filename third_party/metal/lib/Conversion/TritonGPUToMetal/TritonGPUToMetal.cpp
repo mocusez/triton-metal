@@ -11451,7 +11451,7 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   if (!qLoad || !kLoad || !vLoad)
     return mlir::failure();
 
-  // (5) unique tt.store + unique arith.divsi (d_head = d_model / h) in the func.
+  // (5) unique tt.store in the func.
   auto funcOp = forOp->getParentOfType<mlir::triton::FuncOp>();
   if (!funcOp)
     return mlir::failure();
@@ -11463,25 +11463,66 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   });
   if (nStore != 1)
     return mlir::failure();
+
+  // (5a) Every value this matcher hands to `bridgePtrToMemref` MUST be a kernel
+  // entry-block argument. The bridge only builds an unrealized cast — it cannot
+  // check the source — and the emitter's buffer lookup has no way to report a
+  // miss, so a non-kernel-arg operand becomes a SILENT wrong answer (it
+  // resolves to buffer 0, i.e. the kernel reads its own Q pointer as the
+  // sequence length).
+  mlir::Block &entryBlk = funcOp.getBody().front();
+  auto isKernelArg = [&entryBlk](mlir::Value v) {
+    auto ba = mlir::dyn_cast_or_null<mlir::BlockArgument>(v);
+    return ba && ba.getOwner() == &entryBlk;
+  };
+
+  // (5b) `d_head = d_model / h`. NOT "the function's unique arith.divsi" — that
+  // proxy also matches `tl.cdiv(N, BLOCK_N)` (whose operands are `N + BN - 1`
+  // and a constant), which is how the sliding-window kernel came to bind
+  // d_model/h to garbage. Pin the divsi to its role instead: both operands
+  // kernel args, AND the result feeding the per-head column offset
+  // `pid1 * d_head`. Require the role match to be unique.
   mlir::arith::DivSIOp dhead;
-  int nDiv = 0;
+  bool ambiguousDhead = false;
   funcOp.walk([&](mlir::arith::DivSIOp d) {
+    if (!isKernelArg(d.getLhs()) || !isKernelArg(d.getRhs()))
+      return;
+    bool feedsColOffset = false;
+    for (auto *user : d.getResult().getUsers()) {
+      auto mul = mlir::dyn_cast<mlir::arith::MulIOp>(user);
+      if (!mul)
+        continue;
+      mlir::Value other =
+          mul.getLhs() == d.getResult() ? mul.getRhs() : mul.getLhs();
+      auto pid = other.getDefiningOp<mlir::triton::GetProgramIdOp>();
+      if (pid && pid.getAxisAsInt() == 1) { // grid dim y selects the head
+        feedsColOffset = true;
+        break;
+      }
+    }
+    if (!feedsColOffset)
+      return;
+    if (dhead)
+      ambiguousDhead = true;
     dhead = d;
-    ++nDiv;
   });
-  if (nDiv != 1)
+  if (!dhead || ambiguousDhead)
     return mlir::failure();
 
-  // (6) resolve kernel-arg pointers / scalars.
+  // (6) resolve kernel-arg pointers / scalars. `unwrapPtrToKernelArg` returns
+  // its INPUT unchanged when the walk dead-ends, so a null check proves
+  // nothing — every result goes through `isKernelArg`.
   mlir::Value qPtr = unwrapPtrToKernelArg(qLoad.getPtr());
   mlir::Value kPtr = unwrapPtrToKernelArg(kLoad.getPtr());
   mlir::Value vPtr = unwrapPtrToKernelArg(vLoad.getPtr());
   mlir::Value oPtr = unwrapPtrToKernelArg(store.getPtr());
-  if (!qPtr || !kPtr || !vPtr || !oPtr)
-    return mlir::failure();
   mlir::Value nVal = forOp.getUpperBound();
   mlir::Value dModelVal = dhead.getLhs();
   mlir::Value hVal = dhead.getRhs();
+  if (!isKernelArg(qPtr) || !isKernelArg(kPtr) || !isKernelArg(vPtr) ||
+      !isKernelArg(oPtr) || !isKernelArg(nVal) || !isKernelArg(dModelVal) ||
+      !isKernelArg(hVal))
+    return mlir::failure();
 
   // (7) block sizes from tensor shapes. acc = [BM, BD]; dotA result = [BM, BN].
   int64_t BM = accTy.getShape()[0];

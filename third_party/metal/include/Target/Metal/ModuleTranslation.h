@@ -86,6 +86,11 @@ private:
   // emits the declaration exactly once.
   bool _sharedStageBufferDeclared = false;
   bool _fstoreScratchDeclared = false;
+  // Set by a translator that has emitted an `op.emitError()` and cannot produce
+  // correct MSL. `translateModule` turns it into a `failure()` so the compile
+  // aborts instead of handing back a silently-wrong kernel. Without this the
+  // only signal is a diagnostic on stderr, which nothing checks.
+  bool _emitFailed = false;
   unsigned _varCount = 0;
   bool inWhileCondition = false;
   int _curIndent = 0;

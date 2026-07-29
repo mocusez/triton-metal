@@ -191,6 +191,11 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
     ModuleTranslation translator{module, output};
     translator.translateKernels();
     output.flush();
+    // A translator that hit an unemittable op has already called emitError();
+    // surface it as a real failure so ttgir_to_msl throws instead of returning
+    // half-formed MSL. See the `_emitFailed` comment in ModuleTranslation.h.
+    if (translator._emitFailed)
+      return mlir::failure();
   }
   return mlir::success();
 }
@@ -1813,7 +1818,20 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
       break;
     }
     auto it = _buffers.find(m.getAsOpaquePointer());
-    return "v" + std::to_string(it != _buffers.end() ? it->second : 0);
+    if (it == _buffers.end()) {
+      // NEVER fall back to buffer 0. An operand that does not resolve to a
+      // kernel buffer means the matcher bound a computed value (or a constant)
+      // where a kernel argument was required; emitting `v0[0]` for it produces
+      // a kernel that reads its own Q pointer as an integer and silently
+      // computes garbage. Fail the translation instead. The matcher-side gate
+      // is tryFlashAttentionLoop step (5a); this is the backstop.
+      op.emitError() << "metal.flash_attention: operand does not resolve to a "
+                        "kernel buffer (matcher bound a non-kernel-arg value); "
+                        "refusing to emit";
+      _emitFailed = true;
+      return "<unresolved>";
+    }
+    return "v" + std::to_string(it->second);
   };
   const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
                     V = bufName(op.getV()), O = bufName(op.getOut());
