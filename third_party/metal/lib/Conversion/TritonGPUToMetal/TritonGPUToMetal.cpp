@@ -1731,20 +1731,23 @@ struct ArithMulFLowering
   }
 };
 
-// Elementwise `arith.maxnumf` / `arith.maximumf` (`tl.maximum`) → per-thread
-// metal.binary_exp maxOp. Mirrors ArithAddFLowering; needed by a loop-carried
-// column-max accumulator (`acc = tl.maximum(acc, tile)`) that
-// reassociateLoopCarriedAxis0Reduce turns into a scalar `max(s, reduce(...))`.
-template <typename OpTy>
-struct ArithMaxFLowering : public mlir::OpConversionPattern<OpTy> {
+// Elementwise `arith.maxnumf` / `arith.maximumf` (`tl.maximum`) and
+// `arith.minnumf` / `arith.minimumf` (`tl.minimum`) → per-thread
+// metal.binary_exp maxOp / minOp. Mirrors ArithAddFLowering; needed by a
+// loop-carried column-max accumulator (`acc = tl.maximum(acc, tile)`) that
+// reassociateLoopCarriedAxis0Reduce turns into a scalar `max(s, reduce(...))`,
+// and by any clamp idiom (`tl.minimum(tl.maximum(x, lo), hi)` — the PPO/GRPO
+// ratio clip). ModuleTranslation emits both enums as the MSL function-call
+// form `max(a,b)` / `min(a,b)`.
+template <typename OpTy, BinaryExpOperator Kind>
+struct ArithMinMaxFLowering : public mlir::OpConversionPattern<OpTy> {
   using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
   mlir::LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    auto maxEnum = BinaryExpOperatorAttr::get(rewriter.getContext(),
-                                              BinaryExpOperator::maxOp);
+    auto kindEnum = BinaryExpOperatorAttr::get(rewriter.getContext(), Kind);
     rewriter.template replaceOpWithNewOp<BinaryExpOp>(
-        op, adaptor.getLhs().getType(), maxEnum, adaptor.getLhs(),
+        op, adaptor.getLhs().getType(), kindEnum, adaptor.getLhs(),
         adaptor.getRhs());
     return mlir::success();
   }
@@ -3743,6 +3746,10 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
   if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MinimumFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MinNumFOp>(def))
+    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
 
   // int binary arith → raw scalar arith. Operands are normalised to signless
   // (see `toSignlessInt`): a cone leaf read from a device buffer carries the
@@ -4059,6 +4066,10 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
   if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MinimumFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
+  if (auto o = mlir::dyn_cast<mlir::arith::MinNumFOp>(def))
+    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
 
   // tt.broadcast: rank-preserving replication over unit dims. Recurse the
   // source at the SAME (row, col) — the source's own structure (expand_dims /
@@ -4271,7 +4282,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   // legalize even after the evaluator learned shifts).
   if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
                 mlir::arith::DivFOp, mlir::arith::MaximumFOp,
-                mlir::arith::MaxNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
+                mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
+                mlir::arith::MinNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
                 mlir::arith::MulIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
                 mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
                 mlir::arith::ShRUIOp,
@@ -4322,7 +4334,8 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
     return rank2ConeSupported(def->getOperand(0), depth + 1);
   if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
                 mlir::arith::DivFOp, mlir::arith::MaximumFOp,
-                mlir::arith::MaxNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
+                mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
+                mlir::arith::MinNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
                 mlir::arith::MulIOp, mlir::arith::CmpIOp, mlir::arith::CmpFOp>(
           def))
     return rank2ConeSupported(def->getOperand(0), depth + 1) &&
@@ -12401,8 +12414,14 @@ struct ConvertTritonGPUToMetalPass
                  ArithXOrILowering, ArithDivUILowering, ArithRemUILowering,
                  ArithShRUILowering, ArithSelectLowering,
                  ArithMulFLowering, ArithSIToFPLowering, ArithNegFLowering,
-                 ArithMaxFLowering<mlir::arith::MaxNumFOp>,
-                 ArithMaxFLowering<mlir::arith::MaximumFOp>,
+                 ArithMinMaxFLowering<mlir::arith::MaxNumFOp,
+                                      BinaryExpOperator::maxOp>,
+                 ArithMinMaxFLowering<mlir::arith::MaximumFOp,
+                                      BinaryExpOperator::maxOp>,
+                 ArithMinMaxFLowering<mlir::arith::MinNumFOp,
+                                      BinaryExpOperator::minOp>,
+                 ArithMinMaxFLowering<mlir::arith::MinimumFOp,
+                                      BinaryExpOperator::minOp>,
                  ArithIntMinMaxLowering<mlir::arith::MaxSIOp>,
                  ArithIntMinMaxLowering<mlir::arith::MinSIOp>,
                  ArithExtFLowering, ArithTruncFLowering,
