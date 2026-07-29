@@ -677,6 +677,12 @@ def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
     (>= d_head; padded columns are masked by `d < d_head`). bm/bn/bd multiples
     of 8; bm <= 32 (one query row per lane). The FA body runs on one warp; under
     num_warps>1 the extra warps idle but still reach every threadgroup_barrier.
+
+    The threadgroup working set is `3*bm*bd + 2*bd*bn + 2*bm*bn + 2*bm` floats
+    and must fit Apple's 32 KiB, i.e. 8192 floats. The matcher checks this and
+    declines rather than emitting an over-budget kernel, so e.g. a `d_head`
+    above 64 (bd >= 128, ~10.8k floats) falls through to the general path and
+    its hard error. That is the practical ceiling on head width.
   }];
 
   let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
