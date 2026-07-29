@@ -11399,6 +11399,562 @@ static bool faConeHasTrans(mlir::Value v) {
   return false;
 }
 
+//===----------------------------------------------------------------------===//
+// Flash-attention template verifier.
+//===----------------------------------------------------------------------===//
+//
+// The matcher above admits a loop on op COUNTS: 3 iter_args, 2 tt.dot, 2
+// tt.reduce, one transposed dot operand, 1 tt.store. Nothing checks what the
+// loop actually computes, so any kernel sharing that skeleton but not the
+// semantics — a sliding-window band mask, a causal mask, an ALiBi bias, a
+// logit softcap — is claimed and compiled as plain full attention. The failure
+// mode is a silent wrong answer, not a diagnostic.
+//
+// This verifier replaces the count proxies with a ROLE WALK. Starting from the
+// scf.yield it binds each value to a slot of the flash-attention template and
+// marks the defining op CLAIMED; layout/shape plumbing (convert_layout,
+// broadcast, expand_dims) is peeled and claimed on the way. The final gate is
+// COVERAGE: every op in the loop body must have been claimed. An unrecognized
+// op anywhere in the body — the band mask's `math.absi`, a bias `arith.mulf`,
+// a softcap `math.tanh` — leaves ops unclaimed and the loop is rejected. It
+// then falls through to the general path and gets a hard error, which is the
+// correct outcome for a kernel this emitter cannot express.
+//
+// The template pinned here is the ONE spelling the emitter implements, taken
+// from leet-triton/hard-mult_head_attention.py:
+//
+//   for kb = 0 to N step BN:                      (lb/step/ub all checked)
+//     S      = dot(Qload, trans(Kload), 0) * splat(1/sqrt(d_head))
+//     Sm     = select((row < N) & (key < N), S, -inf)
+//     m_new  = maxnumf(reduce_max(Sm, axis=1), m_carried)
+//     scaler = exp(m_carried - m_new)
+//     P      = exp(Sm - lift(m_new))
+//     sum'   = fma(sum_carried, scaler, reduce_add(P, axis=1))
+//     acc'   = fma(acc_carried, lift(scaler), dot(P, Vload, 0))
+//   out = acc / lift(sum)                          (masked store)
+//
+// plus the pieces the emitter hardcodes and the count proxies never checked:
+// the iter-arg INITS (acc/sum 0, max -inf), the load/store ADDRESSES
+// (base + major*d_model + col) and MASKS (major < N, d < d_head), and the
+// scale (1/sqrt(d_head), not an arbitrary factor).
+//
+// Deliberately strict: alternative-but-equivalent spellings (mulf+dot-C
+// instead of fma, `S / sqrt(w)` instead of `S * (1/sqrt(w))`, a cdiv-form
+// loop) are REJECTED rather than accepted, because each is a place the emitter
+// could silently disagree. Widening this set is a separate change, with tests.
+namespace {
+
+struct FaTemplate {
+  // --- inputs, set by the caller before verify() ---
+  mlir::scf::ForOp forOp;
+  mlir::Block *entry = nullptr; // kernel entry block
+  int64_t BM = 0, BN = 0, BD = 0;
+  mlir::Value nVal, dModelVal, dHeadVal;
+  mlir::Value qPtr, kPtr, vPtr, oPtr;
+  mlir::triton::StoreOp store;
+  mlir::triton::LoadOp expectQ, expectK, expectV;
+
+  // --- outputs ---
+  const char *why = nullptr;
+  mlir::Operation *offender = nullptr;
+
+  // Which yield operand / iter_arg carries which role. The epilogue check
+  // needs these to pick the right loop RESULT.
+  int accIdx = -1, sumIdx = -1, maxIdx = -1;
+
+  enum class Idx { None, Row, Key, Feat, FeatBase };
+
+  mlir::Block *body = nullptr;
+  llvm::DenseSet<mlir::Operation *> claimed;
+
+  bool no(const char *r) {
+    if (!why)
+      why = r;
+    return false;
+  }
+  void mark(mlir::Operation *op) {
+    if (op)
+      claimed.insert(op);
+  }
+
+  // Peel layout/shape plumbing, claiming each op on the way.
+  mlir::Value peel(mlir::Value v) {
+    while (auto *def = v.getDefiningOp()) {
+      if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::BroadcastOp,
+                    mlir::triton::ExpandDimsOp>(def)) {
+        mark(def);
+        v = def->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return v;
+  }
+
+  // Splat source after peeling, or null.
+  mlir::Value splatSrc(mlir::Value v) {
+    v = peel(v);
+    auto sp = v.getDefiningOp<mlir::triton::SplatOp>();
+    if (!sp)
+      return {};
+    mark(sp);
+    return sp.getSrc();
+  }
+
+  bool matchFpConst(mlir::Value v,
+                    llvm::function_ref<bool(const llvm::APFloat &)> pred) {
+    v = peel(v);
+    if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>()) {
+      mark(sp);
+      v = sp.getSrc();
+    }
+    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!cst)
+      return false;
+    mark(cst);
+    if (auto f = mlir::dyn_cast<mlir::FloatAttr>(cst.getValue()))
+      return pred(f.getValue());
+    if (auto d = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue()))
+      return d.isSplat() && pred(d.getSplatValue<llvm::APFloat>());
+    return false;
+  }
+  bool isZeroF(mlir::Value v) {
+    return matchFpConst(v, [](const llvm::APFloat &f) { return f.isZero(); });
+  }
+  bool isNegInfF(mlir::Value v) {
+    return matchFpConst(v, [](const llvm::APFloat &f) {
+      return f.isInfinity() && f.isNegative();
+    });
+  }
+  bool isOneF(mlir::Value v) {
+    return matchFpConst(
+        v, [](const llvm::APFloat &f) { return f.isExactlyValue(1.0); });
+  }
+  static bool isIntConst(mlir::Value v, int64_t c) {
+    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!cst)
+      return false;
+    auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue());
+    return ia && ia.getInt() == c;
+  }
+
+  // Classify a rank-1-or-lifted index vector by the shape of its construction:
+  //   pid0*BM + arange(BM)      -> Row       (query row, absolute)
+  //   iv     + arange(BN)       -> Key       (key row, absolute)
+  //   pid1*d_head + arange(BD)  -> Feat      (feature column, absolute)
+  //   arange(BD)                -> FeatBase  (feature index, head-relative)
+  // The base kind disambiguates, so BM == BN == BD is not ambiguous.
+  Idx classifyIdx(mlir::Value v) {
+    v = peel(v);
+    if (auto mr = v.getDefiningOp<mlir::triton::MakeRangeOp>()) {
+      if (mr.getStart() != 0 || (int64_t)mr.getEnd() != BD)
+        return Idx::None;
+      mark(mr);
+      return Idx::FeatBase;
+    }
+    auto add = v.getDefiningOp<mlir::arith::AddIOp>();
+    if (!add)
+      return Idx::None;
+    mlir::Value baseSide, rangeSide;
+    for (int i = 0; i < 2; ++i)
+      if (peel(add->getOperand(i)).getDefiningOp<mlir::triton::MakeRangeOp>()) {
+        rangeSide = peel(add->getOperand(i));
+        baseSide = add->getOperand(1 - i);
+      }
+    if (!rangeSide)
+      return Idx::None;
+    auto mr = rangeSide.getDefiningOp<mlir::triton::MakeRangeOp>();
+    if (mr.getStart() != 0)
+      return Idx::None;
+    int64_t len = (int64_t)mr.getEnd();
+    mlir::Value baseScalar = splatSrc(baseSide);
+    if (!baseScalar)
+      return Idx::None;
+    if (baseScalar == forOp.getInductionVar() && len == BN) {
+      mark(add);
+      mark(mr);
+      return Idx::Key;
+    }
+    auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>();
+    if (!mul)
+      return Idx::None;
+    for (int i = 0; i < 2; ++i) {
+      auto pid =
+          mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
+      if (!pid)
+        continue;
+      mlir::Value other = mul->getOperand(1 - i);
+      if (pid.getAxisAsInt() == 0 && isIntConst(other, BM) && len == BM) {
+        mark(add);
+        mark(mr);
+        mark(mul);
+        return Idx::Row;
+      }
+      if (pid.getAxisAsInt() == 1 && other == dHeadVal && len == BD) {
+        mark(add);
+        mark(mr);
+        mark(mul);
+        return Idx::Feat;
+      }
+    }
+    return Idx::None;
+  }
+
+  using Term = std::pair<Idx, mlir::Value>;
+
+  // Decompose a mask into the set of `slt` bounds terms it ANDs together.
+  bool collectMask(mlir::Value v, llvm::SmallVectorImpl<Term> &terms) {
+    v = peel(v);
+    if (auto andOp = v.getDefiningOp<mlir::arith::AndIOp>()) {
+      mark(andOp);
+      return collectMask(andOp.getLhs(), terms) &&
+             collectMask(andOp.getRhs(), terms);
+    }
+    auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
+    if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+      return false;
+    Idx idx = classifyIdx(cmp.getLhs());
+    if (idx == Idx::None)
+      return false;
+    mlir::Value bound = splatSrc(cmp.getRhs());
+    if (!bound)
+      return false;
+    mark(cmp);
+    terms.push_back({idx, bound});
+    return true;
+  }
+
+  static bool hasTerm(llvm::ArrayRef<Term> set, const Term &t) {
+    for (auto &s : set)
+      if (s.first == t.first && s.second == t.second)
+        return true;
+    return false;
+  }
+  static bool setEq(llvm::ArrayRef<Term> a, llvm::ArrayRef<Term> b) {
+    for (auto &t : a)
+      if (!hasTerm(b, t))
+        return false;
+    for (auto &t : b)
+      if (!hasTerm(a, t))
+        return false;
+    return true;
+  }
+
+  bool maskIs(mlir::Value v, llvm::ArrayRef<Term> want) {
+    llvm::SmallVector<Term, 4> got;
+    return collectMask(v, got) && setEq(got, want);
+  }
+
+  // ptr == addptr(splat(base), major*splat(d_model) + featureColumn)
+  bool matchAddress(mlir::Value ptr, Idx wantMajor, mlir::Value wantBase) {
+    ptr = peel(ptr);
+    auto ap = ptr.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!ap || splatSrc(ap.getPtr()) != wantBase)
+      return false;
+    auto add = peel(ap.getOffset()).getDefiningOp<mlir::arith::AddIOp>();
+    if (!add)
+      return false;
+    for (int i = 0; i < 2; ++i) {
+      auto mul = peel(add->getOperand(i)).getDefiningOp<mlir::arith::MulIOp>();
+      if (!mul)
+        continue;
+      for (int j = 0; j < 2; ++j) {
+        if (splatSrc(mul->getOperand(j)) != dModelVal)
+          continue;
+        if (classifyIdx(mul->getOperand(1 - j)) != wantMajor)
+          continue;
+        if (classifyIdx(add->getOperand(1 - i)) != Idx::Feat)
+          continue;
+        mark(ap);
+        mark(add);
+        mark(mul);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // tt.reduce over axis 1 whose combine is exactly one maxnumf/maximumf (max)
+  // or addf (sum).
+  bool matchReduce(mlir::Value v, bool wantMax, mlir::Value &src) {
+    v = peel(v);
+    auto red = v.getDefiningOp<mlir::triton::ReduceOp>();
+    if (!red || red.getSrcs().size() != 1 || red.getAxis() != 1)
+      return false;
+    mlir::Operation *combine = nullptr;
+    if (red->getNumRegions() == 0 || red->getRegion(0).empty())
+      return false;
+    for (auto &nested : red->getRegion(0).front()) {
+      if (mlir::isa<mlir::triton::ReduceReturnOp>(nested))
+        continue;
+      if (combine)
+        return false; // more than one op: not a bare max/add combine
+      combine = &nested;
+    }
+    if (!combine)
+      return false;
+    bool ok =
+        wantMax
+            ? mlir::isa<mlir::arith::MaxNumFOp, mlir::arith::MaximumFOp>(combine)
+            : mlir::isa<mlir::arith::AddFOp>(combine);
+    if (!ok)
+      return false;
+    mark(red);
+    src = red.getSrcs().front();
+    return true;
+  }
+
+  // scale == divf(1.0, sqrt(sitofp(d_head)))  (with the optional `+ 0.0` that
+  // Triton emits for the Python `d_head + 0.0` int->float promotion).
+  bool matchScale(mlir::Value v) {
+    auto div = v.getDefiningOp<mlir::arith::DivFOp>();
+    if (!div || !isOneF(div.getLhs()))
+      return false;
+    auto sq = div.getRhs().getDefiningOp<mlir::math::SqrtOp>();
+    if (!sq)
+      return false;
+    mlir::Value x = sq.getOperand();
+    if (auto add = x.getDefiningOp<mlir::arith::AddFOp>()) {
+      if (isZeroF(add.getRhs()))
+        x = add.getLhs();
+      else if (isZeroF(add.getLhs()))
+        x = add.getRhs();
+      else
+        return false;
+    }
+    auto si = x.getDefiningOp<mlir::arith::SIToFPOp>();
+    return si && si.getIn() == dHeadVal;
+  }
+
+  bool verify();
+};
+
+bool FaTemplate::verify() {
+  body = forOp.getBody();
+
+  // --- loop shape: `for kb = 0; kb < N; kb += BN` is what the emitter renders.
+  if (!isIntConst(forOp.getLowerBound(), 0))
+    return no("loop lower bound is not 0");
+  if (!isIntConst(forOp.getStep(), BN))
+    return no("loop step is not the key block size");
+  if (forOp.getUpperBound() != nVal)
+    return no("loop upper bound is not the N kernel arg");
+
+  auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
+  mark(yield);
+  if (yield.getNumOperands() != 3)
+    return no("scf.yield does not carry 3 values");
+
+  // --- assign roles: acc is the rank-2 value; of the two rank-1s the running
+  // max is the one produced by a float max.
+  for (unsigned i = 0; i < 3; ++i) {
+    auto tt = mlir::dyn_cast<mlir::RankedTensorType>(yield.getOperand(i).getType());
+    if (!tt)
+      return no("scf.yield operand is not a tensor");
+    if (tt.getRank() == 2) {
+      accIdx = (int)i;
+      continue;
+    }
+    auto *def = yield.getOperand(i).getDefiningOp();
+    if (def && mlir::isa<mlir::arith::MaxNumFOp, mlir::arith::MaximumFOp>(def))
+      maxIdx = (int)i;
+    else
+      sumIdx = (int)i;
+  }
+  if (accIdx < 0 || maxIdx < 0 || sumIdx < 0)
+    return no("cannot assign accumulator/max/sum roles to the iter_args");
+
+  mlir::Value iterAcc = forOp.getRegionIterArg(accIdx);
+  mlir::Value iterMax = forOp.getRegionIterArg(maxIdx);
+  mlir::Value iterSum = forOp.getRegionIterArg(sumIdx);
+
+  // --- inits. The emitter hardcodes obuf = 0, rsum = 0, rmax = -INFINITY.
+  if (!isZeroF(forOp.getInitArgs()[accIdx]))
+    return no("accumulator does not start at 0");
+  if (!isZeroF(forOp.getInitArgs()[sumIdx]))
+    return no("running sum does not start at 0");
+  if (!isNegInfF(forOp.getInitArgs()[maxIdx]))
+    return no("running max does not start at -inf");
+
+  // --- m_new = maxnumf(reduce_max(Sm), m_carried)
+  mlir::Value maxNew = yield.getOperand(maxIdx);
+  mlir::Operation *maxOp = maxNew.getDefiningOp();
+  mark(maxOp);
+  mlir::Value rowMax;
+  if (maxOp->getOperand(0) == iterMax)
+    rowMax = maxOp->getOperand(1);
+  else if (maxOp->getOperand(1) == iterMax)
+    rowMax = maxOp->getOperand(0);
+  else
+    return no("running max does not fold the loop-carried max");
+
+  mlir::Value sMasked;
+  if (!matchReduce(rowMax, /*wantMax=*/true, sMasked))
+    return no("block max is not tt.reduce(max, axis=1)");
+
+  // --- Sm = select(bounds, S*scale, -inf). This is the gate that rejects any
+  // extra mask term (band, causal, ...) or a non--inf fill.
+  auto sel = peel(sMasked).getDefiningOp<mlir::arith::SelectOp>();
+  if (!sel)
+    return no("reduced logits are not a masked select");
+  mark(sel);
+  if (!isNegInfF(sel.getFalseValue()))
+    return no("masked-out logits are not filled with -inf");
+  if (!maskIs(sel.getCondition(), {{Idx::Row, nVal}, {Idx::Key, nVal}}))
+    return no("softmax mask is not exactly (row < N) & (key < N)");
+
+  // --- S*scale
+  auto mulS = peel(sel.getTrueValue()).getDefiningOp<mlir::arith::MulFOp>();
+  if (!mulS)
+    return no("logits are not <dot> * scale");
+  mark(mulS);
+  mlir::Value dotAv, scaleScalar;
+  for (int i = 0; i < 2; ++i)
+    if (mlir::Value s = splatSrc(mulS->getOperand(i))) {
+      scaleScalar = s;
+      dotAv = mulS->getOperand(1 - i);
+    }
+  if (!scaleScalar)
+    return no("logit scale is not a splat scalar");
+  if (!matchScale(scaleScalar))
+    return no("logit scale is not 1/sqrt(d_head)");
+
+  // --- S = dot(Q, K^T, 0)
+  auto dotA = peel(dotAv).getDefiningOp<mlir::triton::DotOp>();
+  if (!dotA)
+    return no("scaled logits are not a tt.dot");
+  mark(dotA);
+  if (!isZeroF(dotA.getC()))
+    return no("QK^T dot does not accumulate from 0");
+  auto qLd = peel(dotA.getA()).getDefiningOp<mlir::triton::LoadOp>();
+  if (!qLd || qLd->getBlock() == body)
+    return no("dot A operand is not a loop-invariant Q load");
+  auto trans = peel(dotA.getB()).getDefiningOp<mlir::triton::TransOp>();
+  if (!trans)
+    return no("dot B operand is not transposed");
+  mark(trans);
+  auto order = trans.getOrder();
+  if (order.size() != 2 || order[0] != 1 || order[1] != 0)
+    return no("dot B transpose is not a plain 2D swap");
+  auto kLd = peel(trans.getSrc()).getDefiningOp<mlir::triton::LoadOp>();
+  if (!kLd || kLd->getBlock() != body)
+    return no("K is not loaded inside the loop");
+  mark(kLd);
+
+  // --- sum' = fma(sum, scaler, reduce_add(P))
+  auto fmaSum = yield.getOperand(sumIdx).getDefiningOp<mlir::math::FmaOp>();
+  if (!fmaSum)
+    return no("running sum update is not a math.fma");
+  mark(fmaSum);
+  if (fmaSum->getOperand(0) != iterSum)
+    return no("running sum fma does not scale the carried sum");
+  mlir::Value scaler = fmaSum->getOperand(1);
+  mlir::Value pV;
+  if (!matchReduce(fmaSum->getOperand(2), /*wantMax=*/false, pV))
+    return no("softmax denominator is not tt.reduce(add, axis=1)");
+
+  // --- scaler = exp(m_old - m_new)
+  auto expS = scaler.getDefiningOp<mlir::math::ExpOp>();
+  if (!expS)
+    return no("rescale factor is not math.exp");
+  mark(expS);
+  auto subS = expS.getOperand().getDefiningOp<mlir::arith::SubFOp>();
+  if (!subS || subS.getLhs() != iterMax || subS.getRhs() != maxNew)
+    return no("rescale factor is not exp(m_old - m_new)");
+  mark(subS);
+
+  // --- P = exp(Sm - lift(m_new))
+  auto expP = peel(pV).getDefiningOp<mlir::math::ExpOp>();
+  if (!expP)
+    return no("softmax numerator is not math.exp");
+  mark(expP);
+  auto subP = peel(expP.getOperand()).getDefiningOp<mlir::arith::SubFOp>();
+  if (!subP)
+    return no("softmax numerator is not exp(S - m)");
+  mark(subP);
+  if (peel(subP.getLhs()) != sel.getResult())
+    return no("softmax numerator does not exponentiate the masked logits");
+  if (peel(subP.getRhs()) != maxNew)
+    return no("softmax numerator is not shifted by the new running max");
+
+  // --- acc' = fma(acc, lift(scaler), dot(P, V, 0))
+  auto fmaAcc = yield.getOperand(accIdx).getDefiningOp<mlir::math::FmaOp>();
+  if (!fmaAcc)
+    return no("accumulator update is not a math.fma");
+  mark(fmaAcc);
+  if (fmaAcc->getOperand(0) != iterAcc)
+    return no("accumulator fma does not scale the carried accumulator");
+  if (peel(fmaAcc->getOperand(1)) != scaler)
+    return no("accumulator is not rescaled by exp(m_old - m_new)");
+  auto dotB = peel(fmaAcc->getOperand(2)).getDefiningOp<mlir::triton::DotOp>();
+  if (!dotB)
+    return no("accumulator increment is not a tt.dot");
+  mark(dotB);
+  if (!isZeroF(dotB.getC()))
+    return no("PV dot does not accumulate from 0");
+  if (peel(dotB.getA()) != expP.getResult())
+    return no("PV dot A operand is not the softmax numerator");
+  auto vLd = peel(dotB.getB()).getDefiningOp<mlir::triton::LoadOp>();
+  if (!vLd || vLd->getBlock() != body)
+    return no("V is not loaded inside the loop");
+  mark(vLd);
+
+  // The loads the caller resolved its buffer operands from must be these ones.
+  if (qLd != expectQ || kLd != expectK || vLd != expectV)
+    return no("role walk reached different loads than the operand resolution");
+
+  // --- addresses: base + major*d_model + head column.
+  if (!matchAddress(qLd.getPtr(), Idx::Row, qPtr))
+    return no("Q address is not base + row*d_model + col");
+  if (!matchAddress(kLd.getPtr(), Idx::Key, kPtr))
+    return no("K address is not base + key*d_model + col");
+  if (!matchAddress(vLd.getPtr(), Idx::Key, vPtr))
+    return no("V address is not base + key*d_model + col");
+
+  // --- masks: exactly (major < N) & (d < d_head), matching the emitter's
+  // staged-load guards. `other` must be 0 (the emitter zero-fills).
+  if (!qLd.getMask() ||
+      !maskIs(qLd.getMask(), {{Idx::Row, nVal}, {Idx::FeatBase, dHeadVal}}))
+    return no("Q load mask is not (row < N) & (d < d_head)");
+  if (!kLd.getMask() ||
+      !maskIs(kLd.getMask(), {{Idx::Key, nVal}, {Idx::FeatBase, dHeadVal}}))
+    return no("K load mask is not (key < N) & (d < d_head)");
+  if (!vLd.getMask() ||
+      !maskIs(vLd.getMask(), {{Idx::Key, nVal}, {Idx::FeatBase, dHeadVal}}))
+    return no("V load mask is not (key < N) & (d < d_head)");
+  if (qLd.getOther() && !isZeroF(qLd.getOther()))
+    return no("Q load `other` is not 0");
+  if (kLd.getOther() && !isZeroF(kLd.getOther()))
+    return no("K load `other` is not 0");
+  if (vLd.getOther() && !isZeroF(vLd.getOther()))
+    return no("V load `other` is not 0");
+
+  // --- epilogue: store(acc / lift(sum)) with the Q mask and the Q addressing.
+  auto divE = peel(store.getValue()).getDefiningOp<mlir::arith::DivFOp>();
+  if (!divE)
+    return no("epilogue is not accumulator / running sum");
+  if (peel(divE.getLhs()) != forOp.getResult(accIdx))
+    return no("epilogue numerator is not the loop accumulator");
+  if (peel(divE.getRhs()) != forOp.getResult(sumIdx))
+    return no("epilogue denominator is not the loop running sum");
+  if (!matchAddress(store.getPtr(), Idx::Row, oPtr))
+    return no("store address is not base + row*d_model + col");
+  if (!store.getMask() ||
+      !maskIs(store.getMask(), {{Idx::Row, nVal}, {Idx::FeatBase, dHeadVal}}))
+    return no("store mask is not (row < N) & (d < d_head)");
+
+  // --- COVERAGE. This is the gate that generalizes: anything the role walk
+  // did not reach is an op the emitter does not implement.
+  for (mlir::Operation &op : *body)
+    if (!claimed.count(&op)) {
+      offender = &op;
+      return no("unclaimed op in the loop body");
+    }
+  return true;
+}
+
+} // namespace
+
 static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   // (1) exactly 3 iter_args: one rank-2 f32 accumulator + two rank-1 f32 state.
   if (forOp.getNumRegionIterArgs() != 3)
@@ -11542,6 +12098,41 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   int64_t tgFloats = 3 * BM * BD + 2 * BD * BN + 2 * BM * BN + 2 * BM;
   if (tgFloats > 8192)
     return mlir::failure();
+
+  // (7a) The shape checks above are necessary but nowhere near sufficient —
+  // they say nothing about what the loop COMPUTES. Verify the whole body
+  // against the flash-attention template and require every op in it to be
+  // claimed by a role. See the FaTemplate comment block.
+  FaTemplate tmpl;
+  tmpl.forOp = forOp;
+  tmpl.entry = &entryBlk;
+  tmpl.BM = BM;
+  tmpl.BN = BN;
+  tmpl.BD = BD;
+  tmpl.nVal = nVal;
+  tmpl.dModelVal = dModelVal;
+  tmpl.dHeadVal = dhead.getResult();
+  tmpl.qPtr = qPtr;
+  tmpl.kPtr = kPtr;
+  tmpl.vPtr = vPtr;
+  tmpl.oPtr = oPtr;
+  tmpl.store = store;
+  tmpl.expectQ = qLoad;
+  tmpl.expectK = kLoad;
+  tmpl.expectV = vLoad;
+  if (!tmpl.verify()) {
+    // A loop that passed every structural gate and still failed here is worth
+    // explaining — it is almost always a near-miss attention kernel someone
+    // expected to be accelerated. Opt-in so the ordinary "this loop is not
+    // flash attention" rejections stay silent.
+    if (::getenv("TRITON_METAL_FA_DEBUG")) {
+      llvm::errs() << "[metal-fa] template verify rejected the loop: "
+                   << (tmpl.why ? tmpl.why : "<no reason>") << "\n";
+      if (tmpl.offender)
+        llvm::errs() << "[metal-fa]   offending op: " << *tmpl.offender << "\n";
+    }
+    return mlir::failure();
+  }
 
   // (8) build metal.flash_attention before the loop.
   mlir::OpBuilder builder(forOp);

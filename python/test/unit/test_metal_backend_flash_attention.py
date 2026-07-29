@@ -157,3 +157,118 @@ def test_flash_attention_block16_lane_guard(N, d_model, h):
 
     expected = _reference(Q, K, V, N, d_model, h)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Decoys: kernels the FA matcher must NOT claim (Phase B template verifier).
+# ---------------------------------------------------------------------------
+#
+# Each of these is structurally IDENTICAL to mha_kernel — 3 iter_args (one
+# rank-2 accumulator + two rank-1), 2 tt.dot, 2 tt.reduce, one transposed dot
+# operand, 1 tt.store, 1 arith.divsi with kernel-arg operands feeding
+# `pid1 * d_head` — so every gate the matcher had before Phase B passes. Only
+# the SEMANTICS differ, in one op each.
+#
+# Measured with the pre-Phase-B matcher, all three compiled and returned
+# silently wrong answers (maxerr 2.4 / 1.4 / 0.95 against their own
+# references); `tryFlashAttentionLoop` dropped the difference on the floor and
+# emitted plain full attention. The Phase-B role walk rejects each with a
+# distinct reason ("softmax mask is not exactly (row < N) & (key < N)",
+# "logits are not <dot> * scale", "logit scale is not 1/sqrt(d_head)"; set
+# TRITON_METAL_FA_DEBUG=1 to print them).
+#
+# The assertion is deliberately "raises OR numerically correct", not "raises":
+# it states the invariant that actually matters (no silent wrong answer) and
+# stays valid if a later phase teaches the emitter one of these variants.
+
+
+@triton.jit
+def _decoy_kernel(Q_ptr, K_ptr, V_ptr, output_ptr, N, d_model, h,
+                  BLOCKSIZE_N: tl.constexpr, BLOCKSIZE_d: tl.constexpr,
+                  VARIANT: tl.constexpr):
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    offset = tl.arange(0, BLOCKSIZE_N)
+    d_head = d_model // h
+    offset_N = pid0 * BLOCKSIZE_N + offset
+    offset_d = pid1 * d_head + tl.arange(0, BLOCKSIZE_d)
+    mask_d = tl.arange(0, BLOCKSIZE_d) < d_head
+    offset_Q = offset_N[:, None] * d_model + offset_d[None, :]
+    mask_Q = (offset_N[:, None] < N) & mask_d[None, :]
+    data_Q = tl.load(Q_ptr + offset_Q, mask=mask_Q)
+    scale = 1.0 / tl.sqrt(d_head + 0.0)
+    if VARIANT == 2:  # forgot the sqrt — a plausible typo, silently wrong
+        scale = 1.0 / (d_head + 0.0)
+    accumulator = tl.zeros((BLOCKSIZE_N, BLOCKSIZE_d), dtype=tl.float32)
+    running_sum = tl.zeros([BLOCKSIZE_N], dtype=tl.float32)
+    running_max = tl.full([BLOCKSIZE_N], float("-inf"), dtype=tl.float32)
+    for current_index in range(0, N, BLOCKSIZE_N):
+        current_N_offset = current_index + offset
+        current_N_mask = current_N_offset < N
+        offset_K = current_N_offset[:, None] * d_model + offset_d[None, :]
+        mask_K = current_N_mask[:, None] & mask_d[None, :]
+        data_K = tl.load(K_ptr + offset_K, mask=mask_K, other=0.0)
+        data_V = tl.load(V_ptr + offset_K, mask=mask_K, other=0.0)
+        logits = tl.dot(data_Q, tl.trans(data_K)) * scale
+        if VARIANT == 1:  # ALiBi-style linear positional bias
+            logits = logits + (offset_N[:, None] - current_N_offset[None, :]) * 0.125
+        logits_mask = (offset_N[:, None] < N) & (current_N_offset[None, :] < N)
+        if VARIANT == 0:  # causal
+            logits_mask = logits_mask & (current_N_offset[None, :] <= offset_N[:, None])
+        logits = tl.where(logits_mask, logits, float("-inf"))
+        max_value = tl.maximum(tl.max(logits, axis=1), running_max)
+        scaler = tl.exp(running_max - max_value)
+        running_max = max_value
+        nom = tl.exp(logits - max_value[:, None])
+        running_sum = tl.fma(running_sum, scaler, tl.sum(nom, axis=1))
+        accumulator = tl.fma(accumulator, scaler[:, None], tl.dot(nom, data_V))
+    tl.store(output_ptr + offset_Q, accumulator / running_sum[:, None], mask=mask_Q)
+
+
+def _decoy_reference(Q, K, V, N, d_model, h, variant):
+    d_head = d_model // h
+    Qc, Kc, Vc = Q.cpu(), K.cpu(), V.cpu()
+    out = torch.zeros(N, d_model, dtype=torch.float32)
+    idx = torch.arange(N)
+    for hi in range(h):
+        sl = slice(hi * d_head, (hi + 1) * d_head)
+        denom = d_head if variant == 2 else d_head ** 0.5
+        scores = (Qc[:, sl] @ Kc[:, sl].T) / denom
+        if variant == 1:
+            scores = scores + (idx[:, None] - idx[None, :]) * 0.125
+        if variant == 0:
+            scores = scores.masked_fill(idx[None, :] > idx[:, None], float("-inf"))
+        out[:, sl] = torch.softmax(scores, dim=-1) @ Vc[:, sl]
+    return out
+
+
+@pytest.mark.parametrize(
+    "variant, what",
+    [
+        (0, "causal mask"),
+        (1, "ALiBi-style linear bias"),
+        (2, "scale missing the sqrt"),
+    ],
+)
+def test_flash_attention_rejects_near_miss_kernels(variant, what):
+    N, d_model, h = 64, 64, 4
+    torch.manual_seed(0xDEC0 + variant)
+    Q = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(N, d_model, dtype=torch.float32, device="mps").contiguous()
+
+    grid = (triton.cdiv(N, 32), h)
+    try:
+        _decoy_kernel[grid](Q, K, V, out, N, d_model, h, 32, max(16, d_model // h),
+                            variant, num_warps=4)
+    except RuntimeError:
+        return  # rejected — the expected outcome today
+
+    expected = _decoy_reference(Q, K, V, N, d_model, h, variant)
+    err = (out.cpu() - expected).abs().max().item()
+    assert err < 1e-3, (
+        f"the FA matcher claimed a kernel with a {what} and dropped it: "
+        f"maxerr {err:.3e}. It must either reject the kernel or implement the "
+        "variant — see metal-sliding-window-attention-plan.md §4 Phase B."
+    )
