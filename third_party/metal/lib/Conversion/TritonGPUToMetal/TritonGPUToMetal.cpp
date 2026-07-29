@@ -11400,15 +11400,16 @@ static bool faConeHasTrans(mlir::Value v) {
 }
 
 //===----------------------------------------------------------------------===//
-// Flash-attention template verifier.
+// Phase B — flash-attention template verifier.
 //===----------------------------------------------------------------------===//
 //
-// The matcher above admits a loop on op COUNTS: 3 iter_args, 2 tt.dot, 2
-// tt.reduce, one transposed dot operand, 1 tt.store. Nothing checks what the
-// loop actually computes, so any kernel sharing that skeleton but not the
+// The original matcher admitted a loop on op COUNTS: 3 iter_args, 2 tt.dot, 2
+// tt.reduce, one transposed dot operand, 1 tt.store. Nothing checked what the
+// loop actually computed, so any kernel sharing that skeleton but not the
 // semantics — a sliding-window band mask, a causal mask, an ALiBi bias, a
-// logit softcap — is claimed and compiled as plain full attention. The failure
-// mode is a silent wrong answer, not a diagnostic.
+// logit softcap — was claimed and compiled as plain full attention. The
+// failure mode is a silent wrong answer, not a diagnostic (see
+// metal-sliding-window-attention-plan.md §1a).
 //
 // This verifier replaces the count proxies with a ROLE WALK. Starting from the
 // scf.yield it binds each value to a slot of the flash-attention template and
@@ -11433,36 +11434,47 @@ static bool faConeHasTrans(mlir::Value v) {
 //     acc'   = fma(acc_carried, lift(scaler), dot(P, Vload, 0))
 //   out = acc / lift(sum)                          (masked store)
 //
-// plus the pieces the emitter hardcodes and the count proxies never checked:
-// the iter-arg INITS (acc/sum 0, max -inf), the load/store ADDRESSES
+// plus the pieces the emitter hardcodes and the old matcher never checked: the
+// iter-arg INITS (acc/sum 0, max -inf), the load/store ADDRESSES
 // (base + major*d_model + col) and MASKS (major < N, d < d_head), and the
 // scale (1/sqrt(d_head), not an arbitrary factor).
 //
 // Deliberately strict: alternative-but-equivalent spellings (mulf+dot-C
 // instead of fma, `S / sqrt(w)` instead of `S * (1/sqrt(w))`, a cdiv-form
 // loop) are REJECTED rather than accepted, because each is a place the emitter
-// could silently disagree. Widening this set is a separate change, with tests.
+// could silently disagree. Phase D of the plan widens this set on purpose,
+// with tests.
 namespace {
 
 struct FaTemplate {
   // --- inputs, set by the caller before verify() ---
+  mlir::triton::FuncOp funcOp;
   mlir::scf::ForOp forOp;
   mlir::Block *entry = nullptr; // kernel entry block
   int64_t BM = 0, BN = 0, BD = 0;
-  mlir::Value nVal, dModelVal, dHeadVal;
   mlir::Value qPtr, kPtr, vPtr, oPtr;
   mlir::triton::StoreOp store;
   mlir::triton::LoadOp expectQ, expectK, expectV;
+  // The role-pinned `d_head = d_model / h` divsi, or null when the kernel has
+  // no head dimension.
+  mlir::arith::DivSIOp dheadDivsi;
 
-  // --- outputs ---
+  // --- outputs: the scalar operands of the metal.flash_attention op, all
+  // recovered from the masks/addresses rather than guessed by position ---
+  mlir::Value mVal;      // query row count
+  mlir::Value nVal;      // key count
+  mlir::Value dModelVal; // row stride
+  mlir::Value dHeadVal;  // feature width (divsi result, or == dModelVal)
+  mlir::Value hVal;      // head count, null when there is no head split
+  mlir::Value windowVal; // band half-width, null for full attention
+  bool hasHeadSplit = false;
+  bool loopFormB = false; // `for s in range(cdiv(N,BN))` rather than `range(0,N,BN)`
+  int accIdx = -1, sumIdx = -1, maxIdx = -1;
+
   const char *why = nullptr;
   mlir::Operation *offender = nullptr;
 
-  // Which yield operand / iter_arg carries which role. The epilogue check
-  // needs these to pick the right loop RESULT.
-  int accIdx = -1, sumIdx = -1, maxIdx = -1;
-
-  enum class Idx { None, Row, Key, Feat, FeatBase };
+  enum class Idx { None, Row, Key, Feat, FeatBase, Window };
 
   mlir::Block *body = nullptr;
   llvm::DenseSet<mlir::Operation *> claimed;
@@ -11475,6 +11487,16 @@ struct FaTemplate {
   void mark(mlir::Operation *op) {
     if (op)
       claimed.insert(op);
+  }
+  bool isKernelArg(mlir::Value v) const {
+    auto ba = mlir::dyn_cast_or_null<mlir::BlockArgument>(v);
+    return ba && ba.getOwner() == entry;
+  }
+  // A feature-column index. Without a head split there is no `pid1 * d_head`
+  // term, so the absolute column and the head-relative index are the same
+  // `arange(BD)` value.
+  bool isFeatCol(Idx i) const {
+    return i == Idx::Feat || (!hasHeadSplit && i == Idx::FeatBase);
   }
 
   // Peel layout/shape plumbing, claiming each op on the way.
@@ -11530,6 +11552,17 @@ struct FaTemplate {
     return matchFpConst(
         v, [](const llvm::APFloat &f) { return f.isExactlyValue(1.0); });
   }
+  // Fill value for masked-out logits. -inf is the textbook spelling; a finite
+  // NEGATIVE constant (-100, -1e9) is equally safe here because the online
+  // softmax divides by its own running sum, so the result is invariant under
+  // any shift of the running max — the fill only ever moves `m` up, never
+  // changes acc/sum. A positive fill would mean "prefer masked entries", which
+  // is never intended, so it is rejected.
+  bool isNegFill(mlir::Value v) {
+    return matchFpConst(v, [](const llvm::APFloat &f) {
+      return f.isNegative() && !f.isNaN();
+    });
+  }
   static bool isIntConst(mlir::Value v, int64_t c) {
     auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
     if (!cst)
@@ -11540,7 +11573,8 @@ struct FaTemplate {
 
   // Classify a rank-1-or-lifted index vector by the shape of its construction:
   //   pid0*BM + arange(BM)      -> Row       (query row, absolute)
-  //   iv     + arange(BN)       -> Key       (key row, absolute)
+  //   iv     + arange(BN)       -> Key       (key row, loop form A)
+  //   iv*BN  + arange(BN)       -> Key       (key row, loop form B)
   //   pid1*d_head + arange(BD)  -> Feat      (feature column, absolute)
   //   arange(BD)                -> FeatBase  (feature index, head-relative)
   // The base kind disambiguates, so BM == BN == BD is not ambiguous.
@@ -11570,7 +11604,8 @@ struct FaTemplate {
     mlir::Value baseScalar = splatSrc(baseSide);
     if (!baseScalar)
       return Idx::None;
-    if (baseScalar == forOp.getInductionVar() && len == BN) {
+    // Key, loop form A: the induction variable already counts elements.
+    if (!loopFormB && baseScalar == forOp.getInductionVar() && len == BN) {
       mark(add);
       mark(mr);
       return Idx::Key;
@@ -11578,6 +11613,18 @@ struct FaTemplate {
     auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>();
     if (!mul)
       return Idx::None;
+    // Key, loop form B: the induction variable counts BLOCKS, so the element
+    // offset is `iv * BN`.
+    if (loopFormB && len == BN) {
+      for (int i = 0; i < 2; ++i)
+        if (mul->getOperand(i) == forOp.getInductionVar() &&
+            isIntConst(mul->getOperand(1 - i), BN)) {
+          mark(add);
+          mark(mr);
+          mark(mul);
+          return Idx::Key;
+        }
+    }
     for (int i = 0; i < 2; ++i) {
       auto pid =
           mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
@@ -11590,7 +11637,8 @@ struct FaTemplate {
         mark(mul);
         return Idx::Row;
       }
-      if (pid.getAxisAsInt() == 1 && other == dHeadVal && len == BD) {
+      if (hasHeadSplit && pid.getAxisAsInt() == 1 && other == dHeadVal &&
+          len == BD) {
         mark(add);
         mark(mr);
         mark(mul);
@@ -11602,7 +11650,9 @@ struct FaTemplate {
 
   using Term = std::pair<Idx, mlir::Value>;
 
-  // Decompose a mask into the set of `slt` bounds terms it ANDs together.
+  // Decompose a mask into the set of bounds terms it ANDs together:
+  //   `slt <idx>, splat(bound)`                      -> a range bound
+  //   `sle absi(sub(<row>, <key>)), splat(window)`    -> the band mask
   bool collectMask(mlir::Value v, llvm::SmallVectorImpl<Term> &terms) {
     v = peel(v);
     if (auto andOp = v.getDefiningOp<mlir::arith::AndIOp>()) {
@@ -11611,17 +11661,42 @@ struct FaTemplate {
              collectMask(andOp.getRhs(), terms);
     }
     auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
-    if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+    if (!cmp)
       return false;
-    Idx idx = classifyIdx(cmp.getLhs());
-    if (idx == Idx::None)
-      return false;
-    mlir::Value bound = splatSrc(cmp.getRhs());
-    if (!bound)
-      return false;
-    mark(cmp);
-    terms.push_back({idx, bound});
-    return true;
+    if (cmp.getPredicate() == mlir::arith::CmpIPredicate::slt) {
+      Idx idx = classifyIdx(cmp.getLhs());
+      if (idx == Idx::None)
+        return false;
+      mlir::Value bound = splatSrc(cmp.getRhs());
+      if (!bound)
+        return false;
+      mark(cmp);
+      terms.push_back({idx, bound});
+      return true;
+    }
+    if (cmp.getPredicate() == mlir::arith::CmpIPredicate::sle) {
+      auto absOp = peel(cmp.getLhs()).getDefiningOp<mlir::math::AbsIOp>();
+      if (!absOp)
+        return false;
+      auto sub = peel(absOp.getOperand()).getDefiningOp<mlir::arith::SubIOp>();
+      if (!sub)
+        return false;
+      if (classifyIdx(sub.getLhs()) != Idx::Row ||
+          classifyIdx(sub.getRhs()) != Idx::Key)
+        return false;
+      mlir::Value w = splatSrc(cmp.getRhs());
+      if (!w)
+        return false;
+      if (windowVal && windowVal != w)
+        return false; // two different band widths in one kernel
+      windowVal = w;
+      mark(cmp);
+      mark(absOp);
+      mark(sub);
+      terms.push_back({Idx::Window, w});
+      return true;
+    }
+    return false;
   }
 
   static bool hasTerm(llvm::ArrayRef<Term> set, const Term &t) {
@@ -11630,14 +11705,15 @@ struct FaTemplate {
         return true;
     return false;
   }
-  static bool setEq(llvm::ArrayRef<Term> a, llvm::ArrayRef<Term> b) {
-    for (auto &t : a)
-      if (!hasTerm(b, t))
-        return false;
-    for (auto &t : b)
-      if (!hasTerm(a, t))
+  // Every term of `sub` appears in `sup`.
+  static bool isSubsetOf(llvm::ArrayRef<Term> sub, llvm::ArrayRef<Term> sup) {
+    for (auto &t : sub)
+      if (!hasTerm(sup, t))
         return false;
     return true;
+  }
+  static bool setEq(llvm::ArrayRef<Term> a, llvm::ArrayRef<Term> b) {
+    return isSubsetOf(a, b) && isSubsetOf(b, a);
   }
 
   bool maskIs(mlir::Value v, llvm::ArrayRef<Term> want) {
@@ -11645,32 +11721,52 @@ struct FaTemplate {
     return collectMask(v, got) && setEq(got, want);
   }
 
-  // ptr == addptr(splat(base), major*splat(d_model) + featureColumn)
+  // `major * splat(d_model)`, in either operand order.
+  bool matchMajorStride(mlir::Value v, Idx wantMajor) {
+    auto mul = peel(v).getDefiningOp<mlir::arith::MulIOp>();
+    if (!mul)
+      return false;
+    for (int j = 0; j < 2; ++j)
+      if (splatSrc(mul->getOperand(j)) == dModelVal &&
+          classifyIdx(mul->getOperand(1 - j)) == wantMajor) {
+        mark(mul);
+        return true;
+      }
+    return false;
+  }
+
+  // Two spellings of `base + major*d_model + column`:
+  //   A: addptr(splat(base), major*splat(d_model) + column)
+  //   B: addptr(broadcast(addptr(splat(base), major*splat(d_model))), column)
   bool matchAddress(mlir::Value ptr, Idx wantMajor, mlir::Value wantBase) {
     ptr = peel(ptr);
     auto ap = ptr.getDefiningOp<mlir::triton::AddPtrOp>();
-    if (!ap || splatSrc(ap.getPtr()) != wantBase)
+    if (!ap)
+      return false;
+    mlir::Value inner = peel(ap.getPtr());
+    if (auto ap2 = inner.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (splatSrc(ap2.getPtr()) != wantBase)
+        return false;
+      if (!matchMajorStride(ap2.getOffset(), wantMajor))
+        return false;
+      if (!isFeatCol(classifyIdx(ap.getOffset())))
+        return false;
+      mark(ap);
+      mark(ap2);
+      return true;
+    }
+    if (splatSrc(inner) != wantBase)
       return false;
     auto add = peel(ap.getOffset()).getDefiningOp<mlir::arith::AddIOp>();
     if (!add)
       return false;
-    for (int i = 0; i < 2; ++i) {
-      auto mul = peel(add->getOperand(i)).getDefiningOp<mlir::arith::MulIOp>();
-      if (!mul)
-        continue;
-      for (int j = 0; j < 2; ++j) {
-        if (splatSrc(mul->getOperand(j)) != dModelVal)
-          continue;
-        if (classifyIdx(mul->getOperand(1 - j)) != wantMajor)
-          continue;
-        if (classifyIdx(add->getOperand(1 - i)) != Idx::Feat)
-          continue;
+    for (int i = 0; i < 2; ++i)
+      if (matchMajorStride(add->getOperand(i), wantMajor) &&
+          isFeatCol(classifyIdx(add->getOperand(1 - i)))) {
         mark(ap);
         mark(add);
-        mark(mul);
         return true;
       }
-    }
     return false;
   }
 
@@ -11704,13 +11800,10 @@ struct FaTemplate {
     return true;
   }
 
-  // scale == divf(1.0, sqrt(sitofp(d_head)))  (with the optional `+ 0.0` that
-  // Triton emits for the Python `d_head + 0.0` int->float promotion).
-  bool matchScale(mlir::Value v) {
-    auto div = v.getDefiningOp<mlir::arith::DivFOp>();
-    if (!div || !isOneF(div.getLhs()))
-      return false;
-    auto sq = div.getRhs().getDefiningOp<mlir::math::SqrtOp>();
+  // sqrt(sitofp(d_head)), with the optional `+ 0.0` Triton emits for the
+  // Python `d_head + 0.0` int->float promotion.
+  bool matchSqrtWidth(mlir::Value v) {
+    auto sq = v.getDefiningOp<mlir::math::SqrtOp>();
     if (!sq)
       return false;
     mlir::Value x = sq.getOperand();
@@ -11725,6 +11818,37 @@ struct FaTemplate {
     auto si = x.getDefiningOp<mlir::arith::SIToFPOp>();
     return si && si.getIn() == dHeadVal;
   }
+  bool matchRecipSqrtWidth(mlir::Value v) {
+    auto div = v.getDefiningOp<mlir::arith::DivFOp>();
+    return div && isOneF(div.getLhs()) && matchSqrtWidth(div.getRhs());
+  }
+
+  // Recover d_head from the `arange(BD) < d_head` term of a load mask. Used
+  // only when there is no head-split divsi to read it off. Runs before the
+  // role walk, so it peels by hand rather than through classifyIdx (which
+  // needs dHeadVal).
+  mlir::Value findFeatBound(mlir::Value mask) {
+    if (!mask)
+      return {};
+    llvm::SmallVector<mlir::Value, 8> work{mask};
+    while (!work.empty()) {
+      mlir::Value v = peel(work.pop_back_val());
+      if (auto andOp = v.getDefiningOp<mlir::arith::AndIOp>()) {
+        work.push_back(andOp.getLhs());
+        work.push_back(andOp.getRhs());
+        continue;
+      }
+      auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
+      if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+        continue;
+      auto mr = peel(cmp.getLhs()).getDefiningOp<mlir::triton::MakeRangeOp>();
+      if (!mr || mr.getStart() != 0 || (int64_t)mr.getEnd() != BD)
+        continue;
+      if (mlir::Value b = splatSrc(cmp.getRhs()))
+        return b;
+    }
+    return {};
+  }
 
   bool verify();
 };
@@ -11732,13 +11856,89 @@ struct FaTemplate {
 bool FaTemplate::verify() {
   body = forOp.getBody();
 
-  // --- loop shape: `for kb = 0; kb < N; kb += BN` is what the emitter renders.
+  // --- loop shape. The emitter renders `for kb = 0; kb < N; kb += BN`, which
+  // two source spellings produce:
+  //   A: `range(0, N, BN)`            -> step BN, ub = N
+  //   B: `range(0, cdiv(N, BN))`      -> step 1,  ub = (N + BN-1) / BN
+  // Form B also shifts the key offset to `iv * BN + arange(BN)`, which
+  // classifyIdx keys off `loopFormB`.
   if (!isIntConst(forOp.getLowerBound(), 0))
     return no("loop lower bound is not 0");
-  if (!isIntConst(forOp.getStep(), BN))
-    return no("loop step is not the key block size");
-  if (forOp.getUpperBound() != nVal)
-    return no("loop upper bound is not the N kernel arg");
+  mlir::Value ub = forOp.getUpperBound();
+  if (isIntConst(forOp.getStep(), BN)) {
+    loopFormB = false;
+    nVal = ub;
+  } else if (isIntConst(forOp.getStep(), 1)) {
+    loopFormB = true;
+    auto div = ub.getDefiningOp<mlir::arith::DivSIOp>();
+    if (!div || !isIntConst(div.getRhs(), BN))
+      return no("unit-step loop bound is not cdiv(N, BN)");
+    auto add = div.getLhs().getDefiningOp<mlir::arith::AddIOp>();
+    if (!add)
+      return no("unit-step loop bound is not cdiv(N, BN)");
+    if (isIntConst(add.getRhs(), BN - 1))
+      nVal = add.getLhs();
+    else if (isIntConst(add.getLhs(), BN - 1))
+      nVal = add.getRhs();
+    else
+      return no("unit-step loop bound is not cdiv(N, BN)");
+  } else {
+    return no("loop step is neither the key block size nor 1");
+  }
+  if (!isKernelArg(nVal))
+    return no("key count is not a kernel argument");
+
+  // --- feature width. With a head split it is the pinned `d_model / h`;
+  // without one the features are the whole row, so d_head == d_model and it
+  // has to be recovered from the `d < d_head` load-mask term.
+  if (dheadDivsi) {
+    hasHeadSplit = true;
+    dHeadVal = dheadDivsi.getResult();
+    dModelVal = dheadDivsi.getLhs();
+    hVal = dheadDivsi.getRhs();
+    if (!isKernelArg(hVal))
+      return no("head count is not a kernel argument");
+  } else {
+    hasHeadSplit = false;
+    dHeadVal = dModelVal = findFeatBound(expectQ.getMask());
+    if (!dHeadVal)
+      return no("cannot recover d_head from the Q load mask");
+    // No head split means the emitter uses column offset 0, so nothing may
+    // depend on the grid's y/z dimensions.
+    bool usesHigherGridDim = false;
+    funcOp.walk([&](mlir::triton::GetProgramIdOp p) {
+      if (p.getAxisAsInt() != 0)
+        usesHigherGridDim = true;
+    });
+    if (usesHigherGridDim)
+      return no("no head split, but the kernel reads grid dim y/z");
+  }
+  if (!isKernelArg(dModelVal))
+    return no("row stride is not a kernel argument");
+
+  // --- query row count, read off the Q load mask (it is NOT always the key
+  // count: a kernel may take separate M and N).
+  llvm::SmallVector<Term, 4> qMask;
+  if (!expectQ.getMask() || !collectMask(expectQ.getMask(), qMask))
+    return no("Q load mask is not a conjunction of recognized bounds");
+  for (auto &t : qMask) {
+    if (t.first == Idx::Row) {
+      if (mVal && mVal != t.second)
+        return no("Q load mask has two different row bounds");
+      mVal = t.second;
+    } else if (t.first == Idx::FeatBase) {
+      if (t.second != dHeadVal)
+        return no("Q load column bound is not d_head");
+    } else {
+      return no("Q load mask has a term that is not a row or column bound");
+    }
+  }
+  if (!mVal)
+    return no("Q load mask has no row bound");
+  if (!isKernelArg(mVal))
+    return no("query row count is not a kernel argument");
+  if (qMask.size() != 2)
+    return no("Q load mask is not (row < M) & (d < d_head)");
 
   auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
   mark(yield);
@@ -11776,7 +11976,7 @@ bool FaTemplate::verify() {
   if (!isNegInfF(forOp.getInitArgs()[maxIdx]))
     return no("running max does not start at -inf");
 
-  // --- m_new = maxnumf(reduce_max(Sm), m_carried)
+  // --- m_new = maxnumf(reduce_max(<masked logits>), m_carried)
   mlir::Value maxNew = yield.getOperand(maxIdx);
   mlir::Operation *maxOp = maxNew.getDefiningOp();
   mark(maxOp);
@@ -11788,36 +11988,49 @@ bool FaTemplate::verify() {
   else
     return no("running max does not fold the loop-carried max");
 
-  mlir::Value sMasked;
-  if (!matchReduce(rowMax, /*wantMax=*/true, sMasked))
+  mlir::Value maxIn;
+  if (!matchReduce(rowMax, /*wantMax=*/true, maxIn))
     return no("block max is not tt.reduce(max, axis=1)");
 
-  // --- Sm = select(bounds, S*scale, -inf). This is the gate that rejects any
-  // extra mask term (band, causal, ...) or a non--inf fill.
-  auto sel = peel(sMasked).getDefiningOp<mlir::arith::SelectOp>();
-  if (!sel)
-    return no("reduced logits are not a masked select");
-  mark(sel);
-  if (!isNegInfF(sel.getFalseValue()))
-    return no("masked-out logits are not filled with -inf");
-  if (!maskIs(sel.getCondition(), {{Idx::Row, nVal}, {Idx::Key, nVal}}))
-    return no("softmax mask is not exactly (row < N) & (key < N)");
+  // The max may be taken over a masked copy of the logits. Its mask set only
+  // has to be a SUBSET of the effective softmax mask: a term the source omits
+  // can only raise `m`, and the online softmax divides by its own running sum,
+  // so acc/sum are invariant under any shift of `m`. (The emitter always masks
+  // with the full set, which is the numerically better choice.)
+  llvm::SmallVector<Term, 4> maxMask;
+  maxIn = peel(maxIn);
+  if (auto selM = maxIn.getDefiningOp<mlir::arith::SelectOp>()) {
+    if (!isNegFill(selM.getFalseValue()))
+      return no("masked-out logits are not filled with -inf or a negative constant");
+    if (!collectMask(selM.getCondition(), maxMask))
+      return no("running-max mask is not a conjunction of recognized bounds");
+    mark(selM);
+    maxIn = peel(selM.getTrueValue());
+  }
 
-  // --- S*scale
-  auto mulS = peel(sel.getTrueValue()).getDefiningOp<mlir::arith::MulFOp>();
-  if (!mulS)
-    return no("logits are not <dot> * scale");
-  mark(mulS);
-  mlir::Value dotAv, scaleScalar;
-  for (int i = 0; i < 2; ++i)
-    if (mlir::Value s = splatSrc(mulS->getOperand(i))) {
-      scaleScalar = s;
-      dotAv = mulS->getOperand(1 - i);
-    }
-  if (!scaleScalar)
-    return no("logit scale is not a splat scalar");
-  if (!matchScale(scaleScalar))
-    return no("logit scale is not 1/sqrt(d_head)");
+  // --- the scaled logits, in either spelling:
+  //   A: dot * splat(1/sqrt(d_head))     B: dot / splat(sqrt(d_head))
+  mlir::Value scaledDot = maxIn;
+  mlir::Value dotAv;
+  if (auto mulS = scaledDot.getDefiningOp<mlir::arith::MulFOp>()) {
+    mark(mulS);
+    for (int i = 0; i < 2; ++i)
+      if (mlir::Value s = splatSrc(mulS->getOperand(i))) {
+        if (!matchRecipSqrtWidth(s))
+          return no("logit scale is not 1/sqrt(d_head)");
+        dotAv = mulS->getOperand(1 - i);
+      }
+    if (!dotAv)
+      return no("logit scale is not a splat scalar");
+  } else if (auto divS = scaledDot.getDefiningOp<mlir::arith::DivFOp>()) {
+    mark(divS);
+    mlir::Value s = splatSrc(divS.getRhs());
+    if (!s || !matchSqrtWidth(s))
+      return no("logit divisor is not sqrt(d_head)");
+    dotAv = divS.getLhs();
+  } else {
+    return no("logits are not a dot scaled by 1/sqrt(d_head)");
+  }
 
   // --- S = dot(Q, K^T, 0)
   auto dotA = peel(dotAv).getDefiningOp<mlir::triton::DotOp>();
@@ -11841,16 +12054,36 @@ bool FaTemplate::verify() {
     return no("K is not loaded inside the loop");
   mark(kLd);
 
-  // --- sum' = fma(sum, scaler, reduce_add(P))
-  auto fmaSum = yield.getOperand(sumIdx).getDefiningOp<mlir::math::FmaOp>();
-  if (!fmaSum)
-    return no("running sum update is not a math.fma");
-  mark(fmaSum);
-  if (fmaSum->getOperand(0) != iterSum)
-    return no("running sum fma does not scale the carried sum");
-  mlir::Value scaler = fmaSum->getOperand(1);
+  // --- sum' = fma(sum, scaler, R)  |  addf(mulf(sum, scaler), R)
+  mlir::Value sumNew = yield.getOperand(sumIdx);
+  mlir::Value scaler, sumR;
+  if (auto fmaSum = sumNew.getDefiningOp<mlir::math::FmaOp>()) {
+    mark(fmaSum);
+    if (fmaSum->getOperand(0) != iterSum)
+      return no("running sum update does not rescale the carried sum");
+    scaler = fmaSum->getOperand(1);
+    sumR = fmaSum->getOperand(2);
+  } else if (auto addSum = sumNew.getDefiningOp<mlir::arith::AddFOp>()) {
+    mark(addSum);
+    for (int i = 0; i < 2 && !scaler; ++i) {
+      auto mul = addSum->getOperand(i).getDefiningOp<mlir::arith::MulFOp>();
+      if (!mul)
+        continue;
+      for (int j = 0; j < 2; ++j)
+        if (mul->getOperand(j) == iterSum) {
+          mark(mul);
+          scaler = mul->getOperand(1 - j);
+          sumR = addSum->getOperand(1 - i);
+        }
+    }
+    if (!scaler)
+      return no("running sum update does not rescale the carried sum");
+  } else {
+    return no("running sum update is neither math.fma nor mul+add");
+  }
+
   mlir::Value pV;
-  if (!matchReduce(fmaSum->getOperand(2), /*wantMax=*/false, pV))
+  if (!matchReduce(sumR, /*wantMax=*/false, pV))
     return no("softmax denominator is not tt.reduce(add, axis=1)");
 
   // --- scaler = exp(m_old - m_new)
@@ -11863,8 +12096,23 @@ bool FaTemplate::verify() {
     return no("rescale factor is not exp(m_old - m_new)");
   mark(subS);
 
-  // --- P = exp(Sm - lift(m_new))
-  auto expP = peel(pV).getDefiningOp<mlir::math::ExpOp>();
+  // --- P. Two spellings, unified by collecting the masks that zero it:
+  //   A: exp(select(mask, S, -inf) - lift(m))     (masked -inf exponentiates to 0)
+  //   B: select(mask2, select(mask1, exp(S - lift(m)), 0), 0)
+  // The union must be exactly the effective softmax mask, because the emitter
+  // writes `p = (in bounds && in band) ? exp(...) : 0` into the P tile that
+  // feeds the second matmul.
+  llvm::SmallVector<Term, 4> pMask;
+  mlir::Value pInner = peel(pV);
+  while (auto selP = pInner.getDefiningOp<mlir::arith::SelectOp>()) {
+    if (!isZeroF(selP.getFalseValue()))
+      break;
+    if (!collectMask(selP.getCondition(), pMask))
+      return no("softmax numerator mask is not a conjunction of recognized bounds");
+    mark(selP);
+    pInner = peel(selP.getTrueValue());
+  }
+  auto expP = pInner.getDefiningOp<mlir::math::ExpOp>();
   if (!expP)
     return no("softmax numerator is not math.exp");
   mark(expP);
@@ -11872,27 +12120,56 @@ bool FaTemplate::verify() {
   if (!subP)
     return no("softmax numerator is not exp(S - m)");
   mark(subP);
-  if (peel(subP.getLhs()) != sel.getResult())
-    return no("softmax numerator does not exponentiate the masked logits");
   if (peel(subP.getRhs()) != maxNew)
     return no("softmax numerator is not shifted by the new running max");
+  mlir::Value pLhs = peel(subP.getLhs());
+  if (auto selIn = pLhs.getDefiningOp<mlir::arith::SelectOp>()) {
+    // Only an -inf fill zeroes the exponential; a finite fill would leave a
+    // nonzero contribution the emitter does not reproduce.
+    if (!isNegInfF(selIn.getFalseValue()))
+      return no("logits fed to exp are masked with a finite fill");
+    if (!collectMask(selIn.getCondition(), pMask))
+      return no("softmax numerator mask is not a conjunction of recognized bounds");
+    mark(selIn);
+    pLhs = peel(selIn.getTrueValue());
+  }
+  if (pLhs != scaledDot)
+    return no("softmax numerator does not exponentiate the scaled logits");
 
   // --- acc' = fma(acc, lift(scaler), dot(P, V, 0))
-  auto fmaAcc = yield.getOperand(accIdx).getDefiningOp<mlir::math::FmaOp>();
-  if (!fmaAcc)
-    return no("accumulator update is not a math.fma");
-  mark(fmaAcc);
-  if (fmaAcc->getOperand(0) != iterAcc)
-    return no("accumulator fma does not scale the carried accumulator");
-  if (peel(fmaAcc->getOperand(1)) != scaler)
-    return no("accumulator is not rescaled by exp(m_old - m_new)");
-  auto dotB = peel(fmaAcc->getOperand(2)).getDefiningOp<mlir::triton::DotOp>();
-  if (!dotB)
-    return no("accumulator increment is not a tt.dot");
+  //          | dot(P, V, mulf(acc, lift(scaler)))
+  mlir::Value accNew = yield.getOperand(accIdx);
+  mlir::triton::DotOp dotB;
+  if (auto fmaAcc = accNew.getDefiningOp<mlir::math::FmaOp>()) {
+    mark(fmaAcc);
+    if (fmaAcc->getOperand(0) != iterAcc)
+      return no("accumulator update does not rescale the carried accumulator");
+    if (peel(fmaAcc->getOperand(1)) != scaler)
+      return no("accumulator is not rescaled by exp(m_old - m_new)");
+    dotB = peel(fmaAcc->getOperand(2)).getDefiningOp<mlir::triton::DotOp>();
+    if (!dotB)
+      return no("accumulator increment is not a tt.dot");
+    if (!isZeroF(dotB.getC()))
+      return no("PV dot does not accumulate from 0");
+  } else if (auto d = peel(accNew).getDefiningOp<mlir::triton::DotOp>()) {
+    dotB = d;
+    auto mulAcc = peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
+    if (!mulAcc)
+      return no("PV dot does not accumulate onto the rescaled accumulator");
+    mark(mulAcc);
+    bool ok = false;
+    for (int i = 0; i < 2; ++i)
+      if (mulAcc->getOperand(i) == iterAcc &&
+          peel(mulAcc->getOperand(1 - i)) == scaler)
+        ok = true;
+    if (!ok)
+      return no("accumulator is not rescaled by exp(m_old - m_new)");
+  } else {
+    return no("accumulator update is neither math.fma nor a dot with a rescaled C");
+  }
   mark(dotB);
-  if (!isZeroF(dotB.getC()))
-    return no("PV dot does not accumulate from 0");
-  if (peel(dotB.getA()) != expP.getResult())
+  if (peel(dotB.getA()) != expP.getResult() &&
+      peel(dotB.getA()) != peel(pV))
     return no("PV dot A operand is not the softmax numerator");
   auto vLd = peel(dotB.getB()).getDefiningOp<mlir::triton::LoadOp>();
   if (!vLd || vLd->getBlock() != body)
@@ -11903,6 +12180,17 @@ bool FaTemplate::verify() {
   if (qLd != expectQ || kLd != expectK || vLd != expectV)
     return no("role walk reached different loads than the operand resolution");
 
+  // --- the effective softmax mask the emitter implements.
+  llvm::SmallVector<Term, 4> want{{Idx::Row, mVal}, {Idx::Key, nVal}};
+  if (windowVal)
+    want.push_back({Idx::Window, windowVal});
+  if (!setEq(pMask, want))
+    return no("softmax numerator mask is not exactly the bounds (and band) mask");
+  if (!isSubsetOf(maxMask, want))
+    return no("running-max mask is not a subset of the softmax mask");
+  if (!isKernelArg(windowVal) && windowVal)
+    return no("band width is not a kernel argument");
+
   // --- addresses: base + major*d_model + head column.
   if (!matchAddress(qLd.getPtr(), Idx::Row, qPtr))
     return no("Q address is not base + row*d_model + col");
@@ -11911,11 +12199,8 @@ bool FaTemplate::verify() {
   if (!matchAddress(vLd.getPtr(), Idx::Key, vPtr))
     return no("V address is not base + key*d_model + col");
 
-  // --- masks: exactly (major < N) & (d < d_head), matching the emitter's
-  // staged-load guards. `other` must be 0 (the emitter zero-fills).
-  if (!qLd.getMask() ||
-      !maskIs(qLd.getMask(), {{Idx::Row, nVal}, {Idx::FeatBase, dHeadVal}}))
-    return no("Q load mask is not (row < N) & (d < d_head)");
+  // --- load masks: exactly (major < bound) & (d < d_head), matching the
+  // emitter's staged-load guards. `other` must be 0 (the emitter zero-fills).
   if (!kLd.getMask() ||
       !maskIs(kLd.getMask(), {{Idx::Key, nVal}, {Idx::FeatBase, dHeadVal}}))
     return no("K load mask is not (key < N) & (d < d_head)");
@@ -11940,8 +12225,8 @@ bool FaTemplate::verify() {
   if (!matchAddress(store.getPtr(), Idx::Row, oPtr))
     return no("store address is not base + row*d_model + col");
   if (!store.getMask() ||
-      !maskIs(store.getMask(), {{Idx::Row, nVal}, {Idx::FeatBase, dHeadVal}}))
-    return no("store mask is not (row < N) & (d < d_head)");
+      !maskIs(store.getMask(), {{Idx::Row, mVal}, {Idx::FeatBase, dHeadVal}}))
+    return no("store mask is not (row < M) & (d < d_head)");
 
   // --- COVERAGE. This is the gate that generalizes: anything the role walk
   // did not reach is an op the emitter does not implement.
@@ -12025,19 +12310,25 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   // check the source — and the emitter's buffer lookup has no way to report a
   // miss, so a non-kernel-arg operand becomes a SILENT wrong answer (it
   // resolves to buffer 0, i.e. the kernel reads its own Q pointer as the
-  // sequence length).
+  // sequence length). See metal-sliding-window-attention-plan.md §1a/§1b.
   mlir::Block &entryBlk = funcOp.getBody().front();
   auto isKernelArg = [&entryBlk](mlir::Value v) {
     auto ba = mlir::dyn_cast_or_null<mlir::BlockArgument>(v);
     return ba && ba.getOwner() == &entryBlk;
   };
 
-  // (5b) `d_head = d_model / h`. NOT "the function's unique arith.divsi" — that
-  // proxy also matches `tl.cdiv(N, BLOCK_N)` (whose operands are `N + BN - 1`
-  // and a constant), which is how the sliding-window kernel came to bind
-  // d_model/h to garbage. Pin the divsi to its role instead: both operands
-  // kernel args, AND the result feeding the per-head column offset
-  // `pid1 * d_head`. Require the role match to be unique.
+  // (5b) `d_head = d_model / h`, when the grid splits heads. NOT "the
+  // function's unique arith.divsi" — that proxy also matches
+  // `tl.cdiv(N, BLOCK_N)` (whose operands are `N + BN - 1` and a constant),
+  // which is exactly how the sliding-window kernel used to bind d_model/h to
+  // garbage. Pin the divsi to its role instead: both operands kernel args, AND
+  // the result feeding the per-head column offset `pid1 * d_head`. Require the
+  // role match to be unique.
+  //
+  // A kernel with no head dimension (1-D grid, features are the whole row) has
+  // no such divsi at all; that is legal and `h` is left off the FA op. The
+  // template verifier below then recovers d_head from the `d < d_head` load
+  // mask and checks that grid dim y really is unused.
   mlir::arith::DivSIOp dhead;
   bool ambiguousDhead = false;
   funcOp.walk([&](mlir::arith::DivSIOp d) {
@@ -12062,22 +12353,20 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
       ambiguousDhead = true;
     dhead = d;
   });
-  if (!dhead || ambiguousDhead)
+  if (ambiguousDhead)
     return mlir::failure();
 
-  // (6) resolve kernel-arg pointers / scalars. `unwrapPtrToKernelArg` returns
-  // its INPUT unchanged when the walk dead-ends, so a null check proves
-  // nothing — every result goes through `isKernelArg`.
+  // (6) resolve kernel-arg pointers. `unwrapPtrToKernelArg` returns its INPUT
+  // unchanged when the walk dead-ends, so a null check proves nothing — every
+  // result goes through `isKernelArg`. The scalar operands (m/n/d_model/h/
+  // window) are resolved and checked by the template verifier, which is the
+  // only thing that knows which mask each bound came from.
   mlir::Value qPtr = unwrapPtrToKernelArg(qLoad.getPtr());
   mlir::Value kPtr = unwrapPtrToKernelArg(kLoad.getPtr());
   mlir::Value vPtr = unwrapPtrToKernelArg(vLoad.getPtr());
   mlir::Value oPtr = unwrapPtrToKernelArg(store.getPtr());
-  mlir::Value nVal = forOp.getUpperBound();
-  mlir::Value dModelVal = dhead.getLhs();
-  mlir::Value hVal = dhead.getRhs();
   if (!isKernelArg(qPtr) || !isKernelArg(kPtr) || !isKernelArg(vPtr) ||
-      !isKernelArg(oPtr) || !isKernelArg(nVal) || !isKernelArg(dModelVal) ||
-      !isKernelArg(hVal))
+      !isKernelArg(oPtr))
     return mlir::failure();
 
   // (7) block sizes from tensor shapes. acc = [BM, BD]; dotA result = [BM, BN].
@@ -12099,19 +12388,18 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
   if (tgFloats > 8192)
     return mlir::failure();
 
-  // (7a) The shape checks above are necessary but nowhere near sufficient —
-  // they say nothing about what the loop COMPUTES. Verify the whole body
-  // against the flash-attention template and require every op in it to be
-  // claimed by a role. See the FaTemplate comment block.
+  // (7a) Phase B: the shape checks above are necessary but nowhere near
+  // sufficient — they say nothing about what the loop COMPUTES. Verify the
+  // whole body against the flash-attention template and require every op in it
+  // to be claimed by a role. See the FaTemplate comment block.
   FaTemplate tmpl;
+  tmpl.funcOp = funcOp;
   tmpl.forOp = forOp;
   tmpl.entry = &entryBlk;
   tmpl.BM = BM;
   tmpl.BN = BN;
   tmpl.BD = BD;
-  tmpl.nVal = nVal;
-  tmpl.dModelVal = dModelVal;
-  tmpl.dHeadVal = dhead.getResult();
+  tmpl.dheadDivsi = dhead;
   tmpl.qPtr = qPtr;
   tmpl.kPtr = kPtr;
   tmpl.vPtr = vPtr;
@@ -12134,20 +12422,31 @@ static mlir::LogicalResult tryFlashAttentionLoop(mlir::scf::ForOp forOp) {
     return mlir::failure();
   }
 
-  // (8) build metal.flash_attention before the loop.
+  // (8) build metal.flash_attention before the loop. Every scalar operand came
+  // out of the template verifier, which proved it is a kernel argument playing
+  // the role the emitter will assume — `h` and `window` are left off when the
+  // kernel has no head split / no band mask.
   mlir::OpBuilder builder(forOp);
   auto loc = forOp.getLoc();
   auto f32 = builder.getF32Type();
-  auto ui32Elem = wrapperElementType(nVal.getType());
+  auto ui32Elem = wrapperElementType(tmpl.nVal.getType());
   mlir::Value qBuf = bridgePtrToMemref(builder, loc, qPtr, f32);
   mlir::Value kBuf = bridgePtrToMemref(builder, loc, kPtr, f32);
   mlir::Value vBuf = bridgePtrToMemref(builder, loc, vPtr, f32);
   mlir::Value oBuf = bridgePtrToMemref(builder, loc, oPtr, f32);
-  mlir::Value nBuf = bridgePtrToMemref(builder, loc, nVal, ui32Elem);
-  mlir::Value dmBuf = bridgePtrToMemref(builder, loc, dModelVal, ui32Elem);
-  mlir::Value hBuf = bridgePtrToMemref(builder, loc, hVal, ui32Elem);
+  mlir::Value mBuf = bridgePtrToMemref(builder, loc, tmpl.mVal, ui32Elem);
+  mlir::Value nBuf = bridgePtrToMemref(builder, loc, tmpl.nVal, ui32Elem);
+  mlir::Value dmBuf = bridgePtrToMemref(builder, loc, tmpl.dModelVal, ui32Elem);
+  mlir::Value hBuf =
+      tmpl.hVal ? bridgePtrToMemref(builder, loc, tmpl.hVal, ui32Elem)
+                : mlir::Value();
+  mlir::Value wBuf =
+      tmpl.windowVal
+          ? bridgePtrToMemref(builder, loc, tmpl.windowVal, ui32Elem)
+          : mlir::Value();
   auto faOp = mlir::triton::metal::FlashAttentionOp::create(
-      builder, loc, qBuf, kBuf, vBuf, oBuf, nBuf, dmBuf, hBuf, BM, BN, BD);
+      builder, loc, qBuf, kBuf, vBuf, oBuf, mBuf, nBuf, dmBuf, hBuf, wBuf, BM,
+      BN, BD);
 
   // (9) DCE the now-dead loop / epilogue / loads / offset arithmetic in the
   // func entry block: everything except the new FA op + terminator becomes

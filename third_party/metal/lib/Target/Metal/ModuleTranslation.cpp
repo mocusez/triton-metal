@@ -1825,6 +1825,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
       // a kernel that reads its own Q pointer as an integer and silently
       // computes garbage. Fail the translation instead. The matcher-side gate
       // is tryFlashAttentionLoop step (5a); this is the backstop.
+      // See metal-sliding-window-attention-plan.md §1b.
       op.emitError() << "metal.flash_attention: operand does not resolve to a "
                         "kernel buffer (matcher bound a non-kernel-arg value); "
                         "refusing to emit";
@@ -1835,10 +1836,26 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   };
   const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
                     V = bufName(op.getV()), O = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
   const std::string N = bufName(op.getN()) + "[0]";
   const std::string DM = bufName(op.getDModel()) + "[0]";
-  const std::string H = bufName(op.getH()) + "[0]";
+  // Optional: absent `h` means no head split (d_head == d_model, column offset
+  // 0); absent `window` means full attention.
+  const bool hasHeads = op.getH() != nullptr;
+  const bool hasWindow = op.getWindow() != nullptr;
+  const std::string H = hasHeads ? bufName(op.getH()) + "[0]" : std::string();
+  const std::string W =
+      hasWindow ? bufName(op.getWindow()) + "[0]" : std::string();
   auto S = [](int64_t x) { return std::to_string(x); };
+  // Band predicate for a (query row, key) pair. Signed on purpose: the window
+  // arrives through a `device uint32_t*` buffer, and comparing the unsigned
+  // difference of two uints would turn any negative offset into a huge positive
+  // one — i.e. silently widen the band to everything.
+  auto inWin = [&](const char *row, const std::string &key) {
+    return hasWindow ? "abs((int)" + std::string(row) + " - (int)(" + key +
+                           ")) <= _fa_win"
+                     : std::string("true");
+  };
 
   auto &os = _output;
   os << "\n  // ---- metal.flash_attention (online softmax, simdgroup dots) ----\n";
@@ -1854,17 +1871,25 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "  {\n";
   os << "  uint _fa_lane = ltid.x & 31u;\n";
   os << "  bool _fa_active = ltid.x < 32u;\n";
+  os << "  uint _fa_M = " << M << ";\n";
   os << "  uint _fa_N = " << N << ";\n";
   os << "  uint _fa_dm = " << DM << ";\n";
-  os << "  uint _fa_dhead = " << DM << " / " << H << ";\n";
-  os << "  uint _fa_coloff = tgid.y * _fa_dhead;\n";
+  if (hasHeads) {
+    os << "  uint _fa_dhead = " << DM << " / " << H << ";\n";
+    os << "  uint _fa_coloff = tgid.y * _fa_dhead;\n";
+  } else {
+    os << "  uint _fa_dhead = _fa_dm;\n";
+    os << "  uint _fa_coloff = 0u;\n";
+  }
+  if (hasWindow)
+    os << "  int _fa_win = (int)" << W << ";\n";
   os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
   os << "  float _fa_scale = 1.0f / sqrt((float)_fa_dhead);\n";
   // load Q + zero-init accumulator/state
   os << "  if (_fa_active) {\n";
   os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
   os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint row = _fa_rowoff + q;\n";
-  os << "      _fa_qbuf[c] = (row < _fa_N && d < _fa_dhead) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
+  os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dhead) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   os << "    if (_fa_lane < " << S(BM) << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
@@ -1904,18 +1929,26 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   // `q` runs over all 32 lanes but every per-row buffer below is sized by BM
   // (_fa_rmax/_fa_rsum: BM floats; _fa_pbuf: BM*BN; _fa_obuf: BM*BD). BM == 32
   // happens to be in bounds; BM < 32 writes past the end of every one of them.
-  // Guard on `q < BM` FIRST — `row < _fa_N` does not imply it. The Q-load /
+  // Guard on `q < BM` FIRST — `row < _fa_M` does not imply it. The Q-load /
   // rmax-init block above is already lane-guarded; this mirrors it.
-  os << "      if (q < " << S(BM) << "u && row < _fa_N) {\n";
+  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
   os << "        float m_cur = -INFINITY;\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk)\n";
-  os << "          if (kb + kk < _fa_N) m_cur = max(m_cur, _fa_sbuf[q*" << S(BN) << "u + kk] * _fa_scale);\n";
+  os << "          if (kb + kk < _fa_N && (" << inWin("row", "kb + kk")
+     << ")) m_cur = max(m_cur, _fa_sbuf[q*" << S(BN) << "u + kk] * _fa_scale);\n";
   os << "        float m_old = _fa_rmax[q];\n";
   os << "        float m_new = max(m_old, m_cur);\n";
-  os << "        float scaler = exp(m_old - m_new);\n";
+  // With a window, a whole key block can fall outside the band, leaving
+  // m_cur == -inf; if m_old is also -inf (every earlier block was outside too)
+  // then exp(-inf - -inf) is exp(NaN) = NaN and it poisons the row's running
+  // sum and accumulator for good. Nothing to rescale in that case, so use 1.
+  // Unreachable without a window (row < M && kb < N implies kk == 0 is in
+  // range, so m_cur is finite) — but the guard is free and correct either way.
+  os << "        float scaler = (m_old == m_new) ? 1.0f : exp(m_old - m_new);\n";
   os << "        float denom = 0.0f;\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
-  os << "          float p = (kb + kk < _fa_N) ? exp(_fa_sbuf[q*" << S(BN) << "u + kk]*_fa_scale - m_new) : 0.0f;\n";
+  os << "          float p = (kb + kk < _fa_N && (" << inWin("row", "kb + kk")
+     << ")) ? exp(_fa_sbuf[q*" << S(BN) << "u + kk]*_fa_scale - m_new) : 0.0f;\n";
   os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
   os << "        }\n";
   os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
@@ -1947,7 +1980,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   // epilogue: O = obuf / run_sum, masked store
   os << "  if (_fa_active) {\n";
   os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
-  os << "    if (q < " << S(BM) << "u && row < _fa_N) {\n"; // see BM<32 note above
+  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n"; // see BM<32 note above
   os << "      float denom = _fa_rsum[q];\n";
   os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
   os << "      for (uint d = 0; d < _fa_dhead; ++d)\n";  // d_head <= BD; skip padded cols

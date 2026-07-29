@@ -643,34 +643,49 @@ def SdpaOp : Metal_Op<"sdpa"> {
 // FlashAttentionOp
 //===----------------------------------------------------------------------===//
 
-def FlashAttentionOp : Metal_Op<"flash_attention"> {
+def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
   let summary = "Fused online-softmax flash attention (Q@K^T -> softmax -> P@V)";
   let description = [{
-    Self-contained flash-attention kernel body for one query-row block of one
-    head. Grid: (cdiv(seqlen, BM), num_heads). Both matmuls run on simdgroup
-    hardware (Q/K^T/V/P tiles staged in threadgroup, `simdgroup_load` reads them
-    directly); the online softmax + O accumulator + running max/sum live in the
-    threadgroup scalar domain, so per-row rescale and row max/sum never touch the
-    opaque simdgroup_matrix lane layout. Bit-close to
-    torch.scaled_dot_product_attention (Phase-0 spike).
+    Self-contained flash-attention kernel body for one query-row block (of one
+    head, when the grid splits heads). Grid: (cdiv(m, bm)[, num_heads]). Both
+    matmuls run on simdgroup hardware (Q/K^T/V/P tiles staged in threadgroup,
+    `simdgroup_load` reads them directly); the online softmax + O accumulator +
+    running max/sum live in the threadgroup scalar domain, so per-row rescale
+    and row max/sum never touch the opaque simdgroup_matrix lane layout.
+    Bit-close to torch.scaled_dot_product_attention (Phase-0 spike).
 
-    Operands are kernel-argument buffers: q/k/v/out are `[seqlen, d_model]`
-    row-major device f32; n/d_model/h are the runtime scalar args
-    (d_head = d_model/h, scale = 1/sqrt(d_head)). Attributes: bm/bn the
-    query/key block sizes, bd the per-head width (== d_head). bm/bn/bd multiples
+    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
+    f32 with row stride `d_model`; `m` is the query-row count and `n` the key
+    count (they may be the same value); `scale = 1/sqrt(d_head)`.
+
+    `h` is OPTIONAL. Present: the grid's y dimension selects a head, so
+    `d_head = d_model / h` and the column offset is `tgid.y * d_head`. Absent:
+    there is no head split, `d_head = d_model`, and the column offset is 0. It
+    is optional rather than "pass a constant 1" because a constant has no kernel
+    buffer to point at — see metal-sliding-window-attention-plan.md §1b for what
+    happens when an operand does not resolve to one.
+
+    `window` is OPTIONAL. Present: a sliding-window band mask
+    `|row - key| <= window` is applied to both the running max and the softmax
+    numerator, so out-of-band keys contribute nothing. Absent: full attention.
+
+    Attributes: bm/bn the query/key block sizes, bd the per-head tile width
+    (>= d_head; padded columns are masked by `d < d_head`). bm/bn/bd multiples
     of 8; bm <= 32 (one query row per lane). The FA body runs on one warp; under
     num_warps>1 the extra warps idle but still reach every threadgroup_barrier.
   }];
 
   let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
                        Metal_MemRefType:$v, Metal_MemRefType:$out,
-                       Metal_MemRefType:$n, Metal_MemRefType:$d_model,
-                       Metal_MemRefType:$h,
+                       Metal_MemRefType:$m, Metal_MemRefType:$n,
+                       Metal_MemRefType:$d_model,
+                       Optional<Metal_MemRefType>:$h,
+                       Optional<Metal_MemRefType>:$window,
                        I64Attr:$bm, I64Attr:$bn, I64Attr:$bd);
 
   let assemblyFormat =
-      "$q `,` $k `,` $v `,` $out `,` $n `,` $d_model `,` $h attr-dict"
-      " `:` type(operands)";
+      "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_model"
+      " (`heads` $h^)? (`window` $window^)? attr-dict `:` type(operands)";
 }
 
 //===----------------------------------------------------------------------===//
