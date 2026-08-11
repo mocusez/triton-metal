@@ -1,17 +1,31 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
 //
-// Phase 2: the online-softmax flash-attention loop (Q@K^T -> masked softmax ->
-// P@V with running max/sum rescaling) from leet-triton/hard-mult_head_attention.py
-// is recognized by tryFlashAttentionLoop and collapsed — loop + divide epilogue
-// + masked store — into a single metal.flash_attention op BEFORE the cvt
-// classifier (so the dot-B operand convert_layouts never hit the L1d3 reject).
-// bm=bn=BLOCKSIZE_N=32, bd=d_head=16. See metal-flash-attention-plan.md.
+// The online-softmax flash-attention loop (Q@K^T -> masked softmax -> P@V with
+// running max/sum rescaling) from leet-triton/hard-mult_head_attention.py is
+// collapsed -- loop + divide epilogue + masked store -- into a single
+// metal.fused_attention op BEFORE the cvt classifier, so the dot-B operand
+// convert_layouts never hit the L1d3 reject.
+//
+// bm=bn=BLOCKSIZE_N=32, bd=d_head=16. `heads` is present: the grid's y
+// dimension selects a head, and d_head is derived as d_model / h in the emitter
+// rather than read from a buffer -- a head-split kernel COMPUTES its per-head
+// width, so there is no kernel argument for it to point at.
+//
+// `softmax_natural_exp` is load-bearing and not cosmetic: this kernel scales by
+// plain 1/sqrt(d_head) and exponentiates base-e, while a kernel that folds
+// log2(e) into its scale uses exp2. The region has already produced the logit
+// by the time the emitter sees it, so the base cannot be corrected after the
+// fact.
 //
 // CHECK: metal.kernel mha_kernel
-// CHECK: metal.flash_attention
+// CHECK: metal.fused_attention
 // CHECK-SAME: bd = 16
 // CHECK-SAME: bm = 32
 // CHECK-SAME: bn = 32
+// CHECK-SAME: norm = 1
+// CHECK-SAME: softmax_natural_exp
+// CHECK: ^bb0(%{{.*}}: f32, %{{.*}}: si32, %{{.*}}: si32
+// CHECK: metal.score_yield
 // The whole loop / dots / softmax reduces / convert_layouts are gone.
 // CHECK-NOT: tt.dot
 // CHECK-NOT: tt.reduce

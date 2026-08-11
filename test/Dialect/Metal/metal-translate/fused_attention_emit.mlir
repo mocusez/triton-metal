@@ -51,6 +51,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    metal.kernel head_split_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dm: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>, %h: !metal.memref<? x ui32>):
+      metal.fused_attention %q, %k, %v, %o, %m, %n, %dm strides %sq, %sk, %sv, %so heads %h {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32, softmax_natural_exp} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
+      ^bb0(%score: f32, %row: si32, %key: si32):
+        %scale = metal.constant 2.500000e-01 : f32
+        %scaled = metal.binary_exp %score, %scale, mulOp : (f32, f32) -> f32
+        metal.score_yield %scaled : f32
+      }
+      metal.return
+    }
   }
 }
 
@@ -94,3 +104,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: _fa_rsum[q] = _fa_rsum[q]*scaler + denom
 // CHECK: simdgroup_multiply_accumulate
 // CHECK: / denom
+
+// --- head-split kernel: `heads` present, so the per-head feature width is
+// DERIVED (`d_model / h`) rather than read from a buffer, and the feature
+// column is offset by the grid's y dimension. A head-split Triton kernel
+// computes `d_head = d_model // h` itself, so there is no kernel argument for a
+// d_head buffer to point at -- carrying `h` and dividing here is what let this
+// family be claimed at all (it moved the parity bar 10 -> 24 on its own).
+// CHECK-LABEL: kernel void head_split_kernel
+// CHECK: uint3 tgid {{\[\[}}threadgroup_position_in_grid]]
+// CHECK: uint3 ltid {{\[\[}}thread_position_in_threadgroup]]
+// CHECK: uint _fa_dh = v6[0] / v11[0];
+// CHECK: uint _fa_col = tgid.y * _fa_dh;
+// The padded feature columns d >= d_head must stage as zero, or the head slice
+// bleeds into its neighbour.
+// CHECK: _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? v0[row * _fa_sq + _fa_col + d] : 0.0f;
+//
+// `softmax_natural_exp` picks base-e. It is not cosmetic: a kernel that folds
+// log2(e) into its scale uses exp2 instead, and the region has already produced
+// the logit, so the emitter cannot rescale after the fact.
+// CHECK: float scaler = (m_old == m_new) ? 1.0f : exp(m_old - m_new);
+// CHECK-NOT: exp2(

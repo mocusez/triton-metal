@@ -647,66 +647,6 @@ def SdpaOp : Metal_Op<"sdpa"> {
 }
 
 //===----------------------------------------------------------------------===//
-// FlashAttentionOp
-//===----------------------------------------------------------------------===//
-
-def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
-  let summary = "Fused online-softmax flash attention (Q@K^T -> softmax -> P@V)";
-  let description = [{
-    Self-contained flash-attention kernel body for one query-row block (of one
-    head, when the grid splits heads). Grid: (cdiv(m, bm)[, num_heads]). Both
-    matmuls run on simdgroup hardware (Q/K^T/V/P tiles staged in threadgroup,
-    `simdgroup_load` reads them directly); the online softmax + O accumulator +
-    running max/sum live in the threadgroup scalar domain, so per-row rescale
-    and row max/sum never touch the opaque simdgroup_matrix lane layout.
-    Bit-close to torch.scaled_dot_product_attention (Phase-0 spike).
-
-    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
-    f32 with row stride `d_model`; `m` is the query-row count and `n` the key
-    count (they may be the same value); `scale = 1/sqrt(d_head)`.
-
-    `h` is OPTIONAL. Present: the grid's y dimension selects a head, so
-    `d_head = d_model / h` and the column offset is `tgid.y * d_head`. Absent:
-    there is no head split, `d_head = d_model`, and the column offset is 0. It
-    is optional rather than "pass a constant 1" because a constant has no kernel
-    buffer to point at — see metal-sliding-window-attention-plan.md §1b for what
-    happens when an operand does not resolve to one.
-
-    `window` is OPTIONAL. Present: a sliding-window band mask
-    `|row - key| <= window` is applied to both the running max and the softmax
-    numerator, so out-of-band keys contribute nothing. Absent: full attention,
-    UNLESS `window_const` is set — Triton drops a kernel argument equal to 1
-    from the signature and folds it into a `dense<1>` constant, so a band of
-    width 1 has no buffer to point at and arrives as the attribute instead.
-    At most one of the two may be set.
-
-    Attributes: bm/bn the query/key block sizes, bd the per-head tile width
-    (>= d_head; padded columns are masked by `d < d_head`). bm/bn/bd multiples
-    of 8; bm <= 32 (one query row per lane). The FA body runs on one warp; under
-    num_warps>1 the extra warps idle but still reach every threadgroup_barrier.
-
-    The threadgroup working set is `3*bm*bd + 2*bd*bn + 2*bm*bn + 2*bm` floats
-    and must fit Apple's 32 KiB, i.e. 8192 floats. The matcher checks this and
-    declines rather than emitting an over-budget kernel, so e.g. a `d_head`
-    above 64 (bd >= 128, ~10.8k floats) falls through to the general path and
-    its hard error. That is the practical ceiling on head width.
-  }];
-
-  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
-                       Metal_MemRefType:$v, Metal_MemRefType:$out,
-                       Metal_MemRefType:$m, Metal_MemRefType:$n,
-                       Metal_MemRefType:$d_model,
-                       Optional<Metal_MemRefType>:$h,
-                       Optional<Metal_MemRefType>:$window,
-                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
-                       OptionalAttr<I64Attr>:$window_const);
-
-  let assemblyFormat =
-      "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_model"
-      " (`heads` $h^)? (`window` $window^)? attr-dict `:` type(operands)";
-}
-
-//===----------------------------------------------------------------------===//
 // SinkAttentionOp
 //===----------------------------------------------------------------------===//
 
@@ -721,8 +661,9 @@ def SinkAttentionOp : Metal_Op<"sink_attention", [AttrSizedOperandSegments]> {
 
     i.e. causal, with the first `S` tokens always visible plus a one-sided
     sliding window of width `W`. This is NOT the symmetric band
-    `abs(row - key) <= window` that `metal.flash_attention` implements, and the
-    key set is not a contiguous block range, which is why it is a separate op.
+    `abs(row - key) <= window` of a plain sliding window, and the key set is not
+    a contiguous block range, which is why it is still a separate op: the key
+    PHASES have to be reproduced, not proven equivalent to a single sweep.
 
     The emitted body walks keys ONE AT A TIME with one query row per lane and
     updates the online-softmax state per key, so it needs no S/P staging and no
@@ -745,7 +686,7 @@ def SinkAttentionOp : Metal_Op<"sink_attention", [AttrSizedOperandSegments]> {
     Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
     f32 with per-tensor row strides `stride_q`/`stride_k`/`stride_v`/`stride_o`
     (this kernel passes four separate stride arguments, so they cannot be folded
-    into one `d_model` the way `metal.flash_attention` does). `m` is the query
+    into one `d_model`). `m` is the query
     row count AND the key count. `scale` is an f32 buffer holding the logit
     scale with `log2(e)` already folded in by the host — the softmax uses
     `exp2`, so the emitter must NOT recompute `1/sqrt(d_head)`.
@@ -811,8 +752,8 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
   let description = [{
     Self-contained attention body for one query-row block, generalizing the
     `dot -> elementwise -> dot` chain that every attention-family Triton kernel
-    compiles to. Replaces the per-variant ops (`metal.flash_attention`,
-    `metal.sink_attention`), whose semantics were baked into hand-printed MSL
+    compiles to. Replaced `metal.flash_attention` (deleted) and is intended to
+    replace `metal.sink_attention`, whose semantics were baked into hand-printed MSL
     and therefore needed a NEW op — matcher and emitter both — for every new
     masking or weighting scheme.
 

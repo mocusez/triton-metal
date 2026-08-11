@@ -7,18 +7,21 @@ dimension (1D grid), separate M/N kernel args, a `range(0, cdiv(N, BLOCK_N))`
 loop instead of `range(0, N, BLOCK_N)`, and `S / sqrt(d)` instead of
 `S * (1/sqrt(d_head))`.
 
-STATUS: supported since Phase C/D of metal-sliding-window-attention-plan.md.
-`metal.flash_attention` grew an optional `window` operand (band predicate
-`|row - key| <= window` on both the running max and the softmax numerator, plus
-a `m_old == m_new` guard so a fully-out-of-band block does not turn
-`exp(-inf - -inf)` into a NaN that poisons the row) and an optional `h`
-(absent => no head split, `d_head == d_model`, column offset 0). The matcher
-learned the cdiv loop form, the `S / sqrt(d)` scale spelling, the two-level
-addptr addressing, the `select`-to-zero numerator chain, the mul+add
-accumulation spelling, and separate M/N bounds.
+STATUS: supported by `metal.fused_attention`. The band mask is NOT an operand
+and not a mode -- it is ordinary arithmetic inside the op's score region,
+`select(|row - key| <= window, s, -inf)`, absorbed from the source kernel's own
+`tl.where`. The emitter's NaN guards (`m_old == m_new`, and `-inf` logits) are
+what keep a fully-out-of-band block from turning `exp(-inf - -inf)` into a NaN
+that poisons the row.
 
-The history is worth keeping in view. Before Phase A, `tryFlashAttentionLoop`
-claimed this kernel on structural head-counts alone — 3 iter_args / 2 dots /
+This was first supported by a dedicated `window` operand on
+`metal.flash_attention`; that op is deleted. Getting here also needed the cdiv
+loop form, the `S / sqrt(d)` scale spelling, the two-level addptr addressing,
+the `select`-to-zero numerator chain, the mul+add accumulation spelling, and
+separate M/N bounds.
+
+The history is worth keeping in view. The deleted `metal.flash_attention`'s
+matcher once claimed this kernel on structural head-counts alone — 3 iter_args / 2 dots /
 2 reduces / one trans / 1 store / 1 divsi, all satisfied by coincidence — and
 emitted plain full attention with the window mask dropped and `N`/`d_model`/`h`
 bound to the function's `tl.cdiv` divsi instead of kernel args. Those bindings
@@ -138,8 +141,11 @@ def _reference(Q, K, V, M, d, window_size):
         (64, 16, 0),    # diagonal only; denom == 1 for every row
         (64, 16, 1),    # tridiagonal. Triton drops an argument equal to 1 from
                         # the kernel signature and folds it into a `dense<1>`
-                        # constant, so this band width arrives as the op's
-                        # `window_const` attribute, not as a buffer operand.
+                        # constant. Under the fused op that needs no special
+                        # handling at all -- a folded scalar is just a
+                        # `metal.constant` in the score region, which is what
+                        # retired the `Optional<operand> + *_const attribute`
+                        # pair the predecessor op carried per parameter.
         (64, 16, 2),    # the smallest band that still comes through as an arg
         (32, 16, 64),   # window >= N -> degenerates to full attention
         (128, 16, 3),   # window < BLOCK_N -> whole key blocks fall outside the

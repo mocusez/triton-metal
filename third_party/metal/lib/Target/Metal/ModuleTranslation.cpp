@@ -272,17 +272,11 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   // kernel body references it (via metal.threadgroup_id). This keeps
   // existing single-program fixtures' MSL signatures unchanged. See
   // `.omc/specs/deep-interview-metal-pid-lowering.md`.
-  // metal.flash_attention needs the threadgroup position (program id) AND the
-  // LOCAL thread index: the single-warp guard must key off
+  // The attention ops need the threadgroup position (program id) AND the LOCAL
+  // thread index: the single-warp guard must key off
   // thread_position_in_threadgroup, since thread_position_in_grid is global and
   // would mis-identify the 2nd query block's warp (Phase-0 finding).
   bool usesFlashAttention = false;
-  op.walk([&](mlir::triton::metal::FlashAttentionOp) {
-    usesFlashAttention = true;
-    return mlir::WalkResult::interrupt();
-  });
-  // metal.sink_attention has the same needs (threadgroup position for the query
-  // block, local thread index for the single-warp guard).
   op.walk([&](mlir::triton::metal::SinkAttentionOp) {
     usesFlashAttention = true;
     return mlir::WalkResult::interrupt();
@@ -358,7 +352,6 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
@@ -407,7 +400,6 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
@@ -1825,211 +1817,6 @@ static void emitMaxSumBody(llvm::raw_ostream &os, int curIndent,
   os << "normalizer = simd_sum(normalizer);";
 }
 
-void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
-  // Emits the Phase-0-validated flash-attention body: two matmuls on simdgroup
-  // hardware (Q/K^T/V/P tiles staged in threadgroup, read via simdgroup_load),
-  // the online softmax + O accumulator + running max/sum in the threadgroup
-  // scalar domain. Runs on ONE warp (guard `_fa_active = ltid.x < 32`); idle
-  // warps under num_warps>1 still reach every threadgroup_barrier (barriers are
-  // OUTSIDE the guard). See metal-flash-attention-phase0-spike.py.
-  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
-  const int64_t mT = BM / 8, nT = BN / 8, dT = BD / 8;
-  const int64_t SZ_Q = BM * BD, SZ_KTV = BD * BN, SZ_S = BM * BN;
-
-  auto bufName = [&](mlir::Value m) -> std::string {
-    // Walk conversion casts to the kernel buffer. A pointer arg resolves
-    // directly to its memref block-arg; a scalar arg (n/d_model/h) is
-    // materialized post-conversion as get_element(buffer[0]) — follow that to
-    // the underlying buffer memref so it resolves to v<i> (read as v<i>[0]),
-    // not v0. Without this, _buffers[...] misses and operator[] yields 0.
-    for (;;) {
-      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-        if (cast.getInputs().size() != 1)
-          break;
-        m = cast.getInputs()[0];
-      }
-      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
-        m = ge.getMemref();
-        continue;
-      }
-      break;
-    }
-    auto it = _buffers.find(m.getAsOpaquePointer());
-    if (it == _buffers.end()) {
-      // NEVER fall back to buffer 0. An operand that does not resolve to a
-      // kernel buffer means the matcher bound a computed value (or a constant)
-      // where a kernel argument was required; emitting `v0[0]` for it produces
-      // a kernel that reads its own Q pointer as an integer and silently
-      // computes garbage. Fail the translation instead. The matcher-side gate
-      // is tryFlashAttentionLoop step (5a); this is the backstop.
-      // See metal-sliding-window-attention-plan.md §1b.
-      op.emitError() << "metal.flash_attention: operand does not resolve to a "
-                        "kernel buffer (matcher bound a non-kernel-arg value); "
-                        "refusing to emit";
-      _emitFailed = true;
-      return "<unresolved>";
-    }
-    return "v" + std::to_string(it->second);
-  };
-  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
-                    V = bufName(op.getV()), O = bufName(op.getOut());
-  const std::string M = bufName(op.getM()) + "[0]";
-  const std::string N = bufName(op.getN()) + "[0]";
-  const std::string DM = bufName(op.getDModel()) + "[0]";
-  // Optional: absent `h` means no head split (d_head == d_model, column offset
-  // 0); absent `window` means full attention.
-  const bool hasHeads = op.getH() != nullptr;
-  const bool hasWindow =
-      op.getWindow() != nullptr || op.getWindowConst().has_value();
-  const std::string H = hasHeads ? bufName(op.getH()) + "[0]" : std::string();
-  const std::string W =
-      op.getWindow() ? bufName(op.getWindow()) + "[0]" : std::string();
-  auto S = [](int64_t x) { return std::to_string(x); };
-  // Band predicate for a (query row, key) pair. Signed on purpose: the window
-  // arrives through a `device uint32_t*` buffer, and comparing the unsigned
-  // difference of two uints would turn any negative offset into a huge positive
-  // one — i.e. silently widen the band to everything.
-  auto inWin = [&](const char *row, const std::string &key) {
-    return hasWindow ? "abs((int)" + std::string(row) + " - (int)(" + key +
-                           ")) <= _fa_win"
-                     : std::string("true");
-  };
-
-  auto &os = _output;
-  os << "\n  // ---- metal.flash_attention (online softmax, simdgroup dots) ----\n";
-  os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
-  os << "  threadgroup float _fa_ktbuf[" << S(SZ_KTV) << "];\n";
-  os << "  threadgroup float _fa_vbuf[" << S(SZ_KTV) << "];\n";
-  os << "  threadgroup float _fa_sbuf[" << S(SZ_S) << "];\n";
-  os << "  threadgroup float _fa_pbuf[" << S(SZ_S) << "];\n";
-  os << "  threadgroup float _fa_obuf[" << S(SZ_Q) << "];\n";
-  os << "  threadgroup float _fa_otbuf[" << S(SZ_Q) << "];\n";
-  os << "  threadgroup float _fa_rmax[" << S(BM) << "];\n";
-  os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
-  os << "  {\n";
-  os << "  uint _fa_lane = ltid.x & 31u;\n";
-  os << "  bool _fa_active = ltid.x < 32u;\n";
-  os << "  uint _fa_M = " << M << ";\n";
-  os << "  uint _fa_N = " << N << ";\n";
-  os << "  uint _fa_dm = " << DM << ";\n";
-  if (hasHeads) {
-    os << "  uint _fa_dhead = " << DM << " / " << H << ";\n";
-    os << "  uint _fa_coloff = tgid.y * _fa_dhead;\n";
-  } else {
-    os << "  uint _fa_dhead = _fa_dm;\n";
-    os << "  uint _fa_coloff = 0u;\n";
-  }
-  if (op.getWindowConst())
-    os << "  int _fa_win = " << *op.getWindowConst() << ";\n";
-  else if (hasWindow)
-    os << "  int _fa_win = (int)" << W << ";\n";
-  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
-  os << "  float _fa_scale = 1.0f / sqrt((float)_fa_dhead);\n";
-  // load Q + zero-init accumulator/state
-  os << "  if (_fa_active) {\n";
-  os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
-  os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint row = _fa_rowoff + q;\n";
-  os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dhead) ? " << Q << "[row * _fa_dm + _fa_coloff + d] : 0.0f;\n";
-  os << "      _fa_obuf[c] = 0.0f;\n";
-  os << "    }\n";
-  os << "    if (_fa_lane < " << S(BM) << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
-  os << "  }\n";
-  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // main loop over key blocks
-  os << "  for (uint kb = 0; kb < _fa_N; kb += " << S(BN) << "u) {\n";
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
-  os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN) << "u; uint kk = kb + key;\n";
-  os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dhead) ? " << K << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
-  os << "      }\n";
-  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
-  os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD) << "u; uint kk = kb + key;\n";
-  os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dhead) ? " << V << "[kk * _fa_dm + _fa_coloff + d] : 0.0f;\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // Dot A: S = Q @ K^T
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
-  os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
-  os << "        simdgroup_float8x8 acc(0.0f);\n";
-  os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
-  os << "          simdgroup_float8x8 a, b;\n";
-  os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD) << "u + ki*8u], " << S(BD) << ");\n";
-  os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
-  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "        }\n";
-  os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // online softmax (one query row per lane)
-  os << "    if (_fa_active) {\n";
-  os << "      uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
-  // `q` runs over all 32 lanes but every per-row buffer below is sized by BM
-  // (_fa_rmax/_fa_rsum: BM floats; _fa_pbuf: BM*BN; _fa_obuf: BM*BD). BM == 32
-  // happens to be in bounds; BM < 32 writes past the end of every one of them.
-  // Guard on `q < BM` FIRST — `row < _fa_M` does not imply it. The Q-load /
-  // rmax-init block above is already lane-guarded; this mirrors it.
-  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
-  os << "        float m_cur = -INFINITY;\n";
-  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk)\n";
-  os << "          if (kb + kk < _fa_N && (" << inWin("row", "kb + kk")
-     << ")) m_cur = max(m_cur, _fa_sbuf[q*" << S(BN) << "u + kk] * _fa_scale);\n";
-  os << "        float m_old = _fa_rmax[q];\n";
-  os << "        float m_new = max(m_old, m_cur);\n";
-  // With a window, a whole key block can fall outside the band, leaving
-  // m_cur == -inf; if m_old is also -inf (every earlier block was outside too)
-  // then exp(-inf - -inf) is exp(NaN) = NaN and it poisons the row's running
-  // sum and accumulator for good. Nothing to rescale in that case, so use 1.
-  // Unreachable without a window (row < M && kb < N implies kk == 0 is in
-  // range, so m_cur is finite) — but the guard is free and correct either way.
-  os << "        float scaler = (m_old == m_new) ? 1.0f : exp(m_old - m_new);\n";
-  os << "        float denom = 0.0f;\n";
-  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
-  os << "          float p = (kb + kk < _fa_N && (" << inWin("row", "kb + kk")
-     << ")) ? exp(_fa_sbuf[q*" << S(BN) << "u + kk]*_fa_scale - m_new) : 0.0f;\n";
-  os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
-  os << "        }\n";
-  os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
-  os << "        _fa_rmax[q] = m_new;\n";
-  os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*" << S(BD) << "u + d] *= scaler;\n";
-  os << "      } else if (q < " << S(BM) << "u) {\n";
-  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*" << S(BN) << "u + kk] = 0.0f;\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // Dot B: O_tile = P @ V
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
-  os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
-  os << "        simdgroup_float8x8 acc(0.0f);\n";
-  os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
-  os << "          simdgroup_float8x8 a, b;\n";
-  os << "          simdgroup_load(a, &_fa_pbuf[(mi*8u)*" << S(BN) << "u + ki*8u], " << S(BN) << ");\n";
-  os << "          simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BD) << "u + di*8u], " << S(BD) << ");\n";
-  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "        }\n";
-  os << "        simdgroup_store(acc, &_fa_otbuf[(mi*8u)*" << S(BD) << "u + di*8u], " << S(BD) << ");\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "    if (_fa_active) { for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "  }\n";
-  // epilogue: O = obuf / run_sum, masked store
-  os << "  if (_fa_active) {\n";
-  os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
-  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n"; // see BM<32 note above
-  os << "      float denom = _fa_rsum[q];\n";
-  os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
-  os << "      for (uint d = 0; d < _fa_dhead; ++d)\n";  // d_head <= BD; skip padded cols
-  os << "        " << O << "[row * _fa_dm + _fa_coloff + d] = _fa_obuf[q*" << S(BD) << "u + d] * inv;\n";
-  os << "    }\n";
-  os << "  }\n";
-  os << "  }";
-}
-
 void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
   // Emits the Phase-0-validated sink-attention body: one query row per lane,
   // keys walked one at a time, online-softmax state updated PER KEY. No S/P
@@ -2041,7 +1828,7 @@ void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
   const int64_t SZ_Q = BM * BD;
 
   auto bufName = [&](mlir::Value m) -> std::string {
-    // Same walk as metal.flash_attention: through conversion casts and a
+    // The usual operand walk: through conversion casts and a
     // post-conversion `get_element(buffer[0])` to the underlying buffer.
     for (;;) {
       while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
@@ -2057,9 +1844,10 @@ void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
     }
     auto it = _buffers.find(m.getAsOpaquePointer());
     if (it == _buffers.end()) {
-      // NEVER fall back to buffer 0 — see the FlashAttentionOp note above. The
-      // matcher-side gate is trySinkAttention's kernel-arg check; this is the
-      // backstop.
+      // NEVER fall back to buffer 0: `bufName`'s silent buffer-v0 fallback is
+      // how a mis-bound operand turns into a kernel that reads Q[0][0] as its
+      // sequence length and writes nothing. The matcher-side gate is
+      // trySinkAttention's kernel-arg check; this is the backstop.
       op.emitError() << "metal.sink_attention: operand does not resolve to a "
                         "kernel buffer (matcher bound a non-kernel-arg value); "
                         "refusing to emit";
@@ -2250,7 +2038,7 @@ std::string ModuleTranslation::emitScoreRegion_(
 
 // Simdgroup body: both matmuls on the matrix unit, with the score transform
 // coming from the op's region instead of the hard-coded scale+mask+softmax that
-// `metal.flash_attention` bakes in. The staged S tile is exactly where a
+// a per-variant emitter would bake in. The staged S tile is exactly where a
 // per-(row, key) transform belongs — the row and key indices are both in hand
 // there — which is what makes one emitter able to serve every variant.
 //
@@ -2320,7 +2108,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
   // `d_head` holds the FULL feature width when a head split is present — a
   // head-split kernel computes `d_model / h` rather than being passed it, so
   // the quotient has no buffer to point at. Same contract as
-  // metal.flash_attention's `_fa_dhead = DM / H`.
+  // the head-split kernel's own `d_head = d_model // h`.
   if (op.getH())
     os << "  uint _fa_dh = " << DH << " / " << bufName(op.getH()) << "[0];\n";
   else
@@ -2495,7 +2283,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
       3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
       (op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax ? 2 * BM
                                                                     : 0);
-  // 8192 floats == Apple's 32 KiB, the same limit metal.flash_attention uses.
+  // 8192 floats == Apple's 32 KiB.
   // Safe to spend in full here because the op replaces the ENTIRE kernel body,
   // so nothing else in the kernel holds threadgroup memory.
   const bool fits = need <= 8192 && BM % 8 == 0 && BN % 8 == 0 && BD % 8 == 0;
@@ -2513,7 +2301,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   //
   // The query-row block is chunked so the threadgroup working set fits Apple's
   // 32 KiB rather than being capped by `bm` (the ceiling that forced
-  // `metal.flash_attention` to decline `bm > 32` and `d_head > 64` outright).
+  // the predecessor op to decline `bm > 32` and `d_head > 64` outright).
   const int64_t BM = op.getBm(), BD = op.getBd();
   const bool softmax =
       op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
@@ -2580,7 +2368,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   // `d_head` holds the FULL feature width when a head split is present — a
   // head-split kernel computes `d_model / h` rather than being passed it, so
   // the quotient has no buffer to point at. Same contract as
-  // metal.flash_attention's `_fa_dhead = DM / H`.
+  // the head-split kernel's own `d_head = d_model // h`.
   if (op.getH())
     os << "  uint _fa_dh = " << DH << " / " << bufName(op.getH()) << "[0];\n";
   else

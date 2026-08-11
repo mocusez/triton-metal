@@ -125,7 +125,6 @@ private:
   void translate(mlir::triton::metal::SoftmaxOp op);
   void translate(mlir::triton::metal::LogsumexpOp op);
   void translate(mlir::triton::metal::SdpaOp op);
-  void translate(mlir::triton::metal::FlashAttentionOp op);
   void translate(mlir::triton::metal::SinkAttentionOp op);
   void translate(mlir::triton::metal::FusedAttentionOp op);
   // The two bodies behind `metal.fused_attention`, mirroring the dialect's

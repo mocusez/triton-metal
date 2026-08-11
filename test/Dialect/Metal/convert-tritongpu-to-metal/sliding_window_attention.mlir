@@ -1,13 +1,17 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
 //
-// Phase C/D: the sliding-window self-attention loop from
+// The sliding-window self-attention loop from
 // leet-triton/hard-sliding_window_self_attention.py is recognized and collapsed
-// into one metal.flash_attention carrying a `window` operand. Compared with the
-// multi-head kernel in flash_attention.mlir it differs in six independent ways,
-// each of which the matcher had to learn:
+// into one metal.fused_attention. The band mask is not an operand and not a
+// mode: it is ORDINARY ARITHMETIC INSIDE THE SCORE REGION, which is the whole
+// point of the op -- a new masking scheme costs a cone-table entry, not a new
+// op with a new matcher and a new hand-printed body.
+//
+// Compared with the multi-head kernel in flash_attention.mlir it differs in six
+// independent ways, each of which the matcher had to learn:
 //
 //   1. band mask   `|offset_m - offset_n| <= window_size`
-//                  (arith.subi -> math.absi -> arith.cmpi sle) -> `window %arg7`
+//                  (arith.subi -> math.absi -> arith.cmpi sle) -> region
 //   2. no heads    1-D grid, no `pid1 * d_head` column offset, so `heads` is
 //                  ABSENT and d_head == d_model == the `d` kernel arg
 //   3. loop form   `range(0, cdiv(N, BLOCK_N))` with step 1 and key offset
@@ -17,16 +21,35 @@
 //   6. algebra     `select`-to-zero numerator chain and `mul`+`add` /
 //                  dot-with-rescaled-C accumulation instead of `math.fma`
 //
-// M and N are separate kernel args here, so the op takes both (%arg4, %arg5).
+// M and N are separate kernel args here, so the op takes both.
 //
 // CHECK: metal.kernel attention
-// CHECK: metal.flash_attention
-// CHECK-SAME: window
+// CHECK: metal.fused_attention
 // CHECK-SAME: bd = 16
 // CHECK-SAME: bm = 16
 // CHECK-SAME: bn = 16
+// CHECK-SAME: norm = 1
 // No `heads` operand: this kernel has no head dimension.
 // CHECK-NOT: heads
+//
+// The band mask has to REACH THE REGION. Checking only that the kernel
+// collapsed would pass just as happily on a body that dropped the mask and
+// computed full attention -- which is exactly what the predecessor op did, at
+// max abs err 0.95-2.4, for six commits before anyone noticed.
+// `abs(row - key)` has no unary form in the dialect, so it lowers to
+// `select(d < 0, 0 - d, d)`, and the masked-out logit is -inf (0xFF800000).
+// CHECK: ^bb0(%[[SCORE:.*]]: f32, %[[ROW:.*]]: si32, %[[KEY:.*]]: si32
+// CHECK: metal.unary_exp %{{.*}}, sqrtOp
+// CHECK: metal.binary_exp %[[SCORE]], %{{.*}}, divOp
+// CHECK: %[[DIFF:.*]] = metal.binary_exp %[[ROW]], %[[KEY]], subOp
+// CHECK: metal.binary_exp %{{.*}}, %[[DIFF]], subOp
+// CHECK: metal.binary_exp %[[DIFF]], %{{.*}}, ltOp
+// CHECK: %[[ABS:.*]] = arith.select
+// CHECK: metal.binary_exp %[[ABS]], %{{.*}}, leOp
+// CHECK: metal.constant 0xFF800000
+// CHECK: arith.select
+// CHECK: metal.score_yield
+//
 // The whole loop / dots / softmax reduces / band mask / convert_layouts are gone.
 // CHECK-NOT: tt.dot
 // CHECK-NOT: tt.reduce

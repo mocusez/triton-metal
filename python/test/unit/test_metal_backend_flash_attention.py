@@ -4,10 +4,15 @@ The verbatim leet-triton `hard-mult_head_attention.py` kernel: a `scf.for` over
 key blocks carrying (2D accumulator, running sum, running max) that does two
 `tl.dot`s (Q@K^T and P@V) with a masked online softmax in between. The matmul
 track can't absorb the second dot (its A operand is a computed `exp`, not a
-load), so `tryFlashAttentionLoop` (TritonGPUToMetal.cpp) recognizes the whole
-loop + divide epilogue + masked store and lowers it to one `metal.flash_attention`
-op, whose emitter renders the Phase-0-validated simdgroup body (both matmuls on
-simdgroup hardware; S/P/O + running state in the threadgroup scalar domain).
+load), so `tryFusedAttention` (TritonGPUToMetal.cpp) recognizes the whole loop +
+divide epilogue + masked store and lowers it to one `metal.fused_attention` op,
+whose emitter renders the simdgroup body (both matmuls on simdgroup hardware;
+S/P/O + running state in the threadgroup scalar domain).
+
+This suite used to back a dedicated `metal.flash_attention` op. That op is gone:
+this suite and the sliding-window one both reached parity on the generalized op,
+which was the deletion precondition -- an op is deletable when every suite it
+BACKS is at parity, not just the one named after it.
 
 Compared against `torch.scaled_dot_product_attention` per head. Envelope:
 BLOCKSIZE_N == 32, num_warps == 4 (matches the leet driver), tile dims multiples
@@ -281,7 +286,6 @@ def test_flash_attention_rejects_near_miss_kernels(variant, what):
         if isinstance(msl, bytes):
             msl = msl.decode()
         assert "metal.fused_attention" in msl
-        assert "metal.flash_attention" not in msl
 
     expected = _decoy_reference(Q, K, V, N, d_model, h, variant)
     err = (out.cpu() - expected).abs().max().item()
