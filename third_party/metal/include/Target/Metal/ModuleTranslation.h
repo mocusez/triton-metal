@@ -127,6 +127,22 @@ private:
   void translate(mlir::triton::metal::SdpaOp op);
   void translate(mlir::triton::metal::FlashAttentionOp op);
   void translate(mlir::triton::metal::SinkAttentionOp op);
+  void translate(mlir::triton::metal::FusedAttentionOp op);
+  // The two bodies behind `metal.fused_attention`, mirroring the dialect's
+  // existing `MatmulKind::Scalar|Mma` split: a simdgroup body for tiles whose
+  // working set fits threadgroup memory, and a per-key scalar body that is the
+  // correctness floor and always applies. `translate` picks between them.
+  void emitFusedAttentionScalar_(mlir::triton::metal::FusedAttentionOp op);
+  void emitFusedAttentionMma_(mlir::triton::metal::FusedAttentionOp op);
+  // Emits the op's score-transform region inline as a run of MSL let-bindings
+  // and returns the name holding the transformed score. `scoreExpr`/`rowExpr`/
+  // `keyExpr` are the MSL expressions the region's three pinned block args bind
+  // to. Emitted exactly once, inside the innermost (per-key) loop, so the
+  // bindings are scoped per iteration and need no per-call name uniquing.
+  std::string emitScoreRegion_(mlir::triton::metal::FusedAttentionOp op,
+                               llvm::StringRef scoreExpr,
+                               llvm::StringRef rowExpr, llvm::StringRef keyExpr,
+                               llvm::StringRef ind);
   void emitCausal_(mlir::triton::metal::SdpaOp op);
   void emitBoolMask_(mlir::triton::metal::SdpaOp op);
   void emitFloatMask_(mlir::triton::metal::SdpaOp op);

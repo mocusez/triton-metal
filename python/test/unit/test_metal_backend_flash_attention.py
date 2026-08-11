@@ -272,3 +272,26 @@ def test_flash_attention_rejects_near_miss_kernels(variant, what):
         f"maxerr {err:.3e}. It must either reject the kernel or implement the "
         "variant — see metal-sliding-window-attention-plan.md §4 Phase B."
     )
+
+
+# `N == BLOCKSIZE_N` (and `h == 1`, which Triton folds out of the signature) is
+# the shape the loop-anchored FA matcher cannot claim, so before
+# `metal.fused_attention` existed this was a hard
+# `convert-tritongpu-to-metal failed` — on the SAME kernel that compiles fine at
+# N=64. A single-block sweep is the degenerate case of every attention kernel,
+# so it is worth pinning separately from the parametrized sweep above.
+@pytest.mark.parametrize("N, d_model, h", [(32, 32, 1), (16, 16, 1), (32, 64, 2)])
+def test_flash_attention_single_key_block(N, d_model, h):
+    torch.manual_seed(0x5106 + N)
+    Q = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(N, d_model, dtype=torch.float32, device="mps").contiguous()
+
+    BLOCKSIZE_N = 32
+    BLOCKSIZE_d = max(16, d_model // h)
+    grid = (triton.cdiv(N, BLOCKSIZE_N), h)
+    mha_kernel[grid](Q, K, V, out, N, d_model, h, BLOCKSIZE_N, BLOCKSIZE_d, num_warps=4)
+
+    expected = _reference(Q, K, V, N, d_model, h)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)

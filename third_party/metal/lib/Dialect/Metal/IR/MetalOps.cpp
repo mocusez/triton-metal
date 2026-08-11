@@ -211,6 +211,77 @@ llvm::LogicalResult TgLoadIndexedOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// FusedAttentionOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult FusedAttentionOp::verify() {
+  // The block sizes reach the emitter as tile geometry; a non-positive or
+  // non-multiple-of-8 tile would silently mis-shape the simdgroup fragments.
+  for (auto [name, v] : {std::pair<const char *, int64_t>{"bm", getBm()},
+                         {"bn", getBn()},
+                         {"bd", getBd()}}) {
+    if (v <= 0)
+      return emitOpError() << name << " must be positive (got " << v << ")";
+    if (v % 8 != 0)
+      return emitOpError()
+             << name << " must be a multiple of 8 (got " << v << ")";
+  }
+
+  mlir::Block &body = getScore().front();
+  // (score, row, key) are pinned; every trailing arg is bound to element 0 of
+  // the correspondingly-positioned `score_params` buffer, so the counts and the
+  // element types have to line up exactly or the region would read a different
+  // scalar than the matcher resolved.
+  const unsigned kFixed = 3;
+  auto params = getScoreParams();
+  if (body.getNumArguments() != kFixed + params.size())
+    return emitOpError() << "score region must take " << kFixed << " + "
+                         << params.size() << " arguments (score, row, key, and "
+                         << "one per score_param), got "
+                         << body.getNumArguments();
+
+  auto f32 = mlir::Float32Type::get(getContext());
+  // SIGNED i32, not signless: `Metal_Type` has no plain I32, so a signless
+  // index could not feed `metal.binary_exp` at all. Signed rather than unsigned
+  // because `row - key` is meant to go negative — that difference is the whole
+  // content of a causal or decay mask.
+  auto si32 = mlir::IntegerType::get(getContext(), 32,
+                                     mlir::IntegerType::Signed);
+  if (body.getArgument(0).getType() != f32)
+    return emitOpError() << "score region arg 0 (score) must be f32, got "
+                         << body.getArgument(0).getType();
+  for (unsigned i = 1; i < kFixed; ++i)
+    if (body.getArgument(i).getType() != si32)
+      return emitOpError() << "score region arg " << i
+                           << " (" << (i == 1 ? "row" : "key")
+                           << ") must be si32, got "
+                           << body.getArgument(i).getType();
+
+  for (auto [i, p] : llvm::enumerate(params)) {
+    auto memRef = llvm::dyn_cast<MetalMemRefType>(p.getType());
+    if (!memRef)
+      return emitOpError() << "score_param " << i << " must be a !metal.memref";
+    mlir::Type want = memRef.getType();
+    mlir::Type got = body.getArgument(kFixed + i).getType();
+    if (want != got)
+      return emitOpError() << "score region arg " << (kFixed + i)
+                           << " type (" << got << ") must match score_param "
+                           << i << " element type (" << want << ")";
+  }
+
+  // The terminator is what the emitter reads back; SingleBlockImplicitTerminator
+  // guarantees its presence but not that the region actually computes an f32.
+  auto yield = llvm::dyn_cast<ScoreYieldOp>(body.getTerminator());
+  if (!yield)
+    return emitOpError() << "score region must end in metal.score_yield";
+  if (yield.getValue().getType() != f32)
+    return emitOpError() << "metal.score_yield must yield f32, got "
+                         << yield.getValue().getType();
+
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // Check Index
 //===----------------------------------------------------------------------===//
 
@@ -357,6 +428,7 @@ llvm::LogicalResult UnaryExpOp::verify() {
       return emitOpError() << "argument type must be signed integer or float";
     break;
   case OP::expOp:
+  case OP::exp2Op:
   case OP::sqrtOp:
   case OP::erfOp:
   case OP::logOp:
@@ -396,6 +468,7 @@ mlir::OpFoldResult UnaryExpOp::fold(FoldAdaptor adaptor) {
     return nullptr;
   }
   case mlir::triton::metal::UnaryExpOperator::expOp:
+  case mlir::triton::metal::UnaryExpOperator::exp2Op:
   case mlir::triton::metal::UnaryExpOperator::sqrtOp:
   case mlir::triton::metal::UnaryExpOperator::erfOp:
   case mlir::triton::metal::UnaryExpOperator::logOp:

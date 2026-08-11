@@ -14738,6 +14738,1115 @@ static void flattenUniformScanInputScfIf(mlir::ModuleOp moduleOp) {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Fused-attention matcher (generalized `dot -> score transform -> dot`).
+//===----------------------------------------------------------------------===//
+//
+// Recognizes the attention-family shape WITHOUT enumerating score shapes:
+//
+//   S      = dot(Qload, trans(Kload))
+//   W      = f(S, row, key)              <-- ABSORBED WHOLESALE into a region
+//   acc'   = dot(W, Vload, acc)
+//   out    = acc                         (norm = none)
+//
+// The predecessor matchers pinned one spelling of `f` each — plain softmax
+// (`tryFlashAttentionLoop`), causal+sinks+window (`trySinkAttention`) — and a
+// kernel whose `f` differed by so much as a band mask was either rejected or,
+// before the role-walk rewrite, silently miscompiled. Here `f` is not matched
+// at all: every op between the two dots is TRANSLATED into the op's score
+// region, and an op with no translation makes the whole match fail. Coverage is
+// therefore established by construction, and widening the supported set is a
+// change to one table (`emitConeScalar`) rather than a new op + matcher +
+// emitter.
+//
+// Store-anchored, not loop-anchored: `hard-mult_head_attention.py` at
+// N == BLOCKSIZE_N trips its key loop exactly once, Triton folds the `scf.for`
+// away, and a loop-anchored matcher has nothing to anchor on (that is the
+// kernel's N=32 hard failure).
+namespace {
+
+struct FusedAttnTemplate {
+  // --- inputs ---
+  mlir::triton::FuncOp funcOp;
+  mlir::Block *entry = nullptr;
+  mlir::triton::StoreOp store;
+  mlir::scf::ForOp forOp; // null when the trip-count-1 loop was folded away
+
+  // --- tile shape ---
+  int64_t BM = 0, BN = 0, BD = 0;
+
+  // --- resolved operands ---
+  mlir::Value qPtr, kPtr, vPtr, oPtr;
+  mlir::Value mVal, nVal, dHeadVal;
+  mlir::Value strideQ, strideK, strideV, strideO;
+  bool causalKeyBound = false;
+
+  // --- the two dots and the cone between them ---
+  mlir::triton::DotOp dotQK, dotPV;
+  mlir::Value scoreOut; // value feeding dotPV's A operand
+  // Cone leaves, bound to the region's block args in this order.
+  mlir::Value rowIdx, keyIdx;               // rank-2 index tensors
+  llvm::SmallVector<mlir::Value> params;    // scalar cone roots -> block args
+  // `d_head` when the feature column carries a `pid1*d_head` head offset.
+  mlir::Value headColScalar;
+  bool softmax = false;
+  bool naturalExp = false; // base-e rather than base-2 online softmax
+
+  const char *why = nullptr;
+  mlir::Operation *offender = nullptr;
+  llvm::DenseSet<mlir::Operation *> claimed;
+
+  bool no(const char *r) {
+    if (!why)
+      why = r;
+    return false;
+  }
+  void mark(mlir::Operation *op) {
+    if (op)
+      claimed.insert(op);
+  }
+  bool isKernelArg(mlir::Value v) const {
+    auto ba = mlir::dyn_cast_or_null<mlir::BlockArgument>(v);
+    return ba && ba.getOwner() == entry;
+  }
+
+  // Peel layout/shape plumbing, claiming each op on the way. These are all
+  // identity for a per-element view of the tensor.
+  mlir::Value peel(mlir::Value v) {
+    while (auto *def = v.getDefiningOp()) {
+      if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::BroadcastOp,
+                    mlir::triton::ExpandDimsOp>(def)) {
+        mark(def);
+        v = def->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return v;
+  }
+
+  mlir::Value splatSrc(mlir::Value v) {
+    v = peel(v);
+    auto sp = v.getDefiningOp<mlir::triton::SplatOp>();
+    if (!sp)
+      return {};
+    mark(sp);
+    return sp.getSrc();
+  }
+
+  static bool isIntConst(mlir::Value v, int64_t c) {
+    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!cst)
+      return false;
+    auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue());
+    return ia && ia.getInt() == c;
+  }
+
+  // A splat float constant matching `pred`. Used to tell the two rank-1
+  // iter_args apart by their INIT — running max starts at -inf, running sum at
+  // 0 — rather than by position, which would be a guess.
+  bool matchFpSplat(mlir::Value v,
+                    llvm::function_ref<bool(const llvm::APFloat &)> pred) {
+    v = peel(v);
+    if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>())
+      v = sp.getSrc();
+    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!cst)
+      return false;
+    if (auto f = mlir::dyn_cast<mlir::FloatAttr>(cst.getValue()))
+      return pred(f.getValue());
+    if (auto d = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue()))
+      return d.isSplat() && pred(d.getSplatValue<llvm::APFloat>());
+    return false;
+  }
+  bool isZeroSplat(mlir::Value v) {
+    return matchFpSplat(v, [](const llvm::APFloat &f) { return f.isZero(); });
+  }
+  bool isNegInfSplat(mlir::Value v) {
+    return matchFpSplat(v, [](const llvm::APFloat &f) {
+      return f.isInfinity() && f.isNegative();
+    });
+  }
+
+  // `tt.reduce` over `axis` whose combine body is exactly one op of type OpT.
+  template <typename OpT>
+  bool isReduce(mlir::triton::ReduceOp red, unsigned axis) {
+    if (!red || red.getAxis() != axis || red.getSrcs().size() != 1)
+      return false;
+    mlir::Block &cb = red.getCombineOp().front();
+    auto ops = cb.without_terminator();
+    if (std::distance(ops.begin(), ops.end()) != 1)
+      return false;
+    return mlir::isa<OpT>(&*ops.begin());
+  }
+
+  enum class Idx { None, Row, Key, Feat };
+
+  // Classify an index vector by the shape of its construction:
+  //   pid0*BM + arange(BM)  -> Row   (query row, absolute)
+  //   iv     + arange(BN)   -> Key   (key row; iv is the key loop's IV)
+  //   arange(BD)            -> Feat  (feature column)
+  // With the loop folded away the Key base is a plain 0 constant instead of the
+  // induction variable, which is the same index set for a single-block sweep.
+  Idx classifyIdx(mlir::Value v) {
+    v = peel(v);
+    if (auto mr = v.getDefiningOp<mlir::triton::MakeRangeOp>()) {
+      if (mr.getStart() != 0)
+        return Idx::None;
+      mark(mr);
+      if ((int64_t)mr.getEnd() == BD)
+        return Idx::Feat;
+      // A bare arange(BN) with no base is the folded-away single-block key set.
+      if (!forOp && (int64_t)mr.getEnd() == BN)
+        return Idx::Key;
+      return Idx::None;
+    }
+    auto add = v.getDefiningOp<mlir::arith::AddIOp>();
+    if (!add)
+      return Idx::None;
+    mlir::Value baseSide, rangeSide;
+    for (int i = 0; i < 2; ++i)
+      if (peel(add->getOperand(i)).getDefiningOp<mlir::triton::MakeRangeOp>()) {
+        rangeSide = peel(add->getOperand(i));
+        baseSide = add->getOperand(1 - i);
+      }
+    if (!rangeSide)
+      return Idx::None;
+    auto mr = rangeSide.getDefiningOp<mlir::triton::MakeRangeOp>();
+    if (mr.getStart() != 0)
+      return Idx::None;
+    int64_t len = (int64_t)mr.getEnd();
+    mlir::Value baseScalar = splatSrc(baseSide);
+    if (!baseScalar)
+      return Idx::None;
+    if (forOp && baseScalar == forOp.getInductionVar() && len == BN) {
+      mark(add);
+      mark(mr);
+      return Idx::Key;
+    }
+    if (auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>()) {
+      for (int i = 0; i < 2; ++i) {
+        auto pid =
+            mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
+        if (!pid)
+          continue;
+        if (pid.getAxisAsInt() == 0 &&
+            isIntConst(mul->getOperand(1 - i), BM) && len == BM) {
+          mark(add);
+          mark(mr);
+          mark(mul);
+          return Idx::Row;
+        }
+        // Head split: the grid's y dimension selects a head, so the feature
+        // column is `pid1*d_head + arange(BD)`. This survives even when Triton
+        // has folded `h == 1` away, which is why it is recognized by the pid
+        // axis rather than by the presence of a `divsi`.
+        if (pid.getAxisAsInt() == 1 && len == BD) {
+          mark(add);
+          mark(mr);
+          mark(mul);
+          headColScalar = mul->getOperand(1 - i);
+          return Idx::Feat;
+        }
+      }
+    }
+    return Idx::None;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Score-cone translation. This IS the absorb-or-decline test: an op reaches
+  // the region only if there is a Metal-dialect scalar form for it, so the
+  // matcher cannot accept a kernel the emitter would then mis-express.
+  //===--------------------------------------------------------------------===//
+
+  // Recognized leaves, resolved before the op walk.
+  bool isScoreRoot(mlir::Value v) { return peel(v) == dotQK.getResult(); }
+
+  // A loop-invariant SCALAR cone over kernel arguments. Kernel args become
+  // region parameters; everything else must be a translatable scalar op.
+  bool collectScalarCone(mlir::Value v, int depth) {
+    if (depth > 16)
+      return no("scalar parameter cone deeper than 16");
+    if (isKernelArg(v)) {
+      if (!v.getType().isF32() && !v.getType().isInteger(32))
+        return no("scalar parameter is neither f32 nor i32");
+      if (!llvm::is_contained(params, v))
+        params.push_back(v);
+      return true;
+    }
+    auto *def = v.getDefiningOp();
+    if (!def)
+      return no("scalar cone reaches a non-kernel block argument");
+    if (forOp && !def->getBlock()->findAncestorOpInBlock(*forOp.getOperation()) &&
+        forOp.getBodyRegion().isAncestor(def->getParentRegion()))
+      return no("scalar parameter cone is not loop-invariant");
+    if (mlir::isa<mlir::arith::ConstantOp>(def)) {
+      mark(def);
+      return true;
+    }
+    if (!mlir::isa<mlir::arith::MulFOp, mlir::arith::AddFOp, mlir::arith::SubFOp,
+                   mlir::arith::DivFOp, mlir::arith::AddIOp,
+                   mlir::arith::SubIOp, mlir::arith::MulIOp,
+                   mlir::arith::DivSIOp, mlir::arith::DivUIOp,
+                   mlir::arith::SIToFPOp, mlir::math::SqrtOp,
+                   mlir::math::ExpOp, mlir::math::Exp2Op>(def)) {
+      offender = def;
+      return no("scalar parameter cone op has no scalar translation");
+    }
+    mark(def);
+    for (mlir::Value o : def->getOperands())
+      if (!collectScalarCone(o, depth + 1))
+        return false;
+    return true;
+  }
+
+  // Walk the cone from `scoreOut` back to the dot result, collecting the leaves
+  // it reads. Fails on anything outside the translatable set.
+  bool collectCone(mlir::Value v, llvm::DenseSet<mlir::Operation *> &seen,
+                   int depth = 0) {
+    if (depth > 32)
+      return no("score cone deeper than 32");
+    v = peel(v);
+    if (v == dotQK.getResult())
+      return true;
+    // A splat of a kernel scalar becomes a region parameter.
+    if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>()) {
+      mark(sp);
+      // A kernel argument becomes a region parameter directly. Anything else
+      // must be a loop-INVARIANT scalar cone over kernel arguments — e.g.
+      // `1/sqrt(d_model)`, which hard-mult_head_attention.py computes in the
+      // kernel rather than passing in. Such a cone is re-emitted inside the
+      // region (it is uniform, so recomputing per key costs nothing) and only
+      // its kernel-arg leaves become parameters.
+      if (!collectScalarCone(sp.getSrc(), 0))
+        return false;
+      return true;
+    }
+    // An index tensor becomes the row or key block arg.
+    switch (classifyIdx(v)) {
+    case Idx::Row:
+      if (rowIdx && peel(rowIdx) != v)
+        return no("two different row index cones in the score transform");
+      rowIdx = v;
+      return true;
+    case Idx::Key:
+      if (keyIdx && peel(keyIdx) != v)
+        return no("two different key index cones in the score transform");
+      keyIdx = v;
+      return true;
+    case Idx::Feat:
+      return no("score transform depends on the feature index");
+    case Idx::None:
+      break;
+    }
+    auto *def = v.getDefiningOp();
+    if (!def)
+      return no("score cone reaches a block argument");
+    if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+      auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+      if (!dense || !dense.isSplat())
+        return no("score cone constant is not a splat");
+      mark(cst);
+      return true;
+    }
+    if (!mlir::isa<mlir::arith::MulFOp, mlir::arith::AddFOp, mlir::arith::SubFOp,
+                   mlir::arith::DivFOp, mlir::arith::MaxNumFOp,
+                   mlir::arith::MinNumFOp, mlir::arith::AddIOp,
+                   mlir::arith::SubIOp, mlir::arith::MulIOp,
+                   mlir::arith::CmpIOp, mlir::arith::CmpFOp,
+                   mlir::arith::SelectOp, mlir::arith::SIToFPOp,
+                   mlir::arith::AndIOp, mlir::arith::OrIOp,
+                   mlir::arith::XOrIOp, mlir::arith::DivSIOp,
+                   mlir::arith::DivUIOp, mlir::math::SqrtOp,
+                   mlir::math::Exp2Op, mlir::math::ExpOp>(def)) {
+      offender = def;
+      return no("score cone op has no scalar translation");
+    }
+    mark(def);
+    if (!seen.insert(def).second)
+      return true;
+    for (mlir::Value o : def->getOperands())
+      if (!collectCone(o, seen, depth + 1))
+        return false;
+    return true;
+  }
+};
+
+} // namespace
+
+namespace {
+
+// Element type of a possibly-tensor cone value. Cone ops are tensor-typed
+// (`tensor<BMxBNxi1>` etc.), so predicates on their scalar type must go through
+// this rather than testing the op's own type.
+static mlir::Type faElemTy(mlir::Type t) {
+  if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(t))
+    return rt.getElementType();
+  return t;
+}
+
+// Emit the Metal-dialect scalar form of a cone value into the score region.
+// `leaf` maps the cone's recognized leaves (dot result / row / key / params) to
+// the region's block arguments. Returns null if translation fails, which the
+// caller turns into a declined match.
+static mlir::Value
+emitConeScalar(mlir::OpBuilder &b, mlir::Location loc, mlir::Value v,
+               llvm::DenseMap<void *, mlir::Value> &leaf,
+               llvm::DenseMap<void *, mlir::Value> &memo, int depth = 0) {
+  if (depth > 32)
+    return {};
+  // Peel the layout/shape plumbing; per element these are all identity.
+  // `tt.splat` included: the cone's parameter leaves are keyed by the SCALAR
+  // the splat broadcasts (that is what becomes a region block arg), so stopping
+  // at the splat result would miss every lookup.
+  while (auto *def = v.getDefiningOp()) {
+    if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::BroadcastOp,
+                  mlir::triton::ExpandDimsOp, mlir::triton::SplatOp>(def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  if (auto it = leaf.find(v.getAsOpaquePointer()); it != leaf.end())
+    return it->second;
+  if (auto it = memo.find(v.getAsOpaquePointer()); it != memo.end())
+    return it->second;
+
+  auto si32 = mlir::IntegerType::get(b.getContext(), 32,
+                                     mlir::IntegerType::Signed);
+  auto f32 = b.getF32Type();
+  auto *def = v.getDefiningOp();
+  if (!def) {
+    if (::getenv("TRITON_METAL_FA_DEBUG"))
+      llvm::errs() << "[metal-fused-attn]   unbound cone leaf: " << v << "\n";
+    return {};
+  }
+
+  auto rec = [&](mlir::Value o) {
+    return emitConeScalar(b, loc, o, leaf, memo, depth + 1);
+  };
+  auto bin = [&](mlir::triton::metal::BinaryExpOperator kind, mlir::Value lhs,
+                 mlir::Value rhs) -> mlir::Value {
+    if (!lhs || !rhs)
+      return {};
+    // Reconcile integer signedness. The pinned index args are si32 while an
+    // integer kernel scalar is bridged with ui32 storage, so a perfectly
+    // ordinary bound check like `row < N` arrives with mismatched operand
+    // types. Both sides are small non-negative counts, so widening to signed
+    // is value-preserving — and it is what the source's `arith.cmpi slt` meant.
+    mlir::Type lt = lhs.getType(), rt = rhs.getType();
+    if (lt != rt && mlir::isa<mlir::IntegerType>(lt) &&
+        mlir::isa<mlir::IntegerType>(rt)) {
+      auto toSigned = [&](mlir::Value x) {
+        return x.getType() == si32
+                   ? x
+                   : mlir::triton::metal::CastOp::create(b, loc, si32, x)
+                         .getResult();
+      };
+      lhs = toSigned(lhs);
+      rhs = toSigned(rhs);
+    } else if (lt != rt) {
+      return {};
+    }
+    return mlir::triton::metal::BinaryExpOp::create(b, loc, kind, lhs, rhs)
+        .getResult();
+  };
+  auto un = [&](mlir::triton::metal::UnaryExpOperator kind,
+                mlir::Value x) -> mlir::Value {
+    if (!x)
+      return {};
+    return mlir::triton::metal::UnaryExpOp::create(b, loc, kind, x).getResult();
+  };
+
+  using BOP = mlir::triton::metal::BinaryExpOperator;
+  using UOP = mlir::triton::metal::UnaryExpOperator;
+  mlir::Value out;
+
+  if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+    // Both spellings occur: a tensor constant in the elementwise cone is a
+    // splat DenseElementsAttr, while a constant inside a loop-invariant SCALAR
+    // parameter cone (e.g. the `1.0` of `1.0/sqrt(d)`) is a plain Float/Integer
+    // attribute.
+    if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(cst.getValue()))
+      return memo[v.getAsOpaquePointer()] =
+                 mlir::triton::metal::ConstantOp::create(
+                     b, loc, b.getFloatAttr(f32, fa.getValueAsDouble()))
+                     .getResult();
+    if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+      return memo[v.getAsOpaquePointer()] =
+                 mlir::triton::metal::ConstantOp::create(
+                     b, loc, b.getIntegerAttr(si32, ia.getInt()))
+                     .getResult();
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      return {};
+    if (auto fa = mlir::dyn_cast<mlir::DenseFPElementsAttr>(dense))
+      out = mlir::triton::metal::ConstantOp::create(
+                b, loc, b.getFloatAttr(f32, fa.getSplatValue<llvm::APFloat>()
+                                                .convertToFloat()))
+                .getResult();
+    else if (auto ia = mlir::dyn_cast<mlir::DenseIntElementsAttr>(dense))
+      out = mlir::triton::metal::ConstantOp::create(
+                b, loc,
+                b.getIntegerAttr(si32,
+                                 ia.getSplatValue<llvm::APInt>().getSExtValue()))
+                .getResult();
+    else
+      return {};
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MulFOp>(def)) {
+    out = bin(BOP::mulOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::AddFOp>(def)) {
+    out = bin(BOP::addOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::SubFOp>(def)) {
+    out = bin(BOP::subOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::DivFOp>(def)) {
+    out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def)) {
+    out = bin(BOP::maxOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MinNumFOp>(def)) {
+    out = bin(BOP::minOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::AddIOp>(def)) {
+    out = bin(BOP::addOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::SubIOp>(def)) {
+    out = bin(BOP::subOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MulIOp>(def)) {
+    out = bin(BOP::mulOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::SIToFPOp>(def)) {
+    // The operand may arrive as ui32: kernel integer scalars are bridged with
+    // ui32 storage (signless i32 is not a Metal_Type), and metal.cast handles
+    // either signedness.
+    mlir::Value in = rec(op.getIn());
+    if (!in)
+      return {};
+    out = mlir::triton::metal::CastOp::create(b, loc, f32, in).getResult();
+  } else if (auto op = mlir::dyn_cast<mlir::arith::AndIOp>(def)) {
+    // i1 only: the score cone's ANDs are mask conjunctions. A wider bitwise AND
+    // would need `&`, not `&&`, so it is deliberately not accepted here.
+    // Test the ELEMENT type — every op in the cone is tensor-typed.
+    if (!faElemTy(op.getType()).isInteger(1))
+      return {};
+    out = bin(BOP::andOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::OrIOp>(def)) {
+    if (!faElemTy(op.getType()).isInteger(1))
+      return {};
+    out = bin(BOP::orOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::DivSIOp>(def)) {
+    out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::DivUIOp>(def)) {
+    out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::math::SqrtOp>(def)) {
+    out = un(UOP::sqrtOp, rec(op.getOperand()));
+  } else if (auto op = mlir::dyn_cast<mlir::math::Exp2Op>(def)) {
+    out = un(UOP::exp2Op, rec(op.getOperand()));
+  } else if (auto op = mlir::dyn_cast<mlir::math::ExpOp>(def)) {
+    out = un(UOP::expOp, rec(op.getOperand()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
+    mlir::Value c = rec(op.getCondition()), t = rec(op.getTrueValue()),
+                e = rec(op.getFalseValue());
+    if (!c || !t || !e)
+      return {};
+    out = mlir::arith::SelectOp::create(b, loc, c, t, e).getResult();
+  } else if (auto op = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
+    using P = mlir::arith::CmpIPredicate;
+    BOP k;
+    switch (op.getPredicate()) {
+    case P::eq: k = BOP::eqOp; break;
+    case P::ne: k = BOP::neOp; break;
+    case P::slt: k = BOP::ltOp; break;
+    case P::sle: k = BOP::leOp; break;
+    case P::sgt: k = BOP::gtOp; break;
+    case P::sge: k = BOP::geOp; break;
+    default: return {};
+    }
+    out = bin(k, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::CmpFOp>(def)) {
+    using P = mlir::arith::CmpFPredicate;
+    BOP k;
+    switch (op.getPredicate()) {
+    case P::OEQ: k = BOP::eqOp; break;
+    case P::ONE: k = BOP::neOp; break;
+    case P::OLT: k = BOP::ltOp; break;
+    case P::OLE: k = BOP::leOp; break;
+    case P::OGT: k = BOP::gtOp; break;
+    case P::OGE: k = BOP::geOp; break;
+    default: return {};
+    }
+    out = bin(k, rec(op.getLhs()), rec(op.getRhs()));
+  } else {
+    if (::getenv("TRITON_METAL_FA_DEBUG"))
+      llvm::errs() << "[metal-fused-attn]   untranslatable cone op: " << *def
+                   << "\n";
+    return {};
+  }
+
+  if (out)
+    memo[v.getAsOpaquePointer()] = out;
+  return out;
+}
+
+} // namespace
+
+namespace {
+
+// `base + major*stride + feature`, the address model the emitter implements
+// (unit column stride — Triton's equal-to-1 specialization drops the column
+// stride from the signature, so it is folded, never an operand).
+//
+// Matched by CONTRIBUTION rather than by shape, because the same address is
+// spelled two different ways in the wild: a two-level
+// `addptr(broadcast(addptr(splat(base), major*stride)), feat)` chain
+// (medium-decaying_causal_attention.py) and a single
+// `addptr(splat(base), major*stride + feat)` (hard-mult_head_attention.py).
+// Both are the same address; pinning either spelling would reject the other.
+// Marks every op it walks so the coverage gate can see them.
+static bool faMatchAddr(FusedAttnTemplate &t, mlir::Value ptr,
+                        FusedAttnTemplate::Idx wantMajor, mlir::Value &base,
+                        mlir::Value &stride) {
+  llvm::SmallVector<mlir::Value, 4> offsets;
+  // Peel the addptr/broadcast chain down to the root splat, collecting offsets.
+  for (int i = 0; i < 16 && ptr; ++i) {
+    if (auto ap = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      t.mark(ap);
+      offsets.push_back(ap.getOffset());
+      ptr = ap.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      t.mark(bc);
+      ptr = bc.getSrc();
+      continue;
+    }
+    break;
+  }
+  base = t.splatSrc(ptr);
+  if (!base || !t.isKernelArg(base))
+    return false;
+
+  // Flatten each offset through `addi`, then classify the leaves.
+  llvm::SmallVector<mlir::Value, 8> terms(offsets.begin(), offsets.end());
+  bool sawFeat = false;
+  int strides = 0;
+  while (!terms.empty()) {
+    mlir::Value o = t.peel(terms.pop_back_val());
+    // Classify BEFORE flattening: an index vector is itself an `addi`
+    // (`pid*blk + arange`), so flattening first would tear the feature index
+    // apart into a splat and a make_range, neither of which classifies.
+    if (t.classifyIdx(o) == FusedAttnTemplate::Idx::Feat) {
+      sawFeat = true;
+      continue;
+    }
+    if (auto add = o.getDefiningOp<mlir::arith::AddIOp>()) {
+      t.mark(add);
+      terms.push_back(add.getLhs());
+      terms.push_back(add.getRhs());
+      continue;
+    }
+    auto mul = o.getDefiningOp<mlir::arith::MulIOp>();
+    if (!mul)
+      return false;
+    t.mark(mul);
+    bool hit = false;
+    for (int i = 0; i < 2; ++i) {
+      if (t.classifyIdx(mul->getOperand(i)) != wantMajor)
+        continue;
+      mlir::Value st = t.splatSrc(mul->getOperand(1 - i));
+      if (!st || !t.isKernelArg(st))
+        return false;
+      stride = st;
+      ++strides;
+      hit = true;
+    }
+    if (!hit)
+      return false;
+  }
+  // Exactly one major*stride term and at least one feature term: two stride
+  // terms would mean an addressing scheme the emitter does not reproduce.
+  return sawFeat && strides == 1;
+}
+
+// `cmpi slt, <idx>, splat(bound)` — returns the bound scalar for the wanted
+// index role, marking the comparison.
+static mlir::Value faBoundOf(FusedAttnTemplate &t, mlir::Value mask,
+                             FusedAttnTemplate::Idx want) {
+  llvm::SmallVector<mlir::Value, 8> wl{mask};
+  while (!wl.empty()) {
+    mlir::Value v = t.peel(wl.pop_back_val());
+    if (auto a = v.getDefiningOp<mlir::arith::AndIOp>()) {
+      t.mark(a);
+      wl.push_back(a.getLhs());
+      wl.push_back(a.getRhs());
+      continue;
+    }
+    auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
+    if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+      continue;
+    t.mark(cmp);
+    if (t.classifyIdx(cmp.getLhs()) == want) {
+      mlir::Value b = t.splatSrc(cmp.getRhs());
+      if (b && t.isKernelArg(b))
+        return b;
+    }
+  }
+  return {};
+}
+
+// Peel a dot operand back to its load, marking the trans/cvt on the way.
+static mlir::triton::LoadOp faPeelLoad(FusedAttnTemplate &t, mlir::Value v,
+                                       bool &transposed) {
+  transposed = false;
+  for (int i = 0; i < 8 && v; ++i) {
+    if (auto ld = v.getDefiningOp<mlir::triton::LoadOp>()) {
+      t.mark(ld);
+      return ld;
+    }
+    auto *d = v.getDefiningOp();
+    if (!d)
+      break;
+    if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(d)) {
+      t.mark(d);
+      v = d->getOperand(0);
+      continue;
+    }
+    if (mlir::isa<mlir::triton::TransOp>(d)) {
+      t.mark(d);
+      transposed = true;
+      v = d->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
+  FusedAttnTemplate t;
+  t.funcOp = funcOp;
+  if (funcOp.getBody().empty())
+    return mlir::failure();
+  t.entry = &funcOp.getBody().front();
+
+  // Anchor: the unique tt.store.
+  llvm::SmallVector<mlir::triton::StoreOp> stores;
+  funcOp.walk([&](mlir::triton::StoreOp s) { stores.push_back(s); });
+  if (stores.size() != 1)
+    return mlir::failure();
+  t.store = stores[0];
+
+  // Epilogue. `store(acc)` is norm=none; `store(acc / lift(sum))` is the online
+  // softmax, whose running state is NOT part of the score transform and is
+  // therefore role-walked here rather than absorbed into the region.
+  mlir::Value stored = t.peel(t.store.getValue());
+  mlir::Value sumLift;
+  if (auto div = stored.getDefiningOp<mlir::arith::DivFOp>()) {
+    t.softmax = true;
+    t.mark(div);
+    sumLift = div.getRhs();
+    stored = t.peel(div.getLhs());
+  }
+
+  auto forOp = stored.getDefiningOp<mlir::scf::ForOp>();
+  if (!forOp)
+    return mlir::failure();
+  t.forOp = forOp;
+  if (forOp.getNumRegionIterArgs() != (t.softmax ? 3u : 1u))
+    return mlir::failure();
+
+  // Identify the iter_args by SHAPE and INIT, never by position: rank-2 is the
+  // output accumulator, and the two rank-1 states are told apart by their inits
+  // (-inf = running max, 0 = running sum).
+  int accIdx = 0, sumIdx = -1, maxIdx = -1;
+  if (t.softmax) {
+    accIdx = -1;
+    for (unsigned i = 0; i < 3; ++i) {
+      auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+          forOp.getInitArgs()[i].getType());
+      if (!ty || !ty.getElementType().isF32())
+        return mlir::failure();
+      if (ty.getRank() == 2) {
+        if (accIdx >= 0 || !t.isZeroSplat(forOp.getInitArgs()[i]))
+          return mlir::failure();
+        accIdx = i;
+      } else if (ty.getRank() == 1) {
+        if (t.isNegInfSplat(forOp.getInitArgs()[i])) {
+          if (maxIdx >= 0)
+            return mlir::failure();
+          maxIdx = i;
+        } else if (t.isZeroSplat(forOp.getInitArgs()[i])) {
+          if (sumIdx >= 0)
+            return mlir::failure();
+          sumIdx = i;
+        } else {
+          return mlir::failure();
+        }
+      } else {
+        return mlir::failure();
+      }
+    }
+    if (accIdx < 0 || sumIdx < 0 || maxIdx < 0)
+      return mlir::failure();
+    if (stored != forOp.getResult(accIdx) ||
+        t.peel(sumLift) != forOp.getResult(sumIdx))
+      return mlir::failure();
+  }
+
+  mlir::Block *body = forOp.getBody();
+  auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
+  t.mark(yield);
+
+  mlir::triton::DotOp dotPV;
+  mlir::Value accNext = t.peel(yield.getOperand(accIdx));
+  if (!t.softmax) {
+    dotPV = accNext.getDefiningOp<mlir::triton::DotOp>();
+    if (!dotPV || t.peel(dotPV.getC()) != forOp.getRegionIterArg(accIdx))
+      return mlir::failure();
+  } else {
+    // acc' = fma(acc_carried, lift(scaler), dot(P, V, 0)) — the rescale rides a
+    // separate fma, so the dot's own C operand has to be zero.
+    auto fma = accNext.getDefiningOp<mlir::math::FmaOp>();
+    if (!fma)
+      return mlir::failure();
+    t.mark(fma);
+    if (t.peel(fma->getOperand(0)) != forOp.getRegionIterArg(accIdx))
+      return mlir::failure();
+    dotPV = t.peel(fma->getOperand(2)).getDefiningOp<mlir::triton::DotOp>();
+    if (!dotPV || !t.isZeroSplat(dotPV.getC()))
+      return mlir::failure();
+  }
+  t.dotPV = dotPV;
+  t.mark(dotPV);
+
+  auto accTy = mlir::dyn_cast<mlir::RankedTensorType>(dotPV.getType());
+  auto scoreTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(t.peel(dotPV.getA()).getType());
+  if (!accTy || !scoreTy || accTy.getRank() != 2 || scoreTy.getRank() != 2 ||
+      !accTy.getElementType().isF32())
+    return mlir::failure();
+  t.BM = accTy.getShape()[0];
+  t.BD = accTy.getShape()[1];
+  t.BN = scoreTy.getShape()[1];
+  if (t.BM % 8 || t.BN % 8 || t.BD % 8)
+    return mlir::failure();
+
+  // The QK dot: reachable from dotPV's A operand through the score cone.
+  llvm::SmallVector<mlir::Operation *, 16> wl;
+  if (auto *d = t.peel(dotPV.getA()).getDefiningOp())
+    wl.push_back(d);
+  llvm::DenseSet<mlir::Operation *> vis;
+  mlir::triton::DotOp dotQK;
+  while (!wl.empty()) {
+    auto *o = wl.pop_back_val();
+    if (!vis.insert(o).second)
+      continue;
+    if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(o)) {
+      if (dotQK && dotQK != d)
+        return mlir::failure(); // two score-side dots: not this template
+      dotQK = d;
+      continue;
+    }
+    for (mlir::Value v : o->getOperands())
+      if (auto *d2 = t.peel(v).getDefiningOp())
+        wl.push_back(d2);
+  }
+  if (!dotQK)
+    return mlir::failure();
+  t.dotQK = dotQK;
+  t.mark(dotQK);
+
+  // Where the score transform ENDS. Under norm=none it is dotPV's A operand
+  // directly. Under online softmax the transform ends at the LOGITS `L`, the
+  // value that feeds both the row-max reduce and the shifted exponential; the
+  // (max, sum, rescale) machinery after it is normalization, not transform, and
+  // must be role-walked rather than absorbed — otherwise the region would
+  // contain a reduction it cannot express per (row, key).
+  t.scoreOut = dotPV.getA();
+  if (t.softmax) {
+    // P = exp(L - lift(m_new)), in whichever base the source used.
+    mlir::Value P = t.peel(dotPV.getA());
+    mlir::Value pin;
+    if (auto e = P.getDefiningOp<mlir::math::ExpOp>()) {
+      t.naturalExp = true;
+      pin = e.getOperand();
+      t.mark(e);
+    } else if (auto e2 = P.getDefiningOp<mlir::math::Exp2Op>()) {
+      t.naturalExp = false;
+      pin = e2.getOperand();
+      t.mark(e2);
+    } else {
+      return mlir::failure();
+    }
+    auto shift = t.peel(pin).getDefiningOp<mlir::arith::SubFOp>();
+    if (!shift)
+      return mlir::failure();
+    t.mark(shift);
+    t.scoreOut = shift.getLhs();
+    mlir::Value mNew = t.peel(shift.getRhs());
+
+    // m' = maxnumf(reduce_max(L, axis=1), m_carried), and it is what is yielded.
+    if (t.peel(yield.getOperand(maxIdx)) != mNew)
+      return mlir::failure();
+    auto mx = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
+    if (!mx)
+      return mlir::failure();
+    t.mark(mx);
+    mlir::Value rmax;
+    for (int i = 0; i < 2; ++i)
+      if (t.peel(mx->getOperand(i)) == forOp.getRegionIterArg(maxIdx))
+        rmax = mx->getOperand(1 - i);
+    if (!rmax)
+      return mlir::failure();
+    auto redMax = t.peel(rmax).getDefiningOp<mlir::triton::ReduceOp>();
+    if (!t.isReduce<mlir::arith::MaxNumFOp>(redMax, 1))
+      return mlir::failure();
+    t.mark(redMax);
+    if (t.peel(redMax.getSrcs()[0]) != t.peel(t.scoreOut))
+      return mlir::failure();
+
+    // scaler = exp(m_carried - m'), in the same base as P. It reaches the
+    // accumulator as the fma's middle operand.
+    auto accFma =
+        t.peel(yield.getOperand(accIdx)).getDefiningOp<mlir::math::FmaOp>();
+    if (!accFma)
+      return mlir::failure();
+    mlir::Value scaler = t.peel(accFma->getOperand(1));
+    mlir::Value sin;
+    if (auto e = scaler.getDefiningOp<mlir::math::ExpOp>()) {
+      if (!t.naturalExp)
+        return mlir::failure();
+      sin = e.getOperand();
+      t.mark(e);
+    } else if (auto e2 = scaler.getDefiningOp<mlir::math::Exp2Op>()) {
+      if (t.naturalExp)
+        return mlir::failure();
+      sin = e2.getOperand();
+      t.mark(e2);
+    } else {
+      return mlir::failure();
+    }
+    auto sSub = t.peel(sin).getDefiningOp<mlir::arith::SubFOp>();
+    if (!sSub || t.peel(sSub.getLhs()) != forOp.getRegionIterArg(maxIdx) ||
+        t.peel(sSub.getRhs()) != mNew)
+      return mlir::failure();
+    t.mark(sSub);
+
+    // sum' = fma(sum_carried, scaler, reduce_add(P, axis=1)).
+    auto sumFma =
+        t.peel(yield.getOperand(sumIdx)).getDefiningOp<mlir::math::FmaOp>();
+    if (!sumFma ||
+        t.peel(sumFma->getOperand(0)) != forOp.getRegionIterArg(sumIdx) ||
+        t.peel(sumFma->getOperand(1)) != scaler)
+      return mlir::failure();
+    t.mark(sumFma);
+    auto redSum =
+        t.peel(sumFma->getOperand(2)).getDefiningOp<mlir::triton::ReduceOp>();
+    if (!t.isReduce<mlir::arith::AddFOp>(redSum, 1))
+      return mlir::failure();
+    t.mark(redSum);
+    if (t.peel(redSum.getSrcs()[0]) != P)
+      return mlir::failure();
+  }
+
+  // Absorb the cone. Anything without a scalar translation fails the match.
+  llvm::DenseSet<mlir::Operation *> coneSeen;
+  if (!t.collectCone(t.scoreOut, coneSeen))
+    goto rejected;
+  if (!t.rowIdx || !t.keyIdx) {
+    t.no("score transform does not read both the row and the key index");
+    goto rejected;
+  }
+
+  {
+    // Operand loads.
+    bool qT = false, kT = false, vT = false;
+    auto qLd = faPeelLoad(t, dotQK.getA(), qT);
+    auto kLd = faPeelLoad(t, dotQK.getB(), kT);
+    auto vLd = faPeelLoad(t, dotPV.getB(), vT);
+    if (!qLd || !kLd || !vLd || qT || vT || !kT) {
+      t.no("operands are not Q, trans(K) and V loads");
+      goto rejected;
+    }
+
+    const char *which = nullptr;
+    if (!faMatchAddr(t, qLd.getPtr(), FusedAttnTemplate::Idx::Row, t.qPtr,
+                     t.strideQ))
+      which = "Q";
+    else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key, t.kPtr,
+                          t.strideK))
+      which = "K";
+    else if (!faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key, t.vPtr,
+                          t.strideV))
+      which = "V";
+    else if (!faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row,
+                          t.oPtr, t.strideO))
+      which = "Out";
+    if (which) {
+      if (::getenv("TRITON_METAL_FA_DEBUG"))
+        llvm::errs() << "[metal-fused-attn]   bad address: " << which << "\n";
+      t.no("an address is not base + major*stride + feature");
+      goto rejected;
+    }
+
+    // Extents, read off the masks rather than guessed by argument position.
+    if (!qLd.getMask() || !kLd.getMask() || !t.store.getMask()) {
+      t.no("a load or the store is unmasked");
+      goto rejected;
+    }
+    t.mVal = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Row);
+    t.nVal = faBoundOf(t, kLd.getMask(), FusedAttnTemplate::Idx::Key);
+    t.dHeadVal = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Feat);
+    (void)faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
+    (void)faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
+    if (!t.mVal || !t.nVal || !t.dHeadVal) {
+      t.no("could not resolve M / N / d_head from the masks");
+      goto rejected;
+    }
+
+    // Key bound: `[0, n)` or the causal `[0, min((pid+1)*BM, n))`. Anything
+    // else is a key set the emitter would not reproduce.
+    if (!FusedAttnTemplate::isIntConst(forOp.getLowerBound(), 0) ||
+        !FusedAttnTemplate::isIntConst(forOp.getStep(), t.BN)) {
+      t.no("key loop is not `range(0, ub, BN)`");
+      goto rejected;
+    }
+    mlir::Value ub = forOp.getUpperBound();
+    if (ub == t.nVal) {
+      t.causalKeyBound = false;
+    } else if (auto mn = ub.getDefiningOp<mlir::arith::MinSIOp>()) {
+      bool sawN = false, sawBlk = false;
+      for (int i = 0; i < 2; ++i) {
+        if (mn->getOperand(i) == t.nVal)
+          sawN = true;
+        if (auto mul = mn->getOperand(i).getDefiningOp<mlir::arith::MulIOp>())
+          for (int j = 0; j < 2; ++j)
+            if (FusedAttnTemplate::isIntConst(mul->getOperand(1 - j), t.BM))
+              if (auto ad =
+                      mul->getOperand(j).getDefiningOp<mlir::arith::AddIOp>())
+                for (int k = 0; k < 2; ++k)
+                  if (FusedAttnTemplate::isIntConst(ad->getOperand(1 - k), 1) &&
+                      ad->getOperand(k)
+                          .getDefiningOp<mlir::triton::GetProgramIdOp>())
+                    sawBlk = true;
+      }
+      if (!sawN || !sawBlk) {
+        t.no("key loop bound is neither N nor min((pid+1)*BM, N)");
+        goto rejected;
+      }
+      t.causalKeyBound = true;
+    } else {
+      t.no("key loop bound is neither N nor min((pid+1)*BM, N)");
+      goto rejected;
+    }
+
+    // COVERAGE. Anything the walk did not reach is an op the emitter does not
+    // implement — the gate that makes over-matching structurally impossible.
+    for (mlir::Operation &op : *body)
+      if (!t.claimed.count(&op)) {
+        t.offender = &op;
+        t.no("unclaimed op in the loop body");
+        goto rejected;
+      }
+  }
+
+  {
+    // --- build metal.fused_attention + its score region ---
+    mlir::OpBuilder builder(forOp);
+    auto loc = forOp.getLoc();
+    auto f32 = builder.getF32Type();
+    auto si32 = mlir::IntegerType::get(builder.getContext(), 32,
+                                       mlir::IntegerType::Signed);
+    auto u32e = wrapperElementType(t.mVal.getType());
+    auto bridge = [&](mlir::Value v, mlir::Type e) {
+      return bridgePtrToMemref(builder, loc, v, e);
+    };
+    // Parameter storage follows the scalar's own type: f32 stays f32, an
+    // integer count is bridged as ui32 (signless i32 is not a Metal_Type). The
+    // op verifier pins each region block arg to its buffer's element type, so
+    // these two lists must stay in lockstep.
+    llvm::SmallVector<mlir::Value> paramBufs;
+    llvm::SmallVector<mlir::Type> paramTys;
+    for (mlir::Value p : t.params) {
+      mlir::Type e = p.getType().isF32() ? mlir::Type(f32) : mlir::Type(u32e);
+      paramTys.push_back(e);
+      paramBufs.push_back(bridge(p, e));
+    }
+
+    auto op = mlir::triton::metal::FusedAttentionOp::create(
+        builder, loc, bridge(t.qPtr, f32), bridge(t.kPtr, f32),
+        bridge(t.vPtr, f32), bridge(t.oPtr, f32), bridge(t.mVal, u32e),
+        bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e),
+        bridge(t.strideQ, u32e), bridge(t.strideK, u32e),
+        bridge(t.strideV, u32e), bridge(t.strideO, u32e),
+        /*h=*/mlir::Value(), paramBufs, t.BM, t.BN, t.BD,
+        t.softmax ? mlir::triton::metal::AttnNorm::OnlineSoftmax
+                  : mlir::triton::metal::AttnNorm::None,
+        t.causalKeyBound, t.naturalExp);
+
+    mlir::Block *rb = &op.getScore().emplaceBlock();
+    llvm::SmallVector<mlir::Type> argTys{f32, si32, si32};
+    llvm::SmallVector<mlir::Location> argLocs{loc, loc, loc};
+    for (mlir::Type pt : paramTys) {
+      argTys.push_back(pt);
+      argLocs.push_back(loc);
+    }
+    rb->addArguments(argTys, argLocs);
+
+    llvm::DenseMap<void *, mlir::Value> leaf, memo;
+    leaf[dotQK.getResult().getAsOpaquePointer()] = rb->getArgument(0);
+    leaf[t.peel(t.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
+    leaf[t.peel(t.keyIdx).getAsOpaquePointer()] = rb->getArgument(2);
+    for (auto [i, p] : llvm::enumerate(t.params))
+      leaf[p.getAsOpaquePointer()] = rb->getArgument(3 + i);
+
+    mlir::OpBuilder rbb(rb, rb->end());
+    mlir::Value w = emitConeScalar(rbb, loc, t.scoreOut, leaf, memo);
+    if (!w) {
+      op.erase();
+      t.no("score cone could not be translated into the region");
+      goto rejected;
+    }
+    mlir::triton::metal::ScoreYieldOp::create(rbb, loc, w);
+
+    // DCE the now-dead loop / epilogue / loads in the entry block.
+    mlir::Block *blk = forOp->getBlock();
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (mlir::Operation &o :
+           llvm::make_early_inc_range(llvm::reverse(*blk))) {
+        if (&o == op.getOperation() || o.hasTrait<mlir::OpTrait::IsTerminator>())
+          continue;
+        if (o.use_empty()) {
+          o.erase();
+          changed = true;
+        }
+      }
+    }
+    return mlir::success();
+  }
+
+rejected:
+  if (::getenv("TRITON_METAL_FA_DEBUG")) {
+    llvm::errs() << "[metal-fused-attn] rejected: "
+                 << (t.why ? t.why : "<no reason>") << "\n";
+    if (t.offender)
+      llvm::errs() << "[metal-fused-attn]   offending op: " << *t.offender
+                   << "\n";
+  }
+  return mlir::failure();
+}
+
+// Runs AFTER the flash/sink matchers, so it is the FLOOR beneath them: kernels
+// they already claim keep their proven (and, for flash, simdgroup) bodies, and
+// this only sees what they declined. That is what makes the transition
+// regression-free.
+static void runFusedAttentionMatcher(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::FuncOp> funcs;
+  moduleOp.walk([&](mlir::triton::FuncOp f) { funcs.push_back(f); });
+  for (auto f : funcs)
+    (void)tryFusedAttention(f);
+}
+
+} // namespace
+
 static void runFlashAttentionMatcher(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) {
@@ -14825,6 +15934,14 @@ struct ConvertTritonGPUToMetalPass
     // by), so the two never contend. See metal-attention-with-sinks-plan.md.
     runSinkAttentionMatcher(moduleOp);
 
+    // Generalized attention: the `dot -> score transform -> dot` chain with the
+    // transform carried as a REGION instead of baked into a per-variant emitter.
+    // Runs LAST of the three so it is the floor beneath them — kernels the two
+    // bespoke matchers claim keep their proven bodies, and this only sees what
+    // they declined (today: medium-decaying_causal_attention.py, which has no
+    // softmax at all and so matches neither).
+    runFusedAttentionMatcher(moduleOp);
+
     // L1d3: rewire dot-feeding ttg.convert_layout(blocked -> dot_op) ops
     // off their tt.dot operands so they don't survive into the cvt
     // classifier below (which would emit the L1d3 hard error). The
@@ -14850,94 +15967,11 @@ struct ConvertTritonGPUToMetalPass
     // gather/scatter, no threadgroup staging).
     normalizeBlockedDivergentCvts(moduleOp);
 
-    // Classify non-identity ttg.convert_layout ops:
-    //   - in-envelope (rank-2 blocked↔blocked, same shape, same elem-type,
-    //     sizePerThread == [1,1] on both sides) → allow-through to
-    //     `ConvertLayoutLowering`'s staged-transpose body (L1d2).
-    //   - out-of-envelope (anything else non-identity, including rank-2
-    //     blocked↔blocked with sizePerThread > 1) → deferred to L1d3.
-    // L1c identity passthrough remains an accept path (handled by
-    // `ConvertLayoutLowering`). See
-    // `.omc/specs/deep-interview-leet-triton-l1d2-staged-transpose-body.md`.
-    bool cvtOk = true;
-    moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
-      auto srcTy = cvt.getSrc().getType();
-      auto dstTy = cvt.getResult().getType();
-      if (srcTy == dstTy)
-        return; // L1c identity — `ConvertLayoutLowering` handles passthrough.
-      auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(srcTy);
-      auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(dstTy);
-      // L3a passthrough: rank-1 slice→blocked cvt with matching shape and
-      // element type collapses to scalar-identity under the TypeConverter
-      // (both sides become the scalar element type). The Triton frontend
-      // inserts this op between `tt.reduce` (which yields a slice-encoded
-      // tensor) and the downstream `tt.store` (which expects a blocked
-      // encoding). `ConvertLayoutLowering` handles the post-conversion
-      // identity. See
-      // `.omc/specs/deep-interview-leet-triton-l3a-reduce-body-axis1.md`.
-      // Scalar-identity relabel — slice-involved broadcast/reduce cones
-      // (`x[None,:]`, `x[:,None]`, reduce output) of any rank, plus degenerate
-      // blocked↔blocked converts that only permute size-1 axes. These collapse
-      // to a no-op under the scalarizing TypeConverter (`ConvertLayoutLowering`
-      // Path 2 / `isScalarIdentityConvert`); the Metal backend re-derives every
-      // per-thread index from `make_range`, so no data moves. Genuine transposes
-      // (both blocked, >=2 non-unit dims) are NOT accepted here and fall through
-      // to the rank-2 staged-transpose envelope below (or the L1d3 reject).
-      if (isScalarIdentityConvert(cvt))
-        return;
-      auto srcBlocked =
-          srcRtt ? mlir::dyn_cast_or_null<
-                       mlir::triton::gpu::BlockedEncodingAttr>(
-                       srcRtt.getEncoding())
-                 : nullptr;
-      auto dstBlocked =
-          dstRtt ? mlir::dyn_cast_or_null<
-                       mlir::triton::gpu::BlockedEncodingAttr>(
-                       dstRtt.getEncoding())
-                 : nullptr;
-      bool sameShapeRank2BlockedPair =
-          srcRtt && dstRtt && srcRtt.getRank() == 2 &&
-          dstRtt.getRank() == 2 && srcRtt.getShape() == dstRtt.getShape() &&
-          srcRtt.getElementType() == dstRtt.getElementType() && srcBlocked &&
-          dstBlocked;
-      bool sizePerThreadAllOne = false;
-      if (sameShapeRank2BlockedPair) {
-        auto srcSpt = srcBlocked.getSizePerThread();
-        auto dstSpt = dstBlocked.getSizePerThread();
-        sizePerThreadAllOne =
-            srcSpt.size() == 2 && dstSpt.size() == 2 && srcSpt[0] == 1 &&
-            srcSpt[1] == 1 && dstSpt[0] == 1 && dstSpt[1] == 1;
-      }
-      bool inEnvelope = sameShapeRank2BlockedPair && sizePerThreadAllOne;
-      if (inEnvelope)
-        return; // L1d2: handled by `ConvertLayoutLowering` staged-transpose
-                // body below.
-      // Rank-1 relabel feeding ONLY `tt.store` — the scatter shape
-      // (`tl.store(dst + idx_tensor, vals[, mask])`, radix sort). Store-
-      // Lowering / MaskedStoreLowering peel back to the pre-cvt operands and
-      // perform the store in the SOURCE layout, so no data actually moves
-      // across the relabel; `ConvertLayoutLowering` Path 2b then forwards the
-      // (by-then unread) source. Kept in lockstep with that path's condition —
-      // any non-store consumer makes the permutation observable and must still
-      // be rejected here.
-      if (srcRtt && dstRtt && srcRtt.getRank() == 1 && dstRtt.getRank() == 1 &&
-          srcRtt.getShape() == dstRtt.getShape() &&
-          srcRtt.getElementType() == dstRtt.getElementType() && srcBlocked &&
-          dstBlocked &&
-          llvm::all_of(cvt.getResult().getUsers(), [](mlir::Operation *u) {
-            return mlir::isa<mlir::triton::StoreOp>(u);
-          }))
-        return;
-      cvt.emitOpError(
-          "ttg.convert_layout: broader staged-transpose deferred to L1d3 "
-          "(rank≠2 or shape/elem-type change or non-blocked encoding or "
-          "sizePerThread > 1)");
-      cvtOk = false;
-    });
-    if (!cvtOk) {
-      signalPassFailure();
-      return;
-    }
+    // NOTE: the ttg.convert_layout legality gate used to run HERE, which
+    // made the Tier-2 `finalizeScalarDots` fallback structurally unable to
+    // be total: any dot still carrying an out-of-envelope operand cvt was
+    // rejected before the fallback that exists to claim it ever ran. The
+    // gate now runs after every dot claimer -- see below.
 
     // Session L3 reduce pre-pass: detect unsupported tt.reduce forms and
     // emit specific errors per spec
@@ -15181,6 +16215,95 @@ struct ConvertTritonGPUToMetalPass
     // early-pass scalar_dots. Closes the tier gap (bare-store loops the SIMD
     // matchers reject, e.g. leet-triton/medium-matrix_power.py).
     finalizeScalarDots(moduleOp);
+
+    // Classify non-identity ttg.convert_layout ops:
+    //   - in-envelope (rank-2 blocked↔blocked, same shape, same elem-type,
+    //     sizePerThread == [1,1] on both sides) → allow-through to
+    //     `ConvertLayoutLowering`'s staged-transpose body (L1d2).
+    //   - out-of-envelope (anything else non-identity, including rank-2
+    //     blocked↔blocked with sizePerThread > 1) → deferred to L1d3.
+    // L1c identity passthrough remains an accept path (handled by
+    // `ConvertLayoutLowering`). See
+    // `.omc/specs/deep-interview-leet-triton-l1d2-staged-transpose-body.md`.
+    bool cvtOk = true;
+    moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
+      auto srcTy = cvt.getSrc().getType();
+      auto dstTy = cvt.getResult().getType();
+      if (srcTy == dstTy)
+        return; // L1c identity — `ConvertLayoutLowering` handles passthrough.
+      auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(srcTy);
+      auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(dstTy);
+      // L3a passthrough: rank-1 slice→blocked cvt with matching shape and
+      // element type collapses to scalar-identity under the TypeConverter
+      // (both sides become the scalar element type). The Triton frontend
+      // inserts this op between `tt.reduce` (which yields a slice-encoded
+      // tensor) and the downstream `tt.store` (which expects a blocked
+      // encoding). `ConvertLayoutLowering` handles the post-conversion
+      // identity. See
+      // `.omc/specs/deep-interview-leet-triton-l3a-reduce-body-axis1.md`.
+      // Scalar-identity relabel — slice-involved broadcast/reduce cones
+      // (`x[None,:]`, `x[:,None]`, reduce output) of any rank, plus degenerate
+      // blocked↔blocked converts that only permute size-1 axes. These collapse
+      // to a no-op under the scalarizing TypeConverter (`ConvertLayoutLowering`
+      // Path 2 / `isScalarIdentityConvert`); the Metal backend re-derives every
+      // per-thread index from `make_range`, so no data moves. Genuine transposes
+      // (both blocked, >=2 non-unit dims) are NOT accepted here and fall through
+      // to the rank-2 staged-transpose envelope below (or the L1d3 reject).
+      if (isScalarIdentityConvert(cvt))
+        return;
+      auto srcBlocked =
+          srcRtt ? mlir::dyn_cast_or_null<
+                       mlir::triton::gpu::BlockedEncodingAttr>(
+                       srcRtt.getEncoding())
+                 : nullptr;
+      auto dstBlocked =
+          dstRtt ? mlir::dyn_cast_or_null<
+                       mlir::triton::gpu::BlockedEncodingAttr>(
+                       dstRtt.getEncoding())
+                 : nullptr;
+      bool sameShapeRank2BlockedPair =
+          srcRtt && dstRtt && srcRtt.getRank() == 2 &&
+          dstRtt.getRank() == 2 && srcRtt.getShape() == dstRtt.getShape() &&
+          srcRtt.getElementType() == dstRtt.getElementType() && srcBlocked &&
+          dstBlocked;
+      bool sizePerThreadAllOne = false;
+      if (sameShapeRank2BlockedPair) {
+        auto srcSpt = srcBlocked.getSizePerThread();
+        auto dstSpt = dstBlocked.getSizePerThread();
+        sizePerThreadAllOne =
+            srcSpt.size() == 2 && dstSpt.size() == 2 && srcSpt[0] == 1 &&
+            srcSpt[1] == 1 && dstSpt[0] == 1 && dstSpt[1] == 1;
+      }
+      bool inEnvelope = sameShapeRank2BlockedPair && sizePerThreadAllOne;
+      if (inEnvelope)
+        return; // L1d2: handled by `ConvertLayoutLowering` staged-transpose
+                // body below.
+      // Rank-1 relabel feeding ONLY `tt.store` — the scatter shape
+      // (`tl.store(dst + idx_tensor, vals[, mask])`, radix sort). Store-
+      // Lowering / MaskedStoreLowering peel back to the pre-cvt operands and
+      // perform the store in the SOURCE layout, so no data actually moves
+      // across the relabel; `ConvertLayoutLowering` Path 2b then forwards the
+      // (by-then unread) source. Kept in lockstep with that path's condition —
+      // any non-store consumer makes the permutation observable and must still
+      // be rejected here.
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 && dstRtt.getRank() == 1 &&
+          srcRtt.getShape() == dstRtt.getShape() &&
+          srcRtt.getElementType() == dstRtt.getElementType() && srcBlocked &&
+          dstBlocked &&
+          llvm::all_of(cvt.getResult().getUsers(), [](mlir::Operation *u) {
+            return mlir::isa<mlir::triton::StoreOp>(u);
+          }))
+        return;
+      cvt.emitOpError(
+          "ttg.convert_layout: broader staged-transpose deferred to L1d3 "
+          "(rank≠2 or shape/elem-type change or non-blocked encoding or "
+          "sizePerThread > 1)");
+      cvtOk = false;
+    });
+    if (!cvtOk) {
+      signalPassFailure();
+      return;
+    }
 
     // L1d2c Phase B pre-conversion sentinel emission. For every tt.func with
     // a masked tt.store, hoist one `metal.threadgroup_alloca<tpb × T>` per

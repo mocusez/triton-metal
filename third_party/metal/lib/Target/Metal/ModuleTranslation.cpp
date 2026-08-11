@@ -287,6 +287,13 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesFlashAttention = true;
     return mlir::WalkResult::interrupt();
   });
+  // metal.fused_attention: same needs (threadgroup position selects the query
+  // block and, with a head split, the head; local thread index drives the
+  // one-query-row-per-lane mapping and the single-warp guard).
+  op.walk([&](mlir::triton::metal::FusedAttentionOp) {
+    usesFlashAttention = true;
+    return mlir::WalkResult::interrupt();
+  });
   bool usesThreadgroupId = usesFlashAttention;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
@@ -353,6 +360,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::SinkAttentionOp,
+            mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -401,6 +409,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FlashAttentionOp,
             mlir::triton::metal::SinkAttentionOp,
+            mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -2160,6 +2169,505 @@ void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
   os << "      for (uint d = 0; d < _sa_dh; ++d)\n";
   os << "        " << O << "[_sa_row * _sa_so + d] = _sa_obuf[_sa_q * " << S(BD)
      << "u + d] / _sa_denom;\n";
+  os << "    }\n";
+  os << "  }\n";
+  os << "  }";
+}
+
+std::string ModuleTranslation::emitScoreRegion_(
+    mlir::triton::metal::FusedAttentionOp op, llvm::StringRef scoreExpr,
+    llvm::StringRef rowExpr, llvm::StringRef keyExpr, llvm::StringRef ind) {
+  mlir::Block &body = op.getScore().front();
+  auto &os = _output;
+
+  // Bind the region's block args to MSL temps and register them in `_buffers`,
+  // which is what `translateVarName` consults — so every use inside the region
+  // renders as `v<idx>` with no special-casing in the value translators.
+  auto bind = [&](mlir::Value arg, llvm::StringRef init) {
+    unsigned idx = _varCount++;
+    os << ind << typeToString(arg.getType()) << " v" << idx << " = " << init
+       << ";\n";
+    _buffers[arg.getAsOpaquePointer()] = idx;
+  };
+  bind(body.getArgument(0), scoreExpr);
+  bind(body.getArgument(1), rowExpr);
+  bind(body.getArgument(2), keyExpr);
+  for (auto [i, p] : llvm::enumerate(op.getScoreParams())) {
+    // `bufName`-equivalent walk; the operand is a kernel buffer, and the op
+    // verifier already pinned the block-arg type to its element type.
+    mlir::Value m = p;
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.fused_attention: score_param " << i
+                     << " does not resolve to a kernel buffer (matcher bound a "
+                        "non-kernel-arg value); refusing to emit";
+      _emitFailed = true;
+      return "0.0f";
+    }
+    bind(body.getArgument(3 + i), "v" + std::to_string(it->second) + "[0]");
+  }
+
+  // The region is a pure scalar DAG (masking is `arith.select`, not control
+  // flow), so IR order is a valid emission order. Force each result into a
+  // let-binding rather than letting uses re-inline the producing expression:
+  // the region is emitted inside the per-key loop, and re-inlining a shared
+  // subexpression there would re-evaluate it per use.
+  for (mlir::Operation &o : body) {
+    if (mlir::isa<mlir::triton::metal::ScoreYieldOp>(o))
+      continue;
+    if (o.getNumResults() != 1) {
+      op.emitError() << "metal.fused_attention: score region op '"
+                     << o.getName() << "' does not produce exactly one result";
+      _emitFailed = true;
+      return "0.0f";
+    }
+    unsigned idx = _varCount++;
+    os << ind << typeToString(o.getResult(0).getType()) << " v" << idx << " = ";
+    translateValue(&o);
+    os << ";\n";
+    _letBound[&o] = idx;
+  }
+
+  auto yield = mlir::cast<mlir::triton::metal::ScoreYieldOp>(body.getTerminator());
+  unsigned outIdx = _varCount++;
+  os << ind << "float v" << outIdx << " = ";
+  translateValueOrVarName(yield.getValue());
+  os << ";\n";
+  return "v" + std::to_string(outIdx);
+}
+
+// Simdgroup body: both matmuls on the matrix unit, with the score transform
+// coming from the op's region instead of the hard-coded scale+mask+softmax that
+// `metal.flash_attention` bakes in. The staged S tile is exactly where a
+// per-(row, key) transform belongs — the row and key indices are both in hand
+// there — which is what makes one emitter able to serve every variant.
+//
+// Applies only when the working set fits threadgroup memory; `translate` falls
+// back to the scalar body otherwise, so this is a fast path, never a gate.
+void ModuleTranslation::emitFusedAttentionMma_(
+    mlir::triton::metal::FusedAttentionOp op) {
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const bool softmax =
+      op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+  const int64_t SZ_Q = BM * BD, SZ_KTV = BD * BN, SZ_S = BM * BN;
+  const int64_t mT = BM / 8, nT = BN / 8, dT = BD / 8;
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.fused_attention: operand does not resolve to a "
+                        "kernel buffer; refusing to emit";
+      _emitFailed = true;
+      return "<unresolved>";
+    }
+    return "v" + std::to_string(it->second);
+  };
+  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
+                    V = bufName(op.getV()), O = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string N = bufName(op.getN()) + "[0]";
+  const std::string DH = bufName(op.getDHead()) + "[0]";
+  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
+  const std::string SK = bufName(op.getStrideK()) + "[0]";
+  const std::string SV = bufName(op.getStrideV()) + "[0]";
+  const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+  const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
+
+  auto &os = _output;
+  os << "\n  // ---- metal.fused_attention (simdgroup dots, region score "
+        "transform) ----\n";
+  os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_ktbuf[" << S(SZ_KTV) << "];\n";
+  os << "  threadgroup float _fa_vbuf[" << S(SZ_KTV) << "];\n";
+  os << "  threadgroup float _fa_sbuf[" << S(SZ_S) << "];\n";
+  os << "  threadgroup float _fa_pbuf[" << S(SZ_S) << "];\n";
+  os << "  threadgroup float _fa_obuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_otbuf[" << S(SZ_Q) << "];\n";
+  if (softmax) {
+    os << "  threadgroup float _fa_rmax[" << S(BM) << "];\n";
+    os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
+  }
+  os << "  {\n";
+  os << "  uint _fa_lane = ltid.x & 31u;\n";
+  os << "  bool _fa_active = ltid.x < 32u;\n";
+  os << "  uint _fa_M = " << M << ";\n";
+  os << "  uint _fa_N = " << N << ";\n";
+  os << "  uint _fa_dh = " << DH << ";\n";
+  os << "  uint _fa_sq = " << SQ << ";\n";
+  os << "  uint _fa_sk = " << SK << ";\n";
+  os << "  uint _fa_sv = " << SV << ";\n";
+  os << "  uint _fa_so = " << SO << ";\n";
+  if (op.getH())
+    os << "  uint _fa_col = tgid.y * _fa_dh;\n";
+  else
+    os << "  uint _fa_col = 0u;\n";
+  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  // Stage Q and zero the accumulator / running state.
+  os << "  if (_fa_active) {\n";
+  os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
+  os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
+     << "u; uint row = _fa_rowoff + q;\n";
+  os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? " << Q
+     << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
+  os << "      _fa_obuf[c] = 0.0f;\n";
+  os << "    }\n";
+  if (softmax)
+    os << "    if (_fa_lane < " << S(BM)
+       << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
+  os << "  }\n";
+  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  if (op.getCausalKeyBound())
+    os << "  uint _fa_kend = min((tgid.x + 1u) * " << S(BM) << "u, _fa_N);\n";
+  else
+    os << "  uint _fa_kend = _fa_N;\n";
+  os << "  for (uint kb = 0; kb < _fa_kend; kb += " << S(BN) << "u) {\n";
+  // Stage K^T and V for this key block.
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
+  os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
+     << "u; uint kk = kb + key;\n";
+  os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
+     << "[kk * _fa_sk + _fa_col + d] : 0.0f;\n";
+  os << "      }\n";
+  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
+  os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
+     << "u; uint kk = kb + key;\n";
+  os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
+     << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // Dot 1: S = Q @ K^T, straight into the staged S tile.
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+  os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+  os << "        simdgroup_float8x8 acc(0.0f);\n";
+  os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+  os << "          simdgroup_float8x8 a, b;\n";
+  os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
+     << "u + ki*8u], " << S(BD) << ");\n";
+  os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
+     << "u + ni*8u], " << S(BN) << ");\n";
+  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "        }\n";
+  os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
+     << "u + ni*8u], " << S(BN) << ");\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // The score transform, one query row per lane. Emitted ONCE, writing its
+  // result back over the S tile, so the softmax passes below re-read it instead
+  // of re-evaluating the region.
+  os << "    if (_fa_active) {\n";
+  os << "      uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  // `q < BM` FIRST: every per-row buffer is sized by BM and `row < M` does not
+  // imply it when BM < 32.
+  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+  os << "          uint _fa_key = kb + kk;\n";
+  os << "          if (_fa_key < _fa_N) {\n";
+  {
+    std::string sc = "_fa_sbuf[q*" + S(BN) + "u + kk]";
+    std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
+                                     "            ");
+    os << "            _fa_pbuf[q*" << S(BN) << "u + kk] = " << w << ";\n";
+  }
+  os << "          } else {\n";
+  // Out-of-range keys must not contribute: a zero weight under norm=none, and a
+  // logit of -inf (which exponentiates to zero) under the online softmax.
+  os << "            _fa_pbuf[q*" << S(BN)
+     << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
+  os << "          }\n";
+  os << "        }\n";
+  if (softmax) {
+    os << "        float m_cur = -INFINITY;\n";
+    os << "        for (uint kk = 0; kk < " << S(BN)
+       << "u; ++kk) m_cur = max(m_cur, _fa_pbuf[q*" << S(BN) << "u + kk]);\n";
+    os << "        float m_old = _fa_rmax[q];\n";
+    os << "        float m_new = max(m_old, m_cur);\n";
+    // Both guards keep -inf minus -inf (= NaN) out of the running state: the
+    // first for a block where every key was masked, the second per key.
+    os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
+       << "(m_old - m_new);\n";
+    os << "        float denom = 0.0f;\n";
+    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+    os << "          float l = _fa_pbuf[q*" << S(BN) << "u + kk];\n";
+    os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
+       << E << "(l - m_new);\n";
+    os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
+    os << "        }\n";
+    os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
+    os << "        _fa_rmax[q] = m_new;\n";
+    os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
+       << S(BD) << "u + d] *= scaler;\n";
+  }
+  os << "      } else if (q < " << S(BM) << "u) {\n";
+  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*"
+     << S(BN) << "u + kk] = 0.0f;\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  // Dot 2: O_tile = P @ V.
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+  os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
+  os << "        simdgroup_float8x8 acc(0.0f);\n";
+  os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
+  os << "          simdgroup_float8x8 a, b;\n";
+  os << "          simdgroup_load(a, &_fa_pbuf[(mi*8u)*" << S(BN)
+     << "u + ki*8u], " << S(BN) << ");\n";
+  os << "          simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BD)
+     << "u + di*8u], " << S(BD) << ");\n";
+  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "        }\n";
+  os << "        simdgroup_store(acc, &_fa_otbuf[(mi*8u)*" << S(BD)
+     << "u + di*8u], " << S(BD) << ");\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    if (_fa_active) { for (uint c = _fa_lane; c < " << S(SZ_Q)
+     << "u; c += 32u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "  }\n";
+  os << "  if (_fa_active) {\n";
+  os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  if (softmax) {
+    os << "      float denom = _fa_rsum[q];\n";
+    os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+       << S(BD) << "u + d] / denom;\n";
+  } else {
+    os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+       << S(BD) << "u + d];\n";
+  }
+  os << "    }\n";
+  os << "  }\n";
+  os << "  }";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
+  // Two bodies, same op and same region — the dialect's existing
+  // `MatmulKind::Scalar|Mma` split. The simdgroup body needs
+  // `3*bm*bd + 2*bd*bn + 2*bm*bn (+ 2*bm)` floats of threadgroup memory against
+  // Apple's 32 KiB; when that does not fit, the scalar body runs instead rather
+  // than the op declining. That is the whole point of keeping the scalar tier:
+  // a shape the fast path cannot hold still compiles and is still correct.
+  //
+  // Lifting the ceiling means blocking bm/bn/bd inside this body, which is
+  // separate follow-up work — today a 64x64x64 tile (28800 floats) takes the
+  // scalar path.
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const int64_t need =
+      3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
+      (op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax ? 2 * BM
+                                                                    : 0);
+  // 8192 floats == Apple's 32 KiB, the same limit metal.flash_attention uses.
+  // Safe to spend in full here because the op replaces the ENTIRE kernel body,
+  // so nothing else in the kernel holds threadgroup memory.
+  const bool fits = need <= 8192 && BM % 8 == 0 && BN % 8 == 0 && BD % 8 == 0;
+  if (fits && !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR"))
+    return emitFusedAttentionMma_(op);
+  return emitFusedAttentionScalar_(op);
+}
+
+void ModuleTranslation::emitFusedAttentionScalar_(
+    mlir::triton::metal::FusedAttentionOp op) {
+  // Correctness-first body, structurally the one validated for
+  // `metal.sink_attention`: one query row per lane, keys walked one at a time,
+  // the score kept in a REGISTER — which is what lets an arbitrary score region
+  // be evaluated inline with no S/P staging and no cross-lane traffic.
+  //
+  // The query-row block is chunked so the threadgroup working set fits Apple's
+  // 32 KiB rather than being capped by `bm` (the ceiling that forced
+  // `metal.flash_attention` to decline `bm > 32` and `d_head > 64` outright).
+  const int64_t BM = op.getBm(), BD = op.getBd();
+  const bool softmax =
+      op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+
+  // 2 tiles of CH*BD floats (Q staging + O accumulator) plus 2*CH of running
+  // state. Budget 7168 floats (28 KiB) leaves headroom for allocas the rest of
+  // the kernel may hold. One query row per lane caps a chunk at 32.
+  int64_t CH = 32;
+  while (CH > 1 && 2 * CH * BD + 2 * CH > 7168)
+    CH /= 2;
+  if (CH > BM)
+    CH = BM;
+  const int64_t SZ = CH * BD;
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      // NEVER fall back to buffer 0: a wrong buffer is a silent wrong answer.
+      op.emitError() << "metal.fused_attention: operand does not resolve to a "
+                        "kernel buffer (matcher bound a non-kernel-arg value); "
+                        "refusing to emit";
+      _emitFailed = true;
+      return "<unresolved>";
+    }
+    return "v" + std::to_string(it->second);
+  };
+  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
+                    V = bufName(op.getV()), O = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string N = bufName(op.getN()) + "[0]";
+  const std::string DH = bufName(op.getDHead()) + "[0]";
+  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
+  const std::string SK = bufName(op.getStrideK()) + "[0]";
+  const std::string SV = bufName(op.getStrideV()) + "[0]";
+  const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+
+  auto &os = _output;
+  os << "\n  // ---- metal.fused_attention (per-key, region score transform) "
+        "----\n";
+  os << "  threadgroup float _fa_qbuf[" << S(SZ) << "];\n";
+  os << "  threadgroup float _fa_obuf[" << S(SZ) << "];\n";
+  if (softmax) {
+    os << "  threadgroup float _fa_rmax[" << S(CH) << "];\n";
+    os << "  threadgroup float _fa_rsum[" << S(CH) << "];\n";
+  }
+  os << "  {\n";
+  os << "  uint _fa_lane = ltid.x & 31u;\n";
+  os << "  bool _fa_active = ltid.x < 32u;\n";
+  os << "  uint _fa_M = " << M << ";\n";
+  os << "  uint _fa_N = " << N << ";\n";
+  os << "  uint _fa_dh = " << DH << ";\n";
+  os << "  uint _fa_sq = " << SQ << ";\n";
+  os << "  uint _fa_sk = " << SK << ";\n";
+  os << "  uint _fa_sv = " << SV << ";\n";
+  os << "  uint _fa_so = " << SO << ";\n";
+  // With a head split the grid's y dimension selects the head and every tensor
+  // is indexed at that head's column offset; without one the offset is 0.
+  if (op.getH())
+    os << "  uint _fa_col = tgid.y * _fa_dh;\n";
+  else
+    os << "  uint _fa_col = 0u;\n";
+  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  // The chunk loop is OUTSIDE the single-warp guard so every warp reaches every
+  // barrier; only the body is warp-0's.
+  os << "  for (uint _fa_c0 = 0u; _fa_c0 < " << S(BM) << "u; _fa_c0 += "
+     << S(CH) << "u) {\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    if (_fa_active) {\n";
+  os << "      for (uint c = _fa_lane; c < " << S(SZ) << "u; c += 32u) {\n";
+  os << "        uint qq = c / " << S(BD) << "u; uint d = c % " << S(BD)
+     << "u;\n";
+  os << "        uint row = _fa_rowoff + _fa_c0 + qq;\n";
+  os << "        _fa_qbuf[c] = (qq + _fa_c0 < " << S(BM)
+     << "u && row < _fa_M && d < _fa_dh) ? " << Q
+     << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
+  os << "        _fa_obuf[c] = 0.0f;\n";
+  os << "      }\n";
+  if (softmax) {
+    os << "      if (_fa_lane < " << S(CH)
+       << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
+  }
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    if (_fa_active) {\n";
+  os << "      uint _fa_q = _fa_lane;\n";
+  os << "      uint _fa_row = _fa_rowoff + _fa_c0 + _fa_q;\n";
+  // `_fa_q < CH` FIRST: every per-row buffer is sized by CH, and `row < M` does
+  // not imply it when CH < 32 (the FA emitter learned this the hard way).
+  os << "      if (_fa_q < " << S(CH) << "u && _fa_c0 + _fa_q < " << S(BM)
+     << "u && _fa_row < _fa_M) {\n";
+  // Causal kernels bound their key loop at `min((pid+1)*BM, seq_len)` and never
+  // visit past it; reproduce that bound rather than sweeping [0, n) and relying
+  // on the region to zero those keys.
+  if (op.getCausalKeyBound())
+    os << "        uint _fa_kend = min((tgid.x + 1u) * " << S(BM)
+       << "u, _fa_N);\n";
+  else
+    os << "        uint _fa_kend = _fa_N;\n";
+  os << "        for (uint _fa_key = 0u; _fa_key < _fa_kend; ++_fa_key) {\n";
+  os << "          float _fa_a = 0.0f;\n";
+  os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
+  os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
+     << "[_fa_key * _fa_sk + _fa_col + d];\n";
+  // ---- the score transform, straight out of the op's region ----
+  std::string w = emitScoreRegion_(op, "_fa_a", "(int)_fa_row", "(int)_fa_key",
+                                   "          ");
+  if (!softmax) {
+    // norm = none: the transformed score IS the weight. The region is
+    // responsible for zeroing keys that must not contribute, exactly as the
+    // source kernel's mask does.
+    os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] += " << w << " * "
+       << V << "[_fa_key * _fa_sv + _fa_col + d];\n";
+  } else {
+    // norm = online_softmax: the transformed score is a logit. `(m_old ==
+    // m_new) ? 1` keeps exp2(-inf - -inf) = NaN out of the running state on the
+    // first visited key, where m_old is -INFINITY.
+    // The exponential must be the one the source used: a kernel that folds
+    // log2(e) into its scale uses exp2, one that scales by plain 1/sqrt(d) uses
+    // exp, and the region has already produced the logit so the emitter cannot
+    // rescale after the fact.
+    const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
+    os << "          float _fa_mold = _fa_rmax[_fa_q];\n";
+    os << "          float _fa_mnew = max(_fa_mold, " << w << ");\n";
+    os << "          float _fa_sc = (_fa_mold == _fa_mnew) ? 1.0f : " << E
+       << "(_fa_mold - _fa_mnew);\n";
+    os << "          float _fa_p = " << E << "(" << w << " - _fa_mnew);\n";
+    os << "          _fa_rsum[_fa_q] = _fa_rsum[_fa_q] * _fa_sc + _fa_p;\n";
+    os << "          _fa_rmax[_fa_q] = _fa_mnew;\n";
+    os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] = _fa_obuf[_fa_q "
+          "* " << S(BD) << "u + d] * _fa_sc + _fa_p * " << V
+       << "[_fa_key * _fa_sv + _fa_col + d];\n";
+  }
+  os << "        }\n";
+  if (softmax) {
+    // Plain divide: a row with no visible key yields NaN, which is what the
+    // source kernel's `acc / l_i` produces.
+    os << "        float _fa_den = _fa_rsum[_fa_q];\n";
+    os << "        for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
+       << "_fa_obuf[_fa_q * " << S(BD) << "u + d] / _fa_den;\n";
+  } else {
+    os << "        for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
+       << "_fa_obuf[_fa_q * " << S(BD) << "u + d];\n";
+  }
+  os << "      }\n";
   os << "    }\n";
   os << "  }\n";
   os << "  }";
@@ -5112,14 +5620,20 @@ void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupsPerGridOp op)
 void ModuleTranslation::translate(mlir::triton::metal::CastOp op) {
   _output << typeToString(op.getType());
   _output << "(";
-  translateValue(op.getArgument().getDefiningOp());
+  // Wall 15 dispatch: the argument may be a BlockArgument with no defining op —
+  // an scf.for iter_arg, or a `metal.fused_attention` score-region arg, where
+  // `float(%row)` and `float(%param)` are both ordinary. `translateValue` would
+  // null-deref on those.
+  translateValueOrVarName(op.getArgument());
   _output << ")";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
-  auto translateArgument = [&] {
-    translateValue(op.getArgument().getDefiningOp());
-  };
+  // Wall 15 dispatch: the argument may be a BlockArgument (an scf.for iter_arg,
+  // or a `metal.fused_attention` score-region arg such as `exp2(%score)`), in
+  // which case there is no defining op and `translateValue` would null-deref.
+  // `metal.binary_exp` already routes through this helper.
+  auto translateArgument = [&] { translateValueOrVarName(op.getArgument()); };
 
   using OP = mlir::triton::metal::UnaryExpOperator;
   switch (op.getUnaryOperator()) {
@@ -5135,6 +5649,15 @@ void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
     break;
   case OP::expOp:
     _output << "metal::precise::exp(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::exp2Op:
+    // `tl.exp2` is the base-2 exponential every attention kernel in this tree
+    // uses for its softmax (the scale carries log2(e)), and the decay mask in
+    // medium-decaying_causal_attention.py relies on exp2(-inf) == 0. Rewriting
+    // it as exp(x * ln2) would perturb both, so it maps to MSL `exp2` directly.
+    _output << "metal::precise::exp2(";
     translateArgument();
     _output << ")";
     break;

@@ -42,4 +42,23 @@ def MatmulKindAttr : I32EnumAttr<
   let cppNamespace = "mlir::triton::metal";
 }
 
+// How `metal.fused_attention` turns transformed scores into output weights.
+//
+// `none`: the transformed score IS the weight. The P@V accumulator is the
+//   result and there is no denominator — `medium-decaying_causal_attention.py`,
+//   where the score cone already applies the causal decay `gamma^(row-key)` and
+//   masks the future to exactly 0.
+// `online_softmax`: the transformed score is a logit. The emitter keeps the
+//   running (max, sum) state per query row, rescales the accumulator on every
+//   key block, and divides by the running sum in the epilogue — the classic
+//   flash-attention formulation.
+def AttnNorm_None         : I32EnumAttrCase<"None",         0>;
+def AttnNorm_OnlineSoftmax : I32EnumAttrCase<"OnlineSoftmax", 1>;
+
+def AttnNormAttr : I32EnumAttr<
+    "AttnNorm", "How fused_attention normalizes transformed scores",
+    [AttnNorm_None, AttnNorm_OnlineSoftmax]> {
+  let cppNamespace = "mlir::triton::metal";
+}
+
 #endif // METAL_ENUMS

@@ -339,12 +339,17 @@ def UnaryExpOperatorLog : I64EnumAttrCase<"logOp", 5>;
 def UnaryExpOperatorRsqrt : I64EnumAttrCase<"rsqrtOp", 6>;
 def UnaryExpOperatorSin : I64EnumAttrCase<"sinOp", 7>;
 def UnaryExpOperatorCos : I64EnumAttrCase<"cosOp", 8>;
+// Base-2 exponential. Distinct from expOp on purpose: the attention kernels
+// fold log2(e) into their scale and use exp2, and a decay mask depends on
+// exp2(-inf) == 0 exactly.
+def UnaryExpOperatorExp2 : I64EnumAttrCase<"exp2Op", 9>;
 
 def UnaryExpOperator : I64EnumAttr<
     "UnaryExpOperator", "",
     [UnaryExpOperatorNot, UnaryExpOperatorMinus, UnaryExpOperatorExp,
      UnaryExpOperatorSqrt, UnaryExpOperatorErf, UnaryExpOperatorLog,
-     UnaryExpOperatorRsqrt, UnaryExpOperatorSin, UnaryExpOperatorCos]> {
+     UnaryExpOperatorRsqrt, UnaryExpOperatorSin, UnaryExpOperatorCos,
+     UnaryExpOperatorExp2]> {
   let cppNamespace = "mlir::triton::metal";
 }
 
@@ -776,6 +781,131 @@ def SinkAttentionOp : Metal_Op<"sink_attention", [AttrSizedOperandSegments]> {
       " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
       " (`sinks` $num_sinks^)? (`window` $window^)? attr-dict"
       " `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
+// FusedAttentionOp
+//===----------------------------------------------------------------------===//
+
+def ScoreYieldOp : Metal_Op<"score_yield", [Pure, Terminator,
+                                            HasParent<"FusedAttentionOp">]> {
+  let summary = "Terminator of a metal.fused_attention score-transform region";
+  let description = [{
+    Yields the transformed score for one (query row, key) pair. Exactly one
+    f32 operand; the parent op's `norm` attribute decides whether that value is
+    a weight (`none`) or a logit (`online_softmax`).
+  }];
+
+  let arguments = (ins F32:$value);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+// NOTE: deliberately NOT SingleBlockImplicitTerminator<"ScoreYieldOp">. That
+// trait auto-inserts the terminator and therefore needs one that is buildable
+// with no operands; `metal.score_yield` carries the transformed score, so the
+// region's terminator is required and type-checked in `verify()` instead.
+def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
+  let summary = "Fused Q@K^T -> score transform -> P@V attention body";
+
+  let description = [{
+    Self-contained attention body for one query-row block, generalizing the
+    `dot -> elementwise -> dot` chain that every attention-family Triton kernel
+    compiles to. Replaces the per-variant ops (`metal.flash_attention`,
+    `metal.sink_attention`), whose semantics were baked into hand-printed MSL
+    and therefore needed a NEW op — matcher and emitter both — for every new
+    masking or weighting scheme.
+
+    What varies between those variants is exactly one thing: the elementwise
+    function applied to each raw `Q@K^T` score before it multiplies V. Here that
+    function is DATA, carried in the `score` region, instead of code in the
+    emitter:
+
+        metal.fused_attention ... {
+        ^bb0(%score: f32, %row: i32, %key: i32, %p0: f32, ...):
+          // arbitrary scalar arith/math on the score and its two indices
+          metal.score_yield %transformed : f32
+        }
+
+    The region is entered once per (query row, key) pair with `%score` bound to
+    the raw dot product, `%row`/`%key` bound to the GLOBAL (not tile-relative)
+    indices, and the trailing block args bound to element 0 of each
+    `score_params` buffer. Masking is expressed the way the source kernel writes
+    it — yield `-inf` (or `0` under `norm = none`) for a key that must not
+    contribute — rather than as an enumerated mode attribute.
+
+    Two consequences worth naming, because both were recurring costs in the ops
+    this replaces:
+
+    - A kernel scalar that Triton FOLDED to a constant (it drops an argument
+      equal to 1 from the signature) needs no operand at all: it is simply an
+      `arith.constant` inside the region. The `Optional<operand> + *_const
+      attribute` pair that both predecessor ops carried per parameter — and the
+      "exactly one of the two is set" invariant that came with it — disappears.
+    - A matcher targeting this op does not enumerate known score shapes. It
+      absorbs every op between the two dots into the region and declines if any
+      op resists absorption, so coverage is established by CONSTRUCTION. The
+      predecessor design established it by pattern enumeration, which is what
+      let a sliding-window / causal / ALiBi / softcap kernel be claimed as plain
+      attention and silently miscompiled (max abs err 0.95-2.4).
+
+    `norm` selects the epilogue: `none` accumulates `sum_key transformed * V`
+    and stores it; `online_softmax` treats the transform's output as a logit and
+    keeps the running (max, sum) rescale, dividing by the sum on the way out.
+
+    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
+    f32 with per-tensor row strides. `m` is the query row count, `n` the key
+    count, `d_head` the feature width. `h` is OPTIONAL: present when the grid's
+    y dimension selects a head.
+
+    `softmax_natural_exp` selects base-e for the `online_softmax` running
+    state instead of the default base-2. Both spellings occur and they are NOT
+    interchangeable: the kernels that fold `log2(e)` into their scale use
+    `exp2`, while a kernel that scales by plain `1/sqrt(d)` uses `exp`. The
+    exponential must match the source's, since the region has already produced
+    the logit and the emitter cannot retroactively rescale it.
+
+    `causal_key_bound` makes the emitter visit keys `[0, min((tgid.x+1)*bm, n))`
+    instead of `[0, n)`, reproducing the `hi = min((pid+1)*BLOCK_M, seq_len)`
+    loop bound a causal kernel writes. It exists because agreement with the
+    source kernel must be REPRODUCED, not proven: a causally-bounded loop never
+    visits keys past `hi`, and that agrees with a `[0, n)` sweep only because
+    the region happens to send `key > row` to zero — which is not decidable for
+    an arbitrary region, and pattern-matching the causal shape to decide it
+    would reintroduce exactly the enumeration this op exists to remove. Same
+    reasoning as `metal.sink_attention` reproducing its two key phases rather
+    than its mathematical mask.
+
+    `bm` is the source kernel's query-row block and is BINDING — it fixes the
+    grid, so this program owns rows `[tgid.x*bm, tgid.x*bm + bm)`. `bn`/`bd` are
+    the source's key/feature tiles, recorded for the verifier; the emitter picks
+    its own key and feature chunking to fit Apple's 32 KiB threadgroup budget
+    and is therefore NOT capped by them. Online softmax is exact at any key
+    blocking, so re-blocking changes only summation order, not the result.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
+                       Metal_MemRefType:$v, Metal_MemRefType:$out,
+                       Metal_MemRefType:$m, Metal_MemRefType:$n,
+                       Metal_MemRefType:$d_head,
+                       Metal_MemRefType:$stride_q, Metal_MemRefType:$stride_k,
+                       Metal_MemRefType:$stride_v, Metal_MemRefType:$stride_o,
+                       Optional<Metal_MemRefType>:$h,
+                       Variadic<Metal_MemRefType>:$score_params,
+                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
+                       AttnNormAttr:$norm,
+                       UnitAttr:$causal_key_bound,
+                       UnitAttr:$softmax_natural_exp);
+
+  let regions = (region SizedRegion<1>:$score);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat =
+      "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_head"
+      " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
+      " (`heads` $h^)? (`params` $score_params^)? attr-dict"
+      " `:` type(operands) $score";
 }
 
 //===----------------------------------------------------------------------===//
