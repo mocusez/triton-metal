@@ -15459,24 +15459,61 @@ static mlir::triton::LoadOp faPeelLoad(FusedAttnTemplate &t, mlir::Value v,
 // would jump over initializations, so they were silent — which made a decline
 // in the prologue indistinguishable from "matcher never ran". Route them
 // through here so TRITON_METAL_FA_DEBUG reports them too.
-static mlir::LogicalResult faDecline(const char *why) {
+// `a*b + c` reaches us in two spellings — `math.fma` (tl.fma, as in
+// hard-mult_head_attention.py) and `arith.addf(arith.mulf(a, b), c)` (the plain
+// `acc * scaler + dot` of hard-sliding_window_self_attention.py). Same
+// computation; pinning one spelling rejects the other kernel outright.
+static bool faSplitFma(FusedAttnTemplate &t, mlir::Value v, mlir::Value &a,
+                       mlir::Value &b, mlir::Value &c) {
+  v = t.peel(v);
+  if (auto fma = v.getDefiningOp<mlir::math::FmaOp>()) {
+    t.mark(fma);
+    a = fma->getOperand(0);
+    b = fma->getOperand(1);
+    c = fma->getOperand(2);
+    return true;
+  }
+  auto add = v.getDefiningOp<mlir::arith::AddFOp>();
+  if (!add)
+    return false;
+  for (int i = 0; i < 2; ++i) {
+    auto mul = t.peel(add->getOperand(i)).getDefiningOp<mlir::arith::MulFOp>();
+    if (!mul)
+      continue;
+    t.mark(add);
+    t.mark(mul);
+    a = mul.getLhs();
+    b = mul.getRhs();
+    c = add->getOperand(1 - i);
+    return true;
+  }
+  return false;
+}
+
+static mlir::LogicalResult faDeclineAt(const char *why, int line) {
   if (::getenv("TRITON_METAL_FA_DEBUG"))
-    llvm::errs() << "[metal-fused-attn] declined (structural): " << why << "\n";
+    llvm::errs() << "[metal-fused-attn] declined (structural): " << why
+                 << "  [TritonGPUToMetal.cpp:" << line << "]\n";
   return mlir::failure();
 }
+// The line number is the authoritative half. The text is a convenience that a
+// future edit can silently desynchronise from its guard -- which already
+// happened twice while closing coverage, and a diagnostic that lies is worse
+// than none.
+#define faDecline(why) faDeclineAt((why), __LINE__)
 
 static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   FusedAttnTemplate t;
   t.funcOp = funcOp;
   if (funcOp.getBody().empty())
-    return faDecline("no unique tt.store");
+    return faDecline("func body empty");
   t.entry = &funcOp.getBody().front();
 
   // Anchor: the unique tt.store.
   llvm::SmallVector<mlir::triton::StoreOp> stores;
   funcOp.walk([&](mlir::triton::StoreOp s) { stores.push_back(s); });
   if (stores.size() != 1)
-    return faDecline("func body empty");
+    return faDecline("not exactly one store");
   t.store = stores[0];
 
   // Epilogue. `store(acc)` is norm=none; `store(acc / lift(sum))` is the online
@@ -15493,10 +15530,10 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
 
   auto forOp = stored.getDefiningOp<mlir::scf::ForOp>();
   if (!forOp)
-    return faDecline("not exactly one store");
+    return faDecline("accumulator is not an scf.for");
   t.forOp = forOp;
   if (forOp.getNumRegionIterArgs() != (t.softmax ? 3u : 1u))
-    return faDecline("accumulator is not an scf.for");
+    return faDecline("wrong iter_arg count for the norm mode");
 
   // Identify the iter_args by SHAPE and INIT, never by position: rank-2 is the
   // output accumulator, and the two rank-1 states are told apart by their inits
@@ -15508,32 +15545,32 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
           forOp.getInitArgs()[i].getType());
       if (!ty || !ty.getElementType().isF32())
-        return faDecline("wrong iter_arg count for the norm mode");
+        return faDecline("iter_arg is not a rank-1/2 f32 tensor");
       if (ty.getRank() == 2) {
         if (accIdx >= 0 || !t.isZeroSplat(forOp.getInitArgs()[i]))
-          return faDecline("iter_arg is not a rank-1/2 f32 tensor");
+          return faDecline("two rank-2 iter_args, or non-zero accumulator init");
         accIdx = i;
       } else if (ty.getRank() == 1) {
         if (t.isNegInfSplat(forOp.getInitArgs()[i])) {
           if (maxIdx >= 0)
-            return faDecline("two rank-2 iter_args or non-zero acc init");
+            return faDecline("two running-max iter_args");
           maxIdx = i;
         } else if (t.isZeroSplat(forOp.getInitArgs()[i])) {
           if (sumIdx >= 0)
-            return faDecline("two running-max iter_args");
+            return faDecline("two running-sum iter_args");
           sumIdx = i;
         } else {
-          return faDecline("two running-sum iter_args");
+          return faDecline("rank-1 iter_arg init is neither -inf nor 0");
         }
       } else {
-        return faDecline("rank-1 iter_arg init is neither -inf nor 0");
+        return faDecline("iter_arg rank is not 1 or 2");
       }
     }
     if (accIdx < 0 || sumIdx < 0 || maxIdx < 0)
-      return faDecline("iter_arg rank is not 1 or 2");
+      return faDecline("could not assign acc/sum/max iter_arg roles");
     if (stored != forOp.getResult(accIdx) ||
         t.peel(sumLift) != forOp.getResult(sumIdx))
-      return faDecline("could not assign acc/sum/max iter_arg roles");
+      return faDecline("store does not divide the acc result by the sum result");
   }
 
   mlir::Block *body = forOp.getBody();
@@ -15545,19 +15582,39 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   if (!t.softmax) {
     dotPV = accNext.getDefiningOp<mlir::triton::DotOp>();
     if (!dotPV || t.peel(dotPV.getC()) != forOp.getRegionIterArg(accIdx))
-      return faDecline("store does not divide the acc result by the sum result");
+      return faDecline("yield is not a dot (norm=none)");
   } else {
     // acc' = fma(acc_carried, lift(scaler), dot(P, V, 0)) — the rescale rides a
     // separate fma, so the dot's own C operand has to be zero.
-    auto fma = accNext.getDefiningOp<mlir::math::FmaOp>();
-    if (!fma)
-      return faDecline("yield is not a dot (norm=none)");
-    t.mark(fma);
-    if (t.peel(fma->getOperand(0)) != forOp.getRegionIterArg(accIdx))
-      return faDecline("acc update is not fma(acc, scaler, dot)");
-    dotPV = t.peel(fma->getOperand(2)).getDefiningOp<mlir::triton::DotOp>();
-    if (!dotPV || !t.isZeroSplat(dotPV.getC()))
-      return faDecline("fma A operand is not the carried accumulator");
+    // A THIRD spelling: Triton folds `dot(P, V) + x` into the dot's own C
+    // operand, so the rescaled accumulator rides inside the dot rather than in
+    // a surrounding fma/add. All three are the same computation.
+    if (auto d = accNext.getDefiningOp<mlir::triton::DotOp>()) {
+      dotPV = d;
+      mlir::Value ma, mb;
+      auto mul = t.peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
+      if (!mul)
+        return faDecline("PV dot C operand is not the rescaled accumulator");
+      t.mark(mul);
+      ma = mul.getLhs();
+      mb = mul.getRhs();
+      if (t.peel(ma) != forOp.getRegionIterArg(accIdx))
+        std::swap(ma, mb);
+      if (t.peel(ma) != forOp.getRegionIterArg(accIdx))
+        return faDecline("PV dot C operand does not rescale the carried accumulator");
+    } else {
+      mlir::Value fa, fb, fc;
+      if (!faSplitFma(t, accNext, fa, fb, fc))
+        return faDecline("acc update is not fma / mul-add / dot-with-rescaled-C");
+      if (t.peel(fa) != forOp.getRegionIterArg(accIdx)) {
+        std::swap(fa, fb); // the accumulator may sit on either side
+        if (t.peel(fa) != forOp.getRegionIterArg(accIdx))
+          return faDecline("acc update A operand is not the carried accumulator");
+      }
+      dotPV = t.peel(fc).getDefiningOp<mlir::triton::DotOp>();
+      if (!dotPV || !t.isZeroSplat(dotPV.getC()))
+        return faDecline("PV dot missing, or its C operand is not zero");
+    }
   }
   t.dotPV = dotPV;
   t.mark(dotPV);
@@ -15567,12 +15624,12 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       mlir::dyn_cast<mlir::RankedTensorType>(t.peel(dotPV.getA()).getType());
   if (!accTy || !scoreTy || accTy.getRank() != 2 || scoreTy.getRank() != 2 ||
       !accTy.getElementType().isF32())
-    return faDecline("PV dot C operand is not zero");
+    return faDecline("dot result / score type is not rank-2 f32");
   t.BM = accTy.getShape()[0];
   t.BD = accTy.getShape()[1];
   t.BN = scoreTy.getShape()[1];
   if (t.BM % 8 || t.BN % 8 || t.BD % 8)
-    return faDecline("dot result/score type is not rank-2 f32");
+    return faDecline("tile dims are not multiples of 8");
 
   // The QK dot: reachable from dotPV's A operand through the score cone.
   llvm::SmallVector<mlir::Operation *, 16> wl;
@@ -15595,7 +15652,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
         wl.push_back(d2);
   }
   if (!dotQK)
-    return faDecline("tile dims are not multiples of 8");
+    return faDecline("two score-side dots");
   t.dotQK = dotQK;
   t.mark(dotQK);
 
@@ -15619,77 +15676,88 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       pin = e2.getOperand();
       t.mark(e2);
     } else {
-      return faDecline("two score-side dots");
+      return faDecline("no QK dot reachable from the PV dot A operand");
     }
     auto shift = t.peel(pin).getDefiningOp<mlir::arith::SubFOp>();
     if (!shift)
-      return faDecline("no QK dot reachable from the PV dot A operand");
+      return faDecline("P is not exp/exp2 of a shifted logit");
     t.mark(shift);
     t.scoreOut = shift.getLhs();
     mlir::Value mNew = t.peel(shift.getRhs());
 
     // m' = maxnumf(reduce_max(L, axis=1), m_carried), and it is what is yielded.
     if (t.peel(yield.getOperand(maxIdx)) != mNew)
-      return faDecline("P is not exp/exp2 of a shifted logit");
+      return faDecline("logit shift is not a subf");
     auto mx = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
     if (!mx)
-      return faDecline("shift is not a subf");
+      return faDecline("yielded running max is not the merged max");
     t.mark(mx);
     mlir::Value rmax;
     for (int i = 0; i < 2; ++i)
       if (t.peel(mx->getOperand(i)) == forOp.getRegionIterArg(maxIdx))
         rmax = mx->getOperand(1 - i);
     if (!rmax)
-      return faDecline("yielded running max is not the merged max");
+      return faDecline("m_new is not a maxnumf");
     auto redMax = t.peel(rmax).getDefiningOp<mlir::triton::ReduceOp>();
     if (!t.isReduce<mlir::arith::MaxNumFOp>(redMax, 1))
-      return faDecline("m_new is not a maxnumf");
+      return faDecline("maxnumf does not carry the running max");
     t.mark(redMax);
     if (t.peel(redMax.getSrcs()[0]) != t.peel(t.scoreOut))
-      return faDecline("maxnumf does not carry the running max");
+      return faDecline("row-max reduce is not max over axis 1");
 
     // scaler = exp(m_carried - m'), in the same base as P. It reaches the
     // accumulator as the fma's middle operand.
-    auto accFma =
-        t.peel(yield.getOperand(accIdx)).getDefiningOp<mlir::math::FmaOp>();
-    if (!accFma)
-      return faDecline("row-max reduce is not max over axis 1");
-    mlir::Value scaler = t.peel(accFma->getOperand(1));
+    mlir::Value scaler;
+    if (auto d = t.peel(yield.getOperand(accIdx))
+                     .getDefiningOp<mlir::triton::DotOp>()) {
+      auto mul = t.peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
+      if (!mul)
+        return faDecline("cannot resolve the scaler from the dot's C operand");
+      scaler = t.peel(mul.getLhs()) == forOp.getRegionIterArg(accIdx)
+                   ? t.peel(mul.getRhs())
+                   : t.peel(mul.getLhs());
+    } else {
+      mlir::Value ga, gb, gc;
+      if (!faSplitFma(t, yield.getOperand(accIdx), ga, gb, gc))
+        return faDecline("acc update not found while resolving the scaler");
+      if (t.peel(ga) != forOp.getRegionIterArg(accIdx))
+        std::swap(ga, gb);
+      scaler = t.peel(gb);
+    }
     mlir::Value sin;
     if (auto e = scaler.getDefiningOp<mlir::math::ExpOp>()) {
       if (!t.naturalExp)
-        return faDecline("row-max reduce source is not the logits");
+        return faDecline("acc update not found while resolving the scaler");
       sin = e.getOperand();
       t.mark(e);
     } else if (auto e2 = scaler.getDefiningOp<mlir::math::Exp2Op>()) {
       if (t.naturalExp)
-        return faDecline("acc update fma missing");
+        return faDecline("scaler exp base disagrees with P");
       sin = e2.getOperand();
       t.mark(e2);
     } else {
-      return faDecline("scaler exp base disagrees with P");
+      return faDecline("scaler is not exp(m_old - m_new)");
     }
     auto sSub = t.peel(sin).getDefiningOp<mlir::arith::SubFOp>();
     if (!sSub || t.peel(sSub.getLhs()) != forOp.getRegionIterArg(maxIdx) ||
         t.peel(sSub.getRhs()) != mNew)
-      return faDecline("scaler is not exp of (m_old - m_new)");
+      return faDecline("sum update is not fma(sum,scaler,reduce_add) nor sum*scaler+reduce_add");
     t.mark(sSub);
 
     // sum' = fma(sum_carried, scaler, reduce_add(P, axis=1)).
-    auto sumFma =
-        t.peel(yield.getOperand(sumIdx)).getDefiningOp<mlir::math::FmaOp>();
-    if (!sumFma ||
-        t.peel(sumFma->getOperand(0)) != forOp.getRegionIterArg(sumIdx) ||
-        t.peel(sumFma->getOperand(1)) != scaler)
-      return faDecline("sum update is not fma(sum, scaler, reduce_add)");
-    t.mark(sumFma);
-    auto redSum =
-        t.peel(sumFma->getOperand(2)).getDefiningOp<mlir::triton::ReduceOp>();
+    mlir::Value sa, sb, sc;
+    if (!faSplitFma(t, yield.getOperand(sumIdx), sa, sb, sc))
+      return faDecline("sum update is not fma/mul-add over the running sum");
+    if (t.peel(sa) != forOp.getRegionIterArg(sumIdx))
+      std::swap(sa, sb);
+    if (t.peel(sa) != forOp.getRegionIterArg(sumIdx) || t.peel(sb) != scaler)
+      return faDecline("sum update does not rescale the running sum by the scaler");
+    auto redSum = t.peel(sc).getDefiningOp<mlir::triton::ReduceOp>();
     if (!t.isReduce<mlir::arith::AddFOp>(redSum, 1))
-      return faDecline("denominator reduce is not add over axis 1");
+      return faDecline("denominator reduce source is not P");
     t.mark(redSum);
     if (t.peel(redSum.getSrcs()[0]) != P)
-      return faDecline("denominator reduce source is not P");
+      return faDecline("structural gate #33");
   }
 
   // Absorb the cone. Anything without a scalar translation fails the match.
