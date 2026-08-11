@@ -15924,7 +15924,13 @@ struct ConvertTritonGPUToMetalPass
     // handling. Its dot-B operand cvts (A operand is a computed `exp`) can't be
     // absorbed by the matmul track and would otherwise hit the L1d3 reject.
     // See metal-flash-attention-plan.md.
-    runFlashAttentionMatcher(moduleOp);
+    // Escape hatch for measuring fused-attention coverage: with the two legacy
+    // matchers off, the existing flash/sink test suites become a direct parity
+    // bar for `metal.fused_attention`, which is the precondition for deleting
+    // those ops. Mirrors TRITON_METAL_SCALAR_DOT=1.
+    const bool legacyAttn = !::getenv("TRITON_METAL_NO_LEGACY_ATTN");
+    if (legacyAttn)
+      runFlashAttentionMatcher(moduleOp);
 
     // Same window, same reason: recognize the causal + attention-sinks +
     // sliding-window kernel (a sink block feeding a local-window loop, K loaded
@@ -15932,7 +15938,8 @@ struct ConvertTritonGPUToMetalPass
     // with one `metal.sink_attention`. Runs after the FA matcher; that matcher
     // cannot see this kernel at all (it has no `tt.trans` to classify its dots
     // by), so the two never contend. See metal-attention-with-sinks-plan.md.
-    runSinkAttentionMatcher(moduleOp);
+    if (legacyAttn)
+      runSinkAttentionMatcher(moduleOp);
 
     // Generalized attention: the `dot -> score transform -> dot` chain with the
     // transform carried as a REGION instead of baked into a per-variant emitter.
