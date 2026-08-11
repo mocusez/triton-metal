@@ -14793,6 +14793,14 @@ struct FusedAttnTemplate {
   bool naturalExp = false; // base-e rather than base-2 online softmax
   mlir::Value hVal;        // head count, null when there is no head split
 
+  // Predicates the source applies to ZERO the softmax numerator — the
+  // `where(mask, exp(L - m), 0.0)` chain a masked kernel writes. They are
+  // folded into the region as `select(pred, L, -inf)` rather than left outside
+  // it, because -inf exponentiates to exactly zero: same key set, but the
+  // emitter gets to own the running max. `.second` is set when the kept value
+  // is on the select's FALSE side, so the fill and the logit swap places.
+  llvm::SmallVector<std::pair<mlir::Value, bool>> zeroPreds;
+
   const char *why = nullptr;
   mlir::Operation *offender = nullptr;
   llvm::DenseSet<mlir::Operation *> claimed;
@@ -14868,6 +14876,64 @@ struct FusedAttnTemplate {
       return f.isInfinity() && f.isNegative();
     });
   }
+  bool isFpSplatConst(mlir::Value v) {
+    return matchFpSplat(v, [](const llvm::APFloat &) { return true; });
+  }
+
+  // Peel `select(pred, X, 0.0)` off the softmax numerator, recording each
+  // predicate in `zeroPreds`. What remains has to be the exponential itself.
+  mlir::Value peelZeroSelects(mlir::Value v) {
+    v = peel(v);
+    for (int i = 0; i < 8; ++i) {
+      auto sel = v.getDefiningOp<mlir::arith::SelectOp>();
+      if (!sel)
+        break;
+      bool keepOnFalse;
+      if (isZeroSplat(sel.getFalseValue()))
+        keepOnFalse = false;
+      else if (isZeroSplat(sel.getTrueValue()))
+        keepOnFalse = true;
+      else
+        break;
+      mark(sel);
+      zeroPreds.push_back({sel.getCondition(), keepOnFalse});
+      v = peel(keepOnFalse ? sel.getFalseValue() : sel.getTrueValue());
+    }
+    return v;
+  }
+
+  // Peel `select(pred, X, <float const>)` off the ROW-MAX source. Unlike the
+  // numerator's zeroing, this one is discarded rather than absorbed: the
+  // running max is normalization bookkeeping that cancels exactly in
+  // `sum(p*V) / sum(p)`, so the emitter is free to take its own max over its
+  // own logits. What still has to hold is that the source's max reads the SAME
+  // logits, differing only by entries replaced with a constant — a kernel whose
+  // max came from somewhere else is one this template does not understand.
+  // It has to run on BOTH sides of that comparison: a causal kernel writes its
+  // logit as `where(causal, s, -inf)`, so `scoreOut` is a masked select too and
+  // peeling only the reduce's side would make two identical expressions differ.
+  mlir::Value peelMaskedMax(mlir::Value v, bool record) {
+    v = peel(v);
+    for (int i = 0; i < 8; ++i) {
+      auto sel = v.getDefiningOp<mlir::arith::SelectOp>();
+      if (!sel)
+        break;
+      mlir::Value keep;
+      if (isFpSplatConst(sel.getFalseValue()))
+        keep = sel.getTrueValue();
+      else if (isFpSplatConst(sel.getTrueValue()))
+        keep = sel.getFalseValue();
+      else
+        break;
+      if (record) {
+        mark(sel);
+        maskedMaxPreds.push_back(sel.getCondition());
+      }
+      v = peel(keep);
+    }
+    return v;
+  }
+  llvm::SmallVector<mlir::Value> maskedMaxPreds;
 
   // `tt.reduce` over `axis` whose combine body is exactly one op of type OpT.
   template <typename OpT>
@@ -14926,6 +14992,18 @@ struct FusedAttnTemplate {
       return Idx::Key;
     }
     if (auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>()) {
+      // `for step in range(cdiv(N, BN))` counts BLOCKS, so the key base is
+      // `step*BN` rather than the induction variable itself. Same key set as
+      // `range(0, N, BN)`; only the loop's unit differs.
+      if (forOp && len == BN)
+        for (int i = 0; i < 2; ++i)
+          if (mul->getOperand(i) == forOp.getInductionVar() &&
+              isIntConst(mul->getOperand(1 - i), BN)) {
+            mark(add);
+            mark(mr);
+            mark(mul);
+            return Idx::Key;
+          }
       for (int i = 0; i < 2; ++i) {
         auto pid =
             mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
@@ -15643,7 +15721,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       continue;
     if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(o)) {
       if (dotQK && dotQK != d)
-        return mlir::failure(); // two score-side dots: not this template
+        return faDecline("two score-side dots");
       dotQK = d;
       continue;
     }
@@ -15652,7 +15730,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
         wl.push_back(d2);
   }
   if (!dotQK)
-    return faDecline("two score-side dots");
+    return faDecline("no QK dot reachable from the PV dot A operand");
   t.dotQK = dotQK;
   t.mark(dotQK);
 
@@ -15664,46 +15742,50 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   // contain a reduction it cannot express per (row, key).
   t.scoreOut = dotPV.getA();
   if (t.softmax) {
-    // P = exp(L - lift(m_new)), in whichever base the source used.
+    // P = exp(L - lift(m_new)), in whichever base the source used, optionally
+    // wrapped in the `where(mask, ..., 0.0)` chain a masked kernel writes. Those
+    // selects move INTO the region as `select(mask, L, -inf)`; see peelZeroSelects.
     mlir::Value P = t.peel(dotPV.getA());
+    mlir::Value pcore = t.peelZeroSelects(P);
     mlir::Value pin;
-    if (auto e = P.getDefiningOp<mlir::math::ExpOp>()) {
+    if (auto e = pcore.getDefiningOp<mlir::math::ExpOp>()) {
       t.naturalExp = true;
       pin = e.getOperand();
       t.mark(e);
-    } else if (auto e2 = P.getDefiningOp<mlir::math::Exp2Op>()) {
+    } else if (auto e2 = pcore.getDefiningOp<mlir::math::Exp2Op>()) {
       t.naturalExp = false;
       pin = e2.getOperand();
       t.mark(e2);
     } else {
-      return faDecline("no QK dot reachable from the PV dot A operand");
+      return faDecline("P is not exp/exp2 of a shifted logit");
     }
     auto shift = t.peel(pin).getDefiningOp<mlir::arith::SubFOp>();
     if (!shift)
-      return faDecline("P is not exp/exp2 of a shifted logit");
+      return faDecline("logit shift is not a subf");
     t.mark(shift);
     t.scoreOut = shift.getLhs();
     mlir::Value mNew = t.peel(shift.getRhs());
 
     // m' = maxnumf(reduce_max(L, axis=1), m_carried), and it is what is yielded.
     if (t.peel(yield.getOperand(maxIdx)) != mNew)
-      return faDecline("logit shift is not a subf");
+      return faDecline("the shift subtrahend is not the yielded running max");
     auto mx = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
     if (!mx)
-      return faDecline("yielded running max is not the merged max");
+      return faDecline("m_new is not a maxnumf");
     t.mark(mx);
     mlir::Value rmax;
     for (int i = 0; i < 2; ++i)
       if (t.peel(mx->getOperand(i)) == forOp.getRegionIterArg(maxIdx))
         rmax = mx->getOperand(1 - i);
     if (!rmax)
-      return faDecline("m_new is not a maxnumf");
+      return faDecline("maxnumf does not carry the running max");
     auto redMax = t.peel(rmax).getDefiningOp<mlir::triton::ReduceOp>();
     if (!t.isReduce<mlir::arith::MaxNumFOp>(redMax, 1))
-      return faDecline("maxnumf does not carry the running max");
+      return faDecline("row-max reduce is not maxnumf over axis 1");
     t.mark(redMax);
-    if (t.peel(redMax.getSrcs()[0]) != t.peel(t.scoreOut))
-      return faDecline("row-max reduce is not max over axis 1");
+    if (t.peelMaskedMax(redMax.getSrcs()[0], /*record=*/true) !=
+        t.peelMaskedMax(t.scoreOut, /*record=*/false))
+      return faDecline("the row-max reduce does not read the logits");
 
     // scaler = exp(m_carried - m'), in the same base as P. It reaches the
     // accumulator as the fma's middle operand.
@@ -15727,7 +15809,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     mlir::Value sin;
     if (auto e = scaler.getDefiningOp<mlir::math::ExpOp>()) {
       if (!t.naturalExp)
-        return faDecline("acc update not found while resolving the scaler");
+        return faDecline("scaler exp base disagrees with P");
       sin = e.getOperand();
       t.mark(e);
     } else if (auto e2 = scaler.getDefiningOp<mlir::math::Exp2Op>()) {
@@ -15741,7 +15823,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     auto sSub = t.peel(sin).getDefiningOp<mlir::arith::SubFOp>();
     if (!sSub || t.peel(sSub.getLhs()) != forOp.getRegionIterArg(maxIdx) ||
         t.peel(sSub.getRhs()) != mNew)
-      return faDecline("sum update is not fma(sum,scaler,reduce_add) nor sum*scaler+reduce_add");
+      return faDecline("scaler is not exp(m_old - m_new)");
     t.mark(sSub);
 
     // sum' = fma(sum_carried, scaler, reduce_add(P, axis=1)).
@@ -15754,20 +15836,29 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       return faDecline("sum update does not rescale the running sum by the scaler");
     auto redSum = t.peel(sc).getDefiningOp<mlir::triton::ReduceOp>();
     if (!t.isReduce<mlir::arith::AddFOp>(redSum, 1))
-      return faDecline("denominator reduce source is not P");
+      return faDecline("denominator reduce is not addf over axis 1");
     t.mark(redSum);
     if (t.peel(redSum.getSrcs()[0]) != P)
-      return faDecline("structural gate #33");
+      return faDecline("denominator reduce source is not P");
   }
 
   // Absorb the cone. Anything without a scalar translation fails the match.
   llvm::DenseSet<mlir::Operation *> coneSeen;
   if (!t.collectCone(t.scoreOut, coneSeen))
     goto rejected;
-  if (!t.rowIdx || !t.keyIdx) {
-    t.no("score transform does not read both the row and the key index");
-    goto rejected;
-  }
+  // The numerator's zeroing predicates are absorbed too — they end up in the
+  // region. The row-max's masking predicates are NOT emitted (the emitter takes
+  // its own max), but they still have to be walked so their ops are claimed by
+  // the coverage gate below.
+  for (auto &zp : t.zeroPreds)
+    if (!t.collectCone(zp.first, coneSeen))
+      goto rejected;
+  for (mlir::Value mp : t.maskedMaxPreds)
+    if (!t.collectCone(mp, coneSeen))
+      goto rejected;
+  // Neither index is REQUIRED: a plain `score * scale` transform reads no index
+  // at all, and a band mask reads both only from the predicates. Over-matching
+  // is prevented by the coverage gate below, not by this.
 
   {
     // Operand loads.
@@ -15835,13 +15926,45 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
 
     // Key bound: `[0, n)` or the causal `[0, min((pid+1)*BM, n))`. Anything
     // else is a key set the emitter would not reproduce.
-    if (!FusedAttnTemplate::isIntConst(forOp.getLowerBound(), 0) ||
+    if (!FusedAttnTemplate::isIntConst(forOp.getLowerBound(), 0)) {
+      t.no("key loop does not start at 0");
+      goto rejected;
+    }
+    // Two spellings of the same sweep: `range(0, N, BN)` steps by keys, while
+    // `range(0, cdiv(N, BN))` steps by blocks. The block form's upper bound is
+    // the cdiv itself, so it is checked against N here rather than compared to
+    // it directly.
+    const bool blockCounted =
+        FusedAttnTemplate::isIntConst(forOp.getStep(), 1) && t.BN != 1;
+    if (!blockCounted &&
         !FusedAttnTemplate::isIntConst(forOp.getStep(), t.BN)) {
-      t.no("key loop is not `range(0, ub, BN)`");
+      t.no("key loop is not `range(0, ub, BN)` nor `range(0, cdiv(N, BN))`");
       goto rejected;
     }
     mlir::Value ub = forOp.getUpperBound();
-    if (ub == t.nVal) {
+    if (blockCounted) {
+      mlir::Value num;
+      if (auto d = ub.getDefiningOp<mlir::arith::DivSIOp>()) {
+        if (FusedAttnTemplate::isIntConst(d.getRhs(), t.BN))
+          num = d.getLhs();
+      } else if (auto d = ub.getDefiningOp<mlir::arith::DivUIOp>()) {
+        if (FusedAttnTemplate::isIntConst(d.getRhs(), t.BN))
+          num = d.getLhs();
+      }
+      auto ad = num ? num.getDefiningOp<mlir::arith::AddIOp>()
+                    : mlir::arith::AddIOp();
+      bool ok = false;
+      if (ad)
+        for (int i = 0; i < 2; ++i)
+          if (FusedAttnTemplate::isIntConst(ad->getOperand(1 - i), t.BN - 1) &&
+              ad->getOperand(i) == t.nVal)
+            ok = true;
+      if (!ok) {
+        t.no("block-counted key loop bound is not cdiv(N, BN)");
+        goto rejected;
+      }
+      t.causalKeyBound = false;
+    } else if (ub == t.nVal) {
       t.causalKeyBound = false;
     } else if (auto mn = ub.getDefiningOp<mlir::arith::MinSIOp>()) {
       bool sawN = false, sawBlk = false;
@@ -15925,8 +16048,10 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
 
     llvm::DenseMap<void *, mlir::Value> leaf, memo;
     leaf[dotQK.getResult().getAsOpaquePointer()] = rb->getArgument(0);
-    leaf[t.peel(t.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
-    leaf[t.peel(t.keyIdx).getAsOpaquePointer()] = rb->getArgument(2);
+    if (t.rowIdx)
+      leaf[t.peel(t.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
+    if (t.keyIdx)
+      leaf[t.peel(t.keyIdx).getAsOpaquePointer()] = rb->getArgument(2);
     for (auto [i, p] : llvm::enumerate(t.params))
       leaf[p.getAsOpaquePointer()] = rb->getArgument(3 + i);
 
@@ -15936,6 +16061,26 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       op.erase();
       t.no("score cone could not be translated into the region");
       goto rejected;
+    }
+    // Re-apply the numerator's zeroing masks as a logit of -inf. The source
+    // zeroes P AFTER exponentiating; -inf before it is the same key set, and it
+    // keeps the whole mask inside the region where the emitter's own running
+    // max can see it. (Both emitter bodies guard `exp(-inf - -inf)`.)
+    for (auto &zp : t.zeroPreds) {
+      mlir::Value c = emitConeScalar(rbb, loc, zp.first, leaf, memo);
+      if (!c) {
+        op.erase();
+        t.no("a numerator mask could not be translated into the region");
+        goto rejected;
+      }
+      mlir::Value fill = mlir::triton::metal::ConstantOp::create(
+                             rbb, loc,
+                             rbb.getFloatAttr(
+                                 f32, -std::numeric_limits<double>::infinity()))
+                             .getResult();
+      w = mlir::arith::SelectOp::create(rbb, loc, c, zp.second ? fill : w,
+                                        zp.second ? w : fill)
+              .getResult();
     }
     mlir::triton::metal::ScoreYieldOp::create(rbb, loc, w);
 

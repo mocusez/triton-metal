@@ -163,13 +163,19 @@ def test_sliding_window_attention(M, d, window_size):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-def test_sliding_window_attention_over_budget_rejects():
+def test_sliding_window_attention_over_budget_is_correct_not_rejected():
     """d = 128 -> BLOCK_D = 128 -> 10784 threadgroup floats > the 8192 budget.
 
-    Stays a hard reject after Phase C/D: the FA envelope check rejects it and
-    the general path cannot compile the kernel either. Pinned separately from
-    the xfail group above so that group can flip to passing without this one
-    silently flipping with it.
+    This used to be a HARD REJECT, and pinned as one: the simdgroup body needs
+    the whole working set in threadgroup memory, so an over-budget tile had
+    nowhere to go and the compile failed. `metal.fused_attention` carries a
+    scalar per-key body as its correctness floor and picks between the two by
+    threadgroup budget, so an over-budget shape now falls back and computes the
+    right answer instead of failing.
+
+    The assertion is NUMERIC on purpose. The thing that could go wrong with the
+    fallback is a wrong answer, not a crash, so a bare "it compiles now" check
+    would pass just as happily on a body that silently drops the band mask.
     """
     M, d, window_size = 64, 128, 16
     torch.manual_seed(0xB0D)
@@ -178,8 +184,10 @@ def test_sliding_window_attention_over_budget_rejects():
     V = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
     out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
 
-    with pytest.raises(RuntimeError):
-        _solve(Q, K, V, out, M, d, window_size)
+    _solve(Q, K, V, out, M, d, window_size)
+
+    expected = _reference(Q, K, V, M, d, window_size)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
 def test_sliding_window_attention_single_row_rejects():

@@ -2660,7 +2660,13 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     os << "          float _fa_mnew = max(_fa_mold, " << w << ");\n";
     os << "          float _fa_sc = (_fa_mold == _fa_mnew) ? 1.0f : " << E
        << "(_fa_mold - _fa_mnew);\n";
-    os << "          float _fa_p = " << E << "(" << w << " - _fa_mnew);\n";
+    // A region that masks by yielding -inf reaches here with `w == -INFINITY`,
+    // and on the first visited key `_fa_mnew` is -INFINITY too. `exp(-inf -
+    // -inf)` is NaN, and one NaN poisons the whole row's accumulator -- so the
+    // masked-out weight is forced to zero rather than computed.
+    os << "          float _fa_p = (" << w << " == -INFINITY || _fa_mnew == "
+          "-INFINITY) ? 0.0f : "
+       << E << "(" << w << " - _fa_mnew);\n";
     os << "          _fa_rsum[_fa_q] = _fa_rsum[_fa_q] * _fa_sc + _fa_p;\n";
     os << "          _fa_rmax[_fa_q] = _fa_mnew;\n";
     os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
