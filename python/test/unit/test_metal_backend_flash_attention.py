@@ -260,10 +260,28 @@ def test_flash_attention_rejects_near_miss_kernels(variant, what):
 
     grid = (triton.cdiv(N, 32), h)
     try:
-        _decoy_kernel[grid](Q, K, V, out, N, d_model, h, 32, max(16, d_model // h),
-                            variant, num_warps=4)
+        compiled = _decoy_kernel[grid](Q, K, V, out, N, d_model, h, 32,
+                                       max(16, d_model // h), variant,
+                                       num_warps=4)
     except RuntimeError:
-        return  # rejected — the expected outcome today
+        # Rejection is still an acceptable outcome for a variant nothing
+        # implements — EXCEPT the causal mask, which `metal.fused_attention`
+        # now carries in its score region. Letting variant 0 take this branch
+        # would mean a regression to "rejected" passes silently, and this test
+        # is the numeric guard that the lit fixture
+        # `flash_attention_reject_causal.mlir` defers to.
+        assert variant != 0, (
+            "a causal mask must be CLAIMED by metal.fused_attention now, not "
+            "rejected — see flash_attention_reject_causal.mlir"
+        )
+        return
+
+    if variant == 0:
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "metal.fused_attention" in msl
+        assert "metal.flash_attention" not in msl
 
     expected = _decoy_reference(Q, K, V, N, d_model, h, variant)
     err = (out.cpu() - expected).abs().max().item()

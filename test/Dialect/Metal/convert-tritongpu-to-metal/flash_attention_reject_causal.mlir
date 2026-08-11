@@ -1,4 +1,4 @@
-// RUN: not triton-metal-opt --convert-tritongpu-to-metal %s 2>&1 | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %s 2>&1 | FileCheck %s
 //
 // Phase B decoy: a CAUSAL-masked attention loop must not be claimed by
 // tryFlashAttentionLoop. It is structurally identical to the multi-head kernel
@@ -18,8 +18,22 @@
 // collected mask a 3-element set. Run with TRITON_METAL_FA_DEBUG=1 to print
 // "softmax mask is not exactly (row < N) & (key < N)".
 //
-// With FA declining, the loop falls through to the general path and hits the
-// pre-existing L1d3 staged-transpose reject — a hard error, which is the
+// SUPERSEDED OUTCOME: the loop used to fall through to a hard L1d3 error, which
+// was the correct result while nothing could express a causal mask. It is now
+// CLAIMED by `metal.fused_attention`, which carries the mask in its score
+// region instead of enumerating it — a causal term is just two more ops to
+// absorb. `metal.flash_attention` must STILL decline it (the CHECK-NOT below):
+// this file's original invariant, that the causal term is never silently
+// dropped, is unchanged.
+//
+// The numeric half of that invariant lives in
+// `test_metal_backend_flash_attention.py::test_flash_attention_rejects_near_miss_kernels[0-causal mask]`,
+// which compiles this same shape and checks it against a per-head reference
+// (4.2e-07). A compile-succeeds check alone would NOT be a safe replacement for
+// the rejection this file used to assert — the failure mode being guarded is a
+// silent wrong answer, not a crash.
+//
+// Historical note: with FA declining and no fused op, the loop hit the
 // correct outcome for a kernel this backend cannot express.
 //
 // The behavioural companion (reject OR numerically correct, for this variant
@@ -28,8 +42,11 @@
 // python/test/unit/test_metal_backend_flash_attention.py.
 //
 // CHECK-NOT: metal.flash_attention
-// CHECK: error:
-// CHECK-SAME: broader staged-transpose deferred to L1d3
+// CHECK: metal.fused_attention
+// The causal term must be IN the score region, not dropped: `key <= row` is a
+// comparison of the two index block args.
+// CHECK: ^bb0(%{{.*}}: f32, %{{.*}}: si32, %{{.*}}: si32
+// CHECK: metal.score_yield
 // CHECK-NOT: metal.flash_attention
 //
 #blocked = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>

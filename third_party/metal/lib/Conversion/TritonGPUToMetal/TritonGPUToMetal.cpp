@@ -14791,6 +14791,7 @@ struct FusedAttnTemplate {
   mlir::Value headColScalar;
   bool softmax = false;
   bool naturalExp = false; // base-e rather than base-2 online softmax
+  mlir::Value hVal;        // head count, null when there is no head split
 
   const char *why = nullptr;
   mlir::Operation *offender = nullptr;
@@ -15058,6 +15059,8 @@ struct FusedAttnTemplate {
                    mlir::arith::AndIOp, mlir::arith::OrIOp,
                    mlir::arith::XOrIOp, mlir::arith::DivSIOp,
                    mlir::arith::DivUIOp, mlir::math::SqrtOp,
+                   mlir::arith::MaxSIOp, mlir::arith::MinSIOp,
+                   mlir::math::AbsIOp, mlir::math::AbsFOp,
                    mlir::math::Exp2Op, mlir::math::ExpOp>(def)) {
       offender = def;
       return no("score cone op has no scalar translation");
@@ -15234,6 +15237,36 @@ emitConeScalar(mlir::OpBuilder &b, mlir::Location loc, mlir::Value v,
     out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::DivUIOp>(def)) {
     out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MaxSIOp>(def)) {
+    out = bin(BOP::maxOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::MinSIOp>(def)) {
+    out = bin(BOP::minOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::math::AbsIOp>(def)) {
+    // No unary abs in the dialect; `x < 0 ? -x : x`. This is what a sliding
+    // window's `abs(row - key) <= w` band mask reduces to.
+    mlir::Value x = rec(op.getOperand());
+    if (!x)
+      return {};
+    mlir::Value zero =
+        mlir::triton::metal::ConstantOp::create(b, loc, b.getIntegerAttr(si32, 0))
+            .getResult();
+    mlir::Value neg = bin(BOP::subOp, zero, x);
+    mlir::Value lt = bin(BOP::ltOp, x, zero);
+    if (!neg || !lt)
+      return {};
+    out = mlir::arith::SelectOp::create(b, loc, lt, neg, x).getResult();
+  } else if (auto op = mlir::dyn_cast<mlir::math::AbsFOp>(def)) {
+    mlir::Value x = rec(op.getOperand());
+    if (!x)
+      return {};
+    mlir::Value zerof =
+        mlir::triton::metal::ConstantOp::create(b, loc, b.getFloatAttr(f32, 0.0))
+            .getResult();
+    mlir::Value neg = bin(BOP::subOp, zerof, x);
+    mlir::Value lt = bin(BOP::ltOp, x, zerof);
+    if (!neg || !lt)
+      return {};
+    out = mlir::arith::SelectOp::create(b, loc, lt, neg, x).getResult();
   } else if (auto op = mlir::dyn_cast<mlir::math::SqrtOp>(def)) {
     out = un(UOP::sqrtOp, rec(op.getOperand()));
   } else if (auto op = mlir::dyn_cast<mlir::math::Exp2Op>(def)) {
@@ -15382,8 +15415,10 @@ static mlir::Value faBoundOf(FusedAttnTemplate &t, mlir::Value mask,
       continue;
     t.mark(cmp);
     if (t.classifyIdx(cmp.getLhs()) == want) {
-      mlir::Value b = t.splatSrc(cmp.getRhs());
-      if (b && t.isKernelArg(b))
+      // Returned RAW: a row/key bound has to be a kernel argument, but the
+      // feature bound may be a computed `d_model / h`, which only the caller
+      // knows how to take apart.
+      if (mlir::Value b = t.splatSrc(cmp.getRhs()))
         return b;
     }
   }
@@ -15695,9 +15730,27 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     t.dHeadVal = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Feat);
     (void)faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
     (void)faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
-    if (!t.mVal || !t.nVal || !t.dHeadVal) {
+    if (!t.mVal || !t.nVal || !t.dHeadVal || !t.isKernelArg(t.mVal) ||
+        !t.isKernelArg(t.nVal)) {
       t.no("could not resolve M / N / d_head from the masks");
       goto rejected;
+    }
+    // The feature bound is either a kernel argument (no head split) or
+    // `d_model / h` with both sides kernel arguments — a head-split kernel
+    // computes its per-head width rather than being passed it, so there is no
+    // buffer for the quotient to point at. Carry the numerator and `h`
+    // separately and let the emitter divide, exactly as metal.flash_attention
+    // does with `_fa_dhead = DM / H`.
+    if (!t.isKernelArg(t.dHeadVal)) {
+      auto div = t.dHeadVal.getDefiningOp<mlir::arith::DivSIOp>();
+      if (!div || !t.isKernelArg(div.getLhs()) ||
+          !t.isKernelArg(div.getRhs())) {
+        t.no("feature extent is neither a kernel argument nor d_model / h");
+        goto rejected;
+      }
+      t.mark(div);
+      t.hVal = div.getRhs();
+      t.dHeadVal = div.getLhs();
     }
 
     // Key bound: `[0, n)` or the causal `[0, min((pid+1)*BM, n))`. Anything
@@ -15775,7 +15828,8 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
         bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e),
         bridge(t.strideQ, u32e), bridge(t.strideK, u32e),
         bridge(t.strideV, u32e), bridge(t.strideO, u32e),
-        /*h=*/mlir::Value(), paramBufs, t.BM, t.BN, t.BD,
+        t.hVal ? bridge(t.hVal, u32e) : mlir::Value(), paramBufs, t.BM, t.BN,
+        t.BD,
         t.softmax ? mlir::triton::metal::AttnNorm::OnlineSoftmax
                   : mlir::triton::metal::AttnNorm::None,
         t.causalKeyBound, t.naturalExp);
@@ -15928,6 +15982,11 @@ struct ConvertTritonGPUToMetalPass
     // matchers off, the existing flash/sink test suites become a direct parity
     // bar for `metal.fused_attention`, which is the precondition for deleting
     // those ops. Mirrors TRITON_METAL_SCALAR_DOT=1.
+    //
+    // ⚠️ ALWAYS pair it with TRITON_ALWAYS_COMPILE=1. This variable is not part
+    // of Triton's kernel cache key, so without that a measurement run happily
+    // reuses kernels the LEGACY path compiled earlier and reports full parity
+    // (86/86 here) when the true number is 24/86.
     const bool legacyAttn = !::getenv("TRITON_METAL_NO_LEGACY_ATTN");
     if (legacyAttn)
       runFlashAttentionMatcher(moduleOp);

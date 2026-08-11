@@ -2317,7 +2317,14 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  bool _fa_active = ltid.x < 32u;\n";
   os << "  uint _fa_M = " << M << ";\n";
   os << "  uint _fa_N = " << N << ";\n";
-  os << "  uint _fa_dh = " << DH << ";\n";
+  // `d_head` holds the FULL feature width when a head split is present — a
+  // head-split kernel computes `d_model / h` rather than being passed it, so
+  // the quotient has no buffer to point at. Same contract as
+  // metal.flash_attention's `_fa_dhead = DM / H`.
+  if (op.getH())
+    os << "  uint _fa_dh = " << DH << " / " << bufName(op.getH()) << "[0];\n";
+  else
+    os << "  uint _fa_dh = " << DH << ";\n";
   os << "  uint _fa_sq = " << SQ << ";\n";
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
@@ -2570,7 +2577,14 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "  bool _fa_active = ltid.x < 32u;\n";
   os << "  uint _fa_M = " << M << ";\n";
   os << "  uint _fa_N = " << N << ";\n";
-  os << "  uint _fa_dh = " << DH << ";\n";
+  // `d_head` holds the FULL feature width when a head split is present — a
+  // head-split kernel computes `d_model / h` rather than being passed it, so
+  // the quotient has no buffer to point at. Same contract as
+  // metal.flash_attention's `_fa_dhead = DM / H`.
+  if (op.getH())
+    os << "  uint _fa_dh = " << DH << " / " << bufName(op.getH()) << "[0];\n";
+  else
+    os << "  uint _fa_dh = " << DH << ";\n";
   os << "  uint _fa_sq = " << SQ << ";\n";
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
