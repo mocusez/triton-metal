@@ -7269,8 +7269,14 @@ struct AtomicRmwLowering
   matchAndRewrite(mlir::triton::AtomicRMWOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    if (op.getAtomicRmwOp() != mlir::triton::RMWOp::FADD)
-      return rewriter.notifyMatchFailure(op, "atomic_rmw: only fadd supported");
+    // `add` (integer) and `fadd` (float) are the same MSL primitive
+    // (`atomic_fetch_add_explicit`) over a different atomic pointer type; the
+    // emitter picks the type from the memref element. Everything else (and/or/
+    // xor/min/max/exch) has no lowering.
+    const bool isIntAdd = op.getAtomicRmwOp() == mlir::triton::RMWOp::ADD;
+    if (op.getAtomicRmwOp() != mlir::triton::RMWOp::FADD && !isIntAdd)
+      return rewriter.notifyMatchFailure(op,
+                                         "atomic_rmw: only add/fadd supported");
 
     // ---- Per-element rank-1 tensor form ------------------------------------
     // `tl.atomic_add(P + cols, v, mask)` where P/v/mask are rank-1 tensors.
@@ -7347,9 +7353,17 @@ struct AtomicRmwLowering
       return rewriter.notifyMatchFailure(
           op, "atomic_rmw: old-value result is consumed (not modeled)");
     mlir::Value val = adaptor.getVal();
-    if (!val.getType().isF32())
-      return rewriter.notifyMatchFailure(op,
-                                         "atomic_rmw: only f32 add supported");
+    // f32 (`fadd`) and 32-bit int (`add`) both have a native MSL atomic;
+    // narrower/wider element types do not (`atomic_fetch_add_explicit` is
+    // defined for atomic_int/atomic_uint/atomic_float only). `tl.sum` over a
+    // comparison — `tl.sum(x == K)` — produces exactly the i32 case.
+    const bool intVal = val.getType().isInteger(32);
+    if (!(val.getType().isF32() || intVal))
+      return rewriter.notifyMatchFailure(
+          op, "atomic_rmw: only f32/i32 scalar add supported");
+    if (intVal != isIntAdd)
+      return rewriter.notifyMatchFailure(
+          op, "atomic_rmw: add kind does not match the value element type");
     // Accept only an absent or constant-true mask.
     if (mlir::Value mask = op.getMask()) {
       auto cst = mask.getDefiningOp<mlir::arith::ConstantOp>();
@@ -7381,7 +7395,13 @@ struct AtomicRmwLowering
       idxUI32 = ConstantOp::create(rewriter, loc,
                                    rewriter.getIntegerAttr(ui32, 0))
                     .getResult();
-    auto resTy = getTypeConverter()->convertType(op.getResult().getType());
+    // The value and the op result must both satisfy `Metal_Type`, which admits
+    // ui32 but NOT signless i32 (MetalOps.td:17) — so an i32 payload has to go
+    // in as the memref's ui32 storage type or `metal.atomic_rmw` fails its own
+    // verifier. Bit-preserving and free: the emitter forwards
+    // `unrealized_conversion_cast` as a no-op.
+    mlir::Value sval = castToMemrefStorage(val, memref, rewriter, loc);
+    mlir::Type resTy = sval.getType();
 
     // A scalar `tl.atomic_add(ptr, scalar)` is a per-PROGRAM op, but every
     // Metal thread runs the kernel body — emitting the atomic unguarded would
@@ -7427,10 +7447,12 @@ struct AtomicRmwLowering
     {
       mlir::OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPointToStart(ifOp.thenBlock());
-      AtomicRmwOp::create(rewriter, loc, resTy, val, memref, idxUI32);
+      AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idxUI32);
     }
     // The old-value result is unused (checked above); replace with the value
-    // operand as a type-matched dummy so the op legalizes.
+    // operand — in its ORIGINAL converted type, which is what any (nonexistent)
+    // consumer would have expected — as a type-matched dummy so the op
+    // legalizes.
     rewriter.replaceOp(op, val);
     return mlir::success();
   }
@@ -14314,6 +14336,56 @@ static void runSinkAttentionMatcher(mlir::ModuleOp moduleOp) {
     (void)trySinkAttention(f);
 }
 
+// `tl.assume(cond)` lowers to `llvm.intr.assume` (python/src/ir.cc
+// `create_assume`), a result-less optimizer hint carrying a range/sign fact
+// (e.g. `tl.assume(pid >= 0)`). It has no runtime meaning and MSL has nothing
+// to emit for it, so the whole hint is dropped before the conversion — leaving
+// it in place fails `applyFullConversion` ("failed to legalize operation
+// 'llvm.intr.assume'"), which is what blocked every kernel using `tl.assume`.
+//
+// Erasing the assume alone is not enough: its predicate cone (`arith.cmpi sge,
+// %pid, %c0`) is then dead but still legal, so it would survive the conversion
+// and reach the emitter, whose `isStatementPrintable` default branch prints any
+// use-less op as a bare statement. We therefore walk back through the operands
+// and erase whatever became trivially dead. The walk is bounded to the assume's
+// own cone — this is NOT a module-wide DCE, so no matcher downstream sees a
+// different module than it did before.
+//
+// Matched by op name rather than `mlir::LLVM::AssumeOp` to keep the Metal
+// conversion library free of an MLIRLLVMDialect link dependency.
+static void eraseAssumeHints(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::Operation *> frontier;
+  llvm::SmallVector<mlir::Operation *> assumes;
+  moduleOp.walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "llvm.intr.assume")
+      assumes.push_back(op);
+  });
+  for (mlir::Operation *op : assumes) {
+    for (mlir::Value operand : op->getOperands())
+      if (mlir::Operation *def = operand.getDefiningOp())
+        frontier.push_back(def);
+    op->erase();
+  }
+  // Level-by-level so an op erased in one round can never be revisited in the
+  // next: we only erase ops with no remaining uses, so nothing erased later can
+  // still name an already-erased op as an operand.
+  while (!frontier.empty()) {
+    llvm::SmallVector<mlir::Operation *> next;
+    llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+    for (mlir::Operation *op : frontier) {
+      if (!seen.insert(op).second)
+        continue;
+      if (!mlir::isOpTriviallyDead(op))
+        continue;
+      for (mlir::Value operand : op->getOperands())
+        if (mlir::Operation *def = operand.getDefiningOp())
+          next.push_back(def);
+      op->erase();
+    }
+    frontier = std::move(next);
+  }
+}
+
 // Structure a top-level early-exit guard `if (cond) return;` into an scf.if so
 // the (structured-only) MSL emitter can handle it. Triton lowers a Python early
 // `return` (e.g. `if pid >= B: return`) to `cf.cond_br %c, ^ret, ^cont` where
@@ -14711,6 +14783,12 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+
+    // Drop `tl.assume` hints (+ their now-dead predicate cones) before anything
+    // walks the body: they are result-less LLVM-dialect ops the conversion has
+    // no pattern for, and every structural matcher below is happier not seeing
+    // them. No-op for kernels without `tl.assume`.
+    eraseAssumeHints(moduleOp);
 
     // Structure top-level early-exit guards (`if cond: return`) into scf.if
     // BEFORE any other handling — the MSL emitter is structured-only and has no

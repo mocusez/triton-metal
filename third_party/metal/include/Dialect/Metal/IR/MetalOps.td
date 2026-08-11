@@ -245,12 +245,14 @@ def GetElementOp : Metal_Op<"get_element", [Pure]> {
 //===----------------------------------------------------------------------===//
 
 def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
-  let summary = "Atomic read-modify-write (fadd) on a device-memory element.";
+  let summary = "Atomic read-modify-write (add) on a device-memory element.";
   let description = [{
     Atomically adds `value` into `memref[index]` and yields the old value.
-    Lowers to MSL `atomic_fetch_add_explicit(..., memory_order_relaxed)`.
-    Models Triton `tt.atomic_rmw fadd` (float add only). NOT `Pure` — it has
-    a device-memory side effect, so it survives dead-code elimination even when
+    Lowers to MSL `atomic_fetch_add_explicit(..., memory_order_relaxed)`, with
+    the atomic pointer type taken from the memref element (`atomic_float` for
+    f32, `atomic_uint`/`atomic_int` for 32-bit integers). Models Triton
+    `tt.atomic_rmw fadd` and `tt.atomic_rmw add`. NOT `Pure` — it has a
+    device-memory side effect, so it survives dead-code elimination even when
     its result is unused.
   }];
 
