@@ -3480,6 +3480,16 @@ static mlir::Value readStagedTile(mlir::Value v, mlir::Value rVal,
 // lifetime (populated across the whole conversion, not scoped to one reduce).
 static const llvm::DenseMap<mlir::Value, mlir::Value> *g_scanBuffers = nullptr;
 
+// An i1 in-bounds predicate every cone-load address is gated by while set:
+// `addr = guard ? addr : 0`. The rank-2 axis=0 reduce needs it because its row
+// loop runs the full compile-time BM while only M rows exist, so a ragged M
+// would send the cone's loads past the end of the buffer. The direct-load path
+// has always gated its own address this way (`safeAddr`); this extends the same
+// guarantee to a computed cone, whose addresses are assembled inside
+// `evalAddPtrChainAt` where the caller cannot reach them. Null everywhere else,
+// so no other path changes.
+static mlir::Value g_coneAddrGuard = nullptr;
+
 // Wall 17 Increment 2: evaluate one element (logical index `idxVal`, an i32
 // scalar) of a RANK-1 tensor cone as scalar Metal ops. Used for the per-row /
 // per-column operands a softmax cone broadcasts into the reduce tile
@@ -4232,6 +4242,13 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
     }
     cur = ap.getPtr();
   }
+  if (addr && g_coneAddrGuard) {
+    auto z = mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getI32IntegerAttr(0));
+    addr = mlir::arith::SelectOp::create(rewriter, loc, g_coneAddrGuard, addr,
+                                         z.getResult())
+               .getResult();
+  }
   return addr;
 }
 
@@ -4403,12 +4420,17 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
                 mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
                 mlir::math::RsqrtOp>(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1);
+  // Keep in sync with the binary cases in `evalRank2ConeAt` — same trap the
+  // rank-1 predicate documents: an op the evaluator handles but this list omits
+  // is silently unreachable. arith.and/or were exactly that, so a cone whose
+  // mask is the ordinary `(rows < M) & (cols < N)` was rejected before the
+  // evaluator ever saw it.
   if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
                 mlir::arith::DivFOp, mlir::arith::MaximumFOp,
                 mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
                 mlir::arith::MinNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
-                mlir::arith::MulIOp, mlir::arith::CmpIOp, mlir::arith::CmpFOp>(
-          def))
+                mlir::arith::MulIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
+                mlir::arith::CmpIOp, mlir::arith::CmpFOp>(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1) &&
            rank2ConeSupported(def->getOperand(1), depth + 1);
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
@@ -4874,10 +4896,88 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
     }
   }
 
+  // Source: a direct device load, or a COMPUTED cone over one.
+  //
+  // Direct is the common case (`tl.sum(tl.load(...), axis=0)`, and the form the
+  // loop-carried reassociation produces). A computed tile — batch norm's
+  // `tl.sum(tl.where(mask, x - mean[None, :], 0.) ** 2, axis=0)` — has no single
+  // device tensor to re-read, so it is re-derived per (row, col) by
+  // `evalRank2ConeAt`, the same evaluator the axis=1 reduce uses for softmax
+  // cones (Wall 17 Case C).
+  //
+  // `loadOp` stays meaningful either way: for a cone it is the REPRESENTATIVE
+  // load, which supplies the row/column mask that makes ragged rows inert and
+  // proves the cone is device-rooted (a cone with no load has nothing to reduce
+  // over that survives conversion; the uniform-splat case above already took
+  // the constant tiles).
   auto loadOp = src.getDefiningOp<mlir::triton::LoadOp>();
-  if (!loadOp)
-    return rewriter.notifyMatchFailure(
-        op, "rank-2 axis0 reduce: source is not a device load or uniform splat");
+  mlir::Value coneRoot; // non-null iff the source is a computed cone
+  // Rank-1 operands a cone broadcasts in (`mean[None, :]`) are normally rebuilt
+  // element-wise by `evalRank1ValueAt`. One shape it cannot rebuild is a PRIOR
+  // column reduce: batch norm's `mean` is an `scf.for` RESULT whose recurrence
+  // has no closed form to re-emit. Stage those instead — `nVal` below IS the
+  // thread's own column, and the producing axis=0 reduce left exactly that
+  // column's value in the thread's converted scalar, so `getRemappedValue` is
+  // the element the cone is asking for. Same mechanism as the Inc-2.5 per-row
+  // staging (`g_stagedLeaves`), keyed on the column instead of the row.
+  //
+  // Collected BEFORE `rank2ConeSupported` runs, because that predicate walks
+  // into these leaves too and would reject the cone on the very value staging
+  // exists to supply.
+  llvm::DenseMap<mlir::Value, mlir::Value> stagedRank1;
+  if (!loadOp) {
+    // i32 cones are NOT taken: `evalRank2ConeAt`'s load leaf yields the memref's
+    // ui32 storage type while the cone's own arith is signless i32, so the two
+    // would meet at a type mismatch. f32 has no such split.
+    if (!isF)
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 axis0 reduce: computed cone is f32-only");
+    int64_t BNforStaging = rtt.getDimSize(1);
+    llvm::SmallVector<mlir::Value, 16> wl{src};
+    llvm::SmallPtrSet<mlir::Value, 16> seen;
+    while (!wl.empty()) {
+      mlir::Value v = wl.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      auto vt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+      if (vt && vt.getRank() == 1) {
+        if (rank1ConeSupported(v, 0))
+          continue; // the evaluator rebuilds it; nothing to stage
+        // Staging is only sound when the value is laid out one element per
+        // thread at the SAME column index this reduce uses, i.e. a full [BN]
+        // row of the reduce's own element type.
+        if (vt.getDimSize(0) != BNforStaging || vt.getElementType() != eltTy)
+          return rewriter.notifyMatchFailure(
+              op, "rank-2 axis0 reduce: cone leaf is neither re-emittable nor a "
+                  "per-column [BN] value");
+        mlir::Value scalar = rewriter.getRemappedValue(v);
+        if (!scalar || scalar.getType() != eltTy)
+          return rewriter.notifyMatchFailure(
+              op, "rank-2 axis0 reduce: cone leaf not converted to a per-thread "
+                  "scalar yet");
+        stagedRank1[v] = scalar;
+        continue;
+      }
+      if (auto *def = v.getDefiningOp())
+        for (auto o : def->getOperands())
+          wl.push_back(o);
+    }
+
+    const llvm::DenseMap<mlir::Value, mlir::Value> *savedLeaves = g_stagedLeaves;
+    g_stagedLeaves = &stagedRank1;
+    bool supported = rank2ConeSupported(src, 0);
+    if (supported)
+      loadOp = findFirstLoadInCone(src, 0);
+    g_stagedLeaves = savedLeaves;
+    if (!supported)
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 axis0 reduce: source is neither a device load, a uniform "
+              "splat, nor an evaluable cone");
+    if (!loadOp)
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 axis0 reduce: computed cone is not device-rooted");
+    coneRoot = src;
+  }
   auto ap = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
   if (!ap)
     return rewriter.notifyMatchFailure(op,
@@ -4955,15 +5055,8 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
     rewriter.setInsertionPointToStart(forOp.getBody());
     mlir::Value m = forOp.getInductionVar();
     mlir::Value acc = forOp.getRegionIterArgs()[0];
-    // Whole addptr chain, not just `ap.getOffset()`: the two-level spelling
-    // `In + rows[:, None] * N + cols[None, :]` parks the row term in an inner
-    // addptr below a tt.broadcast, and reading only the outer offset made every
-    // row alias row 0 (result == BM * tile[0, col]) with no diagnostic.
-    mlir::Value addrI = evalAddPtrChainAt(loadOp.getPtr(), m, dummyRowBase, nVal,
-                                          rewriter, loc, /*depth=*/0);
-    if (!addrI)
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 axis0 reduce: offset cone not evaluable");
+    // The representative load's mask gates BOTH the address and the value, so a
+    // ragged M neither reads out of bounds nor contributes a real element.
     mlir::Value maskBit;
     if (maskV) {
       maskBit = evalRank2ConeAt(maskV, m, dummyRowBase, nVal, rewriter, loc, 0);
@@ -4971,26 +5064,55 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
         return rewriter.notifyMatchFailure(
             op, "rank-2 axis0 reduce: mask cone not evaluable");
     }
-    mlir::Value safeAddr = addrI;
-    if (maskBit) {
-      auto z = mlir::arith::ConstantOp::create(rewriter, loc,
-                                               rewriter.getI32IntegerAttr(0));
-      safeAddr = mlir::arith::SelectOp::create(rewriter, loc, maskBit, addrI,
-                                               z.getResult())
-                     .getResult();
+    mlir::Value v;
+    if (coneRoot) {
+      // Re-derive the whole expression at (m, nVal). The cone's own loads are
+      // addressed by their own addptr chains inside `evalRank2ConeAt`, so the
+      // in-bounds predicate has to travel with it rather than being applied
+      // here.
+      mlir::Value savedGuard = g_coneAddrGuard;
+      const llvm::DenseMap<mlir::Value, mlir::Value> *savedLeaves =
+          g_stagedLeaves;
+      g_coneAddrGuard = maskBit;
+      g_stagedLeaves = &stagedRank1;
+      v = evalRank2ConeAt(coneRoot, m, dummyRowBase, nVal, rewriter, loc,
+                          /*depth=*/0);
+      g_coneAddrGuard = savedGuard;
+      g_stagedLeaves = savedLeaves;
+      if (!v)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 axis0 reduce: computed cone not evaluable");
+    } else {
+      // Whole addptr chain, not just `ap.getOffset()`: the two-level spelling
+      // `In + rows[:, None] * N + cols[None, :]` parks the row term in an inner
+      // addptr below a tt.broadcast, and reading only the outer offset made
+      // every row alias row 0 (result == BM * tile[0, col]) with no diagnostic.
+      mlir::Value addrI = evalAddPtrChainAt(loadOp.getPtr(), m, dummyRowBase,
+                                            nVal, rewriter, loc, /*depth=*/0);
+      if (!addrI)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 axis0 reduce: offset cone not evaluable");
+      mlir::Value safeAddr = addrI;
+      if (maskBit) {
+        auto z = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                 rewriter.getI32IntegerAttr(0));
+        safeAddr = mlir::arith::SelectOp::create(rewriter, loc, maskBit, addrI,
+                                                 z.getResult())
+                       .getResult();
+      }
+      mlir::Value idxU = mlir::UnrealizedConversionCastOp::create(
+                             rewriter, loc, mlir::TypeRange{ui32},
+                             mlir::ValueRange{safeAddr})
+                             .getResult(0);
+      v = GetElementOp::create(rewriter, loc, loadEltTy, memref, idxU)
+              .getResult();
+      // Bridge the memref storage type (ui32 for an i32 buffer) to the signless
+      // accumulator element type.
+      if (loadEltTy != eltTy)
+        v = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{eltTy}, mlir::ValueRange{v})
+                .getResult(0);
     }
-    mlir::Value idxU = mlir::UnrealizedConversionCastOp::create(
-                           rewriter, loc, mlir::TypeRange{ui32},
-                           mlir::ValueRange{safeAddr})
-                           .getResult(0);
-    mlir::Value v =
-        GetElementOp::create(rewriter, loc, loadEltTy, memref, idxU).getResult();
-    // Bridge the memref storage type (ui32 for an i32 buffer) to the signless
-    // accumulator element type.
-    if (loadEltTy != eltTy)
-      v = mlir::UnrealizedConversionCastOp::create(
-              rewriter, loc, mlir::TypeRange{eltTy}, mlir::ValueRange{v})
-              .getResult(0);
     if (maskBit)
       v = mlir::arith::SelectOp::create(rewriter, loc, maskBit, v,
                                         makeIdentity())

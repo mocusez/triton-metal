@@ -393,3 +393,82 @@ def test_reduce_axis0_scalar_base_two_level_addptr(B, M, N, BM, BN):
     _colsum_batched[(triton.cdiv(N, BN), B)](inp, out, M, N, M * N, BM=BM, BN=BN)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), inp.cpu().sum(1), atol=1e-3, rtol=1e-3)
+
+
+# --- COMPUTED cone sources ------------------------------------------------
+# Everything above reduces a device tile directly (or the loop-carried
+# accumulator the reassociation produces). A computed tile —
+# `tl.where(mask, x - mean[None, :], 0.) ** 2` in batch norm's variance pass —
+# has no single tensor to re-read, so it is re-derived per (row, col) by
+# `evalRank2ConeAt`, the evaluator the axis=1 reduce uses for softmax cones.
+# The row loop always runs the full compile-time BM, so the representative
+# load's mask has to gate the cone's own addresses (`g_coneAddrGuard`) and not
+# just its value — hence the ragged-M cases below.
+
+
+@triton.jit
+def _colsum_computed_cone(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # The mask is the ordinary `andi` of two comparisons — which is what caught
+    # `rank2ConeSupported` missing arith.and/or while `evalRank2ConeAt` had them
+    # all along, i.e. every masked cone was rejected before the evaluator ran.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        v = tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0.)
+        v = tl.where(mask, v, 0.0)
+        acc += tl.sum(v * v, axis=0)
+    tl.store(Out + cols, acc, mask=cols < N)
+
+
+# Ragged M (100/17 vs BM) drives the in-bounds guard on the cone's own loads:
+# the row loop always runs the full compile-time BM.
+@pytest.mark.parametrize("M, N, BM, BN", [(64, 128, 32, 128), (100, 128, 32, 128),
+                                          (17, 48, 8, 16), (64, 32, 16, 16)])
+def test_reduce_axis0_computed_cone(M, N, BM, BN):
+    torch.manual_seed(M * 3 + N)
+    x = torch.randn(M, N, device="mps")
+    out = torch.zeros(N, device="mps")
+    _colsum_computed_cone[(triton.cdiv(N, BN),)](x, out, M, N, BM=BM, BN=BN)
+    torch.mps.synchronize()
+    ref = (x.cpu().double() ** 2).sum(0).float()
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-4)
+
+
+@triton.jit
+def _colvar_chained(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # The staged leaf: the second reduce's cone subtracts the FIRST reduce's
+    # result, an scf.for result the cone evaluator cannot re-emit. It resolves
+    # to the thread's own converted scalar, sound because this reduce's column
+    # IS that thread's column.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    mean = tl.zeros((BN,), dtype=tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        mean += tl.sum(tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0.), axis=0)
+    mean /= M
+    var = tl.zeros((BN,), dtype=tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        v = tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0.)
+        v = tl.where(mask, v - mean[None, :], 0.0)
+        var += tl.sum(v * v, axis=0)
+    tl.store(Out + cols, var / M, mask=cols < N)
+
+
+@pytest.mark.parametrize("M, N, BM, BN", [(64, 128, 32, 128), (100, 40, 16, 16),
+                                          (33, 64, 16, 32)])
+def test_reduce_axis0_chained_cone(M, N, BM, BN):
+    torch.manual_seed(M * 5 + N)
+    x = torch.randn(M, N, device="mps")
+    out = torch.zeros(N, device="mps")
+    _colvar_chained[(triton.cdiv(N, BN),)](x, out, M, N, BM=BM, BN=BN)
+    torch.mps.synchronize()
+    xc = x.cpu().double()
+    ref = ((xc - xc.mean(0)) ** 2).mean(0).float()
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-5, rtol=1e-4)
