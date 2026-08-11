@@ -3908,6 +3908,14 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
   return nullptr;
 }
 
+// Defined below (mutually recursive with `evalRank2ConeAt`): sums EVERY
+// tt.addptr offset between a pointer and its base memref, each evaluated at
+// (rVal, nVal).
+static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
+                                     mlir::Value rowBase, mlir::Value nVal,
+                                     mlir::ConversionPatternRewriter &rewriter,
+                                     mlir::Location loc, int depth);
+
 //===----------------------------------------------------------------------===//
 // Wall 17 (Case C): rank-2 axis=1 reduce over a COMPUTED tile.
 //
@@ -3992,51 +4000,9 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     if (!memref)
       return nullptr;
     mlir::Type eltTy = mlir::cast<MetalMemRefType>(memref.getType()).getType();
-    auto i32 = rewriter.getI32Type();
-    mlir::Value addr;
-    auto addTerm = [&](mlir::Value t) {
-      if (t.getType() != i32)
-        t = mlir::UnrealizedConversionCastOp::create(
-                rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{t})
-                .getResult(0);
-      addr = addr ? mlir::arith::AddIOp::create(rewriter, loc, addr, t)
-                        .getResult()
-                  : t;
-    };
-    mlir::Value cur = load.getPtr();
-    while (true) {
-      // Peel the shape ops a 2D tile address is built through: the row half is
-      // an (M,1) addptr broadcast to (M,N), so stopping at tt.broadcast would
-      // drop the row term entirely.
-      bool peeled = true;
-      while (peeled) {
-        peeled = false;
-        if (auto sp = cur.getDefiningOp<mlir::triton::SplatOp>()) {
-          cur = sp.getSrc();
-          peeled = true;
-        } else if (auto bc = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
-          cur = bc.getSrc();
-          peeled = true;
-        } else if (auto ed = cur.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
-          cur = ed.getSrc();
-          peeled = true;
-        }
-      }
-      auto ap = cur.getDefiningOp<mlir::triton::AddPtrOp>();
-      if (!ap)
-        break;
-      mlir::Value off = ap.getOffset();
-      if (mlir::isa<mlir::RankedTensorType>(off.getType())) {
-        mlir::Value s = evalRank2ConeAt(off, rVal, rowBase, nVal, rewriter, loc,
-                                        depth + 1);
-        if (!s)
-          return nullptr;
-        addTerm(s);
-      } else {
-        addTerm(off);
-      }
-      cur = ap.getPtr();
-    }
+    mlir::Value addr =
+        evalAddPtrChainAt(load.getPtr(), rVal, rowBase, nVal, rewriter, loc,
+                          depth);
     if (!addr)
       return nullptr;
     mlir::Value idxUI32 =
@@ -4193,6 +4159,80 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     });
 
   return nullptr;
+}
+
+// Flat element index of `ptrVal` at logical (row `rVal`, column `nVal`), summed
+// over the WHOLE tt.addptr chain down to the base memref.
+//
+// Triton spells the same tile address two ways, depending only on how the user
+// parenthesises the Python:
+//
+//   offs = rows[:, None] * N + cols[None, :]      one level:
+//   tl.load(In + offs)                              addptr(splat(In), offs)
+//
+//   tl.load(In + rows[:, None] * N                two levels:
+//                + cols[None, :])                   addptr(broadcast(
+//                                                     addptr(splat(In),
+//                                                            rows*N)),
+//                                                     cols)
+//
+// The second is the more natural spelling and the one leet-triton kernels use.
+// Reading only the outermost `ap.getOffset()` silently drops the inner `rows*N`
+// term there — every row then resolves to row 0 and the load returns a
+// plausible but wrong tile with no crash and no diagnostic. So walk the chain,
+// peeling the shape ops (`tt.splat` / `tt.broadcast` / `tt.expand_dims`) the row
+// half is threaded through — the (M,1) row addptr sits BELOW a broadcast, so a
+// walker that stops at shape ops sees nothing at all.
+//
+// Tensor offsets are re-derived per element via `evalRank2ConeAt`; scalar ones
+// (a per-program `pid*stride` base) are added as-is. Returns null if any offset
+// cone is not evaluable, or if the chain carried no offset at all.
+static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
+                                     mlir::Value rowBase, mlir::Value nVal,
+                                     mlir::ConversionPatternRewriter &rewriter,
+                                     mlir::Location loc, int depth) {
+  auto i32 = rewriter.getI32Type();
+  mlir::Value addr;
+  auto addTerm = [&](mlir::Value t) {
+    if (t.getType() != i32)
+      t = mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{t})
+              .getResult(0);
+    addr = addr ? mlir::arith::AddIOp::create(rewriter, loc, addr, t).getResult()
+                : t;
+  };
+  mlir::Value cur = ptrVal;
+  while (true) {
+    bool peeled = true;
+    while (peeled) {
+      peeled = false;
+      if (auto sp = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+        cur = sp.getSrc();
+        peeled = true;
+      } else if (auto bc = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
+        cur = bc.getSrc();
+        peeled = true;
+      } else if (auto ed = cur.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+        cur = ed.getSrc();
+        peeled = true;
+      }
+    }
+    auto ap = cur.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!ap)
+      break;
+    mlir::Value off = ap.getOffset();
+    if (mlir::isa<mlir::RankedTensorType>(off.getType())) {
+      mlir::Value s =
+          evalRank2ConeAt(off, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+      if (!s)
+        return nullptr;
+      addTerm(s);
+    } else {
+      addTerm(off);
+    }
+    cur = ap.getPtr();
+  }
+  return addr;
 }
 
 // Find a representative `tt.load` anywhere in a computed cone — used to derive
@@ -4846,7 +4886,6 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   if (!memref)
     return rewriter.notifyMatchFailure(op,
                                        "rank-2 axis0 reduce: base memref not found");
-  mlir::Value offs = ap.getOffset();
   mlir::Value maskV = loadOp.getMask();
 
   // tpb from the source tile's blocked encoding (mirrors the axis=1 path — a
@@ -4916,8 +4955,12 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
     rewriter.setInsertionPointToStart(forOp.getBody());
     mlir::Value m = forOp.getInductionVar();
     mlir::Value acc = forOp.getRegionIterArgs()[0];
-    mlir::Value addrI =
-        evalRank2ConeAt(offs, m, dummyRowBase, nVal, rewriter, loc, /*depth=*/0);
+    // Whole addptr chain, not just `ap.getOffset()`: the two-level spelling
+    // `In + rows[:, None] * N + cols[None, :]` parks the row term in an inner
+    // addptr below a tt.broadcast, and reading only the outer offset made every
+    // row alias row 0 (result == BM * tile[0, col]) with no diagnostic.
+    mlir::Value addrI = evalAddPtrChainAt(loadOp.getPtr(), m, dummyRowBase, nVal,
+                                          rewriter, loc, /*depth=*/0);
     if (!addrI)
       return rewriter.notifyMatchFailure(
           op, "rank-2 axis0 reduce: offset cone not evaluable");

@@ -23,6 +23,27 @@ the reduce body (binary_exp rejects signless i32). Only output E==1 (BN <= tpb):
 BN > tpb is deferred (coalescing moves the output to sizePerThread>1, so a
 per-iteration column index would mis-address — the caller launches tpb >= BN or
 tiles columns across the grid).
+
+ADDRESS SPELLING (`test_*_two_level_addptr` below). Triton emits one of two
+shapes for the same tile address, chosen purely by how the Python is
+parenthesised:
+
+    offs = rows[:, None] * N + cols[None, :]   one level:
+    tl.load(In + offs)                           addptr(splat(In), offs)
+
+    tl.load(In + rows[:, None] * N             two levels:
+                + cols[None, :])                 addptr(broadcast(addptr(
+                                                   splat(In), rows*N)), cols)
+
+Every case above uses the first. The lowering used to read only the OUTERMOST
+`ap.getOffset()`, so under the second spelling the inner `rows*N` term was
+dropped: every row aliased row 0 and the reduce returned `BM * tile[0, col]` —
+plausible numbers, no crash, no diagnostic. `evalAddPtrChainAt` now sums the
+whole chain (the row half sits below a `tt.broadcast`, so the walk has to peel
+shape ops), which also picks up SCALAR chain terms such as a per-program
+`In + b * stride` base that the old outer-offset-only read discarded too.
+Both spellings are pinned here — the second is the one leet-triton kernels
+(e.g. `medium-batch_normalization.py`) actually write.
 """
 
 from __future__ import annotations
@@ -242,3 +263,133 @@ def test_reduce_axis0_minmax_i32_loopcarried(kernel, red, M, N):
     kernel[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), red(inp.cpu()))
+
+
+# --- Two-level addptr addressing (see the module docstring) ----------------
+# `In + rows[:, None] * N + cols[None, :]` instead of `In + offs`. Same tile,
+# same results; before `evalAddPtrChainAt` these all returned BM * tile[0, col].
+
+
+@triton.jit
+def _colsum_two_level(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        acc += tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0.)
+    tl.store(Out + cols, tl.sum(acc, axis=0), mask=cols < N)
+
+
+@triton.jit
+def _colsum_two_level_direct(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    # No loop: the reduce sees the tt.load directly, not the reassociated form.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    v = tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0.)
+    tl.store(Out + cols, tl.sum(v, axis=0), mask=cols < N)
+
+
+# M == BM (single trip) through M >> BM; ragged M/N; BN of 16 and 128 so the
+# tile's blocked layout differs (BN=16 gives sizePerThread=[1,2]).
+@pytest.mark.parametrize("M, N, BM, BN", [(32, 128, 32, 128), (100, 128, 32, 128),
+                                          (96, 700, 32, 128), (256, 333, 32, 128),
+                                          (64, 32, 16, 16), (17, 48, 8, 16),
+                                          (16, 16, 16, 16)])
+def test_reduce_axis0_colsum_two_level_addptr(M, N, BM, BN):
+    torch.manual_seed(M * 3 + N)
+    inp = torch.randn(M, N, device="mps")
+    out = torch.empty(N, device="mps")
+    _colsum_two_level[(triton.cdiv(N, BN),)](inp, out, M, N, BM=BM, BN=BN)
+    torch.mps.synchronize()
+    ref = inp.cpu().sum(0)
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+    # The old bug was exactly BM * row 0 — assert we are not back on it even if
+    # some future rewrite makes the numbers merely "close".
+    assert not torch.allclose(out.cpu(), BM * inp.cpu()[0], atol=1e-3)
+
+
+@pytest.mark.parametrize("M, N, BM, BN", [(32, 128, 32, 128), (16, 256, 16, 128),
+                                          (16, 16, 16, 16)])
+def test_reduce_axis0_colsum_two_level_addptr_direct(M, N, BM, BN):
+    torch.manual_seed(M * 5 + N)
+    inp = torch.randn(M, N, device="mps")
+    out = torch.empty(N, device="mps")
+    _colsum_two_level_direct[(triton.cdiv(N, BN),)](inp, out, M, N, BM=BM, BN=BN)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.cpu().sum(0), atol=1e-3, rtol=1e-3)
+
+
+@triton.jit
+def _colmax_two_level(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.full((BM, BN), -1e30, tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        acc = tl.maximum(acc, tl.load(In + rows[:, None] * N + cols[None, :],
+                                      mask=mask, other=-1e30))
+    tl.store(Out + cols, tl.max(acc, axis=0), mask=cols < N)
+
+
+@triton.jit
+def _colsum_i32_two_level(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), tl.int32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        acc += tl.load(In + rows[:, None] * N + cols[None, :], mask=mask, other=0)
+    tl.store(Out + cols, tl.sum(acc, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("M, N", [(96, 700), (100, 1024)])
+def test_reduce_axis0_colmax_f32_two_level_addptr(M, N):
+    torch.manual_seed(M * 7 + N)
+    inp = torch.randn(M, N, device="mps")
+    out = torch.empty(N, device="mps")
+    _colmax_two_level[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.cpu().amax(0), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("M, N", [(96, 700), (64, 256)])
+def test_reduce_axis0_colsum_i32_two_level_addptr(M, N):
+    torch.manual_seed(M * 11 + N)
+    inp = torch.randint(-500, 500, (M, N), dtype=torch.int32, device="mps")
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colsum_i32_two_level[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), inp.cpu().sum(0, dtype=torch.int32))
+
+
+@triton.jit
+def _colsum_batched(In, Out, M, N, S, BM: tl.constexpr, BN: tl.constexpr):
+    # A SCALAR per-program base (`In + b * S`) sits below the two tensor offsets;
+    # the outer-offset-only read dropped it along with the row term.
+    b = tl.program_id(1)
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    base = In + b * S
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        acc += tl.load(base + rows[:, None] * N + cols[None, :], mask=mask, other=0.)
+    tl.store(Out + b * N + cols, tl.sum(acc, axis=0), mask=cols < N)
+
+
+@pytest.mark.parametrize("B, M, N, BM, BN", [(3, 64, 128, 32, 128),
+                                             (2, 40, 60, 16, 64)])
+def test_reduce_axis0_scalar_base_two_level_addptr(B, M, N, BM, BN):
+    torch.manual_seed(B * 100 + M)
+    inp = torch.randn(B, M, N, device="mps")
+    out = torch.empty(B, N, device="mps")
+    _colsum_batched[(triton.cdiv(N, BN), B)](inp, out, M, N, M * N, BM=BM, BN=BN)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.cpu().sum(1), atol=1e-3, rtol=1e-3)
