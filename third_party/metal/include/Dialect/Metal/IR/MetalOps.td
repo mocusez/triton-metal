@@ -647,84 +647,6 @@ def SdpaOp : Metal_Op<"sdpa"> {
 }
 
 //===----------------------------------------------------------------------===//
-// SinkAttentionOp
-//===----------------------------------------------------------------------===//
-
-def SinkAttentionOp : Metal_Op<"sink_attention", [AttrSizedOperandSegments]> {
-  let summary = "Causal attention with sink tokens and a one-sided sliding window";
-  let description = [{
-    Self-contained attention body for one query-row block of
-    `leet-triton/medium-attention_with_sinks.py`. For query row `i` and key `j`,
-    with `S = num_sinks` and `W = window`:
-
-        keep(i, j) = j <= i && (j < S || j >= i - W + 1)
-
-    i.e. causal, with the first `S` tokens always visible plus a one-sided
-    sliding window of width `W`. This is NOT the symmetric band
-    `abs(row - key) <= window` of a plain sliding window, and the key set is not
-    a contiguous block range, which is why it is still a separate op: the key
-    PHASES have to be reproduced, not proven equivalent to a single sweep.
-
-    The emitted body walks keys ONE AT A TIME with one query row per lane and
-    updates the online-softmax state per key, so it needs no S/P staging and no
-    key blocking: the threadgroup working set is `2*bm*bd + 2*bm` floats and
-    must fit Apple's 32 KiB (8192 floats), capping `bd` at 64 for `bm == 32`.
-    That costs 2x the FMA work of a block-max formulation and gives up
-    simdgroup throughput; it is a correctness-first body. Validated by
-    `metal-attention-with-sinks-phase0-spike.py` (146 configs, <= 8.5e-07).
-
-    Keys are visited in the two phases the SOURCE kernel evaluates, not in the
-    order the mask above suggests: `[0, bs)` for the sinks, then
-    `[local_start, local_start + local_len)` for the window, where
-    `local_start = max(tgid.x*bm - W + 1, S)`. `local_len` is
-    `N_LOCAL_BLOCKS * BLOCK_N`, a host-side constexpr the source kernel is
-    specialized for. Reproducing the phases rather than the mathematical mask
-    means the emitted kernel agrees with the source kernel even when the host
-    passes a `window` too large for the `local_len` it was compiled with (both
-    drop the same keys), instead of silently disagreeing with it.
-
-    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
-    f32 with per-tensor row strides `stride_q`/`stride_k`/`stride_v`/`stride_o`
-    (this kernel passes four separate stride arguments, so they cannot be folded
-    into one `d_model`). `m` is the query
-    row count AND the key count. `scale` is an f32 buffer holding the logit
-    scale with `log2(e)` already folded in by the host — the softmax uses
-    `exp2`, so the emitter must NOT recompute `1/sqrt(d_head)`.
-
-    `num_sinks` and `window` are OPTIONAL operands with constant fallbacks:
-    Triton drops a kernel argument equal to 1 from the signature and folds it
-    into a `dense<1>` constant, leaving no buffer to point at. Exactly one of
-    `num_sinks`/`sinks_const` and one of `window`/`window_const` is set.
-
-    The epilogue divides by the running sum without a zero test, so a row with
-    no visible key yields NaN — which is exactly what the source kernel's
-    `acc / l_i` produces.
-
-    The body runs on one warp (`ltid.x < 32`); under num_warps>1 the extra warps
-    idle. Only the post-staging barrier is shared, so they still reach it.
-  }];
-
-  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
-                       Metal_MemRefType:$v, Metal_MemRefType:$out,
-                       Metal_MemRefType:$m, Metal_MemRefType:$d_head,
-                       Metal_MemRefType:$scale,
-                       Metal_MemRefType:$stride_q, Metal_MemRefType:$stride_k,
-                       Metal_MemRefType:$stride_v, Metal_MemRefType:$stride_o,
-                       Optional<Metal_MemRefType>:$num_sinks,
-                       Optional<Metal_MemRefType>:$window,
-                       I64Attr:$bm, I64Attr:$bd, I64Attr:$bs,
-                       I64Attr:$local_len,
-                       OptionalAttr<I64Attr>:$sinks_const,
-                       OptionalAttr<I64Attr>:$window_const);
-
-  let assemblyFormat =
-      "$q `,` $k `,` $v `,` $out `,` $m `,` $d_head `,` $scale"
-      " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
-      " (`sinks` $num_sinks^)? (`window` $window^)? attr-dict"
-      " `:` type(operands)";
-}
-
-//===----------------------------------------------------------------------===//
 // FusedAttentionOp
 //===----------------------------------------------------------------------===//
 
@@ -742,6 +664,27 @@ def ScoreYieldOp : Metal_Op<"score_yield", [Pure, Terminator,
   let assemblyFormat = "$value attr-dict `:` type($value)";
 }
 
+def KeyBoundsYieldOp : Metal_Op<"key_bounds_yield", [Pure, Terminator,
+                                                     HasParent<"FusedAttentionOp">]> {
+  let summary = "Terminator of a metal.fused_attention key-bounds region";
+  let description = [{
+    Yields the half-open key range `[start, end)` that one phase of the parent
+    op visits, as two si32 values.
+
+    This is how the op REPRODUCES a source kernel's key set instead of proving
+    something about it. A causal loop stops at `min((pid+1)*bm, n)`; an
+    attention-sinks kernel visits a sink block and then a sliding window whose
+    start is `max(pid*bm - window + 1, num_sinks)`. Both are ordinary scalar
+    arithmetic over the block index and the kernel's own arguments, so both are
+    expressible here -- which is what retired the `causal_key_bound` unit
+    attribute rather than growing a second one beside it.
+  }];
+
+  let arguments = (ins SI32:$start, SI32:$end);
+
+  let assemblyFormat = "$start `,` $end attr-dict";
+}
+
 // NOTE: deliberately NOT SingleBlockImplicitTerminator<"ScoreYieldOp">. That
 // trait auto-inserts the terminator and therefore needs one that is buildable
 // with no operands; `metal.score_yield` carries the transformed score, so the
@@ -752,9 +695,9 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
   let description = [{
     Self-contained attention body for one query-row block, generalizing the
     `dot -> elementwise -> dot` chain that every attention-family Triton kernel
-    compiles to. Replaced `metal.flash_attention` (deleted) and is intended to
-    replace `metal.sink_attention`, whose semantics were baked into hand-printed MSL
-    and therefore needed a NEW op — matcher and emitter both — for every new
+    compiles to. Replaced `metal.flash_attention` and `metal.sink_attention`,
+    both now deleted, whose semantics were baked into hand-printed MSL and
+    therefore needed a NEW op — matcher and emitter both — for every new
     masking or weighting scheme.
 
     What varies between those variants is exactly one thing: the elementwise
@@ -763,15 +706,19 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
     emitter:
 
         metal.fused_attention ... {
-        ^bb0(%score: f32, %row: i32, %key: i32, %p0: f32, ...):
-          // arbitrary scalar arith/math on the score and its two indices
+        ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32, %p0: f32, ...):
+          // arbitrary scalar arith/math on the score and its indices
           metal.score_yield %transformed : f32
+        } bounds {
+        ^bb0(%blk: si32, %phase: si32, %m: si32, %n: si32, %p0: f32, ...):
+          metal.key_bounds_yield %start, %end
         }
 
-    The region is entered once per (query row, key) pair with `%score` bound to
-    the raw dot product, `%row`/`%key` bound to the GLOBAL (not tile-relative)
-    indices, and the trailing block args bound to element 0 of each
-    `score_params` buffer. Masking is expressed the way the source kernel writes
+    The score region is entered once per (query row, key) pair with `%score`
+    bound to the raw dot product, `%row`/`%key` bound to the GLOBAL (not
+    tile-relative) indices, `%phase` to the index of the key phase being swept,
+    and the trailing block args bound to element 0 of each `score_params`
+    buffer. Masking is expressed the way the source kernel writes
     it — yield `-inf` (or `0` under `norm = none`) for a key that must not
     contribute — rather than as an enumerated mode attribute.
 
@@ -806,16 +753,29 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
     exponential must match the source's, since the region has already produced
     the logit and the emitter cannot retroactively rescale it.
 
-    `causal_key_bound` makes the emitter visit keys `[0, min((tgid.x+1)*bm, n))`
-    instead of `[0, n)`, reproducing the `hi = min((pid+1)*BLOCK_M, seq_len)`
-    loop bound a causal kernel writes. It exists because agreement with the
-    source kernel must be REPRODUCED, not proven: a causally-bounded loop never
-    visits keys past `hi`, and that agrees with a `[0, n)` sweep only because
-    the region happens to send `key > row` to zero — which is not decidable for
-    an arbitrary region, and pattern-matching the causal shape to decide it
-    would reintroduce exactly the enumeration this op exists to remove. Same
-    reasoning as `metal.sink_attention` reproducing its two key phases rather
-    than its mathematical mask.
+    The `key_bounds` region gives the half-open key range `[start, end)` that
+    each phase visits, as scalar arithmetic over the block index, `m`/`n` and
+    the same params the score region sees. Agreement with the source kernel is
+    REPRODUCED here, not proven: a causally-bounded loop never visits keys past
+    `min((pid+1)*bm, n)`, and that agrees with a `[0, n)` sweep only because the
+    region happens to send `key > row` to zero — undecidable for an arbitrary
+    region, and pattern-matching the causal shape to decide it would reintroduce
+    exactly the enumeration this op exists to remove.
+
+    `num_phases` is how many times that repeats. Both regions take a `phase`
+    argument, so a kernel that visits several disjoint key ranges with a
+    DIFFERENT mask on each — attention sinks being the motivating case: a sink
+    block, then a sliding window that starts at
+    `max(pid*bm - window + 1, num_sinks)` — is one op with `num_phases = 2`
+    rather than a new op. The phases run in source order against one running
+    (accumulator, sum, max) state, which is why they compose: an online softmax
+    merges any partition of the key set.
+
+    Collapsing several phases into one masked sweep is deliberately NOT done.
+    It would be valid only when the ranges cover everything the masks keep, and
+    for a sliding window that is a RUNTIME property (`n_local_blocks*bn >=
+    window + bm - 1`, with `window` a kernel argument), so the matcher cannot
+    check it. Reproducing costs nothing and needs no such argument.
 
     `bm` is the source kernel's query-row block and is BINDING — it fixes the
     grid, so this program owns rows `[tgid.x*bm, tgid.x*bm + bm)`. `bn`/`bd` are
@@ -834,11 +794,12 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
                        Optional<Metal_MemRefType>:$h,
                        Variadic<Metal_MemRefType>:$score_params,
                        I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
+                       DefaultValuedAttr<I64Attr, "1">:$num_phases,
                        AttnNormAttr:$norm,
-                       UnitAttr:$causal_key_bound,
                        UnitAttr:$softmax_natural_exp);
 
-  let regions = (region SizedRegion<1>:$score);
+  let regions = (region SizedRegion<1>:$score,
+                        SizedRegion<1>:$key_bounds);
 
   let hasVerifier = 1;
 
@@ -846,7 +807,7 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
       "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_head"
       " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
       " (`heads` $h^)? (`params` $score_params^)? attr-dict"
-      " `:` type(operands) $score";
+      " `:` type(operands) $score `bounds` $key_bounds";
 }
 
 //===----------------------------------------------------------------------===//

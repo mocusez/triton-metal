@@ -125,7 +125,6 @@ private:
   void translate(mlir::triton::metal::SoftmaxOp op);
   void translate(mlir::triton::metal::LogsumexpOp op);
   void translate(mlir::triton::metal::SdpaOp op);
-  void translate(mlir::triton::metal::SinkAttentionOp op);
   void translate(mlir::triton::metal::FusedAttentionOp op);
   // The two bodies behind `metal.fused_attention`, mirroring the dialect's
   // existing `MatmulKind::Scalar|Mma` split: a simdgroup body for tiles whose
@@ -133,15 +132,32 @@ private:
   // correctness floor and always applies. `translate` picks between them.
   void emitFusedAttentionScalar_(mlir::triton::metal::FusedAttentionOp op);
   void emitFusedAttentionMma_(mlir::triton::metal::FusedAttentionOp op);
+  // Binds a fused-attention region's block args to MSL temps: the pinned
+  // prefix from `fixedInits`, then one per `score_params` buffer. Both regions
+  // take the same params in the same order and the verifier pins their types,
+  // so one walk serves both. Returns false (and sets _emitFailed) if a param
+  // does not resolve to a kernel buffer.
+  bool bindFusedRegionArgs_(mlir::triton::metal::FusedAttentionOp op,
+                            mlir::Block &body,
+                            llvm::ArrayRef<std::string> fixedInits,
+                            llvm::StringRef ind);
   // Emits the op's score-transform region inline as a run of MSL let-bindings
-  // and returns the name holding the transformed score. `scoreExpr`/`rowExpr`/
-  // `keyExpr` are the MSL expressions the region's three pinned block args bind
-  // to. Emitted exactly once, inside the innermost (per-key) loop, so the
-  // bindings are scoped per iteration and need no per-call name uniquing.
+  // and returns the name holding the transformed score. The four expressions
+  // are what the region's pinned block args bind to. Emitted inside the
+  // innermost (per-key) loop, so the bindings are scoped per iteration; with
+  // several key phases it is emitted once per phase, each emission rebinding
+  // every name before its uses.
   std::string emitScoreRegion_(mlir::triton::metal::FusedAttentionOp op,
                                llvm::StringRef scoreExpr,
                                llvm::StringRef rowExpr, llvm::StringRef keyExpr,
-                               llvm::StringRef ind);
+                               llvm::StringRef phaseExpr, llvm::StringRef ind);
+  // Emits the op's key-bounds region for one phase and returns the two names
+  // holding the half-open key range `[start, end)` that phase sweeps.
+  std::pair<std::string, std::string>
+  emitKeyBoundsRegion_(mlir::triton::metal::FusedAttentionOp op,
+                       llvm::StringRef blkExpr, llvm::StringRef phaseExpr,
+                       llvm::StringRef mExpr, llvm::StringRef nExpr,
+                       llvm::StringRef ind);
   void emitCausal_(mlir::triton::metal::SdpaOp op);
   void emitBoolMask_(mlir::triton::metal::SdpaOp op);
   void emitFloatMask_(mlir::triton::metal::SdpaOp op);

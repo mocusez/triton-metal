@@ -27,7 +27,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     metal.kernel decay_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true] {
     ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>, %lg: !metal.memref<? x f32>):
       metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so params %lg {bm = 64 : i64, bn = 64 : i64, bd = 64 : i64, norm = 0 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x f32> {
-      ^bb0(%score: f32, %row: si32, %key: si32, %log2g: f32):
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32, %log2g: f32):
         %diff = metal.binary_exp %row, %key, subOp : (si32, si32) -> si32
         %zero = metal.constant 0 : si32
         %ge = metal.binary_exp %diff, %zero, geOp : (si32, si32) -> i1
@@ -38,26 +38,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         %w = metal.unary_exp %sel, exp2Op : (f32) -> f32
         %out = metal.binary_exp %score, %w, mulOp : (f32, f32) -> f32
         metal.score_yield %out : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32, %log2g: f32):
+        // Causal: keys [0, min((blk+1)*bm, n)). The source's own loop bound,
+        // written out -- not an attribute standing in for it.
+        %zero = metal.constant 0 : si32
+        %one = metal.constant 1 : si32
+        %bm = metal.constant 64 : si32
+        %b1 = metal.binary_exp %blk, %one, addOp : (si32, si32) -> si32
+        %hi = metal.binary_exp %b1, %bm, mulOp : (si32, si32) -> si32
+        %end = metal.binary_exp %hi, %n2, minOp : (si32, si32) -> si32
+        metal.key_bounds_yield %zero, %end
       }
       metal.return
     }
     metal.kernel softmax_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true] {
     ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>):
       metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
-      ^bb0(%score: f32, %row: si32, %key: si32):
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32):
         %scale = metal.constant 2.500000e-01 : f32
         %scaled = metal.binary_exp %score, %scale, mulOp : (f32, f32) -> f32
         metal.score_yield %scaled : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32):
+        %zero = metal.constant 0 : si32
+        metal.key_bounds_yield %zero, %n2
       }
       metal.return
     }
     metal.kernel head_split_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true] {
     ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dm: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>, %h: !metal.memref<? x ui32>):
       metal.fused_attention %q, %k, %v, %o, %m, %n, %dm strides %sq, %sk, %sv, %so heads %h {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32, softmax_natural_exp} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
-      ^bb0(%score: f32, %row: si32, %key: si32):
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32):
         %scale = metal.constant 2.500000e-01 : f32
         %scaled = metal.binary_exp %score, %scale, mulOp : (f32, f32) -> f32
         metal.score_yield %scaled : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32):
+        %zero = metal.constant 0 : si32
+        metal.key_bounds_yield %zero, %n2
       }
       metal.return
     }
@@ -76,6 +95,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // query rows (2 x 32) instead of declining the way flash_attention's bm<=32
 // gate did.
 // CHECK: for (uint _fa_c0 = 0u; _fa_c0 < 64u; _fa_c0 += 32u)
+// The causal key bound comes from the op's key-bounds region, so it is ordinary
+// emitted arithmetic rather than a hard-coded `min((tgid.x+1)*bm, n)`.
+// CHECK: // --- key phase 0 ---
+// CHECK: uint _fa_kbeg =
+// CHECK: uint _fa_kend =
+// CHECK: for (uint _fa_key = _fa_kbeg; _fa_key < _fa_kend; ++_fa_key)
 // CHECK: _fa_a += _fa_qbuf
 // --- the region, emitted inline as let-bindings with score/row/key bound ---
 // CHECK: = _fa_a;

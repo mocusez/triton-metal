@@ -227,18 +227,9 @@ llvm::LogicalResult FusedAttentionOp::verify() {
              << name << " must be a multiple of 8 (got " << v << ")";
   }
 
-  mlir::Block &body = getScore().front();
-  // (score, row, key) are pinned; every trailing arg is bound to element 0 of
-  // the correspondingly-positioned `score_params` buffer, so the counts and the
-  // element types have to line up exactly or the region would read a different
-  // scalar than the matcher resolved.
-  const unsigned kFixed = 3;
-  auto params = getScoreParams();
-  if (body.getNumArguments() != kFixed + params.size())
-    return emitOpError() << "score region must take " << kFixed << " + "
-                         << params.size() << " arguments (score, row, key, and "
-                         << "one per score_param), got "
-                         << body.getNumArguments();
+  if (getNumPhases() < 1)
+    return emitOpError() << "num_phases must be positive (got "
+                         << getNumPhases() << ")";
 
   auto f32 = mlir::Float32Type::get(getContext());
   // SIGNED i32, not signless: `Metal_Type` has no plain I32, so a signless
@@ -247,36 +238,72 @@ llvm::LogicalResult FusedAttentionOp::verify() {
   // content of a causal or decay mask.
   auto si32 = mlir::IntegerType::get(getContext(), 32,
                                      mlir::IntegerType::Signed);
+  auto params = getScoreParams();
+
+  // Every trailing arg of BOTH regions is bound to element 0 of the
+  // correspondingly-positioned `score_params` buffer, so the counts and the
+  // element types have to line up exactly or a region would read a different
+  // scalar than the matcher resolved.
+  auto checkParams = [&](mlir::Block &body, unsigned kFixed,
+                         const char *which) -> llvm::LogicalResult {
+    if (body.getNumArguments() != kFixed + params.size())
+      return emitOpError() << which << " region must take " << kFixed << " + "
+                           << params.size() << " arguments (got "
+                           << body.getNumArguments() << ")";
+    for (auto [i, p] : llvm::enumerate(params)) {
+      auto memRef = llvm::dyn_cast<MetalMemRefType>(p.getType());
+      if (!memRef)
+        return emitOpError() << "score_param " << i << " must be a !metal.memref";
+      mlir::Type want = memRef.getType();
+      mlir::Type got = body.getArgument(kFixed + i).getType();
+      if (want != got)
+        return emitOpError() << which << " region arg " << (kFixed + i)
+                             << " type (" << got << ") must match score_param "
+                             << i << " element type (" << want << ")";
+    }
+    return mlir::success();
+  };
+
+  // --- score region: (score, row, key, phase, params...) ---
+  mlir::Block &body = getScore().front();
+  const unsigned kScoreFixed = 4;
+  if (failed(checkParams(body, kScoreFixed, "score")))
+    return mlir::failure();
   if (body.getArgument(0).getType() != f32)
     return emitOpError() << "score region arg 0 (score) must be f32, got "
                          << body.getArgument(0).getType();
-  for (unsigned i = 1; i < kFixed; ++i)
+  static const char *kScoreNames[] = {"score", "row", "key", "phase"};
+  for (unsigned i = 1; i < kScoreFixed; ++i)
     if (body.getArgument(i).getType() != si32)
-      return emitOpError() << "score region arg " << i
-                           << " (" << (i == 1 ? "row" : "key")
-                           << ") must be si32, got "
+      return emitOpError() << "score region arg " << i << " ("
+                           << kScoreNames[i] << ") must be si32, got "
                            << body.getArgument(i).getType();
 
-  for (auto [i, p] : llvm::enumerate(params)) {
-    auto memRef = llvm::dyn_cast<MetalMemRefType>(p.getType());
-    if (!memRef)
-      return emitOpError() << "score_param " << i << " must be a !metal.memref";
-    mlir::Type want = memRef.getType();
-    mlir::Type got = body.getArgument(kFixed + i).getType();
-    if (want != got)
-      return emitOpError() << "score region arg " << (kFixed + i)
-                           << " type (" << got << ") must match score_param "
-                           << i << " element type (" << want << ")";
-  }
-
-  // The terminator is what the emitter reads back; SingleBlockImplicitTerminator
-  // guarantees its presence but not that the region actually computes an f32.
+  // The terminator is what the emitter reads back; the region's terminator is
+  // required and type-checked here rather than via
+  // SingleBlockImplicitTerminator, which would need one buildable with no
+  // operands.
   auto yield = llvm::dyn_cast<ScoreYieldOp>(body.getTerminator());
   if (!yield)
     return emitOpError() << "score region must end in metal.score_yield";
   if (yield.getValue().getType() != f32)
     return emitOpError() << "metal.score_yield must yield f32, got "
                          << yield.getValue().getType();
+
+  // --- key-bounds region: (blk, phase, m, n, params...) ---
+  mlir::Block &kb = getKeyBounds().front();
+  const unsigned kBoundsFixed = 4;
+  if (failed(checkParams(kb, kBoundsFixed, "key_bounds")))
+    return mlir::failure();
+  static const char *kBoundNames[] = {"blk", "phase", "m", "n"};
+  for (unsigned i = 0; i < kBoundsFixed; ++i)
+    if (kb.getArgument(i).getType() != si32)
+      return emitOpError() << "key_bounds region arg " << i << " ("
+                           << kBoundNames[i] << ") must be si32, got "
+                           << kb.getArgument(i).getType();
+  if (!llvm::isa<KeyBoundsYieldOp>(kb.getTerminator()))
+    return emitOpError()
+           << "key_bounds region must end in metal.key_bounds_yield";
 
   return mlir::success();
 }

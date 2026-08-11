@@ -38,7 +38,7 @@
 // max abs err 0.95-2.4, for six commits before anyone noticed.
 // `abs(row - key)` has no unary form in the dialect, so it lowers to
 // `select(d < 0, 0 - d, d)`, and the masked-out logit is -inf (0xFF800000).
-// CHECK: ^bb0(%[[SCORE:.*]]: f32, %[[ROW:.*]]: si32, %[[KEY:.*]]: si32
+// CHECK: ^bb0(%[[SCORE:.*]]: f32, %[[ROW:.*]]: si32, %[[KEY:.*]]: si32, %{{.*}}: si32
 // CHECK: metal.unary_exp %{{.*}}, sqrtOp
 // CHECK: metal.binary_exp %[[SCORE]], %{{.*}}, divOp
 // CHECK: %[[DIFF:.*]] = metal.binary_exp %[[ROW]], %[[KEY]], subOp
@@ -49,6 +49,12 @@
 // CHECK: metal.constant 0xFF800000
 // CHECK: arith.select
 // CHECK: metal.score_yield
+//
+// The key range comes from the op's second region, which reproduces the
+// source's `range(0, cdiv(N, BLOCK_N))` as `cdiv(n, 16) * 16` rather than
+// substituting `n` for it -- the bound is REPRODUCED, not reasoned about.
+// CHECK: ^bb0(%[[BLK:.*]]: si32, %{{.*}}: si32, %{{.*}}: si32, %[[N:.*]]: si32
+// CHECK: metal.key_bounds_yield
 //
 // The whole loop / dots / softmax reduces / band mask / convert_layouts are gone.
 // CHECK-NOT: tt.dot

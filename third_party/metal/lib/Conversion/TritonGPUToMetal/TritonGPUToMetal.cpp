@@ -11821,1357 +11821,6 @@ static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
     normalizeBlockedDivergentCvt(cvt);
 }
 
-//===----------------------------------------------------------------------===//
-// Sink-attention matcher (causal + attention sinks + one-sided sliding window)
-//===----------------------------------------------------------------------===//
-//
-// Recognizes `leet-triton/medium-attention_with_sinks.py` and replaces the whole
-// body — sink prologue, local-window loop (or its unrolled copies), epilogue and
-// store — with one `metal.sink_attention`. See metal-attention-with-sinks-plan.md.
-//
-// It is a SEPARATE matcher from the general `tryFusedAttention`, not a widening
-// of it, because seven independent things differ (plan §2), the load-bearing
-// ones being:
-//
-//   - K is loaded already transposed (`K + d[:,None] + n[None,:]*stride`), so
-//     there is no `tt.trans` to classify the dots by;
-//   - the sink block sits OUTSIDE the loop and feeds its iter_args, so a
-//     loop-anchored walk with constant-init checks cannot see it;
-//   - `N_LOCAL_BLOCKS == 1` deletes the `scf.for` altogether, so there is no
-//     loop to anchor on at all.
-//
-// Hence the anchor here is the unique `tt.store`, and the walk is over a CHAIN
-// of online-softmax merge steps, each of which is either an `scf.for` body or a
-// straight-line block. Safety comes from the same place as the FA verifier: a
-// role walk that marks every op it recognizes, plus a coverage gate over the
-// backward slice of the store (plus each loop body) at the end.
-namespace {
-
-// A kernel scalar: either a kernel argument or a folded integer constant.
-// Triton drops an argument equal to 1 from the signature and materializes it as
-// a constant — as a `dense<1>` splat in tensor context and a plain `1` in scalar
-// context — so `num_sinks` / `window_size` reach us in two different spellings
-// that must still compare equal.
-struct SaScalar {
-  mlir::Value arg;
-  int64_t cst = 0;
-  bool isConst = false;
-  bool valid = false;
-  bool same(const SaScalar &o) const {
-    if (!valid || !o.valid)
-      return false;
-    if (isConst != o.isConst)
-      return false;
-    return isConst ? cst == o.cst : arg == o.arg;
-  }
-};
-
-struct SinkTemplate {
-  // --- inputs ---
-  mlir::triton::FuncOp funcOp;
-  mlir::Block *entry = nullptr;
-  mlir::triton::StoreOp store;
-
-  // --- tile shape ---
-  int64_t BM = 0, BD = 0, BS = 0, BN = 0, NLB = 0;
-
-  // --- resolved operands ---
-  mlir::Value qPtr, kPtr, vPtr, oPtr;
-  SaScalar mVal, dHeadVal, sinksVal, windowVal;
-  mlir::Value scaleVal;
-  mlir::Value strideQ, strideK, strideV, strideO;
-  mlir::Value localStart; // maxsi(pid*BM - window + 1, num_sinks)
-  mlir::triton::LoadOp qLoad;
-
-  const char *why = nullptr;
-  mlir::Operation *offender = nullptr;
-  llvm::DenseSet<mlir::Operation *> claimed;
-  llvm::SmallVector<mlir::scf::ForOp, 2> loops;
-
-  bool no(const char *r) {
-    if (!why)
-      why = r;
-    return false;
-  }
-  void mark(mlir::Operation *op) {
-    if (op)
-      claimed.insert(op);
-  }
-  bool isKernelArg(mlir::Value v) const {
-    auto ba = mlir::dyn_cast_or_null<mlir::BlockArgument>(v);
-    return ba && ba.getOwner() == entry;
-  }
-
-  // Peel layout/shape plumbing off a VALUE, claiming each op on the way.
-  mlir::Value peel(mlir::Value v) {
-    while (auto *def = v.getDefiningOp()) {
-      if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::BroadcastOp,
-                    mlir::triton::ExpandDimsOp>(def)) {
-        mark(def);
-        v = def->getOperand(0);
-        continue;
-      }
-      break;
-    }
-    return v;
-  }
-
-  // Structural equality of two value cones, claiming both sides as it goes.
-  //
-  // SSA identity is not enough. When one value is consumed at two different
-  // layouts, Triton does not always insert a `ttg.convert_layout` — it can
-  // DUPLICATE the whole producer cone, once per layout. `d = 64` does exactly
-  // that to the online-softmax rescale factor: the running sum multiplies
-  // `exp2(subf(m_i_49, m_new))` while the accumulator multiplies
-  // `exp2(subf(m_i_48, cvt(m_new)))`, two distinct ops computing the same
-  // thing. Comparing pointers there rejects a kernel that is perfectly fine.
-  //
-  // Marking both sides is not just convenient, it is required: the duplicate
-  // cone's ops are real ops in the backward slice, and the coverage gate would
-  // otherwise trip over them.
-  bool sameCone(mlir::Value a, mlir::Value b, int depth = 0) {
-    a = peel(a);
-    b = peel(b);
-    if (a == b)
-      return true;
-    if (depth > 12)
-      return false;
-    mlir::Operation *da = a.getDefiningOp(), *db = b.getDefiningOp();
-    if (!da || !db || da->getName() != db->getName())
-      return false;
-    // Ops carrying regions (tt.reduce) are compared by identity only.
-    if (da->getNumRegions() || db->getNumRegions())
-      return false;
-    if (da->getNumOperands() != db->getNumOperands())
-      return false;
-    if (mlir::isa<mlir::arith::ConstantOp>(da)) {
-      // Attribute dictionaries embed the tensor TYPE, which is exactly what
-      // differs here, so compare the splat value instead.
-      auto ca = mlir::cast<mlir::arith::ConstantOp>(da);
-      auto cb = mlir::cast<mlir::arith::ConstantOp>(db);
-      auto splatF = [](mlir::arith::ConstantOp c, llvm::APFloat &out) {
-        if (auto f = mlir::dyn_cast<mlir::FloatAttr>(c.getValue())) {
-          out = f.getValue();
-          return true;
-        }
-        auto d = mlir::dyn_cast<mlir::DenseFPElementsAttr>(c.getValue());
-        if (!d || !d.isSplat())
-          return false;
-        out = d.getSplatValue<llvm::APFloat>();
-        return true;
-      };
-      auto splatI = [](mlir::arith::ConstantOp c, llvm::APInt &out) {
-        if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
-          out = i.getValue();
-          return true;
-        }
-        auto d = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue());
-        if (!d || !d.isSplat())
-          return false;
-        out = d.getSplatValue<llvm::APInt>();
-        return true;
-      };
-      llvm::APFloat fa(0.0), fb(0.0);
-      if (splatF(ca, fa) && splatF(cb, fb)) {
-        mark(da);
-        mark(db);
-        return fa.bitwiseIsEqual(fb);
-      }
-      llvm::APInt ia, ib;
-      if (splatI(ca, ia) && splatI(cb, ib)) {
-        mark(da);
-        mark(db);
-        return ia.getSExtValue() == ib.getSExtValue();
-      }
-      return false;
-    }
-    // Everything else must agree on its attributes (make_range bounds, cmpi
-    // predicate, expand_dims axis) — none of which embed a layout.
-    if (da->getAttrDictionary() != db->getAttrDictionary())
-      return false;
-    for (unsigned i = 0; i < da->getNumOperands(); ++i)
-      if (!sameCone(da->getOperand(i), db->getOperand(i), depth + 1))
-        return false;
-    mark(da);
-    mark(db);
-    return true;
-  }
-
-  // Peel plumbing off an INDEX, recording the axis it was lifted along by the
-  // outermost `tt.expand_dims`: 0 => the value indexes tile columns, 1 => it
-  // indexes tile rows, -1 => rank-1, no lift. That axis is the ONLY thing that
-  // separates the sink-key index from the feature index here: this kernel has
-  // BLOCK_S == BLOCK_D == 16, so Triton CSEs `arange(BLOCK_S)` and
-  // `arange(BLOCK_D)` into ONE value and a classifier keyed on the producer
-  // alone would confuse a key bound with a feature bound.
-  mlir::Value peelIdx(mlir::Value v, int &axis) {
-    axis = -1;
-    while (auto *def = v.getDefiningOp()) {
-      if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp,
-                    mlir::triton::BroadcastOp>(def)) {
-        mark(def);
-        v = def->getOperand(0);
-        continue;
-      }
-      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
-        mark(ed);
-        if (axis < 0)
-          axis = (int)ed.getAxis();
-        v = ed.getSrc();
-        continue;
-      }
-      break;
-    }
-    return v;
-  }
-
-  // A scalar bound: `splat(kernel arg)`, a splat integer constant, a bare
-  // kernel arg, or a bare integer constant.
-  SaScalar readScalar(mlir::Value v) {
-    SaScalar r;
-    v = peel(v);
-    if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>()) {
-      mark(sp);
-      v = sp.getSrc();
-    }
-    if (isKernelArg(v)) {
-      r.arg = v;
-      r.valid = true;
-      return r;
-    }
-    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
-    if (!cst)
-      return r;
-    mark(cst);
-    if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) {
-      r.cst = ia.getInt();
-      r.isConst = r.valid = true;
-      return r;
-    }
-    auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue());
-    if (dense && dense.isSplat()) {
-      r.cst = dense.getSplatValue<llvm::APInt>().getSExtValue();
-      r.isConst = r.valid = true;
-    }
-    return r;
-  }
-
-  bool matchFpConst(mlir::Value v,
-                    llvm::function_ref<bool(const llvm::APFloat &)> pred) {
-    v = peel(v);
-    if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>()) {
-      mark(sp);
-      v = sp.getSrc();
-    }
-    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
-    if (!cst)
-      return false;
-    mark(cst);
-    if (auto f = mlir::dyn_cast<mlir::FloatAttr>(cst.getValue()))
-      return pred(f.getValue());
-    if (auto d = mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue()))
-      return d.isSplat() && pred(d.getSplatValue<llvm::APFloat>());
-    return false;
-  }
-  bool isZeroF(mlir::Value v) {
-    return matchFpConst(v, [](const llvm::APFloat &f) { return f.isZero(); });
-  }
-  bool isOneF(mlir::Value v) {
-    return matchFpConst(
-        v, [](const llvm::APFloat &f) { return f.isExactlyValue(1.0); });
-  }
-  bool isNegInfF(mlir::Value v) {
-    return matchFpConst(v, [](const llvm::APFloat &f) {
-      return f.isInfinity() && f.isNegative();
-    });
-  }
-  static bool isIntConst(mlir::Value v, int64_t c) {
-    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
-    if (!cst)
-      return false;
-    auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue());
-    return ia && ia.getInt() == c;
-  }
-
-  // --- index predicates. Each takes the axis the index must be lifted along,
-  // so `arange(BLOCK_S)` in a column slot is never mistaken for `arange(BD)` in
-  // a row slot even when the two are literally the same SSA value.
-  //
-  // An `expand_dims` with axis A INSERTS a dimension at A, so the lifted value
-  // indexes the OTHER one: axis 1 => it indexes tile rows, axis 0 => columns.
-  //
-  // A predicate can be lifted at either end. Address arithmetic lifts the index
-  // itself (`expand_dims(offs_n, 0)` then multiply), but a mask usually compares
-  // rank-1 values and lifts the i1 RESULT (`expand_dims(offs_m < M, 1)`), which
-  // leaves the index inside unlifted. `outer` carries the axis picked up while
-  // peeling the mask tree so both spellings classify the same way.
-  static bool axisOk(int got, int want, int outer) {
-    return got >= 0 ? got == want : outer == want;
-  }
-
-  // `arange(0, len)`, bare.
-  bool isRange(mlir::Value v, int wantAxis, int64_t len, int outer = -1) {
-    int ax;
-    mlir::Value p = peelIdx(v, ax);
-    if (!axisOk(ax, wantAxis, outer))
-      return false;
-    auto mr = p.getDefiningOp<mlir::triton::MakeRangeOp>();
-    if (!mr || mr.getStart() != 0 || (int64_t)mr.getEnd() != len)
-      return false;
-    mark(mr);
-    return true;
-  }
-
-  // `splat(pid0 * BM) + arange(BM)` — the absolute query row.
-  bool isRow(mlir::Value v, int wantAxis, int outer = -1) {
-    int ax;
-    mlir::Value p = peelIdx(v, ax);
-    if (!axisOk(ax, wantAxis, outer))
-      return false;
-    auto add = p.getDefiningOp<mlir::arith::AddIOp>();
-    if (!add)
-      return false;
-    for (int i = 0; i < 2; ++i) {
-      if (!isRange(add->getOperand(i), -1, BM))
-        continue;
-      mlir::Value base = peel(add->getOperand(1 - i));
-      auto sp = base.getDefiningOp<mlir::triton::SplatOp>();
-      if (!sp)
-        return false;
-      mark(sp);
-      if (!isStartM(sp.getSrc()))
-        return false;
-      mark(add);
-      return true;
-    }
-    return false;
-  }
-
-  // `pid0 * BM`, the query-row block origin.
-  bool isStartM(mlir::Value v) {
-    auto mul = v.getDefiningOp<mlir::arith::MulIOp>();
-    if (!mul)
-      return false;
-    for (int i = 0; i < 2; ++i) {
-      auto pid = mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
-      if (pid && pid.getAxisAsInt() == 0 && isIntConst(mul->getOperand(1 - i), BM)) {
-        mark(mul);
-        mark(pid);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // `splat(keyBase) + arange(BN)` — a local-window key index.
-  bool isLocalKey(mlir::Value v, int wantAxis, mlir::Value keyBase,
-                  int outer = -1) {
-    int ax;
-    mlir::Value p = peelIdx(v, ax);
-    if (!axisOk(ax, wantAxis, outer))
-      return false;
-    auto add = p.getDefiningOp<mlir::arith::AddIOp>();
-    if (!add)
-      return false;
-    for (int i = 0; i < 2; ++i) {
-      if (!isRange(add->getOperand(i), -1, BN))
-        continue;
-      mlir::Value base = peel(add->getOperand(1 - i));
-      auto sp = base.getDefiningOp<mlir::triton::SplatOp>();
-      if (!sp || sp.getSrc() != keyBase)
-        return false;
-      mark(sp);
-      mark(add);
-      return true;
-    }
-    return false;
-  }
-
-  // `row - window + 1` — the left edge of the one-sided window. Its own axis is
-  // not checked: the expression is built at rank 2 from an already-lifted row,
-  // so the `isRow` call below is what pins it to the row dimension.
-  bool isWindowLeft(mlir::Value v) {
-    // `window_size == 1` is dropped from the kernel signature by Triton's
-    // equal-to-1 specialization, and `row - 1 + 1` then folds away entirely:
-    // the left edge IS the row, and the window degenerates to "this key only".
-    if (windowVal.valid && windowVal.isConst && windowVal.cst == 1 &&
-        isRow(v, 1, -1))
-      return true;
-    int ax;
-    mlir::Value p = peelIdx(v, ax);
-    auto add = p.getDefiningOp<mlir::arith::AddIOp>();
-    if (!add)
-      return false;
-    mlir::Value subSide;
-    bool sawOne = false;
-    for (int i = 0; i < 2; ++i) {
-      SaScalar one = readScalar(add->getOperand(i));
-      if (one.valid && one.isConst && one.cst == 1) {
-        sawOne = true;
-        subSide = add->getOperand(1 - i);
-      }
-    }
-    if (!sawOne)
-      return false;
-    auto sub = peel(subSide).getDefiningOp<mlir::arith::SubIOp>();
-    if (!sub)
-      return false;
-    // The `row` operand is already lifted on axis 1 inside the subtraction.
-    if (!isRow(sub.getLhs(), 1))
-      return false;
-    SaScalar w = readScalar(sub.getRhs());
-    if (!w.valid || !w.same(windowVal))
-      return false;
-    mark(add);
-    mark(sub);
-    return true;
-  }
-
-  // --- mask decomposition. Each recognized comparison becomes one tag; a step's
-  // tag multiset must then be exactly the expected one, so an extra term (a
-  // bias, a second band) or a missing term (the sink escape) is a rejection.
-  enum class Tag {
-    RowLtM,     // row < M
-    FeatLtD,    // d < d_head
-    SinkLtS,    // s < num_sinks
-    SinkLeRow,  // s <= row
-    KeyLtM,     // n < M
-    KeyLeRow,   // n <= row
-    KeyGeWin,   // n >= row - window + 1
-    KeyGeS,     // n >= num_sinks
-  };
-
-  // Context for classification: which key index (sink range vs local key with
-  // this base) and on which axis the key/feature indices live for this tile.
-  struct Ctx {
-    bool sinkKeys = false;
-    mlir::Value keyBase; // local steps only
-    int keyAxis = 0;     // axis the key index is lifted along
-    int featAxis = 1;    // axis the feature index is lifted along
-    int rowAxis = 1;
-    int outerAxis = -1;  // axis picked up while peeling the mask tree
-  };
-
-  bool classifyCmp(mlir::arith::CmpIOp cmp, const Ctx &ctx, Tag &tag) {
-    const int out = ctx.outerAxis;
-    auto pred = cmp.getPredicate();
-    if (pred == mlir::arith::CmpIPredicate::slt) {
-      SaScalar bound = readScalar(cmp.getRhs());
-      if (!bound.valid)
-        return false;
-      if (bound.same(mVal)) {
-        if (isRow(cmp.getLhs(), ctx.rowAxis, out)) {
-          tag = Tag::RowLtM;
-          return true;
-        }
-        if (!ctx.sinkKeys &&
-            isLocalKey(cmp.getLhs(), ctx.keyAxis, ctx.keyBase, out)) {
-          tag = Tag::KeyLtM;
-          return true;
-        }
-        return false;
-      }
-      if (bound.same(dHeadVal) && isRange(cmp.getLhs(), ctx.featAxis, BD, out)) {
-        tag = Tag::FeatLtD;
-        return true;
-      }
-      if (bound.same(sinksVal) && ctx.sinkKeys &&
-          isRange(cmp.getLhs(), ctx.keyAxis, BS, out)) {
-        tag = Tag::SinkLtS;
-        return true;
-      }
-      return false;
-    }
-    if (pred == mlir::arith::CmpIPredicate::sle) {
-      // key <= row
-      if (!isRow(cmp.getRhs(), ctx.rowAxis, out))
-        return false;
-      if (ctx.sinkKeys ? isRange(cmp.getLhs(), ctx.keyAxis, BS, out)
-                       : isLocalKey(cmp.getLhs(), ctx.keyAxis, ctx.keyBase, out)) {
-        tag = ctx.sinkKeys ? Tag::SinkLeRow : Tag::KeyLeRow;
-        return true;
-      }
-      return false;
-    }
-    if (pred == mlir::arith::CmpIPredicate::sge) {
-      if (ctx.sinkKeys)
-        return false;
-      if (!isLocalKey(cmp.getLhs(), ctx.keyAxis, ctx.keyBase, out))
-        return false;
-      if (isWindowLeft(cmp.getRhs())) {
-        tag = Tag::KeyGeWin;
-        return true;
-      }
-      SaScalar s = readScalar(cmp.getRhs());
-      if (s.valid && s.same(sinksVal)) {
-        tag = Tag::KeyGeS;
-        return true;
-      }
-      return false;
-    }
-    return false;
-  }
-
-  // `ctx` is taken BY VALUE: each subtree of the `andi` fan-in inherits the
-  // enclosing lift axis and may refine it without disturbing its siblings.
-  bool collectTags(mlir::Value v, Ctx ctx, llvm::SmallVectorImpl<Tag> &tags) {
-    int ax;
-    v = peelIdx(v, ax);
-    if (ax >= 0)
-      ctx.outerAxis = ax;
-    if (auto andOp = v.getDefiningOp<mlir::arith::AndIOp>()) {
-      mark(andOp);
-      return collectTags(andOp.getLhs(), ctx, tags) &&
-             collectTags(andOp.getRhs(), ctx, tags);
-    }
-    auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
-    if (!cmp)
-      return false;
-    Tag t;
-    if (!classifyCmp(cmp, ctx, t))
-      return false;
-    mark(cmp);
-    tags.push_back(t);
-    return true;
-  }
-
-  bool maskIs(mlir::Value v, const Ctx &ctx, llvm::ArrayRef<Tag> want) {
-    if (!v)
-      return false;
-    llvm::SmallVector<Tag, 6> got;
-    if (!collectTags(v, ctx, got))
-      return false;
-    llvm::SmallVector<int, 8> a, b;
-    for (auto t : got)
-      a.push_back((int)t);
-    for (auto t : want)
-      b.push_back((int)t);
-    llvm::sort(a);
-    llvm::sort(b);
-    a.erase(std::unique(a.begin(), a.end()), a.end());
-    b.erase(std::unique(b.begin(), b.end()), b.end());
-    return a == b;
-  }
-
-  // --- addressing.
-
-  // `base + major*stride + feat`, in the two spellings Triton emits, with the
-  // major index on `majorAxis` and the feature index on `featAxis`. Returns the
-  // stride scalar. The K loads use majorAxis 0 / featAxis 1 (the tile is
-  // [BD, keys], i.e. K^T built by strides instead of by `tt.trans`).
-  mlir::Value matchAddress(mlir::Value ptr, mlir::Value wantBase,
-                           llvm::function_ref<bool(mlir::Value, int)> isMajor,
-                           int majorAxis, int featAxis) {
-    ptr = peel(ptr);
-    auto ap = ptr.getDefiningOp<mlir::triton::AddPtrOp>();
-    if (!ap)
-      return {};
-    mlir::Value stride;
-    auto majorStride = [&](mlir::Value v) -> bool {
-      auto mul = peel(v).getDefiningOp<mlir::arith::MulIOp>();
-      if (!mul)
-        return false;
-      for (int j = 0; j < 2; ++j) {
-        mlir::Value s = peel(mul->getOperand(j));
-        auto sp = s.getDefiningOp<mlir::triton::SplatOp>();
-        if (!sp || !isKernelArg(sp.getSrc()))
-          continue;
-        if (!isMajor(mul->getOperand(1 - j), majorAxis))
-          continue;
-        mark(sp);
-        mark(mul);
-        stride = sp.getSrc();
-        return true;
-      }
-      return false;
-    };
-    mlir::Value inner = peel(ap.getPtr());
-    if (auto ap2 = inner.getDefiningOp<mlir::triton::AddPtrOp>()) {
-      // Two-level: addptr(broadcast(addptr(splat(base), X)), Y). Either level
-      // may carry the major*stride term (the K tile puts the feature offset on
-      // the inner level, everything else the other way round).
-      mlir::Value b = peel(ap2.getPtr());
-      auto sp = b.getDefiningOp<mlir::triton::SplatOp>();
-      if (!sp || sp.getSrc() != wantBase)
-        return {};
-      mark(sp);
-      bool ok = (majorStride(ap2.getOffset()) &&
-                 isRange(ap.getOffset(), featAxis, BD)) ||
-                (isRange(ap2.getOffset(), featAxis, BD) &&
-                 majorStride(ap.getOffset()));
-      if (!ok)
-        return {};
-      mark(ap);
-      mark(ap2);
-      return stride;
-    }
-    auto sp = inner.getDefiningOp<mlir::triton::SplatOp>();
-    if (!sp || sp.getSrc() != wantBase)
-      return {};
-    mark(sp);
-    auto add = peel(ap.getOffset()).getDefiningOp<mlir::arith::AddIOp>();
-    if (!add)
-      return {};
-    for (int i = 0; i < 2; ++i)
-      if (majorStride(add->getOperand(i)) &&
-          isRange(add->getOperand(1 - i), featAxis, BD)) {
-        mark(ap);
-        mark(add);
-        return stride;
-      }
-    return {};
-  }
-
-  // tt.reduce over axis 1 whose combine is exactly one maxnumf/maximumf or addf.
-  bool matchReduce(mlir::Value v, bool wantMax, mlir::Value &src) {
-    v = peel(v);
-    auto red = v.getDefiningOp<mlir::triton::ReduceOp>();
-    if (!red || red.getSrcs().size() != 1 || red.getAxis() != 1)
-      return false;
-    if (red->getNumRegions() == 0 || red->getRegion(0).empty())
-      return false;
-    mlir::Operation *combine = nullptr;
-    for (auto &nested : red->getRegion(0).front()) {
-      if (mlir::isa<mlir::triton::ReduceReturnOp>(nested))
-        continue;
-      if (combine)
-        return false;
-      combine = &nested;
-    }
-    if (!combine)
-      return false;
-    bool ok = wantMax ? mlir::isa<mlir::arith::MaxNumFOp, mlir::arith::MaximumFOp>(
-                            combine)
-                      : mlir::isa<mlir::arith::AddFOp>(combine);
-    if (!ok)
-      return false;
-    mark(red);
-    src = red.getSrcs().front();
-    return true;
-  }
-
-  // --- one online-softmax merge step.
-  struct Step {
-    bool isSink = false;
-    mlir::Value keyBase;                 // local steps only
-    mlir::Value accIn, sumIn, maxIn;     // carried inputs
-    mlir::Value maxOut;                  // this step's new running max
-    mlir::triton::LoadOp kLoad, vLoad;
-  };
-
-  // Verify the merge step that produced (accOut, sumOut) and fill `st`.
-  //
-  //   S      = dot(q, kload, 0) * splat(scale)
-  //   Sm     = select(valid, S, -inf)
-  //   m_new  = maxnumf(m_carried, reduce_max(Sm, 1))
-  //   alpha  = exp2(m_carried - m_new)
-  //   P      = exp2(Sm - lift(m_new))
-  //   sum'   = sum_carried * alpha + reduce_add(P, 1)
-  //   acc'   = dot(P, vload, acc_carried * lift(alpha))
-  bool matchStep(mlir::Value accOut, mlir::Value sumOut, mlir::Block *blk,
-                 Step &st) {
-    // sum' = addf(mulf(sum_carried, alpha), reduce_add(P))
-    auto addSum = peel(sumOut).getDefiningOp<mlir::arith::AddFOp>();
-    if (!addSum)
-      return no("running sum update is not mul+add");
-    mark(addSum);
-    mlir::Value alpha, sumR;
-    for (int i = 0; i < 2 && !alpha; ++i) {
-      auto mul = peel(addSum->getOperand(i)).getDefiningOp<mlir::arith::MulFOp>();
-      if (!mul)
-        continue;
-      mark(mul);
-      st.sumIn = mul->getOperand(0);
-      alpha = mul->getOperand(1);
-      sumR = addSum->getOperand(1 - i);
-    }
-    if (!alpha)
-      return no("running sum update does not rescale the carried sum");
-
-    // alpha = exp2(m_carried - m_new)
-    auto expA = peel(alpha).getDefiningOp<mlir::math::Exp2Op>();
-    if (!expA)
-      return no("rescale factor is not math.exp2");
-    mark(expA);
-    auto subA = peel(expA.getOperand()).getDefiningOp<mlir::arith::SubFOp>();
-    if (!subA)
-      return no("rescale factor is not exp2(m_old - m_new)");
-    mark(subA);
-    st.maxIn = subA.getLhs();
-    st.maxOut = subA.getRhs();
-    // m_new = maxnumf(m_carried, reduce_max(...))
-    auto maxOp = peel(st.maxOut).getDefiningOp();
-    if (!maxOp ||
-        !mlir::isa<mlir::arith::MaxNumFOp, mlir::arith::MaximumFOp>(maxOp))
-      return no("new running max is not a float max");
-    mark(maxOp);
-    mlir::Value rowMax;
-    if (sameCone(maxOp->getOperand(0), st.maxIn))
-      rowMax = maxOp->getOperand(1);
-    else if (sameCone(maxOp->getOperand(1), st.maxIn))
-      rowMax = maxOp->getOperand(0);
-    else
-      return no("new running max does not fold the carried max");
-    mlir::Value maxIn2;
-    if (!matchReduce(rowMax, /*wantMax=*/true, maxIn2))
-      return no("block max is not tt.reduce(max, axis=1)");
-
-    // Sm = select(valid, S*scale, -inf)
-    mlir::Value sm = peel(maxIn2);
-    auto sel = sm.getDefiningOp<mlir::arith::SelectOp>();
-    if (!sel)
-      return no("logits are not masked by a select");
-    if (!isNegInfF(sel.getFalseValue()))
-      return no("masked-out logits are not filled with -inf");
-    mark(sel);
-    mlir::Value maskVal = sel.getCondition();
-    mlir::Value scaled = peel(sel.getTrueValue());
-
-    auto mulS = scaled.getDefiningOp<mlir::arith::MulFOp>();
-    if (!mulS)
-      return no("logits are not a dot scaled by a splat");
-    mark(mulS);
-    mlir::Value dotV;
-    for (int i = 0; i < 2 && !dotV; ++i) {
-      mlir::Value s = peel(mulS->getOperand(i));
-      auto sp = s.getDefiningOp<mlir::triton::SplatOp>();
-      if (!sp)
-        continue;
-      mark(sp);
-      if (!isKernelArg(sp.getSrc()) || !sp.getSrc().getType().isF32())
-        return no("logit scale is not an f32 kernel argument");
-      if (scaleVal && scaleVal != sp.getSrc())
-        return no("two different logit scales in one kernel");
-      scaleVal = sp.getSrc();
-      dotV = mulS->getOperand(1 - i);
-    }
-    if (!dotV)
-      return no("logit scale is not a splat scalar");
-
-    auto dotA = peel(dotV).getDefiningOp<mlir::triton::DotOp>();
-    if (!dotA)
-      return no("scaled logits are not a tt.dot");
-    mark(dotA);
-    if (!isZeroF(dotA.getC()))
-      return no("QK dot does not accumulate from 0");
-    auto qLd = peel(dotA.getA()).getDefiningOp<mlir::triton::LoadOp>();
-    if (!qLd || qLd->getBlock() != entry)
-      return no("dot A operand is not a loop-invariant Q load");
-    if (qLoad && qLoad != qLd)
-      return no("steps read different Q tiles");
-    qLoad = qLd;
-    auto kLd = peel(dotA.getB()).getDefiningOp<mlir::triton::LoadOp>();
-    if (!kLd || kLd->getBlock() != blk)
-      return no("K is not loaded in this step's block");
-    mark(kLd);
-    st.kLoad = kLd;
-
-    auto sTy = mlir::dyn_cast<mlir::RankedTensorType>(dotA.getType());
-    if (!sTy || sTy.getRank() != 2 || sTy.getShape()[0] != BM)
-      return no("logit tile is not [BM, keys]");
-    int64_t width = sTy.getShape()[1];
-
-    // P = exp2(Sm - lift(m_new))
-    mlir::Value pV;
-    if (!matchReduce(sumR, /*wantMax=*/false, pV))
-      return no("softmax denominator is not tt.reduce(add, axis=1)");
-    auto expP = peel(pV).getDefiningOp<mlir::math::Exp2Op>();
-    if (!expP)
-      return no("softmax numerator is not math.exp2");
-    mark(expP);
-    auto subP = peel(expP.getOperand()).getDefiningOp<mlir::arith::SubFOp>();
-    if (!subP)
-      return no("softmax numerator is not exp2(S - m)");
-    mark(subP);
-    if (!sameCone(subP.getLhs(), sm))
-      return no("softmax numerator does not exponentiate the masked logits");
-    if (!sameCone(subP.getRhs(), st.maxOut))
-      return no("softmax numerator is not shifted by the new running max");
-
-    // acc' = dot(P, vload, acc_carried * lift(alpha))
-    auto dotB = peel(accOut).getDefiningOp<mlir::triton::DotOp>();
-    if (!dotB)
-      return no("accumulator update is not a tt.dot");
-    mark(dotB);
-    if (!sameCone(dotB.getA(), expP.getResult()))
-      return no("PV dot A operand is not the softmax numerator");
-    auto vLd = peel(dotB.getB()).getDefiningOp<mlir::triton::LoadOp>();
-    if (!vLd || vLd->getBlock() != blk)
-      return no("V is not loaded in this step's block");
-    mark(vLd);
-    st.vLoad = vLd;
-    auto mulAcc = peel(dotB.getC()).getDefiningOp<mlir::arith::MulFOp>();
-    if (!mulAcc)
-      return no("PV dot does not accumulate onto the rescaled accumulator");
-    mark(mulAcc);
-    bool okAcc = false;
-    for (int i = 0; i < 2 && !okAcc; ++i)
-      if (sameCone(mulAcc->getOperand(i), alpha)) {
-        st.accIn = mulAcc->getOperand(1 - i);
-        okAcc = true;
-      }
-    if (!okAcc)
-      return no("accumulator is not rescaled by exp2(m_old - m_new)");
-
-    // --- the masks. `width` decides which phase this step is; BS and BN are
-    // read off the first sink / first local step and pinned afterwards.
-    Ctx ctx;
-    ctx.sinkKeys = st.isSink;
-    ctx.keyBase = st.keyBase;
-    ctx.keyAxis = 0;
-    ctx.featAxis = 0;
-    if (st.isSink) {
-      if (BS && BS != width)
-        return no("two different sink block widths");
-      BS = width;
-      if (!maskIs(maskVal, ctx, {Tag::RowLtM, Tag::SinkLtS, Tag::SinkLeRow}))
-        return no("sink logit mask is not (row<M) & (s<S) & (s<=row)");
-    } else {
-      if (BN && BN != width)
-        return no("two different local block widths");
-      BN = width;
-      if (!maskIs(maskVal, ctx, {Tag::RowLtM, Tag::KeyLtM, Tag::KeyLeRow,
-                                 Tag::KeyGeWin, Tag::KeyGeS}))
-        return no("local logit mask is not the causal+window+sink-escape mask");
-    }
-
-    // --- K / V addressing and load masks. K's tile is [BD, keys] (transposed
-    // by strides), V's is [keys, BD].
-    auto isKey = [&](mlir::Value v, int axis) {
-      return st.isSink ? isRange(v, axis, BS) : isLocalKey(v, axis, st.keyBase);
-    };
-    mlir::Value sk = matchAddress(kLd.getPtr(), kPtr, isKey, /*majorAxis=*/0,
-                                  /*featAxis=*/1);
-    if (!sk)
-      return no("K address is not base + key*stride + d");
-    if (strideK && strideK != sk)
-      return no("two different K row strides");
-    strideK = sk;
-    mlir::Value sv = matchAddress(vLd.getPtr(), vPtr, isKey, /*majorAxis=*/1,
-                                  /*featAxis=*/0);
-    if (!sv)
-      return no("V address is not base + key*stride + d");
-    if (strideV && strideV != sv)
-      return no("two different V row strides");
-    strideV = sv;
-
-    // K tile is [BD, keys]: rows are features (lift axis 1), columns are keys
-    // (lift axis 0) — K^T built by strides, which is why there is no tt.trans.
-    Ctx kMaskCtx = ctx;
-    kMaskCtx.keyAxis = 0;
-    kMaskCtx.featAxis = 1;
-    if (!maskIs(kLd.getMask(), kMaskCtx,
-                st.isSink ? llvm::ArrayRef<Tag>{Tag::FeatLtD, Tag::SinkLtS}
-                          : llvm::ArrayRef<Tag>{Tag::FeatLtD, Tag::KeyLtM}))
-      return no("K load mask is not (d<d_head) & (key bound)");
-    // V tile is [keys, BD]: rows are keys, columns are features.
-    Ctx vMaskCtx = ctx;
-    vMaskCtx.keyAxis = 1;
-    vMaskCtx.featAxis = 0;
-    if (!maskIs(vLd.getMask(), vMaskCtx,
-                st.isSink ? llvm::ArrayRef<Tag>{Tag::FeatLtD, Tag::SinkLtS}
-                          : llvm::ArrayRef<Tag>{Tag::FeatLtD, Tag::KeyLtM}))
-      return no("V load mask is not (key bound) & (d<d_head)");
-    if (kLd.getOther() && !isZeroF(kLd.getOther()))
-      return no("K load `other` is not 0");
-    if (vLd.getOther() && !isZeroF(vLd.getOther()))
-      return no("V load `other` is not 0");
-    return true;
-  }
-
-  bool verify();
-};
-
-// The K/V mask classification above swaps the key/feature axes per tile; the
-// `Ctx` copies make that explicit rather than mutating one shared context.
-bool SinkTemplate::verify() {
-  entry = &funcOp.getBody().front();
-
-  // --- exactly one store, one Q load feeding the dots, no head grid.
-  int nStore = 0;
-  funcOp.walk([&](mlir::triton::StoreOp s) {
-    store = s;
-    ++nStore;
-  });
-  if (nStore != 1)
-    return no("kernel does not have exactly one tt.store");
-  bool higherGrid = false;
-  funcOp.walk([&](mlir::triton::GetProgramIdOp p) {
-    if (p.getAxisAsInt() != 0)
-      higherGrid = true;
-  });
-  if (higherGrid)
-    return no("kernel reads grid dim y/z");
-  bool sideEffecting = false;
-  funcOp.walk([&](mlir::Operation *op) {
-    if (mlir::isa<mlir::triton::AtomicRMWOp, mlir::triton::AtomicCASOp>(op))
-      sideEffecting = true;
-  });
-  if (sideEffecting)
-    return no("kernel contains atomics");
-
-  // --- tile shape from the store: [BM, BD].
-  auto stTy = mlir::dyn_cast<mlir::RankedTensorType>(store.getValue().getType());
-  if (!stTy || stTy.getRank() != 2 || !stTy.getElementType().isF32())
-    return no("store value is not a rank-2 f32 tile");
-  BM = stTy.getShape()[0];
-  BD = stTy.getShape()[1];
-  if (BM > 32 || BM % 8 || BD % 8)
-    return no("tile shape outside the envelope (bm <= 32, bm/bd multiples of 8)");
-  // Threadgroup budget: qbuf + obuf + rmax + rsum floats must fit 32 KiB.
-  if (2 * BM * BD + 2 * BM > 8192)
-    return no("threadgroup working set exceeds 32 KiB");
-
-  // --- bootstrap M and d_head off the store mask, which is
-  // `(row < M) & (d < d_head)` and needs no prior knowledge to take apart.
-  if (!store.getMask())
-    return no("store is unmasked");
-  {
-    // Mirrors collectTags' peel, but cannot use it: the tags it produces are
-    // defined in terms of mVal/dHeadVal, which is what this loop discovers.
-    llvm::SmallVector<std::pair<mlir::Value, int>, 4> work{
-        {store.getMask(), -1}};
-    while (!work.empty()) {
-      auto [raw, inherited] = work.pop_back_val();
-      int ax;
-      mlir::Value v = peelIdx(raw, ax);
-      int outer = ax >= 0 ? ax : inherited;
-      if (auto andOp = v.getDefiningOp<mlir::arith::AndIOp>()) {
-        work.push_back({andOp.getLhs(), outer});
-        work.push_back({andOp.getRhs(), outer});
-        continue;
-      }
-      auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
-      if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
-        continue;
-      SaScalar bound = readScalar(cmp.getRhs());
-      if (!bound.valid)
-        continue;
-      if (isRange(cmp.getLhs(), 0, BD, outer))
-        dHeadVal = bound;
-      else if (isRow(cmp.getLhs(), 1, outer))
-        mVal = bound;
-    }
-  }
-  if (!mVal.valid || mVal.isConst)
-    return no("query row count is not a kernel argument");
-  if (!dHeadVal.valid || dHeadVal.isConst)
-    return no("feature width is not a kernel argument");
-
-  // --- the pointers, all of which must be kernel arguments: the emitter's
-  // buffer lookup cannot report a miss and would otherwise resolve a computed
-  // value to buffer 0. See metal-sliding-window-attention-plan.md §1b.
-  oPtr = unwrapPtrToKernelArg(store.getPtr());
-  if (!isKernelArg(oPtr))
-    return no("output pointer is not a kernel argument");
-  llvm::SmallVector<mlir::triton::LoadOp, 8> loads;
-  funcOp.walk([&](mlir::triton::LoadOp l) { loads.push_back(l); });
-  for (auto l : loads) {
-    mlir::Value p = unwrapPtrToKernelArg(l.getPtr());
-    if (!isKernelArg(p))
-      return no("a load's base pointer is not a kernel argument");
-  }
-  // Q is the load whose result feeds a dot A operand; K/V are resolved per step.
-  for (auto l : loads) {
-    for (auto *u : l.getResult().getUsers()) {
-      mlir::Operation *cur = u;
-      while (cur && mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(cur)) {
-        if (!cur->getResult(0).hasOneUse())
-          break;
-        cur = *cur->getResult(0).getUsers().begin();
-      }
-      auto dot = mlir::dyn_cast_or_null<mlir::triton::DotOp>(cur);
-      if (dot && peel(dot.getA()) == l.getResult())
-        qPtr = unwrapPtrToKernelArg(l.getPtr());
-    }
-  }
-  if (!isKernelArg(qPtr))
-    return no("Q pointer is not a kernel argument");
-  // The remaining two distinct load bases are K and V; they are pinned by the
-  // per-step address match, so seed them from the tile ranks: K's tile is
-  // [BD, keys], V's is [keys, BD].
-  for (auto l : loads) {
-    auto tt = mlir::dyn_cast<mlir::RankedTensorType>(l.getResult().getType());
-    if (!tt || tt.getRank() != 2)
-      continue;
-    mlir::Value p = unwrapPtrToKernelArg(l.getPtr());
-    if (p == qPtr)
-      continue;
-    if (tt.getShape()[0] == BD && tt.getShape()[1] != BD)
-      kPtr = p;
-    else if (tt.getShape()[1] == BD && tt.getShape()[0] != BD)
-      vPtr = p;
-  }
-  if (!isKernelArg(kPtr) || !isKernelArg(vPtr))
-    return no("cannot tell the K and V pointers apart");
-  if (kPtr == vPtr)
-    return no("K and V resolve to the same kernel argument");
-
-  // --- num_sinks / window, read off the local-window origin
-  // `local_start = maxsi(pid*BM - window + 1, num_sinks)`. Everything else that
-  // mentions them is then checked against these two.
-  mlir::Value lsCand;
-  funcOp.walk([&](mlir::arith::MaxSIOp mx) {
-    for (int i = 0; i < 2; ++i) {
-      auto add = mx->getOperand(i).getDefiningOp<mlir::arith::AddIOp>();
-      if (!add)
-        continue;
-      for (int j = 0; j < 2; ++j) {
-        if (!isIntConst(add->getOperand(j), 1))
-          continue;
-        auto sub = add->getOperand(1 - j).getDefiningOp<mlir::arith::SubIOp>();
-        if (!sub || !isStartM(sub.getLhs()))
-          continue;
-        SaScalar w = readScalar(sub.getRhs());
-        SaScalar s = readScalar(mx->getOperand(1 - i));
-        if (!w.valid || !s.valid)
-          continue;
-        lsCand = mx.getResult();
-        windowVal = w;
-        sinksVal = s;
-        mark(mx);
-        mark(add);
-        mark(sub);
-      }
-    }
-  });
-  if (!lsCand) {
-    // Folded `window_size == 1`: `pid*bm - 1 + 1` is gone, leaving a bare
-    // `max(pid*bm, num_sinks)`. Same shape, one fewer op.
-    funcOp.walk([&](mlir::arith::MaxSIOp mx) {
-      for (int i = 0; i < 2; ++i) {
-        if (!isStartM(mx->getOperand(i)))
-          continue;
-        SaScalar s = readScalar(mx->getOperand(1 - i));
-        if (!s.valid)
-          continue;
-        lsCand = mx.getResult();
-        sinksVal = s;
-        windowVal = SaScalar{};
-        windowVal.cst = 1;
-        windowVal.isConst = windowVal.valid = true;
-        mark(mx);
-      }
-    });
-  }
-  if (!lsCand)
-    return no("cannot find local_start = max(pid*bm - window + 1, num_sinks)");
-  localStart = lsCand;
-  if (windowVal.isConst && windowVal.cst < 0)
-    return no("window width is a negative constant");
-  if (sinksVal.isConst && sinksVal.cst < 0)
-    return no("sink count is a negative constant");
-
-  // --- epilogue: store(acc / lift(sum)).
-  auto divE = peel(store.getValue()).getDefiningOp<mlir::arith::DivFOp>();
-  if (!divE)
-    return no("epilogue is not accumulator / running sum");
-  mark(divE);
-  mark(store);
-  mlir::Value accCur = divE.getLhs(), sumCur = divE.getRhs(), maxCur;
-
-  // --- walk the chain of merge steps backwards to the inits.
-  llvm::SmallVector<Step, 4> steps;
-  while (true) {
-    if (isZeroF(accCur))
-      break;
-    if (steps.size() > 64)
-      return no("merge chain is unreasonably long");
-    Step st;
-    mlir::Value nextAcc, nextSum, nextMax;
-    if (auto forOp = mlir::dyn_cast_or_null<mlir::scf::ForOp>(
-            peel(accCur).getDefiningOp())) {
-      // A loop step: NLB iterations of the local phase.
-      if (!isIntConst(forOp.getLowerBound(), 0) ||
-          !isIntConst(forOp.getStep(), 1))
-        return no("local loop is not `for b in range(0, NLB)`");
-      auto ubC = forOp.getUpperBound().getDefiningOp<mlir::arith::ConstantOp>();
-      auto ubA = ubC ? mlir::dyn_cast<mlir::IntegerAttr>(ubC.getValue())
-                     : mlir::IntegerAttr();
-      if (!ubA || ubA.getInt() < 1)
-        return no("local loop trip count is not a positive constant");
-      if (forOp.getNumRegionIterArgs() != 3)
-        return no("local loop does not carry exactly 3 values");
-      if (NLB)
-        return no("more than one local loop");
-      NLB = ubA.getInt();
-      loops.push_back(forOp);
-      mark(forOp);
-      auto yield =
-          mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
-      mark(yield);
-      int accIdx = -1, sumIdx = -1;
-      for (unsigned i = 0; i < 3; ++i) {
-        if (forOp.getResult(i) == peel(accCur))
-          accIdx = (int)i;
-        if (forOp.getResult(i) == peel(sumCur))
-          sumIdx = (int)i;
-      }
-      if (accIdx < 0 || sumIdx < 0 || accIdx == sumIdx)
-        return no("epilogue does not read the loop's accumulator and sum");
-      // The key base is `local_start + iv*BN`, built inside the body.
-      mlir::Value keyBase;
-      for (mlir::Operation &op : *forOp.getBody()) {
-        auto add = mlir::dyn_cast<mlir::arith::AddIOp>(&op);
-        if (!add)
-          continue;
-        for (int i = 0; i < 2; ++i) {
-          if (add->getOperand(i) != localStart)
-            continue;
-          auto mul = add->getOperand(1 - i).getDefiningOp<mlir::arith::MulIOp>();
-          if (!mul)
-            continue;
-          for (int j = 0; j < 2; ++j)
-            if (mul->getOperand(j) == forOp.getInductionVar()) {
-              keyBase = add.getResult();
-              st.keyBase = keyBase;
-              mark(add);
-              mark(mul);
-              // The block stride must be the local tile width, which the step
-              // match pins into BN; check it after.
-            }
-        }
-      }
-      if (!keyBase)
-        return no("loop key base is not local_start + iv*BLOCK_N");
-      st.isSink = false;
-      if (!matchStep(yield.getOperand(accIdx), yield.getOperand(sumIdx),
-                     forOp.getBody(), st))
-        return false;
-      // Now BN is known: re-check the induction-variable stride.
-      {
-        auto add = mlir::cast<mlir::arith::AddIOp>(keyBase.getDefiningOp());
-        bool okStride = false;
-        for (int i = 0; i < 2; ++i) {
-          auto mul = add->getOperand(i).getDefiningOp<mlir::arith::MulIOp>();
-          if (!mul)
-            continue;
-          for (int j = 0; j < 2; ++j)
-            if (mul->getOperand(j) == forOp.getInductionVar() &&
-                isIntConst(mul->getOperand(1 - j), BN))
-              okStride = true;
-        }
-        if (!okStride)
-          return no("loop key stride is not BLOCK_N");
-      }
-      // The carried values the step consumed must be this loop's iter args.
-      int maxIdx = 3 - accIdx - sumIdx;
-      if (!sameCone(st.accIn, forOp.getRegionIterArg(accIdx)) ||
-          !sameCone(st.sumIn, forOp.getRegionIterArg(sumIdx)) ||
-          !sameCone(st.maxIn, forOp.getRegionIterArg(maxIdx)))
-        return no("loop step does not carry the loop's own iter_args");
-      if (!sameCone(yield.getOperand(maxIdx), st.maxOut))
-        return no("loop does not yield the new running max");
-      nextAcc = forOp.getInitArgs()[accIdx];
-      nextSum = forOp.getInitArgs()[sumIdx];
-      nextMax = forOp.getInitArgs()[maxIdx];
-    } else {
-      // A straight-line step in the entry block: the sink phase, or an
-      // unrolled local block.
-      mlir::Operation *accDef = peel(accCur).getDefiningOp();
-      if (!accDef || accDef->getBlock() != entry)
-        return no("merge step is neither a loop nor a straight-line entry-block step");
-      // Which phase a straight-line step belongs to is not known until it has
-      // been matched (the sink phase is simply whichever one is left when the
-      // chain reaches the inits), so try one and roll back on failure. The
-      // rollback must restore EVERY field the attempt can write — a probe that
-      // pinned BLOCK_S to the local width and then failed used to poison the
-      // next step's width check instead of retrying cleanly.
-      auto snapshot = [&] {
-        return std::make_tuple(BS, BN, strideK, strideV, scaleVal, qLoad,
-                               claimed, why);
-      };
-      auto restore = [&](decltype(snapshot()) s) {
-        std::tie(BS, BN, strideK, strideV, scaleVal, qLoad, claimed, why) = s;
-      };
-      auto saved = snapshot();
-      // A local step's key base is `local_start` (+ a constant block offset);
-      // the sink phase has no base at all.
-      st.isSink = false;
-      st.keyBase = localStart;
-      if (!matchStep(accCur, sumCur, entry, st)) {
-        restore(saved);
-        st = Step();
-        st.isSink = true;
-        if (!matchStep(accCur, sumCur, entry, st))
-          return false;
-      }
-      nextAcc = st.accIn;
-      nextSum = st.sumIn;
-      nextMax = st.maxIn;
-    }
-    if (maxCur && !sameCone(maxCur, st.maxOut))
-      return no("a step's carried max is not the previous step's new max");
-    steps.push_back(st);
-    accCur = nextAcc;
-    sumCur = nextSum;
-    maxCur = nextMax;
-  }
-  if (steps.empty())
-    return no("no merge steps found");
-  std::reverse(steps.begin(), steps.end());
-  if (!steps.front().isSink)
-    return no("the chain does not start with the sink phase");
-  for (size_t i = 1; i < steps.size(); ++i)
-    if (steps[i].isSink)
-      return no("more than one sink phase");
-  if (steps.size() < 2)
-    return no("the chain has no local-window phase");
-  if (!NLB)
-    NLB = (int64_t)steps.size() - 1; // fully unrolled
-  else if (steps.size() != 2)
-    return no("a local loop and extra unrolled local steps in one kernel");
-
-  // --- the inits: acc 0, sum where(row<M, 0, 1), max where(row<M, -inf, 0).
-  if (!isZeroF(accCur))
-    return no("accumulator does not start at 0");
-  auto initSel = [&](mlir::Value v, bool wantNegInf) -> bool {
-    auto sel = peel(v).getDefiningOp<mlir::arith::SelectOp>();
-    if (!sel)
-      return false;
-    mark(sel);
-    llvm::SmallVector<Tag, 2> tags;
-    Ctx ctx;
-    ctx.rowAxis = -1;
-    if (!collectTags(sel.getCondition(), ctx, tags) || tags.size() != 1 ||
-        tags[0] != Tag::RowLtM)
-      return false;
-    if (wantNegInf)
-      return isNegInfF(sel.getTrueValue()) && isZeroF(sel.getFalseValue());
-    return isZeroF(sel.getTrueValue()) && isOneF(sel.getFalseValue());
-  };
-  if (!initSel(sumCur, /*wantNegInf=*/false))
-    return no("running sum does not start at where(row < M, 0, 1)");
-  if (!maxCur || !initSel(maxCur, /*wantNegInf=*/true))
-    return no("running max does not start at where(row < M, -inf, 0)");
-
-  // --- Q load + store addressing.
-  strideQ = matchAddress(
-      qLoad.getPtr(), qPtr,
-      [&](mlir::Value v, int axis) { return isRow(v, axis); },
-      /*majorAxis=*/1, /*featAxis=*/0);
-  if (!strideQ)
-    return no("Q address is not base + row*stride + d");
-  mark(qLoad);
-  Ctx qCtx;
-  qCtx.featAxis = 0;
-  if (!maskIs(qLoad.getMask(), qCtx, {Tag::RowLtM, Tag::FeatLtD}))
-    return no("Q load mask is not (row < M) & (d < d_head)");
-  if (qLoad.getOther() && !isZeroF(qLoad.getOther()))
-    return no("Q load `other` is not 0");
-  strideO = matchAddress(
-      store.getPtr(), oPtr,
-      [&](mlir::Value v, int axis) { return isRow(v, axis); },
-      /*majorAxis=*/1, /*featAxis=*/0);
-  if (!strideO)
-    return no("store address is not base + row*stride + d");
-  if (!maskIs(store.getMask(), qCtx, {Tag::RowLtM, Tag::FeatLtD}))
-    return no("store mask is not (row < M) & (d < d_head)");
-
-  // --- COVERAGE. Everything that contributes to the stored value must have
-  // been claimed by a role. The gate runs over the backward slice of the store
-  // (which reaches the whole prologue through the loop's init operands) plus
-  // every loop body. Pure plumbing is exempt: it cannot change the result
-  // without a computational consumer, and every computational consumer in the
-  // slice has to be claimed anyway.
-  auto inert = [](mlir::Operation *op) {
-    return mlir::isa<mlir::arith::ConstantOp, mlir::triton::MakeRangeOp,
-                     mlir::triton::SplatOp, mlir::triton::ExpandDimsOp,
-                     mlir::triton::BroadcastOp, mlir::triton::GetProgramIdOp,
-                     mlir::triton::gpu::ConvertLayoutOp>(op);
-  };
-  llvm::SmallVector<mlir::Value, 32> work{store.getValue(), store.getPtr(),
-                                          store.getMask()};
-  llvm::DenseSet<mlir::Operation *> seen;
-  while (!work.empty()) {
-    mlir::Value v = work.pop_back_val();
-    mlir::Operation *def = v.getDefiningOp();
-    if (!def || !seen.insert(def).second)
-      continue;
-    if (!inert(def) && !claimed.count(def)) {
-      offender = def;
-      return no("unclaimed op in the backward slice of the store");
-    }
-    for (mlir::Value o : def->getOperands())
-      work.push_back(o);
-  }
-  for (auto forOp : loops)
-    for (mlir::Operation &op : *forOp.getBody())
-      if (!inert(&op) && !claimed.count(&op)) {
-        offender = &op;
-        return no("unclaimed op in the local loop body");
-      }
-  return true;
-}
-
-} // namespace
-
-static mlir::LogicalResult trySinkAttention(mlir::triton::FuncOp funcOp) {
-  if (funcOp.getBody().empty() || !funcOp.getBody().hasOneBlock())
-    return mlir::failure();
-  SinkTemplate tmpl;
-  tmpl.funcOp = funcOp;
-  if (!tmpl.verify()) {
-    // Opt-in: a kernel that is not sink attention at all should stay silent.
-    if (::getenv("TRITON_METAL_SINK_DEBUG")) {
-      llvm::errs() << "[metal-sink] rejected: "
-                   << (tmpl.why ? tmpl.why : "<no reason>") << "\n";
-      if (tmpl.offender)
-        llvm::errs() << "[metal-sink]   offending op: " << *tmpl.offender << "\n";
-    }
-    return mlir::failure();
-  }
-
-  mlir::OpBuilder builder(tmpl.store);
-  auto loc = tmpl.store.getLoc();
-  auto f32 = builder.getF32Type();
-  auto ui32 = wrapperElementType(tmpl.mVal.arg.getType());
-  auto buf = [&](mlir::Value v, mlir::Type t) {
-    return bridgePtrToMemref(builder, loc, v, t);
-  };
-  mlir::Value sinksBuf =
-      tmpl.sinksVal.isConst ? mlir::Value() : buf(tmpl.sinksVal.arg, ui32);
-  mlir::Value windowBuf =
-      tmpl.windowVal.isConst ? mlir::Value() : buf(tmpl.windowVal.arg, ui32);
-  auto op = mlir::triton::metal::SinkAttentionOp::create(
-      builder, loc, buf(tmpl.qPtr, f32), buf(tmpl.kPtr, f32),
-      buf(tmpl.vPtr, f32), buf(tmpl.oPtr, f32), buf(tmpl.mVal.arg, ui32),
-      buf(tmpl.dHeadVal.arg, ui32), buf(tmpl.scaleVal, f32),
-      buf(tmpl.strideQ, ui32), buf(tmpl.strideK, ui32), buf(tmpl.strideV, ui32),
-      buf(tmpl.strideO, ui32), sinksBuf, windowBuf, tmpl.BM, tmpl.BD, tmpl.BS,
-      tmpl.NLB * tmpl.BN, /*sinks_const=*/mlir::IntegerAttr(),
-      /*window_const=*/mlir::IntegerAttr());
-  if (tmpl.sinksVal.isConst)
-    op.setSinksConst(tmpl.sinksVal.cst);
-  if (tmpl.windowVal.isConst)
-    op.setWindowConst(tmpl.windowVal.cst);
-
-  // DCE the now-dead loop / prologue / epilogue: with the store gone, the whole
-  // entry block except the new op + terminator is dead. Bottom-up to fixpoint.
-  tmpl.store.erase();
-  mlir::Block *blk = op->getBlock();
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (mlir::Operation &o : llvm::make_early_inc_range(llvm::reverse(*blk))) {
-      if (&o == op.getOperation() || o.hasTrait<mlir::OpTrait::IsTerminator>())
-        continue;
-      if (o.use_empty()) {
-        o.erase();
-        changed = true;
-      }
-    }
-  }
-  return mlir::success();
-}
-
-static void runSinkAttentionMatcher(mlir::ModuleOp moduleOp) {
-  llvm::SmallVector<mlir::triton::FuncOp> funcs;
-  moduleOp.walk([&](mlir::triton::FuncOp f) { funcs.push_back(f); });
-  for (auto f : funcs)
-    (void)trySinkAttention(f);
-}
-
 // `tl.assume(cond)` lowers to `llvm.intr.assume` (python/src/ir.cc
 // `create_assume`), a result-less optimizer hint carrying a range/sign fact
 // (e.g. `tl.assume(pid >= 0)`). It has no runtime meaning and MSL has nothing
@@ -13585,8 +12234,8 @@ static void flattenUniformScanInputScfIf(mlir::ModuleOp moduleOp) {
 //   acc'   = dot(W, Vload, acc)
 //   out    = acc                         (norm = none)
 //
-// The predecessor matchers pinned one spelling of `f` each — plain softmax
-// causal+sinks+window (`trySinkAttention`) — and a
+// The predecessor matchers (`metal.flash_attention`, `metal.sink_attention`,
+// both now deleted) pinned one spelling of `f` each, and a
 // kernel whose `f` differed by so much as a band mask was either rejected or,
 // before the role-walk rewrite, silently miscompiled. Here `f` is not matched
 // at all: every op between the two dots is TRANSLATED into the op's score
@@ -13627,7 +12276,14 @@ struct FusedAttnTemplate {
   mlir::Value headColScalar;
   bool softmax = false;
   bool naturalExp = false; // base-e rather than base-2 online softmax
+  bool sawExp = false;     // has any phase pinned the exponential base yet
   mlir::Value hVal;        // head count, null when there is no head split
+  // The current phase's key offset: `local_start` in
+  // `offs_n = local_start + block_idx*BLOCK_N + arange(BLOCK_N)`. Null means 0.
+  mlir::Value keyBase;
+  // `tt.get_program_id` axis 0, wherever a key-bound expression reads it. Bound
+  // to the key-bounds region's `blk` argument.
+  llvm::SmallVector<mlir::Value> pidVals;
 
   // Predicates the source applies to ZERO the softmax numerator — the
   // `where(mask, exp(L - m), 0.0)` chain a masked kernel writes. They are
@@ -13668,6 +12324,99 @@ struct FusedAttnTemplate {
       break;
     }
     return v;
+  }
+
+  // Peel, remembering the `tt.expand_dims` axis. In a rank-2 tile the axis an
+  // index was expanded ON is the axis it is CONSTANT along, so axis 0 means the
+  // index runs across dim 1 and axis 1 means it runs down dim 0. That is the
+  // only reliable way to tell a score cone's indices apart: lengths collide
+  // (BLOCK_S == BLOCK_N == BLOCK_D == 16 in the attention-sinks kernel), and
+  // Triton CSEs two aranges of equal length into one value.
+  mlir::Value peelAxis(mlir::Value v, int &axis) {
+    axis = -1;
+    while (auto *def = v.getDefiningOp()) {
+      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+        mark(def);
+        axis = (int)ed.getAxis();
+        v = def->getOperand(0);
+        continue;
+      }
+      if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::BroadcastOp>(
+              def)) {
+        mark(def);
+        v = def->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return v;
+  }
+
+  // Structural equality over cones. Triton materializes one copy of an
+  // expression PER LAYOUT -- `offs_d` shows up as half a dozen distinct
+  // `%offs_d_NN` values with no `convert_layout` between them, and so does the
+  // running max a straight-line phase carries -- so two uses of the SAME source
+  // value are different SSA values that `peel` cannot reconcile. Comparing by
+  // identity silently fails on every such pair, and WHICH pairs collide depends
+  // on the head width: at d=16 the layouts coincide and identity happens to
+  // work, at d=32 and d=64 they do not.
+  //
+  // Structural equality is sound here because these cones are pure: two ops
+  // with the same name, attributes and operand cones compute the same value.
+  //
+  // A SUCCESSFUL match also CLAIMS both cones. Triton keeps both copies alive
+  // -- the accumulator rescale reads one layout of `exp2(m_old - m_new)` and
+  // the running-sum rescale reads the other -- so the walk only ever visits one
+  // of them, and the copy it did not visit would fail the coverage gate. A
+  // structural match means "this computes what I already claimed", which is
+  // exactly the condition under which claiming it is correct.
+  bool sameCone(mlir::Value a, mlir::Value b, int depth = 0) {
+    if (depth > 24)
+      return false;
+    a = peel(a);
+    b = peel(b);
+    if (a == b) {
+      mark(a.getDefiningOp());
+      return true;
+    }
+    auto *da = a.getDefiningOp();
+    auto *db = b.getDefiningOp();
+    if (!da || !db || da->getName() != db->getName() ||
+        da->getNumOperands() != db->getNumOperands())
+      return false;
+    // An op with a region (`tt.reduce`) carries semantics this walk does not
+    // compare, so two of them are only ever equal by identity.
+    if (da->getNumRegions() || db->getNumRegions())
+      return false;
+    // A tensor constant's value attribute is TYPED, and the type carries the
+    // layout -- so `dense<0xFF800000> : tensor<32xf32, #blocked>` and the same
+    // constant under `#blocked1` compare unequal as attributes even though they
+    // are the same number. Compare the splat value instead.
+    if (auto ca = mlir::dyn_cast<mlir::arith::ConstantOp>(da)) {
+      auto cb = mlir::cast<mlir::arith::ConstantOp>(db);
+      mlir::Attribute x = ca.getValue(), y = cb.getValue();
+      auto dx = mlir::dyn_cast<mlir::DenseElementsAttr>(x);
+      auto dy = mlir::dyn_cast<mlir::DenseElementsAttr>(y);
+      bool eq = (dx && dy) ? (dx.isSplat() && dy.isSplat() &&
+                              dx.getSplatValue<mlir::Attribute>() ==
+                                  dy.getSplatValue<mlir::Attribute>())
+                           : x == y;
+      if (eq) {
+        mark(da);
+        mark(db);
+      }
+      return eq;
+    }
+    // Everything else: attributes carry the parts with no operands to recurse
+    // on -- a make_range's bounds, a program id's axis, a cmpi's predicate.
+    if (da->getAttrDictionary() != db->getAttrDictionary())
+      return false;
+    for (unsigned i = 0, e = da->getNumOperands(); i < e; ++i)
+      if (!sameCone(da->getOperand(i), db->getOperand(i), depth + 1))
+        return false;
+    mark(da);
+    mark(db);
+    return true;
   }
 
   mlir::Value splatSrc(mlir::Value v) {
@@ -13714,6 +12463,43 @@ struct FusedAttnTemplate {
   }
   bool isFpSplatConst(mlir::Value v) {
     return matchFpSplat(v, [](const llvm::APFloat &) { return true; });
+  }
+  // The online softmax's rescale factor is an exponential; the accumulator it
+  // multiplies is not. That is the reliable way to tell the two operands of
+  // `acc * scaler` apart -- POSITION is not, because Triton emits the same
+  // source line as `acc * alpha` in a loop and `alpha * acc` in a straight-line
+  // prologue, and a straight-line phase has no iter_arg to compare against.
+  static bool isExpLike(mlir::Value v) {
+    return v.getDefiningOp<mlir::math::ExpOp>() ||
+           v.getDefiningOp<mlir::math::Exp2Op>();
+  }
+
+  // A running-state init, possibly behind a row-bounds select. An
+  // attention-sinks kernel starts from `where(row < m, -inf, 0)` and
+  // `where(row < m, 0, 1)` rather than plain splats: the second arm gives an
+  // out-of-range row a denominator of 1 so its `acc / l` is 0 instead of NaN.
+  // Those rows are never stored, so only the in-range arm carries meaning --
+  // which is why the identity is required on the TRUE side of a `row < m`
+  // test specifically, and not merely on one side or the other.
+  bool isMaskedInit(mlir::Value v, bool negInf) {
+    if (!v)
+      return false;
+    v = peel(v);
+    auto want = [&](mlir::Value x) {
+      return negInf ? isNegInfSplat(x) : isZeroSplat(x);
+    };
+    if (auto sel = v.getDefiningOp<mlir::arith::SelectOp>()) {
+      if (!want(sel.getTrueValue()))
+        return false;
+      auto cmp = peel(sel.getCondition()).getDefiningOp<mlir::arith::CmpIOp>();
+      if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt ||
+          classifyIdx(cmp.getLhs()) != Idx::Row)
+        return false;
+      mark(sel);
+      mark(cmp);
+      return true;
+    }
+    return want(v);
   }
 
   // Peel `select(pred, X, 0.0)` off the softmax numerator, recording each
@@ -13822,24 +12608,54 @@ struct FusedAttnTemplate {
     mlir::Value baseScalar = splatSrc(baseSide);
     if (!baseScalar)
       return Idx::None;
-    if (forOp && baseScalar == forOp.getInductionVar() && len == BN) {
-      mark(add);
-      mark(mr);
-      return Idx::Key;
+    // Key index: `base + iv + arange(BN)`, or -- when the loop counts BLOCKS
+    // rather than keys -- `base + iv*BN + arange(BN)`. `base` is loop-invariant
+    // and is this phase's key START: a sinks kernel writes
+    // `local_start + block_idx*BLOCK_N + offs_bn`, while a plain key loop has
+    // no base at all.
+    if (forOp && len == BN) {
+      llvm::SmallVector<mlir::Value, 4> terms{baseScalar}, rest;
+      llvm::SmallVector<mlir::Operation *, 4> pending;
+      bool sawIv = false;
+      while (!terms.empty()) {
+        mlir::Value x = terms.pop_back_val();
+        if (x == forOp.getInductionVar()) {
+          sawIv = true;
+          continue;
+        }
+        if (auto mul = x.getDefiningOp<mlir::arith::MulIOp>()) {
+          bool hit = false;
+          for (int i = 0; i < 2 && !hit; ++i)
+            if (mul->getOperand(i) == forOp.getInductionVar() &&
+                isIntConst(mul->getOperand(1 - i), BN)) {
+              sawIv = true;
+              pending.push_back(mul);
+              hit = true;
+            }
+          if (hit)
+            continue;
+        }
+        if (auto ad = x.getDefiningOp<mlir::arith::AddIOp>()) {
+          pending.push_back(ad);
+          terms.push_back(ad.getLhs());
+          terms.push_back(ad.getRhs());
+          continue;
+        }
+        rest.push_back(x);
+      }
+      // More than one leftover term would have to be re-summed to recover the
+      // start; decline loudly rather than guess at the arithmetic.
+      if (sawIv && rest.size() <= 1) {
+        mark(add);
+        mark(mr);
+        for (mlir::Operation *o : pending)
+          mark(o);
+        if (!rest.empty())
+          keyBase = rest.front();
+        return Idx::Key;
+      }
     }
     if (auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>()) {
-      // `for step in range(cdiv(N, BN))` counts BLOCKS, so the key base is
-      // `step*BN` rather than the induction variable itself. Same key set as
-      // `range(0, N, BN)`; only the loop's unit differs.
-      if (forOp && len == BN)
-        for (int i = 0; i < 2; ++i)
-          if (mul->getOperand(i) == forOp.getInductionVar() &&
-              isIntConst(mul->getOperand(1 - i), BN)) {
-            mark(add);
-            mark(mr);
-            mark(mul);
-            return Idx::Key;
-          }
       for (int i = 0; i < 2; ++i) {
         auto pid =
             mul->getOperand(i).getDefiningOp<mlir::triton::GetProgramIdOp>();
@@ -13864,6 +12680,16 @@ struct FusedAttnTemplate {
           return Idx::Feat;
         }
       }
+    }
+    // With no loop, a key index is `base + arange(BN)`: `N_LOCAL_BLOCKS == 1`
+    // deletes the scf.for outright and folds `block_idx*BLOCK_N` to zero, so
+    // the sliding window's offset is all that is left. Checked AFTER the
+    // program-id cases so a row index is never mistaken for one.
+    if (!forOp && len == BN) {
+      mark(add);
+      mark(mr);
+      keyBase = baseScalar;
+      return Idx::Key;
     }
     return Idx::None;
   }
@@ -13899,10 +12725,23 @@ struct FusedAttnTemplate {
       mark(def);
       return true;
     }
+    // The block index is a LEAF, bound to the key-bounds region's `blk`
+    // argument: a sliding window starts at `max(pid*bm - window + 1, sinks)`,
+    // which is arithmetic over it. A score cone that reads it would instead
+    // fail later with an unbound leaf, since that region has no `blk` arg.
+    if (auto pid = mlir::dyn_cast<mlir::triton::GetProgramIdOp>(def)) {
+      if (pid.getAxisAsInt() != 0)
+        return no("scalar cone reads a program id other than axis 0");
+      mark(def);
+      if (!llvm::is_contained(pidVals, v))
+        pidVals.push_back(v);
+      return true;
+    }
     if (!mlir::isa<mlir::arith::MulFOp, mlir::arith::AddFOp, mlir::arith::SubFOp,
                    mlir::arith::DivFOp, mlir::arith::AddIOp,
                    mlir::arith::SubIOp, mlir::arith::MulIOp,
                    mlir::arith::DivSIOp, mlir::arith::DivUIOp,
+                   mlir::arith::MaxSIOp, mlir::arith::MinSIOp,
                    mlir::arith::SIToFPOp, mlir::math::SqrtOp,
                    mlir::math::ExpOp, mlir::math::Exp2Op>(def)) {
       offender = def;
@@ -13917,11 +12756,19 @@ struct FusedAttnTemplate {
 
   // Walk the cone from `scoreOut` back to the dot result, collecting the leaves
   // it reads. Fails on anything outside the translatable set.
+  // `inAxis` is threaded DOWN the walk. A kernel computes its masks rank-1 and
+  // lifts them afterwards (`(offs_s < num_sinks)[None, :]`), so by the time the
+  // walk reaches the index itself the expand_dims is several ops behind it --
+  // and without carrying the axis along, that index is back to being classified
+  // by its length.
   bool collectCone(mlir::Value v, llvm::DenseSet<mlir::Operation *> &seen,
-                   int depth = 0) {
+                   int depth = 0, int inAxis = -1) {
     if (depth > 32)
       return no("score cone deeper than 32");
-    v = peel(v);
+    int coneAxis = inAxis, seenAxis = -1;
+    v = peelAxis(v, seenAxis);
+    if (seenAxis >= 0)
+      coneAxis = seenAxis;
     if (v == dotQK.getResult())
       return true;
     // A splat of a kernel scalar becomes a region parameter.
@@ -13937,8 +12784,18 @@ struct FusedAttnTemplate {
         return false;
       return true;
     }
-    // An index tensor becomes the row or key block arg.
-    switch (classifyIdx(v)) {
+    // An index tensor becomes the row or key block arg. Inside a SCORE cone the
+    // tile is (row, key) -- the feature dimension is contracted away by the QK
+    // dot -- so the expand axis decides the role and a "feature" answer from
+    // the length-based classifier is simply a length collision.
+    Idx role = classifyIdx(v);
+    if (role != Idx::None) {
+      if (coneAxis == 0)
+        role = Idx::Key;
+      else if (coneAxis == 1)
+        role = Idx::Row;
+    }
+    switch (role) {
     case Idx::Row:
       if (rowIdx && peel(rowIdx) != v)
         return no("two different row index cones in the score transform");
@@ -13983,7 +12840,7 @@ struct FusedAttnTemplate {
     if (!seen.insert(def).second)
       return true;
     for (mlir::Value o : def->getOperands())
-      if (!collectCone(o, seen, depth + 1))
+      if (!collectCone(o, seen, depth + 1, coneAxis))
         return false;
     return true;
   }
@@ -14292,9 +13149,19 @@ static bool faMatchAddr(FusedAttnTemplate &t, mlir::Value ptr,
     if (!mul)
       return false;
     t.mark(mul);
+    // The major index, preferentially by IDENTITY with the one the score cone
+    // already resolved. Falling back to the length-based classifier is only
+    // safe when the cone read no index at all -- an attention-sinks kernel
+    // loads K already transposed (`K + d*1 + key*stride_k`), and there the
+    // length test calls the key index a feature index, since BLOCK_S and
+    // BLOCK_D are both 16.
+    mlir::Value known = wantMajor == FusedAttnTemplate::Idx::Row ? t.rowIdx
+                                                                 : t.keyIdx;
     bool hit = false;
     for (int i = 0; i < 2; ++i) {
-      if (t.classifyIdx(mul->getOperand(i)) != wantMajor)
+      bool isMajor = known ? t.sameCone(mul->getOperand(i), known)
+                           : t.classifyIdx(mul->getOperand(i)) == wantMajor;
+      if (!isMajor)
         continue;
       mlir::Value st = t.splatSrc(mul->getOperand(1 - i));
       if (!st || !t.isKernelArg(st))
@@ -14416,6 +13283,328 @@ static mlir::LogicalResult faDeclineAt(const char *why, int line) {
 // than none.
 #define faDecline(why) faDeclineAt((why), __LINE__)
 
+//===----------------------------------------------------------------------===//
+// One key phase of the attention body.
+//===----------------------------------------------------------------------===//
+//
+// A phase is a contiguous key range whose contribution is merged into the
+// running (accumulator, sum, max) state. Every kernel in this family is a CHAIN
+// of them: usually one (a single key loop), but an attention-sinks kernel is a
+// straight-line sink block followed by a sliding-window loop, and the two links
+// have exactly the same shape. They differ only in where the carried values
+// come from and which keys are swept, so one matcher serves both instead of the
+// two-phase kernel needing an op of its own.
+struct FaPhase {
+  mlir::scf::ForOp forOp; // null: straight-line (unrolled) phase
+  mlir::triton::DotOp dotQK, dotPV;
+  mlir::Value scoreOut; // the logits L, or the weight under norm=none
+  mlir::Value rowIdx, keyIdx;
+  llvm::SmallVector<std::pair<mlir::Value, bool>> zeroPreds;
+  int64_t BN = 0;
+  // The key range, as expressions in the SOURCE IR; translated into the op's
+  // key-bounds region below. `beg` null means 0. `end` null means
+  // `beg + endConst`, which is the form a phase whose trip count is a constexpr
+  // takes (a sink block, or a window of `n_local_blocks` key blocks).
+  mlir::Value keyBeg, keyEnd;
+  // The `key < X` bound on this phase's own K load. Folded into the range end,
+  // because it is what decides which keys the SOURCE reads -- an attention-sinks
+  // prologue sweeps a BLOCK_S-wide tile but reads only `key < num_sinks` of it.
+  mlir::Value keyBound;
+  int64_t keyEndConst = 0;
+  int64_t keyEndMul = 1; // `end = keyEnd * keyEndMul`, for a block-counted loop
+  // Carried state as seen INSIDE the phase, and what the backward chain walk
+  // continues with. For a loop phase those differ: the region iter arg vs the
+  // init operand.
+  mlir::Value accIn, sumIn, maxIn;
+  mlir::Value accChain, sumChain, maxChain;
+};
+
+// COVERAGE. Every op between the loads and the store has to have been claimed
+// by the walk: an op the matcher did not account for is an op the emitter will
+// not express, and dropping one silently is exactly how the predecessor op
+// computed plain full attention for a band-masked kernel (max abs err 0.95-2.4)
+// for six commits.
+//
+// Walked backwards from the store rather than by scanning a block. A phase can
+// be straight-line code interleaved with address arithmetic that has nothing to
+// do with the attention body and is DCE'd afterwards, so "every op in the
+// block" is not the right set. A load's POINTER and MASK cones are excluded
+// because `faMatchAddr` / `faBoundOf` validate those separately, and they are
+// where the legitimately-unclaimed address arithmetic lives.
+static bool faCoverageOk(FusedAttnTemplate &t) {
+  llvm::SmallVector<mlir::Value, 32> wl;
+  llvm::DenseSet<mlir::Operation *> seen;
+  wl.push_back(t.store.getValue());
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    auto *def = v.getDefiningOp();
+    if (!def)
+      continue; // a block argument: kernel arg, or a loop's iter arg
+    if (!seen.insert(def).second)
+      continue;
+    // Leaves the walk stops at. Constants and index roots carry no semantics
+    // the emitter could drop.
+    if (mlir::isa<mlir::arith::ConstantOp, mlir::triton::MakeRangeOp,
+                  mlir::triton::GetProgramIdOp, mlir::triton::SplatOp>(def))
+      continue;
+    if (!t.claimed.count(def)) {
+      t.offender = def;
+      return t.no("unclaimed op between the loads and the store");
+    }
+    if (mlir::isa<mlir::triton::LoadOp>(def))
+      continue;
+    for (mlir::Value o : def->getOperands())
+      wl.push_back(o);
+    // A loop's body is reachable only through its yield.
+    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(def))
+      for (mlir::Value y :
+           mlir::cast<mlir::scf::YieldOp>(f.getBody()->getTerminator())
+               ->getOperands())
+        wl.push_back(y);
+  }
+  return true;
+}
+
+// Match ONE merge link: `state' = merge(state, one key range's contribution)`.
+// `accOut`/`sumOut`/`maxOut` are the values the link produces; `maxOut` is an
+// in-out slot because a straight-line phase has no iter_arg to compare against
+// and the running max is only discoverable from the logit shift.
+// The carried inputs land in `ph.accIn`/`sumIn`/`maxIn`, checked against
+// whatever is already there and otherwise discovered.
+static mlir::LogicalResult faMatchLink(FusedAttnTemplate &t, FaPhase &ph,
+                                       mlir::Value accOut, mlir::Value sumOut,
+                                       mlir::Value &maxOut) {
+  // `slot` is either pinned by the caller (a loop's iter arg) or discovered.
+  auto bindOrCheck = [&](mlir::Value &slot, mlir::Value v) {
+    if (!slot) {
+      slot = v;
+      return true;
+    }
+    return t.sameCone(slot, v);
+  };
+
+  mlir::triton::DotOp dotPV;
+  mlir::Value accNext = t.peel(accOut);
+  mlir::Value scaler;
+  if (!t.softmax) {
+    dotPV = accNext.getDefiningOp<mlir::triton::DotOp>();
+    if (!dotPV)
+      return faDecline("acc update is not a dot (norm=none)");
+    if (!bindOrCheck(ph.accIn, dotPV.getC()))
+      return faDecline("the dot's C operand is not the carried accumulator");
+  } else {
+    // Three spellings of `acc*scaler + dot(P, V)`, all the same computation:
+    // `math.fma`, `arith.addf(arith.mulf(...))`, and -- the one Triton produces
+    // when it folds the add into the dot -- the rescaled accumulator riding in
+    // the dot's own C operand.
+    if (auto d = accNext.getDefiningOp<mlir::triton::DotOp>()) {
+      dotPV = d;
+      auto mul = t.peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
+      if (!mul)
+        return faDecline("PV dot C operand is not the rescaled accumulator");
+      t.mark(mul);
+      mlir::Value ma = mul.getLhs(), mb = mul.getRhs();
+      if (ph.accIn) {
+        if (!t.sameCone(ma, ph.accIn))
+          std::swap(ma, mb);
+      } else if (FusedAttnTemplate::isExpLike(t.peel(ma))) {
+        std::swap(ma, mb);
+      }
+      if (!bindOrCheck(ph.accIn, ma))
+        return faDecline("PV dot C operand does not rescale the carried accumulator");
+      scaler = t.peel(mb);
+    } else {
+      mlir::Value fa, fb, fc;
+      if (!faSplitFma(t, accNext, fa, fb, fc))
+        return faDecline("acc update is not fma / mul-add / dot-with-rescaled-C");
+      if (ph.accIn) {
+        if (!t.sameCone(fa, ph.accIn))
+          std::swap(fa, fb); // the accumulator may sit on either side
+      } else if (FusedAttnTemplate::isExpLike(t.peel(fa))) {
+        std::swap(fa, fb);
+      }
+      if (!bindOrCheck(ph.accIn, fa))
+        return faDecline("acc update A operand is not the carried accumulator");
+      scaler = t.peel(fb);
+      dotPV = t.peel(fc).getDefiningOp<mlir::triton::DotOp>();
+      if (!dotPV || !t.isZeroSplat(dotPV.getC()))
+        return faDecline("PV dot missing, or its C operand is not zero");
+    }
+  }
+  ph.dotPV = t.dotPV = dotPV;
+  t.mark(dotPV);
+
+  auto accTy = mlir::dyn_cast<mlir::RankedTensorType>(dotPV.getType());
+  auto scoreTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(t.peel(dotPV.getA()).getType());
+  if (!accTy || !scoreTy || accTy.getRank() != 2 || scoreTy.getRank() != 2 ||
+      !accTy.getElementType().isF32())
+    return faDecline("dot result / score type is not rank-2 f32");
+  // BM and BD are the query-row block and the feature width; they fix the grid
+  // and the buffers, so every phase must agree on them. BN is per phase -- the
+  // sink block and the sliding window are different widths.
+  if (t.BM && (t.BM != accTy.getShape()[0] || t.BD != accTy.getShape()[1]))
+    return faDecline("key phases disagree on the query-row block or feature width");
+  t.BM = accTy.getShape()[0];
+  t.BD = accTy.getShape()[1];
+  ph.BN = t.BN = scoreTy.getShape()[1];
+  if (t.BM % 8 || t.BN % 8 || t.BD % 8)
+    return faDecline("tile dims are not multiples of 8");
+
+  // Where the score transform ENDS. Under norm=none it is dotPV's A operand
+  // directly. Under online softmax the transform ends at the LOGITS `L`, the
+  // value that feeds both the row-max reduce and the shifted exponential; the
+  // (max, sum, rescale) machinery after it is normalization, not transform, and
+  // must be role-walked rather than absorbed -- otherwise the region would
+  // contain a reduction it cannot express per (row, key).
+  t.scoreOut = dotPV.getA();
+  if (t.softmax) {
+    // P = exp(L - lift(m_new)), in whichever base the source used, optionally
+    // wrapped in the `where(mask, ..., 0.0)` chain a masked kernel writes.
+    // Those selects move INTO the region as `select(mask, L, -inf)`.
+    mlir::Value P = t.peel(dotPV.getA());
+    mlir::Value pcore = t.peelZeroSelects(P);
+    bool natural;
+    mlir::Value pin;
+    if (auto e = pcore.getDefiningOp<mlir::math::ExpOp>()) {
+      natural = true;
+      pin = e.getOperand();
+      t.mark(e);
+    } else if (auto e2 = pcore.getDefiningOp<mlir::math::Exp2Op>()) {
+      natural = false;
+      pin = e2.getOperand();
+      t.mark(e2);
+    } else {
+      return faDecline("P is not exp/exp2 of a shifted logit");
+    }
+    // The base is a whole-op attribute, so the phases have to agree: the region
+    // has already produced the logit by the time the emitter sees it, and the
+    // emitter cannot rescale one phase's logits after the fact.
+    if (t.sawExp && t.naturalExp != natural)
+      return faDecline("key phases disagree on the exponential base");
+    t.naturalExp = natural;
+    t.sawExp = true;
+
+    auto shift = t.peel(pin).getDefiningOp<mlir::arith::SubFOp>();
+    if (!shift)
+      return faDecline("logit shift is not a subf");
+    t.mark(shift);
+    t.scoreOut = shift.getLhs();
+    mlir::Value mNew = t.peel(shift.getRhs());
+
+    // m' = maxnumf(reduce_max(L, axis=1), m_carried), and it is what the phase
+    // hands on as its running max.
+    if (maxOut && !t.sameCone(maxOut, mNew))
+      return faDecline("the shift subtrahend is not the phase's running max");
+    maxOut = mNew;
+    auto mx = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
+    if (!mx)
+      return faDecline("m_new is not a maxnumf");
+    t.mark(mx);
+    mlir::Value rmax;
+    for (int i = 0; i < 2; ++i)
+      if (ph.maxIn && t.sameCone(mx->getOperand(i), ph.maxIn))
+        rmax = mx->getOperand(1 - i);
+    if (!rmax) {
+      // Straight-line phase: the carried max is whichever operand is not the
+      // block reduce.
+      for (int i = 0; i < 2; ++i)
+        if (!t.peel(mx->getOperand(i))
+                 .getDefiningOp<mlir::triton::ReduceOp>()) {
+          if (!bindOrCheck(ph.maxIn, mx->getOperand(i)))
+            return faDecline("maxnumf does not carry the running max");
+          rmax = mx->getOperand(1 - i);
+        }
+    }
+    if (!rmax)
+      return faDecline("maxnumf does not carry the running max");
+    auto redMax = t.peel(rmax).getDefiningOp<mlir::triton::ReduceOp>();
+    if (!t.isReduce<mlir::arith::MaxNumFOp>(redMax, 1))
+      return faDecline("row-max reduce is not maxnumf over axis 1");
+    t.mark(redMax);
+    // Peeling runs on BOTH sides: a causal kernel writes its logit as
+    // `where(causal, s, -inf)`, so scoreOut is a masked select too and peeling
+    // only the reduce's side would make two identical expressions differ.
+    if (!t.sameCone(t.peelMaskedMax(redMax.getSrcs()[0], /*record=*/true),
+                    t.peelMaskedMax(t.scoreOut, /*record=*/false)))
+      return faDecline("the row-max reduce does not read the logits");
+
+    // scaler = exp(m_carried - m'), in the same base as P.
+    mlir::Value sin;
+    if (auto e = scaler.getDefiningOp<mlir::math::ExpOp>()) {
+      if (!t.naturalExp)
+        return faDecline("scaler exp base disagrees with P");
+      sin = e.getOperand();
+      t.mark(e);
+    } else if (auto e2 = scaler.getDefiningOp<mlir::math::Exp2Op>()) {
+      if (t.naturalExp)
+        return faDecline("scaler exp base disagrees with P");
+      sin = e2.getOperand();
+      t.mark(e2);
+    } else {
+      return faDecline("scaler is not exp(m_old - m_new)");
+    }
+    auto sSub = t.peel(sin).getDefiningOp<mlir::arith::SubFOp>();
+    if (!sSub || !t.sameCone(sSub.getLhs(), ph.maxIn) ||
+        !t.sameCone(sSub.getRhs(), mNew))
+      return faDecline("scaler is not exp(m_old - m_new)");
+    t.mark(sSub);
+
+    // sum' = fma(sum_carried, scaler, reduce_add(P, axis=1)).
+    mlir::Value sa, sb, sc;
+    if (!faSplitFma(t, sumOut, sa, sb, sc))
+      return faDecline("sum update is not fma/mul-add over the running sum");
+    if (ph.sumIn && !t.sameCone(sa, ph.sumIn))
+      std::swap(sa, sb);
+    if (!ph.sumIn && t.sameCone(sa, scaler))
+      std::swap(sa, sb);
+    if (!bindOrCheck(ph.sumIn, sa) || !t.sameCone(sb, scaler))
+      return faDecline("sum update does not rescale the running sum by the scaler");
+    auto redSum = t.peel(sc).getDefiningOp<mlir::triton::ReduceOp>();
+    if (!t.isReduce<mlir::arith::AddFOp>(redSum, 1))
+      return faDecline("denominator reduce is not addf over axis 1");
+    t.mark(redSum);
+    if (!t.sameCone(redSum.getSrcs()[0], P))
+      return faDecline("denominator reduce source is not P");
+  }
+  // The QK dot, reachable through the score cone from the LOGITS -- not from
+  // the PV dot's A operand. Under an online softmax those differ by the running
+  // max, and with the key loop unrolled (`N_LOCAL_BLOCKS == 1` deletes the
+  // scf.for outright) the carried max is a real SSA chain back into the
+  // PREVIOUS phase, so a walk from P reaches that phase's dot too and the
+  // template declines with "two score-side dots". The logits cone never
+  // contains the running max.
+  {
+    llvm::SmallVector<mlir::Operation *, 16> wl;
+    if (auto *d = t.peel(t.scoreOut).getDefiningOp())
+      wl.push_back(d);
+    llvm::DenseSet<mlir::Operation *> vis;
+    mlir::triton::DotOp dotQK;
+    while (!wl.empty()) {
+      auto *o = wl.pop_back_val();
+      if (!vis.insert(o).second)
+        continue;
+      if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(o)) {
+        if (dotQK && dotQK != d)
+          return faDecline("two score-side dots");
+        dotQK = d;
+        continue;
+      }
+      for (mlir::Value v : o->getOperands())
+        if (auto *d2 = t.peel(v).getDefiningOp())
+          wl.push_back(d2);
+    }
+    if (!dotQK)
+      return faDecline("no QK dot reachable from the logits");
+    ph.dotQK = t.dotQK = dotQK;
+    t.mark(dotQK);
+  }
+
+  ph.scoreOut = t.scoreOut;
+  ph.zeroPreds = t.zeroPreds;
+  return mlir::success();
+}
+
 static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   FusedAttnTemplate t;
   t.funcOp = funcOp;
@@ -14432,7 +13621,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
 
   // Epilogue. `store(acc)` is norm=none; `store(acc / lift(sum))` is the online
   // softmax, whose running state is NOT part of the score transform and is
-  // therefore role-walked here rather than absorbed into the region.
+  // therefore role-walked rather than absorbed into the region.
   mlir::Value stored = t.peel(t.store.getValue());
   mlir::Value sumLift;
   if (auto div = stored.getDefiningOp<mlir::arith::DivFOp>()) {
@@ -14442,308 +13631,227 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     stored = t.peel(div.getLhs());
   }
 
-  auto forOp = stored.getDefiningOp<mlir::scf::ForOp>();
-  if (!forOp)
-    return faDecline("accumulator is not an scf.for");
-  t.forOp = forOp;
-  if (forOp.getNumRegionIterArgs() != (t.softmax ? 3u : 1u))
-    return faDecline("wrong iter_arg count for the norm mode");
+  llvm::SmallVector<FaPhase> phases;
+  mlir::Value accCur = stored;
+  mlir::Value sumCur = t.softmax ? t.peel(sumLift) : mlir::Value();
+  mlir::Value maxCur;
 
-  // Identify the iter_args by SHAPE and INIT, never by position: rank-2 is the
-  // output accumulator, and the two rank-1 states are told apart by their inits
-  // (-inf = running max, 0 = running sum).
-  int accIdx = 0, sumIdx = -1, maxIdx = -1;
-  if (t.softmax) {
-    accIdx = -1;
-    for (unsigned i = 0; i < 3; ++i) {
-      auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
-          forOp.getInitArgs()[i].getType());
-      if (!ty || !ty.getElementType().isF32())
-        return faDecline("iter_arg is not a rank-1/2 f32 tensor");
-      if (ty.getRank() == 2) {
-        if (accIdx >= 0 || !t.isZeroSplat(forOp.getInitArgs()[i]))
-          return faDecline("two rank-2 iter_args, or non-zero accumulator init");
-        accIdx = i;
-      } else if (ty.getRank() == 1) {
-        if (t.isNegInfSplat(forOp.getInitArgs()[i])) {
-          if (maxIdx >= 0)
-            return faDecline("two running-max iter_args");
-          maxIdx = i;
-        } else if (t.isZeroSplat(forOp.getInitArgs()[i])) {
-          if (sumIdx >= 0)
-            return faDecline("two running-sum iter_args");
-          sumIdx = i;
-        } else {
-          return faDecline("rank-1 iter_arg init is neither -inf nor 0");
+  // Walk the merge chain BACKWARDS from the store to the initial state. One
+  // link per key phase; the common case is a single loop, and attention sinks
+  // is a straight-line sink block feeding a sliding-window loop.
+  while (!t.isZeroSplat(accCur)) {
+    if (phases.size() >= 4)
+      return faDecline("more than 4 key phases");
+    FaPhase ph;
+    t.zeroPreds.clear();
+    t.maskedMaxPreds.clear();
+    t.rowIdx = {};
+    t.keyIdx = {};
+    t.keyBase = {};
+
+    if (auto f = accCur.getDefiningOp<mlir::scf::ForOp>()) {
+      ph.forOp = t.forOp = f;
+      t.mark(f);
+      const unsigned n = f.getNumRegionIterArgs();
+      if (n != (t.softmax ? 3u : 1u))
+        return faDecline("wrong iter_arg count for the norm mode");
+      // Roles by SHAPE and by what the chain already knows, never by position.
+      // NOT by the inits: an attention-sinks loop is fed by the sink phase, and
+      // even its first phase starts from `where(row < m, -inf, 0)` rather than
+      // a constant, so an init-based role assignment cannot see it.
+      int accIdx = -1, sumIdx = -1, maxIdx = -1;
+      for (unsigned i = 0; i < n; ++i) {
+        auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+            f.getInitArgs()[i].getType());
+        if (!ty || !ty.getElementType().isF32())
+          return faDecline("iter_arg is not a rank-1/2 f32 tensor");
+        if (ty.getRank() == 2) {
+          if (accIdx >= 0)
+            return faDecline("two rank-2 iter_args");
+          accIdx = i;
+        } else if (ty.getRank() != 1) {
+          return faDecline("iter_arg rank is not 1 or 2");
         }
-      } else {
-        return faDecline("iter_arg rank is not 1 or 2");
       }
-    }
-    if (accIdx < 0 || sumIdx < 0 || maxIdx < 0)
-      return faDecline("could not assign acc/sum/max iter_arg roles");
-    if (stored != forOp.getResult(accIdx) ||
-        t.peel(sumLift) != forOp.getResult(sumIdx))
-      return faDecline("store does not divide the acc result by the sum result");
-  }
-
-  mlir::Block *body = forOp.getBody();
-  auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
-  t.mark(yield);
-
-  mlir::triton::DotOp dotPV;
-  mlir::Value accNext = t.peel(yield.getOperand(accIdx));
-  if (!t.softmax) {
-    dotPV = accNext.getDefiningOp<mlir::triton::DotOp>();
-    if (!dotPV || t.peel(dotPV.getC()) != forOp.getRegionIterArg(accIdx))
-      return faDecline("yield is not a dot (norm=none)");
-  } else {
-    // acc' = fma(acc_carried, lift(scaler), dot(P, V, 0)) — the rescale rides a
-    // separate fma, so the dot's own C operand has to be zero.
-    // A THIRD spelling: Triton folds `dot(P, V) + x` into the dot's own C
-    // operand, so the rescaled accumulator rides inside the dot rather than in
-    // a surrounding fma/add. All three are the same computation.
-    if (auto d = accNext.getDefiningOp<mlir::triton::DotOp>()) {
-      dotPV = d;
-      mlir::Value ma, mb;
-      auto mul = t.peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
-      if (!mul)
-        return faDecline("PV dot C operand is not the rescaled accumulator");
-      t.mark(mul);
-      ma = mul.getLhs();
-      mb = mul.getRhs();
-      if (t.peel(ma) != forOp.getRegionIterArg(accIdx))
-        std::swap(ma, mb);
-      if (t.peel(ma) != forOp.getRegionIterArg(accIdx))
-        return faDecline("PV dot C operand does not rescale the carried accumulator");
+      if (accIdx < 0 || f.getResult(accIdx) != accCur)
+        return faDecline("the accumulator is not the loop's rank-2 result");
+      auto yield = mlir::cast<mlir::scf::YieldOp>(f.getBody()->getTerminator());
+      t.mark(yield);
+      ph.accIn = f.getRegionIterArg(accIdx);
+      mlir::Value maxOut;
+      if (t.softmax) {
+        for (unsigned i = 0; i < n; ++i)
+          if ((int)i != accIdx && t.sameCone(f.getResult(i), sumCur))
+            sumIdx = i;
+        for (unsigned i = 0; i < n; ++i)
+          if ((int)i != accIdx && (int)i != sumIdx)
+            maxIdx = i;
+        if (sumIdx < 0 || maxIdx < 0)
+          return faDecline("could not assign the loop's sum/max iter_args");
+        if (maxCur && !t.sameCone(f.getResult(maxIdx), maxCur))
+          return faDecline("the loop's running max is not the one carried on");
+        ph.sumIn = f.getRegionIterArg(sumIdx);
+        ph.maxIn = f.getRegionIterArg(maxIdx);
+        maxOut = t.peel(yield.getOperand(maxIdx));
+      }
+      if (failed(faMatchLink(
+              t, ph, yield.getOperand(accIdx),
+              t.softmax ? yield.getOperand(sumIdx) : mlir::Value(), maxOut)))
+        return mlir::failure();
+      ph.accChain = f.getInitArgs()[accIdx];
+      if (t.softmax) {
+        ph.sumChain = f.getInitArgs()[sumIdx];
+        ph.maxChain = f.getInitArgs()[maxIdx];
+      }
     } else {
-      mlir::Value fa, fb, fc;
-      if (!faSplitFma(t, accNext, fa, fb, fc))
-        return faDecline("acc update is not fma / mul-add / dot-with-rescaled-C");
-      if (t.peel(fa) != forOp.getRegionIterArg(accIdx)) {
-        std::swap(fa, fb); // the accumulator may sit on either side
-        if (t.peel(fa) != forOp.getRegionIterArg(accIdx))
-          return faDecline("acc update A operand is not the carried accumulator");
-      }
-      dotPV = t.peel(fc).getDefiningOp<mlir::triton::DotOp>();
-      if (!dotPV || !t.isZeroSplat(dotPV.getC()))
-        return faDecline("PV dot missing, or its C operand is not zero");
+      // A straight-line phase: no loop, so the carried values are ordinary SSA
+      // values and the link matcher discovers them instead of checking them.
+      ph.forOp = t.forOp = nullptr;
+      mlir::Value maxOut = maxCur;
+      if (failed(faMatchLink(t, ph, accCur, sumCur, maxOut)))
+        return mlir::failure();
+      ph.accChain = ph.accIn;
+      ph.sumChain = ph.sumIn;
+      ph.maxChain = ph.maxIn;
     }
+    ph.rowIdx = t.rowIdx;
+    ph.keyIdx = t.keyIdx;
+    phases.push_back(ph);
+    accCur = t.peel(ph.accChain);
+    sumCur = ph.sumChain ? t.peel(ph.sumChain) : mlir::Value();
+    maxCur = ph.maxChain ? t.peel(ph.maxChain) : mlir::Value();
   }
-  t.dotPV = dotPV;
-  t.mark(dotPV);
 
-  auto accTy = mlir::dyn_cast<mlir::RankedTensorType>(dotPV.getType());
-  auto scoreTy =
-      mlir::dyn_cast<mlir::RankedTensorType>(t.peel(dotPV.getA()).getType());
-  if (!accTy || !scoreTy || accTy.getRank() != 2 || scoreTy.getRank() != 2 ||
-      !accTy.getElementType().isF32())
-    return faDecline("dot result / score type is not rank-2 f32");
-  t.BM = accTy.getShape()[0];
-  t.BD = accTy.getShape()[1];
-  t.BN = scoreTy.getShape()[1];
-  if (t.BM % 8 || t.BN % 8 || t.BD % 8)
-    return faDecline("tile dims are not multiples of 8");
+  if (phases.empty())
+    return faDecline("no key phase reaches the store");
+  // Source order, not walk order.
+  std::reverse(phases.begin(), phases.end());
 
-  // The QK dot: reachable from dotPV's A operand through the score cone.
-  llvm::SmallVector<mlir::Operation *, 16> wl;
-  if (auto *d = t.peel(dotPV.getA()).getDefiningOp())
-    wl.push_back(d);
-  llvm::DenseSet<mlir::Operation *> vis;
-  mlir::triton::DotOp dotQK;
-  while (!wl.empty()) {
-    auto *o = wl.pop_back_val();
-    if (!vis.insert(o).second)
-      continue;
-    if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(o)) {
-      if (dotQK && dotQK != d)
-        return faDecline("two score-side dots");
-      dotQK = d;
-      continue;
-    }
-    for (mlir::Value v : o->getOperands())
-      if (auto *d2 = t.peel(v).getDefiningOp())
-        wl.push_back(d2);
-  }
-  if (!dotQK)
-    return faDecline("no QK dot reachable from the PV dot A operand");
-  t.dotQK = dotQK;
-  t.mark(dotQK);
-
-  // Where the score transform ENDS. Under norm=none it is dotPV's A operand
-  // directly. Under online softmax the transform ends at the LOGITS `L`, the
-  // value that feeds both the row-max reduce and the shifted exponential; the
-  // (max, sum, rescale) machinery after it is normalization, not transform, and
-  // must be role-walked rather than absorbed — otherwise the region would
-  // contain a reduction it cannot express per (row, key).
-  t.scoreOut = dotPV.getA();
+  // The initial state. `acc == 0` ended the walk; the two rank-1 states must be
+  // the online softmax's own identities, possibly behind a row-bounds select:
+  // `where(row < m, -inf, 0)` / `where(row < m, 0, 1)` give an out-of-range row
+  // a denominator of 1 so its `acc / l` is 0 rather than NaN. Those rows are
+  // never stored, so only the in-range arm carries meaning.
   if (t.softmax) {
-    // P = exp(L - lift(m_new)), in whichever base the source used, optionally
-    // wrapped in the `where(mask, ..., 0.0)` chain a masked kernel writes. Those
-    // selects move INTO the region as `select(mask, L, -inf)`; see peelZeroSelects.
-    mlir::Value P = t.peel(dotPV.getA());
-    mlir::Value pcore = t.peelZeroSelects(P);
-    mlir::Value pin;
-    if (auto e = pcore.getDefiningOp<mlir::math::ExpOp>()) {
-      t.naturalExp = true;
-      pin = e.getOperand();
-      t.mark(e);
-    } else if (auto e2 = pcore.getDefiningOp<mlir::math::Exp2Op>()) {
-      t.naturalExp = false;
-      pin = e2.getOperand();
-      t.mark(e2);
-    } else {
-      return faDecline("P is not exp/exp2 of a shifted logit");
-    }
-    auto shift = t.peel(pin).getDefiningOp<mlir::arith::SubFOp>();
-    if (!shift)
-      return faDecline("logit shift is not a subf");
-    t.mark(shift);
-    t.scoreOut = shift.getLhs();
-    mlir::Value mNew = t.peel(shift.getRhs());
-
-    // m' = maxnumf(reduce_max(L, axis=1), m_carried), and it is what is yielded.
-    if (t.peel(yield.getOperand(maxIdx)) != mNew)
-      return faDecline("the shift subtrahend is not the yielded running max");
-    auto mx = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
-    if (!mx)
-      return faDecline("m_new is not a maxnumf");
-    t.mark(mx);
-    mlir::Value rmax;
-    for (int i = 0; i < 2; ++i)
-      if (t.peel(mx->getOperand(i)) == forOp.getRegionIterArg(maxIdx))
-        rmax = mx->getOperand(1 - i);
-    if (!rmax)
-      return faDecline("maxnumf does not carry the running max");
-    auto redMax = t.peel(rmax).getDefiningOp<mlir::triton::ReduceOp>();
-    if (!t.isReduce<mlir::arith::MaxNumFOp>(redMax, 1))
-      return faDecline("row-max reduce is not maxnumf over axis 1");
-    t.mark(redMax);
-    if (t.peelMaskedMax(redMax.getSrcs()[0], /*record=*/true) !=
-        t.peelMaskedMax(t.scoreOut, /*record=*/false))
-      return faDecline("the row-max reduce does not read the logits");
-
-    // scaler = exp(m_carried - m'), in the same base as P. It reaches the
-    // accumulator as the fma's middle operand.
-    mlir::Value scaler;
-    if (auto d = t.peel(yield.getOperand(accIdx))
-                     .getDefiningOp<mlir::triton::DotOp>()) {
-      auto mul = t.peel(d.getC()).getDefiningOp<mlir::arith::MulFOp>();
-      if (!mul)
-        return faDecline("cannot resolve the scaler from the dot's C operand");
-      scaler = t.peel(mul.getLhs()) == forOp.getRegionIterArg(accIdx)
-                   ? t.peel(mul.getRhs())
-                   : t.peel(mul.getLhs());
-    } else {
-      mlir::Value ga, gb, gc;
-      if (!faSplitFma(t, yield.getOperand(accIdx), ga, gb, gc))
-        return faDecline("acc update not found while resolving the scaler");
-      if (t.peel(ga) != forOp.getRegionIterArg(accIdx))
-        std::swap(ga, gb);
-      scaler = t.peel(gb);
-    }
-    mlir::Value sin;
-    if (auto e = scaler.getDefiningOp<mlir::math::ExpOp>()) {
-      if (!t.naturalExp)
-        return faDecline("scaler exp base disagrees with P");
-      sin = e.getOperand();
-      t.mark(e);
-    } else if (auto e2 = scaler.getDefiningOp<mlir::math::Exp2Op>()) {
-      if (t.naturalExp)
-        return faDecline("scaler exp base disagrees with P");
-      sin = e2.getOperand();
-      t.mark(e2);
-    } else {
-      return faDecline("scaler is not exp(m_old - m_new)");
-    }
-    auto sSub = t.peel(sin).getDefiningOp<mlir::arith::SubFOp>();
-    if (!sSub || t.peel(sSub.getLhs()) != forOp.getRegionIterArg(maxIdx) ||
-        t.peel(sSub.getRhs()) != mNew)
-      return faDecline("scaler is not exp(m_old - m_new)");
-    t.mark(sSub);
-
-    // sum' = fma(sum_carried, scaler, reduce_add(P, axis=1)).
-    mlir::Value sa, sb, sc;
-    if (!faSplitFma(t, yield.getOperand(sumIdx), sa, sb, sc))
-      return faDecline("sum update is not fma/mul-add over the running sum");
-    if (t.peel(sa) != forOp.getRegionIterArg(sumIdx))
-      std::swap(sa, sb);
-    if (t.peel(sa) != forOp.getRegionIterArg(sumIdx) || t.peel(sb) != scaler)
-      return faDecline("sum update does not rescale the running sum by the scaler");
-    auto redSum = t.peel(sc).getDefiningOp<mlir::triton::ReduceOp>();
-    if (!t.isReduce<mlir::arith::AddFOp>(redSum, 1))
-      return faDecline("denominator reduce is not addf over axis 1");
-    t.mark(redSum);
-    if (t.peel(redSum.getSrcs()[0]) != P)
-      return faDecline("denominator reduce source is not P");
+    if (!t.isMaskedInit(maxCur, /*negInf=*/true))
+      return faDecline("the running max does not start at -inf");
+    if (!t.isMaskedInit(sumCur, /*negInf=*/false))
+      return faDecline("the running sum does not start at 0");
   }
 
-  // Absorb the cone. Anything without a scalar translation fails the match.
+  // Absorb each phase's cone. Anything without a scalar translation fails the
+  // match: `emitConeScalar` IS the absorb-or-decline test, so coverage is
+  // established by construction rather than by enumerating known score shapes.
   llvm::DenseSet<mlir::Operation *> coneSeen;
-  if (!t.collectCone(t.scoreOut, coneSeen))
-    goto rejected;
-  // The numerator's zeroing predicates are absorbed too — they end up in the
-  // region. The row-max's masking predicates are NOT emitted (the emitter takes
-  // its own max), but they still have to be walked so their ops are claimed by
-  // the coverage gate below.
-  for (auto &zp : t.zeroPreds)
-    if (!t.collectCone(zp.first, coneSeen))
+  for (FaPhase &ph : phases) {
+    t.forOp = ph.forOp;
+    t.BN = ph.BN;
+    t.dotQK = ph.dotQK;
+    t.rowIdx = ph.rowIdx;
+    t.keyIdx = ph.keyIdx;
+    t.keyBase = {};
+    if (!t.collectCone(ph.scoreOut, coneSeen))
       goto rejected;
-  for (mlir::Value mp : t.maskedMaxPreds)
-    if (!t.collectCone(mp, coneSeen))
-      goto rejected;
-  // Neither index is REQUIRED: a plain `score * scale` transform reads no index
-  // at all, and a band mask reads both only from the predicates. Over-matching
-  // is prevented by the coverage gate below, not by this.
-
+    // The numerator's zeroing predicates are absorbed too -- they end up in the
+    // region. The row-max's masking predicates are NOT emitted (the emitter
+    // takes its own max) but still have to be walked so their ops are claimed.
+    for (auto &zp : ph.zeroPreds)
+      if (!t.collectCone(zp.first, coneSeen))
+        goto rejected;
+    for (mlir::Value mp : t.maskedMaxPreds)
+      if (!t.collectCone(mp, coneSeen))
+        goto rejected;
+    // Neither index is REQUIRED: a plain `score * scale` transform reads no
+    // index at all, and a band mask reads both only from the predicates.
+    // Over-matching is prevented by the coverage gate below, not by this.
+    ph.rowIdx = t.rowIdx;
+    ph.keyIdx = t.keyIdx;
+    ph.keyBeg = t.keyBase;
+  }
   {
-    // Operand loads.
-    bool qT = false, kT = false, vT = false;
-    auto qLd = faPeelLoad(t, dotQK.getA(), qT);
-    auto kLd = faPeelLoad(t, dotQK.getB(), kT);
-    auto vLd = faPeelLoad(t, dotPV.getB(), vT);
-    if (!qLd || !kLd || !vLd || qT || vT || !kT) {
-      t.no("operands are not Q, trans(K) and V loads");
-      goto rejected;
-    }
+    // --- operands and extents, per phase; every phase must agree ---
+    for (FaPhase &ph : phases) {
+      t.forOp = ph.forOp;
+      t.BN = ph.BN;
+      t.rowIdx = ph.rowIdx;
+      t.keyIdx = ph.keyIdx;
+      bool qT = false, kT = false, vT = false;
+      auto qLd = faPeelLoad(t, ph.dotQK.getA(), qT);
+      auto kLd = faPeelLoad(t, ph.dotQK.getB(), kT);
+      auto vLd = faPeelLoad(t, ph.dotPV.getB(), vT);
+      if (!qLd || !kLd || !vLd || qT || vT) {
+        t.no("operands are not Q, K and V loads");
+        goto rejected;
+      }
+      // K reaches the QK dot transposed one of two ways: through a `tt.trans`,
+      // or already transposed by its own ADDRESS (`K + d*stride_d +
+      // key*stride_k`), which is what an attention-sinks kernel writes. The
+      // emitter reads `K[key*stride_k + col + d]` either way, so what matters
+      // is that the key index carries the row stride -- which is exactly what
+      // faMatchAddr checks.
+      const char *which = nullptr;
+      if (!faMatchAddr(t, qLd.getPtr(), FusedAttnTemplate::Idx::Row, t.qPtr,
+                       t.strideQ))
+        which = "Q";
+      else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key,
+                            t.kPtr, t.strideK))
+        which = "K";
+      else if (!faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key,
+                            t.vPtr, t.strideV))
+        which = "V";
+      else if (!faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row,
+                            t.oPtr, t.strideO))
+        which = "Out";
+      if (which) {
+        if (::getenv("TRITON_METAL_FA_DEBUG"))
+          llvm::errs() << "[metal-fused-attn]   bad address: " << which << "\n";
+        t.no("an address is not base + major*stride + feature");
+        goto rejected;
+      }
 
-    const char *which = nullptr;
-    if (!faMatchAddr(t, qLd.getPtr(), FusedAttnTemplate::Idx::Row, t.qPtr,
-                     t.strideQ))
-      which = "Q";
-    else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key, t.kPtr,
-                          t.strideK))
-      which = "K";
-    else if (!faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key, t.vPtr,
-                          t.strideV))
-      which = "V";
-    else if (!faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row,
-                          t.oPtr, t.strideO))
-      which = "Out";
-    if (which) {
-      if (::getenv("TRITON_METAL_FA_DEBUG"))
-        llvm::errs() << "[metal-fused-attn]   bad address: " << which << "\n";
-      t.no("an address is not base + major*stride + feature");
-      goto rejected;
+      // Extents, read off the masks rather than guessed by argument position.
+      if (!qLd.getMask() || !kLd.getMask() || !t.store.getMask()) {
+        t.no("a load or the store is unmasked");
+        goto rejected;
+      }
+      mlir::Value m = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Row);
+      mlir::Value dh = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Feat);
+      (void)faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
+      (void)faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
+      // The key bound is PER PHASE, not global. An attention-sinks prologue
+      // masks its K load with `key < num_sinks`, which bounds that phase's
+      // reads and nothing else; taking it for the whole op made the window
+      // phase sweep `[0, num_sinks)` and answer wrong by ~1-4 absolute. It is
+      // folded into the phase's key range below instead.
+      ph.keyBound = faBoundOf(t, kLd.getMask(), FusedAttnTemplate::Idx::Key);
+      // Query rows and feature width ARE global -- they fix the grid and the
+      // buffers. Disagreement is a decline, never a silent first-wins.
+      if (m) {
+        if (t.mVal && t.mVal != m)
+          t.no("key phases disagree on the query-row count");
+        t.mVal = m;
+      }
+      if (dh) {
+        if (t.dHeadVal && t.dHeadVal != dh)
+          t.no("key phases disagree on the feature width");
+        t.dHeadVal = dh;
+      }
+      if (t.why)
+        goto rejected;
     }
-
-    // Extents, read off the masks rather than guessed by argument position.
-    if (!qLd.getMask() || !kLd.getMask() || !t.store.getMask()) {
-      t.no("a load or the store is unmasked");
-      goto rejected;
-    }
-    t.mVal = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Row);
-    t.nVal = faBoundOf(t, kLd.getMask(), FusedAttnTemplate::Idx::Key);
-    t.dHeadVal = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Feat);
-    (void)faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
-    (void)faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
+    // `n` is the key count of K/V. Taken from the LAST phase: earlier phases
+    // are prologues over bounded sub-blocks whose own bounds are folded into
+    // their ranges, while the last phase is the general sweep. Safety does not
+    // rest on this -- every phase's range is clamped by its own bound -- so a
+    // phase-local bound leaking in here can no longer read out of bounds.
+    t.nVal = phases.back().keyBound;
     if (!t.mVal || !t.nVal || !t.dHeadVal || !t.isKernelArg(t.mVal) ||
         !t.isKernelArg(t.nVal)) {
       t.no("could not resolve M / N / d_head from the masks");
       goto rejected;
     }
     // The feature bound is either a kernel argument (no head split) or
-    // `d_model / h` with both sides kernel arguments — a head-split kernel
+    // `d_model / h` with both sides kernel arguments -- a head-split kernel
     // computes its per-head width rather than being passed it, so there is no
     // buffer for the quotient to point at. Carry the numerator and `h`
     // separately and let the emitter divide as `_fa_dh = DM / H`.
@@ -14759,88 +13867,67 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       t.dHeadVal = div.getLhs();
     }
 
-    // Key bound: `[0, n)` or the causal `[0, min((pid+1)*BM, n))`. Anything
-    // else is a key set the emitter would not reproduce.
-    if (!FusedAttnTemplate::isIntConst(forOp.getLowerBound(), 0)) {
-      t.no("key loop does not start at 0");
-      goto rejected;
-    }
-    // Two spellings of the same sweep: `range(0, N, BN)` steps by keys, while
-    // `range(0, cdiv(N, BN))` steps by blocks. The block form's upper bound is
-    // the cdiv itself, so it is checked against N here rather than compared to
-    // it directly.
-    const bool blockCounted =
-        FusedAttnTemplate::isIntConst(forOp.getStep(), 1) && t.BN != 1;
-    if (!blockCounted &&
-        !FusedAttnTemplate::isIntConst(forOp.getStep(), t.BN)) {
-      t.no("key loop is not `range(0, ub, BN)` nor `range(0, cdiv(N, BN))`");
-      goto rejected;
-    }
-    mlir::Value ub = forOp.getUpperBound();
-    if (blockCounted) {
-      mlir::Value num;
-      if (auto d = ub.getDefiningOp<mlir::arith::DivSIOp>()) {
-        if (FusedAttnTemplate::isIntConst(d.getRhs(), t.BN))
-          num = d.getLhs();
-      } else if (auto d = ub.getDefiningOp<mlir::arith::DivUIOp>()) {
-        if (FusedAttnTemplate::isIntConst(d.getRhs(), t.BN))
-          num = d.getLhs();
+    // --- key ranges, one per phase ---
+    for (FaPhase &ph : phases) {
+      t.forOp = ph.forOp;
+      if (!ph.forOp) {
+        // Straight-line phase: one key block, `[beg, beg + bn)`.
+        ph.keyEndConst = ph.BN;
+      } else {
+        auto f = ph.forOp;
+        if (!FusedAttnTemplate::isIntConst(f.getLowerBound(), 0)) {
+          t.no("key loop does not start at 0");
+          goto rejected;
+        }
+        // Two spellings of the same sweep: `range(0, N, BN)` steps by keys,
+        // `range(0, trips)` steps by blocks.
+        const bool blockCounted =
+            FusedAttnTemplate::isIntConst(f.getStep(), 1) && ph.BN != 1;
+        if (!blockCounted &&
+            !FusedAttnTemplate::isIntConst(f.getStep(), ph.BN)) {
+          t.no("key loop is neither `range(0, ub, BN)` nor `range(0, trips)`");
+          goto rejected;
+        }
+        mlir::Value ub = f.getUpperBound();
+        int64_t trips = 0;
+        if (auto c = ub.getDefiningOp<mlir::arith::ConstantOp>())
+          if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()))
+            trips = blockCounted ? ia.getInt() : 0;
+        if (trips > 0) {
+          // A compile-time trip count reproduces the source's key set exactly.
+          ph.keyEndConst = trips * ph.BN;
+        } else if (ph.keyBeg) {
+          t.no("a runtime-bounded key phase cannot also have a key offset");
+          goto rejected;
+        } else {
+          // A runtime bound is REPRODUCED, not reasoned about: the loop's own
+          // upper bound, scaled by the key block when the loop counts blocks.
+          // That is how a causal `min((pid+1)*bm, n)` becomes a key range
+          // instead of an attribute -- and it is why the bound is never
+          // replaced by `n` on the argument that the tail is masked anyway.
+          // (The emitter clamps the range to `[0, n]`, which is what turns a
+          // `cdiv(n, bn)*bn` sweep back into `[0, n)`.)
+          ph.keyEnd = ub;
+          ph.keyEndMul = blockCounted ? ph.BN : 1;
+        }
       }
-      auto ad = num ? num.getDefiningOp<mlir::arith::AddIOp>()
-                    : mlir::arith::AddIOp();
-      bool ok = false;
-      if (ad)
-        for (int i = 0; i < 2; ++i)
-          if (FusedAttnTemplate::isIntConst(ad->getOperand(1 - i), t.BN - 1) &&
-              ad->getOperand(i) == t.nVal)
-            ok = true;
-      if (!ok) {
-        t.no("block-counted key loop bound is not cdiv(N, BN)");
+      // Register the bound expressions' kernel-arg leaves as region params.
+      t.forOp = nullptr;
+      if ((ph.keyBeg && !t.collectScalarCone(ph.keyBeg, 0)) ||
+          (ph.keyEnd && !t.collectScalarCone(ph.keyEnd, 0)))
         goto rejected;
-      }
-      t.causalKeyBound = false;
-    } else if (ub == t.nVal) {
-      t.causalKeyBound = false;
-    } else if (auto mn = ub.getDefiningOp<mlir::arith::MinSIOp>()) {
-      bool sawN = false, sawBlk = false;
-      for (int i = 0; i < 2; ++i) {
-        if (mn->getOperand(i) == t.nVal)
-          sawN = true;
-        if (auto mul = mn->getOperand(i).getDefiningOp<mlir::arith::MulIOp>())
-          for (int j = 0; j < 2; ++j)
-            if (FusedAttnTemplate::isIntConst(mul->getOperand(1 - j), t.BM))
-              if (auto ad =
-                      mul->getOperand(j).getDefiningOp<mlir::arith::AddIOp>())
-                for (int k = 0; k < 2; ++k)
-                  if (FusedAttnTemplate::isIntConst(ad->getOperand(1 - k), 1) &&
-                      ad->getOperand(k)
-                          .getDefiningOp<mlir::triton::GetProgramIdOp>())
-                    sawBlk = true;
-      }
-      if (!sawN || !sawBlk) {
-        t.no("key loop bound is neither N nor min((pid+1)*BM, N)");
-        goto rejected;
-      }
-      t.causalKeyBound = true;
-    } else {
-      t.no("key loop bound is neither N nor min((pid+1)*BM, N)");
-      goto rejected;
     }
 
-    // COVERAGE. Anything the walk did not reach is an op the emitter does not
-    // implement — the gate that makes over-matching structurally impossible.
-    for (mlir::Operation &op : *body)
-      if (!t.claimed.count(&op)) {
-        t.offender = &op;
-        t.no("unclaimed op in the loop body");
-        goto rejected;
-      }
+    // COVERAGE, the gate that makes over-matching structurally impossible.
+    if (!faCoverageOk(t))
+      goto rejected;
   }
-
   {
-    // --- build metal.fused_attention + its score region ---
-    mlir::OpBuilder builder(forOp);
-    auto loc = forOp.getLoc();
+    // --- build metal.fused_attention + its two regions ---
+    mlir::OpBuilder builder(phases.front().forOp
+                                ? phases.front().forOp.getOperation()
+                                : t.store.getOperation());
+    auto loc = t.store.getLoc();
     auto f32 = builder.getF32Type();
     auto si32 = mlir::IntegerType::get(builder.getContext(), 32,
                                        mlir::IntegerType::Signed);
@@ -14866,66 +13953,176 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
         bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e),
         bridge(t.strideQ, u32e), bridge(t.strideK, u32e),
         bridge(t.strideV, u32e), bridge(t.strideO, u32e),
-        t.hVal ? bridge(t.hVal, u32e) : mlir::Value(), paramBufs, t.BM, t.BN,
-        t.BD,
+        t.hVal ? bridge(t.hVal, u32e) : mlir::Value(), paramBufs, t.BM,
+        phases.front().BN, t.BD, (int64_t)phases.size(),
         t.softmax ? mlir::triton::metal::AttnNorm::OnlineSoftmax
                   : mlir::triton::metal::AttnNorm::None,
-        t.causalKeyBound, t.naturalExp);
+        t.naturalExp);
 
-    mlir::Block *rb = &op.getScore().emplaceBlock();
-    llvm::SmallVector<mlir::Type> argTys{f32, si32, si32};
-    llvm::SmallVector<mlir::Location> argLocs{loc, loc, loc};
-    for (mlir::Type pt : paramTys) {
-      argTys.push_back(pt);
-      argLocs.push_back(loc);
-    }
-    rb->addArguments(argTys, argLocs);
+    // Both regions take the same trailing params in the same order; only the
+    // pinned prefix differs (score/row/key/phase vs blk/phase/m/n).
+    auto addBlock = [&](mlir::Region &r, llvm::ArrayRef<mlir::Type> fixed) {
+      mlir::Block *b = &r.emplaceBlock();
+      llvm::SmallVector<mlir::Type> tys(fixed.begin(), fixed.end());
+      llvm::SmallVector<mlir::Location> locs(fixed.size(), loc);
+      for (mlir::Type pt : paramTys) {
+        tys.push_back(pt);
+        locs.push_back(loc);
+      }
+      b->addArguments(tys, locs);
+      return b;
+    };
 
-    llvm::DenseMap<void *, mlir::Value> leaf, memo;
-    leaf[dotQK.getResult().getAsOpaquePointer()] = rb->getArgument(0);
-    if (t.rowIdx)
-      leaf[t.peel(t.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
-    if (t.keyIdx)
-      leaf[t.peel(t.keyIdx).getAsOpaquePointer()] = rb->getArgument(2);
-    for (auto [i, p] : llvm::enumerate(t.params))
-      leaf[p.getAsOpaquePointer()] = rb->getArgument(3 + i);
+    // Per-phase cones are selected on the region's `phase` argument. The
+    // emitter binds it to a LITERAL per phase, so the selects fold away in the
+    // Metal compiler rather than costing a branch per key.
+    auto phaseSelect = [&](mlir::OpBuilder &b, mlir::Value phaseArg, int64_t k,
+                           mlir::Value ifPhase, mlir::Value otherwise) {
+      mlir::Value kc = mlir::triton::metal::ConstantOp::create(
+                           b, loc, b.getIntegerAttr(si32, k))
+                           .getResult();
+      mlir::Value eq =
+          mlir::triton::metal::BinaryExpOp::create(
+              b, loc, mlir::triton::metal::BinaryExpOperator::eqOp, phaseArg,
+              kc)
+              .getResult();
+      return mlir::arith::SelectOp::create(b, loc, eq, ifPhase, otherwise)
+          .getResult();
+    };
 
+    // --- score region ---
+    mlir::Block *rb = addBlock(op.getScore(), {f32, si32, si32, si32});
     mlir::OpBuilder rbb(rb, rb->end());
-    mlir::Value w = emitConeScalar(rbb, loc, t.scoreOut, leaf, memo);
-    if (!w) {
-      op.erase();
-      t.no("score cone could not be translated into the region");
-      goto rejected;
-    }
-    // Re-apply the numerator's zeroing masks as a logit of -inf. The source
-    // zeroes P AFTER exponentiating; -inf before it is the same key set, and it
-    // keeps the whole mask inside the region where the emitter's own running
-    // max can see it. (Both emitter bodies guard `exp(-inf - -inf)`.)
-    for (auto &zp : t.zeroPreds) {
-      mlir::Value c = emitConeScalar(rbb, loc, zp.first, leaf, memo);
-      if (!c) {
+    mlir::Value w;
+    for (int64_t i = (int64_t)phases.size() - 1; i >= 0; --i) {
+      FaPhase &ph = phases[i];
+      // Fresh maps per phase: the same source value can mean different things
+      // under two phases' leaf bindings, so a shared memo would be a silent
+      // cross-phase substitution.
+      llvm::DenseMap<void *, mlir::Value> leaf, memo;
+      leaf[ph.dotQK.getResult().getAsOpaquePointer()] = rb->getArgument(0);
+      if (ph.rowIdx)
+        leaf[t.peel(ph.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
+      if (ph.keyIdx)
+        leaf[t.peel(ph.keyIdx).getAsOpaquePointer()] = rb->getArgument(2);
+      for (auto [j, p] : llvm::enumerate(t.params))
+        leaf[p.getAsOpaquePointer()] = rb->getArgument(4 + j);
+
+      mlir::Value wi = emitConeScalar(rbb, loc, ph.scoreOut, leaf, memo);
+      if (!wi) {
         op.erase();
-        t.no("a numerator mask could not be translated into the region");
+        t.no("score cone could not be translated into the region");
         goto rejected;
       }
-      mlir::Value fill = mlir::triton::metal::ConstantOp::create(
-                             rbb, loc,
-                             rbb.getFloatAttr(
-                                 f32, -std::numeric_limits<double>::infinity()))
-                             .getResult();
-      w = mlir::arith::SelectOp::create(rbb, loc, c, zp.second ? fill : w,
-                                        zp.second ? w : fill)
-              .getResult();
+      // Re-apply the numerator's zeroing masks as a logit of -inf. The source
+      // zeroes P AFTER exponentiating; -inf before it is the same key set, and
+      // it keeps the whole mask inside the region where the emitter's own
+      // running max can see it. (Both emitter bodies guard exp(-inf - -inf).)
+      for (auto &zp : ph.zeroPreds) {
+        mlir::Value c = emitConeScalar(rbb, loc, zp.first, leaf, memo);
+        if (!c) {
+          op.erase();
+          t.no("a numerator mask could not be translated into the region");
+          goto rejected;
+        }
+        mlir::Value fill =
+            mlir::triton::metal::ConstantOp::create(
+                rbb, loc,
+                rbb.getFloatAttr(f32,
+                                 -std::numeric_limits<double>::infinity()))
+                .getResult();
+        wi = mlir::arith::SelectOp::create(rbb, loc, c, zp.second ? fill : wi,
+                                           zp.second ? wi : fill)
+                 .getResult();
+      }
+      w = w ? phaseSelect(rbb, rb->getArgument(3), i, wi, w) : wi;
     }
     mlir::triton::metal::ScoreYieldOp::create(rbb, loc, w);
 
-    // DCE the now-dead loop / epilogue / loads in the entry block.
-    mlir::Block *blk = forOp->getBlock();
+    // --- key-bounds region: the key range each phase sweeps ---
+    mlir::Block *kbb = addBlock(op.getKeyBounds(), {si32, si32, si32, si32});
+    {
+      mlir::OpBuilder bb(kbb, kbb->end());
+      auto konst = [&](int64_t c) {
+        return mlir::triton::metal::ConstantOp::create(
+                   bb, loc, bb.getIntegerAttr(si32, c))
+            .getResult();
+      };
+      // Integer kernel scalars bridge as ui32 STORAGE (signless i32 is not a
+      // Metal_Type) while the pinned index args are si32, so a bound read from
+      // a param arrives with the wrong signedness for `metal.binary_exp`. Both
+      // are small non-negative counts, so widening to signed is
+      // value-preserving.
+      auto toSi = [&](mlir::Value v) {
+        return !v || v.getType() == si32
+                   ? v
+                   : mlir::triton::metal::CastOp::create(bb, loc, si32, v)
+                         .getResult();
+      };
+      mlir::Value beg, end;
+      for (int64_t i = (int64_t)phases.size() - 1; i >= 0; --i) {
+        FaPhase &ph = phases[i];
+        llvm::DenseMap<void *, mlir::Value> leaf, memo;
+        for (auto [j, p] : llvm::enumerate(t.params))
+          leaf[p.getAsOpaquePointer()] = kbb->getArgument(4 + j);
+        // Pinned AFTER the params so they win if an extent is also a param.
+        for (mlir::Value pv : t.pidVals)
+          leaf[pv.getAsOpaquePointer()] = kbb->getArgument(0);
+        leaf[t.mVal.getAsOpaquePointer()] = kbb->getArgument(2);
+        leaf[t.nVal.getAsOpaquePointer()] = kbb->getArgument(3);
+
+        mlir::Value bi = konst(0);
+        if (ph.keyBeg) {
+          bi = toSi(emitConeScalar(bb, loc, ph.keyBeg, leaf, memo));
+          if (!bi) {
+            op.erase();
+            t.no("a key-range start could not be translated into the region");
+            goto rejected;
+          }
+        }
+        mlir::Value ei;
+        if (ph.keyEnd) {
+          ei = toSi(emitConeScalar(bb, loc, ph.keyEnd, leaf, memo));
+          if (!ei) {
+            op.erase();
+            t.no("a key-range end could not be translated into the region");
+            goto rejected;
+          }
+          if (ph.keyEndMul != 1)
+            ei = mlir::triton::metal::BinaryExpOp::create(
+                     bb, loc, mlir::triton::metal::BinaryExpOperator::mulOp,
+                     ei, konst(ph.keyEndMul))
+                     .getResult();
+        } else {
+          ei = mlir::triton::metal::BinaryExpOp::create(
+                   bb, loc, mlir::triton::metal::BinaryExpOperator::addOp, bi,
+                   konst(ph.keyEndConst))
+                   .getResult();
+        }
+        if (ph.keyBound) {
+          mlir::Value bnd = toSi(emitConeScalar(bb, loc, ph.keyBound, leaf, memo));
+          if (!bnd) {
+            op.erase();
+            t.no("a key-range bound could not be translated into the region");
+            goto rejected;
+          }
+          ei = mlir::triton::metal::BinaryExpOp::create(
+                   bb, loc, mlir::triton::metal::BinaryExpOperator::minOp, ei,
+                   bnd)
+                   .getResult();
+        }
+        beg = beg ? phaseSelect(bb, kbb->getArgument(1), i, bi, beg) : bi;
+        end = end ? phaseSelect(bb, kbb->getArgument(1), i, ei, end) : ei;
+      }
+      mlir::triton::metal::KeyBoundsYieldOp::create(bb, loc, beg, end);
+    }
+
+    // DCE the now-dead loops / epilogue / loads in the entry block.
     bool changed = true;
     while (changed) {
       changed = false;
       for (mlir::Operation &o :
-           llvm::make_early_inc_range(llvm::reverse(*blk))) {
+           llvm::make_early_inc_range(llvm::reverse(*t.entry))) {
         if (&o == op.getOperation() || o.hasTrait<mlir::OpTrait::IsTerminator>())
           continue;
         if (o.use_empty()) {
@@ -14947,6 +14144,7 @@ rejected:
   }
   return mlir::failure();
 }
+
 
 // Runs AFTER the flash/sink matchers, so it is the FLOOR beneath them: kernels
 // they already claim keep their proven (and, for flash, simdgroup) bodies, and
@@ -15023,33 +14221,14 @@ struct ConvertTritonGPUToMetalPass
     // `scf.for(s1d += reduce(delta2d, axis=0))`. tutorial-05 `_layer_norm_bwd_dwdb`.
     reassociateLoopCarriedAxis0Reduce(moduleOp);
 
-    // Escape hatch for measuring fused-attention coverage: with the legacy
-    // sink matcher off, its test suite becomes a direct parity bar for
-    // `metal.fused_attention`, which is the precondition for deleting that op.
-    // (`metal.flash_attention` cleared this bar and is gone; its two suites now
-    // run entirely on the fused op.) Mirrors TRITON_METAL_SCALAR_DOT=1.
-    //
-    // ⚠️ ALWAYS pair it with TRITON_ALWAYS_COMPILE=1. This variable is not part
-    // of Triton's kernel cache key, so without that a measurement run happily
-    // reuses kernels the LEGACY path compiled earlier and reports full parity
-    // (86/86 here) when the true number is 24/86.
-    const bool legacyAttn = !::getenv("TRITON_METAL_NO_LEGACY_ATTN");
-
-    // Same window, same reason: recognize the causal + attention-sinks +
-    // sliding-window kernel (a sink block feeding a local-window loop, K loaded
-    // pre-transposed, exp2 with a runtime scale) and replace the whole body
-    // with one `metal.sink_attention`. Runs after the FA matcher; that matcher
-    // cannot see this kernel at all (it has no `tt.trans` to classify its dots
-    // by), so the two never contend. See metal-attention-with-sinks-plan.md.
-    if (legacyAttn)
-      runSinkAttentionMatcher(moduleOp);
-
-    // Generalized attention: the `dot -> score transform -> dot` chain with the
-    // transform carried as a REGION instead of baked into a per-variant emitter.
-    // Runs LAST of the three so it is the floor beneath them — kernels the two
-    // bespoke matchers claim keep their proven bodies, and this only sees what
-    // they declined (today: medium-decaying_causal_attention.py, which has no
-    // softmax at all and so matches neither).
+    // Attention: the `dot -> score transform -> dot` chain, collapsed into one
+    // `metal.fused_attention` with the transform carried as a REGION. This is
+    // the ONLY attention matcher -- `metal.flash_attention` and
+    // `metal.sink_attention` are both gone, and the four suites that backed
+    // them (flash, sliding-window, sinks, decaying-causal) run through here.
+    // It must run before the cvt classifier: the PV dot's A operand is a
+    // computed `exp`, so its dot-operand convert_layouts cannot be absorbed by
+    // the matmul track and would hit the L1d3 reject.
     runFusedAttentionMatcher(moduleOp);
 
     // L1d3: rewire dot-feeding ttg.convert_layout(blocked -> dot_op) ops

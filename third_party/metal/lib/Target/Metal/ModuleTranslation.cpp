@@ -272,30 +272,24 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   // kernel body references it (via metal.threadgroup_id). This keeps
   // existing single-program fixtures' MSL signatures unchanged. See
   // `.omc/specs/deep-interview-metal-pid-lowering.md`.
-  // The attention ops need the threadgroup position (program id) AND the LOCAL
-  // thread index: the single-warp guard must key off
-  // thread_position_in_threadgroup, since thread_position_in_grid is global and
+  // metal.fused_attention needs the threadgroup position (program id) AND the
+  // LOCAL thread index: the threadgroup position selects the query block and,
+  // with a head split, the head, while the single-warp guard must key off
+  // thread_position_in_threadgroup -- thread_position_in_grid is global and
   // would mis-identify the 2nd query block's warp (Phase-0 finding).
-  bool usesFlashAttention = false;
-  op.walk([&](mlir::triton::metal::SinkAttentionOp) {
-    usesFlashAttention = true;
-    return mlir::WalkResult::interrupt();
-  });
-  // metal.fused_attention: same needs (threadgroup position selects the query
-  // block and, with a head split, the head; local thread index drives the
-  // one-query-row-per-lane mapping and the single-warp guard).
+  bool usesFusedAttention = false;
   op.walk([&](mlir::triton::metal::FusedAttentionOp) {
-    usesFlashAttention = true;
+    usesFusedAttention = true;
     return mlir::WalkResult::interrupt();
   });
-  bool usesThreadgroupId = usesFlashAttention;
+  bool usesThreadgroupId = usesFusedAttention;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
     return mlir::WalkResult::interrupt();
   });
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
-  if (usesFlashAttention)
+  if (usesFusedAttention)
     _output << ",\n  uint3 ltid [[thread_position_in_threadgroup]]";
   // Conditionally add the threadgroups-per-grid parameter only when the
   // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
@@ -352,7 +346,6 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
@@ -400,7 +393,6 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
@@ -1817,169 +1809,21 @@ static void emitMaxSumBody(llvm::raw_ostream &os, int curIndent,
   os << "normalizer = simd_sum(normalizer);";
 }
 
-void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
-  // Emits the Phase-0-validated sink-attention body: one query row per lane,
-  // keys walked one at a time, online-softmax state updated PER KEY. No S/P
-  // staging, no key blocking, and — after the single post-staging barrier —
-  // no cross-lane traffic at all, since every lane owns one row of qbuf/obuf/
-  // rmax/rsum. See metal-attention-with-sinks-phase0-spike.py.
-  const int64_t BM = op.getBm(), BD = op.getBd(), BS = op.getBs();
-  const int64_t LOCAL_LEN = op.getLocalLen();
-  const int64_t SZ_Q = BM * BD;
-
-  auto bufName = [&](mlir::Value m) -> std::string {
-    // The usual operand walk: through conversion casts and a
-    // post-conversion `get_element(buffer[0])` to the underlying buffer.
-    for (;;) {
-      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-        if (cast.getInputs().size() != 1)
-          break;
-        m = cast.getInputs()[0];
-      }
-      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
-        m = ge.getMemref();
-        continue;
-      }
-      break;
-    }
-    auto it = _buffers.find(m.getAsOpaquePointer());
-    if (it == _buffers.end()) {
-      // NEVER fall back to buffer 0: `bufName`'s silent buffer-v0 fallback is
-      // how a mis-bound operand turns into a kernel that reads Q[0][0] as its
-      // sequence length and writes nothing. The matcher-side gate is
-      // trySinkAttention's kernel-arg check; this is the backstop.
-      op.emitError() << "metal.sink_attention: operand does not resolve to a "
-                        "kernel buffer (matcher bound a non-kernel-arg value); "
-                        "refusing to emit";
-      _emitFailed = true;
-      return "<unresolved>";
-    }
-    return "v" + std::to_string(it->second);
-  };
-  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
-                    V = bufName(op.getV()), O = bufName(op.getOut());
-  const std::string M = bufName(op.getM()) + "[0]";
-  const std::string DH = bufName(op.getDHead()) + "[0]";
-  const std::string SCALE = bufName(op.getScale()) + "[0]";
-  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
-  const std::string SK = bufName(op.getStrideK()) + "[0]";
-  const std::string SV = bufName(op.getStrideV()) + "[0]";
-  const std::string SO = bufName(op.getStrideO()) + "[0]";
-  auto S = [](int64_t x) { return std::to_string(x); };
-
+bool ModuleTranslation::bindFusedRegionArgs_(
+    mlir::triton::metal::FusedAttentionOp op, mlir::Block &body,
+    llvm::ArrayRef<std::string> fixedInits, llvm::StringRef ind) {
   auto &os = _output;
-  // One key's contribution: scalar inner product, then the online-softmax
-  // merge. `(m_old == m_new) ? 1` keeps exp2(-inf - -inf) = NaN out of the
-  // running state on the first visited key (m_old is -INFINITY there).
-  auto step = [&](const char *ind) {
-    os << ind << "  float _sa_a = 0.0f;\n";
-    os << ind << "  for (uint d = 0; d < _sa_dh; ++d)\n";
-    os << ind << "    _sa_a += _sa_qbuf[_sa_q * " << S(BD) << "u + d] * " << K
-       << "[(uint)_sa_key * _sa_sk + d];\n";
-    os << ind << "  float _sa_s = _sa_a * _sa_scale;\n";
-    os << ind << "  float _sa_mold = _sa_rmax[_sa_q];\n";
-    os << ind << "  float _sa_mnew = max(_sa_mold, _sa_s);\n";
-    os << ind
-       << "  float _sa_sc = (_sa_mold == _sa_mnew) ? 1.0f : exp2(_sa_mold - "
-          "_sa_mnew);\n";
-    os << ind << "  float _sa_p = exp2(_sa_s - _sa_mnew);\n";
-    os << ind << "  _sa_rsum[_sa_q] = _sa_rsum[_sa_q] * _sa_sc + _sa_p;\n";
-    os << ind << "  _sa_rmax[_sa_q] = _sa_mnew;\n";
-    os << ind << "  for (uint d = 0; d < _sa_dh; ++d)\n";
-    os << ind << "    _sa_obuf[_sa_q * " << S(BD) << "u + d] = _sa_obuf[_sa_q * "
-       << S(BD) << "u + d] * _sa_sc + _sa_p * " << V
-       << "[(uint)_sa_key * _sa_sv + d];\n";
-  };
-
-  os << "\n  // ---- metal.sink_attention (per-key online softmax) ----\n";
-  os << "  threadgroup float _sa_qbuf[" << S(SZ_Q) << "];\n";
-  os << "  threadgroup float _sa_obuf[" << S(SZ_Q) << "];\n";
-  os << "  threadgroup float _sa_rmax[" << S(BM) << "];\n";
-  os << "  threadgroup float _sa_rsum[" << S(BM) << "];\n";
-  os << "  {\n";
-  os << "  uint _sa_lane = ltid.x & 31u;\n";
-  os << "  bool _sa_active = ltid.x < 32u;\n";
-  os << "  uint _sa_M = " << M << ";\n";
-  os << "  uint _sa_dh = " << DH << ";\n";
-  os << "  float _sa_scale = " << SCALE << ";\n";
-  os << "  uint _sa_sq = " << SQ << ";\n";
-  os << "  uint _sa_sk = " << SK << ";\n";
-  os << "  uint _sa_sv = " << SV << ";\n";
-  os << "  uint _sa_so = " << SO << ";\n";
-  // Signed on purpose: `row - W + 1` and `rowoff - W + 1` go negative, and the
-  // counts arrive through `device uint32_t*` buffers.
-  if (op.getSinksConst())
-    os << "  int _sa_S = " << *op.getSinksConst() << ";\n";
-  else
-    os << "  int _sa_S = (int)" << bufName(op.getNumSinks()) << "[0];\n";
-  if (op.getWindowConst())
-    os << "  int _sa_W = " << *op.getWindowConst() << ";\n";
-  else
-    os << "  int _sa_W = (int)" << bufName(op.getWindow()) << "[0];\n";
-  os << "  uint _sa_rowoff = tgid.x * " << S(BM) << "u;\n";
-  // stage Q + zero the accumulator / running state
-  os << "  if (_sa_active) {\n";
-  os << "    for (uint c = _sa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
-  os << "      uint qq = c / " << S(BD) << "u; uint d = c % " << S(BD)
-     << "u; uint row = _sa_rowoff + qq;\n";
-  os << "      _sa_qbuf[c] = (row < _sa_M && d < _sa_dh) ? " << Q
-     << "[row * _sa_sq + d] : 0.0f;\n";
-  os << "      _sa_obuf[c] = 0.0f;\n";
-  os << "    }\n";
-  os << "    if (_sa_lane < " << S(BM)
-     << "u) { _sa_rmax[_sa_lane] = -INFINITY; _sa_rsum[_sa_lane] = 0.0f; }\n";
-  os << "  }\n";
-  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "  if (_sa_active) {\n";
-  os << "    uint _sa_q = _sa_lane; uint _sa_row = _sa_rowoff + _sa_q;\n";
-  // `q < BM` FIRST: every per-row buffer is sized by BM, and `row < M` does not
-  // imply it when BM < 32 (the FA emitter learned this the hard way).
-  os << "    if (_sa_q < " << S(BM) << "u && _sa_row < _sa_M) {\n";
-  os << "      int _sa_irow = (int)_sa_row;\n";
-  // phase 0: sink tokens, keys [0, bs)
-  os << "      for (int _sa_key = 0; _sa_key < " << S(BS) << "; ++_sa_key) {\n";
-  os << "        if (!(_sa_key < _sa_S && _sa_key <= _sa_irow)) continue;\n";
-  step("        ");
-  os << "      }\n";
-  // phase 1: local window, keys [local_start, local_start + local_len)
-  os << "      int _sa_lstart = max((int)_sa_rowoff - _sa_W + 1, _sa_S);\n";
-  os << "      for (int _sa_t = 0; _sa_t < " << S(LOCAL_LEN)
-     << "; ++_sa_t) {\n";
-  os << "        int _sa_key = _sa_lstart + _sa_t;\n";
-  os << "        if (!(_sa_key < (int)_sa_M && _sa_key <= _sa_irow &&\n";
-  os << "              _sa_key >= _sa_irow - _sa_W + 1 && _sa_key >= _sa_S)) "
-        "continue;\n";
-  step("        ");
-  os << "      }\n";
-  // epilogue: plain divide — a row with no visible key yields NaN, which is
-  // what the source kernel's `acc / l_i` produces.
-  os << "      float _sa_denom = _sa_rsum[_sa_q];\n";
-  os << "      for (uint d = 0; d < _sa_dh; ++d)\n";
-  os << "        " << O << "[_sa_row * _sa_so + d] = _sa_obuf[_sa_q * " << S(BD)
-     << "u + d] / _sa_denom;\n";
-  os << "    }\n";
-  os << "  }\n";
-  os << "  }";
-}
-
-std::string ModuleTranslation::emitScoreRegion_(
-    mlir::triton::metal::FusedAttentionOp op, llvm::StringRef scoreExpr,
-    llvm::StringRef rowExpr, llvm::StringRef keyExpr, llvm::StringRef ind) {
-  mlir::Block &body = op.getScore().front();
-  auto &os = _output;
-
-  // Bind the region's block args to MSL temps and register them in `_buffers`,
-  // which is what `translateVarName` consults — so every use inside the region
-  // renders as `v<idx>` with no special-casing in the value translators.
+  // Bind each block arg to an MSL temp and register it in `_buffers`, which is
+  // what `translateVarName` consults — so every use inside the region renders
+  // as `v<idx>` with no special-casing in the value translators.
   auto bind = [&](mlir::Value arg, llvm::StringRef init) {
     unsigned idx = _varCount++;
     os << ind << typeToString(arg.getType()) << " v" << idx << " = " << init
        << ";\n";
     _buffers[arg.getAsOpaquePointer()] = idx;
   };
-  bind(body.getArgument(0), scoreExpr);
-  bind(body.getArgument(1), rowExpr);
-  bind(body.getArgument(2), keyExpr);
+  for (auto [i, init] : llvm::enumerate(fixedInits))
+    bind(body.getArgument(i), init);
   for (auto [i, p] : llvm::enumerate(op.getScoreParams())) {
     // `bufName`-equivalent walk; the operand is a kernel buffer, and the op
     // verifier already pinned the block-arg type to its element type.
@@ -2002,16 +1846,36 @@ std::string ModuleTranslation::emitScoreRegion_(
                      << " does not resolve to a kernel buffer (matcher bound a "
                         "non-kernel-arg value); refusing to emit";
       _emitFailed = true;
-      return "0.0f";
+      return false;
     }
-    bind(body.getArgument(3 + i), "v" + std::to_string(it->second) + "[0]");
+    bind(body.getArgument(fixedInits.size() + i),
+         "v" + std::to_string(it->second) + "[0]");
   }
+  return true;
+}
 
-  // The region is a pure scalar DAG (masking is `arith.select`, not control
-  // flow), so IR order is a valid emission order. Force each result into a
-  // let-binding rather than letting uses re-inline the producing expression:
-  // the region is emitted inside the per-key loop, and re-inlining a shared
-  // subexpression there would re-evaluate it per use.
+// Both regions are pure scalar DAGs (masking is `arith.select`, not control
+// flow), so IR order is a valid emission order below.
+
+std::string ModuleTranslation::emitScoreRegion_(
+    mlir::triton::metal::FusedAttentionOp op, llvm::StringRef scoreExpr,
+    llvm::StringRef rowExpr, llvm::StringRef keyExpr,
+    llvm::StringRef phaseExpr, llvm::StringRef ind) {
+  mlir::Block &body = op.getScore().front();
+  auto &os = _output;
+  // Each key phase re-emits the region. Clear the previous pass's let-bindings
+  // first: `translateValue` consults `_letBound`, so a stale entry makes this
+  // phase's code reference the PREVIOUS phase's block-scoped temp -- which
+  // compiles to "use of undeclared identifier" at best, and to reading another
+  // phase's value at worst.
+  for (mlir::Operation &o : body)
+    _letBound.erase(&o);
+  if (!bindFusedRegionArgs_(op, body,
+                            {scoreExpr.str(), rowExpr.str(), keyExpr.str(),
+                             phaseExpr.str()},
+                            ind))
+    return "0.0f";
+
   for (mlir::Operation &o : body) {
     if (mlir::isa<mlir::triton::metal::ScoreYieldOp>(o))
       continue;
@@ -2034,6 +1898,68 @@ std::string ModuleTranslation::emitScoreRegion_(
   translateValueOrVarName(yield.getValue());
   os << ";\n";
   return "v" + std::to_string(outIdx);
+}
+
+std::pair<std::string, std::string> ModuleTranslation::emitKeyBoundsRegion_(
+    mlir::triton::metal::FusedAttentionOp op, llvm::StringRef blkExpr,
+    llvm::StringRef phaseExpr, llvm::StringRef mExpr, llvm::StringRef nExpr,
+    llvm::StringRef ind) {
+  mlir::Block &body = op.getKeyBounds().front();
+  auto &os = _output;
+  // Each key phase re-emits the region. Clear the previous pass's let-bindings
+  // first: `translateValue` consults `_letBound`, so a stale entry makes this
+  // phase's code reference the PREVIOUS phase's block-scoped temp -- which
+  // compiles to "use of undeclared identifier" at best, and to reading another
+  // phase's value at worst.
+  for (mlir::Operation &o : body)
+    _letBound.erase(&o);
+  if (!bindFusedRegionArgs_(op, body,
+                            {blkExpr.str(), phaseExpr.str(), mExpr.str(),
+                             nExpr.str()},
+                            ind))
+    return {"0", "0"};
+
+  for (mlir::Operation &o : body) {
+    if (mlir::isa<mlir::triton::metal::KeyBoundsYieldOp>(o))
+      continue;
+    if (o.getNumResults() != 1) {
+      op.emitError() << "metal.fused_attention: key_bounds region op '"
+                     << o.getName() << "' does not produce exactly one result";
+      _emitFailed = true;
+      return {"0", "0"};
+    }
+    unsigned idx = _varCount++;
+    os << ind << typeToString(o.getResult(0).getType()) << " v" << idx << " = ";
+    translateValue(&o);
+    os << ";\n";
+    _letBound[&o] = idx;
+  }
+
+  auto yield = mlir::cast<mlir::triton::metal::KeyBoundsYieldOp>(
+      body.getTerminator());
+  // Floored at 0 on the way out: the region reproduces the source's own bound
+  // arithmetic, which for a sliding window goes NEGATIVE
+  // (`pid*bm - window + 1`) before its `max(..., num_sinks)`, and the loop
+  // counter is unsigned, so a negative start would wrap to a colossal trip
+  // count. There is deliberately no upper clamp against `n`: each phase's range
+  // already carries the `key < X` bound of that phase's OWN K load, which is
+  // what decides the keys the source reads. Clamping to a single global `n`
+  // instead is what let an attention-sinks prologue's `key < num_sinks` bound
+  // truncate the sliding-window phase.
+  auto one = [&](mlir::Value v, const char *name) {
+    unsigned idx = _varCount++;
+    os << ind << "int _fa_r" << idx << " = ";
+    translateValueOrVarName(v);
+    os << ";\n";
+    os << ind << "uint " << name << " = (uint)max(_fa_r" << idx << ", 0);\n";
+    return std::string(name);
+  };
+  // Stable names rather than `v<n>`: these two bound the key sweep, and a
+  // reader of the generated MSL should be able to find them. Each phase emits
+  // inside its own block, so the names do not collide across phases.
+  std::string beg = one(yield.getStart(), "_fa_kbeg");
+  std::string end = one(yield.getEnd(), "_fa_kend");
+  return {beg, end};
 }
 
 // Simdgroup body: both matmuls on the matrix unit, with the score transform
@@ -2136,11 +2062,13 @@ void ModuleTranslation::emitFusedAttentionMma_(
        << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
   os << "  }\n";
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  if (op.getCausalKeyBound())
-    os << "  uint _fa_kend = min((tgid.x + 1u) * " << S(BM) << "u, _fa_N);\n";
-  else
-    os << "  uint _fa_kend = _fa_N;\n";
-  os << "  for (uint kb = 0; kb < _fa_kend; kb += " << S(BN) << "u) {\n";
+  // The key range this program sweeps, computed by the op's key-bounds region.
+  // A causal kernel's `min((pid+1)*bm, n)` is that region's yielded `end`.
+  auto [_fa_kbeg, _fa_kend] =
+      emitKeyBoundsRegion_(op, "(int)tgid.x", "0 /*phase*/", "(int)_fa_M",
+                           "(int)_fa_N", "  ");
+  os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
+     << "; kb += " << S(BN) << "u) {\n";
   // Stage K^T and V for this key block.
   os << "    if (_fa_active) {\n";
   os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
@@ -2185,11 +2113,11 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
   os << "          uint _fa_key = kb + kk;\n";
-  os << "          if (_fa_key < _fa_N) {\n";
+  os << "          if (_fa_key < " << _fa_kend << ") {\n";
   {
     std::string sc = "_fa_sbuf[q*" + S(BN) + "u + kk]";
     std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
-                                     "            ");
+                                     "0 /*phase*/", "            ");
     os << "            _fa_pbuf[q*" << S(BN) << "u + kk] = " << w << ";\n";
   }
   os << "          } else {\n";
@@ -2286,7 +2214,15 @@ void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
   // 8192 floats == Apple's 32 KiB.
   // Safe to spend in full here because the op replaces the ENTIRE kernel body,
   // so nothing else in the kernel holds threadgroup memory.
-  const bool fits = need <= 8192 && BM % 8 == 0 && BN % 8 == 0 && BD % 8 == 0;
+  //
+  // Several key phases take the scalar body too. The simdgroup body stages a
+  // whole BN-wide key BLOCK per iteration, so a phase whose range is neither
+  // block-aligned nor block-sized would need its own staging pass; the scalar
+  // body walks keys one at a time and simply runs the phases back to back. That
+  // is not a regression against the hand-written body this replaces, which was
+  // per-key for the same reason.
+  const bool fits = need <= 8192 && BM % 8 == 0 && BN % 8 == 0 && BD % 8 == 0 &&
+                    op.getNumPhases() == 1;
   if (fits && !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR"))
     return emitFusedAttentionMma_(op);
   return emitFusedAttentionScalar_(op);
@@ -2294,8 +2230,7 @@ void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
 
 void ModuleTranslation::emitFusedAttentionScalar_(
     mlir::triton::metal::FusedAttentionOp op) {
-  // Correctness-first body, structurally the one validated for
-  // `metal.sink_attention`: one query row per lane, keys walked one at a time,
+  // Correctness-first body: one query row per lane, keys walked one at a time,
   // the score kept in a REGISTER — which is what lets an arbitrary score region
   // be evaluated inline with no S/P staging and no cross-lane traffic.
   //
@@ -2412,22 +2347,32 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   // not imply it when CH < 32 (the FA emitter learned this the hard way).
   os << "      if (_fa_q < " << S(CH) << "u && _fa_c0 + _fa_q < " << S(BM)
      << "u && _fa_row < _fa_M) {\n";
-  // Causal kernels bound their key loop at `min((pid+1)*BM, seq_len)` and never
-  // visit past it; reproduce that bound rather than sweeping [0, n) and relying
-  // on the region to zero those keys.
-  if (op.getCausalKeyBound())
-    os << "        uint _fa_kend = min((tgid.x + 1u) * " << S(BM)
-       << "u, _fa_N);\n";
-  else
-    os << "        uint _fa_kend = _fa_N;\n";
-  os << "        for (uint _fa_key = 0u; _fa_key < _fa_kend; ++_fa_key) {\n";
+  // One sweep per key phase, unrolled at emit time because `num_phases` is a
+  // compile-time attribute -- which also lets `phase` reach both regions as a
+  // literal, so a `select(phase == k, ...)` mask folds away in the Metal
+  // compiler rather than costing a branch per key.
+  //
+  // The phases share the running (accumulator, sum, max) state and run in
+  // source order. That is what makes them composable at all: an online softmax
+  // merges any partition of the key set, so visiting a sink block and then a
+  // sliding window gives the same answer as one sweep over their union -- while
+  // REPRODUCING the source's key set instead of arguing about it.
+  for (int64_t ph = 0; ph < op.getNumPhases(); ++ph) {
+    const std::string P = std::to_string(ph);
+    os << "        // --- key phase " << P << " ---\n";
+    os << "        {\n";
+    auto [kbeg, kend] = emitKeyBoundsRegion_(op, "(int)tgid.x", P + " /*phase*/",
+                                             "(int)_fa_M", "(int)_fa_N",
+                                             "        ");
+  os << "        for (uint _fa_key = " << kbeg << "; _fa_key < " << kend
+     << "; ++_fa_key) {\n";
   os << "          float _fa_a = 0.0f;\n";
   os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
   os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
      << "[_fa_key * _fa_sk + _fa_col + d];\n";
   // ---- the score transform, straight out of the op's region ----
   std::string w = emitScoreRegion_(op, "_fa_a", "(int)_fa_row", "(int)_fa_key",
-                                   "          ");
+                                   P + " /*phase*/", "          ");
   if (!softmax) {
     // norm = none: the transformed score IS the weight. The region is
     // responsible for zeroing keys that must not contribute, exactly as the
@@ -2463,6 +2408,8 @@ void ModuleTranslation::emitFusedAttentionScalar_(
        << "[_fa_key * _fa_sv + _fa_col + d];\n";
   }
   os << "        }\n";
+  os << "        }\n";
+  }
   if (softmax) {
     // Plain divide: a row with no visible key yields NaN, which is what the
     // source kernel's `acc / l_i` produces.

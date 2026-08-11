@@ -338,11 +338,17 @@ def test_attention_with_sinks_window_one():
 
 
 def test_attention_with_sinks_uses_the_fused_op():
-    """The kernel must go through `metal.sink_attention`, not some other path.
+    """The kernel must go through `metal.fused_attention`, not some other path.
 
-    Without this the numeric tests above would still pass if the fused op were
+    Without this the numeric tests above would still pass if the op were
     bypassed — and there is no other working path today, so a silent change of
     lowering would show up here first.
+
+    What is checked beyond the op name is that BOTH key phases survive. The
+    sink block and the sliding window are separate sweeps, and collapsing them
+    into one masked sweep over `[0, M)` would still pass every numeric test
+    here while being wrong in general: it is valid only when
+    `n_local_blocks*bn >= window + bm - 1`, and `window` is a runtime argument.
     """
     M, d, num_sinks, window_size = 64, 16, 4, 32
     Q, K, V, out = _inputs(M, d, seed=0x2)
@@ -360,9 +366,15 @@ def test_attention_with_sinks_uses_the_fused_op():
     msl = compiled.asm["metal"]
     if isinstance(msl, bytes):
         msl = msl.decode()
-    assert "metal.sink_attention" in msl
+    assert "metal.fused_attention" in msl
     # The two phases the emitter reproduces, and the exp2 the kernel asked for.
-    assert "_sa_lstart" in msl and "exp2" in msl
+    assert "// --- key phase 0 ---" in msl, msl[:2000]
+    assert "// --- key phase 1 ---" in msl, msl[:2000]
+    assert "// --- key phase 2 ---" not in msl
+    assert "exp2" in msl
+    # norm = online_softmax: the running state is present, and the epilogue
+    # divides by it.
+    assert "_fa_rmax" in msl and "_fa_rsum" in msl
 
 
 def test_attention_with_sinks_missing_escape_is_not_claimed():
@@ -395,15 +407,23 @@ def test_attention_with_sinks_missing_escape_is_not_claimed():
     )
 
 
-def test_attention_with_sinks_wide_head_rejects():
-    """`BLOCK_D = 128` needs `2*32*128 + 64 = 8256` threadgroup floats, over
-    Apple's 8192. The matcher declines rather than emitting an over-budget
-    kernel, so this is a compile error — the same ceiling `metal.flash_attention`
-    documents."""
+def test_attention_with_sinks_wide_head_is_correct_not_rejected():
+    """`BLOCK_D = 128` used to be a hard reject: `2*32*128 + 64 = 8256`
+    threadgroup floats against Apple's 8192, and the predecessor op's body had
+    nowhere else to go.
+
+    `metal.fused_attention` chunks the query-row block to fit the budget
+    instead of declining, so the shape now compiles and must be RIGHT. The
+    assertion is numeric on purpose — what can go wrong with a chunked body is
+    a wrong answer, not a crash, and a bare "it compiles now" check would pass
+    on a body that dropped half the rows."""
     M, d, num_sinks, window_size = 64, 128, 4, 32
     Q, K, V, out = _inputs(M, d, seed=0x4)
-    with pytest.raises(RuntimeError):
-        _solve(Q, K, V, out, M, d, num_sinks, window_size)
+    _solve(Q, K, V, out, M, d, num_sinks, window_size)
+    torch.mps.synchronize()
+    ref = _reference(Q, K, V, M, d, num_sinks, window_size)
+    err = (out.cpu().double() - ref).abs().max().item()
+    assert err <= 1e-5, f"max abs err {err:.3e}"
 
 
 def test_attention_with_sinks_writes_every_element():
