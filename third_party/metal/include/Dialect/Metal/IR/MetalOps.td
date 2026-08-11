@@ -700,6 +700,83 @@ def FlashAttentionOp : Metal_Op<"flash_attention", [AttrSizedOperandSegments]> {
 }
 
 //===----------------------------------------------------------------------===//
+// SinkAttentionOp
+//===----------------------------------------------------------------------===//
+
+def SinkAttentionOp : Metal_Op<"sink_attention", [AttrSizedOperandSegments]> {
+  let summary = "Causal attention with sink tokens and a one-sided sliding window";
+  let description = [{
+    Self-contained attention body for one query-row block of
+    `leet-triton/medium-attention_with_sinks.py`. For query row `i` and key `j`,
+    with `S = num_sinks` and `W = window`:
+
+        keep(i, j) = j <= i && (j < S || j >= i - W + 1)
+
+    i.e. causal, with the first `S` tokens always visible plus a one-sided
+    sliding window of width `W`. This is NOT the symmetric band
+    `abs(row - key) <= window` that `metal.flash_attention` implements, and the
+    key set is not a contiguous block range, which is why it is a separate op.
+
+    The emitted body walks keys ONE AT A TIME with one query row per lane and
+    updates the online-softmax state per key, so it needs no S/P staging and no
+    key blocking: the threadgroup working set is `2*bm*bd + 2*bm` floats and
+    must fit Apple's 32 KiB (8192 floats), capping `bd` at 64 for `bm == 32`.
+    That costs 2x the FMA work of a block-max formulation and gives up
+    simdgroup throughput; it is a correctness-first body. Validated by
+    `metal-attention-with-sinks-phase0-spike.py` (146 configs, <= 8.5e-07).
+
+    Keys are visited in the two phases the SOURCE kernel evaluates, not in the
+    order the mask above suggests: `[0, bs)` for the sinks, then
+    `[local_start, local_start + local_len)` for the window, where
+    `local_start = max(tgid.x*bm - W + 1, S)`. `local_len` is
+    `N_LOCAL_BLOCKS * BLOCK_N`, a host-side constexpr the source kernel is
+    specialized for. Reproducing the phases rather than the mathematical mask
+    means the emitted kernel agrees with the source kernel even when the host
+    passes a `window` too large for the `local_len` it was compiled with (both
+    drop the same keys), instead of silently disagreeing with it.
+
+    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
+    f32 with per-tensor row strides `stride_q`/`stride_k`/`stride_v`/`stride_o`
+    (this kernel passes four separate stride arguments, so they cannot be folded
+    into one `d_model` the way `metal.flash_attention` does). `m` is the query
+    row count AND the key count. `scale` is an f32 buffer holding the logit
+    scale with `log2(e)` already folded in by the host — the softmax uses
+    `exp2`, so the emitter must NOT recompute `1/sqrt(d_head)`.
+
+    `num_sinks` and `window` are OPTIONAL operands with constant fallbacks:
+    Triton drops a kernel argument equal to 1 from the signature and folds it
+    into a `dense<1>` constant, leaving no buffer to point at. Exactly one of
+    `num_sinks`/`sinks_const` and one of `window`/`window_const` is set.
+
+    The epilogue divides by the running sum without a zero test, so a row with
+    no visible key yields NaN — which is exactly what the source kernel's
+    `acc / l_i` produces.
+
+    The body runs on one warp (`ltid.x < 32`); under num_warps>1 the extra warps
+    idle. Only the post-staging barrier is shared, so they still reach it.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
+                       Metal_MemRefType:$v, Metal_MemRefType:$out,
+                       Metal_MemRefType:$m, Metal_MemRefType:$d_head,
+                       Metal_MemRefType:$scale,
+                       Metal_MemRefType:$stride_q, Metal_MemRefType:$stride_k,
+                       Metal_MemRefType:$stride_v, Metal_MemRefType:$stride_o,
+                       Optional<Metal_MemRefType>:$num_sinks,
+                       Optional<Metal_MemRefType>:$window,
+                       I64Attr:$bm, I64Attr:$bd, I64Attr:$bs,
+                       I64Attr:$local_len,
+                       OptionalAttr<I64Attr>:$sinks_const,
+                       OptionalAttr<I64Attr>:$window_const);
+
+  let assemblyFormat =
+      "$q `,` $k `,` $v `,` $out `,` $m `,` $d_head `,` $scale"
+      " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
+      " (`sinks` $num_sinks^)? (`window` $window^)? attr-dict"
+      " `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
 // ThreadgroupPrefixSumOp
 //===----------------------------------------------------------------------===//
 

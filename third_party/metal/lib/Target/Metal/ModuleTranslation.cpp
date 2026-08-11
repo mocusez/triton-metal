@@ -281,6 +281,12 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesFlashAttention = true;
     return mlir::WalkResult::interrupt();
   });
+  // metal.sink_attention has the same needs (threadgroup position for the query
+  // block, local thread index for the single-warp guard).
+  op.walk([&](mlir::triton::metal::SinkAttentionOp) {
+    usesFlashAttention = true;
+    return mlir::WalkResult::interrupt();
+  });
   bool usesThreadgroupId = usesFlashAttention;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
@@ -346,6 +352,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FlashAttentionOp,
+            mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -393,6 +400,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FlashAttentionOp,
+            mlir::triton::metal::SinkAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
@@ -1988,6 +1996,150 @@ void ModuleTranslation::translate(mlir::triton::metal::FlashAttentionOp op) {
   os << "      float inv = (denom != 0.0f) ? (1.0f / denom) : 0.0f;\n";
   os << "      for (uint d = 0; d < _fa_dhead; ++d)\n";  // d_head <= BD; skip padded cols
   os << "        " << O << "[row * _fa_dm + _fa_coloff + d] = _fa_obuf[q*" << S(BD) << "u + d] * inv;\n";
+  os << "    }\n";
+  os << "  }\n";
+  os << "  }";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::SinkAttentionOp op) {
+  // Emits the Phase-0-validated sink-attention body: one query row per lane,
+  // keys walked one at a time, online-softmax state updated PER KEY. No S/P
+  // staging, no key blocking, and — after the single post-staging barrier —
+  // no cross-lane traffic at all, since every lane owns one row of qbuf/obuf/
+  // rmax/rsum. See metal-attention-with-sinks-phase0-spike.py.
+  const int64_t BM = op.getBm(), BD = op.getBd(), BS = op.getBs();
+  const int64_t LOCAL_LEN = op.getLocalLen();
+  const int64_t SZ_Q = BM * BD;
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    // Same walk as metal.flash_attention: through conversion casts and a
+    // post-conversion `get_element(buffer[0])` to the underlying buffer.
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      // NEVER fall back to buffer 0 — see the FlashAttentionOp note above. The
+      // matcher-side gate is trySinkAttention's kernel-arg check; this is the
+      // backstop.
+      op.emitError() << "metal.sink_attention: operand does not resolve to a "
+                        "kernel buffer (matcher bound a non-kernel-arg value); "
+                        "refusing to emit";
+      _emitFailed = true;
+      return "<unresolved>";
+    }
+    return "v" + std::to_string(it->second);
+  };
+  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
+                    V = bufName(op.getV()), O = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string DH = bufName(op.getDHead()) + "[0]";
+  const std::string SCALE = bufName(op.getScale()) + "[0]";
+  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
+  const std::string SK = bufName(op.getStrideK()) + "[0]";
+  const std::string SV = bufName(op.getStrideV()) + "[0]";
+  const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+
+  auto &os = _output;
+  // One key's contribution: scalar inner product, then the online-softmax
+  // merge. `(m_old == m_new) ? 1` keeps exp2(-inf - -inf) = NaN out of the
+  // running state on the first visited key (m_old is -INFINITY there).
+  auto step = [&](const char *ind) {
+    os << ind << "  float _sa_a = 0.0f;\n";
+    os << ind << "  for (uint d = 0; d < _sa_dh; ++d)\n";
+    os << ind << "    _sa_a += _sa_qbuf[_sa_q * " << S(BD) << "u + d] * " << K
+       << "[(uint)_sa_key * _sa_sk + d];\n";
+    os << ind << "  float _sa_s = _sa_a * _sa_scale;\n";
+    os << ind << "  float _sa_mold = _sa_rmax[_sa_q];\n";
+    os << ind << "  float _sa_mnew = max(_sa_mold, _sa_s);\n";
+    os << ind
+       << "  float _sa_sc = (_sa_mold == _sa_mnew) ? 1.0f : exp2(_sa_mold - "
+          "_sa_mnew);\n";
+    os << ind << "  float _sa_p = exp2(_sa_s - _sa_mnew);\n";
+    os << ind << "  _sa_rsum[_sa_q] = _sa_rsum[_sa_q] * _sa_sc + _sa_p;\n";
+    os << ind << "  _sa_rmax[_sa_q] = _sa_mnew;\n";
+    os << ind << "  for (uint d = 0; d < _sa_dh; ++d)\n";
+    os << ind << "    _sa_obuf[_sa_q * " << S(BD) << "u + d] = _sa_obuf[_sa_q * "
+       << S(BD) << "u + d] * _sa_sc + _sa_p * " << V
+       << "[(uint)_sa_key * _sa_sv + d];\n";
+  };
+
+  os << "\n  // ---- metal.sink_attention (per-key online softmax) ----\n";
+  os << "  threadgroup float _sa_qbuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _sa_obuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _sa_rmax[" << S(BM) << "];\n";
+  os << "  threadgroup float _sa_rsum[" << S(BM) << "];\n";
+  os << "  {\n";
+  os << "  uint _sa_lane = ltid.x & 31u;\n";
+  os << "  bool _sa_active = ltid.x < 32u;\n";
+  os << "  uint _sa_M = " << M << ";\n";
+  os << "  uint _sa_dh = " << DH << ";\n";
+  os << "  float _sa_scale = " << SCALE << ";\n";
+  os << "  uint _sa_sq = " << SQ << ";\n";
+  os << "  uint _sa_sk = " << SK << ";\n";
+  os << "  uint _sa_sv = " << SV << ";\n";
+  os << "  uint _sa_so = " << SO << ";\n";
+  // Signed on purpose: `row - W + 1` and `rowoff - W + 1` go negative, and the
+  // counts arrive through `device uint32_t*` buffers.
+  if (op.getSinksConst())
+    os << "  int _sa_S = " << *op.getSinksConst() << ";\n";
+  else
+    os << "  int _sa_S = (int)" << bufName(op.getNumSinks()) << "[0];\n";
+  if (op.getWindowConst())
+    os << "  int _sa_W = " << *op.getWindowConst() << ";\n";
+  else
+    os << "  int _sa_W = (int)" << bufName(op.getWindow()) << "[0];\n";
+  os << "  uint _sa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  // stage Q + zero the accumulator / running state
+  os << "  if (_sa_active) {\n";
+  os << "    for (uint c = _sa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
+  os << "      uint qq = c / " << S(BD) << "u; uint d = c % " << S(BD)
+     << "u; uint row = _sa_rowoff + qq;\n";
+  os << "      _sa_qbuf[c] = (row < _sa_M && d < _sa_dh) ? " << Q
+     << "[row * _sa_sq + d] : 0.0f;\n";
+  os << "      _sa_obuf[c] = 0.0f;\n";
+  os << "    }\n";
+  os << "    if (_sa_lane < " << S(BM)
+     << "u) { _sa_rmax[_sa_lane] = -INFINITY; _sa_rsum[_sa_lane] = 0.0f; }\n";
+  os << "  }\n";
+  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "  if (_sa_active) {\n";
+  os << "    uint _sa_q = _sa_lane; uint _sa_row = _sa_rowoff + _sa_q;\n";
+  // `q < BM` FIRST: every per-row buffer is sized by BM, and `row < M` does not
+  // imply it when BM < 32 (the FA emitter learned this the hard way).
+  os << "    if (_sa_q < " << S(BM) << "u && _sa_row < _sa_M) {\n";
+  os << "      int _sa_irow = (int)_sa_row;\n";
+  // phase 0: sink tokens, keys [0, bs)
+  os << "      for (int _sa_key = 0; _sa_key < " << S(BS) << "; ++_sa_key) {\n";
+  os << "        if (!(_sa_key < _sa_S && _sa_key <= _sa_irow)) continue;\n";
+  step("        ");
+  os << "      }\n";
+  // phase 1: local window, keys [local_start, local_start + local_len)
+  os << "      int _sa_lstart = max((int)_sa_rowoff - _sa_W + 1, _sa_S);\n";
+  os << "      for (int _sa_t = 0; _sa_t < " << S(LOCAL_LEN)
+     << "; ++_sa_t) {\n";
+  os << "        int _sa_key = _sa_lstart + _sa_t;\n";
+  os << "        if (!(_sa_key < (int)_sa_M && _sa_key <= _sa_irow &&\n";
+  os << "              _sa_key >= _sa_irow - _sa_W + 1 && _sa_key >= _sa_S)) "
+        "continue;\n";
+  step("        ");
+  os << "      }\n";
+  // epilogue: plain divide — a row with no visible key yields NaN, which is
+  // what the source kernel's `acc / l_i` produces.
+  os << "      float _sa_denom = _sa_rsum[_sa_q];\n";
+  os << "      for (uint d = 0; d < _sa_dh; ++d)\n";
+  os << "        " << O << "[_sa_row * _sa_so + d] = _sa_obuf[_sa_q * " << S(BD)
+     << "u + d] / _sa_denom;\n";
   os << "    }\n";
   os << "  }\n";
   os << "  }";
