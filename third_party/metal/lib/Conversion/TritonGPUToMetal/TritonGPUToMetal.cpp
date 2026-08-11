@@ -761,6 +761,119 @@ struct GetNumProgramsLowering
 // `(pid_m*BLOCK_M + row) * stride_m + (pid_n*BLOCK_N + col)` as the
 // per-thread offset. See
 // `.omc/specs/deep-interview-metal-2d-maskedaccess-session2.md`.
+// Largest non-pointer rank-2 blocked tensor still visible in the module — the
+// tile whose (thread, iv) -> element bijection every op in the kernel shares.
+// Walks the whole module rather than the local op: the conversion driver may
+// already have rewritten the surrounding ops, and their MLIR-level types are
+// post-conversion scalars by then.
+static std::optional<TileInfo> findLargestRank2Tile(mlir::Operation *op) {
+  mlir::Operation *modOp = op->getParentOfType<mlir::ModuleOp>();
+  if (!modOp)
+    return std::nullopt;
+  std::optional<TileInfo> tile;
+  int64_t bestSize = 0;
+  modOp->walk([&](mlir::Operation *inner) {
+    for (auto v : inner->getResults()) {
+      auto info = tileFromTensor(v.getType());
+      if (!info)
+        continue;
+      // AC4-v6 intent (mirrored from findTileInfo): skip
+      // tensor<...x!tt.ptr<...>> in the bestSize tiebreaker.
+      if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+          rt && mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+        continue;
+      int64_t sz = 1;
+      for (auto s : info->shape)
+        sz *= s;
+      if (sz > bestSize) {
+        bestSize = sz;
+        tile = info;
+      }
+    }
+  });
+  return tile;
+}
+
+// One coordinate of the current element under that shared bijection: the flat
+// per-iter tile index (`localTid*E + iv` contiguous, `localTid + iv*tpb`
+// strided) decomposed by the parent layout's `order`. `axis` is the tile axis
+// wanted — 0 = row, 1 = column.
+//
+// Extracted from `MakeRangeLowering` so every consumer of the bijection derives
+// it from one place: a second copy that drifted would put two ops in the same
+// kernel on different element mappings, which reads as a plausible-but-wrong
+// result rather than a failure.
+static mlir::Value
+emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
+                  mlir::triton::gpu::BlockedEncodingAttr parent, int axis,
+                  mlir::ConversionPatternRewriter &rewriter,
+                  mlir::Location loc) {
+  auto i32 = rewriter.getI32Type();
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  // Metal `[[thread_position_in_grid]]` is GLOBAL, not per-CTA. For multi-CTA
+  // 2D dispatch we need the threadgroup-local tid:
+  // `lid.x = id.x - tgid.x * threadsPerCTA`.
+  auto tidGlobal =
+      ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
+  mlir::Value tidI32 = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{i32},
+                           mlir::ValueRange{tidGlobal.getResult()})
+                           .getResult(0);
+  auto tgX =
+      ThreadgroupIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
+  mlir::Value tgI32 = mlir::UnrealizedConversionCastOp::create(
+                          rewriter, loc, mlir::TypeRange{i32},
+                          mlir::ValueRange{tgX.getResult()})
+                          .getResult(0);
+  auto tpbAttr = rewriter.getI32IntegerAttr(tile.threadsPerBlock);
+  auto tpbConst = mlir::arith::ConstantOp::create(rewriter, loc, tpbAttr);
+  auto tgOffset =
+      mlir::arith::MulIOp::create(rewriter, loc, tgI32, tpbConst.getResult());
+  mlir::Value localTidI32 =
+      mlir::arith::SubIOp::create(rewriter, loc, tidI32, tgOffset.getResult())
+          .getResult();
+  mlir::Value idxI32 = localTidI32;
+  auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
+  if (parentFor && tile.elemPerThread > 1) {
+    auto iv = parentFor.getInductionVar();
+    if (tile.contiguous) {
+      auto cE = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(tile.elemPerThread));
+      auto mul = mlir::arith::MulIOp::create(rewriter, loc, localTidI32,
+                                             cE.getResult());
+      idxI32 =
+          mlir::arith::AddIOp::create(rewriter, loc, mul.getResult(), iv)
+              .getResult();
+    } else {
+      auto cT = mlir::arith::ConstantOp::create(rewriter, loc, tpbAttr);
+      auto mul = mlir::arith::MulIOp::create(rewriter, loc, iv, cT.getResult());
+      idxI32 = mlir::arith::AddIOp::create(rewriter, loc, localTidI32,
+                                           mul.getResult())
+                   .getResult();
+    }
+  }
+  // Pick div/rem and the divisor based on the PARENT BlockedEncoding's `order`
+  // permutation. With order=[1,0] (dim 1 contiguous), the canonical
+  // linearization is `tid = row*N + col` (divisor = N), so axis=0 (row) = tid/N
+  // (div) and axis=1 (col) = tid%N (rem). With order=[0,1] (dim 0 contiguous),
+  // linearization is `tid = col*M + row` (divisor = M), so axis=0 (row) = tid%M
+  // (rem) and axis=1 (col) = tid/M (div). Pre-L1d2 the codebase only saw
+  // order=[1,0] kernels; the L1d2 staged-transpose body's dst encoding is
+  // order=[0,1] (`#blocked1` in matrix_transpose TTGIR), so this branch is now
+  // load-bearing.
+  auto parentOrder = parent.getOrder();
+  bool rowMajor =
+      parentOrder.size() == 2 && parentOrder[0] == 1 && parentOrder[1] == 0;
+  int64_t divisor = rowMajor ? tile.shape[1] : tile.shape[0];
+  auto bn = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(divisor));
+  if ((axis == 0 && rowMajor) || (axis == 1 && !rowMajor))
+    return mlir::arith::DivSIOp::create(rewriter, loc, idxI32, bn.getResult())
+        .getResult();
+  return mlir::arith::RemSIOp::create(rewriter, loc, idxI32, bn.getResult())
+      .getResult();
+}
+
 struct MakeRangeLowering
     : public mlir::OpConversionPattern<mlir::triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -775,120 +888,10 @@ struct MakeRangeLowering
               mlir::triton::gpu::BlockedEncodingAttr>(slice.getParent())) {
         if (parent.getOrder().size() == 2) {
           int axis = 1 - static_cast<int>(slice.getDim());
-          // Walk the entire enclosing module so we see all rank-2 ttg.blocked
-          // tensors regardless of where the conversion driver is in
-          // converting individual ops (the triton.func may already be a
-          // metal.kernel by now; mlir-level types of replaced values are
-          // post-conversion scalars). The largest 2D blocked tensor we can
-          // still see in the module gives BLOCK_M, BLOCK_N.
-          mlir::Operation *modOp = op->getParentOfType<mlir::ModuleOp>();
-          std::optional<TileInfo> tile;
-          if (modOp) {
-            int64_t bestSize = 0;
-            modOp->walk([&](mlir::Operation *inner) {
-              for (auto v : inner->getResults()) {
-                auto info = tileFromTensor(v.getType());
-                if (!info) continue;
-                // AC4-v6 intent (mirrored from findTileInfo): skip
-                // tensor<...x!tt.ptr<...>> in the bestSize tiebreaker.
-                if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
-                    rt && mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
-                  continue;
-                int64_t sz = 1;
-                for (auto s : info->shape) sz *= s;
-                if (sz > bestSize) {
-                  bestSize = sz;
-                  tile = info;
-                }
-              }
-            });
-          }
+          std::optional<TileInfo> tile = findLargestRank2Tile(op);
           if (tile && tile->rank == 2 && tile->shape.size() == 2) {
-            int64_t blockN = tile->shape[1];
-            auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
-            auto i32 = rewriter.getI32Type();
-            auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
-            // Metal `[[thread_position_in_grid]]` is GLOBAL, not per-CTA.
-            // For multi-CTA 2D dispatch we need the threadgroup-local
-            // tid: `lid.x = id.x - tgid.x * threadsPerCTA`.
-            auto tidGlobal = ThreadIdOp::create(
-                rewriter, loc, ui32, rewriter.getStringAttr("x"));
-            mlir::Value tidI32 =
-                mlir::UnrealizedConversionCastOp::create(
-                    rewriter, loc, mlir::TypeRange{i32},
-                    mlir::ValueRange{tidGlobal.getResult()})
-                    .getResult(0);
-            auto tgX = ThreadgroupIdOp::create(
-                rewriter, loc, ui32, rewriter.getStringAttr("x"));
-            mlir::Value tgI32 =
-                mlir::UnrealizedConversionCastOp::create(
-                    rewriter, loc, mlir::TypeRange{i32},
-                    mlir::ValueRange{tgX.getResult()})
-                    .getResult(0);
-            auto tpbAttr =
-                rewriter.getI32IntegerAttr(tile->threadsPerBlock);
-            auto tpbConst =
-                mlir::arith::ConstantOp::create(rewriter, loc, tpbAttr);
-            auto tgOffset = mlir::arith::MulIOp::create(
-                rewriter, loc, tgI32, tpbConst.getResult());
-            mlir::Value localTidI32 =
-                mlir::arith::SubIOp::create(rewriter, loc, tidI32,
-                                             tgOffset.getResult())
-                    .getResult();
-            // Per-iter local idx in tile: strided vs contiguous (same
-            // shape as emitPerIterIndex but using localTid instead of
-            // global tid).
-            mlir::Value idxI32 = localTidI32;
-            if (parentFor && tile->elemPerThread > 1) {
-              auto iv = parentFor.getInductionVar();
-              if (tile->contiguous) {
-                auto cE = mlir::arith::ConstantOp::create(
-                    rewriter, loc,
-                    rewriter.getI32IntegerAttr(tile->elemPerThread));
-                auto mul = mlir::arith::MulIOp::create(
-                    rewriter, loc, localTidI32, cE.getResult());
-                idxI32 = mlir::arith::AddIOp::create(rewriter, loc,
-                                                      mul.getResult(), iv)
-                             .getResult();
-              } else {
-                auto cT = mlir::arith::ConstantOp::create(rewriter, loc,
-                                                          tpbAttr);
-                auto mul = mlir::arith::MulIOp::create(rewriter, loc, iv,
-                                                        cT.getResult());
-                idxI32 = mlir::arith::AddIOp::create(rewriter, loc,
-                                                      localTidI32,
-                                                      mul.getResult())
-                             .getResult();
-              }
-            }
-            // Pick div/rem and the divisor based on the PARENT
-            // BlockedEncoding's `order` permutation. With order=[1,0] (dim 1
-            // contiguous), the canonical linearization is `tid = row*N + col`
-            // (divisor = N), so axis=0 (row) = tid/N (div) and axis=1 (col) =
-            // tid%N (rem). With order=[0,1] (dim 0 contiguous), linearization
-            // is `tid = col*M + row` (divisor = M), so axis=0 (row) = tid%M
-            // (rem) and axis=1 (col) = tid/M (div). Pre-L1d2 the codebase only
-            // saw order=[1,0] kernels; the L1d2 staged-transpose body's dst
-            // encoding is order=[0,1] (`#blocked1` in matrix_transpose TTGIR),
-            // so this branch is now load-bearing.
-            int64_t blockM = tile->shape[0];
-            auto parentOrder = parent.getOrder();
-            bool rowMajor =
-                parentOrder.size() == 2 && parentOrder[0] == 1 &&
-                parentOrder[1] == 0;
-            int64_t divisor = rowMajor ? blockN : blockM;
-            auto bn = mlir::arith::ConstantOp::create(
-                rewriter, loc, rewriter.getI32IntegerAttr(divisor));
-            mlir::Value result;
-            if ((axis == 0 && rowMajor) || (axis == 1 && !rowMajor))
-              result = mlir::arith::DivSIOp::create(rewriter, loc, idxI32,
-                                                     bn.getResult())
-                           .getResult();
-            else
-              result = mlir::arith::RemSIOp::create(rewriter, loc, idxI32,
-                                                     bn.getResult())
-                           .getResult();
-            rewriter.replaceOp(op, result);
+            rewriter.replaceOp(op, emitTileAxisCoord(op, *tile, parent, axis,
+                                                     rewriter, loc));
             return mlir::success();
           }
         }
@@ -1502,12 +1505,209 @@ struct ArithConstantDenseLowering
 // through, matching the SplatLowering pattern.
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// tt.expand_dims -> identity, EXCEPT for a rank-1 value that came out of an
+// axis=0 (per-column) reduce.
+//
+// Two element conventions coexist in this backend and they disagree once a tile
+// puts more than one element in a thread:
+//
+//   * rank-1 standalone (a `tl.sum(..., axis=0)` result, its rank-1 store):
+//     thread t holds element t.
+//   * inside a rank-2 tile: thread t at tile-iv `iv` holds the element at flat
+//     index `t*E + iv` (contiguous), i.e. COLUMN `(t*E + iv) % BLOCK_N`.
+//
+// A device load reaching a rank-2 context is already in the second convention —
+// its address came from a `tt.make_range` lowered inside this tile, so the
+// scalar is the right element for wherever the thread is. A column reduce's
+// result is in the first, and `tt.broadcast` / `tt.expand_dims` being plain
+// identity passthroughs meant it was consumed as if it were in the second:
+// `mean[None, :]` handed every one of a thread's E columns the mean of column
+// t. Nothing crashed; batch norm just normalised each column by a neighbour's
+// statistics (E copies of every E'th value).
+//
+// So republish: each thread writes its element into a threadgroup slot, and the
+// tile reads back the slot its own column actually needs. Only for a source
+// that genuinely carries a column reduce — republishing a load would be wrong
+// in the other direction (double indexing).
+//===----------------------------------------------------------------------===//
+
+// The `tt.expand_dims` ops that broadcast a column-reduce result into a tile,
+// decided pre-conversion by `preprocessAxis0Broadcasts`. Empty (or null) means
+// every expand_dims stays the plain identity passthrough.
+static const llvm::DenseSet<mlir::Operation *> *g_axis0BroadcastExpands =
+    nullptr;
+
+// Does `v`'s cone carry a rank-2 axis=0 `tt.reduce` result (localTid
+// convention)? `sawTileLeaf` reports a leaf in the OTHER convention (a device
+// load / make_range) found on the way; a cone holding both cannot be reconciled
+// in one scalar and the caller refuses it rather than guessing.
+static bool coneUsesAxis0Reduce(mlir::Value v, bool &sawTileLeaf, int depth) {
+  if (depth > 24)
+    return false;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false; // block arg (loop iter_arg): resolved via its yield below
+  // An already-converted op is detached from its block; touching its operand
+  // list walks a dead ilist.
+  if (!def->getBlock())
+    return false;
+  if (auto red = mlir::dyn_cast<mlir::triton::ReduceOp>(def)) {
+    auto srcTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(red.getSrcs().front().getType());
+    if (red.getAxis() == 0 && srcTy && srcTy.getRank() == 2)
+      return true;
+    return false;
+  }
+  if (mlir::isa<mlir::triton::LoadOp, mlir::triton::MakeRangeOp>(def)) {
+    sawTileLeaf = true;
+    return false;
+  }
+  if (mlir::isa<mlir::triton::SplatOp, mlir::arith::ConstantOp>(def))
+    return false; // uniform: belongs to neither convention
+  // A loop-carried accumulator (`mean` is an scf.for RESULT) hides the reduce
+  // behind the yield of its own result slot.
+  if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(def)) {
+    if (forOp.getRegion().empty() || forOp.getRegion().front().empty())
+      return false;
+    auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(
+        forOp.getRegion().front().getTerminator());
+    unsigned idx = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    if (!yield || idx >= yield.getNumOperands())
+      return false;
+    return coneUsesAxis0Reduce(yield.getOperand(idx), sawTileLeaf, depth + 1);
+  }
+  bool any = false;
+  for (mlir::Value o : def->getOperands())
+    if (coneUsesAxis0Reduce(o, sawTileLeaf, depth + 1))
+      any = true;
+  return any;
+}
+
+// Pre-conversion pass: record every `tt.expand_dims` that lifts a column-reduce
+// result into a rank-2 tile. Fails the pass on a cone that mixes the two element
+// conventions — that shape has no correct single-scalar answer, and answering
+// anyway is what produced neighbour-column statistics before.
+static mlir::LogicalResult
+preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
+                          llvm::DenseSet<mlir::Operation *> &out) {
+  mlir::LogicalResult status = mlir::success();
+  moduleOp.walk([&](mlir::triton::ExpandDimsOp ed) {
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(ed.getType());
+    if (!srcTy || srcTy.getRank() != 1 || !resTy || resTy.getRank() != 2)
+      return;
+    bool sawTileLeaf = false;
+    if (!coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0))
+      return;
+    if (ed.getAxis() != 0) {
+      // A column reduce yields a per-COLUMN vector; `[:, None]` would index it
+      // by row, which is not a reading of the value that means anything.
+      ed.emitError("metal: column-reduce result expanded along axis 1 (per-row) "
+                   "— expected `[None, :]`");
+      status = mlir::failure();
+      return;
+    }
+    if (sawTileLeaf) {
+      ed.emitError(
+          "metal: rank-1 cone mixes a column-reduce result with a device load / "
+          "make_range; one per-thread scalar cannot hold both element "
+          "conventions");
+      status = mlir::failure();
+      return;
+    }
+    out.insert(ed.getOperation());
+  });
+  return status;
+}
+
 struct ExpandDimsLowering
     : public mlir::OpConversionPattern<mlir::triton::ExpandDimsOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ExpandDimsOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    if (resTy && g_axis0BroadcastExpands &&
+        g_axis0BroadcastExpands->count(op.getOperation())) {
+      // A barrier pair only stays uniform if every thread reaches it.
+      for (mlir::Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
+        if (mlir::isa<mlir::scf::IfOp>(p))
+          return rewriter.notifyMatchFailure(
+              op, "expand_dims: column-reduce republish needs a threadgroup "
+                  "barrier and sits under divergent control flow");
+        if (mlir::isa<mlir::triton::FuncOp, mlir::func::FuncOp, KernelOp>(p))
+          break;
+      }
+      auto parentBlocked =
+          mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+              resTy.getEncoding());
+      std::optional<TileInfo> tile = findLargestRank2Tile(op);
+      mlir::Value scalar = adaptor.getSrc();
+      // The republish is unconditional once the source is a column reduce.
+      // E == 1 does NOT make the conventions agree: the tile column is
+      // `localTid % BLOCK_N`, which still differs from the reduce's `localTid`
+      // whenever tpb > BLOCK_N (num_warps=8 at BLOCK_N=16, or any small tile).
+      // Only BLOCK_N == tpb makes them identical, and paying one barrier pair
+      // there is cheaper than a rule that is wrong in the other direction.
+      if (!parentBlocked || !tile || tile->rank != 2 ||
+          tile->shape.size() != 2 || tile->shape[1] > tile->threadsPerBlock ||
+          mlir::isa<mlir::RankedTensorType>(scalar.getType()))
+        return rewriter.notifyMatchFailure(
+            op, "expand_dims: column-reduce republish needs a rank-2 blocked "
+                "tile with BLOCK_N <= tpb and a scalarized source");
+      {
+        auto i32 = rewriter.getI32Type();
+        auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+        int64_t tpb = tile->threadsPerBlock;
+        auto bufTy =
+            MetalMemRefType::get(rewriter.getContext(), scalar.getType(), tpb);
+        mlir::Value buf =
+            ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+        auto tidG =
+            ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
+        mlir::Value tidI = mlir::UnrealizedConversionCastOp::create(
+                               rewriter, loc, mlir::TypeRange{i32},
+                               mlir::ValueRange{tidG.getResult()})
+                               .getResult(0);
+        auto tgG = ThreadgroupIdOp::create(rewriter, loc, ui32,
+                                           rewriter.getStringAttr("x"));
+        mlir::Value tgI = mlir::UnrealizedConversionCastOp::create(
+                              rewriter, loc, mlir::TypeRange{i32},
+                              mlir::ValueRange{tgG.getResult()})
+                              .getResult(0);
+        auto cTpb = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+        mlir::Value localTid =
+            mlir::arith::SubIOp::create(
+                rewriter, loc, tidI,
+                mlir::arith::MulIOp::create(rewriter, loc, tgI, cTpb.getResult())
+                    .getResult())
+                .getResult();
+        mlir::Value slotU = mlir::UnrealizedConversionCastOp::create(
+                                rewriter, loc, mlir::TypeRange{ui32},
+                                mlir::ValueRange{localTid})
+                                .getResult(0);
+        // Leading barrier: one static allocation is reused on every trip of the
+        // enclosing tile loop, so trip t+1's write would otherwise race trip t's
+        // reads.
+        BarrierOp::create(rewriter, loc);
+        StoreOp::create(rewriter, loc, scalar, buf, slotU);
+        BarrierOp::create(rewriter, loc);
+        // Slot `col` was written by thread `col`, i.e. holds element `col`.
+        mlir::Value col = emitTileAxisCoord(op, *tile, parentBlocked, /*axis=*/1,
+                                            rewriter, loc);
+        mlir::Value colU = mlir::UnrealizedConversionCastOp::create(
+                               rewriter, loc, mlir::TypeRange{ui32},
+                               mlir::ValueRange{col})
+                               .getResult(0);
+        rewriter.replaceOp(op, GetElementOp::create(rewriter, loc,
+                                                    scalar.getType(), buf, colU)
+                                   .getResult());
+        return mlir::success();
+      }
+    }
     rewriter.replaceOp(op, adaptor.getSrc());
     return mlir::success();
   }
@@ -14926,6 +15126,19 @@ struct ConvertTritonGPUToMetalPass
     LoopCarriedTileMap loopCarriedTiles;
     preprocessLoopCarriedReduceTiles(moduleOp, loopCarriedTiles);
 
+    // Which `tt.expand_dims` broadcast a COLUMN-REDUCE result into a tile (and
+    // so need the republish, see ExpandDimsLowering). Decided pre-conversion:
+    // the reduce lowers before the expand_dims that consumes it, and a converted
+    // op is detached from its block, so the same walk run from the pattern would
+    // see an empty cone and silently answer "no".
+    llvm::DenseSet<mlir::Operation *> axis0BroadcastExpands;
+    if (mlir::failed(
+            preprocessAxis0Broadcasts(moduleOp, axis0BroadcastExpands))) {
+      signalPassFailure();
+      return;
+    }
+    g_axis0BroadcastExpands = &axis0BroadcastExpands;
+
     // Chained reduces: each rank-2 axis=1 reduce registers its rowBuf here as
     // it lowers, so a LATER reduce whose cone reads the earlier result gets it
     // at its own row instead of through the producer's per-thread scalar.
@@ -15048,6 +15261,7 @@ struct ConvertTritonGPUToMetalPass
         mlir::applyFullConversion(moduleOp, target, std::move(patterns));
     g_scanBuffers = nullptr; // scanBufMap goes out of scope below
     g_reduceRowBufs = nullptr;
+    g_axis0BroadcastExpands = nullptr;
     if (mlir::failed(conversionResult)) {
       signalPassFailure();
       return;
