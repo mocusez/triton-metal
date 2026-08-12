@@ -1258,7 +1258,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot"> {
 
       acc = c_init;
       for (k = 0; k < stride_a; ++k)
-        acc += a_buf[gRow*stride_a + k] * b_buf[k*stride_b + gCol];
+        acc += a_buf[a_base_offset + gRow*stride_a + k]
+             * b_buf[b_base_offset + k*stride_b + gCol];
 
     where `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` are the
     global output coordinates recovered from `emitPerIterIndex`. The reduction
@@ -1269,12 +1270,15 @@ def ScalarDotOp : Metal_Op<"scalar_dot"> {
     tail-tile rows/cols never issue an out-of-bounds device read (their result
     is discarded by the epilogue's masked store).
 
+    `a_base_offset`/`b_base_offset` preserve scalar `tt.addptr` offsets applied
+    before the tiled pointer chain, such as a batched matrix's per-program base.
     NOTE: this is O(M*N*K) scalar work with no matrix-unit reuse — a correctness
     path, not a performance path. `a_buf`/`b_buf` are the device kernel-arg
     buffers; `c_init` is the dot accumulator init (typically `dense<0.0>`).
   }];
 
   let arguments = (ins Metal_MemRefType:$a_buf, Metal_MemRefType:$b_buf,
+                       UI32:$a_base_offset, UI32:$b_base_offset,
                        UI32:$row_origin, UI32:$col_origin,
                        UI32:$stride_a, UI32:$stride_b,
                        AnyType:$c_init,
@@ -1282,7 +1286,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot"> {
 
   let results = (outs AnyType:$result);
 
-  let assemblyFormat = "$a_buf `,` $b_buf `[` $row_origin `,` $col_origin `]`"
+  let assemblyFormat = "$a_buf `,` $b_buf `offset` `[` $a_base_offset `,`"
+                       "$b_base_offset `]` `[` $row_origin `,` $col_origin `]`"
                        " `,` $stride_a `,` $stride_b `,` $c_init"
                        " (`partial` `[` $partial_extents^ `]`)?"
                        " attr-dict `:` functional-type(operands, results)";

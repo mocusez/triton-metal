@@ -199,6 +199,54 @@ def test_dot_bf16_singletile():
     torch.testing.assert_close(c, ref, atol=tol, rtol=tol)
 
 
+# Verbatim compute shape from
+# leet-triton/medium-fp16_batched_matrix_multiplication.py.  Unlike the
+# canonical universal kernel above, each dot operand is explicitly extended
+# from fp16 to fp32 before Triton inserts the blocked -> dot-operand relayout.
+@triton.jit
+def batched_fp16_dot_kernel(
+    a_ptr, b_ptr, c_ptr, BATCH, M, N, K, BLOCK_SIZE: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    a_ptr += pid_b * M * K
+    b_ptr += pid_b * K * N
+    c_ptr += pid_b * M * N
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+
+    for ks in range(0, K, BLOCK_SIZE):
+        offs_k = ks + tl.arange(0, BLOCK_SIZE)
+        offs_a = offs_m[:, None] * K + offs_k[None, :]
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        a = tl.load(a_ptr + offs_a, mask=mask_a, other=0.0).to(tl.float32)
+        offs_b = offs_k[:, None] * N + offs_n[None, :]
+        mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        b = tl.load(b_ptr + offs_b, mask=mask_b, other=0.0).to(tl.float32)
+        acc += tl.dot(a, b)
+
+    offs_c = offs_m[:, None] * N + offs_n[None, :]
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptr + offs_c, acc.to(tl.float16), mask=mask_c)
+
+
+@pytest.mark.parametrize("batch,M,N,K", [(2, 64, 64, 64), (3, 70, 66, 50)])
+def test_batched_fp16_dot_explicit_fp32_operands(batch, M, N, K):
+    torch.manual_seed(0xC0FFEE)
+    a = torch.randn((batch, M, K), dtype=torch.float16).contiguous()
+    b = torch.randn((batch, K, N), dtype=torch.float16).contiguous()
+    c = torch.zeros((batch, M, N), dtype=torch.float16).contiguous()
+    grid = (batch, triton.cdiv(M, 64), triton.cdiv(N, 64))
+    batched_fp16_dot_kernel[grid](a, b, c, batch, M, N, K, BLOCK_SIZE=64)
+    ref = torch.bmm(a.float(), b.float()).half()
+    tol = K * (2.0 ** -9)
+    torch.testing.assert_close(c.float(), ref.float(), atol=tol, rtol=tol)
+
+
 # ----------------------------------------------------------------------------
 # AC5: K-loop tiled, K_TILES in {1, 2, 4, 8}
 # ----------------------------------------------------------------------------
