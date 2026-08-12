@@ -83,16 +83,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// --- decay kernel: norm = None. At 64x64x64 the simdgroup body would need
-// 3*64*64 + 2*64*64 + 2*64*64 = 28672 floats against a 8192 budget, so this one
-// takes the SCALAR floor instead of the op declining — that is what keeping two
-// bodies buys.
+// --- decay kernel: norm = None, and a 64x64x64 tile. There is ONE body, so
+// the tile size decides only how the query rows are chunked, not which emitter
+// runs. (A second, simdgroup-matrix body used to be selected here by a
+// threadgroup-budget test; it measured within 0.5% of this one at every shape
+// it could run and was deleted.)
 // CHECK-LABEL: kernel void decay_kernel
 // CHECK: threadgroup float _fa_qbuf[2048]
 // CHECK: threadgroup float _fa_obuf[2048]
 // CHECK-NOT: _fa_rmax
 // bm=64 with bd=64 exceeds a single 32-lane pass, so the emitter chunks the
-// query rows (2 x 32) instead of declining the way flash_attention's bm<=32
+// query rows (2 x 32) instead of declining the way the predecessor op's bm<=32
 // gate did.
 // CHECK: for (uint _fa_c0 = 0u; _fa_c0 < 64u; _fa_c0 += 32u)
 // The causal key bound comes from the op's key-bounds region, so it is ordinary
@@ -111,24 +112,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: _fa_obuf{{.*}} +=
 // CHECK-NOT: _fa_den
 
-// --- softmax kernel: same op and same region, but its working set
-// (3*32*16 + 2*16*32 + 2*32*32 + 2*32 = 4672 floats) fits Apple's 8192, so the
-// emitter picks the SIMDGROUP body. Both matmuls run on the matrix unit and the
-// region is evaluated over the staged S tile — which is the whole point: one
-// emitter, two bodies, no per-variant code.
+// --- softmax kernel: same op, same emitter, different `norm`. The running
+// (max, sum) state appears and the epilogue divides by it; the score region is
+// otherwise emitted exactly as it is above. No staged S/P tiles and no matrix
+// unit -- the body keeps the score in a REGISTER, which is what lets an
+// arbitrary region be evaluated inline with no cross-lane traffic.
 // CHECK-LABEL: kernel void softmax_kernel
-// CHECK: threadgroup float _fa_sbuf[1024]
-// CHECK: threadgroup float _fa_pbuf[1024]
 // CHECK: threadgroup float _fa_rmax[32]
-// CHECK: simdgroup_multiply_accumulate
-// the region, inlined over the staged score tile
-// CHECK: = _fa_sbuf[q*32u + kk];
-// CHECK: _fa_pbuf[q*32u + kk] =
+// CHECK: threadgroup float _fa_rsum[32]
+// CHECK-NOT: simdgroup_multiply_accumulate
 // running state + rescale + epilogue divide
-// CHECK: float m_new = max(m_old, m_cur)
-// CHECK: _fa_rsum[q] = _fa_rsum[q]*scaler + denom
-// CHECK: simdgroup_multiply_accumulate
-// CHECK: / denom
+// CHECK: float _fa_mnew = max(_fa_mold,
+// CHECK: _fa_rsum{{.*}} * _fa_sc + _fa_p
+// CHECK: / _fa_den
 
 // --- head-split kernel: `heads` present, so the per-head feature width is
 // DERIVED (`d_model / h`) rather than read from a buffer, and the feature
@@ -143,10 +139,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: uint _fa_col = tgid.y * _fa_dh;
 // The padded feature columns d >= d_head must stage as zero, or the head slice
 // bleeds into its neighbour.
-// CHECK: _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? v0[row * _fa_sq + _fa_col + d] : 0.0f;
+// CHECK: _fa_qbuf[c] = ({{.*}}row < _fa_M && d < _fa_dh) ? v0[row * _fa_sq + _fa_col + d] : 0.0f;
 //
 // `softmax_natural_exp` picks base-e. It is not cosmetic: a kernel that folds
 // log2(e) into its scale uses exp2 instead, and the region has already produced
 // the logit, so the emitter cannot rescale after the fact.
-// CHECK: float scaler = (m_old == m_new) ? 1.0f : exp(m_old - m_new);
+// CHECK: float _fa_sc = (_fa_mold == _fa_mnew) ? 1.0f : exp(_fa_mold - _fa_mnew);
 // CHECK-NOT: exp2(

@@ -131,7 +131,6 @@ private:
   // working set fits threadgroup memory, and a per-key scalar body that is the
   // correctness floor and always applies. `translate` picks between them.
   void emitFusedAttentionScalar_(mlir::triton::metal::FusedAttentionOp op);
-  void emitFusedAttentionMma_(mlir::triton::metal::FusedAttentionOp op);
   // Binds a fused-attention region's block args to MSL temps: the pinned
   // prefix from `fixedInits`, then one per `score_params` buffer. Both regions
   // take the same params in the same order and the verifier pins their types,

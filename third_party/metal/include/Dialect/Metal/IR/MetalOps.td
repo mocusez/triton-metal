@@ -779,10 +779,16 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
 
     `bm` is the source kernel's query-row block and is BINDING — it fixes the
     grid, so this program owns rows `[tgid.x*bm, tgid.x*bm + bm)`. `bn`/`bd` are
-    the source's key/feature tiles, recorded for the verifier; the emitter picks
-    its own key and feature chunking to fit Apple's 32 KiB threadgroup budget
-    and is therefore NOT capped by them. Online softmax is exact at any key
-    blocking, so re-blocking changes only summation order, not the result.
+    the source's key/feature tiles, recorded for the verifier; the emitter walks
+    keys one at a time and chunks the query rows to fit Apple's 32 KiB
+    threadgroup budget, so it is NOT capped by them. Online softmax is exact at
+    any key blocking, so re-blocking changes only summation order, not the
+    result.
+
+    There is deliberately no second, simdgroup-matrix body. One existed and was
+    deleted: measured against this one it was within 0.5% at every shape it
+    could run, because the same threadgroup budget that gated it capped `bd` at
+    32 and a tile that small is memory-bound. See the note in `translate`.
   }];
 
   let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
