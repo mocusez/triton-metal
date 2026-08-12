@@ -48,6 +48,7 @@ target_link_libraries(triton-metal-translate PRIVATE
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRLLVMDialect
+  MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRTranslateLib

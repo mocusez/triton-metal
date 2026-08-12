@@ -15,8 +15,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -111,6 +111,12 @@ def rsqrt_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     tl.store(output_ptr + offsets, y, mask=mask)
 
 
+@triton.jit
+def floor_runtime_scalar_kernel(output_ptr, value):
+    center = tl.floor(value / 2).to(tl.int32)
+    tl.store(output_ptr, center)
+
+
 @pytest.mark.parametrize("BLOCK_SIZE", [256, 1024])
 def test_exp_bit_close(BLOCK_SIZE):
     N = BLOCK_SIZE
@@ -151,6 +157,15 @@ def test_rsqrt_bit_close(BLOCK_SIZE):
 
     expected = torch.rsqrt(x)
     torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("value, expected", [(5, 2), (6, 3)])
+def test_floor_runtime_scalar(value, expected):
+    out = torch.zeros(1, dtype=torch.int32)
+
+    floor_runtime_scalar_kernel[(1, 1, 1)](out, value)
+
+    assert out.item() == expected
 
 
 # Lmultiload Phase B audit canary: existing transcendental tests use only

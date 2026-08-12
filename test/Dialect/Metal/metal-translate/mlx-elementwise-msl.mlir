@@ -9,7 +9,8 @@ module {
       %b = metal.get_element %arg1[%id] : (!metal.memref<? x f32>, ui32) -> f32
       %c = metal.get_element %arg2[%id] : (!metal.memref<? x f32>, ui32) -> f32
       %neg = metal.unary_exp %c, minusOp : (f32) -> f32
-      %exp = metal.unary_exp %a, expOp : (f32) -> f32
+      %floor = math.floor %a : f32
+      %exp = metal.unary_exp %floor, expOp : (f32) -> f32
       %sqrt = metal.unary_exp %b, sqrtOp : (f32) -> f32
       %mul = metal.binary_exp %sqrt, %neg, mulOp : (f32, f32) -> f32
       %out = metal.binary_exp %exp, %mul, addOp : (f32, f32) -> f32
@@ -29,4 +30,4 @@ module {
 // CHECK: constant float *v2 {{\[\[buffer\(2\)\]\]}},
 // CHECK: device float *v3 {{\[\[buffer\(3\)\]\]}},
 // CHECK: uint3 id {{\[\[thread_position_in_grid\]\]}})
-// CHECK: v3[id.x] = (metal::precise::exp(v0[id.x])) + ((metal::precise::sqrt(v1[id.x])) * ((-v2[id.x])));
+// CHECK: v3[id.x] = (metal::precise::exp(metal::floor(v0[id.x]))) + ((metal::precise::sqrt(v1[id.x])) * ((-v2[id.x])));

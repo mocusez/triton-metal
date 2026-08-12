@@ -4792,6 +4792,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::arith::MulIOp, mlir::arith::CmpIOp,
                     mlir::arith::CmpFOp, mlir::arith::SelectOp,
                     mlir::arith::SIToFPOp, mlir::math::ExpOp,
+                    mlir::math::FloorOp,
                     mlir::math::SqrtOp, mlir::math::LogOp, mlir::math::SinOp,
                     mlir::math::CosOp, mlir::math::ErfOp, mlir::math::RsqrtOp,
                     mlir::triton::metal::BinaryExpOp,
@@ -5109,6 +5110,15 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         };
         _output << "(-";
         emit(op.getOperand());
+        _output << ")";
+      })
+      .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+        // Scalar tl.floor survives TritonGPU-to-Metal conversion unchanged.
+        // This occurs when a runtime scalar controls index arithmetic, such as
+        // gaussian blur's `floor(kernel_size / 2)`. MSL provides an exact
+        // floor overload in the metal namespace.
+        _output << "metal::floor(";
+        translateValueOrVarName(op.getOperand());
         _output << ")";
       })
       .Case<mlir::arith::DivSIOp>([&](mlir::arith::DivSIOp op) {

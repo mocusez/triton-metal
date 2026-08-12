@@ -12,6 +12,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
@@ -34,6 +35,7 @@ void registerToMSLTranslation() {
       [](DialectRegistry &registry) {
         registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
                         func::FuncDialect, LLVM::LLVMDialect,
+                        math::MathDialect,
                         triton::metal::MetalDialect, mlir::memref::MemRefDialect,
                         scf::SCFDialect>();
       });
