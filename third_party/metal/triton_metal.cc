@@ -18,6 +18,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -44,13 +45,46 @@ void init_triton_metal(py::module &&m) {
   // kernel. Mirrors what `triton-metal-opt --convert-tritongpu-to-metal`
   // piped into `triton-metal-translate --mlir-to-msl` produces in the
   // lit test harness.
-  m.def("ttgir_to_msl", [](mlir::ModuleOp &mod) -> std::string {
+  // Returns (msl, threads_per_group). `threads_per_group` is 0 when the launch
+  // geometry should follow `num_warps` as usual, and 32 when every kernel in
+  // the module is exactly one `metal.fused_attention`: that op's body runs on a
+  // SINGLE warp (`ltid.x < 32`), so a source kernel written with the customary
+  // `num_warps=4` would otherwise launch 128 threads and let 96 of them exit
+  // immediately -- measured at ~12% on this backend, for nothing.
+  m.def("ttgir_to_msl", [](mlir::ModuleOp &mod) -> py::tuple {
     mlir::PassManager pm(mod.getContext());
     pm.addPass(mlir::triton::metal::createConvertTritonGPUToMetalPass());
     if (mlir::failed(pm.run(mod))) {
       throw std::runtime_error(
           "Metal backend: convert-tritongpu-to-metal failed");
     }
+    // Checked on the Metal IR, not by sniffing the MSL text: "this body is one
+    // op" is a structural fact and should be read structurally.
+    //
+    // The test is that `metal.fused_attention` is the only op in the kernel
+    // that DOES anything -- everything else has to be memory-effect-free. The
+    // body is not literally one op: the matcher leaves behind the casts and
+    // `metal.get_element`s that bridge its operands, and those are pure.
+    int threadsPerGroup = 0;
+    {
+      bool anyKernel = false, allSingleWarp = true;
+      mod.walk([&](mlir::triton::metal::KernelOp k) {
+        anyKernel = true;
+        int fused = 0, effectful = 0;
+        for (mlir::Operation &o : k.getBodyRegion().front()) {
+          if (mlir::isa<mlir::triton::metal::FusedAttentionOp>(o))
+            ++fused;
+          else if (!o.hasTrait<mlir::OpTrait::IsTerminator>() &&
+                   !mlir::isMemoryEffectFree(&o))
+            ++effectful;
+        }
+        if (fused != 1 || effectful != 0)
+          allSingleWarp = false;
+      });
+      if (anyKernel && allSingleWarp)
+        threadsPerGroup = 32;
+    }
+
     std::string buffer;
     llvm::raw_string_ostream os(buffer);
     if (mlir::failed(
@@ -58,7 +92,7 @@ void init_triton_metal(py::module &&m) {
       throw std::runtime_error(
           "Metal backend: MLIR -> MSL translation failed");
     }
-    return buffer;
+    return py::make_tuple(buffer, threadsPerGroup);
   });
 
   // The Metal backend is MPS-only: kernels are launched via

@@ -304,7 +304,15 @@ class MetalBackend(BaseBackend):
         # In-process TTGIR -> Metal dialect -> MSL text. The pybind in
         # third_party/metal/triton_metal.cc drives the conversion pass
         # and the ModuleTranslation emitter; we only forward the module.
-        msl = libmetal.ttgir_to_msl(mod)
+        msl, threads_per_group = libmetal.ttgir_to_msl(mod)
+        # A kernel that IS one `metal.fused_attention` runs on a single warp,
+        # so the launch needs 32 threads whatever `num_warps` the source asked
+        # for. Recorded separately rather than by overwriting `num_warps`: that
+        # field drove codegen and is part of the cache key, and a value that no
+        # longer matches the IR it produced would be a lie to every later
+        # reader.
+        if threads_per_group:
+            metadata["threads_per_group"] = threads_per_group
         # CompiledKernel.__init__ requires metadata["name"]; mirror how
         # nvidia's make_cubin pulls the entry-point name out of the
         # produced artifact.

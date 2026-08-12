@@ -259,9 +259,14 @@ class MetalLauncher:
             sig[n] for n, keep in zip(fn_arg_names, self._arg_mask) if keep
         ]
         # num_warps × warp_size = threadgroup x-dim. Default to 4×32=128.
+        # `threads_per_group`, when the compiler set it, overrides that: a
+        # kernel that lowers to a single `metal.fused_attention` runs its whole
+        # body on one warp, so honouring a source `num_warps=4` there would
+        # launch 128 threads and have 96 of them exit immediately (~12%).
         nw = getattr(metadata, "num_warps", 4)
         ws = 32
-        self._threadgroup = (nw * ws, 1, 1)
+        tpg = getattr(metadata, "threads_per_group", None)
+        self._threadgroup = (tpg if tpg else nw * ws, 1, 1)
 
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):

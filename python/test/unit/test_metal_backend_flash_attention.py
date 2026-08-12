@@ -247,6 +247,38 @@ def _decoy_reference(Q, K, V, N, d_model, h, variant):
     return out
 
 
+def test_flash_attention_launches_one_warp():
+    """A fused-attention kernel must launch 32 threads, whatever num_warps says.
+
+    The op's body runs entirely under `ltid.x < 32`, so a source kernel written
+    with the customary `num_warps=4` would launch 128 threads and have 96 of
+    them exit immediately — measured at ~11% on this backend, for nothing.
+    The compiler therefore reports `threads_per_group` and the driver prefers
+    it over `num_warps * 32`.
+
+    Asserted on the MECHANISM rather than on a timing: a perf regression here
+    is silent and a wall-clock assertion in a test suite is a flake generator.
+    The numbers are in the commit that added it.
+    """
+    N, d_model, h = 128, 64, 4
+    torch.manual_seed(0xF1)
+    Q = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(N, d_model, dtype=torch.float32, device="mps").contiguous()
+
+    for num_warps in (1, 2, 4, 8):
+        compiled = mha_kernel[(triton.cdiv(N, 32), h)](
+            Q, K, V, out, N, d_model, h, 32, max(16, d_model // h),
+            num_warps=num_warps)
+        assert getattr(compiled.metadata, "threads_per_group", None) == 32, (
+            f"num_warps={num_warps} did not report a single-warp launch")
+        # The override must not change what the kernel computes.
+        torch.mps.synchronize()
+        torch.testing.assert_close(out.cpu(), _reference(Q, K, V, N, d_model, h),
+                                   atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize(
     "variant, what",
     [
