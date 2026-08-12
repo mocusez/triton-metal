@@ -100,7 +100,10 @@ static llvm::StringRef typeToString(mlir::Type type) {
     case 1:
       return "bool";
     case 8:
-      return intTy.isSigned() ? "int8_t" : "uint8_t";
+      // Triton uses signless i8 for torch.int8 buffers. Only an explicitly
+      // unsigned MLIR integer denotes uint8; treating signless as unsigned
+      // turns negative quantized K/V values into 128..255 before sitofp.
+      return intTy.isUnsigned() ? "uint8_t" : "int8_t";
     case 16:
       return intTy.isSigned() ? "int16_t" : "uint16_t";
     case 32:
@@ -469,9 +472,12 @@ void ModuleTranslation::translate(mlir::triton::metal::TgLoadIndexedOp op) {
 void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
   translateVarName(op.getMemref());
   _output << "[";
-  translateValue(op.getIndex().getDefiningOp());
+  translateValueOrVarName(op.getIndex());
   _output << "] = ";
-  translateValue(op.getValue().getDefiningOp());
+  // A user scf.for may return the online-softmax state that is stored after
+  // the loop. Its individual results are mapped to accumulator temporaries;
+  // translating the defining scf.for as a value cannot select a result.
+  translateValueOrVarName(op.getValue());
   printDelim();
 }
 
@@ -1325,11 +1331,22 @@ void ModuleTranslation::translate(mlir::scf::YieldOp op) {
     // Multi-accumulator reduce: write all K iter_args back (`v_i = yielded_i;`).
     auto mit = _scfForIterArgsMulti.find(parentFor.getOperation());
     if (mit != _scfForIterArgsMulti.end()) {
+      // scf.yield updates all loop-carried values simultaneously. Materialize
+      // every RHS before assigning any accumulator: online softmax yields
+      // `(new_max, old_sum * exp(old_max - new_max) + block_sum)`, so assigning
+      // new_max first would make the second expression observe the new value
+      // and incorrectly turn its rescale factor into exp(0).
+      llvm::SmallVector<unsigned, 8> rhsIdxs;
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-        _output << "v" << mit->second[i] << " = ";
+        unsigned rhsIdx = _varCount++;
+        rhsIdxs.push_back(rhsIdx);
+        _output << typeToString(op.getOperand(i).getType()) << " v" << rhsIdx
+                << " = ";
         translateValueOrVarName(op.getOperand(i));
         _output << "; ";
       }
+      for (unsigned i = 0; i < rhsIdxs.size(); ++i)
+        _output << "v" << mit->second[i] << " = v" << rhsIdxs[i] << "; ";
       return;
     }
     if (op.getNumOperands() != 1)
@@ -5097,6 +5114,37 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         emit(op.getLhs());
         _output << " / ";
         emit(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
+        // Scalar tl.maximum can survive conversion when it combines an
+        // scf.for iter_arg with a reduced tile (online softmax). Tensor forms
+        // lower to metal.binary_exp; spell the scalar form directly in MSL.
+        _output << "metal::max(";
+        translateValueOrVarName(op.getLhs());
+        _output << ", ";
+        translateValueOrVarName(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
+        _output << "metal::max(";
+        translateValueOrVarName(op.getLhs());
+        _output << ", ";
+        translateValueOrVarName(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::MinNumFOp>([&](mlir::arith::MinNumFOp op) {
+        _output << "metal::min(";
+        translateValueOrVarName(op.getLhs());
+        _output << ", ";
+        translateValueOrVarName(op.getRhs());
+        _output << ")";
+      })
+      .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
+        _output << "metal::min(";
+        translateValueOrVarName(op.getLhs());
+        _output << ", ";
+        translateValueOrVarName(op.getRhs());
         _output << ")";
       })
       .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {

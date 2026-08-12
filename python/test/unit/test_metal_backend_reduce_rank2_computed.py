@@ -70,6 +70,46 @@ def _sum_twoload(a_ptr, b_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
 SHAPES = [(8, 16), (4, 32), (128, 64)]
 
 
+@triton.jit
+def _rank2_sum_then_rank1_softmax_stats(q_ptr, k_ptr, m_ptr, l_ptr,
+                                        M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    q = tl.load(q_ptr + rn)
+    k = tl.load(k_ptr + rm[:, None] * N + rn[None, :])
+    scores = tl.sum(q[None, :] * k, axis=1)
+    max_score = tl.max(scores, axis=0)
+    exp_scores = tl.exp(scores - max_score)
+    exp_sum = tl.sum(exp_scores, axis=0)
+    tl.store(m_ptr, max_score)
+    tl.store(l_ptr, exp_sum)
+
+
+@pytest.mark.parametrize("M, N", [(8, 16), (32, 16), (32, 32)])
+def test_rank2_sum_then_slice_rank1_softmax_stats(M, N):
+    """A rank-2 reduce result keeps its slice layout into a rank-1 reduce."""
+    torch.manual_seed(0x51CE + M * N)
+    q = torch.randn(N, dtype=torch.float32, device="mps")
+    k = torch.randn(M, N, dtype=torch.float32, device="mps")
+    max_score = torch.empty((), dtype=torch.float32, device="mps")
+    exp_sum = torch.empty((), dtype=torch.float32, device="mps")
+
+    _rank2_sum_then_rank1_softmax_stats[(1,)](
+        q, k, max_score, exp_sum, M=M, N=N
+    )
+    torch.mps.synchronize()
+
+    scores = (q.cpu().double()[None, :] * k.cpu().double()).sum(dim=1)
+    expected_max = scores.max()
+    expected_sum = torch.exp(scores - expected_max).sum()
+    torch.testing.assert_close(
+        max_score.cpu().double(), expected_max, atol=2e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        exp_sum.cpu().double(), expected_sum, atol=2e-4, rtol=1e-4
+    )
+
+
 @pytest.mark.parametrize("M, N", SHAPES)
 def test_reduce_sum_affine_cone(M, N):
     torch.manual_seed(0)

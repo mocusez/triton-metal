@@ -63,6 +63,123 @@ def test_reduce_loop_carried_leaf(M, N, STEPS):
                                atol=1e-4, rtol=1e-4)
 
 
+@triton.jit
+def _loop_varying_attention_stats_kernel(q_ptr, k_ptr, out_ptr, STEPS,
+                                         M: tl.constexpr, N: tl.constexpr):
+    row = tl.arange(0, M)
+    col = tl.arange(0, N)
+    q = tl.load(q_ptr + col)
+    running_max = -float("inf")
+    running_sum = 0.0
+    for step in range(STEPS):
+        k = tl.load(k_ptr + step * M * N + row[:, None] * N + col[None, :])
+        scores = tl.sum(q[None, :] * k, axis=1)
+        block_max = tl.max(scores, axis=0)
+        new_max = tl.maximum(running_max, block_max)
+        running_sum = running_sum * tl.exp(running_max - new_max)
+        running_sum += tl.sum(tl.exp(scores - new_max), axis=0)
+        running_max = new_max
+    tl.store(out_ptr, running_max)
+    tl.store(out_ptr + 1, running_sum)
+
+
+@pytest.mark.parametrize("M, N, STEPS", [(32, 16, 2), (32, 32, 3)])
+def test_slice_rank1_reduce_in_loop_varying_attention_stats(M, N, STEPS):
+    """The reduced tile address varies inside a loop carrying softmax state."""
+    torch.manual_seed(0xA77E + M * N + STEPS)
+    q = torch.randn(N, dtype=torch.float32, device="mps")
+    k = torch.randn(STEPS, M, N, dtype=torch.float32, device="mps")
+    out = torch.empty(2, dtype=torch.float32, device="mps")
+
+    _loop_varying_attention_stats_kernel[(1,)](
+        q, k, out, STEPS, M=M, N=N, num_warps=4
+    )
+    torch.mps.synchronize()
+
+    scores = (k.cpu().double() * q.cpu().double()[None, None, :]).sum(dim=2)
+    flat_scores = scores.reshape(-1)
+    expected_max = flat_scores.max()
+    expected_sum = torch.exp(flat_scores - expected_max).sum()
+    torch.testing.assert_close(
+        out[0].cpu().double(), expected_max, atol=2e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        out[1].cpu().double(), expected_sum, atol=2e-4, rtol=1e-4
+    )
+
+
+@triton.jit
+def _int8_kv_attention_kernel(q_ptr, k_ptr, v_ptr, k_scale_ptr, v_scale_ptr,
+                              out_ptr, seq_len, head_dim, sm_scale,
+                              BLOCK_SEQ: tl.constexpr, HEAD_DIM: tl.constexpr):
+    head = tl.program_id(0)
+    col = tl.arange(0, HEAD_DIM)
+    col_mask = col < head_dim
+    q = tl.load(q_ptr + head * head_dim + col, mask=col_mask, other=0.0)
+
+    running_max = -float("inf")
+    running_sum = 0.0
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for start in range(0, seq_len, BLOCK_SEQ):
+        row = start + tl.arange(0, BLOCK_SEQ)
+        row_mask = row < seq_len
+        tile_mask = row_mask[:, None] & col_mask[None, :]
+        offsets = head * seq_len * head_dim + row[:, None] * head_dim + col[None, :]
+
+        k = tl.load(k_ptr + offsets, mask=tile_mask, other=0).to(tl.float32)
+        k_scale = tl.load(k_scale_ptr + head * seq_len + row,
+                          mask=row_mask, other=0.0)
+        scores = tl.sum(q[None, :] * k * k_scale[:, None], axis=1) * sm_scale
+        scores = tl.where(row_mask, scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=0)
+        new_max = tl.maximum(running_max, block_max)
+        alpha = tl.exp(running_max - new_max)
+        beta = tl.exp(scores - new_max)
+        running_sum = running_sum * alpha + tl.sum(beta, axis=0)
+
+        v = tl.load(v_ptr + offsets, mask=tile_mask, other=0).to(tl.float32)
+        v_scale = tl.load(v_scale_ptr + head * seq_len + row,
+                          mask=row_mask, other=0.0)
+        acc = acc * alpha + tl.sum(beta[:, None] * v * v_scale[:, None], axis=0)
+        running_max = new_max
+
+    tl.store(out_ptr + head * head_dim + col, acc / running_sum, mask=col_mask)
+
+
+def test_int8_kv_attention_online_softmax_end_to_end():
+    """Covers signed int8 casts and both reductions in a ragged 3-block loop."""
+    heads, seq_len, head_dim = 2, 65, 24
+    torch.manual_seed(0x1A77E)
+    q_cpu = torch.randn(heads, head_dim, dtype=torch.float32)
+    k_cpu = torch.randint(-32, 33, (heads, seq_len, head_dim), dtype=torch.int8)
+    v_cpu = torch.randint(-32, 33, (heads, seq_len, head_dim), dtype=torch.int8)
+    k_scale_cpu = torch.rand(heads, seq_len, dtype=torch.float32) * 0.05 + 0.001
+    v_scale_cpu = torch.rand(heads, seq_len, dtype=torch.float32) * 0.05 + 0.001
+
+    scores = (
+        q_cpu[:, None, :] * k_cpu.float() * k_scale_cpu[:, :, None]
+    ).sum(dim=2) * (head_dim ** -0.5)
+    expected = (
+        torch.softmax(scores, dim=1)[:, :, None]
+        * v_cpu.float()
+        * v_scale_cpu[:, :, None]
+    ).sum(dim=1)
+
+    q, k, v, k_scale, v_scale = [
+        tensor.to("mps")
+        for tensor in (q_cpu, k_cpu, v_cpu, k_scale_cpu, v_scale_cpu)
+    ]
+    out = torch.empty(heads, head_dim, dtype=torch.float32, device="mps")
+    _int8_kv_attention_kernel[(heads,)](
+        q, k, v, k_scale, v_scale, out, seq_len, head_dim,
+        head_dim ** -0.5, BLOCK_SEQ=32,
+        HEAD_DIM=triton.next_power_of_2(head_dim), num_warps=4,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=3e-4, rtol=3e-4)
+
+
 # --- Loop-carried rank-2 TILE ----------------------------------------------
 #
 # The staged-leaf mechanism above maps a leaf to ONE per-thread scalar, i.e. a

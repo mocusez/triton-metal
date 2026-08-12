@@ -2625,8 +2625,26 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
 
   // Derive tpb from the blocked encoding directly (do NOT use
   // tileFromTensor.elemPerThread — it's 0 in the BLOCK < tpb regime).
+  //
+  // A rank-2 axis reduce yields a rank-1 SliceEncodingAttr. Chaining a full
+  // rank-1 reduce onto that value is common in attention:
+  //
+  //   scores = tl.sum(q[None, :] * k, axis=1)
+  //   max_score = tl.max(scores, axis=0)
+  //
+  // The slice is distributed by its blocked parent, so use that parent only
+  // for threadgroup geometry. Its per-thread scalar is replicated along the
+  // removed dimension and therefore cannot be fed directly to the butterfly;
+  // the slice-specific path below re-evaluates each logical element exactly
+  // once through the existing chained-reduce row-buffer/cone machinery.
   auto srcBlocked = mlir::dyn_cast_or_null<
       mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+  auto srcSlice = mlir::dyn_cast_or_null<
+      mlir::triton::gpu::SliceEncodingAttr>(rtt.getEncoding());
+  const bool sliceSource = static_cast<bool>(srcSlice);
+  if (!srcBlocked && srcSlice)
+    srcBlocked = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(srcSlice.getParent());
   if (!srcBlocked)
     return mlir::failure();
   int64_t tpb = 1;
@@ -2718,7 +2736,74 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // 1:N change, no tileFromTensor change — see
   // .omc/plans/option-beta-spt-load-lowering.md.
   mlir::Value inputScalarPT;
-  if (BLOCK > tpb) {
+  if (sliceSource) {
+    // The converted adaptor scalar follows the slice's replicated physical
+    // layout, not a one-thread-per-logical-element rank-1 layout. Rebuild the
+    // logical source at positions `localTid + k*tpb` instead. A preceding
+    // rank-2 reduce is resolved from g_reduceRowBufs; elementwise select/math
+    // between the reductions is replayed by evalRank1ValueAt.
+    mlir::Value reduceSrc = op.getSrcs().front();
+    if (!rank1ConeSupported(reduceSrc, 0))
+      return rewriter.notifyMatchFailure(
+          op, "rank-1 slice reduce: source cone is not evaluable");
+    const int64_t E = (BLOCK + tpb - 1) / tpb;
+    if (E < 1 || E > 64)
+      return rewriter.notifyMatchFailure(
+          op, "rank-1 slice reduce: ceil(BLOCK/tpb) outside supported "
+              "envelope [1, 64]");
+
+    mlir::Value localTid = emitLocalTid(rewriter, loc, tpb);
+    auto cZero = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(0));
+    auto cE = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(E)));
+    auto cOne = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(1));
+    auto cTpb = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+    auto cBlock = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BLOCK)));
+    mlir::Value identity = buildIdentityVal();
+    auto fold = mlir::scf::ForOp::create(
+        rewriter, loc, cZero.getResult(), cE.getResult(), cOne.getResult(),
+        mlir::ValueRange{identity});
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(fold.getBody());
+      mlir::Value pos = mlir::arith::AddIOp::create(
+                            rewriter, loc, localTid,
+                            mlir::arith::MulIOp::create(
+                                rewriter, loc, fold.getInductionVar(),
+                                cTpb.getResult())
+                                .getResult())
+                            .getResult();
+      mlir::Value inRange = mlir::arith::CmpIOp::create(
+                                rewriter, loc,
+                                mlir::arith::CmpIPredicate::slt, pos,
+                                cBlock.getResult())
+                                .getResult();
+      mlir::Value safePos = mlir::arith::SelectOp::create(
+                                rewriter, loc, inRange, pos, cZero.getResult())
+                                .getResult();
+      mlir::Value elt =
+          evalRank1ValueAt(reduceSrc, safePos, rewriter, loc, 0);
+      if (!elt)
+        return rewriter.notifyMatchFailure(
+            op, "rank-1 slice reduce: failed to evaluate source element");
+      if (elt.getType() != storeTy)
+        elt = mlir::UnrealizedConversionCastOp::create(
+                  rewriter, loc, mlir::TypeRange{storeTy},
+                  mlir::ValueRange{elt})
+                  .getResult(0);
+      mlir::Value padded = mlir::arith::SelectOp::create(
+                               rewriter, loc, inRange, elt, buildIdentityVal())
+                               .getResult();
+      mlir::Value next =
+          emitCombine(fold.getRegionIterArgs().front(), padded);
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{next});
+    }
+    inputScalarPT = fold.getResult(0);
+  } else if (BLOCK > tpb) {
     int64_t spt = srcBlocked.getSizePerThread()[0];
     // Wall 8 (.omc/plans/tutorial02-wall8-spt1-direct.md): when spt == 1 and
     // BLOCK > tpb, each thread directly loads E = BLOCK/tpb elements at
@@ -4367,6 +4452,93 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
       return mlir::arith::OrIOp::create(rewriter, loc, a, b).getResult();
     });
+  if (auto o = mlir::dyn_cast<mlir::arith::XOrIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::XOrIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::ShLIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShLIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::ShRSIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShRSIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::ShRUIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::ShRUIOp::create(rewriter, loc, a, b).getResult();
+    });
+
+  auto scalarEltOf = [](mlir::Type t) -> mlir::Type {
+    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(t))
+      return rtt.getElementType();
+    return t;
+  };
+  auto signlessEltOf = [&](mlir::Type t) -> mlir::Type {
+    auto e = scalarEltOf(t);
+    if (auto i = llvm::dyn_cast<mlir::IntegerType>(e))
+      if (!i.isSignless())
+        return mlir::IntegerType::get(e.getContext(), i.getWidth());
+    return e;
+  };
+  if (auto s2f = mlir::dyn_cast<mlir::arith::SIToFPOp>(def)) {
+    mlir::Value x =
+        evalRank2ConeAt(s2f.getIn(), rVal, rowBase, nVal, rewriter, loc,
+                        depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::SIToFPOp::create(
+               rewriter, loc, scalarEltOf(s2f.getType()),
+               toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto u2f = mlir::dyn_cast<mlir::arith::UIToFPOp>(def)) {
+    mlir::Value x =
+        evalRank2ConeAt(u2f.getIn(), rVal, rowBase, nVal, rewriter, loc,
+                        depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::UIToFPOp::create(
+               rewriter, loc, scalarEltOf(u2f.getType()),
+               toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtUIOp>(def)) {
+    mlir::Value x =
+        evalRank2ConeAt(ext.getIn(), rVal, rowBase, nVal, rewriter, loc,
+                        depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::ExtUIOp::create(rewriter, loc,
+                                        signlessEltOf(ext.getType()),
+                                        toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtSIOp>(def)) {
+    mlir::Value x =
+        evalRank2ConeAt(ext.getIn(), rVal, rowBase, nVal, rewriter, loc,
+                        depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::ExtSIOp::create(rewriter, loc,
+                                        signlessEltOf(ext.getType()),
+                                        toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncIOp>(def)) {
+    mlir::Value x =
+        evalRank2ConeAt(trunc.getIn(), rVal, rowBase, nVal, rewriter, loc,
+                        depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::TruncIOp::create(rewriter, loc,
+                                         signlessEltOf(trunc.getType()),
+                                         toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  if (auto tr = mlir::dyn_cast<mlir::triton::TransOp>(def))
+    return evalRank2ConeAt(tr.getSrc(), nVal, rowBase, rVal, rewriter, loc,
+                           depth + 1);
 
   return nullptr;
 }
@@ -4633,6 +4805,11 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
                 mlir::arith::CmpIOp, mlir::arith::CmpFOp>(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1) &&
            rank2ConeSupported(def->getOperand(1), depth + 1);
+  if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
+                mlir::arith::ExtUIOp,
+                mlir::arith::ExtSIOp, mlir::arith::TruncIOp,
+                mlir::triton::TransOp>(def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1);
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
     return rank2ConeSupported(sel.getCondition(), depth + 1) &&
            rank2ConeSupported(sel.getTrueValue(), depth + 1) &&
@@ -5826,32 +6003,37 @@ struct ReduceLowering
     // created and this IS the user's loop — so ask the address instead. A
     // trip-varying address must be re-reduced every iteration, exactly like the
     // staged-cone case; hoisting it would reduce trip 0's tile every time.
+    // Inspect the complete computed cone, not just `reprLoad`: in attention the
+    // first load is commonly the loop-invariant query while a later key/value
+    // load carries the loop induction variable.
     const bool loopVaryingAddr =
-        tileLoop && readsLoopCarriedValue(reprLoad.getPtr(), tileLoop);
-    // ...but only when the loop carries no iter_args. With iter_args the loop
-    // is rebuilt by its own conversion pattern (its arg types change), which
-    // moves the ops around the inline fill and leaves the hoisted rowBuf alloca
-    // failing to dominate the read — "operand #0 does not dominate this use".
-    // Reject up front: a clear unsupported-shape message beats either a
-    // dominance crash or the silently-wrong hoisted reduce this used to emit.
-    // ...but only when the loop carries iter_args we have NOT taken ownership
-    // of. With a staged tile the iter_args are exactly what we replaced with
-    // threadgroup memory, and the alloca sits above the loop, so the shape is
-    // handled rather than rejected.
-    if (loopVaryingAddr && !carriedTile &&
-        !tileLoop.getRegionIterArgs().empty())
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: tile address varies with an enclosing loop that "
-              "also carries iter_args; the fill cannot be hoisted (wrong tile) "
-              "nor emitted inline (rowBuf alloca would not dominate)");
-    // inlineStaged (M<=tpb) reads rowBuf[localTid] (each thread its own row), so
-    // it needs no output tile layout.
-    if (tileLoop && !outTile && !inlineStaged)
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: output tile layout not found");
+        tileLoop && readsLoopCarriedValue(reduceSrc, tileLoop);
+    // SCF structural conversion may already have replaced a state-carrying
+    // user loop when this nested reduce is visited. Its original induction
+    // variable can then survive only in the pre-conversion cone as a detached
+    // block argument, so pointer-based dependence discovery above cannot match
+    // it to the replacement loop. Treat any loop with scalar/tensor state as
+    // iteration-varying conservatively. Recomputing a loop-invariant tile is
+    // still correct; hoisting a genuinely varying tile is not.
+    const bool loopCarriesState =
+        tileLoop && tileLoop.getNumRegionIterArgs() > 0;
+    // A loop with iter_args is rebuilt by SCF structural type conversion. The
+    // row buffer therefore must live at function entry (below), not merely
+    // immediately before the old loop: the replacement loop may otherwise be
+    // inserted before the allocation and its inline fill/read would violate
+    // dominance. With a function-entry allocation, a loop-varying address can
+    // safely keep the fill inline even when the loop carries scalar/tensor
+    // online-softmax state.
+    // A producer used only by a later full rank-1 reduce has no blocked tensor
+    // or store downstream from which to infer an output tile. That is valid:
+    // the later reduce reads this producer's registered rowBuf by logical row,
+    // while the replacement scalar below is only a dead physical placeholder.
+    // The fallback `tid % M` read keeps that placeholder in bounds. Direct
+    // materialized/broadcast consumers still provide outTile and retain their
+    // exact indexing path.
 
     // -------- Staging. --------
-    // The rowBuf threadgroup alloca is ALWAYS hoisted above the outermost loop
+    // The rowBuf threadgroup alloca is ALWAYS placed at function entry
     // (threadgroup memory is function-scope). The FILL is hoisted for a
     // loop-invariant (device) cone (compute once) but emitted INLINE for a
     // staged cone (inlineStaged): the staged leaves' getRemappedValue only
@@ -5859,12 +6041,16 @@ struct ReduceLowering
     // A loop-varying address (loopVaryingAddr) is inline for the same reason.
     // A staged tile is likewise inline: the buffer advances one trip per fill,
     // so the fill IS the recurrence and must run every iteration.
-    const bool fillInLoop = inlineStaged || loopVaryingAddr || carriedTile;
+    const bool fillInLoop =
+        inlineStaged || loopVaryingAddr || loopCarriesState || carriedTile;
     mlir::Value rowBuf;
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
-      if (tileLoop)
-        rewriter.setInsertionPoint(tileLoop);
+      auto kernelOp = op->getParentOfType<KernelOp>();
+      if (!kernelOp || kernelOp.getBodyRegion().empty())
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: enclosing metal.kernel not found");
+      rewriter.setInsertionPointToStart(&kernelOp.getBodyRegion().front());
       auto rowBufTy =
           MetalMemRefType::get(rewriter.getContext(), storeTy, M);
       rowBuf = ThreadgroupAllocaOp::create(rewriter, loc, rowBufTy).getResult();
