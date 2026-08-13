@@ -102,8 +102,9 @@ End-to-end correctness verified against PyTorch references on Apple Silicon (M-s
 | `easy-interleave_arrays.py` | ✅ |
 | `easy-matrix_transpose.py` | ✅ |
 | `medium-mean_squared_error.py` | ✅ |
+| `medium-ordinary_least_squares.py` | ✅ |
 
-Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, simple reductions, atomic accumulation, broadcast, and 2D dispatch.
+Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, reductions, atomic accumulation, broadcast, 2D dispatch, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
 
 In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 
@@ -113,7 +114,7 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 
 - **No autotuning, no perf work.** Generated MSL is single-threadgroup-per-program and makes no use of SIMD-group reductions, threadgroup memory, or vectorized loads. Throughput will be **far** below what Metal-native kernels achieve.
 - **Op coverage is partial.** Many `tl.*` ops are unimplemented; you will hit `NYI` errors on non-trivial kernels.
-- **No `tl.dot` / no matmul lowering.** Tensor-core / SIMD-group-matrix mapping is future work.
+- **No general `tl.dot` / matmul lowering.** Correctness fallbacks cover selected proven f32 GEMM and Gram shapes, but arbitrary dot layouts remain unsupported. Broader SIMD-group-matrix mapping is future work.
 - **Runtime shells out to `xcrun`** at every launch — no MSL caching across processes yet.
 - **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`). For broader distribution it should be re-tagged to the minimum supported macOS.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.

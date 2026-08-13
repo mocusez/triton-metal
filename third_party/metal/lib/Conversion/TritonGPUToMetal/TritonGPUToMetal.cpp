@@ -13098,18 +13098,20 @@ static bool sdMatchWeightedOperand(mlir::Value operand,
   return matrixLoad && weightLoad;
 }
 
-// Correctness fallback for the logistic-regression Hessian loop
+// Correctness fallback for Gram-matrix loops
 //
+//   G += dot(transpose_view(X), X)
 //   H += dot(transpose_view(X), X * W[:, None])
 //
-// where the loop walks samples in BLOCK_M chunks.  This shape cannot use the
-// ordinary scalar-GEMM fallback: A is physically transposed, B is computed,
-// and the reduction extent (n_samples) differs from both physical row strides
-// (n_features).  Collapse only this proven shape to `metal.scalar_dot` with
-// its explicit transpose/weight/extent operands.  Generic observable
-// sizePerThread>1 repacks remain rejected by the later legality walk.
+// where the loop walks samples in BLOCK_M chunks.  These shapes cannot use the
+// ordinary scalar-GEMM fallback: A is physically transposed and the reduction
+// extent (n_samples) differs from both physical row strides (n_features); the
+// Hessian variant also has a computed B operand.  Collapse only these proven
+// shapes to `metal.scalar_dot` with explicit transpose/extent and an optional
+// weight operand.  Generic observable sizePerThread>1 repacks remain rejected
+// by the later legality walk.
 static mlir::LogicalResult
-tryWeightedGramLoopFallback(mlir::scf::ForOp forOp) {
+tryGramLoopFallback(mlir::scf::ForOp forOp) {
   if (forOp.getNumResults() != 1)
     return mlir::failure();
   llvm::SmallVector<mlir::triton::DotOp> dots;
@@ -13142,7 +13144,9 @@ tryWeightedGramLoopFallback(mlir::scf::ForOp forOp) {
 
   auto aLoad = sdPeelToLoad(dot.getA());
   mlir::triton::LoadOp bLoad, weightLoad;
-  if (!aLoad || !sdMatchWeightedOperand(dot.getB(), bLoad, weightLoad))
+  if (!sdMatchWeightedOperand(dot.getB(), bLoad, weightLoad))
+    bLoad = sdPeelToLoad(dot.getB());
+  if (!aLoad || !bLoad)
     return mlir::failure();
   auto aLoadTy =
       mlir::dyn_cast<mlir::RankedTensorType>(aLoad.getType());
@@ -13169,15 +13173,17 @@ tryWeightedGramLoopFallback(mlir::scf::ForOp forOp) {
                              forOp.getInductionVar()))
     return mlir::failure();
 
-  // W must be indexed by the same sample-loop IV.  The scalar fallback then
-  // reads exactly W[k] for k in [0, n_samples).
-  auto weightAdd =
-      weightLoad.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
-  if (!weightAdd ||
-      !weightAdd.getPtr().getDefiningOp<mlir::triton::SplatOp>() ||
-      !contributionContainsSplatOf(weightAdd.getOffset(),
-                                   forOp.getInductionVar()))
-    return mlir::failure();
+  if (weightLoad) {
+    // W must be indexed by the same sample-loop IV.  The scalar fallback then
+    // reads exactly W[k] for k in [0, n_samples).
+    auto weightAdd =
+        weightLoad.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!weightAdd ||
+        !weightAdd.getPtr().getDefiningOp<mlir::triton::SplatOp>() ||
+        !contributionContainsSplatOf(weightAdd.getOffset(),
+                                     forOp.getInductionVar()))
+      return mlir::failure();
+  }
 
   mlir::Value loopResult = forOp.getResult(0);
   if (!sdFindStore(loopResult))
@@ -13192,11 +13198,11 @@ tryWeightedGramLoopFallback(mlir::scf::ForOp forOp) {
   return mlir::success();
 }
 
-static void preprocessWeightedGramDots(mlir::ModuleOp moduleOp) {
+static void preprocessGramDots(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp loop) { loops.push_back(loop); });
   for (auto loop : loops)
-    (void)tryWeightedGramLoopFallback(loop);
+    (void)tryGramLoopFallback(loop);
 }
 
 // Rewrite every scalar-GEMM-eligible dot (standalone + single-dot epilogue
@@ -16695,11 +16701,11 @@ struct ConvertTritonGPUToMetalPass
     // a successful match replaces the whole loop/store with one legal Metal op.
     runInt4WeightOnlyMatmulMatcher(moduleOp);
 
-    // Logistic-regression Hessian: consume the exact weighted-Gram dot loop
-    // before the generic dot-cvt prepass.  Its B operand is computed
-    // (`X * W[:, None]`), so the ordinary load-only prepass intentionally does
-    // not strip either dot-operand conversion.
-    preprocessWeightedGramDots(moduleOp);
+    // Ordinary and weighted Gram matrices both use a physically transposed X
+    // view and reduce over n_samples rather than the physical row stride.
+    // Consume them before the generic dot-cvt prepass; the weighted variant's
+    // B operand is computed (`X * W[:, None]`).
+    preprocessGramDots(moduleOp);
 
     // L1d3: rewire dot-feeding ttg.convert_layout(blocked -> dot_op) ops
     // off their tt.dot operands so they don't survive into the cvt
