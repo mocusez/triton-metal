@@ -120,6 +120,8 @@ private:
   void translate(mlir::triton::metal::GemvOp op);
   void translate(mlir::triton::metal::QmvOp op);
   void translate(mlir::triton::metal::QmmOp op);
+  void translate(mlir::triton::metal::Int4WeightOnlyMatmulOp op);
+  void translate(mlir::triton::metal::Int8QuantizedMatmulOp op);
   void translate(mlir::triton::metal::ReduceOp op);
   void translate(mlir::triton::metal::ArgmaxOp op);
   void translate(mlir::triton::metal::SoftmaxOp op);

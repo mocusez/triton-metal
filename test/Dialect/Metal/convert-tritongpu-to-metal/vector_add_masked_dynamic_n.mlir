@@ -33,6 +33,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %o_addr, %sum, %mask : tensor<128x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // BLOCK=1 folds the tensor address to `tt.splat(scalar_ptr)` instead of
+  // leaving a tensor `tt.addptr`. Masked loads must support the same uniform
+  // pointer shape as unmasked loads.
+  tt.func public @masked_uniform_ptr_block1(%x_ptr: !tt.ptr<f32>, %output_ptr: !tt.ptr<f32>, %n_elements: i32) {
+    %pid = tt.get_program_id x : i32
+    %n_splat = tt.splat %n_elements : i32 -> tensor<1xi32, #blocked>
+    %pid_splat = tt.splat %pid : i32 -> tensor<1xi32, #blocked>
+    %mask = arith.cmpi slt, %pid_splat, %n_splat : tensor<1xi32, #blocked>
+    %zero = arith.constant dense<0.000000e+00> : tensor<1xf32, #blocked>
+    %x_scalar = tt.addptr %x_ptr, %pid : !tt.ptr<f32>, i32
+    %x_uniform = tt.splat %x_scalar : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>, #blocked>
+    %x = tt.load %x_uniform, %mask, %zero : tensor<1x!tt.ptr<f32>, #blocked>
+    %sum = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<1xf32, #blocked>) -> f32
+    tt.store %output_ptr, %sum : !tt.ptr<f32>
+    tt.return
+  }
 }
 
 // METAL: metal.module
@@ -71,6 +92,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // METAL: scf.if
 // METAL: metal.store
 // METAL: metal.return
+// METAL-LABEL: metal.kernel masked_uniform_ptr_block1
+// METAL: ^bb0(%[[UNIFORM_INPUT:[0-9a-z_]+]]: !metal.memref<? x f32>
+// METAL: %[[TGID:[0-9a-z_]+]] = metal.threadgroup_id "x" : ui32
+// METAL-NEXT: %[[PROGRAM_ID:[0-9a-z_]+]] = builtin.unrealized_conversion_cast %[[TGID]] : ui32 to i32
+// METAL: scf.if {{.*}} -> (f32)
+// METAL: %[[UNIFORM_INDEX:[0-9a-z_]+]] = builtin.unrealized_conversion_cast %[[PROGRAM_ID]] : i32 to ui32
+// METAL-NEXT: {{.*}} = metal.get_element %[[UNIFORM_INPUT]][%[[UNIFORM_INDEX]]]
+// METAL: scf.yield
+// METAL: metal.constant
+// METAL: scf.yield
+// METAL: metal.return
 // METAL: metal.module_end
 
 // Post-Lmultiload-Phase-C: 1D canonical short-circuit deleted. The
@@ -102,4 +134,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: v{{[0-9]+}}[{{.*}}] = ({{.*}} ? {{.*}} : {{.*}});
 // MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}}[v{{[0-9]+}}] = v{{[0-9]+}};
+// MSL: return;
+// MSL-LABEL: kernel void masked_uniform_ptr_block1(
+// MSL: if ({{.*}})
+// MSL: = v{{[0-9]+}}[tgid.x];
+// MSL: else
+// MSL: = 0
 // MSL: return;

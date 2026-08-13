@@ -1,4 +1,4 @@
-"""Per-element (rank-1) masked `tl.atomic_add` on the Metal backend.
+"""Per-element masked `tl.atomic_add` and histogram output on Metal.
 
 `tt.atomic_rmw fadd` in tensor form is the lock-free accumulation the
 layer-norm backward uses in place of the tutorial's global spin lock (Apple
@@ -13,6 +13,10 @@ loop replicates the op in place, and the device atomic is guarded by the mask
 cone so masked-off lanes never touch a potentially-OOB (and, zero-copy, live)
 address. Covers E==1 / E>1, a real `cols<N` mask, and the exact grouped
 `_dw[lock_id*N + cols]` accumulation shape of `_layer_norm_bwd_dx_fused`.
+
+The integer cases cover the `tl.histogram` workload: one output lane scans the
+logical input tile for its bin, then a masked i32 tensor atomic accumulates the
+per-program counts into the final histogram.
 """
 
 from __future__ import annotations
@@ -46,8 +50,7 @@ def _scatter_add_rows(In, Out, N, BLOCK: tl.constexpr):
 
 
 # E==1 (BLOCK==tpb at 32), E>1 (BLOCK>tpb at 256/1024), non-pow2 N (masked).
-@pytest.mark.parametrize("G, N", [(8, 32), (5, 200), (16, 256), (3, 1000),
-                                  (7, 1024)])
+@pytest.mark.parametrize("G, N", [(8, 32), (5, 200), (16, 256), (3, 1000), (7, 1024)])
 def test_atomic_add_scatter(G, N):
     torch.manual_seed(G * 100 + N)
     inp = torch.randn(G, N, device="mps")
@@ -72,8 +75,7 @@ def _grouped_accumulate(In, DW, N, GROUP_SIZE_M, BLOCK: tl.constexpr):
     tl.atomic_add(DW + lock_id * N + cols, v, mask=mask)
 
 
-@pytest.mark.parametrize("M, N, GROUP", [(8, 128, 4), (16, 256, 4),
-                                         (10, 200, 3), (12, 1024, 8)])
+@pytest.mark.parametrize("M, N, GROUP", [(8, 128, 4), (16, 256, 4), (10, 200, 3), (12, 1024, 8)])
 def test_atomic_add_grouped(M, N, GROUP):
     torch.manual_seed(M * 1000 + N + GROUP)
     inp = torch.randn(M, N, device="mps")
@@ -105,6 +107,59 @@ def test_atomic_add_ones_exact(G, N):
     torch.mps.synchronize()
     ref = torch.full((N,), float(G))
     torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _histogram_atomic(In, Out, N, NUM_BINS, PADDED_BINS: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < N
+    values = tl.load(In + offsets, mask=valid)
+    hist = tl.histogram(values, PADDED_BINS)
+    # A masked load without an explicit `other` contributes zero for its
+    # inactive lanes. Match the leet kernel by removing those padding zeros.
+    hist -= (BLOCK - tl.sum(valid.to(tl.int32))) * (tl.arange(0, PADDED_BINS) == 0)
+    bins = tl.arange(0, PADDED_BINS)
+    tl.atomic_add(Out + bins, hist, mask=(bins < NUM_BINS) & (hist != 0))
+
+
+@pytest.mark.parametrize("N, NUM_BINS", [(1024, 16), (1000, 16), (2500, 37)])
+def test_histogram_atomic_matches_bincount(N, NUM_BINS):
+    torch.manual_seed(N + NUM_BINS)
+    inp = torch.randint(0, NUM_BINS, (N,), dtype=torch.int32, device="mps")
+    out = torch.zeros(NUM_BINS, dtype=torch.int32, device="mps")
+    _histogram_atomic[(triton.cdiv(N, 1024),)](
+        inp,
+        out,
+        N,
+        NUM_BINS,
+        PADDED_BINS=triton.next_power_of_2(NUM_BINS),
+        BLOCK=1024,
+    )
+    torch.mps.synchronize()
+    ref = torch.bincount(inp.cpu().to(torch.int64), minlength=NUM_BINS)
+    torch.testing.assert_close(out.cpu().to(torch.int64), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _masked_histogram_store(In, Out, N, BINS: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    valid = offsets < N
+    values = tl.load(In + offsets, mask=valid)
+    hist = tl.histogram(values, BINS, mask=valid)
+    tl.store(Out + tl.arange(0, BINS), hist)
+
+
+@pytest.mark.parametrize("N", [100, 1000])
+def test_masked_histogram_matches_bincount(N):
+    BINS = 16
+    torch.manual_seed(N)
+    inp = torch.randint(0, BINS, (N,), dtype=torch.int32, device="mps")
+    out = torch.zeros(BINS, dtype=torch.int32, device="mps")
+    _masked_histogram_store[(1,)](inp, out, N, BINS=BINS, BLOCK=1024)
+    torch.mps.synchronize()
+    ref = torch.bincount(inp.cpu().to(torch.int64), minlength=BINS)
+    torch.testing.assert_close(out.cpu().to(torch.int64), ref, atol=0, rtol=0)
 
 
 @triton.jit

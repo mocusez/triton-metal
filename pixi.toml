@@ -57,6 +57,7 @@ leet-matrix-transpose = "python leet-triton/easy-matrix_transpose.py"
 leet-3d-convolution = "python leet-triton/medium-3D_convolution.py"
 leet-2d-subarray-sum = "python leet-triton/medium-2D_subarray_sum.py"
 leet-3d-subarray-sum = "python leet-triton/medium-3D_subarray_sum.py"
+leet-mse = "python leet-triton/medium-mean_squared_error.py"
 
 # Run every leet-triton example sequentially.
 leet-all = { depends-on = [
@@ -69,4 +70,5 @@ leet-all = { depends-on = [
     "leet-3d-convolution",
     "leet-2d-subarray-sum",
     "leet-3d-subarray-sum",
+    "leet-mse",
 ] }

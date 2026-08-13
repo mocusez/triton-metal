@@ -285,14 +285,26 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesFusedAttention = true;
     return mlir::WalkResult::interrupt();
   });
-  bool usesThreadgroupId = usesFusedAttention;
+  bool usesInt4WeightOnlyMatmul = false;
+  op.walk([&](mlir::triton::metal::Int4WeightOnlyMatmulOp) {
+    usesInt4WeightOnlyMatmul = true;
+    return mlir::WalkResult::interrupt();
+  });
+  bool usesInt8QuantizedMatmul = false;
+  op.walk([&](mlir::triton::metal::Int8QuantizedMatmulOp) {
+    usesInt8QuantizedMatmul = true;
+    return mlir::WalkResult::interrupt();
+  });
+  bool usesThreadgroupId = usesFusedAttention || usesInt4WeightOnlyMatmul ||
+                           usesInt8QuantizedMatmul;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
     return mlir::WalkResult::interrupt();
   });
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
-  if (usesFusedAttention)
+  if (usesFusedAttention || usesInt4WeightOnlyMatmul ||
+      usesInt8QuantizedMatmul)
     _output << ",\n  uint3 ltid [[thread_position_in_threadgroup]]";
   // Conditionally add the threadgroups-per-grid parameter only when the
   // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
@@ -346,7 +358,10 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
-            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
+            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
+            mlir::triton::metal::Int4WeightOnlyMatmulOp,
+            mlir::triton::metal::Int8QuantizedMatmulOp,
+            mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FusedAttentionOp,
@@ -393,7 +408,10 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
-            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp, mlir::triton::metal::ReduceOp,
+            mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
+            mlir::triton::metal::Int4WeightOnlyMatmulOp,
+            mlir::triton::metal::Int8QuantizedMatmulOp,
+            mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
             mlir::triton::metal::FusedAttentionOp,
@@ -4493,6 +4511,265 @@ void ModuleTranslation::translate(mlir::triton::metal::MatmulOp op) {
                    << static_cast<int>(op.getKind());
     return;
   }
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::Int4WeightOnlyMatmulOp op) {
+  auto bufName = [&](mlir::Value m) -> std::string {
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.int4_weight_only_matmul: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+
+  const std::string X = bufName(op.getX());
+  const std::string WQ = bufName(op.getWq());
+  const std::string SCALES = bufName(op.getScales());
+  const std::string OUT = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string N = bufName(op.getN()) + "[0]";
+  const std::string K = bufName(op.getK()) + "[0]";
+  const std::string SXM = bufName(op.getStrideXm()) + "[0]";
+  const std::string SWQN = bufName(op.getStrideWqn()) + "[0]";
+  const std::string SSN = bufName(op.getStrideSn()) + "[0]";
+  const std::string SYM = bufName(op.getStrideYm()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "// ---- metal.int4_weight_only_matmul scalar fallback ----\n";
+    indent();
+    _output << "uint _i4_lane = ltid.x;\n";
+    indent();
+    _output << "uint _i4_M = " << M << ";\n";
+    indent();
+    _output << "uint _i4_N = " << N << ";\n";
+    indent();
+    _output << "uint _i4_K = " << K << ";\n";
+    indent();
+    _output << "uint _i4_sxm = " << SXM << ";\n";
+    indent();
+    _output << "uint _i4_swqn = " << SWQN << ";\n";
+    indent();
+    _output << "uint _i4_ssn = " << SSN << ";\n";
+    indent();
+    _output << "uint _i4_sym = " << SYM << ";\n";
+    indent();
+    _output << "uint _i4_row0 = tgid.x * " << S(op.getBm()) << "u;\n";
+    indent();
+    _output << "uint _i4_col0 = tgid.y * " << S(op.getBn()) << "u;\n";
+    indent();
+    _output << "for (uint _i4_e = _i4_lane; _i4_e < "
+            << S(op.getBm() * op.getBn()) << "u; _i4_e += 128u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "uint _i4_rm = _i4_e / " << S(op.getBn()) << "u;\n";
+      indent();
+      _output << "uint _i4_cn = _i4_e % " << S(op.getBn()) << "u;\n";
+      indent();
+      _output << "uint _i4_m = _i4_row0 + _i4_rm;\n";
+      indent();
+      _output << "uint _i4_n = _i4_col0 + _i4_cn;\n";
+      indent();
+      _output << "if (_i4_m < _i4_M && _i4_n < _i4_N) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "float _i4_acc = 0.0f;\n";
+        indent();
+        _output << "for (uint _i4_kk = 0u; _i4_kk < _i4_K; ++_i4_kk) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "uchar _i4_pack = " << WQ
+                  << "[_i4_n * _i4_swqn + (_i4_kk >> 1u)];\n";
+          indent();
+          _output << "uint _i4_q = ((_i4_kk & 1u) == 0u) ? "
+                     "((uint(_i4_pack) >> 4u) & 15u) : "
+                     "(uint(_i4_pack) & 15u);\n";
+          indent();
+          _output << "float _i4_scale = " << SCALES
+                  << "[_i4_n * _i4_ssn + (_i4_kk / "
+                  << S(op.getGroupSize()) << "u)];\n";
+          indent();
+          _output << "_i4_acc += float(" << X
+                  << "[_i4_m * _i4_sxm + _i4_kk]) * "
+                     "(float(int(_i4_q) - 8) * _i4_scale);\n";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << OUT << "[_i4_m * _i4_sym + _i4_n] = half(_i4_acc);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::Int8QuantizedMatmulOp op) {
+  auto bufName = [&](mlir::Value m) -> std::string {
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.int8_quantized_matmul: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+
+  const std::string A = bufName(op.getA());
+  const std::string B = bufName(op.getB());
+  const std::string OUT = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string N = bufName(op.getN()) + "[0]";
+  const std::string K = bufName(op.getK()) + "[0]";
+  const std::string SCALE_A = bufName(op.getScaleA()) + "[0]";
+  const std::string SCALE_B = bufName(op.getScaleB()) + "[0]";
+  const std::string SCALE_C = bufName(op.getScaleC()) + "[0]";
+  const std::string ZERO_A = bufName(op.getZeroPointA()) + "[0]";
+  const std::string ZERO_B = bufName(op.getZeroPointB()) + "[0]";
+  const std::string ZERO_C = bufName(op.getZeroPointC()) + "[0]";
+  auto S = [](int64_t x) { return std::to_string(x); };
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "// ---- metal.int8_quantized_matmul scalar fallback ----\n";
+    indent();
+    _output << "uint _i8_lane = ltid.x;\n";
+    indent();
+    _output << "uint _i8_M = " << M << ";\n";
+    indent();
+    _output << "uint _i8_N = " << N << ";\n";
+    indent();
+    _output << "uint _i8_K = " << K << ";\n";
+    indent();
+    _output << "float _i8_scale = " << SCALE_A << " * " << SCALE_B
+            << " / " << SCALE_C << ";\n";
+    indent();
+    _output << "int _i8_zpa = as_type<int>(" << ZERO_A << ");\n";
+    indent();
+    _output << "int _i8_zpb = as_type<int>(" << ZERO_B << ");\n";
+    indent();
+    _output << "int _i8_zpc = as_type<int>(" << ZERO_C << ");\n";
+    indent();
+    _output << "uint _i8_row0 = tgid.x * " << S(op.getBm()) << "u;\n";
+    indent();
+    _output << "uint _i8_col0 = tgid.y * " << S(op.getBn()) << "u;\n";
+    indent();
+    _output << "for (uint _i8_e = _i8_lane; _i8_e < "
+            << S(op.getBm() * op.getBn()) << "u; _i8_e += 128u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "uint _i8_m = _i8_row0 + _i8_e / " << S(op.getBn())
+              << "u;\n";
+      indent();
+      _output << "uint _i8_n = _i8_col0 + _i8_e % " << S(op.getBn())
+              << "u;\n";
+      indent();
+      _output << "if (_i8_m < _i8_M && _i8_n < _i8_N) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "int _i8_acc = 0;\n";
+        indent();
+        _output << "int _i8_sum_a = 0;\n";
+        indent();
+        _output << "int _i8_sum_b = 0;\n";
+        indent();
+        _output << "for (uint _i8_kk = 0u; _i8_kk < _i8_K; ++_i8_kk) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "int _i8_av = int(" << A
+                  << "[_i8_m * _i8_K + _i8_kk]);\n";
+          indent();
+          _output << "int _i8_bv = int(" << B
+                  << "[_i8_kk * _i8_N + _i8_n]);\n";
+          indent();
+          _output << "_i8_acc += _i8_av * _i8_bv;\n";
+          indent();
+          _output << "_i8_sum_a += _i8_av;\n";
+          indent();
+          _output << "_i8_sum_b += _i8_bv;";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "int _i8_corrected = _i8_acc - _i8_sum_a * _i8_zpb - "
+                   "_i8_sum_b * _i8_zpa + int(_i8_K) * _i8_zpa * _i8_zpb;\n";
+        indent();
+        _output << "float _i8_q = floor(float(_i8_corrected) * _i8_scale + "
+                   "0.5f) + float(_i8_zpc);\n";
+        indent();
+        _output << "_i8_q = clamp(_i8_q, -128.0f, 127.0f);\n";
+        indent();
+        _output << OUT << "[_i8_m * _i8_N + _i8_n] = int8_t(_i8_q);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
 }
 
 void ModuleTranslation::emitScalarMatmul_(mlir::triton::metal::MatmulOp op) {

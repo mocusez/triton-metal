@@ -91,7 +91,7 @@ pixi run leet-all
 
 ## What works today
 
-End-to-end correctness verified against PyTorch references on Apple Silicon (M-series, macOS 26.4 in the development environment) for the following LeetGPU "easy" kernels under `leet-triton/`:
+End-to-end correctness verified against PyTorch references on Apple Silicon (M-series, macOS 26.4 in the development environment) for the following LeetGPU-style kernels under `leet-triton/`:
 
 | Task | Pass |
 |---|---|
@@ -101,8 +101,9 @@ End-to-end correctness verified against PyTorch references on Apple Silicon (M-s
 | `easy-gaussian_error_gated_linear_unit.py` | ✅ |
 | `easy-interleave_arrays.py` | ✅ |
 | `easy-matrix_transpose.py` | ✅ |
+| `medium-mean_squared_error.py` | ✅ |
 
-Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, simple reductions, broadcast, and 2D dispatch. No medium/hard LeetGPU problems pass yet.
+Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, simple reductions, atomic accumulation, broadcast, and 2D dispatch.
 
 In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 

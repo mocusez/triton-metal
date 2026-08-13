@@ -309,6 +309,117 @@ llvm::LogicalResult FusedAttentionOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// Int4WeightOnlyMatmulOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult Int4WeightOnlyMatmulOp::verify() {
+  if (getGroupSize() <= 0)
+    return emitOpError() << "group_size must be positive (got "
+                         << getGroupSize() << ")";
+  if (getGroupSize() % 2 != 0)
+    return emitOpError() << "group_size must be even (got " << getGroupSize()
+                         << ")";
+  if (getBm() <= 0 || getBn() <= 0)
+    return emitOpError() << "bm and bn must be positive";
+  if (getBm() != 64 || getBn() != 64)
+    return emitOpError()
+           << "currently only the 64x64 leet-triton fallback tile is supported";
+
+  auto checkMemref = [&](mlir::Value v, mlir::Type elem,
+                         llvm::StringRef name) -> llvm::LogicalResult {
+    auto mr = llvm::dyn_cast<MetalMemRefType>(v.getType());
+    if (!mr)
+      return emitOpError() << name << " must be a !metal.memref";
+    if (mr.getType() != elem)
+      return emitOpError() << name << " element type must be " << elem
+                           << ", got " << mr.getType();
+    return mlir::success();
+  };
+
+  auto ctx = getContext();
+  auto f16 = mlir::Float16Type::get(ctx);
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto ui32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Unsigned);
+  if (failed(checkMemref(getX(), f16, "x")) ||
+      failed(checkMemref(getScales(), f32, "scales")) ||
+      failed(checkMemref(getOut(), f16, "out")))
+    return mlir::failure();
+  auto wqMemRef = llvm::dyn_cast<MetalMemRefType>(getWq().getType());
+  auto wqIntTy = wqMemRef ? llvm::dyn_cast<mlir::IntegerType>(wqMemRef.getType())
+                          : nullptr;
+  if (!wqIntTy || wqIntTy.getWidth() != 8)
+    return emitOpError() << "wq element type must be an 8-bit integer, got "
+                         << (wqMemRef ? wqMemRef.getType() : getWq().getType());
+  for (auto [name, v] :
+       {std::pair<llvm::StringRef, mlir::Value>{"m", getM()},
+        {"n", getN()},
+        {"k", getK()},
+        {"stride_xm", getStrideXm()},
+        {"stride_wqn", getStrideWqn()},
+        {"stride_sn", getStrideSn()},
+        {"stride_ym", getStrideYm()}}) {
+    if (failed(checkMemref(v, ui32, name)))
+      return mlir::failure();
+  }
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Int8QuantizedMatmulOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult Int8QuantizedMatmulOp::verify() {
+  if (getBm() != 64 || getBn() != 64)
+    return emitOpError()
+           << "currently only the 64x64 leet-triton fallback tile is supported";
+
+  auto checkMemref = [&](mlir::Value v, mlir::Type elem,
+                         llvm::StringRef name) -> llvm::LogicalResult {
+    auto mr = llvm::dyn_cast<MetalMemRefType>(v.getType());
+    if (!mr)
+      return emitOpError() << name << " must be a !metal.memref";
+    if (mr.getType() != elem)
+      return emitOpError() << name << " element type must be " << elem
+                           << ", got " << mr.getType();
+    return mlir::success();
+  };
+
+  auto checkI8Memref = [&](mlir::Value v,
+                           llvm::StringRef name) -> llvm::LogicalResult {
+    auto mr = llvm::dyn_cast<MetalMemRefType>(v.getType());
+    auto intTy = mr ? llvm::dyn_cast<mlir::IntegerType>(mr.getType()) : nullptr;
+    if (!intTy || intTy.getWidth() != 8 || !intTy.isSignless())
+      return emitOpError() << name
+                           << " element type must be signless i8, got "
+                           << (mr ? mr.getType() : v.getType());
+    return mlir::success();
+  };
+
+  auto ctx = getContext();
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto ui32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Unsigned);
+  if (failed(checkI8Memref(getA(), "a")) ||
+      failed(checkI8Memref(getB(), "b")) ||
+      failed(checkI8Memref(getOut(), "out")) ||
+      failed(checkMemref(getScaleA(), f32, "scale_a")) ||
+      failed(checkMemref(getScaleB(), f32, "scale_b")) ||
+      failed(checkMemref(getScaleC(), f32, "scale_c")))
+    return mlir::failure();
+
+  for (auto [name, v] :
+       {std::pair<llvm::StringRef, mlir::Value>{"m", getM()},
+        {"n", getN()},
+        {"k", getK()},
+        {"zero_point_a", getZeroPointA()},
+        {"zero_point_b", getZeroPointB()},
+        {"zero_point_c", getZeroPointC()}}) {
+    if (failed(checkMemref(v, ui32, name)))
+      return mlir::failure();
+  }
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // Check Index
 //===----------------------------------------------------------------------===//
 

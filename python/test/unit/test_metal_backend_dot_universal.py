@@ -247,6 +247,136 @@ def test_batched_fp16_dot_explicit_fp32_operands(batch, M, N, K):
     torch.testing.assert_close(c.float(), ref.float(), atol=tol, rtol=tol)
 
 
+@triton.jit
+def int4_weight_only_dot_kernel(
+    x,
+    wq,
+    scales,
+    y,
+    M,
+    N,
+    K,
+    group_size: tl.constexpr,
+    stride_xm,
+    stride_xk,
+    stride_wqn,
+    stride_wqk,
+    stride_sn,
+    stride_sk,
+    stride_ym,
+    stride_yn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        offs_x1k = k + tl.arange(0, BLOCK_SIZE_K // 2) * 2
+        mask_x1 = (offs_m[:, None] < M) & (offs_x1k[None, :] < K)
+        tile_x1 = tl.load(
+            x + offs_m[:, None] * stride_xm + offs_x1k[None, :] * stride_xk,
+            mask=mask_x1,
+            other=0.0,
+        ).to(tl.float32)
+
+        offs_x2k = k + tl.arange(0, BLOCK_SIZE_K // 2) * 2 + 1
+        mask_x2 = (offs_m[:, None] < M) & (offs_x2k[None, :] < K)
+        tile_x2 = tl.load(
+            x + offs_m[:, None] * stride_xm + offs_x2k[None, :] * stride_xk,
+            mask=mask_x2,
+            other=0.0,
+        ).to(tl.float32)
+
+        offs_sk = (k // group_size) + tl.arange(0, BLOCK_SIZE_K // group_size)
+        mask_s = (offs_n[:, None] < N) & (offs_sk[None, :] < (K // group_size))
+        tile_s = tl.load(
+            scales + offs_n[:, None] * stride_sn + offs_sk[None, :] * stride_sk,
+            mask=mask_s,
+            other=0.0,
+        ).to(tl.float32)
+        tile_s = tl.broadcast_to(
+            tile_s[:, :, None],
+            (BLOCK_SIZE_N, BLOCK_SIZE_K // group_size, group_size // 2),
+        )
+        tile_s = tl.reshape(tile_s, (BLOCK_SIZE_N, BLOCK_SIZE_K // 2))
+
+        offs_wk = (k // 2) + tl.arange(0, BLOCK_SIZE_K // 2)
+        mask_w = (offs_n[:, None] < N) & (offs_wk[None, :] < (K // 2))
+        tile_wq = tl.load(
+            wq + offs_n[:, None] * stride_wqn + offs_wk[None, :] * stride_wqk,
+            mask=mask_w,
+            other=0x88,
+        )
+        tile_w1 = (((tile_wq & 0xF0) >> 4).to(tl.float32) - 8.0) * tile_s
+        tile_w2 = ((tile_wq & 0x0F).to(tl.float32) - 8.0) * tile_s
+
+        acc = tl.dot(tile_x1, tl.trans(tile_w1), acc=acc, input_precision="ieee")
+        acc = tl.dot(tile_x2, tl.trans(tile_w2), acc=acc, input_precision="ieee")
+
+    mask_y = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(
+        y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+        acc.to(tl.float16),
+        mask=mask_y,
+    )
+
+
+@pytest.mark.parametrize(
+    "M,N,K,group_size",
+    [
+        pytest.param(64, 64, 64, 16, id="single_tile_group16"),
+        pytest.param(64, 64, 64, 32, id="single_tile_group32"),
+        pytest.param(70, 66, 128, 64, id="mn_tail_kloop_group64"),
+    ],
+)
+def test_int4_weight_only_dot_runs_computed_dequant_operand(
+    M, N, K, group_size
+):
+    torch.manual_seed(0x1A4)
+    x = torch.randn((M, K), dtype=torch.float16).contiguous()
+    w_int = torch.randint(-8, 8, (N, K), dtype=torch.int16)
+    hi = ((w_int[:, 0::2] + 8).to(torch.uint8) << 4)
+    lo = (w_int[:, 1::2] + 8).to(torch.uint8)
+    wq = (hi | lo).contiguous()
+    scales = torch.rand((N, K // group_size), dtype=torch.float32).contiguous()
+    y = torch.empty((M, N), dtype=torch.float16).contiguous()
+
+    int4_weight_only_dot_kernel[
+        (triton.cdiv(M, 64), triton.cdiv(N, 64))
+    ](
+        x,
+        wq,
+        scales,
+        y,
+        M,
+        N,
+        K,
+        group_size,
+        x.stride(0),
+        x.stride(1),
+        wq.stride(0),
+        wq.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_SIZE_M=64,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=max(32, group_size),
+    )
+
+    scale_expanded = scales.float().repeat_interleave(group_size, dim=1)
+    w_dequant = w_int.float() * scale_expanded
+    ref = (x.float() @ w_dequant.t()).half()
+    tol = K * (2.0 ** -9)
+    torch.testing.assert_close(y.float(), ref.float(), atol=tol, rtol=tol)
+
+
 # ----------------------------------------------------------------------------
 # AC5: K-loop tiled, K_TILES in {1, 2, 4, 8}
 # ----------------------------------------------------------------------------

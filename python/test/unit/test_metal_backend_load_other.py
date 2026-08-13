@@ -66,6 +66,38 @@ def test_masked_load_with_other_bit_exact(BLOCK_SIZE, OTHER):
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
+@triton.jit
+def _masked_uniform_block1_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    OTHER: tl.constexpr,
+):
+    """Force BLOCK=1 so the tensor address folds to a splat scalar pointer."""
+    offset = tl.program_id(0) + tl.arange(0, 1)
+    mask = offset < n_elements
+    x = tl.load(x_ptr + offset, mask=mask, other=OTHER)
+    tl.atomic_add(output_ptr, tl.sum(x, axis=0))
+
+
+@pytest.mark.parametrize(
+    "grid, n_elements, other",
+    [(1, 1, 0.0), (2, 1, 0.5), (3, 3, -3.25)],
+)
+def test_masked_uniform_block1_load(grid, n_elements, other):
+    """Regression for BLOCK=1 masked loads whose ptr is `tt.splat`."""
+    x = torch.arange(1, n_elements + 1, dtype=torch.float32, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+
+    _masked_uniform_block1_kernel[(grid,)](
+        x, out, n_elements, OTHER=other
+    )
+    torch.mps.synchronize()
+
+    expected = x.cpu().sum().item() + (grid - n_elements) * other
+    torch.testing.assert_close(out.cpu()[0].item(), expected, atol=0, rtol=0)
+
+
 # Lmultiload Phase B audit canary: existing tests in this file only
 # exercise the canonical `offs = pid*BLOCK + arange` shape. This canary
 # adds a divergent constant offset (`offs + 1`) so any future regression

@@ -501,3 +501,56 @@ def test_dot_dynamic_k_fused_lora_masked(M, N, R, K):
     )
     ref = x @ w.t() + scale * ((x @ a.t()) @ b.t())
     torch.testing.assert_close(o.cpu(), ref, atol=1e-3, rtol=1e-3)
+
+
+# --- Weighted Gram matrix: verbatim Hessian kernel from
+#     leet-triton/medium-logistic_regression.py.  This is not an ordinary
+#     row-major GEMM: A is X transposed in the pointer expression and B is
+#     multiplied by a per-sample weight before the dot.
+@triton.jit
+def logistic_hessian_kernel(
+    X, n_samples, n_features, W, hessian,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    offset_row = pid_row * BLOCK_N + tl.arange(0, BLOCK_N)
+    offset_col = pid_col * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_row = offset_row < n_features
+    mask_col = offset_col < n_features
+    sum_h = tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32)
+    for step in range(0, n_samples, BLOCK_M):
+        offset = step + tl.arange(0, BLOCK_M)
+        mask = offset < n_samples
+        vals_xt = tl.load(
+            X + offset_row[:, None] + offset[None, :] * n_features,
+            mask=mask_row[:, None] & mask[None, :], other=0.0,
+        )
+        vals_x = tl.load(
+            X + offset[:, None] * n_features + offset_col[None, :],
+            mask=mask[:, None] & mask_col[None, :], other=0.0,
+        )
+        vals_w = tl.load(W + offset, mask=mask, other=0.0)
+        sum_h += tl.dot(vals_xt, vals_x * vals_w[:, None])
+    sum_h += tl.where(
+        offset_row[:, None] == offset_col[None, :], 1e-6, 0.0
+    )
+    tl.store(
+        hessian + offset_row[:, None] * n_features + offset_col[None, :],
+        sum_h,
+        mask=mask_row[:, None] & mask_col[None, :],
+    )
+
+
+@pytest.mark.parametrize("n_samples,n_features", [(32, 8), (45, 37), (64, 32)])
+def test_dot_logistic_hessian_weighted_gram(n_samples, n_features):
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randn((n_samples, n_features), dtype=torch.float32).contiguous()
+    w = torch.rand((n_samples,), dtype=torch.float32).contiguous()
+    hessian = torch.zeros((n_features, n_features), dtype=torch.float32)
+    logistic_hessian_kernel[
+        (triton.cdiv(n_features, 32), triton.cdiv(n_features, 32))
+    ](x, n_samples, n_features, w, hessian, BLOCK_M=32, BLOCK_N=32)
+    ref = x.t() @ (x * w[:, None])
+    ref += torch.eye(n_features, dtype=torch.float32) * 1e-6
+    torch.testing.assert_close(hessian, ref, atol=2e-3, rtol=2e-3)

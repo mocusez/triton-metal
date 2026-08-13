@@ -541,6 +541,76 @@ def QmmOp : Metal_Op<"qmm"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Int4WeightOnlyMatmulOp
+//===----------------------------------------------------------------------===//
+
+def Int4WeightOnlyMatmulOp : Metal_Op<"int4_weight_only_matmul"> {
+  let summary = "Correctness-first int4 weight-only matmul fallback";
+  let description = [{
+    Specialized fallback for leet-triton's int4 weight-only GEMM:
+    `Y[M,N] = X[M,K] * dequant(Wq, scales)[K,N]`.
+
+    Wq is laid out by output column first. Each byte stores two K values:
+    even K in the high nibble, odd K in the low nibble. The dequantized value
+    is `(q - 8) * scales[n * stride_sn + k / group_size]`.
+
+    The op is intentionally narrow. It carries runtime extents and leading
+    strides from the original Triton signature, but assumes the inner K/N
+    strides are one, matching the source kernel this fallback claims.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$x, Metal_MemRefType:$wq,
+                       Metal_MemRefType:$scales, Metal_MemRefType:$out,
+                       Metal_MemRefType:$m, Metal_MemRefType:$n,
+                       Metal_MemRefType:$k, Metal_MemRefType:$stride_xm,
+                       Metal_MemRefType:$stride_wqn,
+                       Metal_MemRefType:$stride_sn,
+                       Metal_MemRefType:$stride_ym,
+                       I64Attr:$group_size, I64Attr:$bm, I64Attr:$bn);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$x `,` $wq `,` $scales `,` $out `,` $m `,` $n `,` $k "
+                       "`strides` $stride_xm `,` $stride_wqn `,` $stride_sn "
+                       "`,` $stride_ym attr-dict `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
+// Int8QuantizedMatmulOp
+//===----------------------------------------------------------------------===//
+
+def Int8QuantizedMatmulOp : Metal_Op<"int8_quantized_matmul"> {
+  let summary = "Correctness-first asymmetric int8 matmul fallback";
+  let description = [{
+    Specialized fallback for leet-triton's asymmetric int8 GEMM. It computes
+    the int32 matrix product and row/column sums, applies the three zero-point
+    correction terms, rescales in f32, rounds with floor(x + 0.5), clamps to
+    [-128, 127], and stores int8 output.
+
+    The op is intentionally narrow: A, B, and C are contiguous row-major
+    matrices, runtime extents come from the original Triton signature, and the
+    currently supported source tile is 64x64 with a 64-element K step.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$a, Metal_MemRefType:$b,
+                       Metal_MemRefType:$out, Metal_MemRefType:$m,
+                       Metal_MemRefType:$n, Metal_MemRefType:$k,
+                       Metal_MemRefType:$scale_a, Metal_MemRefType:$scale_b,
+                       Metal_MemRefType:$scale_c,
+                       Metal_MemRefType:$zero_point_a,
+                       Metal_MemRefType:$zero_point_b,
+                       Metal_MemRefType:$zero_point_c,
+                       I64Attr:$bm, I64Attr:$bn);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$a `,` $b `,` $out `,` $m `,` $n `,` $k "
+                       "`scales` $scale_a `,` $scale_b `,` $scale_c "
+                       "`zero_points` $zero_point_a `,` $zero_point_b `,` "
+                       "$zero_point_c attr-dict `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
 // ReduceOp
 //===----------------------------------------------------------------------===//
 
@@ -1253,7 +1323,7 @@ def SimdgroupFusedStoreOp
 // ScalarDotOp
 //===----------------------------------------------------------------------===//
 
-def ScalarDotOp : Metal_Op<"scalar_dot"> {
+def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
   let summary = "Per-thread scalar GEMM (correctness fallback for tt.dot).";
 
   let description = [{
@@ -1265,18 +1335,22 @@ def ScalarDotOp : Metal_Op<"scalar_dot"> {
     element per (thread, tile-loop iteration) and emits an `scf.for` reduction
 
       acc = c_init;
-      for (k = 0; k < stride_a; ++k)
+      for (k = 0; k < reduction_extent; ++k)
         acc += a_buf[a_base_offset + gRow*stride_a + k]
              * b_buf[b_base_offset + k*stride_b + gCol];
 
     where `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` are the
     global output coordinates recovered from `emitPerIterIndex`. The reduction
-    trip count is `stride_a` — for a contiguous row-major A tile the row stride
-    equals the (masked) K extent, so the zero-padded columns beyond real-K are
-    never read. When `partial_extents = [m_extent, n_extent]` is present the
-    reduction is guarded by `gRow < m_extent && gCol < n_extent` so out-of-range
-    tail-tile rows/cols never issue an out-of-bounds device read (their result
-    is discarded by the epilogue's masked store).
+    trip count is `reduction_extent` (normally equal to `stride_a`).  A
+    `transpose_a` unit attribute changes A's physical index to
+    `k*stride_a + gRow`; an optional `weight_buf` multiplies each product by
+    `weight_buf[k]`.  Together these two narrow extensions represent the
+    weighted Gram matrix `X.T @ diag(W) @ X` used by logistic-regression
+    Hessians without pretending its dot-operand layout conversions are generic
+    scalar identities. When `partial_extents = [m_extent, n_extent]` is present,
+    the reduction is guarded by `gRow < m_extent && gCol < n_extent` so
+    out-of-range tail-tile rows/cols never issue an out-of-bounds device read
+    (their result is discarded by the epilogue's masked store).
 
     `a_base_offset`/`b_base_offset` preserve scalar `tt.addptr` offsets applied
     before the tiled pointer chain, such as a batched matrix's per-program base.
@@ -1289,14 +1363,18 @@ def ScalarDotOp : Metal_Op<"scalar_dot"> {
                        UI32:$a_base_offset, UI32:$b_base_offset,
                        UI32:$row_origin, UI32:$col_origin,
                        UI32:$stride_a, UI32:$stride_b,
+                       UI32:$reduction_extent,
                        AnyType:$c_init,
+                       Optional<Metal_MemRefType>:$weight_buf,
                        Variadic<UI32>:$partial_extents);
 
   let results = (outs AnyType:$result);
 
   let assemblyFormat = "$a_buf `,` $b_buf `offset` `[` $a_base_offset `,`"
                        "$b_base_offset `]` `[` $row_origin `,` $col_origin `]`"
-                       " `,` $stride_a `,` $stride_b `,` $c_init"
+                       " `,` $stride_a `,` $stride_b `,` $reduction_extent"
+                       " `,` $c_init"
+                       " (`weight` $weight_buf^)?"
                        " (`partial` `[` $partial_extents^ `]`)?"
                        " attr-dict `:` functional-type(operands, results)";
 }

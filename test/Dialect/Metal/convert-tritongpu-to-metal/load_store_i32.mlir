@@ -1,4 +1,4 @@
-// RUN: triton-metal-opt --convert-tritongpu-to-metal %s --split-input-file | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %s --split-input-file | FileCheck %s --check-prefixes=CHECK,HIST
 //
 // L2b: masked tt.load / tt.store on tensor<Nx!tt.ptr<i32>>.
 // Unlike i8 (which is in Metal_Type and flows as signless i8 end-to-end),
@@ -61,3 +61,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.tg_store_indexed {{.*}} x ui32
 // CHECK: scf.if
 // CHECK:   metal.store {{.*}} ui32
+
+// -----
+
+// Correctness-first Metal histogram lowering. The source layout owns four
+// elements per lane, while the 16-bin result is sub-threadgroup. Conversion
+// must size the kernel from the post-histogram output, evaluate all 1024 source
+// elements inside the histogram's scalar loop, and transport the final i32
+// tensor atomic through ui32 device storage.
+
+#hist_src = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#hist_dst = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @histogram_atomic_i32(%input: !tt.ptr<i32>, %output: !tt.ptr<i32>, %N: i32) {
+    %r = tt.make_range {start = 0 : i32, end = 1024 : i32} : tensor<1024xi32, #hist_src>
+    %n = tt.splat %N : i32 -> tensor<1024xi32, #hist_src>
+    %valid = arith.cmpi slt, %r, %n : tensor<1024xi32, #hist_src>
+    %input_s = tt.splat %input : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>, #hist_src>
+    %input_p = tt.addptr %input_s, %r : tensor<1024x!tt.ptr<i32>, #hist_src>, tensor<1024xi32, #hist_src>
+    %values = tt.load %input_p, %valid : tensor<1024x!tt.ptr<i32>, #hist_src>
+    %hist = tt.histogram %values, %valid : tensor<1024xi32, #hist_src> -> tensor<16xi32, #hist_dst>
+    %bins = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #hist_dst>
+    %zero = arith.constant dense<0> : tensor<16xi32, #hist_dst>
+    %nonzero = arith.cmpi ne, %hist, %zero : tensor<16xi32, #hist_dst>
+    %output_s = tt.splat %output : !tt.ptr<i32> -> tensor<16x!tt.ptr<i32>, #hist_dst>
+    %output_p = tt.addptr %output_s, %bins : tensor<16x!tt.ptr<i32>, #hist_dst>, tensor<16xi32, #hist_dst>
+    %old = tt.atomic_rmw add, acq_rel, gpu, %output_p, %hist, %nonzero : (tensor<16x!tt.ptr<i32>, #hist_dst>, tensor<16xi32, #hist_dst>, tensor<16xi1, #hist_dst>) -> tensor<16xi32, #hist_dst>
+    tt.return
+  }
+}
+
+// HIST-LABEL: metal.kernel histogram_atomic_i32
+// One active result lane per bin; inactive lanes skip the source scan.
+// HIST: scf.if {{.*}} -> (i32)
+// HIST: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (i32)
+// HIST: metal.get_element {{.*}} -> ui32
+// Explicit histogram mask participates in the increment predicate.
+// HIST: arith.andi
+// The i32 tensor atomic uses the output memref's legal ui32 transport type.
+// HIST: metal.atomic_rmw {{.*}} : (ui32, !metal.memref<? x ui32>, ui32) -> ui32
+// HIST-NOT: tt.histogram
