@@ -11,6 +11,9 @@ correctness fallback and bridged into the ordinary tile-loop epilogue. See
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -226,3 +229,38 @@ def test_metal_int8_quantized_matmul(M, N, K):
         zero_point_A, zero_point_B, zero_point_C,
     )
     torch.testing.assert_close(c.cpu(), ref, atol=0, rtol=0)
+
+
+def _load_leet_2d_fft():
+    path = Path(__file__).resolve().parents[3] / "leet-triton" / "medium-2d_fft.py"
+    if not path.exists():
+        pytest.skip(f"leet-triton fixture not present: {path}")
+    spec = importlib.util.spec_from_file_location("leet_medium_2d_fft", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "M,N",
+    [
+        pytest.param(32, 32, id="square"),
+        pytest.param(35, 41, id="ragged"),
+    ],
+)
+def test_metal_leet_2d_fft_canonical_dot(M, N):
+    """Regression for the leet FFT canonical complex-matmul formulation."""
+    leet_fft = _load_leet_2d_fft()
+    torch.manual_seed(0x2DFF + M * 3 + N)
+    signal_cpu = torch.randn((M, N, 2), dtype=torch.float32)
+    signal = signal_cpu.to("mps").contiguous()
+    spectrum = torch.empty_like(signal)
+
+    leet_fft.solve(signal, spectrum, M, N)
+    torch.mps.synchronize()
+
+    ref = torch.view_as_real(
+        torch.fft.fft2(torch.view_as_complex(signal_cpu.contiguous()))
+    ).contiguous()
+    torch.testing.assert_close(spectrum.cpu(), ref, atol=1e-2, rtol=1e-3)

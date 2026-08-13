@@ -54,6 +54,8 @@ leet-1d-convolution = "python leet-triton/easy-1D_convolution.py"
 leet-geglu = "python leet-triton/easy-gaussian_error_gated_linear_unit.py"
 leet-interleave-arrays = "python leet-triton/easy-interleave_arrays.py"
 leet-matrix-transpose = "python leet-triton/easy-matrix_transpose.py"
+leet-2d-convolution = "python leet-triton/medium-2d_convolution.py"
+leet-2d-fft = "python leet-triton/medium-2d_fft.py"
 leet-3d-convolution = "python leet-triton/medium-3D_convolution.py"
 leet-2d-subarray-sum = "python leet-triton/medium-2D_subarray_sum.py"
 leet-3d-subarray-sum = "python leet-triton/medium-3D_subarray_sum.py"
@@ -68,6 +70,8 @@ leet-all = { depends-on = [
     "leet-geglu",
     "leet-interleave-arrays",
     "leet-matrix-transpose",
+    "leet-2d-convolution",
+    "leet-2d-fft",
     "leet-3d-convolution",
     "leet-2d-subarray-sum",
     "leet-3d-subarray-sum",

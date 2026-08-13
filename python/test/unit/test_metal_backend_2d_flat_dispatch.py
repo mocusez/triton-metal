@@ -10,6 +10,9 @@ tt.broadcast, 2D #blocked layout in TTGIR) is the next slice.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -60,3 +63,36 @@ def test_2d_shaped_tensors_via_flat_dispatch():
     assert out.shape == (M, N), f"shape changed: {out.shape}"
     assert out.dim() == 2
     torch.testing.assert_close(out, x + y, atol=0, rtol=0)
+
+
+def _load_leet_2d_convolution():
+    path = Path(__file__).resolve().parents[3] / "leet-triton" / "medium-2d_convolution.py"
+    if not path.is_file():
+        pytest.skip(f"leet-triton fixture not present: {path}")
+    spec = importlib.util.spec_from_file_location("leet_triton_medium_2d_convolution", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_leet_2d_convolution_actual_file_matches_cpu_conv2d():
+    torch.manual_seed(0x2D0C)
+    input_rows, input_cols = 35, 41
+    kernel_rows, kernel_cols = 3, 3
+    output_rows = input_rows - kernel_rows + 1
+    output_cols = input_cols - kernel_cols + 1
+
+    inp = torch.randn(input_rows, input_cols, dtype=torch.float32, device="mps").contiguous()
+    ker = torch.randn(kernel_rows, kernel_cols, dtype=torch.float32, device="mps").contiguous()
+    out = torch.empty(output_rows, output_cols, dtype=torch.float32, device="mps").contiguous()
+
+    module = _load_leet_2d_convolution()
+    module.solve(inp, ker, out, input_rows, input_cols, kernel_rows, kernel_cols)
+    torch.mps.synchronize()
+
+    expected = torch.nn.functional.conv2d(
+        inp.cpu().view(1, 1, input_rows, input_cols),
+        ker.cpu().view(1, 1, kernel_rows, kernel_cols),
+    ).view(output_rows, output_cols)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
