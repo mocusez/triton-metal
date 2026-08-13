@@ -2617,6 +2617,267 @@ static mlir::Value emitScalarChain(
 
 } // namespace
 
+// Match the exact two-source/two-result reducer emitted by
+// `tl.argmax(x, axis=0)`. Keeping this structural matcher deliberately narrow
+// prevents the dedicated pairwise lowering below from claiming arbitrary
+// variadic reductions whose combine regions merely happen to start with a
+// floating-point comparison.
+static bool isCanonicalRank1ArgmaxReduce(mlir::triton::ReduceOp op) {
+  if (op.getSrcs().size() != 2 || op->getNumResults() != 2 ||
+      op.getAxis() != 0)
+    return false;
+
+  auto valueTy = mlir::dyn_cast<mlir::RankedTensorType>(
+      op.getSrcs()[0].getType());
+  auto indexTy = mlir::dyn_cast<mlir::RankedTensorType>(
+      op.getSrcs()[1].getType());
+  if (!valueTy || !indexTy || valueTy.getRank() != 1 ||
+      indexTy.getRank() != 1 || valueTy.isDynamicDim(0) ||
+      indexTy.isDynamicDim(0) || valueTy.getShape() != indexTy.getShape() ||
+      valueTy.getEncoding() != indexTy.getEncoding() ||
+      !valueTy.getElementType().isF32() ||
+      !indexTy.getElementType().isInteger(32) ||
+      !op->getResult(0).getType().isF32() ||
+      !op->getResult(1).getType().isInteger(32))
+    return false;
+
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return false;
+  mlir::Block &block = op->getRegion(0).front();
+  if (block.getNumArguments() != 4)
+    return false;
+
+  llvm::SmallVector<mlir::Operation *, 8> bodyOps;
+  for (mlir::Operation &nested : block) {
+    if (!mlir::isa<mlir::triton::ReduceReturnOp>(nested))
+      bodyOps.push_back(&nested);
+  }
+  if (bodyOps.size() != 7)
+    return false;
+
+  auto equal = mlir::dyn_cast<mlir::arith::CmpFOp>(bodyOps[0]);
+  auto lowerIndex = mlir::dyn_cast<mlir::arith::CmpIOp>(bodyOps[1]);
+  auto equalAndLower = mlir::dyn_cast<mlir::arith::AndIOp>(bodyOps[2]);
+  auto greater = mlir::dyn_cast<mlir::arith::CmpFOp>(bodyOps[3]);
+  auto takeLeft = mlir::dyn_cast<mlir::arith::OrIOp>(bodyOps[4]);
+  auto selectValue = mlir::dyn_cast<mlir::arith::SelectOp>(bodyOps[5]);
+  auto selectIndex = mlir::dyn_cast<mlir::arith::SelectOp>(bodyOps[6]);
+  auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(block.back());
+  if (!equal || !lowerIndex || !equalAndLower || !greater || !takeLeft ||
+      !selectValue || !selectIndex || !ret || ret->getNumOperands() != 2)
+    return false;
+
+  mlir::Value lhsValue = block.getArgument(0);
+  mlir::Value lhsIndex = block.getArgument(1);
+  mlir::Value rhsValue = block.getArgument(2);
+  mlir::Value rhsIndex = block.getArgument(3);
+  return equal.getPredicate() == mlir::arith::CmpFPredicate::OEQ &&
+         equal.getLhs() == lhsValue && equal.getRhs() == rhsValue &&
+         lowerIndex.getPredicate() == mlir::arith::CmpIPredicate::slt &&
+         lowerIndex.getLhs() == lhsIndex && lowerIndex.getRhs() == rhsIndex &&
+         equalAndLower.getLhs() == equal.getResult() &&
+         equalAndLower.getRhs() == lowerIndex.getResult() &&
+         greater.getPredicate() == mlir::arith::CmpFPredicate::OGT &&
+         greater.getLhs() == lhsValue && greater.getRhs() == rhsValue &&
+         takeLeft.getLhs() == greater.getResult() &&
+         takeLeft.getRhs() == equalAndLower.getResult() &&
+         selectValue.getCondition() == takeLeft.getResult() &&
+         selectValue.getTrueValue() == lhsValue &&
+         selectValue.getFalseValue() == rhsValue &&
+         selectIndex.getCondition() == takeLeft.getResult() &&
+         selectIndex.getTrueValue() == lhsIndex &&
+         selectIndex.getFalseValue() == rhsIndex &&
+         ret->getOperand(0) == selectValue.getResult() &&
+         ret->getOperand(1) == selectIndex.getResult();
+}
+
+// Lower the canonical rank-1 argmax pair reducer through two lockstep
+// threadgroup buffers. The value buffer decides the winner; the index buffer
+// carries the selected logical index through the same butterfly. Ties select
+// the lower index, matching Triton's default tie_break_left=True semantics.
+static mlir::LogicalResult
+lowerRank1ArgmaxReduce(mlir::triton::ReduceOp op,
+                       typename mlir::OpConversionPattern<
+                           mlir::triton::ReduceOp>::OpAdaptor adaptor,
+                       mlir::ConversionPatternRewriter &rewriter) {
+  if (!isCanonicalRank1ArgmaxReduce(op) || adaptor.getSrcs().size() != 2)
+    return mlir::failure();
+
+  auto loc = op.getLoc();
+  auto valueTensorTy = mlir::cast<mlir::RankedTensorType>(
+      op.getSrcs()[0].getType());
+  auto blocked = mlir::dyn_cast_or_null<
+      mlir::triton::gpu::BlockedEncodingAttr>(valueTensorTy.getEncoding());
+  if (!blocked)
+    return rewriter.notifyMatchFailure(
+        op, "rank-1 argmax requires a blocked source encoding");
+
+  int64_t tpb = 1;
+  for (int64_t threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (int64_t warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  int64_t blockSize = valueTensorTy.getDimSize(0);
+  if (tpb <= 0 || (tpb & (tpb - 1)) != 0 || blockSize <= 0 ||
+      blockSize > tpb)
+    return rewriter.notifyMatchFailure(
+        op, "rank-1 argmax requires 0 < BLOCK <= power-of-two tpb");
+
+  auto f32 = rewriter.getF32Type();
+  auto i32 = rewriter.getI32Type();
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  mlir::Value tidI32 = emitLocalTid(rewriter, loc, tpb);
+  mlir::Value tidUI32 = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{ui32},
+                            mlir::ValueRange{tidI32})
+                            .getResult(0);
+
+  mlir::Value inputValue = adaptor.getSrcs()[0];
+  mlir::Value inputIndex = toSignlessInt(adaptor.getSrcs()[1], rewriter, loc);
+  if (inputValue.getType() != f32 || inputIndex.getType() != i32)
+    return rewriter.notifyMatchFailure(
+        op, "rank-1 argmax adaptor must provide scalar f32/i32 values");
+
+  mlir::Value paddedValue = inputValue;
+  mlir::Value paddedIndex = inputIndex;
+  if (blockSize < tpb) {
+    auto cBlock = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(blockSize)));
+    mlir::Value active = mlir::arith::CmpIOp::create(
+                             rewriter, loc, mlir::arith::CmpIPredicate::ult,
+                             tidI32, cBlock.getResult())
+                             .getResult();
+    auto negativeInfinity = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
+    auto largestIndex = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(std::numeric_limits<int32_t>::max()));
+    paddedValue = mlir::arith::SelectOp::create(
+                      rewriter, loc, active, inputValue,
+                      negativeInfinity.getResult())
+                      .getResult();
+    paddedIndex = mlir::arith::SelectOp::create(
+                      rewriter, loc, active, inputIndex,
+                      largestIndex.getResult())
+                      .getResult();
+  }
+
+  auto valueBufTy = MetalMemRefType::get(rewriter.getContext(), f32, tpb);
+  auto indexBufTy = MetalMemRefType::get(rewriter.getContext(), ui32, tpb);
+  mlir::Value valueBuf =
+      ThreadgroupAllocaOp::create(rewriter, loc, valueBufTy).getResult();
+  mlir::Value indexBuf =
+      ThreadgroupAllocaOp::create(rewriter, loc, indexBufTy).getResult();
+
+  auto castIndexForStorage = [&](mlir::Value index) -> mlir::Value {
+    return mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{ui32},
+               mlir::ValueRange{index})
+        .getResult(0);
+  };
+  auto emitPairCombine = [&](mlir::Value lhsValue, mlir::Value lhsIndex,
+                             mlir::Value rhsValue,
+                             mlir::Value rhsIndex) {
+    mlir::Value greater = mlir::arith::CmpFOp::create(
+                              rewriter, loc,
+                              mlir::arith::CmpFPredicate::OGT, lhsValue,
+                              rhsValue)
+                              .getResult();
+    mlir::Value equal = mlir::arith::CmpFOp::create(
+                            rewriter, loc, mlir::arith::CmpFPredicate::OEQ,
+                            lhsValue, rhsValue)
+                            .getResult();
+    mlir::Value lowerIndex = mlir::arith::CmpIOp::create(
+                                 rewriter, loc,
+                                 mlir::arith::CmpIPredicate::slt, lhsIndex,
+                                 rhsIndex)
+                                 .getResult();
+    mlir::Value equalAndLower = mlir::arith::AndIOp::create(
+                                    rewriter, loc, equal, lowerIndex)
+                                    .getResult();
+    mlir::Value takeLeft = mlir::arith::OrIOp::create(
+                               rewriter, loc, greater, equalAndLower)
+                               .getResult();
+    mlir::Value resultValue = mlir::arith::SelectOp::create(
+                                  rewriter, loc, takeLeft, lhsValue, rhsValue)
+                                  .getResult();
+    mlir::Value resultIndex = mlir::arith::SelectOp::create(
+                                  rewriter, loc, takeLeft, lhsIndex, rhsIndex)
+                                  .getResult();
+    return std::pair<mlir::Value, mlir::Value>{resultValue, resultIndex};
+  };
+
+  // The leading barrier prevents iteration t+1 from overwriting a static
+  // scratch allocation before all threads have consumed iteration t's slot 0.
+  BarrierOp::create(rewriter, loc);
+  StoreOp::create(rewriter, loc, paddedValue, valueBuf, tidUI32);
+  StoreOp::create(rewriter, loc, castIndexForStorage(paddedIndex), indexBuf,
+                  tidUI32);
+  BarrierOp::create(rewriter, loc);
+
+  for (int64_t stride = tpb / 2; stride >= 1; stride /= 2) {
+    auto cStride = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(stride)));
+    mlir::Value active = mlir::arith::CmpIOp::create(
+                             rewriter, loc, mlir::arith::CmpIPredicate::ult,
+                             tidI32, cStride.getResult())
+                             .getResult();
+    auto ifOp = mlir::scf::IfOp::create(
+        rewriter, loc, mlir::TypeRange{}, active,
+        /*addThenBlock=*/true, /*addElseBlock=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      mlir::Value partnerI32 = mlir::arith::AddIOp::create(
+                                   rewriter, loc, tidI32,
+                                   cStride.getResult())
+                                   .getResult();
+      mlir::Value partnerUI32 = mlir::UnrealizedConversionCastOp::create(
+                                    rewriter, loc, mlir::TypeRange{ui32},
+                                    mlir::ValueRange{partnerI32})
+                                    .getResult(0);
+      mlir::Value lhsValue = GetElementOp::create(
+                                 rewriter, loc, f32, valueBuf, tidUI32)
+                                 .getResult();
+      mlir::Value rhsValue = GetElementOp::create(
+                                 rewriter, loc, f32, valueBuf, partnerUI32)
+                                 .getResult();
+      mlir::Value lhsIndex = toSignlessInt(
+          GetElementOp::create(rewriter, loc, ui32, indexBuf, tidUI32)
+              .getResult(),
+          rewriter, loc);
+      mlir::Value rhsIndex = toSignlessInt(
+          GetElementOp::create(rewriter, loc, ui32, indexBuf, partnerUI32)
+              .getResult(),
+          rewriter, loc);
+      auto [resultValue, resultIndex] =
+          emitPairCombine(lhsValue, lhsIndex, rhsValue, rhsIndex);
+      StoreOp::create(rewriter, loc, resultValue, valueBuf, tidUI32);
+      StoreOp::create(rewriter, loc, castIndexForStorage(resultIndex),
+                      indexBuf, tidUI32);
+      mlir::scf::YieldOp::create(rewriter, loc);
+    }
+    BarrierOp::create(rewriter, loc);
+  }
+
+  auto cZero = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(0));
+  mlir::Value zeroUI32 = mlir::UnrealizedConversionCastOp::create(
+                             rewriter, loc, mlir::TypeRange{ui32},
+                             mlir::ValueRange{cZero.getResult()})
+                             .getResult(0);
+  mlir::Value resultValue =
+      GetElementOp::create(rewriter, loc, f32, valueBuf, zeroUI32).getResult();
+  mlir::Value resultIndex = toSignlessInt(
+      GetElementOp::create(rewriter, loc, ui32, indexBuf, zeroUI32).getResult(),
+      rewriter, loc);
+  rewriter.replaceOp(op, mlir::ValueRange{resultValue, resultIndex});
+  return mlir::success();
+}
+
 static mlir::LogicalResult
 lowerRank1Reduce(mlir::triton::ReduceOp op,
                  typename mlir::OpConversionPattern<
@@ -5958,6 +6219,8 @@ struct ReduceLowering
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ReduceOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    if (isCanonicalRank1ArgmaxReduce(op))
+      return lowerRank1ArgmaxReduce(op, adaptor, rewriter);
     if (op.getSrcs().size() != 1)
       return mlir::failure();
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(
@@ -7495,6 +7758,55 @@ struct StoreLowering
       return mlir::failure();  // handled by MaskedStoreLowering
     auto loc = op.getLoc();
     auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+
+    // A singleton tensor store is canonicalized to `tt.splat %scalar_ptr`
+    // rather than `tt.addptr %splat_ptr, %make_range`. This is what
+    // BLOCK_SIZE_K=1 produces in MoE top-k gating after the all-true mask is
+    // folded away. Treat it as one scalar store owned by local lane 0; the
+    // ordinary tensor path below intentionally requires a tensor addptr.
+    if (auto ptrSplat =
+            op.getPtr().getDefiningOp<mlir::triton::SplatOp>()) {
+      auto ptrTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getPtr().getType());
+      if (ptrTy && ptrTy.getRank() == 1 && ptrTy.getDimSize(0) == 1) {
+        mlir::Value scalarPtr = ptrSplat.getSrc();
+        mlir::Value memref = findBaseMemref(scalarPtr, rewriter);
+        auto tile = tileFromTensor(op.getPtr().getType());
+        if (!memref || !tile)
+          return rewriter.notifyMatchFailure(
+              op, "singleton tensor tt.store: base memref or tile not found");
+
+        mlir::Value offset =
+            accumulateScalarAddPtrOffsets(scalarPtr, rewriter, loc);
+        if (!offset)
+          offset = mlir::arith::ConstantOp::create(
+                       rewriter, loc, rewriter.getI32IntegerAttr(0))
+                       .getResult();
+        mlir::Value index = mlir::UnrealizedConversionCastOp::create(
+                                rewriter, loc, mlir::TypeRange{ui32},
+                                mlir::ValueRange{offset})
+                                .getResult(0);
+        mlir::Value localTid =
+            emitLocalTid(rewriter, loc, tile->threadsPerBlock);
+        auto cZero = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(0));
+        mlir::Value isLaneZero = mlir::arith::CmpIOp::create(
+                                     rewriter, loc,
+                                     mlir::arith::CmpIPredicate::eq, localTid,
+                                     cZero.getResult())
+                                     .getResult();
+        auto ifOp = mlir::scf::IfOp::create(
+            rewriter, loc, isLaneZero, /*withElseRegion=*/false);
+        {
+          mlir::OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.thenBlock());
+          mlir::Value value = castToMemrefStorage(
+              adaptor.getValue(), memref, rewriter, loc);
+          StoreOp::create(rewriter, loc, value, memref, index);
+        }
+        rewriter.eraseOp(op);
+        return mlir::success();
+      }
+    }
 
     // Scalar pointer path: `tt.store %scalar_ptr, %val` where the ptr is a
     // bare `!tt.ptr<T>` block argument (no tt.addptr, no tensor layout).
@@ -16170,6 +16482,29 @@ struct ConvertTritonGPUToMetalPass
       if (axes > 1) {
         red.emitOpError("multi-axis or rank>2 reduce requires Session L3b (future)");
         reduceOk = false;
+        return;
+      }
+      // Triton's canonical rank-1 argmax reducer is a paired reduction over
+      // (f32 value, i32 logical index). It is lowered by the dedicated
+      // lockstep value/index butterfly rather than the single-result combine
+      // allowlist below.
+      if (isCanonicalRank1ArgmaxReduce(red)) {
+        auto blocked = mlir::dyn_cast_or_null<
+            mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+        int64_t tpb = 1;
+        if (blocked) {
+          for (int64_t threads : blocked.getThreadsPerWarp())
+            tpb *= threads;
+          for (int64_t warps : blocked.getWarpsPerCTA())
+            tpb *= warps;
+        }
+        int64_t blockSize = rtt.getDimSize(0);
+        if (!blocked || tpb <= 0 || (tpb & (tpb - 1)) != 0 ||
+            blockSize <= 0 || blockSize > tpb) {
+          red.emitOpError(
+              "rank-1 argmax requires blocked 0 < BLOCK <= power-of-two tpb");
+          reduceOk = false;
+        }
         return;
       }
       // Rank-2 axis=1 ships via the rank-2 ReduceLowering body. Rank-2 axis=0

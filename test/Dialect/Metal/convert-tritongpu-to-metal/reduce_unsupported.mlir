@@ -24,6 +24,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+// A two-source reducer that is close to argmax but selects the HIGHER index on
+// ties must not be claimed by the canonical argmax lowering.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_argmax_near_miss(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<1.0> : tensor<32xf32, #blocked>
+    %idx = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    // expected-error @+1 {{reduce combine requires Session L3c (future) — got arith.cmpf}}
+    %r:2 = "tt.reduce"(%x, %idx) ({
+    ^bb0(%lhs_value: f32, %lhs_index: i32, %rhs_value: f32, %rhs_index: i32):
+      %equal = arith.cmpf oeq, %lhs_value, %rhs_value : f32
+      %higher_index = arith.cmpi sgt, %lhs_index, %rhs_index : i32
+      %equal_and_higher = arith.andi %equal, %higher_index : i1
+      %greater = arith.cmpf ogt, %lhs_value, %rhs_value : f32
+      %take_left = arith.ori %greater, %equal_and_higher : i1
+      %value = arith.select %take_left, %lhs_value, %rhs_value : f32
+      %index = arith.select %take_left, %lhs_index, %rhs_index : i32
+      tt.reduce.return %value, %index : f32, i32
+    }) {axis = 0 : i32} : (tensor<32xf32, #blocked>, tensor<32xi32, #blocked>) -> (f32, i32)
+    tt.return
+  }
+}
+
+// -----
 // Unsupported combine op → "reduce combine requires Session L3c". NB: float
 // `arith.maxnumf` is now ACCEPTED by the pre-pass (tl.max rank-1 needs it), so
 // the still-unsupported combine probed here is integer `arith.maxsi` — its

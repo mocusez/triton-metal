@@ -29,6 +29,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.store %o_addr, %vals, %mask : tensor<1024x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // BLOCK=1 folds the all-true mask and the tensor addptr, leaving a uniform
+  // tensor pointer. This is the K=1 output-store shape in MoE top-k gating.
+  tt.func public @singleton_store_uniform_ptr(%out_ptr: !tt.ptr<f32>, %row: i32) {
+    %scalar_ptr = tt.addptr %out_ptr, %row : !tt.ptr<f32>, i32
+    %ptr = tt.splat %scalar_ptr : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>, #blocked>
+    %value = arith.constant dense<1.0> : tensor<1xf32, #blocked>
+    tt.store %ptr, %value : tensor<1x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 }
 
 // CHECK-LABEL: metal.kernel masked_store_rank1
@@ -38,5 +48,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Phase-B unconditional rewrite emits arith.select between val and old, then
 // an unconditional metal.store (no scf.if around the store).
 // CHECK: arith.select
+// CHECK: metal.store
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel singleton_store_uniform_ptr
+// One local lane owns the scalarized singleton tensor store.
+// CHECK: metal.thread_id "x"
+// CHECK: metal.threadgroup_id "x"
+// CHECK: arith.cmpi eq
+// CHECK: scf.if
 // CHECK: metal.store
 // CHECK: metal.return

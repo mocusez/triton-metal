@@ -81,6 +81,66 @@ def reduce_min_rank1_kernel(
     tl.store(out_ptr + 0, s)
 
 
+@triton.jit
+def argmax_rank1_kernel(
+    x_ptr,
+    out_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs, mask=offs < N, other=float("-inf"))
+    idx = tl.argmax(x, axis=0)
+    tl.store(out_ptr + 0, idx)
+
+
+@triton.jit
+def argmax_per_row_kernel(
+    x_ptr,
+    out_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + row * N + offs, mask=offs < N,
+                other=float("-inf"))
+    idx = tl.argmax(x, axis=0)
+    tl.store(out_ptr + row, idx)
+
+
+@triton.jit
+def moe_top_k_gating_kernel(
+    logits_ptr,
+    topk_w_ptr,
+    topk_idx_ptr,
+    E,
+    K,
+    BLOCK_E: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs_e = tl.arange(0, BLOCK_E)
+    logits = tl.load(logits_ptr + row * E + offs_e, mask=offs_e < E,
+                     other=float("-inf"))
+    offs_k = tl.arange(0, BLOCK_K)
+    topk_vals = tl.full((BLOCK_K,), float("-inf"), tl.float32)
+    topk_idxs = tl.full((BLOCK_K,), 0, tl.int32)
+
+    for i in range(K):
+        curr_max_val = tl.max(logits, axis=0)
+        curr_max_idx = tl.argmax(logits, axis=0)
+        topk_vals = tl.where(offs_k == i, curr_max_val, topk_vals)
+        topk_idxs = tl.where(offs_k == i, curr_max_idx, topk_idxs)
+        logits = tl.where(offs_e == curr_max_idx, float("-inf"), logits)
+
+    max_val = tl.max(topk_vals, axis=0)
+    topk_vals = tl.exp(topk_vals - max_val)
+    topk_vals /= tl.sum(topk_vals, axis=0)
+    tl.store(topk_w_ptr + row * K + offs_k, topk_vals, mask=offs_k < K)
+    tl.store(topk_idx_ptr + row * K + offs_k, topk_idxs, mask=offs_k < K)
+
+
 _NUM_WARPS = 8   # threads_per_block = num_warps * 32 = 256
 
 
@@ -141,6 +201,69 @@ def test_reduce_min_rank1_i32(BLOCK):
     reduce_min_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
     expected = torch.min(x.cpu()).to(torch.int32)
     assert out[0].item() == expected.item()
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([1.0, 7.0, 3.0, 7.0, -2.0], 1),
+        ([float("-inf")] * 13, 0),
+    ],
+)
+def test_argmax_rank1_f32_tie_break_left_and_padding(values, expected):
+    x = torch.tensor(values, dtype=torch.float32, device="mps")
+    out = torch.full((1,), -1, dtype=torch.int32, device="mps")
+    argmax_rank1_kernel[(1,)](x, out, len(values), BLOCK=32, num_warps=4)
+    torch.mps.synchronize()
+    assert out.item() == expected
+
+
+def test_argmax_rank1_f32_multiprogram():
+    x = torch.tensor(
+        [
+            [1.0, 9.0, 3.0, 9.0, -2.0],
+            [-4.0, -3.0, -2.0, -1.0, -5.0],
+            [8.0, 7.0, 6.0, 5.0, 4.0],
+        ],
+        dtype=torch.float32,
+        device="mps",
+    )
+    out = torch.full((x.shape[0],), -1, dtype=torch.int32, device="mps")
+    argmax_per_row_kernel[(x.shape[0],)](
+        x, out, x.shape[1], BLOCK=32, num_warps=4
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(
+        out.cpu(), torch.tensor([1, 3, 0], dtype=torch.int32), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "M, E, K", [(1, 13, 1), (4, 13, 4), (3, 32, 8), (2, 127, 16)]
+)
+def test_moe_top_k_gating(M, E, K):
+    torch.manual_seed(M * 10000 + E * 100 + K)
+    logits = torch.randn((M, E), dtype=torch.float32, device="mps")
+    weights = torch.empty((M, K), dtype=torch.float32, device="mps")
+    indices = torch.empty((M, K), dtype=torch.int32, device="mps")
+
+    moe_top_k_gating_kernel[(M,)](
+        logits,
+        weights,
+        indices,
+        E,
+        K,
+        BLOCK_E=triton.next_power_of_2(E),
+        BLOCK_K=triton.next_power_of_2(K),
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+
+    ref_vals, ref_indices = torch.topk(logits.cpu(), K, dim=1)
+    ref_weights = torch.softmax(ref_vals, dim=1)
+    torch.testing.assert_close(indices.cpu(), ref_indices.to(torch.int32),
+                               rtol=0, atol=0)
+    torch.testing.assert_close(weights.cpu(), ref_weights, rtol=1e-5, atol=1e-6)
 
 
 # --- W-B: rich rank-1 reduce over a COMPUTED cone (select/cmp/andi/make_range +

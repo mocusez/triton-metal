@@ -65,6 +65,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // The kernel legalizes at all — the slice-encoded load no longer bails.
 // CHECK-LABEL: metal.kernel slice_load_plus_reduce
 
+// The rank-2 axis=1 reduce stages its per-row sums in threadgroup memory. The
+// allocation is hoisted to kernel entry, before the localTid arithmetic below.
+// CHECK: metal.threadgroup_alloca : !metal.memref<32 x f32>
+
 // localTid = tid.x - tgid.x*tpb. This is the FIRST subi emitted, and the
 // re-encoded (#blocked1) cone must use it verbatim.
 // CHECK: %[[LTID:[0-9a-z_]+]] = arith.subi
@@ -74,9 +78,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: arith.divsi
 
 // CHECK: %[[MASK:[0-9a-z_]+]] = arith.cmpi slt, %[[LTID]],
-
-// The rank-2 axis=1 reduce still stages its per-row sums in threadgroup memory.
-// CHECK: metal.threadgroup_alloca : !metal.memref<32 x f32>
 
 // The masked rank-1 load: guarded by the #blocked1 mask and addressed by
 // localTid DIRECTLY. Before the fix this index came from the slice projection

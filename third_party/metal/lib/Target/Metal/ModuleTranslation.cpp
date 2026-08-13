@@ -5295,11 +5295,12 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             // by routing through translateVarName.
             assert(op.getInputs().size() == 1 &&
                    "unrealized_conversion_cast: expected single-input form");
-            auto in = op.getInputs()[0];
-            if (auto inOp = in.getDefiningOp())
-              translateValue(inOp);
-            else
-              translateVarName(in);
+            // A cast may consume one specific result of a multi-result scf.for
+            // (the i32 top-k index carried by the MoE selection loop). Resolve
+            // the Value first so the per-result `_buffers` mapping selects the
+            // right accumulator instead of trying to render the whole scf.for
+            // as an expression.
+            translateValueOrVarName(op.getInputs()[0]);
           })
       .Case<mlir::arith::MulIOp>([&](mlir::arith::MulIOp op) {
         // Used by BLOCK_SIZE>threads idx arithmetic (e.g. `tid * E`).
