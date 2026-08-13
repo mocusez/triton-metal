@@ -356,6 +356,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::TgStoreIndexedOp,
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
+            mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
@@ -406,6 +407,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::TgStoreIndexedOp,
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
+            mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
@@ -559,6 +561,112 @@ void ModuleTranslation::translate(
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      " << OUT << "[_ps_base + _ps_tid] += _ps_carry;\n";
   os << "      _ps_carry += _ps_total;\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    }\n";
+  os << "  }\n";
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp op) {
+  const int64_t BLOCK = op.getBlock();
+  const int64_t TPB = op.getTpb();
+  if (BLOCK <= 0 || TPB <= 0 || (BLOCK % TPB) != 0) {
+    op.emitError("metal.threadgroup_segmented_prefix_sum requires positive "
+                 "block/tpb with block divisible by tpb");
+    _emitFailed = true;
+    return;
+  }
+
+  auto valueTy = llvm::cast<MetalMemRefType>(op.getValues().getType());
+  auto flagTy = llvm::cast<MetalMemRefType>(op.getFlags().getType());
+  if (!valueTy.getType().isF32()) {
+    op.emitError("metal.threadgroup_segmented_prefix_sum values buffer must "
+                 "have f32 element type");
+    _emitFailed = true;
+    return;
+  }
+  auto flagIntTy = llvm::dyn_cast<mlir::IntegerType>(flagTy.getType());
+  if (!flagIntTy || flagIntTy.getWidth() != 1) {
+    op.emitError("metal.threadgroup_segmented_prefix_sum flags buffer must "
+                 "have i1 element type");
+    _emitFailed = true;
+    return;
+  }
+  if (valueTy.getSize() < BLOCK || flagTy.getSize() < BLOCK) {
+    op.emitError("metal.threadgroup_segmented_prefix_sum buffers must have at "
+                 "least block elements");
+    _emitFailed = true;
+    return;
+  }
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        break;
+      m = cast.getInputs()[0];
+    }
+    if (auto def = m.getDefiningOp())
+      if (auto it = _alloca.find(def); it != _alloca.end())
+        return "v" + std::to_string(it->second);
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    return "v" + std::to_string(it != _buffers.end() ? it->second : 0);
+  };
+  const std::string VALUES = bufName(op.getValues());
+  const std::string FLAGS = bufName(op.getFlags());
+  auto S = [](int64_t x) { return std::to_string(x); };
+  const int64_t E = BLOCK / TPB;
+  auto &os = _output;
+
+  os << "\n  // ---- metal.threadgroup_segmented_prefix_sum ----\n";
+  os << "  {\n";
+  os << "    uint _sgps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
+  os << "    float _sgps_carry_v = 0.0f;\n";
+  os << "    bool _sgps_carry_f = false;\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    for (uint _sgps_k = 0u; _sgps_k < " << S(E)
+     << "u; ++_sgps_k) {\n";
+  os << "      uint _sgps_base = _sgps_k * " << S(TPB) << "u;\n";
+  os << "      for (uint _sgps_off = 1u; _sgps_off < " << S(TPB)
+     << "u; _sgps_off <<= 1) {\n";
+  os << "        float _sgps_cur_v = " << VALUES
+     << "[_sgps_base + _sgps_tid];\n";
+  os << "        bool _sgps_cur_f = " << FLAGS
+     << "[_sgps_base + _sgps_tid];\n";
+  os << "        float _sgps_prev_v = 0.0f;\n";
+  os << "        bool _sgps_prev_f = false;\n";
+  os << "        if (_sgps_tid >= _sgps_off) {\n";
+  os << "          _sgps_prev_v = " << VALUES
+     << "[_sgps_base + _sgps_tid - _sgps_off];\n";
+  os << "          _sgps_prev_f = " << FLAGS
+     << "[_sgps_base + _sgps_tid - _sgps_off];\n";
+  os << "        }\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "        if (_sgps_tid >= _sgps_off) {\n";
+  os << "          " << VALUES
+     << "[_sgps_base + _sgps_tid] = _sgps_cur_f ? _sgps_cur_v : "
+        "(_sgps_prev_v + _sgps_cur_v);\n";
+  os << "          " << FLAGS
+     << "[_sgps_base + _sgps_tid] = _sgps_prev_f || _sgps_cur_f;\n";
+  os << "        }\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      }\n";
+  os << "      float _sgps_total_v = " << VALUES << "[_sgps_base + "
+     << S(TPB - 1) << "u];\n";
+  os << "      bool _sgps_total_f = " << FLAGS << "[_sgps_base + "
+     << S(TPB - 1) << "u];\n";
+  os << "      bool _sgps_local_f = " << FLAGS
+     << "[_sgps_base + _sgps_tid];\n";
+  os << "      float _sgps_local_v = " << VALUES
+     << "[_sgps_base + _sgps_tid];\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      " << VALUES
+     << "[_sgps_base + _sgps_tid] = _sgps_local_f ? _sgps_local_v : "
+        "(_sgps_carry_v + _sgps_local_v);\n";
+  os << "      " << FLAGS
+     << "[_sgps_base + _sgps_tid] = _sgps_carry_f || _sgps_local_f;\n";
+  os << "      _sgps_carry_v = _sgps_total_f ? _sgps_total_v : "
+        "(_sgps_carry_v + _sgps_total_v);\n";
+  os << "      _sgps_carry_f = _sgps_carry_f || _sgps_total_f;\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "    }\n";
   os << "  }\n";

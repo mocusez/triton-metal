@@ -5418,6 +5418,250 @@ static void collectStagingLeaves(mlir::Value v, int depth,
     collectStagingLeaves(operand, depth + 1, out, seen);
 }
 
+// Match the exact two-state monoid emitted by
+// `leet-triton/medium-segmented_exclusive_prefix_sum.py`:
+//
+//   combine((lhsValue, lhsFlag), (rhsValue, rhsFlag)) =
+//       (rhsFlag ? rhsValue : lhsValue + rhsValue, lhsFlag | rhsFlag)
+//
+// Keeping this structural matcher narrow is a correctness boundary: the Metal
+// primitive below implements this algebra, not an arbitrary tt.scan region.
+static bool isCanonicalSegmentedSumScan(mlir::triton::ScanOp op) {
+  if (op.getSrcs().size() != 2 || op->getNumResults() != 2 ||
+      op.getAxis() != 0 || op.getReverse())
+    return false;
+
+  auto valueTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[0].getType());
+  auto flagTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[1].getType());
+  auto valueResultTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  auto flagResultTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(1).getType());
+  if (!valueTy || !flagTy || !valueResultTy || !flagResultTy ||
+      valueTy.getRank() != 1 || flagTy.getRank() != 1 ||
+      valueResultTy.getRank() != 1 || flagResultTy.getRank() != 1 ||
+      valueTy.isDynamicDim(0) || flagTy.isDynamicDim(0) ||
+      valueTy.getShape() != flagTy.getShape() ||
+      valueTy.getShape() != valueResultTy.getShape() ||
+      valueTy.getShape() != flagResultTy.getShape() ||
+      valueTy.getEncoding() != flagTy.getEncoding() ||
+      valueTy.getEncoding() != valueResultTy.getEncoding() ||
+      valueTy.getEncoding() != flagResultTy.getEncoding() ||
+      !valueTy.getElementType().isF32() ||
+      !flagTy.getElementType().isInteger(1) ||
+      !valueResultTy.getElementType().isF32() ||
+      !flagResultTy.getElementType().isInteger(1))
+    return false;
+
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return false;
+  mlir::Block &block = op->getRegion(0).front();
+  if (block.getNumArguments() != 4)
+    return false;
+
+  llvm::SmallVector<mlir::Operation *, 4> bodyOps;
+  for (mlir::Operation &nested : block)
+    if (!mlir::isa<mlir::triton::ScanReturnOp>(nested))
+      bodyOps.push_back(&nested);
+  if (bodyOps.size() != 3)
+    return false;
+
+  auto add = mlir::dyn_cast<mlir::arith::AddFOp>(bodyOps[0]);
+  auto select = mlir::dyn_cast<mlir::arith::SelectOp>(bodyOps[1]);
+  auto flagOr = mlir::dyn_cast<mlir::arith::OrIOp>(bodyOps[2]);
+  auto ret = mlir::dyn_cast<mlir::triton::ScanReturnOp>(block.back());
+  if (!add || !select || !flagOr || !ret || ret->getNumOperands() != 2)
+    return false;
+
+  mlir::Value lhsValue = block.getArgument(0);
+  mlir::Value lhsFlag = block.getArgument(1);
+  mlir::Value rhsValue = block.getArgument(2);
+  mlir::Value rhsFlag = block.getArgument(3);
+  return add.getLhs() == lhsValue && add.getRhs() == rhsValue &&
+         select.getCondition() == rhsFlag &&
+         select.getTrueValue() == rhsValue &&
+         select.getFalseValue() == add.getResult() &&
+         flagOr.getLhs() == lhsFlag && flagOr.getRhs() == rhsFlag &&
+         ret->getOperand(0) == select.getResult() &&
+         ret->getOperand(1) == flagOr.getResult();
+}
+
+// Lower the canonical segmented-sum scan through two in-place threadgroup
+// buffers. At BLOCK=4096 this costs one f32 buffer plus one i1 buffer instead
+// of the four input/output buffers a direct generalisation of cumsum would use;
+// staying below Apple's threadgroup-memory limit is required by pass1/pass3.
+static mlir::LogicalResult lowerCanonicalSegmentedSumScan(
+    mlir::triton::ScanOp op,
+    llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
+    mlir::ConversionPatternRewriter &rewriter) {
+  auto loc = op.getLoc();
+  auto rtt = mlir::cast<mlir::RankedTensorType>(op.getSrcs()[0].getType());
+  auto blocked = mlir::dyn_cast_or_null<
+      mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+  if (!blocked)
+    return rewriter.notifyMatchFailure(op, "segmented scan: no blocked encoding");
+
+  int64_t tpb = 1;
+  for (auto t : blocked.getThreadsPerWarp())
+    tpb *= t;
+  for (auto w : blocked.getWarpsPerCTA())
+    tpb *= w;
+  if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+    return rewriter.notifyMatchFailure(op,
+                                       "segmented scan: tpb not power-of-two");
+  int64_t block = rtt.getDimSize(0);
+  if (block <= 0)
+    return rewriter.notifyMatchFailure(op, "segmented scan: empty tile");
+  const int64_t bufLen = std::max(block, tpb);
+  const bool padded = block < bufLen;
+  if (bufLen % tpb != 0)
+    return rewriter.notifyMatchFailure(
+        op, "segmented scan: BLOCK not a multiple of tpb");
+  int64_t elemsPerThread = bufLen / tpb;
+  if (elemsPerThread < 1 || elemsPerThread > 64 ||
+      (elemsPerThread & (elemsPerThread - 1)) != 0)
+    return rewriter.notifyMatchFailure(
+        op, "segmented scan: E=BLOCK/tpb outside [1,64] pow2");
+
+  mlir::Value valueInput = op.getSrcs()[0];
+  mlir::Value flagInput = op.getSrcs()[1];
+  if (!rank1ConeSupported(valueInput, 0) ||
+      !rank1ConeSupported(flagInput, 0))
+    return rewriter.notifyMatchFailure(op,
+                                       "segmented scan: input cone unsupported");
+
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto i32 = rewriter.getI32Type();
+  auto f32 = rewriter.getF32Type();
+  auto i1 = rewriter.getI1Type();
+
+  // LOCAL thread id = global_tid - tgid*tpb (multi-program safe).
+  mlir::Value tidGlobal =
+      mlir::UnrealizedConversionCastOp::create(
+          rewriter, loc, mlir::TypeRange{i32},
+          mlir::ValueRange{ThreadIdOp::create(rewriter, loc, ui32,
+                                              rewriter.getStringAttr("x"))
+                               .getResult()})
+          .getResult(0);
+  mlir::Value threadgroup =
+      mlir::UnrealizedConversionCastOp::create(
+          rewriter, loc, mlir::TypeRange{i32},
+          mlir::ValueRange{ThreadgroupIdOp::create(
+                               rewriter, loc, ui32,
+                               rewriter.getStringAttr("x"))
+                               .getResult()})
+          .getResult(0);
+  auto cTpb = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+  mlir::Value threadgroupOffset =
+      mlir::arith::MulIOp::create(rewriter, loc, threadgroup, cTpb.getResult())
+          .getResult();
+  mlir::Value tidLocal = mlir::arith::SubIOp::create(
+                             rewriter, loc, tidGlobal, threadgroupOffset)
+                             .getResult();
+
+  auto valueBufTy =
+      MetalMemRefType::get(rewriter.getContext(), f32, bufLen);
+  auto flagBufTy = MetalMemRefType::get(rewriter.getContext(), i1, bufLen);
+  mlir::Value valueBuf =
+      ThreadgroupAllocaOp::create(rewriter, loc, valueBufTy).getResult();
+  mlir::Value flagBuf =
+      ThreadgroupAllocaOp::create(rewriter, loc, flagBufTy).getResult();
+
+  // The allocations are static in MSL. In a user loop this fill must wait for
+  // every lazy consumer of the preceding trip before overwriting the buffers.
+  if (findOutermostScfFor(op))
+    BarrierOp::create(rewriter, loc);
+
+  for (int64_t k = 0; k < elemsPerThread; ++k) {
+    mlir::Value pos = tidLocal;
+    if (k > 0) {
+      auto cKtpb = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(k * tpb)));
+      pos = mlir::arith::AddIOp::create(rewriter, loc, tidLocal,
+                                       cKtpb.getResult())
+                .getResult();
+    }
+
+    mlir::Value inRange;
+    mlir::Value evalPos = pos;
+    if (padded) {
+      auto cBlock = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(block)));
+      auto cZeroIndex = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(0));
+      inRange = mlir::arith::CmpIOp::create(
+                    rewriter, loc, mlir::arith::CmpIPredicate::slt, pos,
+                    cBlock.getResult())
+                    .getResult();
+      evalPos = mlir::arith::SelectOp::create(
+                    rewriter, loc, inRange, pos, cZeroIndex.getResult())
+                    .getResult();
+    }
+
+    mlir::Value value =
+        evalRank1ValueAt(valueInput, evalPos, rewriter, loc, 0);
+    mlir::Value flag = evalRank1ValueAt(flagInput, evalPos, rewriter, loc, 0);
+    if (!value || !flag)
+      return rewriter.notifyMatchFailure(op,
+                                         "segmented scan: input eval failed");
+    if (padded) {
+      auto cZero = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+      auto cFalse = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getBoolAttr(false));
+      value = mlir::arith::SelectOp::create(
+                  rewriter, loc, inRange, value, cZero.getResult())
+                  .getResult();
+      flag = mlir::arith::SelectOp::create(
+                 rewriter, loc, inRange, flag, cFalse.getResult())
+                 .getResult();
+    }
+    mlir::Value posUI =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{pos})
+            .getResult(0);
+    StoreOp::create(rewriter, loc, value, valueBuf, posUI);
+    StoreOp::create(rewriter, loc, flag, flagBuf, posUI);
+  }
+
+  ThreadgroupSegmentedPrefixSumOp::create(
+      rewriter, loc, valueBuf, flagBuf,
+      rewriter.getI64IntegerAttr(bufLen), rewriter.getI64IntegerAttr(tpb));
+
+  mlir::Value idxUI;
+  auto resultTile = tileFromTensor(op->getResult(0).getType());
+  mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
+  if (resultTile && resultTile->elemPerThread > 1 && tileLoop) {
+    idxUI = emitPerIterIndex(*resultTile, tileLoop, rewriter, loc);
+  } else {
+    idxUI = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{ui32},
+                mlir::ValueRange{tidLocal})
+                .getResult(0);
+  }
+
+  auto valuePlaceholder =
+      GetElementOp::create(rewriter, loc, f32, valueBuf, idxUI);
+  auto flagPlaceholder =
+      GetElementOp::create(rewriter, loc, i1, flagBuf, idxUI);
+  if (tileLoop) {
+    valuePlaceholder->setAttr("metal.materialize", rewriter.getUnitAttr());
+    flagPlaceholder->setAttr("metal.materialize", rewriter.getUnitAttr());
+  }
+
+  (*scanBufs)[op->getResult(0)] = valueBuf;
+  (*scanBufs)[op->getResult(1)] = flagBuf;
+  rewriter.replaceOp(
+      op, mlir::ValueRange{valuePlaceholder.getResult(),
+                           flagPlaceholder.getResult()});
+  return mlir::success();
+}
+
 // W-C: `tt.scan` (cumsum) — inclusive prefix-sum over a rank-1 f32 tensor.
 //
 // Emits a DISTRIBUTED prefix-sum into a threadgroup buffer `scanbuf[BLOCK]`:
@@ -5448,6 +5692,8 @@ struct ScanLowering
   matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor /*adaptor*/,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    if (isCanonicalSegmentedSumScan(op))
+      return lowerCanonicalSegmentedSumScan(op, scanBufs, rewriter);
     if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
       return rewriter.notifyMatchFailure(op, "scan: single operand/result only");
     if (op.getAxis() != 0 || op.getReverse())

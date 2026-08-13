@@ -915,6 +915,34 @@ def ThreadgroupPrefixSumOp : Metal_Op<"threadgroup_prefix_sum",
 }
 
 //===----------------------------------------------------------------------===//
+// ThreadgroupSegmentedPrefixSumOp
+//===----------------------------------------------------------------------===//
+
+def ThreadgroupSegmentedPrefixSumOp
+    : Metal_Op<"threadgroup_segmented_prefix_sum",
+        [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "In-place segmented inclusive prefix-sum over threadgroup buffers";
+  let description = [{
+    Reads and writes two threadgroup buffers in place: `values[0..block)` is an
+    f32 buffer and `flags[0..block)` is an i1 buffer. The op computes the
+    inclusive associative scan of pairs `(value, flag)` using
+    `combine((v1, f1), (v2, f2)) = (f2 ? v2 : v1 + v2, f1 || f2)`.
+
+    The MSL emitter tiles over `E = block/tpb` chunks. Each chunk runs a
+    barrier-uniform Hillis-Steele pair scan across `tpb` threads, then combines
+    the chunk-local prefix with a carry pair from all previous chunks. Barriers
+    are emitted outside per-lane conditionals; callers must place this op only
+    in uniform control flow.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$values, Metal_MemRefType:$flags,
+                       I64Attr:$block, I64Attr:$tpb);
+
+  let assemblyFormat =
+      "$values `,` $flags attr-dict `:` type($values) `,` type($flags)";
+}
+
+//===----------------------------------------------------------------------===//
 // RmsNormOp
 //===----------------------------------------------------------------------===//
 

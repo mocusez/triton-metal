@@ -1,4 +1,4 @@
-// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal --split-input-file %s | FileCheck %s
 //
 // W-C: `tt.scan` (cumsum) lowering. `tl.cumsum(v, axis=0)` feeding an inverse-CDF
 // `tl.min` reduce lowers to a threadgroup prefix-sum: two `metal.threadgroup_alloca`
@@ -117,4 +117,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.threadgroup_alloca : !metal.memref<128 x f32>
 // CHECK: arith.select
 // CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 128 : i64, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @segmented_scan(%values_ptr: !tt.ptr<f32>, %flags_ptr: !tt.ptr<i32>, %out_ptr: !tt.ptr<f32>, %flag_out_ptr: !tt.ptr<i32>, %n: i32) attributes {noinline = false} {
+    %zero = arith.constant dense<0.000000e+00> : tensor<4096xf32, #blocked>
+    %zero_i32 = arith.constant dense<0> : tensor<4096xi32, #blocked>
+    %one_i32 = arith.constant dense<1> : tensor<4096xi32, #blocked>
+    %offs = tt.make_range {end = 4096 : i32, start = 0 : i32} : tensor<4096xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<4096xi32, #blocked>
+    %mask = arith.cmpi slt, %offs, %n_splat : tensor<4096xi32, #blocked>
+    %vptr = tt.splat %values_ptr : !tt.ptr<f32> -> tensor<4096x!tt.ptr<f32>, #blocked>
+    %vptr_0 = tt.addptr %vptr, %offs : tensor<4096x!tt.ptr<f32>, #blocked>, tensor<4096xi32, #blocked>
+    %fptr = tt.splat %flags_ptr : !tt.ptr<i32> -> tensor<4096x!tt.ptr<i32>, #blocked>
+    %fptr_0 = tt.addptr %fptr, %offs : tensor<4096x!tt.ptr<i32>, #blocked>, tensor<4096xi32, #blocked>
+    %vals = tt.load %vptr_0, %mask, %zero : tensor<4096x!tt.ptr<f32>, #blocked>
+    %flags_i32 = tt.load %fptr_0, %mask, %zero_i32 : tensor<4096x!tt.ptr<i32>, #blocked>
+    %flags = arith.cmpi eq, %flags_i32, %one_i32 : tensor<4096xi32, #blocked>
+    %scan:2 = "tt.scan"(%vals, %flags) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs_v: f32, %lhs_f: i1, %rhs_v: f32, %rhs_f: i1):
+      %sum = arith.addf %lhs_v, %rhs_v : f32
+      %out_v = arith.select %rhs_f, %rhs_v, %sum : f32
+      %out_f = arith.ori %lhs_f, %rhs_f : i1
+      tt.scan.return %out_v, %out_f : f32, i1
+    }) : (tensor<4096xf32, #blocked>, tensor<4096xi1, #blocked>) -> (tensor<4096xf32, #blocked>, tensor<4096xi1, #blocked>)
+    %optr = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<4096x!tt.ptr<f32>, #blocked>
+    %optr_0 = tt.addptr %optr, %offs : tensor<4096x!tt.ptr<f32>, #blocked>, tensor<4096xi32, #blocked>
+    %flag_i32 = arith.extui %scan#1 : tensor<4096xi1, #blocked> to tensor<4096xi32, #blocked>
+    %flag_optr = tt.splat %flag_out_ptr : !tt.ptr<i32> -> tensor<4096x!tt.ptr<i32>, #blocked>
+    %flag_optr_0 = tt.addptr %flag_optr, %offs : tensor<4096x!tt.ptr<i32>, #blocked>, tensor<4096xi32, #blocked>
+    tt.store %optr_0, %scan#0, %mask : tensor<4096x!tt.ptr<f32>, #blocked>
+    tt.store %flag_optr_0, %flag_i32, %mask : tensor<4096x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel segmented_scan
+// CHECK: metal.threadgroup_alloca : !metal.memref<4096 x f32>
+// CHECK: metal.threadgroup_alloca : !metal.memref<4096 x i1>
+// CHECK-NOT: metal.threadgroup_alloca
+// CHECK: metal.threadgroup_segmented_prefix_sum {{.*}} {block = 4096 : i64, tpb = 256 : i64}
 // CHECK-NOT: tt.scan
