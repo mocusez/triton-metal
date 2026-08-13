@@ -392,3 +392,85 @@ def test_reduce_loop_carried_tile_multiprogram(batch, M, N, STEPS, n_rows):
     ref = torch.stack(out, 1).reshape(-1)
     err = (y.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
     assert err <= 2e-5, f"rel err {err}"
+
+
+@triton.jit
+def _multi_agent_simulation_kernel(agents_ptr, agents_next_ptr, N,
+                                   BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    component = tl.arange(0, 2)
+    position = tl.load(agents_ptr + pid * 4 + component)
+    velocity = tl.load(agents_ptr + pid * 4 + 2 + component)
+
+    neighbor_velocity_sum = tl.zeros((2,), dtype=tl.float32)
+    neighbor_count = 0.0
+    n_chunks = tl.ceil(N / BLOCK_SIZE).to(tl.int32)
+    for chunk in range(0, n_chunks):
+        neighbor = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        is_valid_neighbor = (neighbor < N) & (neighbor != pid)
+        neighbor_position = tl.load(
+            agents_ptr + neighbor[:, None] * 4 + component[None, :],
+            mask=is_valid_neighbor[:, None],
+        )
+        neighbor_velocity = tl.load(
+            agents_ptr + neighbor[:, None] * 4 + 2 + component[None, :],
+            mask=is_valid_neighbor[:, None],
+        )
+        delta = position[None, :] - neighbor_position
+        distance_sq = tl.sum(delta * delta, axis=1)
+        weight = (
+            (distance_sq < 25.0) & is_valid_neighbor
+        ).to(tl.float32)
+        neighbor_velocity_sum += tl.sum(
+            neighbor_velocity * weight[:, None], axis=0
+        )
+        neighbor_count += tl.sum(weight, axis=0)
+
+    average_velocity = neighbor_velocity_sum / tl.maximum(
+        neighbor_count, 1e-6
+    )
+    average_velocity = tl.where(
+        neighbor_count > 0.0, average_velocity, velocity
+    )
+    next_velocity = velocity + 0.05 * (average_velocity - velocity)
+    next_position = position + next_velocity
+    tl.store(agents_next_ptr + pid * 4 + component, next_position)
+    tl.store(agents_next_ptr + pid * 4 + 2 + component, next_velocity)
+
+
+def _multi_agent_simulation_reference(agents):
+    position = agents[:, :2]
+    velocity = agents[:, 2:]
+    delta = position[:, None, :] - position[None, :, :]
+    distance_sq = (delta * delta).sum(dim=2)
+    is_neighbor = distance_sq < 25.0
+    is_neighbor.fill_diagonal_(False)
+    neighbor_count = is_neighbor.sum(dim=1, keepdim=True)
+    velocity_sum = (
+        velocity[None, :, :] * is_neighbor[:, :, None]
+    ).sum(dim=1)
+    average_velocity = velocity_sum / neighbor_count.clamp_min(1)
+    average_velocity = torch.where(
+        neighbor_count > 0, average_velocity, velocity
+    )
+    next_velocity = velocity + 0.05 * (average_velocity - velocity)
+    return torch.cat((position + next_velocity, next_velocity), dim=1)
+
+
+@pytest.mark.parametrize("N", [1, 17, 1025])
+def test_multi_agent_simulation_end_to_end(N):
+    """Regression for the leet-triton hard multi-agent kernel shape."""
+    torch.manual_seed(0xA63E + N)
+    agents_cpu = torch.empty((N, 4), dtype=torch.float32)
+    agents_cpu[:, :2] = torch.randn((N, 2)) * 8.0
+    agents_cpu[:, 2:] = torch.randn((N, 2)) * 0.25
+    expected = _multi_agent_simulation_reference(agents_cpu)
+    agents = agents_cpu.to("mps")
+    agents_next = torch.empty_like(agents)
+    _multi_agent_simulation_kernel[(N,)](
+        agents, agents_next, N, BLOCK_SIZE=1024, num_warps=4
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(
+        agents_next.cpu(), expected, atol=2e-4, rtol=2e-4
+    )

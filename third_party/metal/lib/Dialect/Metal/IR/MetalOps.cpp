@@ -420,6 +420,48 @@ llvm::LogicalResult Int8QuantizedMatmulOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// LinearAttentionPreprocessOp / LinearAttentionApplyOp
+//===----------------------------------------------------------------------===//
+
+static llvm::LogicalResult verifyLinearAttentionBuffers(
+    mlir::Operation *op, mlir::ValueRange floatBuffers,
+    mlir::ValueRange extentBuffers) {
+  auto checkMemref = [&](mlir::Value value, mlir::Type elem,
+                         llvm::StringRef name) -> llvm::LogicalResult {
+    auto memref = llvm::dyn_cast<MetalMemRefType>(value.getType());
+    if (!memref)
+      return op->emitOpError() << name << " must be a !metal.memref";
+    if (memref.getType() != elem)
+      return op->emitOpError() << name << " element type must be " << elem
+                               << ", got " << memref.getType();
+    return mlir::success();
+  };
+
+  auto *ctx = op->getContext();
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto ui32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Unsigned);
+  for (auto [index, value] : llvm::enumerate(floatBuffers))
+    if (failed(checkMemref(value, f32,
+                           ("float operand " + llvm::Twine(index)).str())))
+      return mlir::failure();
+  for (auto [index, value] : llvm::enumerate(extentBuffers))
+    if (failed(checkMemref(value, ui32,
+                           ("extent operand " + llvm::Twine(index)).str())))
+      return mlir::failure();
+  return mlir::success();
+}
+
+llvm::LogicalResult LinearAttentionPreprocessOp::verify() {
+  return verifyLinearAttentionBuffers(
+      getOperation(), {getKt(), getV(), getKv(), getKsum()}, {getM(), getD()});
+}
+
+llvm::LogicalResult LinearAttentionApplyOp::verify() {
+  return verifyLinearAttentionBuffers(
+      getOperation(), {getQ(), getKv(), getKsum(), getOut()}, {getM(), getD()});
+}
+
+//===----------------------------------------------------------------------===//
 // Check Index
 //===----------------------------------------------------------------------===//
 

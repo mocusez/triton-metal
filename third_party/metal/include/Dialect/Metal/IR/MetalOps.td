@@ -611,6 +611,55 @@ def Int8QuantizedMatmulOp : Metal_Op<"int8_quantized_matmul"> {
 }
 
 //===----------------------------------------------------------------------===//
+// LinearAttentionPreprocessOp / LinearAttentionApplyOp
+//===----------------------------------------------------------------------===//
+
+def LinearAttentionPreprocessOp : Metal_Op<"linear_attention_preprocess"> {
+  let summary = "Correctness-first hard linear-attention preprocessing";
+  let description = [{
+    Specialized fallback for the first leet-triton hard linear-attention
+    kernel.  For the source program's 256-row chunk it atomically accumulates
+    `KV += phi(K)^T * V` and `Ksum += sum(phi(K), axis=0)`, where
+    `phi(x) = x + 1` for positive x and `exp(x)` otherwise.
+
+    The op is intentionally produced only by a conservative whole-kernel
+    matcher.  It consumes the computed dot operand, its side reduction, and
+    the rank-2/rank-1 atomic publication before those operations reach the
+    generic layout and atomic lowerings.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$kt, Metal_MemRefType:$v,
+                       Metal_MemRefType:$kv, Metal_MemRefType:$ksum,
+                       Metal_MemRefType:$m, Metal_MemRefType:$d);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$kt `,` $v `,` $kv `,` $ksum `,` $m `,` $d "
+                       "attr-dict `:` type(operands)";
+}
+
+def LinearAttentionApplyOp : Metal_Op<"linear_attention_apply"> {
+  let summary = "Correctness-first hard linear-attention output kernel";
+  let description = [{
+    Specialized fallback for the second leet-triton hard linear-attention
+    kernel.  Each source program covers a 64x64 output tile and computes
+    `phi(Q) * KV / (phi(Q) * Ksum + 1e-5)` using runtime M and D bounds.
+
+    The op is intentionally produced only by a conservative whole-kernel
+    matcher so unrelated dot/reduce kernels keep using the generic paths.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$kv,
+                       Metal_MemRefType:$ksum, Metal_MemRefType:$out,
+                       Metal_MemRefType:$m, Metal_MemRefType:$d);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$q `,` $kv `,` $ksum `,` $out `,` $m `,` $d "
+                       "attr-dict `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
 // ReduceOp
 //===----------------------------------------------------------------------===//
 
@@ -940,6 +989,36 @@ def ThreadgroupSegmentedPrefixSumOp
 
   let assemblyFormat =
       "$values `,` $flags attr-dict `:` type($values) `,` type($flags)";
+}
+
+//===----------------------------------------------------------------------===//
+// ThreadgroupAffinePrefixScanOp
+//===----------------------------------------------------------------------===//
+
+def ThreadgroupAffinePrefixScanOp
+    : Metal_Op<"threadgroup_affine_prefix_scan",
+        [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "In-place affine-composition prefix scan over threadgroup buffers";
+  let description = [{
+    Reads and writes two f32 threadgroup buffers in place.  Each pair `(a, x)`
+    represents the affine transform `h -> a*h + x`; the op computes the
+    inclusive associative scan
+
+    `combine((a_l, x_l), (a_r, x_r)) =
+        (a_l*a_r, a_r*x_l + x_r)`.
+
+    The MSL emitter tiles over `E = block/tpb` chunks.  Each chunk runs a
+    barrier-uniform Hillis-Steele pair scan across `tpb` threads, then composes
+    the chunk-local prefixes with the carry transform from prior chunks.
+    Barriers are emitted outside per-lane conditionals; callers must place this
+    op only in uniform control flow.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$a, Metal_MemRefType:$x,
+                       I64Attr:$block, I64Attr:$tpb);
+
+  let assemblyFormat =
+      "$a `,` $x attr-dict `:` type($a) `,` type($x)";
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,8 +1,13 @@
-"""Segmented exclusive prefix sum on the Metal backend.
+"""Tuple associative scans on the Metal backend.
 
 These tests pin the unmodified LeetTriton medium segmented-prefix-sum kernels:
 each pass must compile to Metal, and the original three-pass ``solve`` entry
 must match a CPU segmented-exclusive reference on MPS.
+
+They also pin the two-state affine composition used by the medium linear
+recurrence.  That algebra has a dedicated narrow lowering; unrelated tuple
+scans must remain rejected instead of being miscompiled as one of the supported
+monoids.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ pytest.importorskip(
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SEGMENTED_SCAN_PATH = REPO_ROOT / "leet-triton" / "medium-segmented_exclusive_prefix_sum.py"
+LINEAR_RECURRENCE_PATH = REPO_ROOT / "leet-triton" / "medium-linear_recurrence.py"
 TILE_SIZE = 65536
 BLOCK_SIZE = 4096
 
@@ -149,6 +155,83 @@ def test_pass3_downsweep_original_kernel_compiles_to_metal():
     )
 
 
+def _compile_linear_recurrence_kernel_in_child(
+    kernel_name, signature, constexprs, *, num_warps=4
+):
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        from pathlib import Path
+
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource
+
+        path = Path({str(LINEAR_RECURRENCE_PATH)!r})
+        spec = importlib.util.spec_from_file_location("linear_recurrence_child", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        src = ASTSource(
+            fn=getattr(module, {kernel_name!r}),
+            signature={signature!r},
+            constexprs={constexprs!r},
+        )
+        target = GPUTarget(backend="metal", arch=80, warp_size=32)
+        compiled = triton.compile(src, target=target, options={{"num_warps": {num_warps}}})
+        raw = compiled.asm["metal"]
+        msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        assert msl, "{kernel_name} produced empty Metal output"
+        assert "kernel void {kernel_name}" in msl, msl
+        assert "metal.threadgroup_affine_prefix_scan" in msl, msl
+        assert "_aps_carry_a" in msl, msl
+        assert "threadgroup_barrier(mem_flags::mem_threadgroup)" in msl, msl
+        """
+    )
+    result = _run_child(script)
+    assert result.returncode == 0, (
+        f"{kernel_name} failed to compile to Metal in a child process "
+        f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
+def test_linear_recurrence_local_scan_original_kernel_compiles_to_metal():
+    _compile_linear_recurrence_kernel_in_child(
+        "local_scan_kernel",
+        {
+            "a_ptr": "*fp32",
+            "x_ptr": "*fp32",
+            "h_ptr": "*fp32",
+            "a_prefix_ptr": "*fp32",
+            "chunk_a_ptr": "*fp32",
+            "chunk_x_ptr": "*fp32",
+            "L": "constexpr",
+            "N_CHUNKS": "constexpr",
+            "BLOCK": "constexpr",
+        },
+        {"L": 520, "N_CHUNKS": 3, "BLOCK": 256},
+    )
+
+
+@pytest.mark.parametrize(
+    ("n_chunks", "scan_block"),
+    [(1, 1), (3, 4), (256, 256)],
+)
+def test_linear_recurrence_chunk_scan_original_kernel_compiles_to_metal(
+    n_chunks, scan_block
+):
+    _compile_linear_recurrence_kernel_in_child(
+        "chunk_scan_kernel",
+        {
+            "chunk_a_ptr": "*fp32",
+            "chunk_x_ptr": "*fp32",
+            "N_CHUNKS": "constexpr",
+            "CHUNK_SCAN_BLOCK": "constexpr",
+        },
+        {"N_CHUNKS": n_chunks, "CHUNK_SCAN_BLOCK": scan_block},
+    )
+
+
 def test_noncanonical_tuple_scan_remains_rejected():
     # Conversion failures can crash while cleaning up after the useful
     # diagnostic. Keep this intentionally unsupported case in a child process.
@@ -251,5 +334,54 @@ def test_original_solve_matches_segmented_exclusive_reference(N, reset_positions
     result = _run_child(script)
     assert result.returncode == 0, (
         f"original solve failed for N={N}, reset_positions={reset_positions} "
+        f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("B", "L"),
+    [(1, 17), (2, 520), (1, 16384), (1, 65536)],
+)
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
+)
+def test_original_linear_recurrence_solve_matches_reference(B, L):
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        from pathlib import Path
+
+        import torch
+
+        path = Path({str(LINEAR_RECURRENCE_PATH)!r})
+        spec = importlib.util.spec_from_file_location("linear_recurrence_child", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        torch.manual_seed(0xC0FFEE + {L})
+        B, L = {B}, {L}
+        # Keep coefficients close to one so scan carry propagation remains
+        # numerically significant across chunk and internal threadgroup-tile
+        # boundaries; small random coefficients would rapidly erase such bugs.
+        a_cpu = torch.empty((B, L), dtype=torch.float32).uniform_(0.90, 0.99)
+        x_cpu = torch.randn((B, L), dtype=torch.float32)
+
+        expected = torch.empty_like(x_cpu)
+        expected[:, 0] = x_cpu[:, 0]
+        for t in range(1, L):
+            expected[:, t] = a_cpu[:, t] * expected[:, t - 1] + x_cpu[:, t]
+
+        a = a_cpu.to("mps")
+        x = x_cpu.to("mps")
+        output = torch.empty_like(x)
+        module.solve(a, x, output, B, L)
+        torch.mps.synchronize()
+        torch.testing.assert_close(output.cpu(), expected, rtol=1e-5, atol=1e-5)
+        """
+    )
+    result = _run_child(script)
+    assert result.returncode == 0, (
+        f"linear recurrence solve failed for B={B}, L={L} "
         f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )

@@ -112,6 +112,7 @@ private:
   void translate(mlir::triton::metal::StoreOp op);
   void translate(mlir::triton::metal::ThreadgroupPrefixSumOp op);
   void translate(mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp op);
+  void translate(mlir::triton::metal::ThreadgroupAffinePrefixScanOp op);
   void translate(mlir::triton::metal::AtomicRmwOp op);
   void translate(mlir::triton::metal::IfOp op);
   void translate(mlir::triton::metal::WhileOp op);
@@ -123,6 +124,8 @@ private:
   void translate(mlir::triton::metal::QmmOp op);
   void translate(mlir::triton::metal::Int4WeightOnlyMatmulOp op);
   void translate(mlir::triton::metal::Int8QuantizedMatmulOp op);
+  void translate(mlir::triton::metal::LinearAttentionPreprocessOp op);
+  void translate(mlir::triton::metal::LinearAttentionApplyOp op);
   void translate(mlir::triton::metal::ReduceOp op);
   void translate(mlir::triton::metal::ArgmaxOp op);
   void translate(mlir::triton::metal::SoftmaxOp op);

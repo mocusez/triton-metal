@@ -23,6 +23,9 @@ BD is the unpadded path. N covers block-aligned, masked-tail, and ragged cases.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -349,3 +352,56 @@ def test_flash_attention_single_key_block(N, d_model, h):
 
     expected = _reference(Q, K, V, N, d_model, h)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+def _load_softmax_attention_backward():
+    path = (Path(__file__).resolve().parents[3] / "leet-triton" /
+            "medium-softmax_attention_backward.py")
+    if not path.is_file():
+        pytest.skip(f"leet-triton fixture not present: {path}")
+    spec = importlib.util.spec_from_file_location(
+        "leet_triton_softmax_attention_backward", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "M, N, d, force_chunk_rows",
+    [
+        (16, 16, 16, None),
+        (17, 19, 20, None),
+        (32, 48, 32, 16),
+        (64, 256, 128, None),
+    ],
+)
+def test_softmax_attention_backward(M, N, d, force_chunk_rows):
+    """The leet-triton backward kernel compiles and matches CPU autograd."""
+    torch.manual_seed(0xBADC0DE + M + N + d)
+    q_cpu = torch.randn(M, d, dtype=torch.float32, requires_grad=True)
+    k_cpu = torch.randn(N, d, dtype=torch.float32, requires_grad=True)
+    v_cpu = torch.randn(N, d, dtype=torch.float32, requires_grad=True)
+    do_cpu = torch.randn(M, d, dtype=torch.float32)
+
+    scale = d ** -0.5
+    expected = (torch.softmax(q_cpu @ k_cpu.T * scale, dim=1) @ v_cpu)
+    expected.backward(do_cpu)
+
+    Q = q_cpu.detach().to("mps").contiguous()
+    K = k_cpu.detach().to("mps").contiguous()
+    V = v_cpu.detach().to("mps").contiguous()
+    dO = do_cpu.to("mps").contiguous()
+    dQ = torch.empty_like(Q)
+    dK = torch.empty_like(K)
+    dV = torch.empty_like(V)
+
+    backward = _load_softmax_attention_backward()
+    if force_chunk_rows is not None:
+        backward._SCRATCH_ELEMS = force_chunk_rows * backward._pad16(N)
+    backward.solve(Q, K, V, dO, dQ, dK, dV, M, N, d)
+    torch.mps.synchronize()
+
+    torch.testing.assert_close(dQ.cpu(), q_cpu.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(dK.cpu(), k_cpu.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(dV.cpu(), v_cpu.grad, atol=1e-5, rtol=1e-5)

@@ -295,8 +295,17 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesInt8QuantizedMatmul = true;
     return mlir::WalkResult::interrupt();
   });
+  bool usesLinearAttention = false;
+  op.walk([&](mlir::triton::metal::LinearAttentionPreprocessOp) {
+    usesLinearAttention = true;
+    return mlir::WalkResult::interrupt();
+  });
+  op.walk([&](mlir::triton::metal::LinearAttentionApplyOp) {
+    usesLinearAttention = true;
+    return mlir::WalkResult::interrupt();
+  });
   bool usesThreadgroupId = usesFusedAttention || usesInt4WeightOnlyMatmul ||
-                           usesInt8QuantizedMatmul;
+                           usesInt8QuantizedMatmul || usesLinearAttention;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
     return mlir::WalkResult::interrupt();
@@ -304,7 +313,7 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
   if (usesFusedAttention || usesInt4WeightOnlyMatmul ||
-      usesInt8QuantizedMatmul)
+      usesInt8QuantizedMatmul || usesLinearAttention)
     _output << ",\n  uint3 ltid [[thread_position_in_threadgroup]]";
   // Conditionally add the threadgroups-per-grid parameter only when the
   // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
@@ -357,11 +366,14 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
+            mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
             mlir::triton::metal::Int4WeightOnlyMatmulOp,
             mlir::triton::metal::Int8QuantizedMatmulOp,
+            mlir::triton::metal::LinearAttentionPreprocessOp,
+            mlir::triton::metal::LinearAttentionApplyOp,
             mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
@@ -408,11 +420,14 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
+            mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
             mlir::triton::metal::IfOp,
             mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
             mlir::triton::metal::Int4WeightOnlyMatmulOp,
             mlir::triton::metal::Int8QuantizedMatmulOp,
+            mlir::triton::metal::LinearAttentionPreprocessOp,
+            mlir::triton::metal::LinearAttentionApplyOp,
             mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
@@ -667,6 +682,100 @@ void ModuleTranslation::translate(
   os << "      _sgps_carry_v = _sgps_total_f ? _sgps_total_v : "
         "(_sgps_carry_v + _sgps_total_v);\n";
   os << "      _sgps_carry_f = _sgps_carry_f || _sgps_total_f;\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    }\n";
+  os << "  }\n";
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::ThreadgroupAffinePrefixScanOp op) {
+  const int64_t BLOCK = op.getBlock();
+  const int64_t TPB = op.getTpb();
+  if (BLOCK <= 0 || TPB <= 0 || (BLOCK % TPB) != 0) {
+    op.emitError("metal.threadgroup_affine_prefix_scan requires positive "
+                 "block/tpb with block divisible by tpb");
+    _emitFailed = true;
+    return;
+  }
+
+  auto aTy = llvm::cast<MetalMemRefType>(op.getA().getType());
+  auto xTy = llvm::cast<MetalMemRefType>(op.getX().getType());
+  if (!aTy.getType().isF32() || !xTy.getType().isF32()) {
+    op.emitError("metal.threadgroup_affine_prefix_scan buffers must have f32 "
+                 "element type");
+    _emitFailed = true;
+    return;
+  }
+  if (aTy.getSize() < BLOCK || xTy.getSize() < BLOCK) {
+    op.emitError("metal.threadgroup_affine_prefix_scan buffers must have at "
+                 "least block elements");
+    _emitFailed = true;
+    return;
+  }
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        break;
+      m = cast.getInputs()[0];
+    }
+    if (auto def = m.getDefiningOp())
+      if (auto it = _alloca.find(def); it != _alloca.end())
+        return "v" + std::to_string(it->second);
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    return "v" + std::to_string(it != _buffers.end() ? it->second : 0);
+  };
+  const std::string A = bufName(op.getA());
+  const std::string X = bufName(op.getX());
+  auto S = [](int64_t value) { return std::to_string(value); };
+  const int64_t E = BLOCK / TPB;
+  auto &os = _output;
+
+  os << "\n  // ---- metal.threadgroup_affine_prefix_scan ----\n";
+  os << "  {\n";
+  os << "    uint _aps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
+  os << "    float _aps_carry_a = 1.0f;\n";
+  os << "    float _aps_carry_x = 0.0f;\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    for (uint _aps_k = 0u; _aps_k < " << S(E) << "u; ++_aps_k) {\n";
+  os << "      uint _aps_base = _aps_k * " << S(TPB) << "u;\n";
+  os << "      for (uint _aps_off = 1u; _aps_off < " << S(TPB)
+     << "u; _aps_off <<= 1) {\n";
+  os << "        float _aps_cur_a = " << A << "[_aps_base + _aps_tid];\n";
+  os << "        float _aps_cur_x = " << X << "[_aps_base + _aps_tid];\n";
+  os << "        float _aps_prev_a = 1.0f;\n";
+  os << "        float _aps_prev_x = 0.0f;\n";
+  os << "        if (_aps_tid >= _aps_off) {\n";
+  os << "          _aps_prev_a = " << A
+     << "[_aps_base + _aps_tid - _aps_off];\n";
+  os << "          _aps_prev_x = " << X
+     << "[_aps_base + _aps_tid - _aps_off];\n";
+  os << "        }\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "        if (_aps_tid >= _aps_off) {\n";
+  os << "          " << A
+     << "[_aps_base + _aps_tid] = _aps_prev_a * _aps_cur_a;\n";
+  os << "          " << X
+     << "[_aps_base + _aps_tid] = _aps_cur_a * _aps_prev_x + "
+        "_aps_cur_x;\n";
+  os << "        }\n";
+  os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      }\n";
+  os << "      float _aps_total_a = " << A << "[_aps_base + " << S(TPB - 1)
+     << "u];\n";
+  os << "      float _aps_total_x = " << X << "[_aps_base + " << S(TPB - 1)
+     << "u];\n";
+  os << "      float _aps_local_a = " << A << "[_aps_base + _aps_tid];\n";
+  os << "      float _aps_local_x = " << X << "[_aps_base + _aps_tid];\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      " << A
+     << "[_aps_base + _aps_tid] = _aps_carry_a * _aps_local_a;\n";
+  os << "      " << X
+     << "[_aps_base + _aps_tid] = _aps_local_a * _aps_carry_x + "
+        "_aps_local_x;\n";
+  os << "      _aps_carry_x = _aps_total_a * _aps_carry_x + "
+        "_aps_total_x;\n";
+  os << "      _aps_carry_a *= _aps_total_a;\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "    }\n";
   os << "  }\n";
@@ -4880,6 +4989,248 @@ void ModuleTranslation::translate(
   _output << "}";
 }
 
+void ModuleTranslation::translate(
+    mlir::triton::metal::LinearAttentionPreprocessOp op) {
+  auto bufName = [&](mlir::Value value) -> std::string {
+    for (;;) {
+      while (auto cast =
+                 value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        value = cast.getInputs()[0];
+      }
+      if (auto get =
+              value.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        value = get.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(value.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.linear_attention_preprocess: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+
+  const std::string KT = bufName(op.getKt());
+  const std::string V = bufName(op.getV());
+  const std::string KV = bufName(op.getKv());
+  const std::string KSUM = bufName(op.getKsum());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string D = bufName(op.getD()) + "[0]";
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "// ---- metal.linear_attention_preprocess scalar fallback ----\n";
+    indent();
+    _output << "uint _lap_lane = ltid.x;\n";
+    indent();
+    _output << "uint _lap_M = " << M << ";\n";
+    indent();
+    _output << "uint _lap_D = " << D << ";\n";
+    indent();
+    _output << "uint _lap_row_begin = tgid.x * 256u;\n";
+    indent();
+    _output << "uint _lap_row_end = min(_lap_row_begin + 256u, _lap_M);\n";
+    indent();
+    _output << "uint _lap_matrix_elems = _lap_D * _lap_D;\n";
+    indent();
+    _output << "for (uint _lap_e = _lap_lane; _lap_e < "
+               "_lap_matrix_elems + _lap_D; _lap_e += 512u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "if (_lap_e < _lap_matrix_elems) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint _lap_k = _lap_e / _lap_D;\n";
+        indent();
+        _output << "uint _lap_col = _lap_e % _lap_D;\n";
+        indent();
+        _output << "float _lap_acc = 0.0f;\n";
+        indent();
+        _output << "for (uint _lap_row = _lap_row_begin; "
+                   "_lap_row < _lap_row_end; ++_lap_row) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "float _lap_x = " << KT
+                  << "[_lap_k * _lap_M + _lap_row];\n";
+          indent();
+          _output << "float _lap_phi = (_lap_x > 0.0f) ? "
+                     "(_lap_x + 1.0f) : exp(_lap_x);\n";
+          indent();
+          _output << "_lap_acc += _lap_phi * " << V
+                  << "[_lap_row * _lap_D + _lap_col];";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "atomic_fetch_add_explicit((device atomic_float*)&" << KV
+                << "[_lap_e], _lap_acc, memory_order_relaxed);";
+      }
+      _output << "\n";
+      indent();
+      _output << "} else {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint _lap_k = _lap_e - _lap_matrix_elems;\n";
+        indent();
+        _output << "float _lap_acc = 0.0f;\n";
+        indent();
+        _output << "for (uint _lap_row = _lap_row_begin; "
+                   "_lap_row < _lap_row_end; ++_lap_row) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "float _lap_x = " << KT
+                  << "[_lap_k * _lap_M + _lap_row];\n";
+          indent();
+          _output << "_lap_acc += (_lap_x > 0.0f) ? "
+                     "(_lap_x + 1.0f) : exp(_lap_x);";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "atomic_fetch_add_explicit((device atomic_float*)&"
+                << KSUM
+                << "[_lap_k], _lap_acc, memory_order_relaxed);";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::LinearAttentionApplyOp op) {
+  auto bufName = [&](mlir::Value value) -> std::string {
+    for (;;) {
+      while (auto cast =
+                 value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        value = cast.getInputs()[0];
+      }
+      if (auto get =
+              value.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        value = get.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(value.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.linear_attention_apply: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+
+  const std::string Q = bufName(op.getQ());
+  const std::string KV = bufName(op.getKv());
+  const std::string KSUM = bufName(op.getKsum());
+  const std::string OUT = bufName(op.getOut());
+  const std::string M = bufName(op.getM()) + "[0]";
+  const std::string D = bufName(op.getD()) + "[0]";
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "// ---- metal.linear_attention_apply scalar fallback ----\n";
+    indent();
+    _output << "uint _laa_lane = ltid.x;\n";
+    indent();
+    _output << "uint _laa_M = " << M << ";\n";
+    indent();
+    _output << "uint _laa_D = " << D << ";\n";
+    indent();
+    _output << "uint _laa_row0 = tgid.y * 64u;\n";
+    indent();
+    _output << "uint _laa_col0 = tgid.x * 64u;\n";
+    indent();
+    _output << "for (uint _laa_e = _laa_lane; _laa_e < 4096u; "
+               "_laa_e += 256u) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "uint _laa_row = _laa_row0 + _laa_e / 64u;\n";
+      indent();
+      _output << "uint _laa_col = _laa_col0 + _laa_e % 64u;\n";
+      indent();
+      _output << "if (_laa_row < _laa_M && _laa_col < _laa_D) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "float _laa_numer = 0.0f;\n";
+        indent();
+        _output << "float _laa_denom = 1.0e-5f;\n";
+        indent();
+        _output << "for (uint _laa_k = 0u; _laa_k < _laa_D; ++_laa_k) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          _output << "float _laa_x = " << Q
+                  << "[_laa_row * _laa_D + _laa_k];\n";
+          indent();
+          _output << "float _laa_phi = (_laa_x > 0.0f) ? "
+                     "(_laa_x + 1.0f) : exp(_laa_x);\n";
+          indent();
+          _output << "_laa_numer += _laa_phi * " << KV
+                  << "[_laa_k * _laa_D + _laa_col];\n";
+          indent();
+          _output << "_laa_denom += _laa_phi * " << KSUM << "[_laa_k];";
+        }
+        _output << "\n";
+        indent();
+        _output << "}\n";
+        indent();
+        _output << OUT << "[_laa_row * _laa_D + _laa_col] = "
+                << "_laa_numer / _laa_denom;";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
 void ModuleTranslation::emitScalarMatmul_(mlir::triton::metal::MatmulOp op) {
   auto m = op.getM();
   auto n = op.getN();
@@ -5569,6 +5920,13 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // gaussian blur's `floor(kernel_size / 2)`. MSL provides an exact
         // floor overload in the metal namespace.
         _output << "metal::floor(";
+        translateValueOrVarName(op.getOperand());
+        _output << ")";
+      })
+      .Case<mlir::math::CeilOp>([&](mlir::math::CeilOp op) {
+        // Scalar tl.ceil survives conversion for runtime loop bounds, e.g.
+        // ceil(N / BLOCK_SIZE) in chunked kernels.
+        _output << "metal::ceil(";
         translateValueOrVarName(op.getOperand());
         _output << ")";
       })

@@ -1,4 +1,4 @@
-"""Float widen/narrow (arith.extf / arith.truncf) on the Metal backend.
+"""Floating-point casts on the Metal backend.
 
 fp16-in / fp32-compute / fp16-out is the ubiquitous shape for layer-norm,
 softmax, and attention kernels: `tl.load(fp16).to(tl.float32)` lowers to a
@@ -75,3 +75,33 @@ def test_extf_in_reduce_cone(N):
     torch.mps.synchronize()
     ref = x.cpu().float().sum()
     torch.testing.assert_close(out.cpu()[0], ref, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
+def _bool_to_float_after_reduce_kernel(x_ptr, out_ptr, N,
+                                       BLOCK: tl.constexpr):
+    row = tl.arange(0, BLOCK)
+    col = tl.arange(0, 2)
+    mask = row < N
+    x = tl.load(
+        x_ptr + row[:, None] * 2 + col[None, :],
+        mask=mask[:, None],
+        other=0.0,
+    )
+    distance_sq = tl.sum(x * x, axis=1)
+    selected = ((distance_sq < 25.0) & mask).to(tl.float32)
+    tl.store(out_ptr + row, selected, mask=mask)
+
+
+@pytest.mark.parametrize("N", [17, 1000])
+def test_bool_to_float_after_reduce(N):
+    """A slice-encoded i1 tile must scalarize through arith.uitofp."""
+    torch.manual_seed(N)
+    x = torch.randn((N, 2), dtype=torch.float32, device="mps") * 4.0
+    out = torch.empty(N, dtype=torch.float32, device="mps")
+    _bool_to_float_after_reduce_kernel[(1,)](
+        x, out, N, BLOCK=1024, num_warps=4
+    )
+    torch.mps.synchronize()
+    expected = ((x.cpu() * x.cpu()).sum(dim=1) < 25.0).float()
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
