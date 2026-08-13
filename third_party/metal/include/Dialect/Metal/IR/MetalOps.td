@@ -245,21 +245,20 @@ def GetElementOp : Metal_Op<"get_element", [Pure]> {
 //===----------------------------------------------------------------------===//
 
 def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
-  let summary = "Atomic read-modify-write (add) on a device-memory element.";
+  let summary = "Atomic read-modify-write on a device-memory element.";
   let description = [{
-    Atomically adds `value` into `memref[index]` and yields the old value.
-    Lowers to MSL `atomic_fetch_add_explicit(..., memory_order_relaxed)`, with
-    the atomic pointer type taken from the memref element (`atomic_float` for
-    f32, `atomic_uint`/`atomic_int` for 32-bit integers). Models Triton
-    `tt.atomic_rmw fadd` and `tt.atomic_rmw add`. NOT `Pure` — it has a
-    device-memory side effect, so it survives dead-code elimination even when
-    its result is unused.
+    Applies `kind` to `value` and `memref[index]`, yielding the old value.
+    `add` models Triton `tt.atomic_rmw fadd/add`; `max` and `umin` model the
+    signed-positive and unsigned-negative halves of Triton's f32
+    `tl.atomic_max` expansion. NOT `Pure` — it has a device-memory side effect,
+    so it survives dead-code elimination even when its result is unused.
   }];
 
-  let arguments = (ins Metal_Type:$value, Metal_MemRefType:$memref, UI32:$index);
+  let arguments = (ins AtomicRmwKindAttr:$kind, Metal_Type:$value,
+                       Metal_MemRefType:$memref, UI32:$index);
   let results = (outs Metal_Type:$result);
 
-  let assemblyFormat = "$value `,` $memref `[` $index `]` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$kind $value `,` $memref `[` $index `]` attr-dict `:` functional-type(operands, results)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -324,6 +323,15 @@ def CastOp : Metal_Op<"cast", [Pure]> {
   let results = (outs Metal_Type);
 
   let assemblyFormat = "$argument  attr-dict `:` functional-type(operands, results)";
+}
+
+def BitcastOp : Metal_Op<"bitcast", [Pure]> {
+  let summary = "Bit-preserving scalar reinterpret cast";
+
+  let arguments = (ins Metal_Type:$argument);
+  let results = (outs Metal_Type);
+
+  let assemblyFormat = "$argument attr-dict `:` functional-type(operands, results)";
 }
 
 //===----------------------------------------------------------------------===//

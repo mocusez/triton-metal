@@ -1496,6 +1496,52 @@ struct ArithConstantDenseLowering
   }
 };
 
+// Scalar `tt.bitcast` is a bit-preserving reinterpretation, not a numeric
+// cast. Triton's f32 atomic min/max expansion relies on this distinction when
+// it orders IEEE-754 values through signed/unsigned integer atomics. Pointer
+// bitcasts are represented as an unrealized memref view; the consuming atomic
+// resolves the original buffer and chooses the actual MSL atomic pointer type.
+struct BitcastLowering
+    : public mlir::OpConversionPattern<mlir::triton::BitcastOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::BitcastOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(
+          op, "bitcast: result type not convertible");
+
+    if (mlir::isa<MetalMemRefType>(resultTy)) {
+      auto cast = mlir::UnrealizedConversionCastOp::create(
+          rewriter, op.getLoc(), mlir::TypeRange{resultTy},
+          mlir::ValueRange{adaptor.getSrc()});
+      rewriter.replaceOp(op, cast.getResult(0));
+      return mlir::success();
+    }
+
+    mlir::Type legalResultTy = wrapperElementType(resultTy);
+    mlir::Value source = adaptor.getSrc();
+    mlir::Type legalSourceTy = wrapperElementType(source.getType());
+    if (legalSourceTy != source.getType())
+      source = mlir::UnrealizedConversionCastOp::create(
+                   rewriter, op.getLoc(), mlir::TypeRange{legalSourceTy},
+                   mlir::ValueRange{source})
+                   .getResult(0);
+
+    mlir::Value result = BitcastOp::create(
+                             rewriter, op.getLoc(), legalResultTy, source)
+                             .getResult();
+    if (legalResultTy != resultTy)
+      result = mlir::UnrealizedConversionCastOp::create(
+                   rewriter, op.getLoc(), mlir::TypeRange{resultTy},
+                   mlir::ValueRange{result})
+                   .getResult(0);
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // tt.expand_dims / tt.broadcast -> identity (under typeconverter).
 //
@@ -6541,6 +6587,16 @@ static mlir::Value findBaseMemref(mlir::Value origPtrVal,
       cur = addptr.getPtr();
       continue;
     }
+    if (auto bitcast = cur.getDefiningOp<mlir::triton::BitcastOp>()) {
+      cur = bitcast.getSrc();
+      continue;
+    }
+    if (auto cast = cur.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        return {};
+      cur = cast.getInputs()[0];
+      continue;
+    }
     // Chase through tt.splat (src is the scalar pointer).
     if (auto splat = cur.getDefiningOp<mlir::triton::SplatOp>()) {
       cur = splat.getSrc();
@@ -6596,6 +6652,16 @@ static mlir::Value accumulateScalarAddPtrOffsets(
     }
     if (auto splat = cur.getDefiningOp<mlir::triton::SplatOp>()) {
       cur = splat.getSrc();
+      continue;
+    }
+    if (auto bitcast = cur.getDefiningOp<mlir::triton::BitcastOp>()) {
+      cur = bitcast.getSrc();
+      continue;
+    }
+    if (auto cast = cur.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        break;
+      cur = cast.getInputs()[0];
       continue;
     }
     break;
@@ -7439,14 +7505,14 @@ struct StoreLowering
 };
 
 //===----------------------------------------------------------------------===//
-// tt.atomic_rmw fadd (scalar) → metal.atomic_rmw
+// tt.atomic_rmw add/fadd/max/umin (scalar) → metal.atomic_rmw
 //
 // Models the scalar `tl.atomic_add(ptr, scalar)` form — e.g. the leet-triton
 // subarray-sum kernels accumulating each program's partial into output[0].
-// Only f32 add with an UNUSED old-value result is supported, and the mask must
-// be absent or constant-true (the subarray guards the atomic with an outer
-// `scf.if sum > 0`). The address is the base memref + any scalar tt.addptr
-// offset, reusing the rank-1-reduce helpers. See `metal.atomic_rmw`.
+// Add accepts f32/i32 and a constant-true mask. MAX/UMIN accept the scalar i32
+// pair plus sign-dependent masks emitted by Triton's f32 atomic_max expansion.
+// The address is the base memref + any scalar tt.addptr offset, reusing the
+// rank-1-reduce helpers. See `metal.atomic_rmw`.
 //===----------------------------------------------------------------------===//
 struct AtomicRmwLowering
     : public mlir::OpConversionPattern<mlir::triton::AtomicRMWOp> {
@@ -7455,14 +7521,18 @@ struct AtomicRmwLowering
   matchAndRewrite(mlir::triton::AtomicRMWOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    // `add` (integer) and `fadd` (float) are the same MSL primitive
-    // (`atomic_fetch_add_explicit`) over a different atomic pointer type; the
-    // emitter picks the type from the memref element. Everything else (and/or/
-    // xor/min/max/exch) has no lowering.
+    // `add` (integer) and `fadd` (float) share the MSL add primitive. Triton's
+    // f32 atomic_max expansion emits signed MAX for non-negative values and
+    // unsigned UMIN for negative values over the same bitcast pointer.
     const bool isIntAdd = op.getAtomicRmwOp() == mlir::triton::RMWOp::ADD;
-    if (op.getAtomicRmwOp() != mlir::triton::RMWOp::FADD && !isIntAdd)
-      return rewriter.notifyMatchFailure(op,
-                                         "atomic_rmw: only add/fadd supported");
+    const bool isFAdd = op.getAtomicRmwOp() == mlir::triton::RMWOp::FADD;
+    const bool isMax = op.getAtomicRmwOp() == mlir::triton::RMWOp::MAX;
+    const bool isUMin = op.getAtomicRmwOp() == mlir::triton::RMWOp::UMIN;
+    const bool isAdd = isIntAdd || isFAdd;
+    if (!isAdd && !isMax && !isUMin)
+      return rewriter.notifyMatchFailure(
+          op,
+          "atomic_rmw: only add/fadd and scalar max/umin supported");
 
     // ---- Per-element rank-1 tensor form ------------------------------------
     // `tl.atomic_add(P + cols, v, mask)` where P/v/mask are rank-1 tensors.
@@ -7477,6 +7547,9 @@ struct AtomicRmwLowering
     // the scalar form below (a per-PROGRAM op guarded to `localTid==0`), each
     // thread here owns its own element and adds unconditionally under the mask.
     if (mlir::isa<mlir::RankedTensorType>(op.getVal().getType())) {
+      if (!isAdd)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: max/umin only supported in scalar form");
       auto rtt = mlir::cast<mlir::RankedTensorType>(op.getVal().getType());
       if (rtt.getRank() != 1)
         return rewriter.notifyMatchFailure(
@@ -7525,9 +7598,13 @@ struct AtomicRmwLowering
                                             /*withElseRegion=*/false);
         mlir::OpBuilder::InsertionGuard g(rewriter);
         rewriter.setInsertionPointToStart(ifOp.thenBlock());
-        AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idx);
+        auto kind = AtomicRmwKindAttr::get(rewriter.getContext(),
+                                           AtomicRmwKind::Add);
+        AtomicRmwOp::create(rewriter, loc, resTy, kind, sval, memref, idx);
       } else {
-        AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idx);
+        auto kind = AtomicRmwKindAttr::get(rewriter.getContext(),
+                                           AtomicRmwKind::Add);
+        AtomicRmwOp::create(rewriter, loc, resTy, kind, sval, memref, idx);
       }
       // Old-value result is unused (checked above); the scalarized value stands
       // in as a type-matched dummy so the op legalizes (mirrors the scalar path).
@@ -7539,18 +7616,22 @@ struct AtomicRmwLowering
       return rewriter.notifyMatchFailure(
           op, "atomic_rmw: old-value result is consumed (not modeled)");
     mlir::Value val = adaptor.getVal();
-    // f32 (`fadd`) and 32-bit int (`add`) both have a native MSL atomic;
-    // narrower/wider element types do not (`atomic_fetch_add_explicit` is
-    // defined for atomic_int/atomic_uint/atomic_float only). `tl.sum` over a
-    // comparison — `tl.sum(x == K)` — produces exactly the i32 case.
+    // Add accepts f32/i32. The ordered-bit max/umin pair accepts i32 only.
     const bool intVal = val.getType().isInteger(32);
-    if (!(val.getType().isF32() || intVal))
+    if (isAdd) {
+      if (!(val.getType().isF32() || intVal))
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: only f32/i32 scalar add supported");
+      if (intVal != isIntAdd)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: add kind does not match the value element type");
+    } else if (!intVal) {
       return rewriter.notifyMatchFailure(
-          op, "atomic_rmw: only f32/i32 scalar add supported");
-    if (intVal != isIntAdd)
-      return rewriter.notifyMatchFailure(
-          op, "atomic_rmw: add kind does not match the value element type");
-    // Accept only an absent or constant-true mask.
+          op, "atomic_rmw: scalar max/umin requires i32 bit payload");
+    }
+
+    // Add keeps its historical constant-true restriction. Max/umin consume
+    // Triton's scalar sign mask below, combined with the local-thread guard.
     if (mlir::Value mask = op.getMask()) {
       auto cst = mask.getDefiningOp<mlir::arith::ConstantOp>();
       bool isTrue = false;
@@ -7560,7 +7641,7 @@ struct AtomicRmwLowering
         else if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
           isTrue = i.getValue().isOne();
       }
-      if (!isTrue)
+      if (isAdd && !isTrue)
         return rewriter.notifyMatchFailure(
             op, "atomic_rmw: non-trivial mask not supported");
     }
@@ -7581,12 +7662,24 @@ struct AtomicRmwLowering
       idxUI32 = ConstantOp::create(rewriter, loc,
                                    rewriter.getIntegerAttr(ui32, 0))
                     .getResult();
-    // The value and the op result must both satisfy `Metal_Type`, which admits
-    // ui32 but NOT signless i32 (MetalOps.td:17) — so an i32 payload has to go
-    // in as the memref's ui32 storage type or `metal.atomic_rmw` fails its own
-    // verifier. Bit-preserving and free: the emitter forwards
-    // `unrealized_conversion_cast` as a no-op.
-    mlir::Value sval = castToMemrefStorage(val, memref, rewriter, loc);
+    mlir::Value sval;
+    AtomicRmwKind kindEnum = AtomicRmwKind::Add;
+    if (isMax) {
+      auto si32 = rewriter.getIntegerType(32, /*isSigned=*/true);
+      sval = mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{si32}, mlir::ValueRange{val})
+                 .getResult(0);
+      kindEnum = AtomicRmwKind::Max;
+    } else if (isUMin) {
+      sval = mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{val})
+                 .getResult(0);
+      kindEnum = AtomicRmwKind::UMin;
+    } else {
+      // The value and result must satisfy Metal_Type. Integer add is bridged
+      // through the memref's ui32 storage type; float add stays f32.
+      sval = castToMemrefStorage(val, memref, rewriter, loc);
+    }
     mlir::Type resTy = sval.getType();
 
     // A scalar `tl.atomic_add(ptr, scalar)` is a per-PROGRAM op, but every
@@ -7628,12 +7721,18 @@ struct AtomicRmwLowering
     auto isFirst = mlir::arith::CmpIOp::create(
         rewriter, loc, mlir::arith::CmpIPredicate::eq, localTid.getResult(),
         cZero.getResult());
-    auto ifOp = mlir::scf::IfOp::create(rewriter, loc, isFirst.getResult(),
+    mlir::Value guard = isFirst.getResult();
+    if (!isAdd && op.getMask())
+      guard = mlir::arith::AndIOp::create(rewriter, loc, guard,
+                                          adaptor.getMask())
+                  .getResult();
+    auto ifOp = mlir::scf::IfOp::create(rewriter, loc, guard,
                                         /*withElseRegion=*/false);
     {
       mlir::OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPointToStart(ifOp.thenBlock());
-      AtomicRmwOp::create(rewriter, loc, resTy, sval, memref, idxUI32);
+      auto kind = AtomicRmwKindAttr::get(rewriter.getContext(), kindEnum);
+      AtomicRmwOp::create(rewriter, loc, resTy, kind, sval, memref, idxUI32);
     }
     // The old-value result is unused (checked above); replace with the value
     // operand — in its ORIGINAL converted type, which is what any (nonexistent)
@@ -14981,6 +15080,7 @@ struct ConvertTritonGPUToMetalPass
                  AddPtrLowering,
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
+                 BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
                  AtomicRmwLowering,
                  ArithMuliLowering, ArithAddILowering,
@@ -15108,6 +15208,7 @@ struct ConvertTritonGPUToMetalPass
                          mlir::arith::ShRUIOp, mlir::arith::SelectOp,
                          mlir::triton::metal::ThreadIdOp,
                          mlir::triton::metal::ThreadgroupIdOp,
+                         mlir::triton::metal::BitcastOp,
                          mlir::UnrealizedConversionCastOp>(op))
             return;
           if (!op->use_empty())

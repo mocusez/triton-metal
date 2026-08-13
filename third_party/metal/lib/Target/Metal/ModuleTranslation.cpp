@@ -547,37 +547,54 @@ void ModuleTranslation::translate(
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
-  // Atomic add into device memory with relaxed ordering. Reinterpret the
+  // Atomic RMW into device memory with relaxed ordering. Reinterpret the
   // element address `&buf[idx]` as the matching `device atomic_*` pointer;
   // valid for relaxed atomics in the `device` address space on Apple GPUs. The
   // returned old value is discarded — the conversion guarantees the result is
   // unused (AtomicRmwLowering rejects atomics whose old value is consumed).
   //
-  // The atomic type is picked from the MEMREF element type, not the value type,
-  // because the pointer cast is what has to agree with the buffer declaration
-  // (`device uint32_t*` / `device float*`). MSL defines
-  // `atomic_fetch_add_explicit` for atomic_int / atomic_uint (always) and
-  // atomic_float (Metal 3+); AtomicRmwLowering admits only f32 and 32-bit
-  // integer payloads, so nothing else can reach here.
+  // Add picks its atomic type from the MEMREF element. Max/umin deliberately
+  // reinterpret an f32 buffer as signed/unsigned integer storage: this is the
+  // exact ordered-bit expansion Triton's frontend emits for f32 atomic_max.
+  const char *fetch = "atomic_fetch_add_explicit";
   llvm::StringRef atomicTy = "atomic_float";
-  mlir::Type elemTy =
-      mlir::cast<mlir::triton::metal::MetalMemRefType>(op.getMemref().getType())
-          .getType();
-  if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(elemTy)) {
-    if (intTy.getWidth() != 32)
-      llvm_unreachable("metal.atomic_rmw: unsupported integer element width");
-    // Matches `typeToString`: unsigned prints as `uint32_t`, signed and
-    // signless both print as an `int`-family type.
-    atomicTy = intTy.isUnsigned() ? "atomic_uint" : "atomic_int";
-  } else if (!elemTy.isF32()) {
-    llvm_unreachable("metal.atomic_rmw: unsupported element type");
+  switch (op.getKind()) {
+  case mlir::triton::metal::AtomicRmwKind::Add: {
+    mlir::Type elemTy =
+        mlir::cast<mlir::triton::metal::MetalMemRefType>(
+            op.getMemref().getType())
+            .getType();
+    if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(elemTy)) {
+      if (intTy.getWidth() != 32)
+        llvm_unreachable(
+            "metal.atomic_rmw: unsupported integer element width");
+      atomicTy = intTy.isUnsigned() ? "atomic_uint" : "atomic_int";
+    } else if (!elemTy.isF32()) {
+      llvm_unreachable("metal.atomic_rmw: unsupported element type");
+    }
+    break;
   }
-  _output << "atomic_fetch_add_explicit((device " << atomicTy << "*)&";
+  case mlir::triton::metal::AtomicRmwKind::Max:
+    fetch = "atomic_fetch_max_explicit";
+    atomicTy = "atomic_int";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::UMin:
+    fetch = "atomic_fetch_min_explicit";
+    atomicTy = "atomic_uint";
+    break;
+  }
+  _output << fetch << "((device " << atomicTy << "*)&";
   translateVarName(op.getMemref());
   _output << "[";
   translateValueOrVarName(op.getIndex());
   _output << "], ";
+  if (op.getKind() == mlir::triton::metal::AtomicRmwKind::Max)
+    _output << "as_type<int32_t>(";
+  else if (op.getKind() == mlir::triton::metal::AtomicRmwKind::UMin)
+    _output << "as_type<uint32_t>(";
   translateValueOrVarName(op.getValue());
+  if (op.getKind() != mlir::triton::metal::AtomicRmwKind::Add)
+    _output << ")";
   _output << ", memory_order_relaxed)";
   printDelim();
 }
@@ -4896,7 +4913,7 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             mlir::triton::metal::ThreadIdOp,
             mlir::triton::metal::ThreadgroupIdOp,
             mlir::triton::metal::ThreadgroupsPerGridOp,
-            mlir::triton::metal::CastOp,
+            mlir::triton::metal::CastOp, mlir::triton::metal::BitcastOp,
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
@@ -5437,6 +5454,12 @@ void ModuleTranslation::translate(mlir::triton::metal::CastOp op) {
   // an scf.for iter_arg, or a `metal.fused_attention` score-region arg, where
   // `float(%row)` and `float(%param)` are both ordinary. `translateValue` would
   // null-deref on those.
+  translateValueOrVarName(op.getArgument());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::BitcastOp op) {
+  _output << "as_type<" << typeToString(op.getType()) << ">(";
   translateValueOrVarName(op.getArgument());
   _output << ")";
 }

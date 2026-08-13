@@ -184,6 +184,7 @@ private:
   void translate(mlir::triton::metal::ThreadgroupIdOp op);
   void translate(mlir::triton::metal::ThreadgroupsPerGridOp op);
   void translate(mlir::triton::metal::CastOp op);
+  void translate(mlir::triton::metal::BitcastOp op);
   void translate(mlir::triton::metal::UnaryExpOp op);
   void translate(mlir::triton::metal::BinaryExpOp op);
   void translate(mlir::triton::metal::YieldWhileOp op);

@@ -20,6 +20,16 @@ def MetalReduceKindAttr : I64EnumAttr<
   let cppNamespace = "mlir::triton::metal";
 }
 
+def AtomicRmwKind_Add  : I32EnumAttrCase<"Add",  0>;
+def AtomicRmwKind_Max  : I32EnumAttrCase<"Max",  1>;
+def AtomicRmwKind_UMin : I32EnumAttrCase<"UMin", 2>;
+
+def AtomicRmwKindAttr : I32EnumAttr<
+    "AtomicRmwKind", "Atomic read-modify-write operation",
+    [AtomicRmwKind_Add, AtomicRmwKind_Max, AtomicRmwKind_UMin]> {
+  let cppNamespace = "mlir::triton::metal";
+}
+
 def MaskSinkMode_Causal     : I32EnumAttrCase<"Causal",     0>;
 def MaskSinkMode_BoolMask   : I32EnumAttrCase<"BoolMask",   1>;
 def MaskSinkMode_FloatMask  : I32EnumAttrCase<"FloatMask",  2>;

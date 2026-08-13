@@ -105,3 +105,64 @@ def test_atomic_add_ones_exact(G, N):
     torch.mps.synchronize()
     ref = torch.full((N,), float(G))
     torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _atomic_max_scalar_f32(In, Out):
+    value = tl.load(In + tl.program_id(0))
+    tl.atomic_max(Out, value)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [1.0, 7.0, 3.0, 29.0, 11.0],
+        [-91.0, -7.0, -31.0, -2.0, -18.0],
+    ],
+)
+def test_atomic_max_scalar_f32_contended(values):
+    inp = torch.tensor(values, dtype=torch.float32, device="mps")
+    out = torch.full((1,), -2147483648.0, dtype=torch.float32, device="mps")
+    _atomic_max_scalar_f32[(len(values),)](inp, out)
+    torch.mps.synchronize()
+    assert out.cpu().item() == max(values)
+
+
+@triton.jit
+def _max_subarray_sum_kernel(
+    input, output, N, windows_size, length, BLOCK_SIZE: tl.constexpr
+):
+    # Verbatim kernel body from leet-triton/medium-max_subarray_sum.py.
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < length
+    result = tl.zeros([BLOCK_SIZE], tl.float32)
+    for i in range(windows_size):
+        offs_i = offs + i
+        mask_i = offs_i < N
+        val = tl.load(input + offs_i, mask_i)
+        result += val
+    ret = tl.where(mask, result, float("-inf"))
+    ret = tl.max(ret)
+    tl.atomic_max(output, ret)
+
+
+@pytest.mark.parametrize(
+    "N, window_size",
+    [(1, 1), (31, 5), (32, 7), (33, 7), (1000, 37), (1025, 64)],
+)
+def test_max_subarray_sum_matches_torch(N, window_size):
+    torch.manual_seed(N * 100 + window_size)
+    inp = torch.randn(N, dtype=torch.float32, device="mps")
+    # Pin the all-negative case as well as mixed random inputs.
+    if N == 33:
+        inp = -inp.abs() - 1.0
+    out = torch.empty(1, dtype=torch.float32, device="mps")
+    out.fill_(-2147483648)
+    length = N - window_size + 1
+    BLOCK_SIZE = 32
+    _max_subarray_sum_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
+        inp, out, N, window_size, length, BLOCK_SIZE
+    )
+    torch.mps.synchronize()
+    expected = inp.cpu().unfold(0, window_size, 1).sum(1).max()
+    torch.testing.assert_close(out.cpu()[0], expected, atol=1e-5, rtol=1e-5)
