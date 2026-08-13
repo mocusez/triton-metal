@@ -16023,6 +16023,9 @@ struct FusedAttnTemplate {
   mlir::Block *entry = nullptr;
   mlir::triton::StoreOp store;
   mlir::scf::ForOp forOp; // null when the trip-count-1 loop was folded away
+  // Optional inner reduction over the full feature width. This is distinct
+  // from `forOp`, which walks keys and carries the online-softmax state.
+  mlir::scf::ForOp qkForOp;
 
   // --- tile shape ---
   int64_t BM = 0, BN = 0, BD = 0;
@@ -16036,6 +16039,10 @@ struct FusedAttnTemplate {
   // --- the two dots and the cone between them ---
   mlir::triton::DotOp dotQK, dotPV;
   mlir::Value scoreOut; // value feeding dotPV's A operand
+  // The raw score leaf is normally dotQK's result. A feature-reduction loop
+  // makes the loop result the leaf instead; the loop body is reproduced by the
+  // scalar emitter, not copied into the score-transform region.
+  mlir::Value scoreRoot;
   // Cone leaves, bound to the region's block args in this order.
   mlir::Value rowIdx, keyIdx;               // rank-2 index tensors
   llvm::SmallVector<mlir::Value> params;    // scalar cone roots -> block args
@@ -16044,6 +16051,9 @@ struct FusedAttnTemplate {
   bool softmax = false;
   bool naturalExp = false; // base-e rather than base-2 online softmax
   bool sawExp = false;     // has any phase pinned the exponential base yet
+  bool safeDenominatorOne = false;
+  bool featureTiled = false;
+  bool kFeatureMajor = false;
   mlir::Value hVal;        // head count, null when there is no head split
   // The current phase's key offset: `local_start` in
   // `offs_n = local_start + block_idx*BLOCK_N + arange(BLOCK_N)`. Null means 0.
@@ -16223,6 +16233,10 @@ struct FusedAttnTemplate {
   bool isZeroSplat(mlir::Value v) {
     return matchFpSplat(v, [](const llvm::APFloat &f) { return f.isZero(); });
   }
+  bool isOneSplat(mlir::Value v) {
+    return matchFpSplat(
+        v, [](const llvm::APFloat &f) { return f.isExactlyValue(1.0); });
+  }
   bool isNegInfSplat(mlir::Value v) {
     return matchFpSplat(v, [](const llvm::APFloat &f) {
       return f.isInfinity() && f.isNegative();
@@ -16375,6 +16389,13 @@ struct FusedAttnTemplate {
     mlir::Value baseScalar = splatSrc(baseSide);
     if (!baseScalar)
       return Idx::None;
+    // Inner QK reduction: `feature_iv + arange(BD)`. It must be recognized
+    // before the outer key-loop case, because both are loop IV based.
+    if (qkForOp && len == BD && baseScalar == qkForOp.getInductionVar()) {
+      mark(add);
+      mark(mr);
+      return Idx::Feat;
+    }
     // Key index: `base + iv + arange(BN)`, or -- when the loop counts BLOCKS
     // rather than keys -- `base + iv*BN + arange(BN)`. `base` is loop-invariant
     // and is this phase's key START: a sinks kernel writes
@@ -16440,10 +16461,13 @@ struct FusedAttnTemplate {
         // has folded `h == 1` away, which is why it is recognized by the pid
         // axis rather than by the presence of a `divsi`.
         if (pid.getAxisAsInt() == 1 && len == BD) {
+          mlir::Value colScalar = mul->getOperand(1 - i);
+          if (headColScalar && !sameCone(headColScalar, colScalar))
+            return Idx::None;
           mark(add);
           mark(mr);
           mark(mul);
-          headColScalar = mul->getOperand(1 - i);
+          headColScalar = colScalar;
           return Idx::Feat;
         }
       }
@@ -16468,7 +16492,7 @@ struct FusedAttnTemplate {
   //===--------------------------------------------------------------------===//
 
   // Recognized leaves, resolved before the op walk.
-  bool isScoreRoot(mlir::Value v) { return peel(v) == dotQK.getResult(); }
+  bool isScoreRoot(mlir::Value v) { return peel(v) == peel(scoreRoot); }
 
   // A loop-invariant SCALAR cone over kernel arguments. Kernel args become
   // region parameters; everything else must be a translatable scalar op.
@@ -16536,7 +16560,7 @@ struct FusedAttnTemplate {
     v = peelAxis(v, seenAxis);
     if (seenAxis >= 0)
       coneAxis = seenAxis;
-    if (v == dotQK.getResult())
+    if (v == peel(scoreRoot))
       return true;
     // A splat of a kernel scalar becomes a region parameter.
     if (auto sp = v.getDefiningOp<mlir::triton::SplatOp>()) {
@@ -16945,6 +16969,68 @@ static bool faMatchAddr(FusedAttnTemplate &t, mlir::Value ptr,
   return sawFeat && strides == 1;
 }
 
+// K storage used by the leet ALiBi kernel after `K.T.contiguous()`:
+//   base + feature*stride_k + key
+// This is NOT interchangeable with faMatchAddr's ordinary
+// `base + key*stride_k + feature` contract. The distinction is carried onto
+// metal.fused_attention so the emitter cannot silently choose the wrong one.
+static bool faMatchFeatureMajorKAddr(FusedAttnTemplate &t, mlir::Value ptr,
+                                     mlir::Value &base, mlir::Value &stride) {
+  llvm::SmallVector<mlir::Value, 4> offsets;
+  for (int i = 0; i < 16 && ptr; ++i) {
+    if (auto ap = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      t.mark(ap);
+      offsets.push_back(ap.getOffset());
+      ptr = ap.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      t.mark(bc);
+      ptr = bc.getSrc();
+      continue;
+    }
+    break;
+  }
+  base = t.splatSrc(ptr);
+  if (!base || !t.isKernelArg(base))
+    return false;
+
+  llvm::SmallVector<mlir::Value, 8> terms(offsets.begin(), offsets.end());
+  int keys = 0;
+  int featureStrides = 0;
+  while (!terms.empty()) {
+    mlir::Value o = t.peel(terms.pop_back_val());
+    if (t.classifyIdx(o) == FusedAttnTemplate::Idx::Key) {
+      ++keys;
+      continue;
+    }
+    if (auto add = o.getDefiningOp<mlir::arith::AddIOp>()) {
+      t.mark(add);
+      terms.push_back(add.getLhs());
+      terms.push_back(add.getRhs());
+      continue;
+    }
+    auto mul = o.getDefiningOp<mlir::arith::MulIOp>();
+    if (!mul)
+      return false;
+    bool hit = false;
+    for (int i = 0; i < 2; ++i) {
+      if (t.classifyIdx(mul->getOperand(i)) != FusedAttnTemplate::Idx::Feat)
+        continue;
+      mlir::Value st = t.splatSrc(mul->getOperand(1 - i));
+      if (!st || !t.isKernelArg(st))
+        return false;
+      stride = st;
+      ++featureStrides;
+      hit = true;
+    }
+    if (!hit)
+      return false;
+    t.mark(mul);
+  }
+  return keys == 1 && featureStrides == 1;
+}
+
 // `cmpi slt, <idx>, splat(bound)` — returns the bound scalar for the wanted
 // index role, marking the comparison.
 static mlir::Value faBoundOf(FusedAttnTemplate &t, mlir::Value mask,
@@ -17063,8 +17149,11 @@ static mlir::LogicalResult faDeclineAt(const char *why, int line) {
 // two-phase kernel needing an op of its own.
 struct FaPhase {
   mlir::scf::ForOp forOp; // null: straight-line (unrolled) phase
+  mlir::scf::ForOp qkForOp; // null: QK is one direct dot
   mlir::triton::DotOp dotQK, dotPV;
   mlir::Value scoreOut; // the logits L, or the weight under norm=none
+  mlir::Value scoreRoot; // direct dot result, or qkForOp result
+  mlir::Value qkUpperBound;
   mlir::Value rowIdx, keyIdx;
   llvm::SmallVector<std::pair<mlir::Value, bool>> zeroPreds;
   int64_t BN = 0;
@@ -17085,6 +17174,39 @@ struct FaPhase {
   mlir::Value accIn, sumIn, maxIn;
   mlir::Value accChain, sumChain, maxChain;
 };
+
+// Match the exact inner reduction emitted for
+//   qk = 0
+//   for feature in range(0, d_head, BD): qk = dot(Q, K, qk)
+// The output loop/grid and K storage are validated separately. Keeping this
+// helper strict is important: accepting an arbitrary region-bearing op as a
+// raw score leaf would drop its body when the score region is materialized.
+static bool faMatchQKFeatureLoop(FusedAttnTemplate &t, mlir::scf::ForOp f,
+                                 mlir::triton::DotOp &dot,
+                                 mlir::Value &upperBound) {
+  if (!f || f.getNumRegionIterArgs() != 1 || f.getNumResults() != 1 ||
+      !FusedAttnTemplate::isIntConst(f.getLowerBound(), 0) ||
+      !FusedAttnTemplate::isIntConst(f.getStep(), t.BD) ||
+      !t.isZeroSplat(f.getInitArgs().front()))
+    return false;
+  auto resultTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(f.getResult(0).getType());
+  if (!resultTy || resultTy.getRank() != 2 ||
+      !resultTy.getElementType().isF32() || resultTy.getShape()[0] != t.BM ||
+      resultTy.getShape()[1] != t.BN)
+    return false;
+  auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(f.getBody()->getTerminator());
+  if (!yield || yield.getNumOperands() != 1)
+    return false;
+  dot = t.peel(yield.getOperand(0)).getDefiningOp<mlir::triton::DotOp>();
+  if (!dot || !t.sameCone(dot.getC(), f.getRegionIterArg(0)))
+    return false;
+  t.mark(f);
+  t.mark(yield);
+  t.mark(dot);
+  upperBound = f.getUpperBound();
+  return true;
+}
 
 // COVERAGE. Every op between the loads and the store has to have been claimed
 // by the walk: an op the matcher did not account for is an op the emitter will
@@ -17347,6 +17469,9 @@ static mlir::LogicalResult faMatchLink(FusedAttnTemplate &t, FaPhase &ph,
       wl.push_back(d);
     llvm::DenseSet<mlir::Operation *> vis;
     mlir::triton::DotOp dotQK;
+    mlir::scf::ForOp qkForOp;
+    mlir::Value scoreRoot;
+    mlir::Value qkUpperBound;
     while (!wl.empty()) {
       auto *o = wl.pop_back_val();
       if (!vis.insert(o).second)
@@ -17355,6 +17480,20 @@ static mlir::LogicalResult faMatchLink(FusedAttnTemplate &t, FaPhase &ph,
         if (dotQK && dotQK != d)
           return faDecline("two score-side dots");
         dotQK = d;
+        scoreRoot = d.getResult();
+        continue;
+      }
+      if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(o)) {
+        mlir::triton::DotOp nestedDot;
+        mlir::Value nestedUpper;
+        if (!faMatchQKFeatureLoop(t, f, nestedDot, nestedUpper))
+          return faDecline("score-side loop is not a QK feature reduction");
+        if (dotQK && dotQK != nestedDot)
+          return faDecline("two score-side dots");
+        dotQK = nestedDot;
+        qkForOp = f;
+        scoreRoot = f.getResult(0);
+        qkUpperBound = nestedUpper;
         continue;
       }
       for (mlir::Value v : o->getOperands())
@@ -17364,6 +17503,9 @@ static mlir::LogicalResult faMatchLink(FusedAttnTemplate &t, FaPhase &ph,
     if (!dotQK)
       return faDecline("no QK dot reachable from the logits");
     ph.dotQK = t.dotQK = dotQK;
+    ph.qkForOp = t.qkForOp = qkForOp;
+    ph.scoreRoot = t.scoreRoot = scoreRoot;
+    ph.qkUpperBound = qkUpperBound;
     t.mark(dotQK);
   }
 
@@ -17402,6 +17544,32 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   mlir::Value accCur = stored;
   mlir::Value sumCur = t.softmax ? t.peel(sumLift) : mlir::Value();
   mlir::Value maxCur;
+
+  // Some kernels explicitly make an all-masked row finite with
+  //   denom = select(sum == 0, 1, sum)
+  // Match only that exact guard. It is semantic (not layout plumbing), so it
+  // must be carried to the op/emitter rather than merely peeled away.
+  if (t.softmax) {
+    if (auto sel = sumCur.getDefiningOp<mlir::arith::SelectOp>()) {
+      mlir::Value candidate = sel.getFalseValue();
+      auto cmp =
+          t.peel(sel.getCondition()).getDefiningOp<mlir::arith::CmpFOp>();
+      if (cmp && cmp.getPredicate() == mlir::arith::CmpFPredicate::OEQ &&
+          t.isOneSplat(sel.getTrueValue())) {
+        mlir::Value compared;
+        if (t.isZeroSplat(cmp.getLhs()))
+          compared = cmp.getRhs();
+        else if (t.isZeroSplat(cmp.getRhs()))
+          compared = cmp.getLhs();
+        if (compared && t.sameCone(compared, candidate)) {
+          t.safeDenominatorOne = true;
+          t.mark(sel);
+          t.mark(cmp);
+          sumCur = t.peel(candidate);
+        }
+      }
+    }
+  }
 
   // Walk the merge chain BACKWARDS from the store to the initial state. One
   // link per key phase; the common case is a single loop, and attention sinks
@@ -17512,8 +17680,10 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
   llvm::DenseSet<mlir::Operation *> coneSeen;
   for (FaPhase &ph : phases) {
     t.forOp = ph.forOp;
+    t.qkForOp = ph.qkForOp;
     t.BN = ph.BN;
     t.dotQK = ph.dotQK;
+    t.scoreRoot = ph.scoreRoot;
     t.rowIdx = ph.rowIdx;
     t.keyIdx = ph.keyIdx;
     t.keyBase = {};
@@ -17539,6 +17709,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     // --- operands and extents, per phase; every phase must agree ---
     for (FaPhase &ph : phases) {
       t.forOp = ph.forOp;
+      t.qkForOp = ph.qkForOp;
       t.BN = ph.BN;
       t.rowIdx = ph.rowIdx;
       t.keyIdx = ph.keyIdx;
@@ -17560,14 +17731,23 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       if (!faMatchAddr(t, qLd.getPtr(), FusedAttnTemplate::Idx::Row, t.qPtr,
                        t.strideQ))
         which = "Q";
-      else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key,
-                            t.kPtr, t.strideK))
-        which = "K";
-      else if (!faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key,
-                            t.vPtr, t.strideV))
+      if (!which) {
+        if (ph.qkForOp) {
+          if (!faMatchFeatureMajorKAddr(t, kLd.getPtr(), t.kPtr, t.strideK))
+            which = "K(feature-major)";
+          else
+            t.kFeatureMajor = true;
+        } else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key,
+                                t.kPtr, t.strideK)) {
+          which = "K";
+        }
+      }
+      if (!which && !faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key,
+                                 t.vPtr, t.strideV))
         which = "V";
-      else if (!faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row,
-                            t.oPtr, t.strideO))
+      if (!which &&
+          !faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row, t.oPtr,
+                       t.strideO))
         which = "Out";
       if (which) {
         if (::getenv("TRITON_METAL_FA_DEBUG"))
@@ -17583,14 +17763,35 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       }
       mlir::Value m = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Row);
       mlir::Value dh = faBoundOf(t, qLd.getMask(), FusedAttnTemplate::Idx::Feat);
-      (void)faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
-      (void)faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
+      mlir::Value vKeyBound =
+          faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Key);
+      mlir::Value storeM =
+          faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Row);
+      if (ph.qkForOp) {
+        mlir::Value kDh =
+            faBoundOf(t, kLd.getMask(), FusedAttnTemplate::Idx::Feat);
+        mlir::Value vDh =
+            faBoundOf(t, vLd.getMask(), FusedAttnTemplate::Idx::Feat);
+        mlir::Value outDh =
+            faBoundOf(t, t.store.getMask(), FusedAttnTemplate::Idx::Feat);
+        if (!dh || !kDh || !vDh || !outDh || !t.sameCone(dh, kDh) ||
+            !t.sameCone(dh, vDh) || !t.sameCone(dh, outDh)) {
+          t.no("feature-tiled Q/K/V/output masks disagree on d_head");
+          goto rejected;
+        }
+      }
       // The key bound is PER PHASE, not global. An attention-sinks prologue
       // masks its K load with `key < num_sinks`, which bounds that phase's
       // reads and nothing else; taking it for the whole op made the window
       // phase sweep `[0, num_sinks)` and answer wrong by ~1-4 absolute. It is
       // folded into the phase's key range below instead.
       ph.keyBound = faBoundOf(t, kLd.getMask(), FusedAttnTemplate::Idx::Key);
+      if (ph.qkForOp &&
+          (!m || !storeM || !ph.keyBound || !vKeyBound ||
+           !t.sameCone(m, storeM) || !t.sameCone(ph.keyBound, vKeyBound))) {
+        t.no("feature-tiled Q/output or K/V masks disagree on M/N");
+        goto rejected;
+      }
       // Query rows and feature width ARE global -- they fix the grid and the
       // buffers. Disagreement is a decline, never a silent first-wins.
       if (m) {
@@ -17632,6 +17833,35 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       t.mark(div);
       t.hVal = div.getRhs();
       t.dHeadVal = div.getLhs();
+    }
+
+    bool sawFeatureQK = false;
+    for (FaPhase &ph : phases) {
+      if (!ph.qkForOp)
+        continue;
+      sawFeatureQK = true;
+      if (!t.sameCone(ph.qkUpperBound, t.dHeadVal)) {
+        t.no("QK feature loop does not reduce over the full d_head");
+        goto rejected;
+      }
+    }
+    if (sawFeatureQK) {
+      if (t.hVal || !t.headColScalar ||
+          !FusedAttnTemplate::isIntConst(t.headColScalar, t.BD) ||
+          !t.kFeatureMajor) {
+        t.no("feature-reduced QK requires pid1*BD output tiling and "
+             "feature-major K without a head split");
+        goto rejected;
+      }
+      for (FaPhase &ph : phases)
+        if (!ph.qkForOp) {
+          t.no("key phases disagree on QK feature reduction mode");
+          goto rejected;
+        }
+      t.featureTiled = true;
+    } else if (t.kFeatureMajor) {
+      t.no("feature-major K requires a QK feature-reduction loop");
+      goto rejected;
     }
 
     // --- key ranges, one per phase ---
@@ -17717,14 +17947,13 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
     auto op = mlir::triton::metal::FusedAttentionOp::create(
         builder, loc, bridge(t.qPtr, f32), bridge(t.kPtr, f32),
         bridge(t.vPtr, f32), bridge(t.oPtr, f32), bridge(t.mVal, u32e),
-        bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e),
-        bridge(t.strideQ, u32e), bridge(t.strideK, u32e),
-        bridge(t.strideV, u32e), bridge(t.strideO, u32e),
-        t.hVal ? bridge(t.hVal, u32e) : mlir::Value(), paramBufs, t.BM,
-        phases.front().BN, t.BD, (int64_t)phases.size(),
+        bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e), bridge(t.strideQ, u32e),
+        bridge(t.strideK, u32e), bridge(t.strideV, u32e),
+        bridge(t.strideO, u32e), t.hVal ? bridge(t.hVal, u32e) : mlir::Value(),
+        paramBufs, t.BM, phases.front().BN, t.BD, (int64_t)phases.size(),
         t.softmax ? mlir::triton::metal::AttnNorm::OnlineSoftmax
                   : mlir::triton::metal::AttnNorm::None,
-        t.naturalExp);
+        t.naturalExp, t.safeDenominatorOne, t.featureTiled, t.kFeatureMajor);
 
     // Both regions take the same trailing params in the same order; only the
     // pinned prefix differs (score/row/key/phase vs blk/phase/m/n).
@@ -17767,7 +17996,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       // under two phases' leaf bindings, so a shared memo would be a silent
       // cross-phase substitution.
       llvm::DenseMap<void *, mlir::Value> leaf, memo;
-      leaf[ph.dotQK.getResult().getAsOpaquePointer()] = rb->getArgument(0);
+      leaf[t.peel(ph.scoreRoot).getAsOpaquePointer()] = rb->getArgument(0);
       if (ph.rowIdx)
         leaf[t.peel(ph.rowIdx).getAsOpaquePointer()] = rb->getArgument(1);
       if (ph.keyIdx)

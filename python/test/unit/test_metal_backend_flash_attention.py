@@ -250,6 +250,87 @@ def _decoy_reference(Q, K, V, N, d_model, h, variant):
     return out
 
 
+def _load_alibi_attention():
+    path = (Path(__file__).resolve().parents[3] / "leet-triton" /
+            "medium-attention_with_linear_biases.py")
+    if not path.is_file():
+        pytest.skip(f"leet-triton fixture not present: {path}")
+    spec = importlib.util.spec_from_file_location(
+        "leet_triton_attention_with_linear_biases", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _alibi_reference(Q, K, V, M, N, d, alpha):
+    Qc, Kc, Vc = Q.cpu(), K.cpu(), V.cpu()
+    off_m = torch.arange(M, dtype=torch.float32)[:, None]
+    off_n = torch.arange(N, dtype=torch.float32)[None, :]
+    scores = (Qc @ Kc.T) * (d ** -0.5)
+    scores = scores + alpha * (off_m - off_n)
+    return torch.softmax(scores, dim=1) @ Vc
+
+
+def _launch_alibi_attention(alibi, Q, K, V, out, M, N, d, alpha):
+    K_t = K.T.contiguous()
+    block_m = 16
+    block_n = 16
+    block_d = 64
+    grid = (triton.cdiv(M, block_m), triton.cdiv(d, block_d))
+    return alibi.alibi_attention_fwd[grid](
+        Q, K_t, V, out,
+        M, N, d, alpha, d ** -0.5,
+        Q.stride(0), Q.stride(1),
+        K_t.stride(0), K_t.stride(1),
+        V.stride(0), V.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_D=block_d,
+    )
+
+
+@pytest.mark.parametrize(
+    "M, N, d, alpha",
+    [
+        (16, 16, 32, 0.0),
+        (17, 19, 32, 0.125),
+        (16, 16, 64, 0.125),
+        (31, 33, 96, -0.0625),
+        (18, 47, 96, 0.25),
+    ],
+)
+def test_leet_alibi_attention_matches_reference(M, N, d, alpha):
+    """The leet-triton ALiBi attention kernel compiles on Metal and is numeric."""
+    torch.manual_seed(0xA11B1 + M * 17 + N * 3 + d)
+    Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
+
+    alibi = _load_alibi_attention()
+    inspect_msl = (M, N, d, alpha) == (31, 33, 96, -0.0625)
+    if inspect_msl:
+        compiled = _launch_alibi_attention(alibi, Q, K, V, out, M, N, d, alpha)
+    else:
+        # Exercise the public leet-triton entry point, including its
+        # `K.T.contiguous()` storage conversion and 2-D grid calculation.
+        alibi.solve(Q, K, V, out, M, N, d, alpha)
+    torch.mps.synchronize()
+
+    if inspect_msl:
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "metal.fused_attention" in msl
+        assert "feature-tiled QK full-dhead sweep" in msl
+        assert msl.count("simdgroup_multiply_accumulate") >= 2
+
+    expected = _alibi_reference(Q, K, V, M, N, d, alpha)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 def test_flash_attention_launches_one_warp():
     """A fused-attention kernel must launch 32 threads, whatever num_warps says.
 
@@ -304,19 +385,18 @@ def test_flash_attention_rejects_near_miss_kernels(variant, what):
                                        max(16, d_model // h), variant,
                                        num_warps=4)
     except RuntimeError:
-        # Rejection is still an acceptable outcome for a variant nothing
-        # implements — EXCEPT the causal mask, which `metal.fused_attention`
-        # now carries in its score region. Letting variant 0 take this branch
-        # would mean a regression to "rejected" passes silently, and this test
-        # is the numeric guard that the lit fixture
-        # `flash_attention_reject_causal.mlir` defers to.
-        assert variant != 0, (
-            "a causal mask must be CLAIMED by metal.fused_attention now, not "
-            "rejected — see flash_attention_reject_causal.mlir"
+        # Rejection is still acceptable for a variant nothing implements, but
+        # causal and ALiBi must be claimed by `metal.fused_attention` now.
+        # Letting those variants take this branch would turn the tests into
+        # compile-only guards and miss regressions in the emitted score region.
+        assert variant == 2, (
+            f"a {what} must be CLAIMED by metal.fused_attention now, not "
+            "rejected — see flash_attention_reject_causal.mlir and the "
+            "leet-triton ALiBi regression"
         )
         return
 
-    if variant == 0:
+    if variant in (0, 1):
         msl = compiled.asm["metal"]
         if isinstance(msl, bytes):
             msl = msl.decode()

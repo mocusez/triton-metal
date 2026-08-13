@@ -868,10 +868,23 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
     and stores it; `online_softmax` treats the transform's output as a logit and
     keeps the running (max, sum) rescale, dividing by the sum on the way out.
 
-    Operands are kernel-argument buffers. `q`/`k`/`v`/`out` are row-major device
-    f32 with per-tensor row strides. `m` is the query row count, `n` the key
-    count, `d_head` the feature width. `h` is OPTIONAL: present when the grid's
-    y dimension selects a head.
+    Operands are kernel-argument buffers. Normally `q`/`k`/`v`/`out` are
+    row-major device f32 with per-tensor row strides. `m` is the query row
+    count, `n` the key count, `d_head` the feature width. `h` is OPTIONAL:
+    present when the grid's y dimension selects a head.
+
+    `feature_tiled` is the deliberately narrow alternative used by kernels
+    whose y grid tiles the OUTPUT feature dimension rather than selecting a
+    head. In that mode each program writes
+    `[tgid.y * bd, min((tgid.y + 1) * bd, d_head))`, while Q@K reduces over the
+    full `d_head`. `k_feature_major` states that K is already materialized as
+    `[feature, key]`, so its address is `feature * stride_k + key`. The verifier
+    currently requires those attributes together and rejects `h`: keeping the
+    storage and grid contracts explicit prevents a transposed-K kernel from
+    being silently emitted with the ordinary row-major/head-split indexing.
+
+    `safe_denominator_one` reproduces the exact epilogue
+    `acc / select(sum == 0, 1, sum)`. It is meaningful only for online softmax.
 
     `softmax_natural_exp` selects base-e for the `online_softmax` running
     state instead of the default base-2. Both spellings occur and they are NOT
@@ -923,7 +936,10 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
                        I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
                        DefaultValuedAttr<I64Attr, "1">:$num_phases,
                        AttnNormAttr:$norm,
-                       UnitAttr:$softmax_natural_exp);
+                       UnitAttr:$softmax_natural_exp,
+                       UnitAttr:$safe_denominator_one,
+                       UnitAttr:$feature_tiled,
+                       UnitAttr:$k_feature_major);
 
   let regions = (region SizedRegion<1>:$score,
                         SizedRegion<1>:$key_bounds);

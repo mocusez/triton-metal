@@ -231,6 +231,19 @@ llvm::LogicalResult FusedAttentionOp::verify() {
     return emitOpError() << "num_phases must be positive (got "
                          << getNumPhases() << ")";
 
+  const bool onlineSoftmax = getNorm() == AttnNorm::OnlineSoftmax;
+  if (getSafeDenominatorOne() && !onlineSoftmax)
+    return emitOpError()
+           << "safe_denominator_one requires norm = online_softmax";
+  if (getFeatureTiled() != getKFeatureMajor())
+    return emitOpError()
+           << "feature_tiled and k_feature_major must be specified together";
+  if (getFeatureTiled() && !onlineSoftmax)
+    return emitOpError() << "feature_tiled currently requires norm = "
+                            "online_softmax";
+  if (getFeatureTiled() && getH())
+    return emitOpError() << "feature_tiled is incompatible with heads";
+
   auto f32 = mlir::Float32Type::get(getContext());
   // SIGNED i32, not signless: `Metal_Type` has no plain I32, so a signless
   // index could not feed `metal.binary_exp` at all. Signed rather than unsigned

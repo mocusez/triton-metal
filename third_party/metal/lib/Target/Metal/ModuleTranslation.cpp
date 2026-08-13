@@ -2244,6 +2244,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
   const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
   const bool softmax =
       op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+  const bool featureTiled = op.getFeatureTiled();
   const int64_t SZ_Q = BM * BD, SZ_KTV = BD * BN, SZ_S = BM * BN;
   const int64_t mT = BM / 8, nT = BN / 8, dT = BD / 8;
 
@@ -2314,16 +2315,22 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  uint _fa_so = " << SO << ";\n";
   if (op.getH())
     os << "  uint _fa_col = tgid.y * _fa_dh;\n";
+  else if (featureTiled)
+    os << "  uint _fa_col = tgid.y * " << S(BD) << "u;\n";
   else
     os << "  uint _fa_col = 0u;\n";
+  if (featureTiled)
+    os << "  uint _fa_out_d = (_fa_col < _fa_dh) ? min(" << S(BD)
+       << "u, _fa_dh - _fa_col) : 0u;\n";
   os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
   // Stage Q and zero the accumulator / running state.
   os << "  if (_fa_active) {\n";
   os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
   os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
      << "u; uint row = _fa_rowoff + q;\n";
-  os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? " << Q
-     << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
+  if (!featureTiled)
+    os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? " << Q
+       << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   if (softmax)
@@ -2338,40 +2345,102 @@ void ModuleTranslation::emitFusedAttentionMma_(
                            "(int)_fa_N", "  ");
   os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
      << "; kb += " << S(BN) << "u) {\n";
-  // Stage K^T and V for this key block.
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
-  os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
-     << "u; uint kk = kb + key;\n";
-  os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
-     << "[kk * _fa_sk + _fa_col + d] : 0.0f;\n";
-  os << "      }\n";
-  os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV) << "u; c += 32u) {\n";
-  os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
-     << "u; uint kk = kb + key;\n";
-  os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
-     << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // Dot 1: S = Q @ K^T, straight into the staged S tile.
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
-  os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
-  os << "        simdgroup_float8x8 acc(0.0f);\n";
-  os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
-  os << "          simdgroup_float8x8 a, b;\n";
-  os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
-     << "u + ki*8u], " << S(BD) << ");\n";
-  os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
-     << "u + ni*8u], " << S(BN) << ");\n";
-  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "        }\n";
-  os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
-     << "u + ni*8u], " << S(BN) << ");\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  if (featureTiled) {
+    // V belongs to the y-selected output feature tile, while Q/K belong to a
+    // separate full-d_head reduction domain. Clear S once per key block, then
+    // accumulate one BD-wide Q/K chunk at a time so runtime d_head may exceed
+    // the statically-sized threadgroup tiles.
+    os << "    if (_fa_active) {\n";
+    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
+       << "u; c += 32u) {\n";
+    os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
+       << "u; uint kk = kb + key;\n";
+    os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_out_d) ? " << V
+       << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+    os << "      }\n";
+    os << "    }\n";
+    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "    // ---- feature-tiled QK full-dhead sweep ----\n";
+    os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(BD)
+       << "u) {\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint c = _fa_lane; c < " << S(SZ_Q)
+       << "u; c += 32u) {\n";
+    os << "          uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
+       << "u; uint row = _fa_rowoff + q;\n";
+    os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
+       << Q << "[row * _fa_sq + _fa_dc + d] : 0.0f;\n";
+    os << "        }\n";
+    os << "        for (uint c = _fa_lane; c < " << S(SZ_KTV)
+       << "u; c += 32u) {\n";
+    os << "          uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
+       << "u; uint kk = kb + key;\n";
+    os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
+       << K << "[(_fa_dc + d) * _fa_sk + kk] : 0.0f;\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+    os << "        for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+    // The zero constructor and in-place MAC are both required on Apple family
+    // 9. Only later chunks reload the partial score tile.
+    os << "          simdgroup_float8x8 acc(0.0f);\n";
+    os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
+          "&_fa_sbuf[(mi*8u)*"
+       << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
+    os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+    os << "            simdgroup_float8x8 a, b;\n";
+    os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
+       << "u + ki*8u], " << S(BD) << ");\n";
+    os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
+       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+    os << "          }\n";
+    os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
+       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "    }\n";
+  } else {
+    // Stage K^T and V for this key block.
+    os << "    if (_fa_active) {\n";
+    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
+       << "u; c += 32u) {\n";
+    os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
+       << "u; uint kk = kb + key;\n";
+    os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
+       << "[kk * _fa_sk + _fa_col + d] : 0.0f;\n";
+    os << "      }\n";
+    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
+       << "u; c += 32u) {\n";
+    os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
+       << "u; uint kk = kb + key;\n";
+    os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
+       << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+    os << "      }\n";
+    os << "    }\n";
+    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    // Dot 1: S = Q @ K^T, straight into the staged S tile.
+    os << "    if (_fa_active) {\n";
+    os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+    os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+    os << "        simdgroup_float8x8 acc(0.0f);\n";
+    os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+    os << "          simdgroup_float8x8 a, b;\n";
+    os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
+       << "u + ki*8u], " << S(BD) << ");\n";
+    os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
+       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+    os << "        }\n";
+    os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
+       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "      }\n";
+    os << "    }\n";
+    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  }
   // The score transform, one query row per lane. Emitted ONCE, writing its
   // result back over the S tile, so the softmax passes below re-read it instead
   // of re-evaluating the region.
@@ -2415,8 +2484,12 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "        }\n";
     os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
     os << "        _fa_rmax[q] = m_new;\n";
-    os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
-       << S(BD) << "u + d] *= scaler;\n";
+    if (featureTiled)
+      os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
+         << S(BD) << "u + d] *= scaler;\n";
+    else
+      os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
+         << S(BD) << "u + d] *= scaler;\n";
   }
   os << "      } else if (q < " << S(BM) << "u) {\n";
   os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*"
@@ -2451,11 +2524,19 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
   if (softmax) {
     os << "      float denom = _fa_rsum[q];\n";
-    os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    if (op.getSafeDenominatorOne())
+      os << "      denom = (denom == 0.0f) ? 1.0f : denom;\n";
+    if (featureTiled)
+      os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
+    else
+      os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
     os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d] / denom;\n";
   } else {
-    os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    if (featureTiled)
+      os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
+    else
+      os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
     os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d];\n";
   }
@@ -2490,8 +2571,8 @@ void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
   // body walks keys one at a time and simply runs the phases back to back. That
   // is not a regression against the hand-written body this replaces, which was
   // per-key for the same reason.
-  const bool fits = need <= 8192 && BM % 8 == 0 && BN % 8 == 0 && BD % 8 == 0 &&
-                    op.getNumPhases() == 1;
+  const bool fits = need <= 8192 && BM <= 32 && BM % 8 == 0 && BN % 8 == 0 &&
+                    BD % 8 == 0 && op.getNumPhases() == 1;
   if (fits && !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR"))
     return emitFusedAttentionMma_(op);
   return emitFusedAttentionScalar_(op);
@@ -2509,6 +2590,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   const int64_t BM = op.getBm(), BD = op.getBd();
   const bool softmax =
       op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+  const bool featureTiled = op.getFeatureTiled();
 
   // 2 tiles of CH*BD floats (Q staging + O accumulator) plus 2*CH of running
   // state. Budget 7168 floats (28 KiB) leaves headroom for allocas the rest of
@@ -2581,12 +2663,18 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
   os << "  uint _fa_so = " << SO << ";\n";
-  // With a head split the grid's y dimension selects the head and every tensor
-  // is indexed at that head's column offset; without one the offset is 0.
+  // The y grid is either a head selector or an output-feature tile selector.
   if (op.getH())
     os << "  uint _fa_col = tgid.y * _fa_dh;\n";
+  else if (featureTiled)
+    os << "  uint _fa_col = tgid.y * " << S(BD) << "u;\n";
   else
     os << "  uint _fa_col = 0u;\n";
+  if (featureTiled)
+    os << "  uint _fa_out_d = (_fa_col < _fa_dh) ? min(" << S(BD)
+       << "u, _fa_dh - _fa_col) : 0u;\n";
+  else
+    os << "  uint _fa_out_d = _fa_dh;\n";
   os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
   // The chunk loop is OUTSIDE the single-warp guard so every warp reaches every
   // barrier; only the body is warp-0's.
@@ -2599,7 +2687,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
      << "u;\n";
   os << "        uint row = _fa_rowoff + _fa_c0 + qq;\n";
   os << "        _fa_qbuf[c] = (qq + _fa_c0 < " << S(BM)
-     << "u && row < _fa_M && d < _fa_dh) ? " << Q
+     << "u && row < _fa_M && d < _fa_out_d) ? " << Q
      << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "        _fa_obuf[c] = 0.0f;\n";
   os << "      }\n";
@@ -2637,8 +2725,12 @@ void ModuleTranslation::emitFusedAttentionScalar_(
      << "; ++_fa_key) {\n";
   os << "          float _fa_a = 0.0f;\n";
   os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
-  os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
-     << "[_fa_key * _fa_sk + _fa_col + d];\n";
+  if (featureTiled)
+    os << "            _fa_a += " << Q << "[_fa_row * _fa_sq + d] * " << K
+       << "[d * _fa_sk + _fa_key];\n";
+  else
+    os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
+       << "[_fa_key * _fa_sk + _fa_col + d];\n";
   // ---- the score transform, straight out of the op's region ----
   std::string w = emitScoreRegion_(op, "_fa_a", "(int)_fa_row", "(int)_fa_key",
                                    P + " /*phase*/", "          ");
@@ -2646,7 +2738,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     // norm = none: the transformed score IS the weight. The region is
     // responsible for zeroing keys that must not contribute, exactly as the
     // source kernel's mask does.
-    os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] += " << w << " * "
        << V << "[_fa_key * _fa_sv + _fa_col + d];\n";
   } else {
@@ -2671,7 +2763,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
        << E << "(" << w << " - _fa_mnew);\n";
     os << "          _fa_rsum[_fa_q] = _fa_rsum[_fa_q] * _fa_sc + _fa_p;\n";
     os << "          _fa_rmax[_fa_q] = _fa_mnew;\n";
-    os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] = _fa_obuf[_fa_q "
           "* " << S(BD) << "u + d] * _fa_sc + _fa_p * " << V
        << "[_fa_key * _fa_sv + _fa_col + d];\n";
@@ -2680,14 +2772,14 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "        }\n";
   }
   if (softmax) {
-    // Plain divide: a row with no visible key yields NaN, which is what the
-    // source kernel's `acc / l_i` produces.
     os << "        float _fa_den = _fa_rsum[_fa_q];\n";
-    os << "        for (uint d = 0; d < _fa_dh; ++d)\n";
+    if (op.getSafeDenominatorOne())
+      os << "        _fa_den = (_fa_den == 0.0f) ? 1.0f : _fa_den;\n";
+    os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d] / _fa_den;\n";
   } else {
-    os << "        for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d];\n";
   }

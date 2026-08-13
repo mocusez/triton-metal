@@ -80,6 +80,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    metal.kernel feature_tiled_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>):
+      metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so {bm = 16 : i64, bn = 16 : i64, bd = 64 : i64, feature_tiled, k_feature_major, norm = 1 : i32, safe_denominator_one, softmax_natural_exp} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32):
+        metal.score_yield %score : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32):
+        %zero = metal.constant 0 : si32
+        metal.key_bounds_yield %zero, %n2
+      }
+      metal.return
+    }
   }
 }
 
@@ -150,3 +162,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // the logit, so the emitter cannot rescale after the fact.
 // CHECK: float scaler = (m_old == m_new) ? 1.0f : exp(m_old - m_new);
 // CHECK-NOT: exp2(
+
+// --- feature-tiled kernel: y selects a BD-wide output tile, while QK reduces
+// over the full runtime d_head and reads already-transposed K as [feature,key].
+// The MMA body must sweep full-d_head Q/K chunks independently of the output
+// tile, so d_head>BD remains correct without falling back to the scalar body.
+// CHECK-LABEL: kernel void feature_tiled_kernel
+// CHECK: uint _fa_col = tgid.y * 64u;
+// CHECK: uint _fa_out_d = (_fa_col < _fa_dh) ? min(64u, _fa_dh - _fa_col) : 0u;
+// CHECK: v2[kk * _fa_sv + _fa_col + d]
+// CHECK: // ---- feature-tiled QK full-dhead sweep ----
+// CHECK: for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += 64u)
+// CHECK: v0[row * _fa_sq + _fa_dc + d]
+// CHECK: v1[(_fa_dc + d) * _fa_sk + kk]
+// CHECK: simdgroup_float8x8 acc(0.0f);
+// CHECK: if (_fa_dc != 0u) simdgroup_load(acc, &_fa_sbuf
+// CHECK: simdgroup_multiply_accumulate(acc, a, b, acc);
+// CHECK: simdgroup_store(acc, &_fa_sbuf
+// CHECK: denom = (denom == 0.0f) ? 1.0f : denom;
+// CHECK: v3[row * _fa_so + _fa_col + d]
