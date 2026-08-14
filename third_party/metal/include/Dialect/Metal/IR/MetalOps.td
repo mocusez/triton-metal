@@ -1453,17 +1453,23 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     Correctness-first lowering of a standalone `tt.dot` whose fused-epilogue
     shape the SIMD-group matmul matchers cannot consume (e.g. a `dot` feeding
     an `alpha*out + beta*C` epilogue rather than a bare `tt.store`). The result
-    is a rank-2 `tensor<MxNxf32, #blocked>` value that flows into the ordinary
-    per-thread tile-loop model: `ScalarDotLowering` scalarizes it to one output
-    element per (thread, tile-loop iteration) and emits an `scf.for` reduction
+    is a rank-2 `tensor<MxNxf32, #blocked>` value, or a rank-3 batched
+    `tensor<BxMxNxf32, #blocked>` value. It flows into the ordinary per-thread
+    tile-loop model:
+    `ScalarDotLowering` scalarizes it to one output element per (thread,
+    tile-loop iteration) and emits an `scf.for` reduction
 
       acc = c_init;
       for (k = 0; k < reduction_extent; ++k)
-        acc += a_buf[a_base_offset + gRow*stride_a + k]
-             * b_buf[b_base_offset + k*stride_b + gCol];
+        acc += a_buf[a_base_offset + a_batch_offset + gRow*stride_a + k]
+             * b_buf[b_base_offset + b_batch_offset + k*stride_b + gCol];
 
-    where `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` are the
-    global output coordinates recovered from `emitPerIterIndex`. The reduction
+    where `(localBatch, linRow, linCol)` are recovered from the blocked tile
+    geometry and `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)`.
+    `a_batch_offset`/`b_batch_offset` are scalarized shaped pointer
+    contributions for the current batch lane. The geometry is pinned to the
+    function-wide tile loop so it remains aligned with the store when a folded
+    result layout conversion uses a different blocked encoding. The reduction
     trip count is `reduction_extent` (normally equal to `stride_a`).  A
     `transpose_a` unit attribute changes A's physical index to
     `k*stride_a + gRow`; an optional `weight_buf` multiplies each product by
@@ -1471,9 +1477,10 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     weighted Gram matrix `X.T @ diag(W) @ X` used by logistic-regression
     Hessians without pretending its dot-operand layout conversions are generic
     scalar identities. When `partial_extents = [m_extent, n_extent]` is present,
-    the reduction is guarded by `gRow < m_extent && gCol < n_extent` so
-    out-of-range tail-tile rows/cols never issue an out-of-bounds device read
-    (their result is discarded by the epilogue's masked store).
+    the reduction is guarded by the matrix bounds. Rank-3 multi-batch tiles use
+    `[batch_extent, m_extent, n_extent]` and additionally guard
+    `batch_origin + localBatch < batch_extent`, so no tail lane issues an
+    out-of-bounds device read.
 
     `a_base_offset`/`b_base_offset` preserve scalar `tt.addptr` offsets applied
     before the tiled pointer chain, such as a batched matrix's per-program base.
@@ -1484,7 +1491,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
 
   let arguments = (ins Metal_MemRefType:$a_buf, Metal_MemRefType:$b_buf,
                        UI32:$a_base_offset, UI32:$b_base_offset,
-                       UI32:$row_origin, UI32:$col_origin,
+                       AnyType:$a_batch_offset, AnyType:$b_batch_offset,
+                       UI32:$batch_origin, UI32:$row_origin, UI32:$col_origin,
                        UI32:$stride_a, UI32:$stride_b,
                        UI32:$reduction_extent,
                        AnyType:$c_init,
@@ -1494,7 +1502,9 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
   let results = (outs AnyType:$result);
 
   let assemblyFormat = "$a_buf `,` $b_buf `offset` `[` $a_base_offset `,`"
-                       "$b_base_offset `]` `[` $row_origin `,` $col_origin `]`"
+                       "$b_base_offset `]` `batch_offset` `[` $a_batch_offset"
+                       " `,` $b_batch_offset `]` `origin` `[` $batch_origin"
+                       " `,` $row_origin `,` $col_origin `]`"
                        " `,` $stride_a `,` $stride_b `,` $reduction_extent"
                        " `,` $c_init"
                        " (`weight` $weight_buf^)?"

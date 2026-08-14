@@ -247,6 +247,120 @@ def test_batched_fp16_dot_explicit_fp32_operands(batch, M, N, K):
     torch.testing.assert_close(c.float(), ref.float(), atol=tol, rtol=tol)
 
 
+# Compute shape from leet-triton/medium-batched_matrix_multiplication.py.  The
+# batch dimension remains in every tile, so tl.dot is rank-3 for both unit and
+# multi-element batch tiles.
+@triton.jit
+def batched_f32_rank3_dot_kernel(
+    a, b, c, BATCH, M, N, K,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    COMBINE_OFFSETS: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_b = pid_b * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask_b = offs_b < BATCH
+
+    offs_m64 = offs_m.to(tl.int64)
+    offs_n64 = offs_n.to(tl.int64)
+    offs_b64 = offs_b.to(tl.int64)
+    M64 = tl.full((), M, tl.int64)
+    N64 = tl.full((), N, tl.int64)
+    K64 = tl.full((), K, tl.int64)
+
+    acc = tl.zeros((BLOCK_BATCH, BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for i in range(0, K, BLOCK_K):
+        offs_k = i + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        offs_k64 = offs_k.to(tl.int64)
+
+        a_batch_offset = offs_b64[:, None, None] * (M64 * K64)
+        a_row_offset = offs_m64[None, :, None] * K64
+        a_k_offset = offs_k64[None, None, :]
+        if COMBINE_OFFSETS:
+            a_ptrs = a + (a_batch_offset + a_row_offset + a_k_offset)
+        else:
+            a_ptrs = a + a_batch_offset + a_row_offset + a_k_offset
+        a_mask = (
+            mask_b[:, None, None]
+            & mask_m[None, :, None]
+            & mask_k[None, None, :]
+        )
+        tile_a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        b_batch_offset = offs_b64[:, None, None] * (K64 * N64)
+        b_k_offset = offs_k64[None, :, None] * N64
+        b_col_offset = offs_n64[None, None, :]
+        if COMBINE_OFFSETS:
+            b_ptrs = b + (b_batch_offset + b_k_offset + b_col_offset)
+        else:
+            b_ptrs = b + b_batch_offset + b_k_offset + b_col_offset
+        b_mask = (
+            mask_b[:, None, None]
+            & mask_k[None, :, None]
+            & mask_n[None, None, :]
+        )
+        tile_b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc = tl.dot(tile_a, tile_b, acc=acc, input_precision="ieee")
+
+    c_batch_offset = offs_b64[:, None, None] * (M64 * N64)
+    c_row_offset = offs_m64[None, :, None] * N64
+    c_col_offset = offs_n64[None, None, :]
+    if COMBINE_OFFSETS:
+        c_ptrs = c + (c_batch_offset + c_row_offset + c_col_offset)
+    else:
+        c_ptrs = c + c_batch_offset + c_row_offset + c_col_offset
+    c_mask = (
+        mask_b[:, None, None]
+        & mask_m[None, :, None]
+        & mask_n[None, None, :]
+    )
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@pytest.mark.parametrize(
+    "batch,M,N,K,block_batch,combine_offsets",
+    [
+        (2, 64, 64, 64, 1, False),
+        (3, 70, 66, 50, 1, False),
+        (2, 33, 17, 96, 1, False),
+        (4, 64, 64, 64, 2, False),
+        (3, 70, 66, 50, 2, False),
+        (5, 33, 17, 96, 4, False),
+        (3, 33, 17, 96, 2, False),
+        (3, 33, 17, 96, 2, True),
+    ],
+)
+def test_batched_f32_rank3_dot_batch_tile(
+    batch, M, N, K, block_batch, combine_offsets,
+):
+    torch.manual_seed(0xC0FFEE)
+    a = torch.randn((batch, M, K), dtype=torch.float32).contiguous()
+    b = torch.randn((batch, K, N), dtype=torch.float32).contiguous()
+    c = torch.zeros((batch, M, N), dtype=torch.float32).contiguous()
+    grid = (
+        triton.cdiv(M, 64),
+        triton.cdiv(N, 64),
+        triton.cdiv(batch, block_batch),
+    )
+    batched_f32_rank3_dot_kernel[grid](
+        a, b, c, batch, M, N, K,
+        BLOCK_BATCH=block_batch, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64,
+        COMBINE_OFFSETS=combine_offsets,
+    )
+    ref = torch.bmm(a, b)
+    torch.testing.assert_close(c, ref, atol=1e-4, rtol=1e-4)
+
+
 @triton.jit
 def int4_weight_only_dot_kernel(
     x,

@@ -11552,6 +11552,137 @@ static std::optional<int> findExpandDimsAxis(mlir::Value v, int depth = 0) {
   return std::nullopt;
 }
 
+enum class BatchedMatrixAxis { Batch, Row, Col };
+
+struct SliceAxis {
+  int64_t parentRank;
+  int64_t originalAxis;
+};
+
+// A comparison is commonly formed on the rank-1 make_range before its
+// expand_dims/broadcast shell. Recover the one surviving original dimension
+// from nested #ttg.slice encodings.
+static std::optional<SliceAxis> recoverSliceAxis(mlir::Value v) {
+  auto ty = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!ty || ty.getRank() != 1)
+    return std::nullopt;
+
+  mlir::Attribute enc = ty.getEncoding();
+  llvm::SmallVector<int64_t, 2> removedDims;
+  while (auto slice =
+             mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc)) {
+    removedDims.push_back(slice.getDim());
+    enc = slice.getParent();
+  }
+  auto blocked =
+      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(enc);
+  if (!blocked)
+    return std::nullopt;
+  int64_t parentRank = blocked.getOrder().size();
+  if (parentRank != 2 && parentRank != 3)
+    return std::nullopt;
+
+  llvm::SmallVector<int64_t, 3> remaining;
+  for (int64_t axis = 0; axis < parentRank; ++axis)
+    remaining.push_back(axis);
+  for (auto it = removedDims.rbegin(); it != removedDims.rend(); ++it) {
+    int64_t dim = *it;
+    if (dim < 0 || dim >= static_cast<int64_t>(remaining.size()))
+      return std::nullopt;
+    remaining.erase(remaining.begin() + dim);
+  }
+  if (remaining.size() != 1)
+    return std::nullopt;
+  return SliceAxis{parentRank, remaining.front()};
+}
+
+static std::optional<BatchedMatrixAxis> batchedMatrixAxisFromSlice(
+    mlir::Value v) {
+  auto recovered = recoverSliceAxis(v);
+  if (!recovered)
+    return std::nullopt;
+  if (recovered->parentRank == 2) {
+    if (recovered->originalAxis == 0)
+      return BatchedMatrixAxis::Row;
+    if (recovered->originalAxis == 1)
+      return BatchedMatrixAxis::Col;
+    return std::nullopt;
+  }
+  if (recovered->parentRank == 3) {
+    if (recovered->originalAxis == 0)
+      return BatchedMatrixAxis::Batch;
+    if (recovered->originalAxis == 1)
+      return BatchedMatrixAxis::Row;
+    if (recovered->originalAxis == 2)
+      return BatchedMatrixAxis::Col;
+  }
+  return std::nullopt;
+}
+
+// Interpret an expand_dims contribution as batch/row/column. Rank-2 keeps the
+// canonical axis=1 -> row, axis=0 -> col mapping. Rank-3 expand axes are
+// ambiguous after two insertions, so find the slice-encoded rank-1 leaf and
+// recover its original dimension instead.
+static std::optional<BatchedMatrixAxis>
+batchedMatrixAxisFromExpandDims(mlir::Value shapedValue, int expandAxis) {
+  auto ty = mlir::dyn_cast<mlir::RankedTensorType>(shapedValue.getType());
+  if (!ty)
+    return std::nullopt;
+  if (ty.getRank() == 2) {
+    if (expandAxis == 1)
+      return BatchedMatrixAxis::Row;
+    if (expandAxis == 0)
+      return BatchedMatrixAxis::Col;
+    return std::nullopt;
+  }
+  if (ty.getRank() != 3)
+    return std::nullopt;
+
+  llvm::SmallVector<std::pair<mlir::Value, int>, 8> worklist{
+      {shapedValue, 0}};
+  llvm::SmallPtrSet<mlir::Value, 8> seen;
+  std::optional<BatchedMatrixAxis> found;
+  while (!worklist.empty()) {
+    auto [value, depth] = worklist.pop_back_val();
+    if (!value || depth > 10 || !seen.insert(value).second)
+      continue;
+    if (auto axis = batchedMatrixAxisFromSlice(value)) {
+      if (found && *found != *axis)
+        return std::nullopt;
+      found = axis;
+    }
+    auto *def = value.getDefiningOp();
+    if (!def)
+      continue;
+    for (mlir::Value operand : def->getOperands()) {
+      if (mlir::isa<mlir::ShapedType>(operand.getType()))
+        worklist.push_back({operand, depth + 1});
+    }
+  }
+  return found;
+}
+
+// Compatibility wrappers for existing rank-2/leading-unit matrix-only
+// callers: row=0, column=1, batch is intentionally not a matrix axis.
+static std::optional<int>
+logicalMatrixAxisFromExpandDims(mlir::Value shapedValue, int expandAxis) {
+  auto axis = batchedMatrixAxisFromExpandDims(shapedValue, expandAxis);
+  if (axis == BatchedMatrixAxis::Row)
+    return 0;
+  if (axis == BatchedMatrixAxis::Col)
+    return 1;
+  return std::nullopt;
+}
+
+static std::optional<int> logicalMatrixAxisFromSlice(mlir::Value v) {
+  auto axis = batchedMatrixAxisFromSlice(v);
+  if (axis == BatchedMatrixAxis::Row)
+    return 0;
+  if (axis == BatchedMatrixAxis::Col)
+    return 1;
+  return std::nullopt;
+}
+
 // Look for `tt.splat(arith.muli(tt.get_program_id, arith.constant))` within
 // a contribution chain. Returns the `arith.muli` result on match, null
 // Value otherwise.
@@ -11577,6 +11708,10 @@ static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0) {
     return findPidOriginInContribution(cvt.getSrc(), depth + 1);
   if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
     return findPidOriginInContribution(ed.getSrc(), depth + 1);
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtSIOp>())
+    return findPidOriginInContribution(ext.getIn(), depth + 1);
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtUIOp>())
+    return findPidOriginInContribution(ext.getIn(), depth + 1);
   if (auto addi = v.getDefiningOp<mlir::arith::AddIOp>()) {
     if (auto s = findPidOriginInContribution(addi.getLhs(), depth + 1))
       return s;
@@ -11701,75 +11836,75 @@ static OriginPair extractOriginPair(TtMemOp memOp) {
 
 // AC2: walk a tt.store mask of the canonical 2D form
 //   `arith.andi(cmpi(slt, offs_m_2d, splat(M)), cmpi(slt, offs_n_2d, splat(N)))`
-// and return (M_extent_val, N_extent_val) as kernel-scalar SSA values. The
-// shape is unmasked-axis-aware: the cmpi whose LHS chain reaches the row-axis
-// `offs_m` returns M_extent; the col-axis one returns N_extent. Returns
-// {null, null} on any shape mismatch.
+// and return batch/M/N extents as kernel-scalar SSA values. Rank-2 masks only
+// populate M/N; canonical rank-3 masks additionally populate batch. Returns an
+// empty result if row/column classification is incomplete or contradictory.
 struct MaskExtents {
+  mlir::Value batchExtent;
   mlir::Value mExtent;
   mlir::Value nExtent;
 };
 static MaskExtents extractMaskExtents(mlir::Value mask) {
   MaskExtents empty;
   if (!mask) return empty;
-  // Accept both `(offs_row < ROW) & (offs_col < K)` (arith.andi) and the
-  // `(offs_row < ROW) * (offs_col < K)` (arith.muli) form some kernels use for
-  // the store mask (e.g. medium-lora_linear.py's `mask_y = ... * ...`).
-  mlir::Value maskLhs, maskRhs;
-  if (auto andi = mask.getDefiningOp<mlir::arith::AndIOp>()) {
-    maskLhs = andi.getLhs();
-    maskRhs = andi.getRhs();
-  } else if (auto muli = mask.getDefiningOp<mlir::arith::MulIOp>()) {
-    maskLhs = muli.getLhs();
-    maskRhs = muli.getRhs();
-  } else {
-    return empty;
-  }
-
-  // Each side: walk through tt.broadcast / tt.expand_dims wrappers to the
-  // underlying cmpi-slt with a tt.splat RHS.
-  auto unwrapToCmpi = [](mlir::Value v) -> mlir::arith::CmpIOp {
-    while (v) {
-      auto def = v.getDefiningOp();
-      if (!def) return {};
-      if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def)) {
-        v = bc.getSrc();
-        continue;
-      }
-      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
-        v = ed.getSrc();
-        continue;
-      }
-      break;
+  // Collect every comparison leaf through broadcast/expand/conjunction
+  // shells. Batched masks have three leaves (batch, row, col), and choosing
+  // only the first shaped comparison can confuse the expanded batch predicate
+  // with a matrix bound. Classify every leaf by its original logical axis.
+  llvm::SmallVector<mlir::arith::CmpIOp, 4> comparisons;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  std::function<void(mlir::Value, int)> collectComparisons =
+      [&](mlir::Value v, int depth) {
+    if (!v || depth > 12)
+      return;
+    auto *def = v.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      return;
+    if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
+      comparisons.push_back(cmp);
+      return;
     }
-    return v.getDefiningOp<mlir::arith::CmpIOp>();
+    if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def)) {
+      collectComparisons(bc.getSrc(), depth + 1);
+      return;
+    }
+    if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+      collectComparisons(ed.getSrc(), depth + 1);
+      return;
+    }
+    if (auto splat = mlir::dyn_cast<mlir::triton::SplatOp>(def)) {
+      collectComparisons(splat.getSrc(), depth + 1);
+      return;
+    }
+    if (auto andi = mlir::dyn_cast<mlir::arith::AndIOp>(def)) {
+      collectComparisons(andi.getLhs(), depth + 1);
+      collectComparisons(andi.getRhs(), depth + 1);
+      return;
+    }
+    if (auto muli = mlir::dyn_cast<mlir::arith::MulIOp>(def)) {
+      collectComparisons(muli.getLhs(), depth + 1);
+      collectComparisons(muli.getRhs(), depth + 1);
+    }
   };
+  collectComparisons(mask, 0);
 
-  auto cmpLhs = unwrapToCmpi(maskLhs);
-  auto cmpRhs = unwrapToCmpi(maskRhs);
-  if (!cmpLhs || !cmpRhs) return empty;
-  if (cmpLhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
-  if (cmpRhs.getPredicate() != mlir::arith::CmpIPredicate::slt) return empty;
-
-  // Extract the splat source on each cmpi's RHS — that's the scalar bound.
+  // Extract the splat source on a cmpi's RHS — that's the scalar bound.
   auto extractSplatSrc = [](mlir::arith::CmpIOp cmp) -> mlir::Value {
     if (auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>())
       return splat.getSrc();
     return {};
   };
-  mlir::Value boundLhs = extractSplatSrc(cmpLhs);
-  mlir::Value boundRhs = extractSplatSrc(cmpRhs);
-  if (!boundLhs || !boundRhs) return empty;
-
-  // Axis disambiguation: the cmpi whose LHS reaches an `expand_dims` with
-  // axis=1 is the row-axis (M_extent); axis=0 is the col-axis (N_extent).
-  auto axisOf = [](mlir::arith::CmpIOp cmp) -> int {
+  // Prefer an explicit expand_dims shell; when the comparison precedes that
+  // shell, use its nested #ttg.slice encoding to recover batch/row/column.
+  auto axisOf = [](mlir::arith::CmpIOp cmp)
+      -> std::optional<BatchedMatrixAxis> {
     auto v = cmp.getLhs();
     while (v) {
       auto def = v.getDefiningOp();
-      if (!def) return -1;
-      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def))
-        return ed.getAxis();
+      if (!def) return std::nullopt;
+      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+        return batchedMatrixAxisFromExpandDims(v, ed.getAxis());
+      }
       if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def)) {
         v = bc.getSrc();
         continue;
@@ -11788,22 +11923,31 @@ static MaskExtents extractMaskExtents(mlir::Value mask) {
       }
       break;
     }
-    return -1;
+    return batchedMatrixAxisFromSlice(cmp.getLhs());
   };
-  int axisLhs = axisOf(cmpLhs);
-  int axisRhs = axisOf(cmpRhs);
-
   MaskExtents r;
-  if (axisLhs == 1 && axisRhs == 0) {
-    r.mExtent = boundLhs;
-    r.nExtent = boundRhs;
-  } else if (axisLhs == 0 && axisRhs == 1) {
-    r.mExtent = boundRhs;
-    r.nExtent = boundLhs;
-  } else {
-    return empty;
+  for (auto cmp : comparisons) {
+    if (cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+      continue;
+    mlir::Value bound = extractSplatSrc(cmp);
+    if (!bound)
+      continue;
+    auto axis = axisOf(cmp);
+    if (axis == BatchedMatrixAxis::Batch) {
+      if (r.batchExtent && r.batchExtent != bound)
+        return empty;
+      r.batchExtent = bound;
+    } else if (axis == BatchedMatrixAxis::Row) {
+      if (r.mExtent && r.mExtent != bound)
+        return empty;
+      r.mExtent = bound;
+    } else if (axis == BatchedMatrixAxis::Col) {
+      if (r.nExtent && r.nExtent != bound)
+        return empty;
+      r.nExtent = bound;
+    }
   }
-  return r;
+  return (r.mExtent && r.nExtent) ? r : empty;
 }
 
 // Helper: walk addptr/splat/broadcast/expand_dims back to the kernel-arg ptr.
@@ -12571,9 +12715,10 @@ static bool contributionContainsSplatOf(mlir::Value v, mlir::Value scalar,
 // `findStrideSplatSourceInPtrChain`, which returns the first `splat(i32
 // block-arg)` it finds — and is fooled by the `splat(iv)` inside
 // `offs_k = k + arange` — this returns the stride multiplied by the offset
-// contribution that varies along `axis` (i.e. the `muli(expand_dims(..),
-// splat(stride))` whose expand_dims axis is `1 - axis`). Returns null if not
-// found (caller emits a `metal.constant` fallback).
+// contribution that varies along logical matrix `axis`. Rank-2 maps
+// expand_dims 1/0 to row/col; leading-unit rank-3 recovers original dims 1/2
+// as row/col from the slice-encoded leaf and excludes original dim 0 (batch).
+// Returns null if not found (caller emits a `metal.constant` fallback).
 static mlir::Value findAxisStride(mlir::Value ptr, int axis) {
   std::function<mlir::Value(mlir::Value)> fromOffset =
       [&](mlir::Value off) -> mlir::Value {
@@ -12588,7 +12733,9 @@ static mlir::Value findAxisStride(mlir::Value ptr, int axis) {
       return fromOffset(ed.getSrc());
     if (auto muli = off.getDefiningOp<mlir::arith::MulIOp>()) {
       auto ax = findExpandDimsAxis(off);
-      if (ax.has_value() && (1 - *ax) == axis) {
+      auto logicalAxis =
+          ax ? logicalMatrixAxisFromExpandDims(off, *ax) : std::nullopt;
+      if (logicalAxis && *logicalAxis == axis) {
         auto splatSrc = [](mlir::Value v) -> mlir::Value {
           while (v) {
             if (auto s = v.getDefiningOp<mlir::triton::SplatOp>())
@@ -13742,6 +13889,13 @@ static std::optional<int> sdAxisOf(mlir::Value v, int depth = 0) {
   return std::nullopt;
 }
 
+static std::optional<BatchedMatrixAxis> sdBatchedMatrixAxis(mlir::Value v) {
+  auto expandAxis = sdAxisOf(v);
+  if (!expandAxis)
+    return std::nullopt;
+  return batchedMatrixAxisFromExpandDims(v, *expandAxis);
+}
+
 // The constexpr stride multiplier (a splat dense-int constant) applied within a
 // contribution, e.g. `arith.muli(rowIdx, dense<K>) -> K`. Returns nullopt for a
 // contiguous (stride-1) contribution with no constant multiplier.
@@ -13771,44 +13925,69 @@ static std::optional<int64_t> sdConstStride(mlir::Value v, int depth = 0) {
   return std::nullopt;
 }
 
-// Split a canonical 2-level 2D pointer chain
+// Split a canonical matrix pointer chain (rank-2 or rank-3)
 //   addptr(broadcast(addptr(splat(arg), INNER)), OUTER)
-// into its axis-1 (leading/row) and axis-0 (trailing/col) offset contributions
-// and its root kernel-arg pointer.
+// into batch/row/column offset contributions and its root kernel-arg pointer.
 struct SdPtrParts {
-  mlir::Value rowContrib;  // expand_dims axis == 1
-  mlir::Value colContrib;  // expand_dims axis == 0
+  mlir::Value batchContrib;
+  mlir::Value rowContrib;
+  mlir::Value colContrib;
   mlir::Value rootArg;
   llvm::SmallVector<mlir::Value, 2> baseOffsets;
 };
 static SdPtrParts sdSplitPtr(mlir::Value ptr) {
   SdPtrParts p;
-  auto collectContrib = [&](mlir::Value off) {
+  std::function<void(mlir::Value, int)> collectContrib =
+      [&](mlir::Value off, int depth) {
+    if (!off || depth > 8)
+      return;
+    auto ax = sdBatchedMatrixAxis(off);
     auto addi = off.getDefiningOp<mlir::arith::AddIOp>();
     if (addi) {
-      auto lhsAxis = sdAxisOf(addi.getLhs());
-      auto rhsAxis = sdAxisOf(addi.getRhs());
-      // Triton may collapse both 2D axes into one addptr offset
-      // (`row_contrib + col_contrib`) instead of emitting a two-level pointer
-      // chain. Split that top-level sum before recording the contributions;
-      // treating the whole sum as the first axis silently loses pid_n.
-      if (lhsAxis && rhsAxis && *lhsAxis != *rhsAxis) {
-        if (*lhsAxis == 1 && !p.rowContrib) p.rowContrib = addi.getLhs();
-        if (*lhsAxis == 0 && !p.colContrib) p.colContrib = addi.getLhs();
-        if (*rhsAxis == 1 && !p.rowContrib) p.rowContrib = addi.getRhs();
-        if (*rhsAxis == 0 && !p.colContrib) p.colContrib = addi.getRhs();
+      auto lhsAxis = sdBatchedMatrixAxis(addi.getLhs());
+      auto rhsAxis = sdBatchedMatrixAxis(addi.getRhs());
+      // Triton may collapse multiple axes into one addptr offset. Split sums
+      // whose branches identify different axes, and recursively flatten an
+      // ambiguous mixed subtree such as `(batch + row) + col`. Keep a
+      // single-axis `splat(pid) + make_range` contribution intact so origin
+      // recovery still sees both pieces.
+      if ((lhsAxis && rhsAxis && *lhsAxis != *rhsAxis) || !ax) {
+        collectContrib(addi.getLhs(), depth + 1);
+        collectContrib(addi.getRhs(), depth + 1);
         return;
       }
     }
-    auto ax = sdAxisOf(off);
-    if (ax == 1 && !p.rowContrib)
+    // Canonicalization may wrap a mixed `(batch + row)` subtree in a
+    // broadcast before using it as one addptr contribution.  If the wrapper
+    // cannot be assigned a single logical axis, peel it and let the recursive
+    // addi handling split the underlying axes.  Only recurse while the
+    // semantic classifier remains ambiguous; a proven single-axis wrapper is
+    // kept intact so its scalarized value preserves the surrounding shape.
+    if (!ax) {
+      if (auto bc = off.getDefiningOp<mlir::triton::BroadcastOp>()) {
+        collectContrib(bc.getSrc(), depth + 1);
+        return;
+      }
+      if (auto cvt =
+              off.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+        collectContrib(cvt.getSrc(), depth + 1);
+        return;
+      }
+      if (auto ed = off.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+        collectContrib(ed.getSrc(), depth + 1);
+        return;
+      }
+    }
+    if (ax == BatchedMatrixAxis::Batch && !p.batchContrib)
+      p.batchContrib = off;
+    else if (ax == BatchedMatrixAxis::Row && !p.rowContrib)
       p.rowContrib = off;
-    else if (ax == 0 && !p.colContrib)
+    else if (ax == BatchedMatrixAxis::Col && !p.colContrib)
       p.colContrib = off;
   };
   for (int depth = 0; depth < 16 && ptr; ++depth) {
     if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
-      collectContrib(addptr.getOffset());
+      collectContrib(addptr.getOffset(), 0);
       ptr = addptr.getPtr();
       continue;
     }
@@ -13942,8 +14121,13 @@ static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
   // commonly keep M/N/K dynamic even with a constexpr tile size.
   SdPtrParts aParts = sdSplitPtr(aLoad.getPtr());
   SdPtrParts bParts = sdSplitPtr(bLoad.getPtr());
+  int64_t batchTile = resultTensorTy.getRank() == 3
+                          ? resultTensorTy.getDimSize(0)
+                          : 1;
   if (!aParts.rowContrib || !bParts.rowContrib || !aParts.rootArg ||
       !bParts.rootArg)
+    return {};
+  if (batchTile > 1 && (!aParts.batchContrib || !bParts.batchContrib))
     return {};
   mlir::Value strideADynamic =
       findAxisStride(aLoad.getPtr(), /*axis=*/transposeA ? 1 : 0);
@@ -13960,15 +14144,26 @@ static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
   // Origins (pid*BLOCK) from the store's contributions — the output row/col
   // origins equal A's row origin and B's col origin respectively.
   auto store = sdFindStore(replaceTarget);
-  mlir::Value rowOriginScalar, colOriginScalar;
+  mlir::Value batchOriginScalar, rowOriginScalar, colOriginScalar;
   MaskExtents maskExtents;
   if (store) {
     SdPtrParts cParts = sdSplitPtr(store.getPtr());
+    if (cParts.batchContrib)
+      batchOriginScalar = findPidOriginInContribution(cParts.batchContrib);
     if (cParts.rowContrib)
       rowOriginScalar = findPidOriginInContribution(cParts.rowContrib);
     if (cParts.colContrib)
       colOriginScalar = findPidOriginInContribution(cParts.colContrib);
     if (store.getMask()) maskExtents = extractMaskExtents(store.getMask());
+    // A claimed masked scalar-dot tile must carry both output extents.  Falling
+    // back to an unguarded O(M*N*K) reduction after mask classification fails
+    // can issue out-of-bounds A/B reads on tail programs.
+    if (store.getMask() && resultTensorTy.getRank() == 3 &&
+        (!maskExtents.mExtent || !maskExtents.nExtent))
+      return {};
+    if (store.getMask() && batchTile > 1 &&
+        (!maskExtents.batchExtent || !batchOriginScalar))
+      return {};
   }
 
   mlir::OpBuilder builder(insertBefore);
@@ -14008,6 +14203,12 @@ static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
   }
   mlir::Value aBaseOffset = emitBaseOffset(aParts);
   mlir::Value bBaseOffset = emitBaseOffset(bParts);
+  mlir::Value aBatchOffset =
+      aParts.batchContrib ? aParts.batchContrib : emitConstUi32(0);
+  mlir::Value bBatchOffset =
+      bParts.batchContrib ? bParts.batchContrib : emitConstUi32(0);
+  mlir::Value batchOrigin =
+      emitOriginOperand(builder, loc, ui32, batchOriginScalar);
   mlir::Value rowOrigin = emitOriginOperand(builder, loc, ui32, rowOriginScalar);
   mlir::Value colOrigin = emitOriginOperand(builder, loc, ui32, colOriginScalar);
   auto emitStride = [&](mlir::Value dynamic,
@@ -14026,17 +14227,53 @@ static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
   mlir::Value reductionExtentUi32 =
       reductionExtent ? toUi32(reductionExtent) : strideA;
 
-  llvm::SmallVector<mlir::Value, 2> partialExtents;
+  llvm::SmallVector<mlir::Value, 3> partialExtents;
   if (maskExtents.mExtent && maskExtents.nExtent) {
+    if (batchTile > 1)
+      partialExtents.push_back(toUi32(maskExtents.batchExtent));
     partialExtents.push_back(toUi32(maskExtents.mExtent));
     partialExtents.push_back(toUi32(maskExtents.nExtent));
   }
 
+  std::optional<TileInfo> functionTile;
+  if (resultTensorTy.getRank() == 3) {
+    auto funcOp = insertBefore->getParentOfType<mlir::triton::FuncOp>();
+    if (!funcOp)
+      return {};
+    functionTile = findTileInfo(funcOp);
+    if (!functionTile)
+      return {};
+    int64_t functionElements = 1;
+    for (auto dim : functionTile->shape)
+      functionElements *= dim;
+    int64_t resultElements = 1;
+    for (auto dim : resultTensorTy.getShape())
+      resultElements *= dim;
+    if (functionElements != resultElements)
+      return {};
+  }
+
   auto scalarDot = ScalarDotOp::create(builder, loc, resultTensorTy, aBuf, bBuf,
-                                       aBaseOffset, bBaseOffset, rowOrigin,
+                                       aBaseOffset, bBaseOffset, aBatchOffset,
+                                       bBatchOffset, batchOrigin, rowOrigin,
                                        colOrigin, strideA, strideB,
                                        reductionExtentUi32, cInit, weightBuf,
                                        partialExtents);
+  // Tensor values are scalarized inside one function-wide tile loop.  Record
+  // the exact loop geometry selected by FuncOpLowering so scalar_dot computes
+  // the logical element owned by the current (thread, iteration), even when a
+  // folded result convert changes the result encoding (for example #blocked1
+  // -> a strided #blocked2 in leading-unit rank-3 batched matmul).
+  if (functionTile) {
+    scalarDot->setAttr("metal.tile_elem_per_thread",
+                       builder.getI64IntegerAttr(
+                           functionTile->elemPerThread));
+    scalarDot->setAttr("metal.tile_threads_per_block",
+                       builder.getI64IntegerAttr(
+                           functionTile->threadsPerBlock));
+    if (functionTile->contiguous)
+      scalarDot->setAttr("metal.tile_contiguous", builder.getUnitAttr());
+  }
   if (transposeA)
     scalarDot->setAttr("transpose_a", builder.getUnitAttr());
   // Zero-init dot accumulator -> eligible for the SIMD-group fast path (the
@@ -14044,7 +14281,7 @@ static ScalarDotOp sdEmitScalarDot(mlir::Operation *insertBefore,
   // handled by masked staged loads whose extents ScalarDotLowering derives from
   // the store mask when present, else the full tile bounds). The warp count is
   // recovered in the pattern from the tile's threadsPerBlock.
-  if (sdIsZeroInit(cInit) && !weightLoad && !transposeA)
+  if (batchTile == 1 && sdIsZeroInit(cInit) && !weightLoad && !transposeA)
     scalarDot->setAttr("metal.simdgroup", builder.getUnitAttr());
   replaceTarget.replaceAllUsesWith(scalarDot.getResult());
   return scalarDot;
@@ -14069,16 +14306,47 @@ static void sdEraseCone(mlir::Value v) {
   }
 }
 
-// A standalone (non-loop) rank-2 f32 dot whose dims are multiples of 8 and
+// Extract the logical batch/matrix shape. Rank-2 is represented as one batch;
+// rank-3 keeps its static leading batch tile so ScalarDotLowering can
+// decompose the function-wide element index into (batch,row,column).
+static bool sdGetBatchedMatrixShape(mlir::RankedTensorType ty, int64_t &B,
+                                    int64_t &M, int64_t &N) {
+  if (!ty)
+    return false;
+  auto shape = ty.getShape();
+  if (ty.getRank() == 2) {
+    B = 1;
+    M = shape[0];
+    N = shape[1];
+    return true;
+  }
+  if (ty.getRank() == 3 && shape[0] > 0) {
+    B = shape[0];
+    M = shape[1];
+    N = shape[2];
+    return true;
+  }
+  return false;
+}
+
+static bool sdGetMatrixShape(mlir::RankedTensorType ty, int64_t &M,
+                             int64_t &N) {
+  int64_t B = 0;
+  return sdGetBatchedMatrixShape(ty, B, M, N);
+}
+
+// A standalone (non-loop) f32 matrix dot whose dims are multiples of 8 and
 // larger than a single 8x8 tile (iters==1 in the source: K <= TILE).
 static bool sdDotEligible(mlir::triton::DotOp dot) {
   if (!dot) return false;
   if (dot->getParentOfType<mlir::scf::ForOp>()) return false;
   auto rt = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
-  if (!rt || rt.getRank() != 2 || !rt.getElementType().isF32()) return false;
-  auto s = rt.getShape();
-  if (s[0] % 8 != 0 || s[1] % 8 != 0) return false;
-  if (s[0] == 8 && s[1] == 8) return false;
+  int64_t M = 0, N = 0;
+  if (!rt || !rt.getElementType().isF32() ||
+      !sdGetMatrixShape(rt, M, N))
+    return false;
+  if (M % 8 != 0 || N % 8 != 0) return false;
+  if (M == 8 && N == 8) return false;
   return true;
 }
 
@@ -14129,10 +14397,11 @@ static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   if (dots.size() != 1) return mlir::failure();
   auto dot = dots[0];
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
-  if (!resTy || resTy.getRank() != 2 || !resTy.getElementType().isF32())
+  int64_t matrixM = 0, matrixN = 0;
+  if (!resTy || !resTy.getElementType().isF32() ||
+      !sdGetMatrixShape(resTy, matrixM, matrixN))
     return mlir::failure();
-  auto s = resTy.getShape();
-  if (s[0] % 8 != 0 || s[1] % 8 != 0) return mlir::failure();
+  if (matrixM % 8 != 0 || matrixN % 8 != 0) return mlir::failure();
 
   // Single accumulator iter_arg. The dot yields into it, possibly with a
   // convert_layout on each side when the loop carries the accumulator in the
@@ -14379,13 +14648,14 @@ static void finalizeScalarDots(mlir::ModuleOp moduleOp) {
 // Lowers `metal.scalar_dot` (created by `tryScalarDotFallback`) to a per-thread
 // scalar reduction inside the tile loop. Under the tensor->scalar TypeConverter
 // the result is one f32 per (thread, tile-loop iteration); this thread's output
-// element is `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)` where
-// `lin = emitPerIterIndex` gives the row-major local-tile index. The reduction
+// element is `(localBatch, gRow, gCol)`, where `lin = emitPerIterIndex` gives
+// the row-major local-tile index and row/column origins make matrix coordinates
+// global. The reduction
 //   acc = c_init; for k in [0, reduction_extent): ...
 // Ordinary GEMM passes `stride_a` as the extent. Weighted-Gram passes the
 // sample count separately, reads transposed A, and multiplies by weight[k].
-// On tail tiles the whole reduction is
-// guarded by `gRow < m_extent && gCol < n_extent` to avoid OOB device reads.
+// On tail tiles the whole reduction is guarded by batch/M/N extents to avoid
+// out-of-bounds device reads.
 struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
@@ -14393,14 +14663,25 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
-    if (!resTy || resTy.getRank() != 2)
-      return rewriter.notifyMatchFailure(op, "scalar_dot: non-2D result");
+    int64_t B = 0, M = 0, N = 0;
+    if (!resTy || !sdGetBatchedMatrixShape(resTy, B, M, N))
+      return rewriter.notifyMatchFailure(
+          op, "scalar_dot: expected rank-2 or rank-3 result");
     auto elemTy = resTy.getElementType();
     if (!elemTy.isF32())
       return rewriter.notifyMatchFailure(op, "scalar_dot: non-f32 result");
     auto tileInfo = tileFromTensor(resTy);
     if (!tileInfo)
       return rewriter.notifyMatchFailure(op, "scalar_dot: no tile info");
+    auto tileE = op->getAttrOfType<mlir::IntegerAttr>(
+        "metal.tile_elem_per_thread");
+    auto tileT = op->getAttrOfType<mlir::IntegerAttr>(
+        "metal.tile_threads_per_block");
+    if (tileE && tileT) {
+      tileInfo->elemPerThread = tileE.getInt();
+      tileInfo->threadsPerBlock = tileT.getInt();
+      tileInfo->contiguous = op->hasAttr("metal.tile_contiguous");
+    }
 
     auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
     auto i32 = rewriter.getI32Type();
@@ -14438,7 +14719,6 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     // lockstep — the tiles are selected by the runtime warp index, never a
     // warp-divergent `if`. Each output tile is stored row-major into threadgroup
     // scratch; every thread then reloads its element for the epilogue.
-    int64_t M = resTy.getShape()[0], N = resTy.getShape()[1];
     const int mTiles = static_cast<int>(M / 8);
     const int nTiles = static_cast<int>(N / 8);
     int numWarps = std::max<int64_t>(1, tileInfo->threadsPerBlock / 32);
@@ -14447,7 +14727,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                         : factorWarps(numWarps, mTiles, nTiles);
     // `TRITON_METAL_SCALAR_DOT` forces the scalar reduction — an escape hatch
     // for debugging / A-B perf comparison, exercised by the scalar lit test.
-    if (op->hasAttr("metal.simdgroup") && !::getenv("TRITON_METAL_SCALAR_DOT") &&
+    if (B == 1 && op->hasAttr("metal.simdgroup") &&
+        !::getenv("TRITON_METAL_SCALAR_DOT") &&
         tileInfo->elemPerThread > 1 &&
         parentFor && M % 8 == 0 && N % 8 == 0 && wf) {
       const int warpsM = wf->first, warpsN = wf->second;
@@ -14618,15 +14899,30 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     }
     // ---- scalar fallback path ----------------------------------------------
     mlir::Value linI32 = toI32(linUi32);
+    auto cMatrixElements = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(M * N)));
     auto cN = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getI32IntegerAttr(
-                           static_cast<int32_t>(resTy.getShape()[1])));
+                           static_cast<int32_t>(N)));
+    mlir::Value localBatch = mlir::arith::DivSIOp::create(
+                                 rewriter, loc, linI32,
+                                 cMatrixElements.getResult())
+                                 .getResult();
+    mlir::Value matrixLin = mlir::arith::RemSIOp::create(
+                                rewriter, loc, linI32,
+                                cMatrixElements.getResult())
+                                .getResult();
     mlir::Value linRow =
-        mlir::arith::DivSIOp::create(rewriter, loc, linI32, cN.getResult())
+        mlir::arith::DivSIOp::create(rewriter, loc, matrixLin, cN.getResult())
             .getResult();
     mlir::Value linCol =
-        mlir::arith::RemSIOp::create(rewriter, loc, linI32, cN.getResult())
+        mlir::arith::RemSIOp::create(rewriter, loc, matrixLin, cN.getResult())
             .getResult();
+    mlir::Value gBatch = mlir::arith::AddIOp::create(
+                             rewriter, loc,
+                             toI32(adaptor.getBatchOrigin()), localBatch)
+                             .getResult();
     mlir::Value gRow = mlir::arith::AddIOp::create(
                            rewriter, loc, toI32(adaptor.getRowOrigin()), linRow)
                            .getResult();
@@ -14639,6 +14935,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         toI32(adaptor.getReductionExtent());
     mlir::Value aBaseI32 = toI32(adaptor.getABaseOffset());
     mlir::Value bBaseI32 = toI32(adaptor.getBBaseOffset());
+    mlir::Value aBatchI32 = toI32(adaptor.getABatchOffset());
+    mlir::Value bBatchI32 = toI32(adaptor.getBBatchOffset());
     mlir::Value cInit = adaptor.getCInit();
 
     // Device element types of A/B (may be f16/bf16); each read is extf'd to f32.
@@ -14676,8 +14974,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         b.setInsertionPointToStart(kLoop.getBody());
         mlir::Value k = kLoop.getInductionVar();
         mlir::Value acc = kLoop.getRegionIterArgs()[0];
-        // aIdx = aBase + gRow*stride_a + k
-        // bIdx = bBase + k*stride_b + gCol
+        // aIdx = aBase + aBatch + gRow*stride_a + k
+        // bIdx = bBase + bBatch + k*stride_b + gCol
         mlir::Value aLogicalIdx;
         if (op->hasAttr("transpose_a")) {
           aLogicalIdx = mlir::arith::AddIOp::create(
@@ -14697,11 +14995,17 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                             .getResult();
         }
         mlir::Value aIdx = mlir::arith::AddIOp::create(
-                               b, loc, aBaseI32, aLogicalIdx)
+                               b, loc,
+                               mlir::arith::AddIOp::create(
+                                   b, loc, aBaseI32, aBatchI32)
+                                   .getResult(),
+                               aLogicalIdx)
                                .getResult();
         mlir::Value bIdx =
             mlir::arith::AddIOp::create(
-                b, loc, bBaseI32,
+                b, loc,
+                mlir::arith::AddIOp::create(b, loc, bBaseI32, bBatchI32)
+                    .getResult(),
                 mlir::arith::AddIOp::create(
                     b, loc,
                     mlir::arith::MulIOp::create(b, loc, k, strideBI32)
@@ -14734,19 +15038,34 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     };
 
     mlir::Value result;
-    if (adaptor.getPartialExtents().size() == 2) {
-      // Tail-tile guard: only reduce when (gRow < M && gCol < N); otherwise the
-      // element is discarded by the epilogue's masked store, so yield c_init.
-      mlir::Value mExt = toI32(adaptor.getPartialExtents()[0]);
-      mlir::Value nExt = toI32(adaptor.getPartialExtents()[1]);
+    if (adaptor.getPartialExtents().size() == 2 ||
+        adaptor.getPartialExtents().size() == 3) {
+      // Tail-tile guard. Rank-3 multi-batch tiles carry the batch bound first;
+      // invalid lanes yield c_init and are discarded by the masked store.
+      bool hasBatchExtent = adaptor.getPartialExtents().size() == 3;
+      unsigned matrixExtentBase = hasBatchExtent ? 1 : 0;
+      mlir::Value mExt =
+          toI32(adaptor.getPartialExtents()[matrixExtentBase]);
+      mlir::Value nExt =
+          toI32(adaptor.getPartialExtents()[matrixExtentBase + 1]);
       auto rowOk = mlir::arith::CmpIOp::create(
           rewriter, loc, mlir::arith::CmpIPredicate::slt, gRow, mExt);
       auto colOk = mlir::arith::CmpIOp::create(
           rewriter, loc, mlir::arith::CmpIPredicate::slt, gCol, nExt);
-      auto cond = mlir::arith::AndIOp::create(rewriter, loc, rowOk.getResult(),
-                                              colOk.getResult());
+      mlir::Value cond = mlir::arith::AndIOp::create(
+                             rewriter, loc, rowOk.getResult(),
+                             colOk.getResult())
+                             .getResult();
+      if (hasBatchExtent) {
+        mlir::Value batchExt = toI32(adaptor.getPartialExtents()[0]);
+        auto batchOk = mlir::arith::CmpIOp::create(
+            rewriter, loc, mlir::arith::CmpIPredicate::slt, gBatch, batchExt);
+        cond = mlir::arith::AndIOp::create(
+                   rewriter, loc, batchOk.getResult(), cond)
+                   .getResult();
+      }
       auto scfIf = mlir::scf::IfOp::create(
-          rewriter, loc, mlir::TypeRange{elemTy}, cond.getResult(),
+          rewriter, loc, mlir::TypeRange{elemTy}, cond,
           /*addThenBlock=*/true, /*addElseBlock=*/true);
       {
         mlir::OpBuilder::InsertionGuard g(rewriter);
