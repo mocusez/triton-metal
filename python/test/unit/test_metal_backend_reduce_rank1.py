@@ -1,7 +1,9 @@
 """Rank-1 tt.reduce on the Metal backend (f32/i32, sum/max).
 
-All f32 rank-1 reduce cases (sum+max, BLOCK ∈ {32, 64, 128, 256, 512, 1024})
-pass end-to-end via the spt-fold in `lowerRank1Reduce`.
+The core f32 rank-1 reduce cases (sum+max,
+BLOCK ∈ {32, 64, 128, 256, 512, 1024}) pass end-to-end via the spt-fold in
+`lowerRank1Reduce`. A 4096-element constexpr-masked case and the Leet GroupNorm
+entry point cover the larger cyclic-tile and loop-offset paths.
 
 Kernel shape: load a row of length N from a 1D `!tt.ptr`, reduce via
 `tl.sum(row, axis=0)` or `tl.max(row, axis=0)`, store the resulting scalar.
@@ -10,6 +12,7 @@ Coverage:
   BLOCK_SIZE ∈ {32, 64, 128, 256, 512, 1024}
   dtype      ∈ {f32, i32}
   op         ∈ {sum, max}
+  integration: f32 sum with BLOCK=4096 and Leet GroupNorm
 
 Notes:
   - f32 sum+max: all 12 parametrized cases pass.
@@ -26,6 +29,9 @@ Notes:
 """
 
 from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -55,6 +61,18 @@ def reduce_sum_rank1_kernel(
     x = tl.load(x_ptr + offs)
     s = tl.sum(x, axis=0)
     tl.store(out_ptr + 0, s)
+
+
+@triton.jit
+def reduce_sum_rank1_constexpr_mask_kernel(
+    x_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs, mask=offs < N, other=0.0)
+    tl.store(out_ptr, tl.sum(x, axis=0))
 
 
 @triton.jit
@@ -156,6 +174,21 @@ def test_reduce_sum_rank1_f32(BLOCK):
     reduce_sum_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
     expected = torch.sum(x.cpu())
     torch.testing.assert_close(out[0].item(), expected.item(),
+                               atol=1e-3, rtol=1e-3)
+
+
+def test_reduce_sum_rank1_f32_block4096_constexpr_mask():
+    """A constexpr mask bound lowers from dense<splat>, not tt.splat."""
+    N = 1000
+    BLOCK = 4096
+    torch.manual_seed(0x4096)
+    x = torch.randn(N, dtype=torch.float32, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+    reduce_sum_rank1_constexpr_mask_kernel[(1,)](
+        x, out, N=N, BLOCK=BLOCK, num_warps=_NUM_WARPS
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x.cpu().sum().reshape(1),
                                atol=1e-3, rtol=1e-3)
 
 
@@ -340,3 +373,47 @@ def test_reduce_min_idx_computed_cone(B, V):
     sel = torch.where(cond, idx[None, :], torch.full_like(idx[None, :], V))
     expected = sel.min(dim=1).values.to(torch.int32)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+def _load_leet_group_norm_module():
+    path = (Path(__file__).resolve().parents[3] / "leet-triton" /
+            "medium-group-normalization.py")
+    assert path.is_file(), f"required leet-triton fixture not present: {path}"
+    spec = importlib.util.spec_from_file_location(
+        "leet_medium_group_normalization", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "shape,groups",
+    [
+        ((1, 4, 2, 2), 2),
+        ((1, 1, 64, 64), 1),
+        ((1, 2, 64, 64), 1),
+        ((8, 512, 64, 64), 32),
+    ],
+)
+def test_leet_group_normalization(shape, groups):
+    """The public Leet solve() compiles and matches PyTorch GroupNorm."""
+    module = _load_leet_group_norm_module()
+    n, c, h, w = shape
+    eps = 1e-5
+    torch.manual_seed(n * 1000 + c * 100 + h * 10 + w)
+    x_cpu = torch.randn(shape, dtype=torch.float32)
+    gamma_cpu = torch.randn(c, dtype=torch.float32)
+    beta_cpu = torch.randn(c, dtype=torch.float32)
+    expected = torch.nn.functional.group_norm(
+        x_cpu, groups, gamma_cpu, beta_cpu, eps
+    )
+
+    x = x_cpu.to("mps")
+    gamma = gamma_cpu.to("mps")
+    beta = beta_cpu.to("mps")
+    out = torch.empty_like(x)
+    module.solve(x, gamma, beta, out, n, c, h, w, groups, eps)
+    torch.mps.synchronize()
+
+    torch.testing.assert_close(out.cpu(), expected, atol=5e-4, rtol=5e-4)

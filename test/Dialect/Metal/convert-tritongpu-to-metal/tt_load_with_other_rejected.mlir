@@ -2,7 +2,7 @@
 //
 // Negative fixture: tt.load with an `other` operand feeding a `tt.dot`
 // operand position is rejected by the dot-prepass. Elementwise other-loads
-// are accepted via MaskedLoadLowering (Session L1, splat-constant only);
+// are accepted via MaskedLoadLowering (constant or runtime-uniform splat);
 // this fixture validates that the dot-operand-position guardrail remains
 // intact. See `.omc/specs/deep-interview-leet-triton-l1-refine-and-ship.md`
 // §3.0 ADR.

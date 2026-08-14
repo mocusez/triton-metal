@@ -1,9 +1,12 @@
-"""Session L1: tt.load with splat-constant `other` operand.
+"""Masked tt.load with constant and runtime-uniform `other` operands.
 
 Asserts that `tl.load(ptr, mask=m, other=splat_const)` on the elementwise
 path lowers correctly and produces bit-exact agreement with the CPU
 reference `torch.where(mask, x, other_scalar)`. The masked-off tail must
 carry the user-provided `other` value (not the v1 hardcoded zero).
+
+Also covers a dynamic scalar expression (`other - 1`) broadcast by Triton as a
+uniform `tt.splat`, including the signless-i32 to ui32 Metal storage bridge.
 
 See `.omc/specs/deep-interview-leet-triton-l1-refine-and-ship.md`.
 """
@@ -64,6 +67,39 @@ def test_masked_load_with_other_bit_exact(BLOCK_SIZE, OTHER):
     # bit-exact: the kernel just passes x through (no FP ops on the masked
     # path other than the splat-constant select).
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _masked_load_with_dynamic_other_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    other,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask, other=other - 1)
+    tl.store(output_ptr + offsets, x)
+
+
+def test_masked_load_with_dynamic_i32_other():
+    """A uniform runtime scalar may supply a masked load's `other` value."""
+    BLOCK_SIZE = 1024
+    N = 1000
+    other = 7
+    x_cpu = torch.arange(N, dtype=torch.int32)
+    x = x_cpu.to("mps")
+    out = torch.zeros(BLOCK_SIZE, dtype=torch.int32, device="mps")
+
+    _masked_load_with_dynamic_other_kernel[(1,)](
+        x, out, N, other, BLOCK_SIZE=BLOCK_SIZE
+    )
+    torch.mps.synchronize()
+
+    expected = torch.full((BLOCK_SIZE,), other - 1, dtype=torch.int32)
+    expected[:N] = x_cpu
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 @triton.jit

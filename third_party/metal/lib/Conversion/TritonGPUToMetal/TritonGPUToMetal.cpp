@@ -52,12 +52,15 @@ namespace {
 // `builtin.unrealized_conversion_cast`). This mirrors the scalar-wrap path's
 // `wrapperElementType` (:303) and `ReduceLowering`'s ui32 staging.
 //
-// Scope L2b: i32 ONLY. i8 stays signless (it is already in `Metal_Type`);
-// i16/i64 are out of scope per the spec's non-goals.
+// i8 stays signless (it is already in `Metal_Type`). Signless i32/i64 storage
+// uses the corresponding unsigned Metal type, then bridges back after loads;
+// this keeps PyTorch's standard int64 index tensors usable without changing
+// their bit representation. i16 remains out of scope.
 static mlir::Type metalStorageElementType(mlir::Type t) {
   if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(t))
-    if (intTy.isSignless() && intTy.getWidth() == 32)
-      return mlir::IntegerType::get(t.getContext(), 32,
+    if (intTy.isSignless() &&
+        (intTy.getWidth() == 32 || intTy.getWidth() == 64))
+      return mlir::IntegerType::get(t.getContext(), intTy.getWidth(),
                                     mlir::IntegerType::Unsigned);
   return t;
 }
@@ -65,14 +68,14 @@ static mlir::Type metalStorageElementType(mlir::Type t) {
 // Inverse of `metalStorageElementType`: bit-preserving cast of a value carrying
 // a SIGNED/UNSIGNED integer type back to the signless integer of the same width.
 //
-// Device buffers are typed with the ui32 storage element type (see
-// `wrapperElementType`), so a `metal.get_element` read inside a reduce/scan cone
-// yields a ui32 value. Every `arith.*` integer op — addi, cmpi, select, andi —
-// requires SIGNLESS operands ("operand #0 must be signless-non-zero-bitwidth-
-// integer-like"), so rebuilding an arith node directly on a cone leaf produced a
-// module that failed its own verifier. That is why `tl.sum(tl.where(v > 0, 1, 0))`
-// over an i32 buffer used to abort the pass while the leaf-only `tl.sum(v)` was
-// fine: only the former rebuilds arith ops on top of the leaf.
+// Signless i32/i64 device buffers use unsigned storage of the same width, so a
+// `metal.get_element` read inside a reduce/scan cone yields ui32/ui64. Every
+// `arith.*` integer op — addi, cmpi, select, andi — requires SIGNLESS operands
+// ("operand #0 must be signless-non-zero-bitwidth-integer-like"), so rebuilding
+// an arith node directly on a cone leaf produced a module that failed its own
+// verifier. That is why `tl.sum(tl.where(v > 0, 1, 0))` over an i32 buffer used
+// to abort the pass while the leaf-only `tl.sum(v)` was fine: only the former
+// rebuilds arith ops on top of the leaf.
 //
 // The emitter forwards `unrealized_conversion_cast` as a no-op (MSL treats int
 // and uint interchangeably in expression context), so this is free at runtime
@@ -3355,13 +3358,15 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
       richCone = true;
     }
     // Wall 7 (.omc/plans/tutorial02-wall7-masked-spt-reduce-consensus.md):
-    // masked tt.load extraction. Canonical mask shape only: cmpi slt
-    // (make_range start=0) (tt.splat scalar). Other shapes degrade to
-    // notifyMatchFailure preserving the original wall-6 reject semantics.
+    // masked tt.load extraction. Accepted mask shape: cmpi slt with a
+    // make_range(start=0), optionally offset by a uniform splat (tile loops),
+    // and a uniform RHS represented by tt.splat or a dense splat constant.
+    // Other shapes degrade to notifyMatchFailure.
     // TODO(Wall 8): tl.sum on arith.divf chain — input is non-load, current
     // 'src not produced by tt.load' reject at line ~1525 fires. See
     // .omc/specs/deep-interview-tutorial02-wall7-masked-spt-reduce.md §Risks.
     mlir::Value maskBoundN;       // i32 scalar; null = unmasked
+    mlir::Value maskIndexBase;    // uniform base in splat(base) + make_range
     mlir::TypedAttr otherAttrPre; // populated only if user provided `other`
     if (!richCone && loadOp.getMask()) {
       mlir::Value maskVal = loadOp.getMask();
@@ -3385,17 +3390,57 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
             "rank-1 reduce B2.3 masked: mask not cmpi slt "
             "(see .omc/specs/deep-interview-tutorial02-wall7-masked-spt-reduce"
             ".md AC2)");
-      auto range =
-          cmp.getLhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+      mlir::Value maskIndex = cmp.getLhs();
+      auto range = maskIndex.getDefiningOp<mlir::triton::MakeRangeOp>();
+      if (!range) {
+        // A reduce nested in a tile loop uses absolute logical indices:
+        //   splat(loop_iv) + make_range(0, BLOCK)
+        // Keep the uniform base for both the replayed load address and mask.
+        if (auto add = maskIndex.getDefiningOp<mlir::arith::AddIOp>()) {
+          auto lhsSplat =
+              add.getLhs().getDefiningOp<mlir::triton::SplatOp>();
+          auto rhsSplat =
+              add.getRhs().getDefiningOp<mlir::triton::SplatOp>();
+          if (lhsSplat) {
+            range =
+                add.getRhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+            maskIndexBase = lhsSplat.getSrc();
+          } else if (rhsSplat) {
+            range =
+                add.getLhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+            maskIndexBase = rhsSplat.getSrc();
+          }
+        }
+      }
       if (!range || range.getStart() != 0)
         return rewriter.notifyMatchFailure(
             op,
-            "rank-1 reduce B2.3 masked: mask lhs not make_range(start=0)");
+            "rank-1 reduce B2.3 masked: mask lhs is neither "
+            "make_range(start=0) nor splat(base) + make_range(start=0)");
+      if (maskIndexBase) {
+        auto ptrAdd =
+            loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+        if (!ptrAdd || ptrAdd.getOffset() != maskIndex)
+          return rewriter.notifyMatchFailure(
+              op, "rank-1 reduce B2.3 masked: loop-offset mask does not "
+                  "match the load pointer offset");
+      }
       auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>();
-      if (!splat)
+      if (splat) {
+        maskBoundN = splat.getSrc();
+      } else if (auto boundAttr = extractSplatConstantAttr(cmp.getRhs());
+                 boundAttr && boundAttr->getType() == i32) {
+        // A constexpr bound (for example GroupNorm's M = Cg * HW) is folded
+        // by Triton to `arith.constant dense<M>` instead of `tt.splat %M`.
+        // Both forms are uniform scalar bounds once the tensor is replayed
+        // element-by-element, so materialize the dense splat's scalar value.
+        maskBoundN = mlir::arith::ConstantOp::create(rewriter, loc, *boundAttr)
+                         .getResult();
+      } else {
         return rewriter.notifyMatchFailure(
-            op, "rank-1 reduce B2.3 masked: mask rhs not tt.splat");
-      maskBoundN = splat.getSrc();
+            op, "rank-1 reduce B2.3 masked: mask rhs is neither tt.splat "
+                "nor an i32 dense splat constant");
+      }
       if (loadOp.getOther()) {
         auto opt = extractSplatConstantAttr(loadOp.getOther());
         if (!opt)
@@ -3475,6 +3520,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
       // `addrUI32` adds `scalarOff` so the per-row addressing is correct for
       // softmax-style kernels.
       scalarOff = accumulateScalarAddPtrOffsets(loadOp.getPtr(), rewriter, loc);
+      if (maskIndexBase) {
+        scalarOff = scalarOff
+                        ? mlir::arith::AddIOp::create(
+                              rewriter, loc, scalarOff, maskIndexBase)
+                              .getResult()
+                        : maskIndexBase;
+      }
     }
     // Wall 15: re-roll the Wall-14 per-k unroll into a single scf.for + f32
     // iter_arg accumulator. ModuleTranslation::translate(scf::ForOp)
@@ -3592,8 +3644,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
       mlir::Value condKResult;
       if (maskBoundN) {
         // Wall 7 masked path inside the loop body.
+        mlir::Value maskIdxI32 = idxI32;
+        if (maskIndexBase)
+          maskIdxI32 = mlir::arith::AddIOp::create(
+                           rewriter, loc, maskIdxI32, maskIndexBase)
+                           .getResult();
         auto condK = mlir::arith::CmpIOp::create(
-            rewriter, loc, mlir::arith::CmpIPredicate::slt, idxI32,
+            rewriter, loc, mlir::arith::CmpIPredicate::slt, maskIdxI32,
             maskBoundN);
         condKResult = condK.getResult();
         auto scfIf = mlir::scf::IfOp::create(
@@ -3835,12 +3892,13 @@ static mlir::Value peelShapeOps(mlir::Value v) {
   return v;
 }
 
-// Symbolically evaluate the SCALAR i32 value of an index cone `v` at logical
-// element position `idx` (an i32 scalar). Walks the ORIGINAL Triton cone:
-// make_range(start s) -> idx + s; tt.splat(x) -> x; addi/muli/subi -> scalar
-// arith; shape-only ops -> recurse operand 0. Returns null on any unsupported
-// op. Lets the contiguous-masked-reduce path re-derive a per-element device
-// index / mask bound without the canonical `slt make_range(0) splat` shape.
+// Symbolically evaluate the SCALAR integer value of an index cone `v` at
+// logical element position `idx` (an i32 scalar). Walks the ORIGINAL Triton
+// cone: make_range(start s) -> idx + s; tt.splat(x) -> x; integer
+// arithmetic/casts -> scalar arithmetic; tt.load -> the loaded scalar at idx;
+// shape-only ops -> recurse operand 0. Returns null on any unsupported op. Lets
+// the contiguous-masked-reduce path re-derive a per-element device index / mask
+// bound without the canonical `slt make_range(0) splat` shape.
 static mlir::Value scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
                                         mlir::ConversionPatternRewriter &rewriter,
                                         mlir::Location loc, int depth = 0) {
@@ -3876,6 +3934,29 @@ static mlir::Value scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
     return mlir::arith::ConstantOp::create(
                rewriter, loc, dense.getSplatValue<mlir::TypedAttr>())
         .getResult();
+  }
+  // Gather indices commonly contain a widened row offset plus an integer
+  // label loaded from another tensor. Reuse the general rank-1 evaluator for
+  // these nodes; when it reaches the label load's own pointer offset, that
+  // simpler cone recurses back here and terminates at make_range/scalars.
+  if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
+                mlir::arith::TruncIOp>(def))
+    return evalRank1ValueAt(v, idx, rewriter, loc, depth + 1);
+  if (mlir::isa<mlir::triton::LoadOp>(def)) {
+    mlir::Value loaded = evalRank1ValueAt(v, idx, rewriter, loc, depth + 1);
+    if (!loaded)
+      return {};
+    // Device integer storage is unsigned (ui32/ui64), while the original
+    // Triton index cone is signless. Bridge the loaded bits back to the
+    // logical element type before rebuilding arith.addi/muli/subi.
+    auto logicalTy =
+        mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
+    if (loaded.getType() != logicalTy)
+      loaded = mlir::UnrealizedConversionCastOp::create(
+                   rewriter, loc, mlir::TypeRange{logicalTy},
+                   mlir::ValueRange{loaded})
+                   .getResult(0);
+    return loaded;
   }
   auto recurse2 = [&](mlir::Value a, mlir::Value b,
                       auto make) -> mlir::Value {
@@ -4643,6 +4724,16 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
                                         toSignlessInt(x, rewriter, loc))
         .getResult();
   }
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtSIOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(ext.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::ExtSIOp::create(rewriter, loc,
+                                        signlessEltOf(ext.getType()),
+                                        toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
   if (auto trunc = mlir::dyn_cast<mlir::arith::TruncIOp>(def)) {
     mlir::Value x =
         evalRank1ValueAt(trunc.getIn(), idxVal, rewriter, loc, depth + 1);
@@ -4919,7 +5010,9 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return nullptr;
 
   // tt.load leaf: re-materialise the address from the load's OWN tt.addptr
-  // chain, evaluated at (rVal, nVal).
+  // chain, evaluated at (rVal, nVal). Masked loads must replay their mask and
+  // `other` value too: the ordinary MaskedLoadLowering never materialises this
+  // load because the reduce consumes the original tensor cone directly.
   //
   // This used to read `device[rowBase + nVal]`, where `rowBase` is derived once
   // from the reduce's REPRESENTATIVE load. That silently assumes every load in
@@ -4950,8 +5043,49 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
         mlir::UnrealizedConversionCastOp::create(
             rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{addr})
             .getResult(0);
-    return GetElementOp::create(rewriter, loc, eltTy, memref, idxUI32)
-        .getResult();
+    if (!load.getMask())
+      return GetElementOp::create(rewriter, loc, eltTy, memref, idxUI32)
+          .getResult();
+
+    mlir::Value cond = evalRank2ConeAt(load.getMask(), rVal, rowBase, nVal,
+                                       rewriter, loc, depth + 1);
+    if (!cond)
+      return nullptr;
+    mlir::Value otherV;
+    if (load.getOther()) {
+      otherV = evalRank2ConeAt(load.getOther(), rVal, rowBase, nVal, rewriter,
+                               loc, depth + 1);
+      if (!otherV)
+        return nullptr;
+      if (otherV.getType() != eltTy)
+        otherV =
+            mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{eltTy}, mlir::ValueRange{otherV})
+                .getResult(0);
+    } else {
+      auto zeroAttr =
+          mlir::isa<mlir::FloatType>(eltTy)
+              ? mlir::cast<mlir::TypedAttr>(rewriter.getFloatAttr(eltTy, 0.0))
+              : mlir::cast<mlir::TypedAttr>(rewriter.getIntegerAttr(eltTy, 0));
+      otherV = ConstantOp::create(rewriter, loc, zeroAttr).getResult();
+    }
+    auto scfIf =
+        mlir::scf::IfOp::create(rewriter, loc, mlir::TypeRange{eltTy}, cond,
+                                /*addThenBlock=*/true,
+                                /*addElseBlock=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&scfIf.getThenRegion().front());
+      auto el = GetElementOp::create(rewriter, loc, eltTy, memref, idxUI32);
+      mlir::scf::YieldOp::create(rewriter, loc,
+                                 mlir::ValueRange{el.getResult()});
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&scfIf.getElseRegion().front());
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{otherV});
+    }
+    return scfIf.getResult(0);
   }
 
   // Unary math → metal.unary_exp.
@@ -5320,6 +5454,11 @@ static bool indexConeSupported(mlir::Value v, int depth) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
     return dense && dense.isSplat();
   }
+  if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
+                mlir::arith::TruncIOp>(def))
+    return indexConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::triton::LoadOp>(def))
+    return rank1ConeSupported(v, depth + 1);
   if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp, mlir::arith::SubIOp>(
           def))
     return indexConeSupported(def->getOperand(0), depth + 1) &&
@@ -5401,9 +5540,10 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
     return rank1ConeSupported(s.getIn(), depth + 1);
   if (auto s = mlir::dyn_cast<mlir::arith::UIToFPOp>(def))
     return rank1ConeSupported(s.getIn(), depth + 1);
-  // Integer width casts mirror the ExtUIOp/TruncIOp cases in evalRank1ValueAt.
+  // Integer width casts mirror the corresponding cases in evalRank1ValueAt.
   if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp,
-                mlir::arith::ExtUIOp, mlir::arith::TruncIOp>(def))
+                mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
+                mlir::arith::TruncIOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
   if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
                 mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
@@ -5450,8 +5590,15 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
     return false;
-  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def))
-    return load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>() != nullptr;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    if (!load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
+      return false;
+    if (load.getMask() && !rank2ConeSupported(load.getMask(), depth + 1))
+      return false;
+    if (load.getOther() && !rank2ConeSupported(load.getOther(), depth + 1))
+      return false;
+    return true;
+  }
   if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
     return rank2ConeSupported(bc.getSrc(), depth + 1);
   if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
@@ -8434,13 +8581,13 @@ emitTileAwareMask(llvm::ArrayRef<MaskComponent> shapes, const TileInfo &tile,
 // Masked tt.load → scf.if (yields `other` scalar or zero on the masked-off
 // branch).
 //
-// Restricted to (addr, mask[, other]) shape. The `other` operand is accepted
-// only when its producer SSA chain is a splat-constant: either
-// `tt.splat(arith.constant scalar)` or `arith.constant dense<splat>` —
-// matching the canonical Triton emit for `tl.load(..., other=0.0)`. Non-splat
-// `other` is rejected with a clear diagnostic. Restricted to float element
-// types in this slice; integer masked loads are next-session work. Session L1
-// of `.omc/specs/deep-interview-leet-triton-l1-refine-and-ship.md`.
+// Restricted to (addr, mask[, other]) shape. The `other` operand may be either
+// a splat-constant (`tt.splat(arith.constant scalar)` / dense splat) or a
+// runtime-uniform `tt.splat` of a scalar expression. The latter is the shape
+// emitted for `tl.load(..., other=K - 1)`: the tensor-to-scalar TypeConverter
+// makes the adaptor operand a scalar, which the else branch can yield after a
+// logical-to-storage type bridge. A genuinely per-lane tensor `other` remains
+// unsupported and is rejected with a clear diagnostic.
 //===----------------------------------------------------------------------===//
 
 // Extract the splat scalar attribute behind `other`. Accepts both
@@ -8485,16 +8632,23 @@ struct MaskedLoadLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     if (!op.getMask())
       return mlir::failure();  // handled by LoadLowering
-    // `other` operand: accept only splat-constant producers. Non-splat (or
-    // dynamic) `other` is rejected here; the line-1868 dot-prepass handles
-    // the orthogonal restriction of "no `other` in `tt.dot` operand position".
+    // `other` operand: constants keep their literal materialization path;
+    // dynamic values must be a direct tt.splat of a runtime-uniform scalar.
+    // The dot prepass separately keeps every `other` out of tt.dot operands.
     std::optional<mlir::TypedAttr> otherSplatAttr;
+    mlir::Value dynamicOther;
     if (op.getOther()) {
       otherSplatAttr = extractSplatConstantAttr(op.getOther());
-      if (!otherSplatAttr)
-        return rewriter.notifyMatchFailure(
-            op,
-            "tt.load `other` operand requires splat-constant producer");
+      if (!otherSplatAttr) {
+        if (!op.getOther().getDefiningOp<mlir::triton::SplatOp>())
+          return rewriter.notifyMatchFailure(
+              op, "tt.load dynamic `other` requires a uniform tt.splat");
+        dynamicOther = adaptor.getOther();
+        if (!dynamicOther ||
+            mlir::isa<mlir::RankedTensorType>(dynamicOther.getType()))
+          return rewriter.notifyMatchFailure(
+              op, "tt.load dynamic `other` did not scalarize");
+      }
     }
     auto loc = op.getLoc();
     // BLOCK=1 commonly folds `splat(ptr) + arange(0, 1)` into a uniform
@@ -8511,25 +8665,39 @@ struct MaskedLoadLowering
                                          "memref source not MetalMemRefType");
     auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
     auto elemTy = memrefTy.getType();
-    // L2b: accept FloatType OR a width-8/width-32 integer STORAGE type. `elemTy`
-    // is the memref storage type, so an i32 ptr already presents as ui32 here
-    // (routed by metalStorageElementType); i8 stays signless i8. Other integer
-    // widths (i1/i16/i64) are still rejected; widen only when a leet needs them.
+    // Accept FloatType OR a width-8/width-32/width-64 integer STORAGE type.
+    // `elemTy` is the memref storage type, so an i32 ptr already presents as
+    // ui32 here (routed by metalStorageElementType); i8 stays signless i8, and
+    // i64 is used by PyTorch class-index tensors. i1/i16 remain unsupported.
     {
       bool isFloat = mlir::isa<mlir::FloatType>(elemTy);
       auto intTy = mlir::dyn_cast<mlir::IntegerType>(elemTy);
       bool isI8 = intTy && intTy.getWidth() == 8;
       bool isI32 = intTy && intTy.getWidth() == 32;
-      if (!isFloat && !isI8 && !isI32)
+      bool isI64 = intTy && intTy.getWidth() == 64;
+      if (!isFloat && !isI8 && !isI32 && !isI64)
         return rewriter.notifyMatchFailure(
-            op,
-            "masked tt.load: only float, i8 and i32 element types supported");
+            op, "masked tt.load: only float, i8, i32 and i64 element types "
+                "supported");
     }
 
     auto tile = tileFromLoadPtrTensor(op.getPtr().getType());
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.load operand missing ttg.blocked / ttg.slice layout");
+    if (dynamicOther && dynamicOther.getType() != elemTy) {
+      auto otherIntTy =
+          mlir::dyn_cast<mlir::IntegerType>(dynamicOther.getType());
+      auto elemIntTy = mlir::dyn_cast<mlir::IntegerType>(elemTy);
+      if (!otherIntTy || !elemIntTy ||
+          otherIntTy.getWidth() != elemIntTy.getWidth())
+        return rewriter.notifyMatchFailure(
+            op, "tt.load dynamic `other` element type mismatches result");
+      dynamicOther = mlir::UnrealizedConversionCastOp::create(
+                         rewriter, loc, mlir::TypeRange{elemTy},
+                         mlir::ValueRange{dynamicOther})
+                         .getResult(0);
+    }
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value cond;
     if (tile->rank == 2) {
@@ -8585,42 +8753,48 @@ struct MaskedLoadLowering
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(&scfIf.getElseRegion().front());
-      // Else branch yields the user-provided splat-constant `other` scalar if
-      // present; otherwise zero. v1 supports float elem types only, and the
-      // splat-constant must match the load's element type.
-      mlir::TypedAttr elseAttr;
-      if (otherSplatAttr) {
-        auto a = *otherSplatAttr;
-        if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(a)) {
-          if (fa.getType() != elemTy)
-            return rewriter.notifyMatchFailure(
-                op, "tt.load `other` element type mismatches result");
-          elseAttr = fa;
-        } else if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(a)) {
-          // L2b: integer `other` splat-constant. The attr carries the tensor's
-          // (possibly signless) element type while `elemTy` is the storage
-          // type (ui32 for i32). Match on bit width and re-key the attr to the
-          // storage type so the emitted metal.constant satisfies Metal_Type.
-          auto iaTy = mlir::dyn_cast<mlir::IntegerType>(ia.getType());
-          auto elTy = mlir::dyn_cast<mlir::IntegerType>(elemTy);
-          if (!iaTy || !elTy || iaTy.getWidth() != elTy.getWidth())
-            return rewriter.notifyMatchFailure(
-                op, "tt.load `other` element type mismatches result");
-          elseAttr = rewriter.getIntegerAttr(elemTy, ia.getValue());
-        } else {
-          return rewriter.notifyMatchFailure(
-              op,
-              "tt.load `other`: only float or integer splat-constants supported");
-        }
-      } else if (mlir::isa<mlir::FloatType>(elemTy)) {
-        elseAttr = rewriter.getFloatAttr(elemTy, 0.0);
+      // Else branch yields the user-provided constant/uniform dynamic `other`
+      // scalar if present; otherwise zero. Integer device storage is unsigned,
+      // so dynamic signless integers need the same bit-preserving bridge used
+      // by stores and atomics.
+      mlir::Value elseValue;
+      if (dynamicOther) {
+        elseValue = dynamicOther;
       } else {
-        // L2b: default-zero for integer element types (i8 today).
-        elseAttr = rewriter.getIntegerAttr(elemTy, 0);
+        mlir::TypedAttr elseAttr;
+        if (otherSplatAttr) {
+          auto a = *otherSplatAttr;
+          if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(a)) {
+            if (fa.getType() != elemTy)
+              return rewriter.notifyMatchFailure(
+                  op, "tt.load `other` element type mismatches result");
+            elseAttr = fa;
+          } else if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(a)) {
+            // L2b: integer `other` splat-constant. The attr carries the
+            // tensor's (possibly signless) element type while `elemTy` is the
+            // storage type (ui32 for i32). Match on bit width and re-key the
+            // attr to the storage type so the emitted metal.constant satisfies
+            // Metal_Type.
+            auto iaTy = mlir::dyn_cast<mlir::IntegerType>(ia.getType());
+            auto elTy = mlir::dyn_cast<mlir::IntegerType>(elemTy);
+            if (!iaTy || !elTy || iaTy.getWidth() != elTy.getWidth())
+              return rewriter.notifyMatchFailure(
+                  op, "tt.load `other` element type mismatches result");
+            elseAttr = rewriter.getIntegerAttr(elemTy, ia.getValue());
+          } else {
+            return rewriter.notifyMatchFailure(
+                op, "tt.load `other`: only float or integer splat-constants "
+                    "supported");
+          }
+        } else if (mlir::isa<mlir::FloatType>(elemTy)) {
+          elseAttr = rewriter.getFloatAttr(elemTy, 0.0);
+        } else {
+          elseAttr = rewriter.getIntegerAttr(elemTy, 0);
+        }
+        elseValue = ConstantOp::create(rewriter, loc, elemTy, elseAttr);
       }
-      auto elseVal = ConstantOp::create(rewriter, loc, elemTy, elseAttr);
       mlir::scf::YieldOp::create(rewriter,
-          loc, mlir::ValueRange{elseVal.getResult()});
+          loc, mlir::ValueRange{elseValue});
     }
     // L2b: the scf.if yields the storage type (ui32 for i32). Bridge back to
     // the tensor's signless element type so downstream signless arith is sound.
@@ -18513,7 +18687,7 @@ struct ConvertTritonGPUToMetalPass
     // Reject tt.load with an `other` operand only when it feeds a `tt.dot`
     // operand position. The matmul track does not (yet) honour Triton `other`
     // semantics under the simdgroup rewrite. Elementwise other-loads are
-    // handled by MaskedLoadLowering (Session L1, splat-constant only). See
+    // handled by MaskedLoadLowering (constant or runtime-uniform splat). See
     // `.omc/specs/deep-interview-leet-triton-l1-refine-and-ship.md` §3.0 ADR.
     bool otherOk = true;
     moduleOp.walk([&](mlir::triton::LoadOp load) {

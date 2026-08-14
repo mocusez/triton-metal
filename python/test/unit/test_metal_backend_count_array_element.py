@@ -31,6 +31,9 @@ bug, not the backend's, so the cases below use K != 0 and
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -137,6 +140,61 @@ def test_k_zero_counts_masked_padding():
     _solve(inp, out, N, 0, BLOCK_SIZE=BLOCK)
     padding = triton.cdiv(N, BLOCK) * BLOCK - N
     assert out.cpu().item() == padding
+
+
+def _load_leet_count_module(filename: str):
+    path = Path(__file__).resolve().parents[3] / "leet-triton" / filename
+    assert path.is_file(), f"required leet-triton fixture not present: {path}"
+    module_name = "leet_triton_" + filename.removesuffix(".py").replace("-", "_")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "N,M,K",
+    [
+        (1, 1, 3),
+        (64, 64, 5),       # exactly one 4096-element block
+        (65, 64, 0),       # masked tail; dynamic other=K-1 must not match K
+        (257, 193, 6),     # multiple programs with a masked tail
+    ],
+)
+def test_leet_count_2d_actual_file_matches_torch(N, M, K):
+    module = _load_leet_count_module("medium-count_2d_array_element.py")
+    torch.manual_seed(0x2D00 + N * 17 + M)
+    inp_cpu = torch.randint(0, 8, (N, M), dtype=torch.int32)
+    inp = inp_cpu.to("mps")
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+
+    module.solve(inp, out, N, M, K)
+    torch.mps.synchronize()
+
+    assert out.cpu().item() == (inp_cpu == K).sum().item()
+
+
+@pytest.mark.parametrize(
+    "N,M,K,P",
+    [
+        (1, 1, 1, 3),
+        (8, 8, 16, 5),     # exactly one 1024-element block
+        (9, 8, 16, 4),     # multiple programs with a masked tail
+        (9, 8, 15, -1),    # sentinel value is also a legitimate target
+    ],
+)
+def test_leet_count_3d_actual_file_matches_torch(N, M, K, P):
+    module = _load_leet_count_module("medium-count_3d_array_element.py")
+    torch.manual_seed(0x3D00 + N * 17 + M * 3 + K)
+    inp_cpu = torch.randint(-2, 8, (N, M, K), dtype=torch.int32)
+    inp = inp_cpu.to("mps")
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+
+    module.solve(inp, out, N, M, K, P)
+    torch.mps.synchronize()
+
+    assert out.cpu().item() == (inp_cpu == P).sum().item()
 
 
 @triton.jit

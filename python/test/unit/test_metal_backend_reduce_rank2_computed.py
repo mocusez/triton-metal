@@ -294,3 +294,83 @@ def test_rank2_three_chained_reduces(M, N):
     ref = (p * vc).sum(1) / p.sum(1)
     err = (o.cpu().double() - ref).abs().max() / max(ref.abs().max().item(), 1.0)
     assert err <= 2e-6, f"rel err {err}"
+
+
+# --- Leet categorical cross entropy ---------------------------------------
+#
+# This is the verbatim kernel shape from
+# `leet-triton/medium-categorical_cross_entropy_loss.py`.  It combines three
+# previously independent paths in one launch:
+#
+# * a masked rank-2 computed reduce whose `other=-inf` must survive cone replay,
+# * an int64 label gather (PyTorch's standard class-index dtype), and
+# * a second rank-1 reduce over the gathered logits, including BLOCK_N=128.
+
+
+@triton.jit
+def _categorical_cross_entropy_kernel(
+    logits_ptr,
+    labels_ptr,
+    loss_ptr,
+    n_rows,
+    n_classes,
+    BLOCK_N: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = rows < n_rows
+    class_mask = tl.arange(0, BLOCK_C) < n_classes
+
+    offsets = n_classes * rows[:, None] + tl.arange(0, BLOCK_C)[None, :]
+    mask = row_mask[:, None] & class_mask[None, :]
+    logits = tl.load(logits_ptr + offsets, mask=mask, other=float("-inf"))
+
+    result = tl.exp(logits)
+    result = tl.where(row_mask, tl.sum(result, axis=1), 1.0)
+    result = tl.sum(tl.log(result), axis=0)
+
+    labels = tl.load(labels_ptr + rows, mask=row_mask, other=0)
+    selected_offsets = n_classes * rows + labels
+    selected = tl.load(logits_ptr + selected_offsets, mask=row_mask)
+    result -= tl.sum(selected, axis=0)
+    result /= n_rows
+    tl.atomic_add(loss_ptr, result, sem="relaxed")
+
+
+@pytest.mark.parametrize(
+    "n_rows,n_classes",
+    [
+        (17, 7),       # BLOCK_N=128: small-class gather-reduce path
+        (37, 9),       # non-power-of-two class mask with substantial padding
+        (130, 17),     # non-power-of-two classes and multiple programs
+        (5, 512),      # int64 label load with a small BLOCK_N
+    ],
+)
+def test_categorical_cross_entropy(n_rows, n_classes):
+    torch.manual_seed(0xCCE + n_rows * 1000 + n_classes)
+    logits_cpu = torch.randn(n_rows, n_classes, dtype=torch.float32)
+    labels_cpu = torch.randint(
+        0, n_classes, (n_rows,), dtype=torch.int64
+    )
+    logits = logits_cpu.to("mps")
+    labels = labels_cpu.to("mps")
+    loss = torch.zeros(1, dtype=torch.float32, device="mps")
+
+    block_c = triton.next_power_of_2(n_classes)
+    block_n = 1024 // block_c
+    _categorical_cross_entropy_kernel[(triton.cdiv(n_rows, block_n),)](
+        logits,
+        labels,
+        loss,
+        n_rows,
+        n_classes,
+        BLOCK_N=block_n,
+        BLOCK_C=block_c,
+    )
+    torch.mps.synchronize()
+
+    expected = torch.nn.functional.cross_entropy(logits_cpu, labels_cpu)
+    torch.testing.assert_close(
+        loss.cpu().squeeze(), expected, atol=2e-5, rtol=1e-5
+    )
