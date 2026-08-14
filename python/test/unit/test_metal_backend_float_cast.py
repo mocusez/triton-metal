@@ -93,6 +93,24 @@ def _bool_to_float_after_reduce_kernel(x_ptr, out_ptr, N,
     tl.store(out_ptr + row, selected, mask=mask)
 
 
+@triton.jit
+def _fptosi_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = x.to(tl.int32)
+    tl.store(out_ptr + offs, y, mask=mask)
+
+
+@triton.jit
+def _fptoui_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = x.to(tl.uint32)
+    tl.store(out_ptr + offs, y, mask=mask)
+
+
 @pytest.mark.parametrize("N", [17, 1000])
 def test_bool_to_float_after_reduce(N):
     """A slice-encoded i1 tile must scalarize through arith.uitofp."""
@@ -105,3 +123,31 @@ def test_bool_to_float_after_reduce(N):
     torch.mps.synchronize()
     expected = ((x.cpu() * x.cpu()).sum(dim=1) < 25.0).float()
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("N", [17, 1000])
+def test_fptosi_runtime_truncates_toward_zero(N):
+    torch.manual_seed(N)
+    x = (torch.randn(N, dtype=torch.float32, device="mps") * 100.0).contiguous()
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _fptosi_kernel[(1,)](x, out, N, BLOCK=triton.next_power_of_2(N))
+    torch.mps.synchronize()
+    expected = torch.trunc(x.cpu()).to(torch.int32)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("N", [17, 1000])
+def test_fptoui_runtime_truncates_toward_zero(N):
+    # Include the upper half of u32 so a mistaken signed MSL cast is visible.
+    # Near 2^32, fp32 values are spaced by 256; all values below are exact.
+    values = torch.tensor(
+        [0.0, 1.75, float(2**31), float(2**31 + 256), float(2**32 - 256)],
+        dtype=torch.float32,
+        device="mps",
+    )
+    x = values.repeat((N + values.numel() - 1) // values.numel())[:N].contiguous()
+    out = torch.empty(N, dtype=torch.uint32, device="mps")
+    _fptoui_kernel[(1,)](x, out, N, BLOCK=triton.next_power_of_2(N))
+    torch.mps.synchronize()
+    expected = torch.trunc(x.cpu()).to(torch.uint32)
+    assert out.cpu().tolist() == expected.tolist()

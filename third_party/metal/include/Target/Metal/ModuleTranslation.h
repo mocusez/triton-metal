@@ -113,6 +113,7 @@ private:
   void translate(mlir::triton::metal::ThreadgroupPrefixSumOp op);
   void translate(mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp op);
   void translate(mlir::triton::metal::ThreadgroupAffinePrefixScanOp op);
+  void translate(mlir::triton::metal::AtomicCasOp op);
   void translate(mlir::triton::metal::AtomicRmwOp op);
   void translate(mlir::triton::metal::IfOp op);
   void translate(mlir::triton::metal::WhileOp op);
@@ -193,6 +194,9 @@ private:
   void translate(mlir::triton::metal::BitcastOp op);
   void translate(mlir::triton::metal::UnaryExpOp op);
   void translate(mlir::triton::metal::BinaryExpOp op);
+  void translate(mlir::triton::metal::FmaOp op);
+  void translate(mlir::triton::metal::ClampFOp op);
+  void translate(mlir::triton::metal::MulHiUIOp op);
   void translate(mlir::triton::metal::YieldWhileOp op);
 
   // SIMD-group matrix translators. Emit the modern Metal 17.5 surface

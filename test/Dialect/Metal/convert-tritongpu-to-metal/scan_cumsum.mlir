@@ -75,6 +75,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %o_0, %cs, %m_0 : tensor<16x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // Same one-input/one-result add scan envelope, but reverse=true. The result
+  // remains indexed in the original logical order: out[i] = sum(in[i:]).
+  tt.func public @k_reverse(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) attributes {noinline = false} {
+    %off = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %i = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %i_0 = tt.addptr %i, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %i_0 : tensor<1024x!tt.ptr<f32>, #blocked>
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = true}> ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.scan.return %s : f32
+    }) : (tensor<1024xf32, #blocked>) -> tensor<1024xf32, #blocked>
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %o_0, %cs : tensor<1024x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 } loc(#loc)
 #loc1 = loc("/tmp/dump_scan_ttgir.py":10:9)
 #loc2 = loc("/tmp/dump_scan_ttgir.py":7:9)
@@ -117,6 +135,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.threadgroup_alloca : !metal.memref<128 x f32>
 // CHECK: arith.select
 // CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 128 : i64, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel k_reverse
+// CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 1024 : i64, reverse, tpb = 128 : i64}
 // CHECK-NOT: tt.scan
 
 // -----

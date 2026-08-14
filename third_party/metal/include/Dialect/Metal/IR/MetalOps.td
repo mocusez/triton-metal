@@ -267,6 +267,28 @@ def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
 }
 
 //===----------------------------------------------------------------------===//
+// AtomicCasOp
+//===----------------------------------------------------------------------===//
+
+def AtomicCasOp : Metal_Op<"atomic_cas"> {
+  let summary = "Atomic compare-and-swap on a 32-bit device-memory element.";
+  let description = [{
+    Atomically compares `memref[index]` against `cmp` and stores `value` when
+    equal, yielding the old value observed at the memory location. NOT `Pure`:
+    it has a device-memory side effect and must be emitted even when its result
+    is unused.
+  }];
+
+  let arguments = (ins Metal_Type:$cmp, Metal_Type:$value,
+                       Metal_MemRefType:$memref, UI32:$index);
+  let results = (outs Metal_Type:$result);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$cmp `,` $value `,` $memref `[` $index `]` attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
 // ThreadIdOp
 //===----------------------------------------------------------------------===//
 
@@ -356,13 +378,15 @@ def UnaryExpOperatorCos : I64EnumAttrCase<"cosOp", 8>;
 // fold log2(e) into their scale and use exp2, and a decay mask depends on
 // exp2(-inf) == 0 exactly.
 def UnaryExpOperatorExp2 : I64EnumAttrCase<"exp2Op", 9>;
+def UnaryExpOperatorLog2 : I64EnumAttrCase<"log2Op", 10>;
+def UnaryExpOperatorAbs : I64EnumAttrCase<"absOp", 11>;
 
 def UnaryExpOperator : I64EnumAttr<
     "UnaryExpOperator", "",
     [UnaryExpOperatorNot, UnaryExpOperatorMinus, UnaryExpOperatorExp,
      UnaryExpOperatorSqrt, UnaryExpOperatorErf, UnaryExpOperatorLog,
      UnaryExpOperatorRsqrt, UnaryExpOperatorSin, UnaryExpOperatorCos,
-     UnaryExpOperatorExp2]> {
+     UnaryExpOperatorExp2, UnaryExpOperatorLog2, UnaryExpOperatorAbs]> {
   let cppNamespace = "mlir::triton::metal";
 }
 
@@ -444,6 +468,80 @@ def BinaryExpOp : Metal_Op<"binary_exp", [Pure]> {
   let hasVerifier = 1;
 
   let assemblyFormat = "$lhs `,` $rhs `,` $binaryOperator  attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// FmaOp
+//===----------------------------------------------------------------------===//
+
+def FmaOp : Metal_Op<"fma", [Pure]> {
+  let summary = "Fused f32 multiply-add expression";
+  let description = [{
+    Computes `fma(a, b, c)` with one fused rounding. This is first-class rather
+    than represented as `a * b + c` so Triton `math.fma` can preserve fused
+    semantics through Metal emission.
+  }];
+
+  let arguments = (ins F32:$a, F32:$b, F32:$c);
+  let results = (outs F32:$result);
+
+  let builders = [
+    OpBuilder<(ins "Value":$a, "Value":$b, "Value":$c)>
+  ];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$a `,` $b `,` $c attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// ClampFOp
+//===----------------------------------------------------------------------===//
+
+def ClampFOp : Metal_Op<"clampf", [Pure]> {
+  let summary = "Clamp an f32 value with explicit input-NaN propagation";
+  let description = [{
+    Computes `fmin(fmax(x, min), max)`. When `propagateNan` is true, an NaN
+    value of `x` is returned directly instead of being consumed by the
+    number-preferring min/max operations. Triton leaves NaN bounds undefined,
+    so only `x` participates in the explicit propagation rule.
+  }];
+
+  let arguments = (ins F32:$x, F32:$min, F32:$max,
+                        BoolAttr:$propagateNan);
+  let results = (outs F32:$result);
+
+  let builders = [
+    OpBuilder<(ins "Value":$x, "Value":$min, "Value":$max,
+                   "bool":$propagateNan)>
+  ];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$x `,` $min `,` $max `,` `propagate_nan` `=` $propagateNan attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// MulHiUIOp
+//===----------------------------------------------------------------------===//
+
+def MulHiUIOp : Metal_Op<"mulhi_ui", [Pure]> {
+  let summary = "High half of an unsigned 32x32-bit or 64x64-bit product";
+  let description = [{
+    For ui32, zero-extends both operands to 64 bits and returns bits 32..63.
+    For ui64, uses an exact 32-bit-limb decomposition and returns bits 64..127
+    without requiring a 128-bit MSL type. Operands/results are explicitly
+    unsigned so signless Triton integers cannot be sign-extended.
+  }];
+
+  let arguments = (ins AnyUnsignedInteger:$x, AnyUnsignedInteger:$y);
+  let results = (outs AnyUnsignedInteger:$result);
+
+  let builders = [OpBuilder<(ins "Value":$x, "Value":$y)>];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$x `,` $y attr-dict `:` functional-type(operands, results)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -987,7 +1085,8 @@ def ThreadgroupPrefixSumOp : Metal_Op<"threadgroup_prefix_sum",
   }];
 
   let arguments = (ins Metal_MemRefType:$inbuf, Metal_MemRefType:$outbuf,
-                       I64Attr:$block, I64Attr:$tpb);
+                       I64Attr:$block, I64Attr:$tpb,
+                       OptionalAttr<UnitAttr>:$reverse);
 
   let assemblyFormat =
       "$inbuf `,` $outbuf attr-dict `:` type($inbuf) `,` type($outbuf)";

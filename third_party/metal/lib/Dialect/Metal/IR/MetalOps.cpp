@@ -582,6 +582,28 @@ llvm::LogicalResult AtomicRmwOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// AtomicCasOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult AtomicCasOp::verify() {
+  auto memRef = llvm::cast<MetalMemRefType>(getMemref().getType());
+  mlir::Type memType = memRef.getType();
+  mlir::Type cmpType = getCmp().getType();
+  mlir::Type valueType = getValue().getType();
+  mlir::Type resultType = getResult().getType();
+  if (cmpType != valueType || cmpType != resultType)
+    return emitOpError() << "requires cmp, value, and result types to match";
+
+  auto cmpInt = llvm::dyn_cast<mlir::IntegerType>(cmpType);
+  auto memInt = llvm::dyn_cast<mlir::IntegerType>(memType);
+  if (!cmpInt || cmpInt.getWidth() != 32 || !memInt ||
+      memInt.getWidth() != 32)
+    return emitOpError(
+        "requires 32-bit integer cmp/value/result and storage");
+  return checkIndex(*this, memRef, getIndex());
+}
+
+//===----------------------------------------------------------------------===//
 // GetElementOp
 //===----------------------------------------------------------------------===//
 
@@ -697,9 +719,11 @@ llvm::LogicalResult UnaryExpOp::verify() {
     break;
   case OP::expOp:
   case OP::exp2Op:
+  case OP::log2Op:
   case OP::sqrtOp:
   case OP::erfOp:
   case OP::logOp:
+  case OP::absOp:
   case OP::rsqrtOp:
   case OP::sinOp:
   case OP::cosOp:
@@ -737,9 +761,11 @@ mlir::OpFoldResult UnaryExpOp::fold(FoldAdaptor adaptor) {
   }
   case mlir::triton::metal::UnaryExpOperator::expOp:
   case mlir::triton::metal::UnaryExpOperator::exp2Op:
+  case mlir::triton::metal::UnaryExpOperator::log2Op:
   case mlir::triton::metal::UnaryExpOperator::sqrtOp:
   case mlir::triton::metal::UnaryExpOperator::erfOp:
   case mlir::triton::metal::UnaryExpOperator::logOp:
+  case mlir::triton::metal::UnaryExpOperator::absOp:
   case mlir::triton::metal::UnaryExpOperator::rsqrtOp:
   case mlir::triton::metal::UnaryExpOperator::sinOp:
   case mlir::triton::metal::UnaryExpOperator::cosOp:
@@ -815,6 +841,65 @@ llvm::LogicalResult BinaryExpOp::verify() {
       return emitOpError() << "result type mismatch";
     break;
   }
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// FmaOp
+//===----------------------------------------------------------------------===//
+
+void FmaOp::build(OpBuilder &builder, OperationState &result, Value a, Value b,
+                  Value c) {
+  result.addTypes(a.getType());
+  result.addOperands({a, b, c});
+}
+
+llvm::LogicalResult FmaOp::verify() {
+  if (!getA().getType().isF32() || !getB().getType().isF32() ||
+      !getC().getType().isF32() || !getResult().getType().isF32())
+    return emitOpError() << "requires f32 operands and result";
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// ClampFOp
+//===----------------------------------------------------------------------===//
+
+void ClampFOp::build(OpBuilder &builder, OperationState &result, Value x,
+                     Value min, Value max, bool propagateNan) {
+  result.addTypes(x.getType());
+  result.addOperands({x, min, max});
+  result.addAttribute("propagateNan", builder.getBoolAttr(propagateNan));
+}
+
+llvm::LogicalResult ClampFOp::verify() {
+  if (!getX().getType().isF32() || !getMin().getType().isF32() ||
+      !getMax().getType().isF32() || !getResult().getType().isF32())
+    return emitOpError() << "requires f32 operands and result";
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// MulHiUIOp
+//===----------------------------------------------------------------------===//
+
+void MulHiUIOp::build(OpBuilder &builder, OperationState &result, Value x,
+                      Value y) {
+  result.addTypes(x.getType());
+  result.addOperands({x, y});
+}
+
+llvm::LogicalResult MulHiUIOp::verify() {
+  auto isSupportedUnsigned = [](mlir::Type type) {
+    auto intTy = mlir::dyn_cast<mlir::IntegerType>(type);
+    return intTy && (intTy.getWidth() == 32 || intTy.getWidth() == 64) &&
+           intTy.isUnsigned();
+  };
+  if (!isSupportedUnsigned(getX().getType()) ||
+      getY().getType() != getX().getType() ||
+      getResult().getType() != getX().getType())
+    return emitOpError()
+           << "requires matching ui32 or ui64 operands and result";
   return mlir::success();
 }
 

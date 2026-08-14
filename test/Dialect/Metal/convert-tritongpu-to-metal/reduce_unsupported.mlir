@@ -48,21 +48,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// Unsupported combine op → "reduce combine requires Session L3c". NB: float
-// `arith.maxnumf` is now ACCEPTED by the pre-pass (tl.max rank-1 needs it), so
-// the still-unsupported combine probed here is integer `arith.maxsi` — its
-// si-compare lowering path is the L3c deliverable.
+// Unsupported combine op → "reduce combine requires Session L3c". Signed
+// i32 max/min are now accepted for rank-1 and rank-2, so integer product remains
+// as the representative unsupported combine.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_maxsi(%x_ptr: !tt.ptr<i32>) {
+  tt.func public @reduce_muli(%x_ptr: !tt.ptr<i32>) {
     %x = arith.constant dense<0> : tensor<16x32xi32, #blocked>
-    // expected-error @+1 {{reduce combine requires Session L3c (future) — got arith.maxsi}}
+    // expected-error @+1 {{reduce combine requires Session L3c (future) — got arith.muli}}
     %r = "tt.reduce"(%x) ({
+    ^bb0(%a: i32, %b: i32):
+      %m = arith.muli %a, %b : i32
+      tt.reduce.return %m : i32
+    }) {axis = 1 : i32} : (tensor<16x32xi32, #blocked>) -> tensor<16xi32, #slice1>
+    tt.return
+  }
+}
+
+// -----
+// Rank-2 axis=1 i32 extrema currently support a direct unmasked load only.
+// Keep the adjacent computed-cone shape behind a stable pre-pass diagnostic.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_maxsi_computed_deferred(%x_ptr: !tt.ptr<i32>) {
+    %r0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %r1 = tt.expand_dims %r0 {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
+    %offs = tt.broadcast %r1 : tensor<1x16xi32, #blocked> -> tensor<8x16xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<i32> -> tensor<8x16x!tt.ptr<i32>, #blocked>
+    %ap = tt.addptr %sp, %offs : tensor<8x16x!tt.ptr<i32>, #blocked>, tensor<8x16xi32, #blocked>
+    %x = tt.load %ap : tensor<8x16x!tt.ptr<i32>, #blocked>
+    %one = arith.constant dense<1> : tensor<8x16xi32, #blocked>
+    %computed = arith.addi %x, %one : tensor<8x16xi32, #blocked>
+    // expected-error @+1 {{rank-2 axis=1 i32 max/min requires a direct unmasked tt.load}}
+    %r = "tt.reduce"(%computed) ({
     ^bb0(%a: i32, %b: i32):
       %m = arith.maxsi %a, %b : i32
       tt.reduce.return %m : i32
-    }) {axis = 1 : i32} : (tensor<16x32xi32, #blocked>) -> tensor<16xi32, #slice1>
+    }) {axis = 1 : i32} : (tensor<8x16xi32, #blocked>) -> tensor<8xi32, #slice1>
     tt.return
   }
 }

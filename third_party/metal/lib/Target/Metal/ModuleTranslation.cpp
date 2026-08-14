@@ -363,7 +363,8 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicCasOp,
+            mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
@@ -417,7 +418,8 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicCasOp,
+            mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
@@ -516,6 +518,40 @@ void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
   printDelim();
 }
 
+void ModuleTranslation::translate(mlir::triton::metal::AtomicCasOp op) {
+  // Metal compare-exchange mutates the expected argument to the observed old
+  // value. Initialize that temp from Triton's cmp operand and expose the same
+  // temp as the op result.
+  auto valueInt = llvm::cast<mlir::IntegerType>(op.getValue().getType());
+  llvm::StringRef atomicTy = valueInt.isUnsigned() ? "atomic_uint"
+                                                   : "atomic_int";
+  unsigned expectedIdx = _varCount++;
+  if (!op.getResult().use_empty())
+    _buffers[op.getResult().getAsOpaquePointer()] = expectedIdx;
+
+  _output << typeToString(op.getResult().getType()) << " v" << expectedIdx
+          << " = ";
+  translateValueOrVarName(op.getCmp());
+  _output << ";\n";
+  indent();
+  // MSL exposes only weak compare-exchange. Retry a spurious failure while
+  // the observed value still equals Triton's compare operand; stop after a
+  // successful exchange or a real mismatch. This recovers strong CAS
+  // semantics while retaining the expected temporary as Triton's old value.
+  _output << "while (!atomic_compare_exchange_weak_explicit((device "
+          << atomicTy << "*)&";
+  translateVarName(op.getMemref());
+  _output << "[";
+  translateValueOrVarName(op.getIndex());
+  _output << "], &v" << expectedIdx << ", ";
+  translateValueOrVarName(op.getValue());
+  _output << ", memory_order_relaxed, memory_order_relaxed) && v"
+          << expectedIdx << " == ";
+  translateValueOrVarName(op.getCmp());
+  _output << ") {}";
+  printDelim();
+}
+
 void ModuleTranslation::translate(
     mlir::triton::metal::ThreadgroupPrefixSumOp op) {
   // Inclusive prefix-sum (cumsum) of inbuf -> outbuf over `block` elements,
@@ -528,6 +564,7 @@ void ModuleTranslation::translate(
   const int64_t BLOCK = op.getBlock();
   const int64_t TPB = op.getTpb();
   const int64_t E = BLOCK / TPB;
+  const bool REVERSE = op->hasAttr("reverse");
   auto bufName = [&](mlir::Value m) -> std::string {
     while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
       if (cast.getInputs().size() != 1)
@@ -559,9 +596,18 @@ void ModuleTranslation::translate(
   os << "    uint _ps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
   os << "    " << ELEM << " _ps_carry = " << ZERO << ";\n";
   os << "    for (uint _ps_k = 0u; _ps_k < " << S(E) << "u; ++_ps_k) {\n";
-  os << "      uint _ps_base = _ps_k * " << S(TPB) << "u;\n";
-  os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
-     << "[_ps_base + _ps_tid];\n";
+  if (REVERSE) {
+    os << "      uint _ps_base = " << S(BLOCK)
+       << "u - (_ps_k + 1u) * " << S(TPB) << "u;\n";
+    os << "      uint _ps_orig = _ps_base + " << S(TPB - 1)
+       << "u - _ps_tid;\n";
+    os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
+       << "[_ps_orig];\n";
+  } else {
+    os << "      uint _ps_base = _ps_k * " << S(TPB) << "u;\n";
+    os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
+       << "[_ps_base + _ps_tid];\n";
+  }
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      for (uint _ps_off = 1u; _ps_off < " << S(TPB)
      << "u; _ps_off <<= 1) {\n";
@@ -577,6 +623,13 @@ void ModuleTranslation::translate(
   os << "      " << OUT << "[_ps_base + _ps_tid] += _ps_carry;\n";
   os << "      _ps_carry += _ps_total;\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  if (REVERSE) {
+    os << "      " << ELEM << " _ps_result = " << OUT
+       << "[_ps_base + _ps_tid];\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      " << OUT << "[_ps_orig] = _ps_result;\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  }
   os << "    }\n";
   os << "  }\n";
 }
@@ -5720,6 +5773,9 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::math::CosOp, mlir::math::ErfOp, mlir::math::RsqrtOp,
                     mlir::triton::metal::BinaryExpOp,
                     mlir::triton::metal::UnaryExpOp,
+                    mlir::triton::metal::FmaOp,
+                    mlir::triton::metal::ClampFOp,
+                    mlir::triton::metal::MulHiUIOp,
                     mlir::triton::metal::GetElementOp>(&op)) {
         _output << "\n";
         indent();
@@ -5804,6 +5860,8 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             mlir::triton::metal::ThreadgroupsPerGridOp,
             mlir::triton::metal::CastOp, mlir::triton::metal::BitcastOp,
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
+            mlir::triton::metal::FmaOp, mlir::triton::metal::ClampFOp,
+            mlir::triton::metal::MulHiUIOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
         // Emit `(lhs <pred> rhs)` matching arith.cmpi semantics. Only the
@@ -5833,59 +5891,78 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << ")";
       })
       .Case<mlir::arith::CmpFOp>([&](mlir::arith::CmpFOp op) {
-        // Emit `(lhs <pred> rhs)` matching arith.cmpf semantics. Only the
-        // ordered predicates needed by the leaky_relu fixture are wired;
-        // extend as new fixtures land.
+        // Emit an exact scalar implementation of every arith.cmpf predicate.
+        // Plain MSL relations already implement ordered comparisons (except
+        // ONE) and unordered not-equal. The remaining predicates need
+        // explicit isnan terms to preserve MLIR's NaN semantics.
         using P = mlir::arith::CmpFPredicate;
-        const char *opStr = nullptr;
+        auto emitRelation = [&](llvm::StringRef relation) {
+          _output << "(";
+          translateValueOrVarName(op.getLhs());
+          _output << relation;
+          translateValueOrVarName(op.getRhs());
+          _output << ")";
+        };
+        auto emitIsNan = [&](mlir::Value value, bool negate) {
+          if (negate)
+            _output << "!";
+          _output << "metal::isnan(";
+          translateValueOrVarName(value);
+          _output << ")";
+        };
+        auto emitUnorderedRelation = [&](llvm::StringRef relation) {
+          _output << "(";
+          emitIsNan(op.getLhs(), false);
+          _output << " || ";
+          emitIsNan(op.getRhs(), false);
+          _output << " || ";
+          translateValueOrVarName(op.getLhs());
+          _output << relation;
+          translateValueOrVarName(op.getRhs());
+          _output << ")";
+        };
+
         switch (op.getPredicate()) {
-        // Ordered preds: MSL `>`/`<`/`==` on `float` return false on NaN,
-        // matching MLIR's ordered semantics.
-        case P::OEQ: opStr = " == "; break;
-        case P::OGT: opStr = " > ";  break;
-        case P::OGE: opStr = " >= "; break;
-        case P::OLT: opStr = " < ";  break;
-        case P::OLE: opStr = " <= "; break;
-        case P::ONE: opStr = " != "; break;
-        // Unordered not-equal: MSL `a != b` is true when either operand is NaN
-        // or they differ, matching `une` semantics (Triton lowers `x != y` to
-        // this). The `tl.atomic`-guarded subarray-sum kernels use `sum != 0`.
-        case P::UNE: opStr = " != "; break;
-        // Other unordered / non-ordered predicates: deferred. Listed explicitly
-        // so the diagnostic names the predicate that hit.
-        case P::UEQ:
-          llvm_unreachable(
-              "arith.cmpf UEQ (unordered ==) not yet supported on Metal");
-        case P::UGT:
-          llvm_unreachable(
-              "arith.cmpf UGT (unordered >) not yet supported on Metal");
-        case P::UGE:
-          llvm_unreachable(
-              "arith.cmpf UGE (unordered >=) not yet supported on Metal");
-        case P::ULT:
-          llvm_unreachable(
-              "arith.cmpf ULT (unordered <) not yet supported on Metal");
-        case P::ULE:
-          llvm_unreachable(
-              "arith.cmpf ULE (unordered <=) not yet supported on Metal");
+        case P::OEQ: emitRelation(" == "); break;
+        case P::OGT: emitRelation(" > "); break;
+        case P::OGE: emitRelation(" >= "); break;
+        case P::OLT: emitRelation(" < "); break;
+        case P::OLE: emitRelation(" <= "); break;
+        case P::ONE:
+          _output << "(";
+          emitIsNan(op.getLhs(), true);
+          _output << " && ";
+          emitIsNan(op.getRhs(), true);
+          _output << " && ";
+          translateValueOrVarName(op.getLhs());
+          _output << " != ";
+          translateValueOrVarName(op.getRhs());
+          _output << ")";
+          break;
+        case P::UEQ: emitUnorderedRelation(" == "); break;
+        case P::UGT: emitUnorderedRelation(" > "); break;
+        case P::UGE: emitUnorderedRelation(" >= "); break;
+        case P::ULT: emitUnorderedRelation(" < "); break;
+        case P::ULE: emitUnorderedRelation(" <= "); break;
+        // MSL `!=` is true if either operand is NaN, exactly matching UNE.
+        case P::UNE: emitRelation(" != "); break;
         case P::ORD:
-          llvm_unreachable(
-              "arith.cmpf ORD (ordered, neither is NaN) not yet supported on Metal");
+          _output << "(";
+          emitIsNan(op.getLhs(), true);
+          _output << " && ";
+          emitIsNan(op.getRhs(), true);
+          _output << ")";
+          break;
         case P::UNO:
-          llvm_unreachable(
-              "arith.cmpf UNO (unordered, at least one NaN) not yet supported on Metal");
-        case P::AlwaysTrue:
-          llvm_unreachable(
-              "arith.cmpf AlwaysTrue not yet supported on Metal");
-        case P::AlwaysFalse:
-          llvm_unreachable(
-              "arith.cmpf AlwaysFalse not yet supported on Metal");
+          _output << "(";
+          emitIsNan(op.getLhs(), false);
+          _output << " || ";
+          emitIsNan(op.getRhs(), false);
+          _output << ")";
+          break;
+        case P::AlwaysTrue: _output << "true"; break;
+        case P::AlwaysFalse: _output << "false"; break;
         }
-        _output << "(";
-        translateValueOrVarName(op.getLhs());
-        _output << opStr;
-        translateValueOrVarName(op.getRhs());
-        _output << ")";
       })
       .Case<mlir::arith::ConstantOp>([&](mlir::arith::ConstantOp op) {
         // arith.constant (signless integer or float) survives in the masked
@@ -6412,6 +6489,16 @@ void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
     translateArgument();
     _output << ")";
     break;
+  case OP::log2Op:
+    _output << "metal::precise::log2(";
+    translateArgument();
+    _output << ")";
+    break;
+  case OP::absOp:
+    _output << "metal::fabs(";
+    translateArgument();
+    _output << ")";
+    break;
   case OP::rsqrtOp:
     _output << "metal::precise::rsqrt(";
     translateArgument();
@@ -6503,6 +6590,109 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   _output << " (";
   translateValueOrVarName(op.getRhs());
   _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::FmaOp op) {
+  _output << "metal::precise::fma(";
+  translateValueOrVarName(op.getA());
+  _output << ", ";
+  translateValueOrVarName(op.getB());
+  _output << ", ";
+  translateValueOrVarName(op.getC());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
+  auto emitClamp = [&]() {
+    _output << "metal::fmin(metal::fmax(";
+    translateValueOrVarName(op.getX());
+    _output << ", ";
+    translateValueOrVarName(op.getMin());
+    _output << "), ";
+    translateValueOrVarName(op.getMax());
+    _output << ")";
+  };
+
+  if (!op.getPropagateNan()) {
+    emitClamp();
+    return;
+  }
+
+  // Triton PropagateNan::ALL applies only to x; NaN bounds are undefined.
+  // Preserve x itself so its NaN payload/sign are not unnecessarily replaced.
+  _output << "(metal::isnan(";
+  translateValueOrVarName(op.getX());
+  _output << ") ? ";
+  translateValueOrVarName(op.getX());
+  _output << " : ";
+  emitClamp();
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::MulHiUIOp op) {
+  auto intTy = mlir::cast<mlir::IntegerType>(op.getResult().getType());
+  if (intTy.getWidth() == 32) {
+    _output << "(uint32_t)((((uint64_t)(";
+    translateValueOrVarName(op.getX());
+    _output << ")) * ((uint64_t)(";
+    translateValueOrVarName(op.getY());
+    _output << "))) >> 32u)";
+    return;
+  }
+
+  // Hacker's Delight unsigned 64x64 high-product decomposition, expanded as
+  // one pure expression because value translation occurs inside its consumer.
+  // Let x0/y0 be low 32-bit limbs and x1/y1 be high limbs:
+  //   t = x1*y0 + high(x0*y0)
+  //   hi = x1*y1 + high(t) + high(low(t) + x0*y1)
+  // Each intermediate fits in uint64_t, so this is exact without uint128.
+  auto emitX = [&] { translateValueOrVarName(op.getX()); };
+  auto emitY = [&] { translateValueOrVarName(op.getY()); };
+  auto emitX0 = [&] {
+    _output << "((uint64_t)(";
+    emitX();
+    _output << ") & 0xfffffffful)";
+  };
+  auto emitY0 = [&] {
+    _output << "((uint64_t)(";
+    emitY();
+    _output << ") & 0xfffffffful)";
+  };
+  auto emitX1 = [&] {
+    _output << "((uint64_t)(";
+    emitX();
+    _output << ") >> 32u)";
+  };
+  auto emitY1 = [&] {
+    _output << "((uint64_t)(";
+    emitY();
+    _output << ") >> 32u)";
+  };
+  auto emitT = [&] {
+    _output << "(";
+    emitX1();
+    _output << " * ";
+    emitY0();
+    _output << " + ((";
+    emitX0();
+    _output << " * ";
+    emitY0();
+    _output << ") >> 32u))";
+  };
+
+  _output << "(";
+  emitX1();
+  _output << " * ";
+  emitY1();
+  _output << " + (";
+  emitT();
+  _output << " >> 32u) + (((";
+  emitT();
+  _output << " & 0xfffffffful) + (";
+  emitX0();
+  _output << " * ";
+  emitY1();
+  _output << ")) >> 32u))";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::YieldWhileOp op) {

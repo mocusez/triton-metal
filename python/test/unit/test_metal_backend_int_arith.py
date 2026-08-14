@@ -146,6 +146,16 @@ def _select_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, tl.where(cond, x, y))
 
 
+@triton.jit
+def _umulhi_u64_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask, other=0)
+    y = tl.load(y_ptr + offs, mask=mask, other=0)
+    high = tl.umulhi(x, y)
+    tl.store(out_ptr + offs, high, mask=mask)
+
+
 _SIGNATURE_1ARG = {"out_ptr": "*fp32", "BLOCK": "constexpr"}
 _SIGNATURE_SELECT = {
     "x_ptr": "*fp32",
@@ -214,6 +224,73 @@ def test_select_f32_runtime_bit_exact():
     mask = torch.arange(BLOCK) < N
     expected = torch.where(mask, x, y)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_umulhi_u64_compiles_exact_limb_msl():
+    src = ASTSource(
+        fn=_umulhi_u64_kernel,
+        signature={
+            "x_ptr": "*u64",
+            "y_ptr": "*u64",
+            "out_ptr": "*u64",
+            "N": "i32",
+            "BLOCK": "constexpr",
+        },
+        constexprs={"BLOCK": 8},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    compiled = triton.compile(src, target=target, options={"num_warps": 1})
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "uint128" not in msl
+    assert "0xfffffffful" in msl
+    assert msl.count(">> 32u") >= 4
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_umulhi_u64_runtime_edge_carries():
+    """Lock the exact high 64 bits, especially both limb-carry terms."""
+    max_u64 = 2**64 - 1
+    x_host = [
+        0,
+        1,
+        max_u64,
+        2**63,
+        0xFFFFFFFF00000000,
+        0x00000000FFFFFFFF,
+        0xFEDCBA9876543210,
+        0xFFFFFFFF7FFFFFFF,
+    ]
+    y_host = [
+        max_u64,
+        1,
+        max_u64,
+        2,
+        0x00000001FFFFFFFF,
+        0xFFFFFFFF00000001,
+        0x0123456789ABCDEF,
+        0x80000001FFFFFFFF,
+    ]
+    expected_host = [(x * y) >> 64 for x, y in zip(x_host, y_host)]
+    x = torch.tensor(x_host, dtype=torch.uint64, device="mps")
+    y = torch.tensor(y_host, dtype=torch.uint64, device="mps")
+    out = torch.tensor([0] * len(x_host), dtype=torch.uint64, device="mps")
+
+    compiled = _umulhi_u64_kernel.warmup(
+        x, y, out, len(x_host), BLOCK=8, grid=(1,)
+    )
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "uint128" not in msl
+    assert "0xfffffffful" in msl
+
+    _umulhi_u64_kernel[(1,)](x, y, out, len(x_host), BLOCK=8)
+    torch.mps.synchronize()
+    assert out.cpu().tolist() == expected_host
 
 
 @triton.jit

@@ -1,4 +1,5 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
 // W2a fixture (`metal-lora-linear-fix-plan.md`). Canonical 3-iter-arg matmul
 // (same shape as `dot_universal_grid.mlir`) but with a RUNTIME K-loop trip
@@ -19,7 +20,7 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @dot_dynamic_k(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %c_ptr: !tt.ptr<f32>, %K: i32, %stride_am: i32, %stride_bk: i32, %stride_cm: i32) {
+  tt.func public @dot_dynamic_k(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %c_ptr: !tt.ptr<f32>, %K: i32, %M: i32, %N: i32, %stride_am: i32, %stride_bk: i32, %stride_cm: i32) {
     %acc = arith.constant dense<0.000000e+00> : tensor<8x8xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
     %cst = arith.constant dense<8> : tensor<8x8xi32, #blocked>
@@ -71,7 +72,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     %c_base = tt.addptr %c_base_sp, %c_row_off : tensor<8x1x!tt.ptr<f32>, #blocked>, tensor<8x1xi32, #blocked>
     %c_base_bc = tt.broadcast %c_base : tensor<8x1x!tt.ptr<f32>, #blocked> -> tensor<8x8x!tt.ptr<f32>, #blocked>
     %c_ptrs = tt.addptr %c_base_bc, %b_col_bc : tensor<8x8x!tt.ptr<f32>, #blocked>, tensor<8x8xi32, #blocked>
-    tt.store %c_ptrs, %loop#2 : tensor<8x8x!tt.ptr<f32>, #blocked>
+    // Local remaining-count mask. The store pointer already carries the
+    // program-grid origin, so comparing these aranges against %M/%N is in tile
+    // coordinates. The matcher must normalize each bound to origin+remaining
+    // before the MSL epilogue compares it with global gi/gj.
+    %offs_m_2d = tt.expand_dims %r0 {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %m_splat_2d = tt.splat %M : i32 -> tensor<8x1xi32, #blocked>
+    %m_cmp_2d = arith.cmpi slt, %offs_m_2d, %m_splat_2d : tensor<8x1xi32, #blocked>
+    %m_cmp_2d_bc = tt.broadcast %m_cmp_2d : tensor<8x1xi1, #blocked> -> tensor<8x8xi1, #blocked>
+    %offs_n_2d = tt.expand_dims %r1 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x8xi32, #blocked>
+    %n_splat_2d = tt.splat %N : i32 -> tensor<1x8xi32, #blocked>
+    %n_cmp_2d = arith.cmpi slt, %offs_n_2d, %n_splat_2d : tensor<1x8xi32, #blocked>
+    %n_cmp_2d_bc = tt.broadcast %n_cmp_2d : tensor<1x8xi1, #blocked> -> tensor<8x8xi1, #blocked>
+    %store_mask = arith.andi %m_cmp_2d_bc, %n_cmp_2d_bc : tensor<8x8xi1, #blocked>
+    tt.store %c_ptrs, %loop#2, %store_mask : tensor<8x8x!tt.ptr<f32>, #blocked>
     tt.return
   }
 }
@@ -84,4 +98,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: scf.for
 // CHECK: metal.simdgroup_multiply_accumulate
 // CHECK: metal.simdgroup_store
+// CHECK-SAME: partial
 // CHECK: metal.return
+
+// The local M/N bounds are normalized to global origins. This must not regress
+// to `gi < M && gj < N`, which drops every nonzero program tile.
+// MSL: uint gi =
+// MSL: uint gj =
+// MSL: if (gi <
+// MSL-SAME: +
+// MSL: && gj <
+// MSL-SAME: +
