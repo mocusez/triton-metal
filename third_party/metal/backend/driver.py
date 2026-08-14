@@ -199,7 +199,20 @@ class MetalUtils:
         import torch
         src = (kernel_bytes.decode() if isinstance(kernel_bytes, (bytes, bytearray))
                else kernel_bytes)
-        lib = torch.mps.compile_shader(src)
+        try:
+            lib = torch.mps.compile_shader(src)
+        except Exception as exc:
+            # MSL exposes 64-bit buffer min/max only through atomic_ulong and
+            # only on capable Apple GPUs. Keep the compiler's precise source
+            # location as the chained cause, but add the backend capability
+            # boundary that a raw MSL diagnostic cannot explain.
+            if "atomic_ulong" in src:
+                raise RuntimeError(
+                    "u64 atomic min/max requires an Apple8-or-newer GPU on "
+                    "macOS; signed i64 atomics and u64 old-value fetch are "
+                    "not supported by Metal"
+                ) from exc
+            raise
         kernel = getattr(lib, name)
         return lib, kernel, 32, 0, 1024
 
@@ -276,10 +289,10 @@ class MetalLauncher:
         # compile_shader's (threads = total grid threads, group_size = threads
         # per threadgroup): threadgroup_position_in_grid then enumerates
         # 0..gridX-1 == tl.program_id. MPS tensors bind directly (honoring
-        # storage_offset); Python scalars bind via setBytes into the 1-element
-        # `device T*` slots the emitter declares. No alloc/copy/free, ordered
-        # on PyTorch's MPS stream. The MPS path uses only tensor methods, so no
-        # `torch` module import is needed here.
+        # storage_offset); ordinary Python scalars bind via setBytes into the
+        # 1-element `device T*` slots the emitter declares, while u64 uses a
+        # one-element MPS tensor because compile_shader cannot cast Python ints
+        # to that slot type. Dispatch remains ordered on PyTorch's MPS stream.
         if launch_enter_hook is not None:
             launch_enter_hook(launch_metadata)
 
@@ -300,6 +313,15 @@ class MetalLauncher:
                 call_args.append(dev_t)
                 if dev_t is not t:
                     writeback.append((t, dev_t))
+            elif ty == "u64":
+                # compile_shader cannot bind a Python int directly to the
+                # device uint64_t[1] slot emitted for scalar Triton arguments.
+                # Materialize that one slot as an MPS tensor; the compiled
+                # kernel still sees the same by-value scalar at vN[0].
+                import torch
+                call_args.append(
+                    torch.tensor([arg], dtype=torch.uint64, device="mps")
+                )
             else:
                 call_args.append(arg)
 

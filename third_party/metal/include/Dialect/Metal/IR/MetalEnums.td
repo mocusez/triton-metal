@@ -23,10 +23,13 @@ def MetalReduceKindAttr : I64EnumAttr<
 def AtomicRmwKind_Add  : I32EnumAttrCase<"Add",  0>;
 def AtomicRmwKind_Max  : I32EnumAttrCase<"Max",  1>;
 def AtomicRmwKind_UMin : I32EnumAttrCase<"UMin", 2>;
+def AtomicRmwKind_Min  : I32EnumAttrCase<"Min",  3>;
+def AtomicRmwKind_UMax : I32EnumAttrCase<"UMax", 4>;
 
 def AtomicRmwKindAttr : I32EnumAttr<
     "AtomicRmwKind", "Atomic read-modify-write operation",
-    [AtomicRmwKind_Add, AtomicRmwKind_Max, AtomicRmwKind_UMin]> {
+    [AtomicRmwKind_Add, AtomicRmwKind_Max, AtomicRmwKind_UMin,
+     AtomicRmwKind_Min, AtomicRmwKind_UMax]> {
   let cppNamespace = "mlir::triton::metal";
 }
 

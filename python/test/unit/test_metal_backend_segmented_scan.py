@@ -31,6 +31,7 @@ pytest.importorskip(
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SEGMENTED_SCAN_PATH = REPO_ROOT / "leet-triton" / "medium-segmented_exclusive_prefix_sum.py"
 LINEAR_RECURRENCE_PATH = REPO_ROOT / "leet-triton" / "medium-linear_recurrence.py"
+STREAM_COMPACTION_PATH = REPO_ROOT / "leet-triton" / "medium-stream-compaction.py"
 TILE_SIZE = 65536
 BLOCK_SIZE = 4096
 
@@ -383,5 +384,53 @@ def test_original_linear_recurrence_solve_matches_reference(B, L):
     result = _run_child(script)
     assert result.returncode == 0, (
         f"linear recurrence solve failed for B={B}, L={L} "
+        f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
+)
+def test_original_stream_compaction_solve_matches_reference():
+    # Compile and launch the exact Leet file in a child process: before the
+    # rank-1 shared-cone normalization fix, aligned MPS tensors fail conversion
+    # and compiler cleanup may abort the process after the diagnostic.
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        from pathlib import Path
+
+        import torch
+
+        path = Path({str(STREAM_COMPACTION_PATH)!r})
+        spec = importlib.util.spec_from_file_location("stream_compaction_child", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        cases = [
+            torch.empty(0, dtype=torch.float32),
+            torch.tensor([3.0], dtype=torch.float32),
+            torch.arange(100, dtype=torch.float32) - 50,
+            (torch.arange(1024, dtype=torch.float32) % 11) - 5,
+            (torch.arange(4113, dtype=torch.float32) % 17) - 8,
+            torch.arange(1, 1501, dtype=torch.float32),
+            -torch.arange(1500, dtype=torch.float32),
+        ]
+        for values_cpu in cases:
+            values = values_cpu.to("mps")
+            output = torch.empty_like(values)
+            module.solve(values, values.numel(), output)
+            torch.mps.synchronize()
+
+            expected = torch.zeros_like(values_cpu)
+            kept = values_cpu[values_cpu > 0]
+            expected[: kept.numel()] = kept
+            torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+        """
+    )
+    result = _run_child(script)
+    assert result.returncode == 0, (
+        "original stream-compaction solve failed "
         f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )

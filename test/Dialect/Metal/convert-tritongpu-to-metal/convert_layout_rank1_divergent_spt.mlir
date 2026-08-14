@@ -41,10 +41,91 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %op, %cvt, %m1 : tensor<1024x!tt.ptr<f32>, #blocked1>
     tt.return
   }
+
+  // Exact producer-sharing shape emitted by medium-stream-compaction.py for
+  // aligned MPS tensors. The loaded value and predicate feed both the spt=1
+  // scan/scatter path and source-layout users, so the destination-layout
+  // branches must be cloned and genuinely re-encoded instead of forwarded as
+  // scalar identities.
+  tt.func public @stream_compaction_shared_cone(%a_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %out_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %block_offsets_ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 16 : i32}) {
+    %c1024 = arith.constant 1024 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<1024xf32, #blocked>
+    %pid = tt.get_program_id x : i32
+    %block_start = arith.muli %pid, %c1024 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %start = tt.splat %block_start : i32 -> tensor<1024xi32, #blocked>
+    %offsets = arith.addi %start, %range : tensor<1024xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %in_bounds = arith.cmpi slt, %offsets, %n_splat : tensor<1024xi32, #blocked>
+    %a_base = tt.splat %a_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %a_addresses = tt.addptr %a_base, %offsets : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %a = tt.load %a_addresses, %in_bounds, %zero : tensor<1024x!tt.ptr<f32>, #blocked>
+    %valid = arith.cmpf ogt, %a, %zero : tensor<1024xf32, #blocked>
+    %valid_scan = ttg.convert_layout %valid : tensor<1024xi1, #blocked> -> tensor<1024xi1, #blocked1>
+    %valid_i32 = arith.extui %valid_scan : tensor<1024xi1, #blocked1> to tensor<1024xi32, #blocked1>
+    %inclusive = "tt.scan"(%valid_i32) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: i32, %rhs: i32):
+      %sum = arith.addi %lhs, %rhs : i32
+      tt.scan.return %sum : i32
+    }) : (tensor<1024xi32, #blocked1>) -> tensor<1024xi32, #blocked1>
+    %local_offsets = arith.subi %inclusive, %valid_i32 : tensor<1024xi32, #blocked1>
+    %block_offset_ptr = tt.addptr %block_offsets_ptr, %pid : !tt.ptr<i32>, i32
+    %block_offset = tt.load %block_offset_ptr : !tt.ptr<i32>
+    %block_offset_splat = tt.splat %block_offset : i32 -> tensor<1024xi32, #blocked1>
+    %write_offsets = arith.addi %block_offset_splat, %local_offsets : tensor<1024xi32, #blocked1>
+    %write_mask = arith.andi %valid, %in_bounds : tensor<1024xi1, #blocked>
+    %out_base = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+    %out_addresses = tt.addptr %out_base, %write_offsets : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+    %store_value = ttg.convert_layout %a : tensor<1024xf32, #blocked> -> tensor<1024xf32, #blocked1>
+    %store_mask = ttg.convert_layout %write_mask : tensor<1024xi1, #blocked> -> tensor<1024xi1, #blocked1>
+    tt.store %out_addresses, %store_value, %store_mask : tensor<1024x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+
+  // Radix-style scatter: unlike stream compaction, both pointer and value are
+  // relabeled. The masked-store lowering peels this pair and stores in the
+  // source layout. The generic normalizer must not independently re-encode the
+  // pointer cone through its scan boundary.
+  tt.func public @scan_scatter_paired_relabels(%src_ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %dst_ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 16 : i32}) {
+    %zero = arith.constant dense<0> : tensor<1024xi32, #blocked>
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %range1 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked1>
+    %n_splat = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %n_splat1 = tt.splat %n : i32 -> tensor<1024xi32, #blocked1>
+    %valid = arith.cmpi slt, %range, %n_splat : tensor<1024xi32, #blocked>
+    %valid1 = arith.cmpi slt, %range1, %n_splat1 : tensor<1024xi32, #blocked1>
+    %src_base = tt.splat %src_ptr : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>, #blocked>
+    %src_addresses = tt.addptr %src_base, %range : tensor<1024x!tt.ptr<i32>, #blocked>, tensor<1024xi32, #blocked>
+    %values = tt.load %src_addresses, %valid, %zero : tensor<1024x!tt.ptr<i32>, #blocked>
+    %selected = arith.cmpi sgt, %values, %zero : tensor<1024xi32, #blocked>
+    %selected_i32 = arith.extui %selected : tensor<1024xi1, #blocked> to tensor<1024xi32, #blocked>
+    %inclusive = "tt.scan"(%selected_i32) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: i32, %rhs: i32):
+      %sum = arith.addi %lhs, %rhs : i32
+      tt.scan.return %sum : i32
+    }) : (tensor<1024xi32, #blocked>) -> tensor<1024xi32, #blocked>
+    %write_offsets = arith.subi %inclusive, %selected_i32 : tensor<1024xi32, #blocked>
+    %dst_base = tt.splat %dst_ptr : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>, #blocked>
+    %dst_addresses = tt.addptr %dst_base, %write_offsets : tensor<1024x!tt.ptr<i32>, #blocked>, tensor<1024xi32, #blocked>
+    %store_addresses = ttg.convert_layout %dst_addresses : tensor<1024x!tt.ptr<i32>, #blocked> -> tensor<1024x!tt.ptr<i32>, #blocked1>
+    %store_values = ttg.convert_layout %values : tensor<1024xi32, #blocked> -> tensor<1024xi32, #blocked1>
+    tt.store %store_addresses, %store_values, %valid1 : tensor<1024x!tt.ptr<i32>, #blocked1>
+    tt.return
+  }
 }
 
 // The pass must succeed (previously a hard error) and emit a Metal kernel; no
 // ttg.convert_layout survives the normalization + passthrough.
-// CHECK: metal.kernel
+// CHECK-LABEL: metal.kernel add_mixed_align
+// CHECK-NOT: ttg.convert_layout
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel stream_compaction_shared_cone
+// CHECK: metal.threadgroup_prefix_sum
+// CHECK-NOT: ttg.convert_layout
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel scan_scatter_paired_relabels
+// CHECK: metal.threadgroup_prefix_sum
 // CHECK-NOT: ttg.convert_layout
 // CHECK: metal.return

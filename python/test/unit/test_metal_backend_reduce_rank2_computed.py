@@ -374,3 +374,123 @@ def test_categorical_cross_entropy(n_rows, n_classes):
     torch.testing.assert_close(
         loss.cpu().squeeze(), expected, atol=2e-5, rtol=1e-5
     )
+
+
+# --- Leet token embedding + LayerNorm -------------------------------------
+#
+# Verbatim kernel shape from `leet-triton/medium-token_embedding_layer.py`.
+# It combines two rank-1 integer gathers, two rank-2 embedding gathers, and two
+# chained axis=1 reductions whose results are broadcast back into a tiled 2D
+# value.  The `position_ids[rows % T]` address also exercises signed remainder
+# while replaying a rank-1 load inside the computed-reduce cone.
+
+
+@triton.jit
+def _token_embedding_layernorm_kernel(
+    token_ids_ptr,
+    position_ids_ptr,
+    token_emb_ptr,
+    position_emb_ptr,
+    gamma_ptr,
+    beta_ptr,
+    output_ptr,
+    N,
+    T,
+    D,
+    eps,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    rows = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    row_mask = rows < N
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    mask2d = row_mask[:, None] & col_mask[None, :]
+
+    tok_ids = tl.load(token_ids_ptr + rows, mask=row_mask, other=0).to(tl.int64)
+    pos_ids = tl.load(
+        position_ids_ptr + rows % T, mask=row_mask, other=0
+    ).to(tl.int64)
+    emb_off = cols[None, :]
+    tok = tl.load(
+        token_emb_ptr + tok_ids[:, None] * D + emb_off,
+        mask=mask2d,
+        other=0.0,
+    ).to(tl.float32)
+    pos = tl.load(
+        position_emb_ptr + pos_ids[:, None] * D + emb_off,
+        mask=mask2d,
+        other=0.0,
+    ).to(tl.float32)
+    summed = tok + pos
+
+    mean = tl.sum(summed, axis=1) / D
+    diff = tl.where(mask2d, summed - mean[:, None], 0.0)
+    var = tl.sum(diff * diff, axis=1) / D
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    gamma = tl.load(gamma_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+    beta = tl.load(beta_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+    output = gamma[None, :] * diff * rstd[:, None] + beta[None, :]
+    out_off = rows.to(tl.int64)[:, None] * D + emb_off
+    tl.store(
+        output_ptr + out_off,
+        output.to(output_ptr.dtype.element_ty),
+        mask=mask2d,
+    )
+
+
+@pytest.mark.parametrize(
+    "B,T,V,P,D",
+    [
+        (1, 1, 8, 8, 32),
+        (2, 5, 31, 16, 64),
+        (3, 7, 23, 11, 33),
+        (9, 8, 31, 16, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_token_embedding_layernorm_matches_torch(B, T, V, P, D, dtype):
+    torch.manual_seed(0xEBD + B * 1009 + T * 101 + D)
+    eps = 1e-5
+    token_ids_cpu = torch.randint(0, V, (B, T), dtype=torch.int32)
+    position_ids_cpu = torch.randint(0, P, (T,), dtype=torch.int32)
+    token_emb_cpu = torch.randn(V, D, dtype=dtype)
+    position_emb_cpu = torch.randn(P, D, dtype=dtype)
+    gamma_cpu = torch.randn(D, dtype=dtype)
+    beta_cpu = torch.randn(D, dtype=dtype)
+    output = torch.empty(B, T, D, dtype=dtype, device="mps")
+
+    block_d = triton.next_power_of_2(D)
+    block_t = max(1, 4096 // block_d)
+    grid = (triton.cdiv(B * T, block_t),)
+    _token_embedding_layernorm_kernel[grid](
+        token_ids_cpu.to("mps"),
+        position_ids_cpu.to("mps"),
+        token_emb_cpu.to("mps"),
+        position_emb_cpu.to("mps"),
+        gamma_cpu.to("mps"),
+        beta_cpu.to("mps"),
+        output,
+        B * T,
+        T,
+        D,
+        eps,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        num_warps=8 if block_t * block_d >= 4096 else 4,
+    )
+    torch.mps.synchronize()
+
+    gathered = (
+        token_emb_cpu.float()[token_ids_cpu.long()]
+        + position_emb_cpu.float()[position_ids_cpu.long()].unsqueeze(0)
+    )
+    expected = torch.nn.functional.layer_norm(
+        gathered, (D,), gamma_cpu.float(), beta_cpu.float(), eps
+    )
+    atol = rtol = 1e-4 if dtype == torch.float32 else 5e-3
+    torch.testing.assert_close(
+        output.cpu().float(), expected, atol=atol, rtol=rtol
+    )

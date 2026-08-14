@@ -784,49 +784,59 @@ void ModuleTranslation::translate(
 void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
   // Atomic RMW into device memory with relaxed ordering. Reinterpret the
   // element address `&buf[idx]` as the matching `device atomic_*` pointer;
-  // valid for relaxed atomics in the `device` address space on Apple GPUs. The
-  // returned old value is discarded — the conversion guarantees the result is
-  // unused (AtomicRmwLowering rejects atomics whose old value is consumed).
+  // valid for relaxed atomics in the `device` address space on Apple GPUs.
+  // 32-bit fetch operations materialize their old-value result when consumed;
+  // this is required before a result-bearing scf.if can yield it. MSL's ulong
+  // min/max functions return void, so the Metal op verifier requires their
+  // result to be unused.
   //
-  // Add picks its atomic type from the MEMREF element. Max/umin deliberately
-  // reinterpret an f32 buffer as signed/unsigned integer storage: this is the
-  // exact ordered-bit expansion Triton's frontend emits for f32 atomic_max.
-  const char *fetch = "atomic_fetch_add_explicit";
+  // Add picks its atomic type from the value. The signed/unsigned integer
+  // kinds deliberately permit a 32-bit f32 buffer: this is the exact
+  // ordered-bit expansion Triton's frontend emits for f32 atomic min/max.
+  const bool resultUsed = !op.getResult().use_empty();
+  auto valueInt = llvm::dyn_cast<mlir::IntegerType>(op.getValue().getType());
+  const bool is64 = valueInt && valueInt.getWidth() == 64;
+  const char *function = "atomic_fetch_add_explicit";
   llvm::StringRef atomicTy = "atomic_float";
   switch (op.getKind()) {
   case mlir::triton::metal::AtomicRmwKind::Add: {
-    mlir::Type elemTy =
-        mlir::cast<mlir::triton::metal::MetalMemRefType>(
-            op.getMemref().getType())
-            .getType();
-    if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(elemTy)) {
-      if (intTy.getWidth() != 32)
-        llvm_unreachable(
-            "metal.atomic_rmw: unsupported integer element width");
-      atomicTy = intTy.isUnsigned() ? "atomic_uint" : "atomic_int";
-    } else if (!elemTy.isF32()) {
-      llvm_unreachable("metal.atomic_rmw: unsupported element type");
-    }
+    if (valueInt)
+      atomicTy = valueInt.isUnsigned() ? "atomic_uint" : "atomic_int";
     break;
   }
   case mlir::triton::metal::AtomicRmwKind::Max:
-    fetch = "atomic_fetch_max_explicit";
+    function = "atomic_fetch_max_explicit";
+    atomicTy = "atomic_int";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::Min:
+    function = "atomic_fetch_min_explicit";
     atomicTy = "atomic_int";
     break;
   case mlir::triton::metal::AtomicRmwKind::UMin:
-    fetch = "atomic_fetch_min_explicit";
-    atomicTy = "atomic_uint";
+    function = is64 ? "atomic_min_explicit" : "atomic_fetch_min_explicit";
+    atomicTy = is64 ? "atomic_ulong" : "atomic_uint";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::UMax:
+    function = is64 ? "atomic_max_explicit" : "atomic_fetch_max_explicit";
+    atomicTy = is64 ? "atomic_ulong" : "atomic_uint";
     break;
   }
-  _output << fetch << "((device " << atomicTy << "*)&";
+  if (resultUsed) {
+    unsigned idx = _varCount++;
+    _buffers[op.getResult().getAsOpaquePointer()] = idx;
+    _output << typeToString(op.getResult().getType()) << " v" << idx << " = ";
+  }
+  _output << function << "((device " << atomicTy << "*)&";
   translateVarName(op.getMemref());
   _output << "[";
   translateValueOrVarName(op.getIndex());
   _output << "], ";
-  if (op.getKind() == mlir::triton::metal::AtomicRmwKind::Max)
+  if (op.getKind() == mlir::triton::metal::AtomicRmwKind::Max ||
+      op.getKind() == mlir::triton::metal::AtomicRmwKind::Min)
     _output << "as_type<int32_t>(";
-  else if (op.getKind() == mlir::triton::metal::AtomicRmwKind::UMin)
-    _output << "as_type<uint32_t>(";
+  else if (op.getKind() == mlir::triton::metal::AtomicRmwKind::UMin ||
+           op.getKind() == mlir::triton::metal::AtomicRmwKind::UMax)
+    _output << (is64 ? "as_type<ulong>(" : "as_type<uint32_t>(");
   translateValueOrVarName(op.getValue());
   if (op.getKind() != mlir::triton::metal::AtomicRmwKind::Add)
     _output << ")";

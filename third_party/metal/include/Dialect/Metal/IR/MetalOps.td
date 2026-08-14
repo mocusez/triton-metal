@@ -248,15 +248,20 @@ def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
   let summary = "Atomic read-modify-write on a device-memory element.";
   let description = [{
     Applies `kind` to `value` and `memref[index]`, yielding the old value.
-    `add` models Triton `tt.atomic_rmw fadd/add`; `max` and `umin` model the
-    signed-positive and unsigned-negative halves of Triton's f32
-    `tl.atomic_max` expansion. NOT `Pure` — it has a device-memory side effect,
+    `add` models Triton `tt.atomic_rmw fadd/add`; `min`/`max` and
+    `umin`/`umax` preserve Triton's signed and unsigned integer ordering.
+    The 32-bit integer kinds also model the ordered-bit expansion used by
+    Triton's f32 atomic min/max. Unsigned 64-bit min/max are permitted only
+    when the old-value result is unused because MSL's atomic_ulong modify
+    functions return void. NOT `Pure` — it has a device-memory side effect,
     so it survives dead-code elimination even when its result is unused.
   }];
 
   let arguments = (ins AtomicRmwKindAttr:$kind, Metal_Type:$value,
                        Metal_MemRefType:$memref, UI32:$index);
   let results = (outs Metal_Type:$result);
+
+  let hasVerifier = 1;
 
   let assemblyFormat = "$kind $value `,` $memref `[` $index `]` attr-dict `:` functional-type(operands, results)";
 }

@@ -61,6 +61,8 @@ leet-2d-subarray-sum = "python leet-triton/medium-2D_subarray_sum.py"
 leet-3d-subarray-sum = "python leet-triton/medium-3D_subarray_sum.py"
 leet-mse = "python leet-triton/medium-mean_squared_error.py"
 leet-ordinary-least-squares = "python leet-triton/medium-ordinary_least_squares.py"
+leet-stream-compaction = "python leet-triton/medium-stream-compaction.py"
+leet-subarray-sum = "python leet-triton/medium-subarray_sum.py"
 
 # Run every leet-triton example sequentially.
 leet-all = { depends-on = [
@@ -77,4 +79,6 @@ leet-all = { depends-on = [
     "leet-3d-subarray-sum",
     "leet-mse",
     "leet-ordinary-least-squares",
+    "leet-stream-compaction",
+    "leet-subarray-sum",
 ] }

@@ -44,6 +44,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %o_addr, %x_val, %mask : tensor<16x16x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  tt.func public @atomic_min_2d_i32(%out_ptr: !tt.ptr<i32>, %M: i32, %N: i32, %v: i32) {
+    %rm = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rm2d = tt.expand_dims %rm {axis = 1 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<16x1xi32, #blocked>
+    %M_sp = tt.splat %M : i32 -> tensor<16x1xi32, #blocked>
+    %mask_m = arith.cmpi slt, %rm2d, %M_sp : tensor<16x1xi32, #blocked>
+    %mask_m_b = tt.broadcast %mask_m : tensor<16x1xi1, #blocked> -> tensor<16x16xi1, #blocked>
+
+    %rn = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %rn2d = tt.expand_dims %rn {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
+    %N_sp = tt.splat %N : i32 -> tensor<1x16xi32, #blocked>
+    %mask_n = arith.cmpi slt, %rn2d, %N_sp : tensor<1x16xi32, #blocked>
+    %mask_n_b = tt.broadcast %mask_n : tensor<1x16xi1, #blocked> -> tensor<16x16xi1, #blocked>
+    %mask = arith.andi %mask_m_b, %mask_n_b : tensor<16x16xi1, #blocked>
+
+    %N_row = tt.splat %N : i32 -> tensor<16x1xi32, #blocked>
+    %row_off = arith.muli %rm2d, %N_row : tensor<16x1xi32, #blocked>
+    %row_off_b = tt.broadcast %row_off : tensor<16x1xi32, #blocked> -> tensor<16x16xi32, #blocked>
+    %rn_b = tt.broadcast %rn2d : tensor<1x16xi32, #blocked> -> tensor<16x16xi32, #blocked>
+    %flat_off = arith.addi %row_off_b, %rn_b : tensor<16x16xi32, #blocked>
+    %out = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<16x16x!tt.ptr<i32>, #blocked>
+    %addr = tt.addptr %out, %flat_off : tensor<16x16x!tt.ptr<i32>, #blocked>, tensor<16x16xi32, #blocked>
+    %values = tt.splat %v : i32 -> tensor<16x16xi32, #blocked>
+    %old = tt.atomic_rmw min, acq_rel, gpu, %addr, %values, %mask : (tensor<16x16x!tt.ptr<i32>, #blocked>, tensor<16x16xi32, #blocked>, tensor<16x16xi1, #blocked>) -> tensor<16x16xi32, #blocked>
+    tt.return
+  }
 }
 
 // CHECK: metal.module
@@ -54,3 +80,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: arith.andi
 // CHECK: scf.if
 // CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel atomic_min_2d_i32
+// CHECK: arith.cmpi
+// CHECK: arith.cmpi
+// CHECK: arith.andi
+// CHECK: scf.if
+// CHECK: metal.atomic_rmw Min {{.*}} : (si32, !metal.memref<? x ui32>, ui32) -> si32
+// CHECK-NOT: tt.atomic_rmw

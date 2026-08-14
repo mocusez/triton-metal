@@ -736,6 +736,36 @@ def test_atomic_scalar_masks():
     tl.atomic_xor(ptrs, 1, mask=True)
 
 
+@filecheck_test
+@triton.jit
+def test_atomic_min_float_negative_value():
+    # CHECK-LABEL: test_atomic_min_float_negative_value
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.float32), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), -1.0, tl.float32)
+
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    # CHECK: {{.*}} = tt.atomic_rmw umax, acq_rel, gpu
+    tl.atomic_min(ptrs, val, mask=True)
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_min_float64_negative_value():
+    # CHECK-LABEL: test_atomic_min_float64_negative_value
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.float64), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), -1.0, tl.float64)
+
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    # CHECK: {{.*}} = tt.atomic_rmw umax, acq_rel, gpu
+    tl.atomic_min(ptrs, val, mask=True)
+
+
 @pytest.mark.interpreter
 def test_return_promotion():
 

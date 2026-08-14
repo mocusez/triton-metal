@@ -105,8 +105,10 @@ End-to-end correctness verified against PyTorch references on Apple Silicon (M-s
 | `medium-2d_fft.py` | ✅ |
 | `medium-mean_squared_error.py` | ✅ |
 | `medium-ordinary_least_squares.py` | ✅ |
+| `medium-stream-compaction.py` | ✅ |
+| `medium-subarray_sum.py` | ✅ |
 
-Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, reductions, atomic accumulation, broadcast, 2D dispatch, convolution, a correctness-first direct 2D DFT built from supported `tl.dot` tiles, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
+Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, reductions, scans, stable compaction, atomic accumulation, broadcast, 2D dispatch, convolution, a correctness-first direct 2D DFT built from supported `tl.dot` tiles, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
 
 In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 

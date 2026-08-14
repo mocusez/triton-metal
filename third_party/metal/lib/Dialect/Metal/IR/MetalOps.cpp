@@ -531,6 +531,57 @@ llvm::LogicalResult StoreOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// AtomicRmwOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult AtomicRmwOp::verify() {
+  auto memRef = llvm::cast<MetalMemRefType>(getMemref().getType());
+  mlir::Type memType = memRef.getType();
+  mlir::Type valueType = getValue().getType();
+  mlir::Type resultType = getResult().getType();
+  if (valueType != resultType)
+    return emitOpError() << "requires value type (" << valueType
+                         << ") to match result type (" << resultType << ")";
+
+  auto valueInt = llvm::dyn_cast<mlir::IntegerType>(valueType);
+  auto memInt = llvm::dyn_cast<mlir::IntegerType>(memType);
+  auto storageMatchesWidth = [&](unsigned width) {
+    return (memInt && memInt.getWidth() == width) ||
+           (width == 32 && memType.isF32());
+  };
+
+  switch (getKind()) {
+  case AtomicRmwKind::Add:
+    if (valueType.isF32() && memType.isF32())
+      break;
+    if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+        memInt.getWidth() != 32)
+      return emitOpError(
+          "add requires f32 storage/value or a 32-bit integer storage/value");
+    break;
+  case AtomicRmwKind::Min:
+  case AtomicRmwKind::Max:
+    if (!valueInt || !valueInt.isSigned() || valueInt.getWidth() != 32 ||
+        !storageMatchesWidth(32))
+      return emitOpError(
+          "signed min/max requires an si32 value/result and 32-bit storage");
+    break;
+  case AtomicRmwKind::UMin:
+  case AtomicRmwKind::UMax:
+    if (!valueInt || !valueInt.isUnsigned() ||
+        (valueInt.getWidth() != 32 && valueInt.getWidth() != 64) ||
+        !storageMatchesWidth(valueInt.getWidth()))
+      return emitOpError("unsigned min/max requires ui32/ui64 value/result and "
+                         "matching storage");
+    if (valueInt.getWidth() == 64 && !getResult().use_empty())
+      return emitOpError(
+          "u64 atomic min/max does not support a consumed old-value result");
+    break;
+  }
+  return checkIndex(*this, memRef, getIndex());
+}
+
+//===----------------------------------------------------------------------===//
 // GetElementOp
 //===----------------------------------------------------------------------===//
 

@@ -21,6 +21,9 @@ per-program counts into the final histogram.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -37,6 +40,10 @@ if not torch.backends.mps.is_available():
         "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
         allow_module_level=True,
     )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SUBARRAY_SUM_PATH = REPO_ROOT / "leet-triton" / "medium-subarray_sum.py"
 
 
 @triton.jit
@@ -61,6 +68,25 @@ def test_atomic_add_scatter(G, N):
     ref = inp.cpu().sum(0)
     # Float-add reorder across programs is non-bit-deterministic; close in fp32.
     torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("N", "S", "E"),
+    [(32, 0, 0), (1024, 0, 1023), (2500, 113, 2317)],
+)
+def test_original_subarray_sum_solve_matches_reference(N, S, E):
+    spec = importlib.util.spec_from_file_location("subarray_sum", SUBARRAY_SUM_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    values_cpu = (torch.arange(N, dtype=torch.float32) % 29) * 0.125 - 1.5
+    values = values_cpu.to("mps")
+    output = torch.zeros(1, dtype=torch.float32, device="mps")
+    module.solve(values, output, N, S, E)
+    torch.mps.synchronize()
+    torch.testing.assert_close(
+        output.cpu()[0], values_cpu[S : E + 1].sum(), atol=2e-3, rtol=2e-5
+    )
 
 
 @triton.jit
@@ -181,6 +207,244 @@ def test_atomic_max_scalar_f32_contended(values):
     _atomic_max_scalar_f32[(len(values),)](inp, out)
     torch.mps.synchronize()
     assert out.cpu().item() == max(values)
+
+
+@triton.jit
+def _atomic_min_scalar_i32(In, Out):
+    value = tl.load(In + tl.program_id(0))
+    tl.atomic_min(Out, value)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [17, 5, 93, 11, 42],
+        [12, -7, 31, -44, 0, 19],
+    ],
+)
+def test_atomic_min_scalar_i32_contended(values):
+    inp = torch.tensor(values, dtype=torch.int32, device="mps")
+    out = torch.full((1,), 2147483647, dtype=torch.int32, device="mps")
+    _atomic_min_scalar_i32[(len(values),)](inp, out)
+    torch.mps.synchronize()
+    assert out.cpu().item() == min(values)
+
+
+@triton.jit
+def _atomic_minmax_rows(In, Out, N, BLOCK: tl.constexpr, DO_MAX: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    values = tl.load(In + row * N + cols, mask=mask)
+    if DO_MAX:
+        tl.atomic_max(Out + cols, values, mask=mask)
+    else:
+        tl.atomic_min(Out + cols, values, mask=mask)
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+@pytest.mark.parametrize("N", [16, 200])
+def test_atomic_minmax_tensor_i32(do_max, N):
+    G = 5
+    torch.manual_seed(9000 + N + do_max)
+    inp = torch.randint(-1000, 1000, (G, N), dtype=torch.int32, device="mps")
+    initial = -2147483648 if do_max else 2147483647
+    out = torch.full((N,), initial, dtype=torch.int32, device="mps")
+    _atomic_minmax_rows[(G,)](
+        inp, out, N, BLOCK=triton.next_power_of_2(N), DO_MAX=do_max
+    )
+    torch.mps.synchronize()
+    ref = inp.cpu().amax(0) if do_max else inp.cpu().amin(0)
+    torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+def test_atomic_minmax_tensor_u32_uses_unsigned_order(do_max):
+    values = torch.tensor(
+        [
+            [0, 2**31 - 1, 2**31, 2**32 - 1],
+            [17, 2**31, 2**32 - 1, 3],
+            [2**31 + 9, 1, 5, 2**31 + 1],
+        ],
+        dtype=torch.uint32,
+        device="mps",
+    )
+    initial = 0 if do_max else 2**32 - 1
+    out = torch.full((4,), initial, dtype=torch.uint32, device="mps")
+    _atomic_minmax_rows[(values.shape[0],)](
+        values, out, 4, BLOCK=4, DO_MAX=do_max
+    )
+    torch.mps.synchronize()
+    rows = values.cpu().tolist()
+    expected = [
+        (max if do_max else min)(row[col] for row in rows)
+        for col in range(values.shape[1])
+    ]
+    assert out.cpu().tolist() == expected
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+def test_atomic_minmax_tensor_f32_ordered_bits(do_max):
+    values = torch.tensor(
+        [
+            [-91.5, -0.25, 7.0, 2.0],
+            [-7.0, 3.5, -31.0, 29.0],
+            [-18.0, -2.0, 11.0, -5.0],
+        ],
+        dtype=torch.float32,
+        device="mps",
+    )
+    initial = float("-inf") if do_max else float("inf")
+    out = torch.full((4,), initial, dtype=torch.float32, device="mps")
+    _atomic_minmax_rows[(values.shape[0],)](
+        values, out, 4, BLOCK=4, DO_MAX=do_max
+    )
+    torch.mps.synchronize()
+    ref = values.cpu().amax(0) if do_max else values.cpu().amin(0)
+    torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _atomic_minmax_rank2(
+    In,
+    Out,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DO_MAX: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    rows = tl.arange(0, BLOCK_M)[:, None]
+    cols = tl.arange(0, BLOCK_N)[None, :]
+    offsets = rows * N + cols
+    mask = (rows < M) & (cols < N)
+    values = tl.load(In + batch * M * N + offsets, mask=mask)
+    if DO_MAX:
+        tl.atomic_max(Out + offsets, values, mask=mask)
+    else:
+        tl.atomic_min(Out + offsets, values, mask=mask)
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+def test_atomic_minmax_tensor_rank2_masked_sub_tpb(do_max):
+    G, M, N = 5, 3, 5
+    torch.manual_seed(12000 + do_max)
+    values = torch.randint(
+        -1000, 1000, (G, M, N), dtype=torch.int32, device="mps"
+    )
+    initial = -2147483648 if do_max else 2147483647
+    out = torch.full((M, N), initial, dtype=torch.int32, device="mps")
+    _atomic_minmax_rank2[(G,)](
+        values, out, M, N, BLOCK_M=4, BLOCK_N=8, DO_MAX=do_max
+    )
+    torch.mps.synchronize()
+    ref = values.cpu().amax(0) if do_max else values.cpu().amin(0)
+    torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _atomic_min_return_old(In, Out, Old, N, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < N
+    values = tl.load(In + offsets, mask=mask)
+    old = tl.atomic_min(Out + offsets, values, mask=mask)
+    tl.store(Old + offsets, old, mask=mask)
+
+
+def test_atomic_min_tensor_returns_old_value_once():
+    N, BLOCK = 17, 32
+    values = torch.arange(N, dtype=torch.int32, device="mps") - 50
+    out = torch.full((N,), 1234, dtype=torch.int32, device="mps")
+    old = torch.empty_like(out)
+    compiled = _atomic_min_return_old.warmup(
+        values, out, old, N, BLOCK=BLOCK, grid=(1,)
+    )
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert msl.count("atomic_fetch_min_explicit") == 1
+    assert "int32_t v" in msl
+
+    _atomic_min_return_old[(1,)](values, out, old, N, BLOCK=BLOCK)
+    torch.mps.synchronize()
+    torch.testing.assert_close(old.cpu(), torch.full((N,), 1234, dtype=torch.int32))
+    torch.testing.assert_close(out.cpu(), values.cpu())
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+def test_atomic_minmax_tensor_u64_void_modify(do_max):
+    values = torch.tensor(
+        [
+            [0, 2**63 - 1, 2**63, 2**64 - 1],
+            [9, 2**63, 2**64 - 1, 7],
+            [2**63 + 11, 1, 5, 2**63 + 3],
+        ],
+        dtype=torch.uint64,
+        device="mps",
+    )
+    initial = 0 if do_max else 2**64 - 1
+    # torch.mps supports uint64 tensors, but torch.full(uint64, device="mps")
+    # currently rejects the scalar fill path. Constructing from explicit data
+    # exercises the same storage without depending on that unrelated PyTorch
+    # limitation.
+    out = torch.tensor([initial] * 4, dtype=torch.uint64, device="mps")
+    compiled = _atomic_minmax_rows.warmup(
+        values, out, 4, BLOCK=4, DO_MAX=do_max, grid=(values.shape[0],)
+    )
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    expected_function = "atomic_max_explicit" if do_max else "atomic_min_explicit"
+    assert f"{expected_function}((device atomic_ulong*)" in msl
+    assert "atomic_fetch_" not in msl
+
+    _atomic_minmax_rows[(values.shape[0],)](
+        values, out, 4, BLOCK=4, DO_MAX=do_max
+    )
+    torch.mps.synchronize()
+    rows = values.cpu().tolist()
+    expected = [
+        (max if do_max else min)(row[col] for row in rows)
+        for col in range(values.shape[1])
+    ]
+    assert out.cpu().tolist() == expected
+
+
+@triton.jit
+def _atomic_minmax_scalar_u64(Out, value, DO_MAX: tl.constexpr):
+    if DO_MAX:
+        tl.atomic_max(Out, value)
+    else:
+        tl.atomic_min(Out, value)
+
+
+@pytest.mark.parametrize("do_max", [False, True])
+def test_atomic_minmax_scalar_u64_void_modify(do_max):
+    host_values = [0, 2**63 - 1, 2**63, 2**64 - 1, 17]
+    initial = 0 if do_max else 2**64 - 1
+    out = torch.tensor([initial], dtype=torch.uint64, device="mps")
+    for value in host_values:
+        _atomic_minmax_scalar_u64[(1,)](out, value, DO_MAX=do_max)
+    torch.mps.synchronize()
+    assert out.cpu().item() == (max if do_max else min)(host_values)
+
+
+def test_atomic_ulong_compile_error_has_capability_context(monkeypatch):
+    from triton.backends.metal import driver as metal_driver
+
+    compiler_error = RuntimeError("MSL compiler rejected atomic_ulong")
+
+    def reject_shader(_source):
+        raise compiler_error
+
+    monkeypatch.setattr(metal_driver, "_use_mps_runtime", lambda: True)
+    monkeypatch.setattr(torch.mps, "compile_shader", reject_shader)
+    with pytest.raises(RuntimeError, match="Apple8-or-newer") as error:
+        metal_driver.MetalUtils().load_binary(
+            "atomic_u64", "kernel void atomic_u64(device atomic_ulong*)", 0, 0
+        )
+    assert error.value.__cause__ is compiler_error
 
 
 @triton.jit
