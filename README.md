@@ -105,10 +105,22 @@ End-to-end correctness verified against PyTorch references on Apple Silicon (M-s
 | `medium-2d_fft.py` | ✅ |
 | `medium-mean_squared_error.py` | ✅ |
 | `medium-ordinary_least_squares.py` | ✅ |
+| `medium-sparse_matrix-vector_multiplication.py` | ✅ |
+| `medium-sparse_matrix-Dense_matrix_multiplication.py` | ✅ |
 | `medium-stream-compaction.py` | ✅ |
 | `medium-subarray_sum.py` | ✅ |
 
-Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, reductions, scans, stable compaction, atomic accumulation, broadcast, 2D dispatch, convolution, a correctness-first direct 2D DFT built from supported `tl.dot` tiles, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
+Reproduce with `pixi run leet-all`. These cover element-wise ops, masked load/store, reductions, scans, stable compaction, atomic accumulation, broadcast, 2D dispatch, convolution, COO sparse matvec/matmul, a correctness-first direct 2D DFT built from supported `tl.dot` tiles, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
+
+The sparse examples accept a CPU `torch.sparse_coo_tensor` through their
+existing `solve(A, ..., nnz)` entry point, coalesce duplicate coordinates, and
+transfer only the resulting COO indices and values to the GPU. Here `nnz` is
+the input tensor's stored-entry count. For repeated multiplies, call
+`prepare_coo(...)` once and pass its prepacked int32 row/column indices and
+float32 values to `solve_coo(...)`; SpMV core work is then `O(nnz)` and SpMM
+core work is `O(nnz * K)`. A contiguous strided dense `A` remains supported as
+a compatibility fallback, but retains dense complexity and is not the
+sparse-optimized path.
 
 In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 

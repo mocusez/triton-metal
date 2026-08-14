@@ -63,6 +63,8 @@ leet-mse = "python leet-triton/medium-mean_squared_error.py"
 leet-ordinary-least-squares = "python leet-triton/medium-ordinary_least_squares.py"
 leet-stream-compaction = "python leet-triton/medium-stream-compaction.py"
 leet-subarray-sum = "python leet-triton/medium-subarray_sum.py"
+leet-sparse-matvec = "python leet-triton/medium-sparse_matrix-vector_multiplication.py"
+leet-sparse-dense-matmul = "python leet-triton/medium-sparse_matrix-Dense_matrix_multiplication.py"
 
 # Run every leet-triton example sequentially.
 leet-all = { depends-on = [
@@ -81,4 +83,6 @@ leet-all = { depends-on = [
     "leet-ordinary-least-squares",
     "leet-stream-compaction",
     "leet-subarray-sum",
+    "leet-sparse-matvec",
+    "leet-sparse-dense-matmul",
 ] }

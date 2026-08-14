@@ -19,29 +19,25 @@ Two independent Metal-backend fixes are covered here.
    `offs_m = pid*BLOCK_M + arange(...)` — the fabricated term is still used, so
    that shape is unchanged.
 
-2. **Uniform (splat) pointer loads.** `tt.load` on a bare `tt.splat` of a
+2. **Uniform (splat) pointer accesses.** `tt.load` on a bare `tt.splat` of a
    scalar pointer — no `tt.addptr`, every lane reading the SAME address — hit
    `"tt.load expects a tt.addptr feeding ptr"` and failed to legalize. Triton
    emits exactly this whenever the per-element offset folds away, which a
    1-element tile always does (`tl.arange(0, 1) * stride` is 0). It is not
    specific to size 1: the `uniform_load` cases below cover wider tiles too.
 
-Two related gaps are deliberately NOT asserted here:
-
-* `tt.store` on a bare splat tensor pointer is still unlowered (the symmetric
-  half of fix 2). Left alone on purpose: for BLOCK>1 every lane would write the
-  SAME address with a DIFFERENT value, which is a data race with no
-  well-defined result, so it needs a semantics decision and not just a
-  lowering. Real kernels hit the load form (a broadcast read); the SSM scan at
-  d_state=1 stores through a scalar pointer and works.
-* A FAILED legalization poisons the MLIR context, so the NEXT compile in the
-  same process aborts (SIGABRT) instead of raising. That makes any
-  xfail-on-compile-failure test unsafe to keep in a shared pytest process — it
-  takes the following test down with it, which is why the store gap above is
-  documented rather than tested.
+The store lowering intentionally covers only rank-1 singleton tensors, where
+lane 0 has unambiguous ownership. Wider splat stores would write multiple
+values to one address and remain unsupported. A FAILED legalization poisons
+the MLIR context, so the NEXT compile in the same process aborts (SIGABRT)
+instead of raising; compile-failure xfails are therefore unsafe in this shared
+pytest process.
 """
 
 from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -126,10 +122,9 @@ def _uniform_load_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
     tl.store(out_ptr + tl.arange(0, BLOCK), v)
 
 
-# BLOCK=1 is excluded here only because the STORE address would fold too, and
-# tt.store has the same unfixed splat gap (see test_uniform_splat_store_block1).
-# BLOCK=1 loads are covered by test_uniform_splat_load_feeding_reduce, which
-# stores through a scalar pointer.
+# BLOCK=1 is covered by the reduce test below, which stores through a scalar
+# pointer. Wider blocks exercise the uniform load without introducing an
+# intentionally unsupported wider uniform store.
 @pytest.mark.parametrize("BLOCK", [2, 8, 32, 64])
 def test_uniform_splat_load(BLOCK):
     torch.manual_seed(BLOCK)
@@ -157,6 +152,127 @@ def test_uniform_splat_load_feeding_reduce(BLOCK):
     torch.mps.synchronize()
     ref = x.cpu().double()[0] * BLOCK
     assert (out.cpu().double()[0] - ref).abs() <= 2e-5 * max(abs(ref.item()), 1.0)
+
+
+@triton.jit
+def _singleton_masked_store_kernel(out_ptr, limit, BLOCK: tl.constexpr):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.full((BLOCK,), 7.0, tl.float32)
+    tl.store(out_ptr + offset, value, mask=offset < limit)
+
+
+def test_singleton_masked_splat_store_respects_false_mask():
+    out = torch.full((2,), -1.0, dtype=torch.float32, device="mps")
+    _singleton_masked_store_kernel[(2,)](out, 1, BLOCK=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), torch.tensor([7.0, -1.0]))
+
+
+def _load_sparse_matvec_module():
+    path = (Path(__file__).resolve().parents[3] / "leet-triton" /
+            "medium-sparse_matrix-vector_multiplication.py")
+    assert path.is_file(), f"required leet-triton fixture not present: {path}"
+    spec = importlib.util.spec_from_file_location("leet_sparse_matvec", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "M,N,density", [(1, 1, 0.0), (3, 5, 0.3), (5, 1031, 0.05)]
+)
+def test_leet_sparse_matvec_coo(M, N, density):
+    """Sparse COO solve paths match PyTorch without a dense GPU A."""
+    module = _load_sparse_matvec_module()
+    torch.manual_seed(0x5A00 + M * 17 + N)
+    a_cpu = torch.randn((M, N), dtype=torch.float32)
+    a_cpu *= torch.rand((M, N)) < density
+    a_sparse = a_cpu.to_sparse_coo().coalesce()
+    nnz = a_sparse._nnz()
+    assert a_sparse.layout == torch.sparse_coo
+    assert a_sparse.values().numel() == nnz
+    x_cpu = torch.randn((N,), dtype=torch.float32)
+    x = x_cpu.to("mps").contiguous()
+    y = torch.empty((M,), dtype=torch.float32, device="mps")
+    y_prepacked = torch.empty_like(y)
+
+    module.solve(a_sparse, x, y, M, N, nnz)
+    row_indices, col_indices, values = module.prepare_coo(
+        a_sparse, "mps", M, N, nnz
+    )
+    module.solve_coo(
+        row_indices,
+        col_indices,
+        values,
+        x,
+        y_prepacked,
+        M,
+        N,
+        nnz,
+    )
+    torch.mps.synchronize()
+
+    expected = a_cpu @ x_cpu
+    torch.testing.assert_close(y.cpu(), expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        y_prepacked.cpu(), expected, atol=1e-4, rtol=1e-4
+    )
+
+
+def test_leet_sparse_matvec_coalesces_duplicate_coordinates():
+    module = _load_sparse_matvec_module()
+    indices = torch.tensor([[0, 0, 1], [1, 1, 0]], dtype=torch.int64)
+    values = torch.tensor([1.25, 2.75, -3.0], dtype=torch.float32)
+    a_sparse = torch.sparse_coo_tensor(indices, values, (2, 3))
+    assert not a_sparse.is_coalesced()
+    x_cpu = torch.tensor([2.0, -1.0, 4.0], dtype=torch.float32)
+    x = x_cpu.to("mps")
+    y = torch.empty((2,), dtype=torch.float32, device="mps")
+    y_prepacked = torch.empty_like(y)
+
+    module.solve(a_sparse, x, y, 2, 3, a_sparse._nnz())
+    rows, cols, packed_values = module.prepare_coo(
+        a_sparse, "mps", 2, 3, a_sparse._nnz()
+    )
+    assert packed_values.numel() == 2
+    module.solve_coo(
+        rows, cols, packed_values, x, y_prepacked, 2, 3,
+        packed_values.numel()
+    )
+    torch.mps.synchronize()
+
+    expected = a_sparse.to_dense() @ x_cpu
+    torch.testing.assert_close(y.cpu(), expected)
+    torch.testing.assert_close(y_prepacked.cpu(), expected)
+
+
+def test_leet_sparse_matvec_dense_input_compatibility():
+    module = _load_sparse_matvec_module()
+    torch.manual_seed(0x5A5A)
+    M, N = 3, 5
+    a_cpu = torch.randn((M, N), dtype=torch.float32)
+    x_cpu = torch.randn((N,), dtype=torch.float32)
+    y = torch.empty((M,), dtype=torch.float32, device="mps")
+
+    module.solve(
+        a_cpu.to("mps"),
+        x_cpu.to("mps"),
+        y,
+        M,
+        N,
+        int(torch.count_nonzero(a_cpu)),
+    )
+    torch.mps.synchronize()
+
+    torch.testing.assert_close(y.cpu(), a_cpu @ x_cpu, atol=1e-4, rtol=1e-4)
+
+    a_noncontiguous = torch.randn(
+        (M, N * 2), dtype=torch.float32, device="mps"
+    )[:, ::2]
+    assert not a_noncontiguous.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        module.solve(a_noncontiguous, x_cpu.to("mps"), y, M, N, M * N)
 
 
 # --- 3. Slice-encoded rank-1 loads -----------------------------------------

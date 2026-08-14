@@ -16,6 +16,9 @@ an 8x8 program grid. See `metal-lora-linear-fix-plan.md` (W2a).
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -91,6 +94,127 @@ def test_dot_dynamic_k_program_grid(M, N, K):
     c, a, b = _run(M, N, K)
     expected = torch.matmul(a, b)
     torch.testing.assert_close(c.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+def _load_sparse_dense_matmul_module():
+    path = (Path(__file__).resolve().parents[3] / "leet-triton" /
+            "medium-sparse_matrix-Dense_matrix_multiplication.py")
+    assert path.is_file(), f"required leet-triton fixture not present: {path}"
+    spec = importlib.util.spec_from_file_location(
+        "leet_sparse_dense_matmul", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "M,N,K,density",
+    [(8, 8, 8, 0.25), (64, 64, 64, 0.1), (70, 66, 96, 0.05),
+     (4, 7, 5, 0.0)],
+)
+def test_leet_sparse_dense_matmul_coo(M, N, K, density):
+    """Sparse COO solve paths match PyTorch without a dense GPU A."""
+    module = _load_sparse_dense_matmul_module()
+    torch.manual_seed(0x5B00 + M * 17 + N * 3 + K)
+    a_cpu = torch.randn((M, N), dtype=torch.float32)
+    a_cpu *= torch.rand((M, N)) < density
+    a_sparse = a_cpu.to_sparse_coo().coalesce()
+    nnz = a_sparse._nnz()
+    assert a_sparse.layout == torch.sparse_coo
+    assert a_sparse.values().numel() == nnz
+    b_cpu = torch.randn((N, K), dtype=torch.float32)
+    b = b_cpu.to("mps").contiguous()
+    c = torch.empty((M, K), dtype=torch.float32, device="mps")
+    c_prepacked = torch.empty_like(c)
+
+    module.solve(a_sparse, b, c, M, N, K, nnz)
+    row_indices, col_indices, values = module.prepare_coo(
+        a_sparse, "mps", M, N, nnz
+    )
+    module.solve_coo(
+        row_indices,
+        col_indices,
+        values,
+        b,
+        c_prepacked,
+        M,
+        N,
+        K,
+        nnz,
+    )
+    torch.mps.synchronize()
+
+    expected = a_cpu @ b_cpu
+    torch.testing.assert_close(c.cpu(), expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        c_prepacked.cpu(), expected, atol=1e-3, rtol=1e-3
+    )
+
+
+def test_leet_sparse_dense_matmul_coalesces_duplicate_coordinates():
+    module = _load_sparse_dense_matmul_module()
+    indices = torch.tensor([[0, 0, 1], [1, 1, 0]], dtype=torch.int64)
+    values = torch.tensor([1.25, 2.75, -3.0], dtype=torch.float32)
+    a_sparse = torch.sparse_coo_tensor(indices, values, (2, 3))
+    assert not a_sparse.is_coalesced()
+    b_cpu = torch.tensor(
+        [[2.0, -1.0], [0.5, 3.0], [-4.0, 2.0]], dtype=torch.float32
+    )
+    b = b_cpu.to("mps")
+    c = torch.empty((2, 2), dtype=torch.float32, device="mps")
+    c_prepacked = torch.empty_like(c)
+
+    module.solve(a_sparse, b, c, 2, 3, 2, a_sparse._nnz())
+    rows, cols, packed_values = module.prepare_coo(
+        a_sparse, "mps", 2, 3, a_sparse._nnz()
+    )
+    assert packed_values.numel() == 2
+    module.solve_coo(
+        rows, cols, packed_values, b, c_prepacked, 2, 3, 2,
+        packed_values.numel()
+    )
+    torch.mps.synchronize()
+
+    expected = a_sparse.to_dense() @ b_cpu
+    torch.testing.assert_close(c.cpu(), expected)
+    torch.testing.assert_close(c_prepacked.cpu(), expected)
+
+
+def test_leet_sparse_dense_matmul_dense_input_compatibility():
+    module = _load_sparse_dense_matmul_module()
+    torch.manual_seed(0x5B5B)
+    M, N, K = 8, 8, 8
+    a_cpu = torch.randn((M, N), dtype=torch.float32)
+    b_cpu = torch.randn((N, K), dtype=torch.float32)
+    c = torch.empty((M, K), dtype=torch.float32, device="mps")
+
+    module.solve(
+        a_cpu.to("mps"),
+        b_cpu.to("mps"),
+        c,
+        M,
+        N,
+        K,
+        int(torch.count_nonzero(a_cpu)),
+    )
+    torch.mps.synchronize()
+
+    torch.testing.assert_close(c.cpu(), a_cpu @ b_cpu, atol=1e-3, rtol=1e-3)
+
+    a_noncontiguous = a_cpu.to("mps").T
+    assert not a_noncontiguous.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        module.solve(
+            a_noncontiguous,
+            b_cpu.to("mps"),
+            c,
+            M,
+            N,
+            K,
+            M * N,
+        )
 
 
 # --- W1: transposed B operand, tl.dot(a, tl.trans(w)) -------------------------

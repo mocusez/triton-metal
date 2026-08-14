@@ -39,6 +39,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.store %ptr, %value : tensor<1x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // A dynamic mask preserves the masked tt.store form after canonicalization.
+  // The tensor has one logical element, so only lane 0 may perform the scalar
+  // store when the user predicate is true.
+  tt.func public @singleton_masked_store_uniform_ptr(%out_ptr: !tt.ptr<f32>, %row: i32, %limit: i32, %value: f32) {
+    %scalar_ptr = tt.addptr %out_ptr, %row : !tt.ptr<f32>, i32
+    %ptr = tt.splat %scalar_ptr : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>, #blocked>
+    %row_tensor = tt.splat %row : i32 -> tensor<1xi32, #blocked>
+    %limit_tensor = tt.splat %limit : i32 -> tensor<1xi32, #blocked>
+    %mask = arith.cmpi slt, %row_tensor, %limit_tensor : tensor<1xi32, #blocked>
+    %value_tensor = tt.splat %value : f32 -> tensor<1xf32, #blocked>
+    tt.store %ptr, %value_tensor, %mask : tensor<1x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 }
 
 // CHECK-LABEL: metal.kernel masked_store_rank1
@@ -56,6 +70,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: metal.thread_id "x"
 // CHECK: metal.threadgroup_id "x"
 // CHECK: arith.cmpi eq
+// CHECK: scf.if
+// CHECK: metal.store
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel singleton_masked_store_uniform_ptr
+// CHECK: arith.cmpi slt
+// CHECK: metal.thread_id "x"
+// CHECK: metal.threadgroup_id "x"
+// CHECK: arith.cmpi eq
+// CHECK: arith.andi
 // CHECK: scf.if
 // CHECK: metal.store
 // CHECK: metal.return

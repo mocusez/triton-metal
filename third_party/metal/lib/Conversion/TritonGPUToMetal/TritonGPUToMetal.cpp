@@ -9679,6 +9679,57 @@ struct MaskedStoreLowering
       auto ptrTy =
           mlir::dyn_cast<mlir::RankedTensorType>(op.getPtr().getType());
       auto tile = tileFromTensor(op.getPtr().getType());
+      // A singleton tensor store is canonicalized to a splat of a scalar
+      // pointer. The generic tensor path below requires a tensor addptr, so
+      // scalarize the value and mask and let local lane 0 own the store.
+      if (!valueIsScanResult && ptrTy && ptrTy.getRank() == 1 &&
+          ptrTy.getDimSize(0) == 1 && tile) {
+        mlir::Value scalarPtr = ptrSplat.getSrc();
+        mlir::Value memref = findBaseMemref(scalarPtr, rewriter);
+        if (!memref)
+          return rewriter.notifyMatchFailure(
+              op, "singleton masked tt.store: base memref not found");
+        mlir::Value offset =
+            accumulateScalarAddPtrOffsets(scalarPtr, rewriter, loc);
+        if (!offset)
+          offset = mlir::arith::ConstantOp::create(
+                       rewriter, loc, rewriter.getI32IntegerAttr(0))
+                       .getResult();
+
+        auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+        mlir::Value index =
+            mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{offset})
+                .getResult(0);
+        mlir::Value value =
+            castToMemrefStorage(adaptor.getValue(), memref, rewriter, loc);
+
+        mlir::Value localTid =
+            emitLocalTid(rewriter, loc, tile->threadsPerBlock);
+        auto zero = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(0));
+        auto isLaneZero = mlir::arith::CmpIOp::create(
+            rewriter, loc, mlir::arith::CmpIPredicate::eq, localTid,
+            zero.getResult());
+        mlir::Value cond = adaptor.getMask();
+        if (cond.getType() != rewriter.getI1Type()) {
+          return rewriter.notifyMatchFailure(
+              op, "singleton masked tt.store: scalarized mask has bad type");
+        }
+        cond = mlir::arith::AndIOp::create(rewriter, loc, cond,
+                                           isLaneZero.getResult())
+                   .getResult();
+
+        auto ifOp = mlir::scf::IfOp::create(rewriter, loc, cond,
+                                            /*withElseRegion=*/false);
+        {
+          mlir::OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(ifOp.thenBlock());
+          StoreOp::create(rewriter, loc, value, memref, index);
+        }
+        rewriter.eraseOp(op);
+        return mlir::success();
+      }
       if (valueIsScanResult && ptrTy && ptrTy.getRank() == 1 && tile) {
         auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
         auto i32 = rewriter.getI32Type();
