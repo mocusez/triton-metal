@@ -16527,6 +16527,9 @@ struct FusedAttnTemplate {
   mlir::Value qPtr, kPtr, vPtr, oPtr;
   mlir::Value mVal, nVal, dHeadVal;
   mlir::Value strideQ, strideK, strideV, strideO;
+  mlir::Value strideQHead, strideKHead, strideVHead, strideOHead;
+  mlir::Value kvGroupSize;
+  bool independentHeads = false;
   bool causalKeyBound = false;
 
   // --- the two dots and the cone between them ---
@@ -17377,6 +17380,14 @@ emitConeScalar(mlir::OpBuilder &b, mlir::Location loc, mlir::Value v,
 namespace {
 
 // `base + major*stride + feature`, the address model the emitter implements
+enum class FaHeadAddrMode { None, QueryHead, GroupedKvHead };
+
+struct FaHeadAddr {
+  FaHeadAddrMode mode = FaHeadAddrMode::None;
+  mlir::Value stride;
+  mlir::Value groups;
+};
+
 // (unit column stride — Triton's equal-to-1 specialization drops the column
 // stride from the signature, so it is folded, never an operand).
 //
@@ -17389,7 +17400,7 @@ namespace {
 // Marks every op it walks so the coverage gate can see them.
 static bool faMatchAddr(FusedAttnTemplate &t, mlir::Value ptr,
                         FusedAttnTemplate::Idx wantMajor, mlir::Value &base,
-                        mlir::Value &stride) {
+                        mlir::Value &stride, FaHeadAddr *head = nullptr) {
   llvm::SmallVector<mlir::Value, 4> offsets;
   // Peel the addptr/broadcast chain down to the root splat, collecting offsets.
   for (int i = 0; i < 16 && ptr; ++i) {
@@ -17407,7 +17418,63 @@ static bool faMatchAddr(FusedAttnTemplate &t, mlir::Value ptr,
     break;
   }
   base = t.splatSrc(ptr);
-  if (!base || !t.isKernelArg(base))
+  if (!base)
+    return false;
+
+  // Independent-head storage first offsets the scalar base pointer, then
+  // splats it into the row/feature tile:
+  //
+  //   Q/O: addptr(base, pid.y * stride_head)
+  //   K/V: addptr(base, (pid.y / groups) * stride_head)
+  //
+  // Keep this deliberately narrower than general scalar pointer arithmetic.
+  // The emitter reproduces exactly these two selectors; accepting any other
+  // cone would turn an address mismatch into a silent wrong-buffer read.
+  if (!t.isKernelArg(base)) {
+    if (!head)
+      return false;
+    auto ap = base.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!ap || !t.isKernelArg(ap.getPtr()))
+      return false;
+    auto mul = ap.getOffset().getDefiningOp<mlir::arith::MulIOp>();
+    if (!mul)
+      return false;
+
+    bool matched = false;
+    for (int i = 0; i < 2 && !matched; ++i) {
+      mlir::Value selector = mul->getOperand(i);
+      mlir::Value headStride = mul->getOperand(1 - i);
+      if (!t.isKernelArg(headStride))
+        continue;
+
+      if (auto pid =
+              selector.getDefiningOp<mlir::triton::GetProgramIdOp>()) {
+        if (pid.getAxisAsInt() != 1)
+          continue;
+        head->mode = FaHeadAddrMode::QueryHead;
+        t.mark(pid);
+      } else if (auto div =
+                     selector.getDefiningOp<mlir::arith::DivSIOp>()) {
+        auto pid = div.getLhs().getDefiningOp<mlir::triton::GetProgramIdOp>();
+        if (!pid || pid.getAxisAsInt() != 1 || !t.isKernelArg(div.getRhs()))
+          continue;
+        head->mode = FaHeadAddrMode::GroupedKvHead;
+        head->groups = div.getRhs();
+        t.mark(pid);
+        t.mark(div);
+      } else {
+        continue;
+      }
+      head->stride = headStride;
+      matched = true;
+    }
+    if (!matched)
+      return false;
+    t.mark(ap);
+    t.mark(mul);
+    base = ap.getPtr();
+  }
+  if (!t.isKernelArg(base))
     return false;
 
   // Flatten each offset through `addi`, then classify the leaves.
@@ -18221,8 +18288,9 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       // is that the key index carries the row stride -- which is exactly what
       // faMatchAddr checks.
       const char *which = nullptr;
+      FaHeadAddr qHead, kHead, vHead, oHead;
       if (!faMatchAddr(t, qLd.getPtr(), FusedAttnTemplate::Idx::Row, t.qPtr,
-                       t.strideQ))
+                       t.strideQ, &qHead))
         which = "Q";
       if (!which) {
         if (ph.qkForOp) {
@@ -18231,21 +18299,57 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
           else
             t.kFeatureMajor = true;
         } else if (!faMatchAddr(t, kLd.getPtr(), FusedAttnTemplate::Idx::Key,
-                                t.kPtr, t.strideK)) {
+                                t.kPtr, t.strideK, &kHead)) {
           which = "K";
         }
       }
       if (!which && !faMatchAddr(t, vLd.getPtr(), FusedAttnTemplate::Idx::Key,
-                                 t.vPtr, t.strideV))
+                                 t.vPtr, t.strideV, &vHead))
         which = "V";
       if (!which &&
           !faMatchAddr(t, t.store.getPtr(), FusedAttnTemplate::Idx::Row, t.oPtr,
-                       t.strideO))
+                       t.strideO, &oHead))
         which = "Out";
       if (which) {
         if (::getenv("TRITON_METAL_FA_DEBUG"))
           llvm::errs() << "[metal-fused-attn]   bad address: " << which << "\n";
         t.no("an address is not base + major*stride + feature");
+        goto rejected;
+      }
+
+      const bool noHeadOffsets =
+          qHead.mode == FaHeadAddrMode::None &&
+          kHead.mode == FaHeadAddrMode::None &&
+          vHead.mode == FaHeadAddrMode::None &&
+          oHead.mode == FaHeadAddrMode::None;
+      const bool groupedHeadOffsets =
+          qHead.mode == FaHeadAddrMode::QueryHead &&
+          kHead.mode == FaHeadAddrMode::GroupedKvHead &&
+          vHead.mode == FaHeadAddrMode::GroupedKvHead &&
+          oHead.mode == FaHeadAddrMode::QueryHead && kHead.groups &&
+          vHead.groups && t.sameCone(kHead.groups, vHead.groups);
+      if (!noHeadOffsets && !groupedHeadOffsets) {
+        t.no("Q/K/V/output head offsets do not form grouped-query attention");
+        goto rejected;
+      }
+      if (groupedHeadOffsets) {
+        if (t.independentHeads &&
+            (!t.sameCone(t.strideQHead, qHead.stride) ||
+             !t.sameCone(t.strideKHead, kHead.stride) ||
+             !t.sameCone(t.strideVHead, vHead.stride) ||
+             !t.sameCone(t.strideOHead, oHead.stride) ||
+             !t.sameCone(t.kvGroupSize, kHead.groups))) {
+          t.no("key phases disagree on grouped-query head addressing");
+          goto rejected;
+        }
+        t.independentHeads = true;
+        t.strideQHead = qHead.stride;
+        t.strideKHead = kHead.stride;
+        t.strideVHead = vHead.stride;
+        t.strideOHead = oHead.stride;
+        t.kvGroupSize = kHead.groups;
+      } else if (t.independentHeads) {
+        t.no("key phases disagree on whether head storage is independent");
         goto rejected;
       }
 
@@ -18327,6 +18431,10 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       t.hVal = div.getRhs();
       t.dHeadVal = div.getLhs();
     }
+    if (t.independentHeads && t.hVal) {
+      t.no("independent head storage is incompatible with feature-split heads");
+      goto rejected;
+    }
 
     bool sawFeatureQK = false;
     for (FaPhase &ph : phases) {
@@ -18339,7 +18447,7 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       }
     }
     if (sawFeatureQK) {
-      if (t.hVal || !t.headColScalar ||
+      if (t.independentHeads || t.hVal || !t.headColScalar ||
           !FusedAttnTemplate::isIntConst(t.headColScalar, t.BD) ||
           !t.kFeatureMajor) {
         t.no("feature-reduced QK requires pid1*BD output tiling and "
@@ -18436,14 +18544,21 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
       paramTys.push_back(e);
       paramBufs.push_back(bridge(p, e));
     }
+    llvm::SmallVector<mlir::Value> headParamBufs;
+    if (t.independentHeads) {
+      for (mlir::Value p : {t.strideQHead, t.strideKHead, t.strideVHead,
+                            t.strideOHead, t.kvGroupSize})
+        headParamBufs.push_back(bridge(p, u32e));
+    }
 
     auto op = mlir::triton::metal::FusedAttentionOp::create(
         builder, loc, bridge(t.qPtr, f32), bridge(t.kPtr, f32),
         bridge(t.vPtr, f32), bridge(t.oPtr, f32), bridge(t.mVal, u32e),
         bridge(t.nVal, u32e), bridge(t.dHeadVal, u32e), bridge(t.strideQ, u32e),
         bridge(t.strideK, u32e), bridge(t.strideV, u32e),
-        bridge(t.strideO, u32e), t.hVal ? bridge(t.hVal, u32e) : mlir::Value(),
-        paramBufs, t.BM, phases.front().BN, t.BD, (int64_t)phases.size(),
+        bridge(t.strideO, u32e), headParamBufs,
+        t.hVal ? bridge(t.hVal, u32e) : mlir::Value(), paramBufs, t.BM,
+        phases.front().BN, t.BD, (int64_t)phases.size(),
         t.softmax ? mlir::triton::metal::AttnNorm::OnlineSoftmax
                   : mlir::triton::metal::AttnNorm::None,
         t.naturalExp, t.safeDenominatorOne, t.featureTiled, t.kFeatureMajor);

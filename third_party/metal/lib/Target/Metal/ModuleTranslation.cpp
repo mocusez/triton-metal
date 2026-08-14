@@ -2279,6 +2279,16 @@ void ModuleTranslation::emitFusedAttentionMma_(
   const std::string SK = bufName(op.getStrideK()) + "[0]";
   const std::string SV = bufName(op.getStrideV()) + "[0]";
   const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto headParams = op.getHeadParams();
+  const bool independentHeads = !headParams.empty();
+  std::string SQH, SKH, SVH, SOH, GROUPS;
+  if (independentHeads) {
+    SQH = bufName(headParams[0]) + "[0]";
+    SKH = bufName(headParams[1]) + "[0]";
+    SVH = bufName(headParams[2]) + "[0]";
+    SOH = bufName(headParams[3]) + "[0]";
+    GROUPS = bufName(headParams[4]) + "[0]";
+  }
   auto S = [](int64_t x) { return std::to_string(x); };
   const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
 
@@ -2313,6 +2323,14 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
   os << "  uint _fa_so = " << SO << ";\n";
+  if (independentHeads) {
+    os << "  uint _fa_qhoff = tgid.y * " << SQH << ";\n";
+    os << "  uint _fa_khoff = (tgid.y / " << GROUPS << ") * " << SKH
+       << ";\n";
+    os << "  uint _fa_vhoff = (tgid.y / " << GROUPS << ") * " << SVH
+       << ";\n";
+    os << "  uint _fa_ohoff = tgid.y * " << SOH << ";\n";
+  }
   if (op.getH())
     os << "  uint _fa_col = tgid.y * _fa_dh;\n";
   else if (featureTiled)
@@ -2330,7 +2348,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
      << "u; uint row = _fa_rowoff + q;\n";
   if (!featureTiled)
     os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? " << Q
-       << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
+       << "[" << (independentHeads ? "_fa_qhoff + " : "")
+       << "row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   if (softmax)
@@ -2411,14 +2430,16 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
-       << "[kk * _fa_sk + _fa_col + d] : 0.0f;\n";
+       << "[" << (independentHeads ? "_fa_khoff + " : "")
+       << "kk * _fa_sk + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
     os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
        << "u; c += 32u) {\n";
     os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
-       << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+       << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << "kk * _fa_sv + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -2530,14 +2551,18 @@ void ModuleTranslation::emitFusedAttentionMma_(
       os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
     else
       os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
-    os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+    os << "        " << O << "["
+       << (independentHeads ? "_fa_ohoff + " : "")
+       << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d] / denom;\n";
   } else {
     if (featureTiled)
       os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
     else
       os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
-    os << "        " << O << "[row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+    os << "        " << O << "["
+       << (independentHeads ? "_fa_ohoff + " : "")
+       << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d];\n";
   }
   os << "    }\n";
@@ -2635,6 +2660,16 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   const std::string SK = bufName(op.getStrideK()) + "[0]";
   const std::string SV = bufName(op.getStrideV()) + "[0]";
   const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto headParams = op.getHeadParams();
+  const bool independentHeads = !headParams.empty();
+  std::string SQH, SKH, SVH, SOH, GROUPS;
+  if (independentHeads) {
+    SQH = bufName(headParams[0]) + "[0]";
+    SKH = bufName(headParams[1]) + "[0]";
+    SVH = bufName(headParams[2]) + "[0]";
+    SOH = bufName(headParams[3]) + "[0]";
+    GROUPS = bufName(headParams[4]) + "[0]";
+  }
   auto S = [](int64_t x) { return std::to_string(x); };
 
   auto &os = _output;
@@ -2663,6 +2698,14 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
   os << "  uint _fa_so = " << SO << ";\n";
+  if (independentHeads) {
+    os << "  uint _fa_qhoff = tgid.y * " << SQH << ";\n";
+    os << "  uint _fa_khoff = (tgid.y / " << GROUPS << ") * " << SKH
+       << ";\n";
+    os << "  uint _fa_vhoff = (tgid.y / " << GROUPS << ") * " << SVH
+       << ";\n";
+    os << "  uint _fa_ohoff = tgid.y * " << SOH << ";\n";
+  }
   // The y grid is either a head selector or an output-feature tile selector.
   if (op.getH())
     os << "  uint _fa_col = tgid.y * _fa_dh;\n";
@@ -2688,7 +2731,8 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "        uint row = _fa_rowoff + _fa_c0 + qq;\n";
   os << "        _fa_qbuf[c] = (qq + _fa_c0 < " << S(BM)
      << "u && row < _fa_M && d < _fa_out_d) ? " << Q
-     << "[row * _fa_sq + _fa_col + d] : 0.0f;\n";
+     << "[" << (independentHeads ? "_fa_qhoff + " : "")
+     << "row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "        _fa_obuf[c] = 0.0f;\n";
   os << "      }\n";
   if (softmax) {
@@ -2730,7 +2774,8 @@ void ModuleTranslation::emitFusedAttentionScalar_(
        << "[d * _fa_sk + _fa_key];\n";
   else
     os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
-       << "[_fa_key * _fa_sk + _fa_col + d];\n";
+       << "[" << (independentHeads ? "_fa_khoff + " : "")
+       << "_fa_key * _fa_sk + _fa_col + d];\n";
   // ---- the score transform, straight out of the op's region ----
   std::string w = emitScoreRegion_(op, "_fa_a", "(int)_fa_row", "(int)_fa_key",
                                    P + " /*phase*/", "          ");
@@ -2740,7 +2785,8 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     // source kernel's mask does.
     os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] += " << w << " * "
-       << V << "[_fa_key * _fa_sv + _fa_col + d];\n";
+       << V << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << "_fa_key * _fa_sv + _fa_col + d];\n";
   } else {
     // norm = online_softmax: the transformed score is a logit. `(m_old ==
     // m_new) ? 1` keeps exp2(-inf - -inf) = NaN out of the running state on the
@@ -2766,7 +2812,8 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] = _fa_obuf[_fa_q "
           "* " << S(BD) << "u + d] * _fa_sc + _fa_p * " << V
-       << "[_fa_key * _fa_sv + _fa_col + d];\n";
+       << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << "_fa_key * _fa_sv + _fa_col + d];\n";
   }
   os << "        }\n";
   os << "        }\n";
@@ -2776,11 +2823,15 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     if (op.getSafeDenominatorOne())
       os << "        _fa_den = (_fa_den == 0.0f) ? 1.0f : _fa_den;\n";
     os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
-    os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
+    os << "          " << O << "["
+       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d] / _fa_den;\n";
   } else {
     os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
-    os << "          " << O << "[_fa_row * _fa_so + _fa_col + d] = "
+    os << "          " << O << "["
+       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d];\n";
   }
   os << "      }\n";

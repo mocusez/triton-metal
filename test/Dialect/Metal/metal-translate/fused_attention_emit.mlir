@@ -92,6 +92,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    metal.kernel grouped_head_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>, %sqh: !metal.memref<? x ui32>, %skh: !metal.memref<? x ui32>, %svh: !metal.memref<? x ui32>, %soh: !metal.memref<? x ui32>, %groups: !metal.memref<? x ui32>):
+      metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so head_params %sqh, %skh, %svh, %soh, %groups {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32, softmax_natural_exp} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32):
+        metal.score_yield %score : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32):
+        %zero = metal.constant 0 : si32
+        metal.key_bounds_yield %zero, %n2
+      }
+      metal.return
+    }
   }
 }
 
@@ -181,3 +193,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: simdgroup_store(acc, &_fa_sbuf
 // CHECK: denom = (denom == 0.0f) ? 1.0f : denom;
 // CHECK: v3[row * _fa_so + _fa_col + d]
+
+// --- grouped-head kernel: y selects an independently stored query head;
+// K/V share one head per runtime-sized query group. The head offsets are
+// separate from row/feature indexing and are not guessed from sequence and
+// d_head.
+// CHECK-LABEL: kernel void grouped_head_kernel
+// CHECK: uint _fa_qhoff = tgid.y * v11[0];
+// CHECK: uint _fa_khoff = (tgid.y / v15[0]) * v12[0];
+// CHECK: uint _fa_vhoff = (tgid.y / v15[0]) * v13[0];
+// CHECK: uint _fa_ohoff = tgid.y * v14[0];
+// CHECK: v0[_fa_qhoff + row * _fa_sq + _fa_col + d]
+// CHECK: v1[_fa_khoff + kk * _fa_sk + _fa_col + d]
+// CHECK: v2[_fa_vhoff + kk * _fa_sv + _fa_col + d]
+// CHECK: v3[_fa_ohoff + row * _fa_so + _fa_col + d]

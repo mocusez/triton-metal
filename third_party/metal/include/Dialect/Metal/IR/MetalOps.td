@@ -873,6 +873,13 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
     count, `n` the key count, `d_head` the feature width. `h` is OPTIONAL:
     present when the grid's y dimension selects a head.
 
+    `head_params` is the independent-head-storage alternative. When present it
+    contains exactly `[stride_qh, stride_kh, stride_vh, stride_oh, groups]`.
+    The grid's y dimension selects query head `y`, while K/V use grouped head
+    `y / groups`; the four strides address tensors stored as
+    `[head, sequence, feature]`. This is deliberately distinct from `h`, whose
+    heads occupy feature slices of one `[sequence, d_model]` tensor.
+
     `feature_tiled` is the deliberately narrow alternative used by kernels
     whose y grid tiles the OUTPUT feature dimension rather than selecting a
     head. In that mode each program writes
@@ -931,6 +938,7 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
                        Metal_MemRefType:$d_head,
                        Metal_MemRefType:$stride_q, Metal_MemRefType:$stride_k,
                        Metal_MemRefType:$stride_v, Metal_MemRefType:$stride_o,
+                       Variadic<Metal_MemRefType>:$head_params,
                        Optional<Metal_MemRefType>:$h,
                        Variadic<Metal_MemRefType>:$score_params,
                        I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
@@ -949,6 +957,7 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
   let assemblyFormat =
       "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_head"
       " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
+      " (`head_params` $head_params^)?"
       " (`heads` $h^)? (`params` $score_params^)? attr-dict"
       " `:` type(operands) $score `bounds` $key_bounds";
 }

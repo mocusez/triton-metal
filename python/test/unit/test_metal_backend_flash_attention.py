@@ -100,6 +100,147 @@ def _reference(Q, K, V, N, d_model, h):
     return ref
 
 
+@triton.jit
+def _grouped_query_attention_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr,
+    stride_qh, stride_qs, stride_qd,
+    stride_kh, stride_ks, stride_kd,
+    stride_vh, stride_vs, stride_vd,
+    stride_oh, stride_os, stride_od,
+    seq_len, head_dim, scale, groups,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    q_head_idx = tl.program_id(1)
+    kv_head_idx = q_head_idx // groups
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < seq_len
+    mask_d = offs_d < head_dim
+
+    q_ptrs = (q_ptr + q_head_idx * stride_qh +
+              offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd)
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    for start_n in range(0, seq_len, BLOCK_N):
+        offs_n_curr = start_n + offs_n
+        mask_n = offs_n_curr < seq_len
+
+        k_ptrs = (k_ptr + kv_head_idx * stride_kh +
+                  offs_n_curr[:, None] * stride_ks +
+                  offs_d[None, :] * stride_kd)
+        v_ptrs = (v_ptr + kv_head_idx * stride_vh +
+                  offs_n_curr[:, None] * stride_vs +
+                  offs_d[None, :] * stride_vd)
+        kv_mask = mask_n[:, None] & mask_d[None, :]
+        k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+
+        qk = tl.dot(q, tl.trans(k)) * scale
+        score_mask = mask_m[:, None] & mask_n[None, :]
+        qk = tl.where(score_mask, qk, float("-inf"))
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        p = tl.where(score_mask, p, 0.0)
+        l_i = alpha * l_i + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p, v)
+        m_i = m_i_new
+
+    acc = acc / l_i[:, None]
+    o_ptrs = (o_ptr + q_head_idx * stride_oh +
+              offs_m[:, None] * stride_os + offs_d[None, :] * stride_od)
+    tl.store(o_ptrs, acc, mask=mask_m[:, None] & mask_d[None, :])
+
+
+def _launch_grouped_query_attention(
+    Q, K, V, output, num_q_heads, num_kv_heads, seq_len, head_dim,
+):
+    block_d = triton.next_power_of_2(max(16, head_dim))
+    if block_d >= 256:
+        block_m, block_n = 16, 16
+    elif block_d >= 128:
+        block_m, block_n = 32, 32
+    else:
+        block_m, block_n = 64, 64
+    grid = (triton.cdiv(seq_len, block_m), num_q_heads)
+    return _grouped_query_attention_kernel[grid](
+        Q, K, V, output,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K.stride(0), K.stride(1), K.stride(2),
+        V.stride(0), V.stride(1), V.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        seq_len, head_dim, head_dim ** -0.5,
+        num_q_heads // num_kv_heads,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_D=block_d,
+    )
+
+
+def _gqa_reference(Q, K, V, num_q_heads, num_kv_heads):
+    groups = num_q_heads // num_kv_heads
+    return torch.nn.functional.scaled_dot_product_attention(
+        Q.cpu(),
+        K.cpu().repeat_interleave(groups, dim=0),
+        V.cpu().repeat_interleave(groups, dim=0),
+    )
+
+
+@pytest.mark.parametrize(
+    "num_q_heads, num_kv_heads, seq_len, head_dim",
+    [
+        pytest.param(4, 2, 64, 16, id="grouped-heads-block-aligned"),
+        pytest.param(4, 2, 33, 16, id="ragged-sequence"),
+        pytest.param(4, 2, 64, 12, id="padded-head-dim"),
+        pytest.param(8, 2, 129, 32, id="multiple-key-blocks"),
+    ],
+)
+def test_leet_grouped_query_attention_matches_reference(
+    num_q_heads, num_kv_heads, seq_len, head_dim
+):
+    torch.manual_seed(
+        0x60A + num_q_heads * 31 + num_kv_heads * 7 + seq_len + head_dim)
+    Q = torch.randn(
+        num_q_heads, seq_len, head_dim, dtype=torch.float32,
+        device="mps").contiguous()
+    K = torch.randn(
+        num_kv_heads, seq_len, head_dim, dtype=torch.float32,
+        device="mps").contiguous()
+    V = torch.randn(
+        num_kv_heads, seq_len, head_dim, dtype=torch.float32,
+        device="mps").contiguous()
+    sentinel = 1234.5
+    out = torch.full_like(Q, sentinel)
+
+    compiled = _launch_grouped_query_attention(
+        Q, K, V, out, num_q_heads, num_kv_heads, seq_len, head_dim)
+    torch.mps.synchronize()
+
+    if (num_q_heads, num_kv_heads, seq_len, head_dim) == (4, 2, 64, 16):
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "metal.fused_attention" in msl
+        for head_offset in (
+            "_fa_qhoff", "_fa_khoff", "_fa_vhoff", "_fa_ohoff"
+        ):
+            assert head_offset in msl
+
+    actual = out.cpu()
+    assert actual.isfinite().all()
+    assert not torch.any(actual == sentinel)
+    torch.testing.assert_close(
+        actual,
+        _gqa_reference(Q, K, V, num_q_heads, num_kv_heads),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
 @pytest.mark.parametrize(
     "N, d_model, h",
     [

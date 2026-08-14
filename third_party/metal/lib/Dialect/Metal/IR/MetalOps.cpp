@@ -244,6 +244,22 @@ llvm::LogicalResult FusedAttentionOp::verify() {
   if (getFeatureTiled() && getH())
     return emitOpError() << "feature_tiled is incompatible with heads";
 
+  auto headParams = getHeadParams();
+  if (!headParams.empty()) {
+    if (headParams.size() != 5)
+      return emitOpError()
+             << "head_params must contain stride_qh, stride_kh, stride_vh, "
+                "stride_oh and groups (got "
+             << headParams.size() << " operands)";
+    if (getH())
+      return emitOpError()
+             << "independent head_params are incompatible with feature-split "
+                "heads";
+    if (getFeatureTiled())
+      return emitOpError()
+             << "independent head_params are incompatible with feature_tiled";
+  }
+
   auto f32 = mlir::Float32Type::get(getContext());
   // SIGNED i32, not signless: `Metal_Type` has no plain I32, so a signless
   // index could not feed `metal.binary_exp` at all. Signed rather than unsigned
@@ -251,6 +267,14 @@ llvm::LogicalResult FusedAttentionOp::verify() {
   // content of a causal or decay mask.
   auto si32 = mlir::IntegerType::get(getContext(), 32,
                                      mlir::IntegerType::Signed);
+  auto ui32 = mlir::IntegerType::get(getContext(), 32,
+                                     mlir::IntegerType::Unsigned);
+  for (auto [i, p] : llvm::enumerate(headParams)) {
+    auto memRef = llvm::dyn_cast<MetalMemRefType>(p.getType());
+    if (!memRef || memRef.getType() != ui32)
+      return emitOpError() << "head_param " << i
+                           << " must be a !metal.memref<? x ui32>";
+  }
   auto params = getScoreParams();
 
   // Every trailing arg of BOTH regions is bound to element 0 of the
