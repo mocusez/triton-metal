@@ -1,4 +1,5 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: sed -e 's/warpsPerCTA = \[4, 1\]/warpsPerCTA = [128, 1]/g' -e 's/"ttg.num-warps" = 4 : i32/"ttg.num-warps" = 128 : i32/g' %s | not triton-metal-opt --convert-tritongpu-to-metal 2>&1 | FileCheck %s --check-prefix=REJECT
 //
 // AC4 v6 multi-warp 64×64 dot at num_warps=4. The conversion pass
 // matches `tryUnrollCanonical3IterArgDot` and emits a per-warp
@@ -93,3 +94,4 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-NOT: metal.simdgroup_index
 // CHECK-COUNT-64: metal.simdgroup_multiply_accumulate
 // CHECK-NOT: metal.simdgroup_multiply_accumulate
+// REJECT: canonical multi-tile dot has no valid warp partition

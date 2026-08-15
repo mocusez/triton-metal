@@ -11,6 +11,8 @@ linked (e.g. a Linux build without the Metal plugin).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import triton
@@ -38,6 +40,212 @@ def add_kernel_unmasked(
     x = tl.load(x_ptr + offsets)
     y = tl.load(y_ptr + offsets)
     tl.store(output_ptr + offsets, x + y)
+
+
+@triton.jit
+def dot_scaled_e8m0_bf16_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_base + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_base + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "bf16",
+        b,
+        b_scale,
+        "bf16",
+        fast_math=False,
+    )
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e8m0_e5m2_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_base + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_base + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e5m2",
+        b,
+        b_scale,
+        "e5m2",
+        fast_math=False,
+    )
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e8m0_e4m3_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_base + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_base + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e8m0_e2m1_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    LHS_K_PACK: tl.constexpr,
+    RHS_K_PACK: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    if LHS_K_PACK:
+        LHS_PACKED_K: tl.constexpr = BLOCK_K // 2
+        offs_lhs_packed_k = tl.arange(0, LHS_PACKED_K)
+        a = tl.load(a_base + offs_m[:, None] * LHS_PACKED_K + offs_lhs_packed_k[None, :])
+    else:
+        PACKED_M: tl.constexpr = BLOCK_M // 2
+        offs_packed_m = tl.arange(0, PACKED_M)
+        a = tl.load(a_base + offs_packed_m[:, None] * BLOCK_K + offs_k[None, :])
+    if RHS_K_PACK:
+        RHS_PACKED_K: tl.constexpr = BLOCK_K // 2
+        offs_rhs_packed_k = tl.arange(0, RHS_PACKED_K)
+        b = tl.load(b_base + offs_rhs_packed_k[:, None] * BLOCK_N + offs_n[None, :])
+    else:
+        PACKED_N: tl.constexpr = BLOCK_N // 2
+        offs_packed_n = tl.arange(0, PACKED_N)
+        b = tl.load(b_base + offs_k[:, None] * PACKED_N + offs_packed_n[None, :])
+
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e2m1",
+        b,
+        b_scale,
+        "e2m1",
+        fast_math=False,
+        lhs_k_pack=LHS_K_PACK,
+        rhs_k_pack=RHS_K_PACK,
+    )
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e4m3_extra_use_unsupported_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    scratch_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_offsets = offs_m[:, None] * BLOCK_K + offs_k[None, :]
+    b_offsets = offs_k[:, None] * BLOCK_N + offs_n[None, :]
+    a_raw = tl.load(a_base + a_offsets)
+    b_raw = tl.load(b_base + b_offsets)
+    a = a_raw.to(tl.float8e4nv, bitcast=True)
+    b = b_raw.to(tl.float8e4nv, bitcast=True)
+    a_roundtrip = a.to(tl.uint8, bitcast=True)
+
+    a_scale = tl.load(a_scale_base + offs_m[:, None])
+    b_scale = tl.load(b_scale_base + offs_n[:, None])
+    result = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", fast_math=False)
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+    tl.store(scratch_base + a_offsets, a_roundtrip)
+
+
+@triton.jit
+def fp8e5_copy_unsupported_kernel(
+    input_base,
+    output_base,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    value = tl.load(input_base + offsets)
+    tl.store(output_base + offsets, value)
+
+
+@triton.jit
+def fp8e4_copy_unsupported_kernel(
+    input_base,
+    output_base,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    value = tl.load(input_base + offsets)
+    tl.store(output_base + offsets, value)
 
 
 def test_triton_jit_compiles_to_msl():
@@ -85,7 +293,284 @@ def test_triton_jit_compiles_to_msl():
         "(id.x - (tgid.x * 128))",
         "(tgid.x * 128) + (id.x - (tgid.x * 128))",
     ):
-        assert needle in msl, (
-            f"MSL output missing required substring {needle!r}.\n"
-            f"--- MSL ---\n{msl}\n"
+        assert needle in msl, f"MSL output missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
+
+
+def test_dot_scaled_e8m0_bf16_compiles_to_msl():
+    src = ASTSource(
+        fn=dot_scaled_e8m0_bf16_kernel,
+        signature={
+            "a_base": "*bf16",
+            "b_base": "*bf16",
+            "a_scale_base": "*u8",
+            "b_scale_base": "*u8",
+            "output_base": "*fp32",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+        },
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    compiled = triton.compile(src, target=target, options={"num_warps": 4})
+
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    for needle in (
+        "as_type<bfloat>",
+        "bfloat(NAN)",
+        "& 255",
+        "== 255",
+        "/ 32",
+    ):
+        assert needle in msl, f"scaled-dot MSL output missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
+
+
+def test_dot_scaled_e8m0_e5m2_compiles_to_msl():
+    src = ASTSource(
+        fn=dot_scaled_e8m0_e5m2_kernel,
+        signature={
+            "a_base": "*fp8e5",
+            "b_base": "*fp8e5",
+            "a_scale_base": "*u8",
+            "b_scale_base": "*u8",
+            "output_base": "*fp32",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+        },
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    compiled = triton.compile(src, target=target, options={"num_warps": 4})
+
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    for needle in (
+        "as_type<half>",
+        "<< 8",
+        "bfloat",
+        "& 255",
+        "/ 32",
+    ):
+        assert needle in msl, f"E5M2 scaled-dot MSL output missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
+
+
+def test_dot_scaled_e8m0_e4m3_compiles_to_msl():
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    for payload_type in ("*fp8e4nv", "*u8"):
+        src = ASTSource(
+            fn=dot_scaled_e8m0_e4m3_kernel,
+            signature={
+                "a_base": payload_type,
+                "b_base": payload_type,
+                "a_scale_base": "*u8",
+                "b_scale_base": "*u8",
+                "output_base": "*fp32",
+                "BLOCK_M": "constexpr",
+                "BLOCK_N": "constexpr",
+                "BLOCK_K": "constexpr",
+            },
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32},
         )
+        compiled = triton.compile(src, target=target, options={"num_warps": 4})
+
+        raw = compiled.asm["metal"]
+        msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        for needle in (
+            "as_type<bfloat>",
+            "bfloat(NAN)",
+            "== 127",
+            "& 127",
+            "/ 32",
+        ):
+            assert needle in msl, f"E4M3 scaled-dot MSL for {payload_type} missing {needle!r}.\n--- MSL ---\n{msl}\n"
+
+
+def test_e4m3_decoder_reference_covers_all_payloads():
+    torch = pytest.importorskip("torch")
+    raw = torch.arange(256, dtype=torch.uint8)
+    decoded = raw.view(torch.float8_e4m3fn).to(torch.bfloat16)
+    bits = decoded.view(torch.uint16)
+
+    expected = []
+    for value in range(256):
+        sign = (value & 0x80) << 8
+        magnitude = value & 0x7F
+        mantissa = magnitude & 0x7
+        if magnitude < 8:
+            subnormal_bits = (
+                0x0000,
+                0x3B00,
+                0x3B80,
+                0x3BC0,
+                0x3C00,
+                0x3C20,
+                0x3C40,
+                0x3C60,
+            )
+            decoded_magnitude = subnormal_bits[mantissa]
+        else:
+            decoded_magnitude = (magnitude << 4) + 0x3C00
+        if magnitude == 0x7F:
+            decoded_magnitude = 0x7FC0
+        expected.append(sign | decoded_magnitude)
+
+    expected_bits = torch.tensor(expected, dtype=torch.uint16)
+    finite = ~torch.isnan(decoded.float())
+    assert finite.sum().item() == 254
+    assert torch.equal(bits[finite], expected_bits[finite])
+    assert torch.isnan(decoded[~finite].float()).all()
+    assert decoded[0x7E].float().item() == 448.0
+    assert decoded[0xFE].float().item() == -448.0
+
+
+@pytest.mark.parametrize("lhs_k_pack,rhs_k_pack", [(True, True), (False, True), (True, False), (False, False)])
+def test_dot_scaled_e8m0_e2m1_compiles_to_msl(lhs_k_pack, rhs_k_pack):
+    src = ASTSource(
+        fn=dot_scaled_e8m0_e2m1_kernel,
+        signature={
+            "a_base": "*u8",
+            "b_base": "*u8",
+            "a_scale_base": "*u8",
+            "b_scale_base": "*u8",
+            "output_base": "*fp32",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+            "LHS_K_PACK": "constexpr",
+            "RHS_K_PACK": "constexpr",
+        },
+        constexprs={
+            "BLOCK_M": 16,
+            "BLOCK_N": 16,
+            "BLOCK_K": 32,
+            "LHS_K_PACK": lhs_k_pack,
+            "RHS_K_PACK": rhs_k_pack,
+        },
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    compiled = triton.compile(src, target=target, options={"num_warps": 4})
+
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    for needle in (
+        "as_type<bfloat>",
+        "bfloat(NAN)",
+        "/ 2",
+        "& 15",
+        "& 7",
+        "/ 32",
+    ):
+        assert needle in msl, f"E2M1 scaled-dot MSL missing {needle!r}.\n--- MSL ---\n{msl}\n"
+
+    # Prove that the per-operand packing flags reach scalar_dot lowering.  The
+    # generated variable numbers are intentionally ignored: only the physical
+    # coordinate divided by two distinguishes K packing from outer M/N packing.
+    lhs_outer_address = bool(re.search(r"\(\(v\d+ / 16\) / 2\)", msl))
+    rhs_outer_address = "% 16) / 2)" in msl
+    k_packed_address = bool(re.search(r"\(v\d+ / 2\)", msl))
+    assert lhs_outer_address is not lhs_k_pack
+    assert rhs_outer_address is not rhs_k_pack
+    assert k_packed_address is (lhs_k_pack or rhs_k_pack)
+
+
+def test_e2m1_decoder_reference_covers_all_nibbles():
+    torch = pytest.importorskip("torch")
+    from triton.tools.mxfp import MXFP4Tensor
+
+    raw = torch.arange(16, dtype=torch.uint8)
+    oracle = MXFP4Tensor(size=(16,), device="cpu")
+    oracle.data = raw
+    decoded_bits = oracle.to(torch.float32).to(torch.bfloat16).view(torch.uint16)
+
+    expected = []
+    for nibble in range(16):
+        sign = (nibble & 8) << 12
+        magnitude = nibble & 7
+        if magnitude == 0:
+            magnitude_bits = 0
+        elif magnitude == 1:
+            magnitude_bits = 0x3F00
+        else:
+            magnitude_bits = 0x3F00 + (magnitude << 6)
+        expected.append(sign | magnitude_bits)
+
+    assert torch.equal(decoded_bits, torch.tensor(expected, dtype=torch.uint16))
+    assert decoded_bits[8].item() == 0x8000
+
+
+def test_generic_fp8e5_load_remains_rejected():
+    src = ASTSource(
+        fn=fp8e5_copy_unsupported_kernel,
+        signature={
+            "input_base": "*fp8e5",
+            "output_base": "*fp8e5",
+            "BLOCK_SIZE": "constexpr",
+        },
+        constexprs={"BLOCK_SIZE": 128},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    # The pybind boundary intentionally collapses pass diagnostics to the
+    # stage-level failure below; the lit negative test pins the detailed E5M2
+    # diagnostic emitted before dialect conversion.
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        triton.compile(src, target=target, options={"num_warps": 4})
+
+
+def test_e4m3_payload_bitcast_with_extra_use_remains_rejected():
+    src = ASTSource(
+        fn=dot_scaled_e4m3_extra_use_unsupported_kernel,
+        signature={
+            "a_base": "*u8",
+            "b_base": "*u8",
+            "a_scale_base": "*u8",
+            "b_scale_base": "*u8",
+            "output_base": "*fp32",
+            "scratch_base": "*u8",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+        },
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        triton.compile(src, target=target, options={"num_warps": 4})
+
+
+def test_generic_fp8e4_load_remains_rejected():
+    src = ASTSource(
+        fn=fp8e4_copy_unsupported_kernel,
+        signature={
+            "input_base": "*fp8e4nv",
+            "output_base": "*fp8e4nv",
+            "BLOCK_SIZE": "constexpr",
+        },
+        constexprs={"BLOCK_SIZE": 128},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        triton.compile(src, target=target, options={"num_warps": 4})
+
+
+def test_e5m2_decode_embedding_covers_every_encoding():
+    torch = pytest.importorskip("torch")
+    raw = torch.arange(256, dtype=torch.uint8)
+    e5m2 = raw.view(torch.float8_e5m2)
+    f16 = e5m2.to(torch.float16)
+    f16_bits = f16.view(torch.uint16).to(torch.int32)
+    expected_bits = raw.to(torch.int32) * 256
+
+    is_nan = torch.isnan(e5m2)
+    is_finite = torch.isfinite(e5m2)
+    assert is_finite.sum().item() == 248
+    assert torch.isinf(e5m2).sum().item() == 2
+    assert is_nan.sum().item() == 6
+    assert torch.equal(f16_bits[~is_nan], expected_bits[~is_nan])
+    assert torch.equal(torch.isnan(f16), is_nan)
+
+    # Every finite E5M2 value is exactly representable in BF16.  NaN payload
+    # and signaling bits are deliberately outside the Metal contract.
+    bf16 = f16.to(torch.float32).to(torch.bfloat16)
+    assert torch.equal(bf16[is_finite].to(torch.float32), e5m2[is_finite].to(torch.float32))

@@ -14,7 +14,9 @@ accumulator (`dw += load_tile`, `db += load_tile`) over axis 0;
 load_tile, axis=0))` (per accumulator) so the reduce sees a per-iteration direct
 masked load.
 
-Combines: f32 sum/max and i32 sum/max/min, both direct and loop-carried (the
+Combines: f32 sum/max and i32 sum/product/max/min. Product is direct-unmasked
+load only;
+the other combines support both direct and loop-carried forms (the
 reassociation reassociates any same-kind loop-carried accumulator whose tensor
 update op has an elementwise scalarizing lowering — arith.add{f,i},
 metal.binary_exp for f32 max, and scalar arith.maxsi/minsi for i32 max/min). Sum
@@ -135,7 +137,8 @@ def test_bwd_dwdb_verbatim(M, N):
 
 
 # --- Combines beyond f32 sum (Session L3a2 generalization) -----------------
-# f32 max and i32 sum/max/min. Sum uses scalar arith; f32 max uses
+# f32 max and i32 sum/product/max/min. Sum uses scalar arith; product uses
+# ui32 metal.binary_exp for modulo-2^32 behavior; f32 max uses
 # metal.binary_exp maxOp; i32 max/min use cmpi+select (binary_exp rejects
 # signless i32). Both direct and loop-carried (reassociation + elementwise
 # maxnumf / maxsi / minsi lowerings).
@@ -186,6 +189,109 @@ def test_reduce_axis0_colsum_i32(M, N):
     _colsum_i32[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), inp.cpu().sum(0, dtype=torch.int32))
+
+
+@triton.jit
+def _product_combine(a, b):
+    return a * b
+
+
+@triton.jit
+def _colproduct_i32(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    offs = rows[:, None] * BN + cols[None, :]
+    x = tl.load(In + offs)
+    product = tl.reduce(x, axis=0, combine_fn=_product_combine)
+    tl.store(Out + cols, product)
+
+
+@triton.jit
+def _colproduct_f32(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    offs = rows[:, None] * BN + cols[None, :]
+    x = tl.load(In + offs)
+    product = tl.reduce(x, axis=0, combine_fn=_product_combine)
+    tl.store(Out + cols, product)
+
+
+@triton.jit
+def _colmax_f32_direct(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    offs = rows[:, None] * BN + cols[None, :]
+    x = tl.load(In + offs)
+    tl.store(Out + cols, tl.max(x, axis=0))
+
+
+@triton.jit
+def _colmin_f32_direct(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    offs = rows[:, None] * BN + cols[None, :]
+    x = tl.load(In + offs)
+    tl.store(Out + cols, tl.min(x, axis=0))
+
+
+@pytest.mark.parametrize("M,N", [(4, 16), (8, 32)])
+def test_reduce_axis0_colproduct_i32_direct(M, N):
+    inp = torch.ones((M, N), dtype=torch.int32)
+    inp[0] = 2
+    inp[1] = -3
+    if M >= 4:
+        inp[2, 0] = 65536
+        inp[3, 0] = 65536
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colproduct_i32[(1,)](inp.to("mps"), out, BM=M, BN=N)
+    torch.mps.synchronize()
+    expected_values = []
+    for column in inp.T.tolist():
+        bits = 1
+        for value in column:
+            bits = (bits * (value & 0xFFFFFFFF)) & 0xFFFFFFFF
+        expected_values.append(bits if bits < 0x80000000 else bits - 0x100000000)
+    expected = torch.tensor(expected_values, dtype=torch.int32)
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("M,N", [(4, 16), (8, 32)])
+def test_reduce_axis0_colproduct_f32_direct(M, N):
+    inp = torch.ones((M, N), dtype=torch.float32)
+    inp[0] = 1.25
+    inp[1] = -0.5
+    inp[2, 0] = 0.0
+    inp[2, 1] = -0.0
+    inp[2, 2] = float("inf")
+    inp[2, 3] = float("nan")
+    out = torch.empty(N, dtype=torch.float32, device="mps")
+    _colproduct_f32[(1,)](inp.to("mps"), out, BM=M, BN=N)
+    torch.mps.synchronize()
+    expected = torch.prod(inp, dim=0)
+    actual = out.cpu()
+    finite = torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=1e-6, rtol=1e-6)
+    assert torch.isneginf(actual[2])
+    assert torch.isnan(actual[3])
+    assert torch.equal(actual.view(torch.int32)[[0, 1]],
+                       expected.view(torch.int32)[[0, 1]])
+
+
+@pytest.mark.parametrize(
+    "kernel, fill, check",
+    [
+        (_colmax_f32_direct, float("-inf"), torch.isneginf),
+        (_colmin_f32_direct, float("inf"), torch.isposinf),
+    ],
+)
+@pytest.mark.parametrize("M,N", [(4, 16), (8, 32)])
+def test_reduce_axis0_f32_extrema_exact_infinity_identity(kernel, fill, check,
+                                                          M, N):
+    inp = torch.full((M, N), fill, dtype=torch.float32, device="mps")
+    out = torch.empty(N, dtype=torch.float32, device="mps")
+    kernel[(1,)](inp, out, BM=M, BN=N)
+    torch.mps.synchronize()
+    assert check(out).all()
 
 
 @triton.jit

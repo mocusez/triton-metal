@@ -6434,8 +6434,12 @@ void ModuleTranslation::translate(mlir::triton::metal::CastOp op) {
 
 void ModuleTranslation::translate(mlir::triton::metal::BitcastOp op) {
   _output << "as_type<" << typeToString(op.getType()) << ">(";
+  // Integer arithmetic narrower than `int` is promoted by C/MSL expression
+  // rules.  Reassert the MLIR source type at the as_type boundary so a ui16
+  // shift cannot become a 32-bit argument to as_type<half>.
+  _output << typeToString(op.getArgument().getType()) << "(";
   translateValueOrVarName(op.getArgument());
-  _output << ")";
+  _output << "))";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {

@@ -1,4 +1,4 @@
-"""Rank-2 axis=1 f32 extrema and argmin on the Metal backend.
+"""Rank-2 axis=1 f32 extrema/argmin and direct-load i32 product on Metal.
 
 Companion to `test_metal_backend_reduce_sum.py`. The rank-2 `ReduceLowering`
 row-scan body originally only implemented the sum combine (arith.addf /
@@ -7,10 +7,9 @@ arith.maxnumf): the kernel loads a 2D `(M, N)` block, calls
 `tl.max(x, axis=1)`, and stores the resulting `(M,)` vector.
 
 The combine is emitted as `metal.binary_exp ... maxOp` (MSL `max(a, b)`) and
-the per-row scf.for iter_arg is identity-initialised to -FLT_MAX (the MSL
-float-constant emitter can't render -inf, and `max(x, -FLT_MAX) == x` for
-every finite x). Max is an exact element selection, so the result is compared
-bit-tight against `torch.amax(input, dim=1)`.
+the per-row scf.for iter_arg is identity-initialised to exact -infinity. Max is
+an exact element selection, so the result is compared bit-tight against
+`torch.amax(input, dim=1)`.
 """
 
 from __future__ import annotations
@@ -19,8 +18,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -62,6 +61,26 @@ def reduce_min_axis1_kernel(
     x = tl.load(x_ptr + addr)
     m = tl.min(x, axis=1)
     tl.store(out_ptr + offs_m, m)
+
+
+@triton.jit
+def _product_combine(a, b):
+    return a * b
+
+
+@triton.jit
+def reduce_product_axis1_kernel(
+    x_ptr,
+    out_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    addr = offs_m[:, None] * BLOCK_N + offs_n[None, :]
+    x = tl.load(x_ptr + addr)
+    product = tl.reduce(x, axis=1, combine_fn=_product_combine)
+    tl.store(out_ptr + offs_m, product)
 
 
 @triton.jit
@@ -138,15 +157,22 @@ def test_reduce_max_axis1_f32(M, N):
 
 
 def test_reduce_max_axis1_negative_rows():
-    """All-negative rows: confirms the -FLT_MAX identity never wins over a
-    real (finite, negative) element."""
+    """All-negative rows keep their real finite maximum."""
     M, N = 8, 16
     x = -torch.rand((M, N), dtype=torch.float32).contiguous() - 1.0  # in [-2, -1)
     out = torch.zeros((M,), dtype=torch.float32).contiguous()
     reduce_max_axis1_kernel[(1, 1, 1)](x, out, BLOCK_M=M, BLOCK_N=N)
     expected = torch.amax(x.cpu(), dim=1)
-    assert (out.cpu() < 0).all(), f"identity (-FLT_MAX) leaked into result: {out}"
+    assert (out.cpu() < 0).all(), f"max identity leaked into result: {out}"
     torch.testing.assert_close(out.cpu(), expected, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("M,N", [(8, 16), (16, 32)])
+def test_reduce_max_axis1_all_negative_infinity(M, N):
+    x = torch.full((M, N), float("-inf"), dtype=torch.float32)
+    out = torch.zeros((M,), dtype=torch.float32)
+    reduce_max_axis1_kernel[(1,)](x, out, BLOCK_M=M, BLOCK_N=N)
+    assert torch.isneginf(out).all()
 
 
 @pytest.mark.parametrize("M, N", [(8, 16), (4, 32), (16, 16), (128, 64)])
@@ -168,6 +194,39 @@ def test_reduce_min_axis1_positive_rows():
     expected = torch.amin(x.cpu(), dim=1)
     assert (out.cpu() > 0).all(), f"non-positive minimum returned: {out}"
     torch.testing.assert_close(out.cpu(), expected, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("M,N", [(8, 16), (16, 32)])
+def test_reduce_product_axis1_i32_direct_load(M, N):
+    x = torch.ones((M, N), dtype=torch.int32)
+    x[:, :2] = torch.tensor([2, 3], dtype=torch.int32)
+    x[0, :2] = 65536
+    x[1, 0] = -2
+    out = torch.zeros((M,), dtype=torch.int32)
+    reduce_product_axis1_kernel[(1,)](x, out, BLOCK_M=M, BLOCK_N=N)
+    expected = torch.prod(x.to(torch.int64), dim=1).to(torch.int32)
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("M,N", [(8, 16), (16, 32)])
+def test_reduce_product_axis1_f32_direct_load(M, N):
+    x = torch.ones((M, N), dtype=torch.float32)
+    x[:, 0] = 1.25
+    x[:, 1] = -0.5
+    x[0, 2] = 0.0
+    x[1, 2] = float("inf")
+    x[2, 2] = float("nan")
+    x[3, 2] = -0.0
+    out = torch.zeros((M,), dtype=torch.float32)
+    reduce_product_axis1_kernel[(1,)](x, out, BLOCK_M=M, BLOCK_N=N)
+    expected = torch.prod(x, dim=1)
+    actual = out.cpu()
+    finite = torch.isfinite(expected)
+    torch.testing.assert_close(actual[finite], expected[finite], atol=1e-6, rtol=1e-6)
+    assert torch.isneginf(actual[1])
+    assert torch.isnan(actual[2])
+    assert torch.equal(actual.view(torch.int32)[[0, 3]],
+                       expected.view(torch.int32)[[0, 3]])
 
 
 @pytest.mark.parametrize(

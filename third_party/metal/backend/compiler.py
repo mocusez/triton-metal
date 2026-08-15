@@ -33,7 +33,10 @@ class MetalOptions:
     # without a target context — fix the caller in that case.
     arch: int = 0
     # Required by Triton's compile loop / metadata even if unused at v1.
-    supported_fp8_dtypes: tuple = ()
+    # E4M3FN/E5M2 are accepted only by the exact software tt.dot_scaled path.
+    # They are byte-backed in the Metal ABI and decoded to bf16 before
+    # arithmetic.
+    supported_fp8_dtypes: tuple = ("fp8e4nv", "fp8e5")
     deprecated_fp8_dot_operand_dtypes: tuple = ()
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: tuple = ("ieee",)
@@ -56,7 +59,7 @@ class MetalOptions:
         # constant stub, which made every multi-warp kernel collide with
         # the first nw=1 compile in the in-process cache.
         return (
-            f"metal-stub-v2-nw{self.num_warps}-nctas{self.num_ctas}"
+            f"metal-stub-v4-nw{self.num_warps}-nctas{self.num_ctas}"
             f"-ns{self.num_stages}-ws{self.warp_size}-arch{self.arch}"
             f"-precfp{self.default_dot_input_precision}"
             f"-fpfuse{int(self.enable_fp_fusion)}"
@@ -95,7 +98,9 @@ _OPT_WARN_UNSUPPORTED = {
     "maxnreg": "Metal (MSL text) exposes no per-thread register cap.",
     "extern_libs": "The Metal backend loads no external libdevice; core libdevice "
                    "maps to MSL intrinsics (get_module_map returns {}).",
-    "max_num_imprecise_acc_default": "Metal has no fp8 dot path.",
+    "max_num_imprecise_acc_default": (
+        "Metal has no hardware fp8 dot path; the exact E5M2 scaled-dot path is software-only."
+    ),
     "instrumentation_mode": "Metal runs no instrumentation passes.",
 }
 _OPT_REJECT_UNSUPPORTED = {

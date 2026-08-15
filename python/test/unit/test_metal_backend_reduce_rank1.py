@@ -1,4 +1,4 @@
-"""Rank-1 tt.reduce on the Metal backend (f32/i32, sum/max).
+"""Rank-1 tt.reduce on the Metal backend (f32/i32 sum/extrema/product).
 
 The core f32 rank-1 reduce cases (sum+max,
 BLOCK ∈ {32, 64, 128, 256, 512, 1024}) pass end-to-end via the spt-fold in
@@ -11,7 +11,7 @@ Kernel shape: load a row of length N from a 1D `!tt.ptr`, reduce via
 Coverage:
   BLOCK_SIZE ∈ {32, 64, 128, 256, 512, 1024}
   dtype      ∈ {f32, i32}
-  op         ∈ {sum, max}
+  op         ∈ {sum, max, product}
   integration: f32 sum with BLOCK=4096 and Leet GroupNorm
 
 Notes:
@@ -97,6 +97,23 @@ def reduce_min_rank1_kernel(
     x = tl.load(x_ptr + offs)
     s = tl.min(x, axis=0)
     tl.store(out_ptr + 0, s)
+
+
+@triton.jit
+def _product_combine(a, b):
+    return a * b
+
+
+@triton.jit
+def reduce_product_rank1_kernel(
+    x_ptr,
+    out_ptr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    product = tl.reduce(x, axis=0, combine_fn=_product_combine)
+    tl.store(out_ptr, product)
 
 
 @triton.jit
@@ -204,6 +221,32 @@ def test_reduce_max_rank1_f32(BLOCK):
 
 
 @pytest.mark.parametrize("BLOCK", _block_params())
+def test_reduce_min_rank1_f32(BLOCK):
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randn((BLOCK,), dtype=torch.float32).contiguous()
+    out = torch.zeros((1,), dtype=torch.float32).contiguous()
+    reduce_min_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    expected = torch.min(x.cpu())
+    torch.testing.assert_close(out[0].item(), expected.item(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("BLOCK", [32, 512])
+def test_reduce_max_rank1_f32_all_negative_infinity(BLOCK):
+    x = torch.full((BLOCK,), float("-inf"), dtype=torch.float32)
+    out = torch.zeros((1,), dtype=torch.float32)
+    reduce_max_rank1_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    assert torch.isneginf(out[0])
+
+
+@pytest.mark.parametrize("BLOCK", [32, 512])
+def test_reduce_min_rank1_f32_all_positive_infinity(BLOCK):
+    x = torch.full((BLOCK,), float("inf"), dtype=torch.float32)
+    out = torch.zeros((1,), dtype=torch.float32)
+    reduce_min_rank1_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    assert torch.isposinf(out[0])
+
+
+@pytest.mark.parametrize("BLOCK", _block_params())
 def test_reduce_sum_rank1_i32(BLOCK):
     torch.manual_seed(0xC0FFEE)
     x = torch.randint(-100, 100, (BLOCK,), dtype=torch.int32).contiguous()
@@ -234,6 +277,57 @@ def test_reduce_min_rank1_i32(BLOCK):
     reduce_min_rank1_kernel[(1, 1, 1)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
     expected = torch.min(x.cpu()).to(torch.int32)
     assert out[0].item() == expected.item()
+
+
+@pytest.mark.parametrize("BLOCK", [32, 512])
+def test_reduce_product_rank1_i32(BLOCK):
+    x = torch.ones((BLOCK,), dtype=torch.int32)
+    x[:4] = torch.tensor([-2, 3, -1, 2], dtype=torch.int32)
+    out = torch.zeros((1,), dtype=torch.int32)
+    reduce_product_rank1_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    assert out.item() == 12
+
+
+def test_reduce_product_rank1_i32_wraps_modulo_32_bits():
+    x = torch.ones((32,), dtype=torch.int32)
+    x[:2] = 65536
+    out = torch.full((1,), -1, dtype=torch.int32)
+    reduce_product_rank1_kernel[(1,)](x, out, BLOCK=32, num_warps=_NUM_WARPS)
+    assert out.item() == 0
+
+
+@pytest.mark.parametrize("BLOCK", [32, 512])
+def test_reduce_product_rank1_f32_direct_load(BLOCK):
+    x = torch.ones((BLOCK,), dtype=torch.float32)
+    x[:4] = torch.tensor([-2.0, 0.5, -1.0, 2.0], dtype=torch.float32)
+    out = torch.zeros((1,), dtype=torch.float32)
+    reduce_product_rank1_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    assert out.item() == 2.0
+
+
+@pytest.mark.parametrize("BLOCK", [32, 512])
+@pytest.mark.parametrize(
+    "values, expected_class",
+    [
+        ([-1.0, 0.0], "negative-zero"),
+        ([-1.0, -0.0], "positive-zero"),
+        ([-1.0, float("inf")], "negative-infinity"),
+        ([float("nan")], "nan"),
+    ],
+)
+def test_reduce_product_rank1_f32_special_values(BLOCK, values, expected_class):
+    x = torch.ones((BLOCK,), dtype=torch.float32)
+    x[: len(values)] = torch.tensor(values, dtype=torch.float32)
+    out = torch.zeros((1,), dtype=torch.float32)
+    reduce_product_rank1_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=_NUM_WARPS)
+    actual = out.cpu()
+    if expected_class == "nan":
+        assert torch.isnan(actual[0])
+    elif expected_class == "negative-infinity":
+        assert torch.isneginf(actual[0])
+    else:
+        expected_bits = 0x80000000 if expected_class == "negative-zero" else 0
+        assert actual.view(torch.int32)[0].item() & 0xFFFFFFFF == expected_bits
 
 
 @pytest.mark.parametrize(

@@ -65,6 +65,390 @@ def dot_universal_kernel(
     tl.store(c_ptrs, acc)
 
 
+@triton.jit
+def dot_scaled_e4m3_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    a_scale = tl.load(a_scale_ptr + offs_m[:, None])
+    b_scale = tl.load(b_scale_ptr + offs_n[:, None])
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e2m1_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    LHS_K_PACK: tl.constexpr,
+    RHS_K_PACK: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    if LHS_K_PACK:
+        LHS_PACKED_K: tl.constexpr = BLOCK_K // 2
+        offs_lhs_packed_k = tl.arange(0, LHS_PACKED_K)
+        a = tl.load(a_ptr + offs_m[:, None] * LHS_PACKED_K + offs_lhs_packed_k[None, :])
+    else:
+        PACKED_M: tl.constexpr = BLOCK_M // 2
+        offs_packed_m = tl.arange(0, PACKED_M)
+        a = tl.load(a_ptr + offs_packed_m[:, None] * BLOCK_K + offs_k[None, :])
+    if RHS_K_PACK:
+        RHS_PACKED_K: tl.constexpr = BLOCK_K // 2
+        offs_rhs_packed_k = tl.arange(0, RHS_PACKED_K)
+        b = tl.load(b_ptr + offs_rhs_packed_k[:, None] * BLOCK_N + offs_n[None, :])
+    else:
+        PACKED_N: tl.constexpr = BLOCK_N // 2
+        offs_packed_n = tl.arange(0, PACKED_N)
+        b = tl.load(b_ptr + offs_k[:, None] * PACKED_N + offs_packed_n[None, :])
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_ptr + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_ptr + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e2m1",
+        b,
+        b_scale,
+        "e2m1",
+        fast_math=False,
+        lhs_k_pack=LHS_K_PACK,
+        rhs_k_pack=RHS_K_PACK,
+    )
+    tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e5m2_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    a_scale = tl.load(a_scale_ptr + offs_m[:, None])
+    b_scale = tl.load(b_scale_ptr + offs_n[:, None])
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e5m2",
+        b,
+        b_scale,
+        "e5m2",
+        fast_math=False,
+    )
+    tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+def _run_dot_scaled_e4m3_u8(a, *, a_scale_raw=127):
+    b = torch.zeros((32, 16), dtype=torch.uint8)
+    diagonal = torch.arange(16)
+    b[diagonal, diagonal] = 0x38
+    a_scale = torch.full((16, 1), a_scale_raw, dtype=torch.uint8)
+    b_scale = torch.full((16, 1), 127, dtype=torch.uint8)
+    output = torch.empty((16, 16), dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_u8_kernel[(1,)](
+        a.to("mps"),
+        b.to("mps"),
+        a_scale.to("mps"),
+        b_scale.to("mps"),
+        output,
+        BLOCK_M=16,
+        BLOCK_N=16,
+        BLOCK_K=32,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    return output.cpu()
+
+
+def _run_dot_scaled_e5m2_u8(a):
+    b = torch.zeros((32, 16), dtype=torch.uint8)
+    diagonal = torch.arange(16)
+    b[diagonal, diagonal] = 0x3C
+    a_scale = torch.full((16, 1), 127, dtype=torch.uint8)
+    b_scale = torch.full((16, 1), 127, dtype=torch.uint8)
+    output = torch.empty((16, 16), dtype=torch.float32, device="mps")
+
+    dot_scaled_e5m2_u8_kernel[(1,)](
+        a.to("mps"),
+        b.to("mps"),
+        a_scale.to("mps"),
+        b_scale.to("mps"),
+        output,
+        BLOCK_M=16,
+        BLOCK_N=16,
+        BLOCK_K=32,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    return output.cpu()
+
+
+def _run_dot_scaled_e2m1_u8(a, b, *, lhs_k_pack=True, rhs_k_pack=True, a_scale_raw=None, b_scale_raw=None):
+    M = a.shape[0] if lhs_k_pack else a.shape[0] * 2
+    logical_k_a = a.shape[1] * 2 if lhs_k_pack else a.shape[1]
+    logical_k_b = b.shape[0] * 2 if rhs_k_pack else b.shape[0]
+    N = b.shape[1] if rhs_k_pack else b.shape[1] * 2
+    assert logical_k_a == logical_k_b
+    logical_k = logical_k_a
+    scale_groups = logical_k // 32
+    if a_scale_raw is None:
+        a_scale_raw = torch.full((M, scale_groups), 127, dtype=torch.uint8)
+    if b_scale_raw is None:
+        b_scale_raw = torch.full((N, scale_groups), 127, dtype=torch.uint8)
+    assert a_scale_raw.shape == (M, scale_groups)
+    assert b_scale_raw.shape == (N, scale_groups)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_e2m1_u8_kernel[(1,)](
+        a.to("mps"),
+        b.to("mps"),
+        a_scale_raw.to("mps"),
+        b_scale_raw.to("mps"),
+        output,
+        BLOCK_M=M,
+        BLOCK_N=N,
+        BLOCK_K=logical_k,
+        LHS_K_PACK=lhs_k_pack,
+        RHS_K_PACK=rhs_k_pack,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    return output.cpu()
+
+
+def _decode_e2m1_packed(packed, dim):
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    low = values[(packed & 0xF).long()]
+    high = values[(packed >> 4).long()]
+    return torch.stack((low, high), dim=dim + 1).flatten(dim, dim + 1)
+
+
+def test_dot_scaled_e2m1_a_payload_bytes_exhaustive():
+    # Every physical A byte contributes its low then high nibble to adjacent
+    # logical-K columns.  An encoded +1 identity on B exposes all 512 decoded
+    # values independently in the 16x32 output.
+    a = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
+    b = torch.zeros((16, 32), dtype=torch.uint8)
+    for diagonal in range(32):
+        b[diagonal // 2, diagonal] = 0x2 << (4 * (diagonal & 1))
+
+    actual = _run_dot_scaled_e2m1_u8(a, b)
+    reference = _decode_e2m1_packed(a, dim=1)
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e2m1_b_payload_bytes_exhaustive():
+    # Mirror the exhaustive byte/address check for B.  Packed A now supplies
+    # the logical identity, so both nibbles of all 256 B bytes are observable.
+    a = torch.zeros((32, 16), dtype=torch.uint8)
+    for diagonal in range(32):
+        a[diagonal, diagonal // 2] = 0x2 << (4 * (diagonal & 1))
+    b = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
+
+    actual = _run_dot_scaled_e2m1_u8(a, b)
+    reference = _decode_e2m1_packed(b, dim=0)
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e2m1_lhs_outer_packed_payload_bytes_exhaustive():
+    a = torch.arange(256, dtype=torch.uint8).reshape(8, 32)
+    b = torch.zeros((16, 32), dtype=torch.uint8)
+    for diagonal in range(32):
+        b[diagonal // 2, diagonal] = 0x2 << (4 * (diagonal & 1))
+
+    actual = _run_dot_scaled_e2m1_u8(a, b, lhs_k_pack=False)
+    reference = _decode_e2m1_packed(a, dim=0)
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e2m1_rhs_outer_packed_payload_bytes_exhaustive():
+    a = torch.zeros((32, 16), dtype=torch.uint8)
+    for diagonal in range(32):
+        a[diagonal, diagonal // 2] = 0x2 << (4 * (diagonal & 1))
+    b = torch.arange(256, dtype=torch.uint8).reshape(32, 8)
+
+    actual = _run_dot_scaled_e2m1_u8(a, b, rhs_k_pack=False)
+    reference = _decode_e2m1_packed(b, dim=1)
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e2m1_both_outer_packed_with_distinct_scales():
+    a = torch.arange(256, dtype=torch.uint8).reshape(8, 32)
+    b = torch.arange(255, -1, -1, dtype=torch.int32).to(torch.uint8).reshape(32, 8)
+    a_scale_raw = torch.tensor(([126, 127, 128, 127] * 4), dtype=torch.uint8).reshape(16, 1)
+    b_scale_raw = torch.tensor(([128, 127, 126, 127] * 4), dtype=torch.uint8).reshape(16, 1)
+
+    actual = _run_dot_scaled_e2m1_u8(
+        a,
+        b,
+        lhs_k_pack=False,
+        rhs_k_pack=False,
+        a_scale_raw=a_scale_raw,
+        b_scale_raw=b_scale_raw,
+    )
+    decoded_a = _decode_e2m1_packed(a, dim=0)
+    decoded_b = _decode_e2m1_packed(b, dim=1)
+    a_scales = torch.pow(2.0, a_scale_raw.float() - 127.0)
+    b_scales = torch.pow(2.0, b_scale_raw.float() - 127.0).T
+    reference = (decoded_a @ decoded_b) * a_scales * b_scales
+    assert torch.equal(actual, reference)
+
+
+@pytest.mark.parametrize("lhs_k_pack,rhs_k_pack", [(False, True), (True, False)])
+def test_dot_scaled_e2m1_mixed_packing_uses_logical_k_scale_groups(lhs_k_pack, rhs_k_pack):
+    M, N, K = 16, 16, 64
+    a_shape = (M, K // 2) if lhs_k_pack else (M // 2, K)
+    b_shape = (K // 2, N) if rhs_k_pack else (K, N // 2)
+    a = torch.full(a_shape, 0x22, dtype=torch.uint8)
+    b = torch.full(b_shape, 0x22, dtype=torch.uint8)
+    a_scale_raw = torch.tensor(([127, 129] * M), dtype=torch.uint8).reshape(M, 2)
+    b_scale_raw = torch.tensor(([127, 128] * N), dtype=torch.uint8).reshape(N, 2)
+
+    actual = _run_dot_scaled_e2m1_u8(
+        a,
+        b,
+        lhs_k_pack=lhs_k_pack,
+        rhs_k_pack=rhs_k_pack,
+        a_scale_raw=a_scale_raw,
+        b_scale_raw=b_scale_raw,
+    )
+    # Each logical payload is +1. Group 0 contributes 32 * 1 * 1 and group 1
+    # contributes 32 * 4 * 2. Reusing physical packed-K for scale lookup would
+    # incorrectly select group 0 for the entire reduction.
+    assert torch.equal(actual, torch.full((M, N), 288.0))
+
+
+def test_dot_scaled_e5m2_exhaustive_finite_payloads():
+    finite_raw = [value for value in range(256) if value & 0x7F < 0x7C]
+    raw = torch.tensor(finite_raw + [0] * 8, dtype=torch.uint8).reshape(16, 16)
+    a = torch.zeros((16, 32), dtype=torch.uint8)
+    a[:, :16] = raw
+
+    actual = _run_dot_scaled_e5m2_u8(a)
+    reference = raw.reshape(-1).view(torch.float8_e5m2).float().reshape(16, 16)
+    assert torch.isfinite(reference).all()
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e5m2_special_value_classes():
+    special = torch.tensor(
+        [0x7C, 0xFC, 0x7D, 0x7E, 0x7F, 0xFD, 0xFE, 0xFF],
+        dtype=torch.uint8,
+    )
+    a = torch.zeros((16, 32), dtype=torch.uint8)
+    diagonal = torch.arange(special.numel())
+    a[diagonal, diagonal] = special
+
+    actual = _run_dot_scaled_e5m2_u8(a).diagonal()
+    assert actual[0].item() == float("inf")
+    assert actual[1].item() == float("-inf")
+    assert torch.isnan(actual[2:8]).all()
+    assert torch.equal(actual[8:], torch.zeros_like(actual[8:]))
+
+
+def test_dot_scaled_e4m3_exhaustive_finite_payloads():
+    # Each output selects one A element through an E4M3 +1 diagonal in B.  Keep
+    # NaNs out of this matrix because NaN*0 would intentionally contaminate the
+    # other outputs in its row; NaN class is covered independently below.
+    finite_raw = [value for value in range(256) if value & 0x7F != 0x7F]
+    raw = torch.tensor(finite_raw + [0, 0], dtype=torch.uint8).reshape(16, 16)
+    a = torch.zeros((16, 32), dtype=torch.uint8)
+    a[:, :16] = raw
+
+    actual = _run_dot_scaled_e4m3_u8(a)
+    reference = raw.reshape(-1).view(torch.float8_e4m3fn).float().reshape(16, 16)
+    assert torch.isfinite(reference).all()
+    assert torch.equal(actual, reference)
+
+
+def test_dot_scaled_e4m3_nan_class():
+    a = torch.zeros((16, 32), dtype=torch.uint8)
+    a[0, 0] = 0x7F
+    a[1, 1] = 0xFF
+
+    actual = _run_dot_scaled_e4m3_u8(a)
+    assert torch.isnan(actual[:2]).all()
+    assert torch.equal(actual[2:], torch.zeros_like(actual[2:]))
+
+
+# Raw 10 is the smallest boundary here whose selected products stay out of the
+# target's native BF16/F32 denormal-flush region; 127/254/255 cover unity,
+# overflow, and the required E8M0 NaN sentinel.
+@pytest.mark.parametrize("scale_raw", [10, 127, 254, 255])
+def test_dot_scaled_e4m3_bf16_scale_boundaries(scale_raw):
+    payloads = torch.tensor(
+        [
+            0x01,
+            0x03,
+            0x07,
+            0x08,
+            0x38,
+            0x3F,
+            0x78,
+            0x7E,
+            0x81,
+            0x83,
+            0x87,
+            0x88,
+            0xB8,
+            0xBF,
+            0xF8,
+            0xFE,
+        ],
+        dtype=torch.uint8,
+    )
+    a = torch.zeros((16, 32), dtype=torch.uint8)
+    diagonal = torch.arange(16)
+    a[diagonal, diagonal] = payloads
+    actual = _run_dot_scaled_e4m3_u8(a, a_scale_raw=scale_raw).diagonal()
+
+    if scale_raw == 255:
+        assert torch.isnan(actual).all()
+        return
+    scale_bits = torch.tensor([scale_raw << 7], dtype=torch.uint16)
+    scale = scale_bits.view(torch.bfloat16)
+    reference = (payloads.view(torch.float8_e4m3fn).to(torch.bfloat16) * scale).float()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0, equal_nan=True)
+
+
 def _run(M, N, K, dtype_in=torch.float32, *, seed=0xC0FFEE):
     torch.manual_seed(seed)
     a = torch.randn((M, K), dtype=dtype_in).contiguous()

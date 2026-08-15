@@ -4,9 +4,7 @@
 // tl.max — or arith.maximumf, f32) lowers through the same self-contained
 // per-row reduction body as the sum combine (L3a-tileloop-2), but with the
 // combine emitted as `metal.binary_exp ... maxOp` (MSL max(a, b)) and the
-// scf.for iter_arg identity-initialised to -FLT_MAX instead of 0.0 (the MSL
-// float-constant emitter can't render -inf, and max(x, -FLT_MAX) == x for
-// every finite x).
+// scf.for iter_arg identity-initialised to exact -infinity.
 
 // -----
 // f32 / arith.maxnumf, shape <8x16xf32>, axis=1. M=8 < tpb=128, so there is no
@@ -48,8 +46,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.for
 // CHECK: arith.cmpi slt
 // CHECK: scf.if
-// Identity init is -FLT_MAX (~ -3.40282e+38), NOT 0.0.
-// CHECK: arith.constant -3.40282{{.*}} : f32
+// Identity init is exact -infinity, so an all--inf row remains -inf.
+// CHECK: arith.constant 0xFF800000 : f32
 // CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
 // CHECK: metal.get_element
 // The combine is maxOp, not addOp.

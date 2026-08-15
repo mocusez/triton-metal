@@ -1579,6 +1579,11 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
 
     where `(localBatch, linRow, linCol)` are recovered from the blocked tile
     geometry and `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)`.
+    When `output_indices` is present, its scalarized row contribution, column
+    contribution, and row stride instead recover the exact rank-2 output
+    coordinates owned by the current store lane.  This keeps scalar-dot
+    evaluation aligned with a folded result layout conversion whose blocked
+    distribution differs from the function-wide tile loop.
     `a_batch_offset`/`b_batch_offset` are scalarized shaped pointer
     contributions for the current batch lane. The geometry is pinned to the
     function-wide tile loop so it remains aligned with the store when a folded
@@ -1597,6 +1602,20 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
 
     `a_base_offset`/`b_base_offset` preserve scalar `tt.addptr` offsets applied
     before the tiled pointer chain, such as a batched matrix's per-program base.
+    The optional `scale_bufs`/`scale_params` tail carries the first exact
+    software `tt.dot_scaled` slice.  It contains two buffers (A then B, with an
+    unused matrix buffer as the placeholder for an unscaled side) and five
+    ui32 parameters: A/B scale base offsets, A/B scale row strides, and the
+    shared 16- or 32-element scale factor.  Unit attributes identify which
+    sides are scaled and whether scale-NaN masking may be skipped.  The
+    lowering decodes each E8M0 byte into the operand compute type; optional
+    markers identify E2M1 (packed along K or the outer matrix dimension) or
+    byte-backed E4M3FN/E5M2 payloads.  Every
+    finite payload is widened exactly to bf16 before scaling; NaN class is
+    preserved without promising payload bits.  The scaled operand is rounded
+    at that compute type and only then extended for f32 accumulation.  Exact
+    cross-backend numerical parity excludes denormal products or accumulation
+    results on targets whose native floating-point arithmetic flushes them.
     NOTE: this is O(M*N*K) scalar work with no matrix-unit reuse — a correctness
     path, not a performance path. `a_buf`/`b_buf` are the device kernel-arg
     buffers; `c_init` is the dot accumulator init (typically `dense<0.0>`).
@@ -1609,8 +1628,11 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        UI32:$stride_a, UI32:$stride_b,
                        UI32:$reduction_extent,
                        AnyType:$c_init,
+                       Variadic<AnyType>:$output_indices,
                        Optional<Metal_MemRefType>:$weight_buf,
-                       Variadic<UI32>:$partial_extents);
+                       Variadic<UI32>:$partial_extents,
+                       Variadic<Metal_MemRefType>:$scale_bufs,
+                       Variadic<UI32>:$scale_params);
 
   let results = (outs AnyType:$result);
 
@@ -1620,8 +1642,11 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        " `,` $row_origin `,` $col_origin `]`"
                        " `,` $stride_a `,` $stride_b `,` $reduction_extent"
                        " `,` $c_init"
+                       " (`output` `[` $output_indices^ `]`)?"
                        " (`weight` $weight_buf^)?"
                        " (`partial` `[` $partial_extents^ `]`)?"
+                       " (`scales` `[` $scale_bufs^ `]` `params` `[`"
+                       " $scale_params `]`)?"
                        " attr-dict `:` functional-type(operands, results)";
 }
 
