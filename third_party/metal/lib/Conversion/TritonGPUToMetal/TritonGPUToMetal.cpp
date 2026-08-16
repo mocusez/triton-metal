@@ -1025,11 +1025,14 @@ static std::optional<TileInfo> findSubTpbRank2Companion(
 // it from one place: a second copy that drifted would put two ops in the same
 // kernel on different element mappings, which reads as a plausible-but-wrong
 // result rather than a failure.
-static mlir::Value
-emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
-                  mlir::triton::gpu::BlockedEncodingAttr parent, int axis,
-                  mlir::ConversionPatternRewriter &rewriter,
-                  mlir::Location loc) {
+// The flat half of that bijection: this (thread, tile-iv)'s position in the
+// tile, before any per-axis decomposition. Split out of `emitTileAxisCoord` so
+// the rank-1 shuffles (`tt.cat`, `tt.split`) index the tile the same way the
+// rank-2 coordinate does — a second copy that drifted would put two ops in one
+// kernel on different element mappings.
+static mlir::Value emitTileFlatIndex(mlir::Operation *op, const TileInfo &tile,
+                                     mlir::ConversionPatternRewriter &rewriter,
+                                     mlir::Location loc) {
   auto i32 = rewriter.getI32Type();
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
   // Metal `[[thread_position_in_grid]]` is GLOBAL, not per-CTA. For multi-CTA
@@ -1054,26 +1057,30 @@ emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
   mlir::Value localTidI32 =
       mlir::arith::SubIOp::create(rewriter, loc, tidI32, tgOffset.getResult())
           .getResult();
-  mlir::Value idxI32 = localTidI32;
   auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
-  if (parentFor && tile.elemPerThread > 1) {
-    auto iv = parentFor.getInductionVar();
-    if (tile.contiguous) {
-      auto cE = mlir::arith::ConstantOp::create(
-          rewriter, loc, rewriter.getI32IntegerAttr(tile.elemPerThread));
-      auto mul = mlir::arith::MulIOp::create(rewriter, loc, localTidI32,
-                                             cE.getResult());
-      idxI32 =
-          mlir::arith::AddIOp::create(rewriter, loc, mul.getResult(), iv)
-              .getResult();
-    } else {
-      auto cT = mlir::arith::ConstantOp::create(rewriter, loc, tpbAttr);
-      auto mul = mlir::arith::MulIOp::create(rewriter, loc, iv, cT.getResult());
-      idxI32 = mlir::arith::AddIOp::create(rewriter, loc, localTidI32,
-                                           mul.getResult())
-                   .getResult();
-    }
+  if (!parentFor || tile.elemPerThread <= 1)
+    return localTidI32;
+  auto iv = parentFor.getInductionVar();
+  if (tile.contiguous) {
+    auto cE = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(tile.elemPerThread));
+    auto mul =
+        mlir::arith::MulIOp::create(rewriter, loc, localTidI32, cE.getResult());
+    return mlir::arith::AddIOp::create(rewriter, loc, mul.getResult(), iv)
+        .getResult();
   }
+  auto cT = mlir::arith::ConstantOp::create(rewriter, loc, tpbAttr);
+  auto mul = mlir::arith::MulIOp::create(rewriter, loc, iv, cT.getResult());
+  return mlir::arith::AddIOp::create(rewriter, loc, localTidI32, mul.getResult())
+      .getResult();
+}
+
+static mlir::Value
+emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
+                  mlir::triton::gpu::BlockedEncodingAttr parent, int axis,
+                  mlir::ConversionPatternRewriter &rewriter,
+                  mlir::Location loc) {
+  mlir::Value idxI32 = emitTileFlatIndex(op, tile, rewriter, loc);
   // Pick div/rem and the divisor based on the PARENT BlockedEncoding's `order`
   // permutation. With order=[1,0] (dim 1 contiguous), the canonical
   // linearization is `tid = row*N + col` (divisor = N), so axis=0 (row) = tid/N
@@ -2142,6 +2149,376 @@ struct TransLowering
   matchAndRewrite(mlir::triton::TransOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOp(op, adaptor.getSrc());
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tt.join / tt.split / tt.cat — the cross-lane shuffles.
+//
+// `tl.join(a, b)` interleaves two rank-1 tiles into an [N, 2] tile,
+// `tl.interleave` is that plus a reshape, `tl.split` is the inverse, and
+// `tl.cat` concatenates. Triton picks layouts for these that keep them
+// per-thread (join's result has `sizePerThread = [1, 2]`, so one thread owns
+// both columns of its row) — but this backend does not honour a layout's thread
+// assignment. It imposes its own bijection, `flat = localTid*E + iv` decomposed
+// by `order`, and under THAT mapping the result element (i, k) lives in lane
+// `i*2 + k` while its source element i lives in lane i. They are genuine
+// cross-lane moves here, so they go through threadgroup memory: every lane
+// publishes what it holds, and after a barrier reads the slot it needs.
+//
+// The shape restrictions below all reduce to one requirement — each source
+// element must live in a lane of its own, so `sourceElements <= tpb`. Bigger
+// tiles would need the source staged in bands across tile-loop trips, which is
+// the gather fill loop; the pre-pass names those instead.
+//===----------------------------------------------------------------------===//
+
+// Every lane publishes `values[v]` into slot `v*tpb + localTid` of one fresh
+// threadgroup buffer, so afterwards any lane can read any lane's element of any
+// band. Returns the buffer; the caller reads it with `readLaneBandSlot`.
+static mlir::Value
+publishLaneBands(llvm::ArrayRef<mlir::Value> values, int64_t tpb,
+                 mlir::Type stageTy,
+                 mlir::ConversionPatternRewriter &rewriter, mlir::Location loc) {
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto bufTy = MetalMemRefType::get(rewriter.getContext(), stageTy,
+                                    tpb * static_cast<int64_t>(values.size()));
+  mlir::Value buf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+  mlir::Value localTid = emitLocalTid(rewriter, loc, tpb);
+  // Leading barrier: the single static allocation is reused on every trip of an
+  // enclosing tile loop, so trip t+1's write would otherwise race trip t's
+  // reads. Same write-after-read hazard the gather fill and the column-reduce
+  // republish guard against.
+  BarrierOp::create(rewriter, loc);
+  for (auto [band, value] : llvm::enumerate(values)) {
+    mlir::Value slot = localTid;
+    if (band > 0) {
+      auto cBand = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(band * tpb)));
+      slot = mlir::arith::AddIOp::create(rewriter, loc, localTid,
+                                         cBand.getResult())
+                 .getResult();
+    }
+    mlir::Value staged = value;
+    if (staged.getType() != stageTy)
+      staged = mlir::UnrealizedConversionCastOp::create(
+                   rewriter, loc, mlir::TypeRange{stageTy},
+                   mlir::ValueRange{staged})
+                   .getResult(0);
+    mlir::Value slotU = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{ui32},
+                            mlir::ValueRange{slot})
+                            .getResult(0);
+    StoreOp::create(rewriter, loc, staged, buf, slotU);
+  }
+  BarrierOp::create(rewriter, loc);
+  return buf;
+}
+
+static mlir::Value readLaneBandSlot(mlir::Value buf, mlir::Value slotI32,
+                                    int64_t slots, mlir::Type stageTy,
+                                    mlir::Type wantTy,
+                                    mlir::ConversionPatternRewriter &rewriter,
+                                    mlir::Location loc) {
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  // Lanes past the tile compute a slot past the buffer (their result is masked
+  // off downstream, but the READ still happens). An out-of-range threadgroup
+  // access is undefined, not merely useless, so clamp — the same reason the
+  // gather fill clamps its evaluation index.
+  auto cLast = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(slots - 1)));
+  auto cZero =
+      mlir::arith::ConstantOp::create(rewriter, loc,
+                                      rewriter.getI32IntegerAttr(0));
+  slotI32 = mlir::arith::MaxSIOp::create(rewriter, loc, slotI32,
+                                         cZero.getResult())
+                .getResult();
+  slotI32 = mlir::arith::MinSIOp::create(rewriter, loc, slotI32,
+                                         cLast.getResult())
+                .getResult();
+  mlir::Value slotU = mlir::UnrealizedConversionCastOp::create(
+                          rewriter, loc, mlir::TypeRange{ui32},
+                          mlir::ValueRange{slotI32})
+                          .getResult(0);
+  mlir::Value v =
+      GetElementOp::create(rewriter, loc, stageTy, buf, slotU).getResult();
+  if (v.getType() != wantTy)
+    v = mlir::UnrealizedConversionCastOp::create(rewriter, loc,
+                                                 mlir::TypeRange{wantTy},
+                                                 mlir::ValueRange{v})
+            .getResult(0);
+  return v;
+}
+
+// The tile a shuffle indexes with, or nullopt when the shape is out of
+// envelope. `wideTy` is the joined side ([N, 2] for join/split, [2N] for cat)
+// and `narrowTy` one of the rank-1 halves.
+//
+// ONE function, called by both the lowerings and the pre-pass. Keeping the two
+// in separate copies is how a declined pattern turns into a process kill: the
+// pre-pass says yes, the pattern says no, and nothing catches the difference.
+//
+// The envelope is `wideElements <= tpb`. That is what makes every element —
+// source and result alike — live in a lane of its own, and it also keeps the
+// tile out of the tile loop (E <= 1), so the flat index is just `localTid` and
+// cannot disagree with whichever tile sized a loop elsewhere in the kernel.
+static std::optional<TileInfo> shuffleTileFor(mlir::Type wideTy,
+                                              mlir::Type narrowTy) {
+  auto wide = mlir::dyn_cast<mlir::RankedTensorType>(wideTy);
+  auto narrow = mlir::dyn_cast<mlir::RankedTensorType>(narrowTy);
+  if (!wide || !narrow || narrow.getRank() != 1)
+    return std::nullopt;
+  std::optional<TileInfo> tile = tileFromTensor(wide);
+  if (!tile)
+    return std::nullopt;
+  int64_t wideElements = 1;
+  for (auto s : wide.getShape())
+    wideElements *= s;
+  if (wideElements != 2 * narrow.getDimSize(0))
+    return std::nullopt;
+  if (wideElements > tile->threadsPerBlock)
+    return std::nullopt;
+  return tile;
+}
+
+// A threadgroup barrier is only a barrier if every thread reaches it.
+static bool underDivergentControlFlow(mlir::Operation *op) {
+  for (mlir::Operation *p = op->getParentOp(); p; p = p->getParentOp()) {
+    if (mlir::isa<mlir::scf::IfOp>(p))
+      return true;
+    if (mlir::isa<mlir::triton::FuncOp, mlir::func::FuncOp, KernelOp>(p))
+      break;
+  }
+  return false;
+}
+
+struct JoinLowering : public mlir::OpConversionPattern<mlir::triton::JoinOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::JoinOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getLhs().getType());
+    if (!resTy || !srcTy || srcTy.getRank() != 1 || resTy.getRank() != 2 ||
+        resTy.getDimSize(1) != 2)
+      return rewriter.notifyMatchFailure(op, "join: rank-1 -> [N, 2] only");
+    auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+        resTy.getEncoding());
+    if (!enc)
+      return rewriter.notifyMatchFailure(op, "join: result not blocked");
+    if (underDivergentControlFlow(op))
+      return rewriter.notifyMatchFailure(op, "join: divergent control flow");
+    std::optional<TileInfo> tile = shuffleTileFor(resTy, srcTy);
+    if (!tile)
+      return rewriter.notifyMatchFailure(op, "join: shape out of envelope");
+    mlir::Value lhs = adaptor.getLhs();
+    mlir::Value rhs = adaptor.getRhs();
+    if (mlir::isa<mlir::RankedTensorType>(lhs.getType()) ||
+        mlir::isa<mlir::RankedTensorType>(rhs.getType()))
+      return rewriter.notifyMatchFailure(op, "join: operands not scalarized");
+
+    mlir::Value col =
+        emitTileAxisCoord(op, *tile, enc, /*axis=*/1, rewriter, loc);
+    auto cZero =
+        mlir::arith::ConstantOp::create(rewriter, loc,
+                                        rewriter.getI32IntegerAttr(0));
+    mlir::Value isRhs =
+        mlir::arith::CmpIOp::create(rewriter, loc,
+                                    mlir::arith::CmpIPredicate::ne, col,
+                                    cZero.getResult())
+            .getResult();
+
+    // Which lane holds source element `row` depends on which of the backend's
+    // two rank-1 conventions is in force, and getting it wrong is a silent
+    // wrong answer — the differential sweep caught `join` returning
+    // a[0],b[0],a[0],b[0],a[1],... instead of a[0],b[0],a[1],b[1],...
+    //
+    // A rank-2 tile SMALLER than the threadgroup has a companion mapping
+    // (`findSubTpbRank2Companion`): every rank-1 value of the companion's row
+    // extent is held per ROW, so lane t already holds a[row(t)] and b[row(t)].
+    // The join is then a pure local select and needs no data movement at all.
+    // Ask the same function MakeRangeLowering asks, so the two cannot disagree.
+    mlir::triton::gpu::BlockedEncodingAttr companionEnc;
+    std::optional<TileInfo> companion =
+        findSubTpbRank2Companion(op, &companionEnc);
+    const bool perRowOperands = companion && companion->shape.size() == 2 &&
+                                companion->shape[0] == srcTy.getDimSize(0) &&
+                                companion->shape[1] == 2;
+    if (perRowOperands) {
+      rewriter.replaceOp(op, mlir::arith::SelectOp::create(rewriter, loc, isRhs,
+                                                           rhs, lhs)
+                                 .getResult());
+      return mlir::success();
+    }
+
+    // Otherwise lane t holds element t of each source, and the element this
+    // lane needs lives in lane `row`.
+    const int64_t tpb = tile->threadsPerBlock;
+    mlir::Type stageTy = metalStorageElementType(lhs.getType());
+    mlir::Value buf =
+        publishLaneBands({lhs, rhs}, tpb, stageTy, rewriter, loc);
+    mlir::Value row =
+        emitTileAxisCoord(op, *tile, enc, /*axis=*/0, rewriter, loc);
+    auto cTpb = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+    mlir::Value band = mlir::arith::SelectOp::create(rewriter, loc, isRhs,
+                                                     cTpb.getResult(),
+                                                     cZero.getResult())
+                           .getResult();
+    mlir::Value slot =
+        mlir::arith::AddIOp::create(rewriter, loc, row, band).getResult();
+    rewriter.replaceOp(op, readLaneBandSlot(buf, slot, 2 * tpb, stageTy,
+                                            lhs.getType(), rewriter, loc));
+    return mlir::success();
+  }
+};
+
+struct SplitLowering : public mlir::OpConversionPattern<mlir::triton::SplitOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::SplitOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getResult(0).getType());
+    if (!srcTy || !resTy || srcTy.getRank() != 2 || srcTy.getDimSize(1) != 2 ||
+        resTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(op, "split: [N, 2] -> rank-1 only");
+    if (underDivergentControlFlow(op))
+      return rewriter.notifyMatchFailure(op, "split: divergent control flow");
+    std::optional<TileInfo> srcTile = shuffleTileFor(srcTy, resTy);
+    std::optional<TileInfo> resTile = tileFromTensor(resTy);
+    if (!srcTile || !resTile || srcTile->order.size() != 2)
+      return rewriter.notifyMatchFailure(op, "split: shape out of envelope");
+    const int64_t N = resTy.getDimSize(0);
+    mlir::Value src = adaptor.getSrc();
+    if (mlir::isa<mlir::RankedTensorType>(src.getType()))
+      return rewriter.notifyMatchFailure(op, "split: operand not scalarized");
+
+    const int64_t tpb = srcTile->threadsPerBlock;
+    mlir::Type stageTy = metalStorageElementType(src.getType());
+    mlir::Value buf = publishLaneBands({src}, tpb, stageTy, rewriter, loc);
+    // Which source row this lane must produce follows the same two conventions
+    // as join: under the sub-tpb companion mapping a rank-1 value of the
+    // companion's row extent is held per ROW, so this lane owes row `row(t)`,
+    // not row `t`. Both results still come from another lane — this lane holds
+    // exactly one of the row's two columns — so unlike join the shuffle stays.
+    auto srcEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+        srcTy.getEncoding());
+    mlir::triton::gpu::BlockedEncodingAttr companionEnc;
+    std::optional<TileInfo> companion =
+        findSubTpbRank2Companion(op, &companionEnc);
+    const bool perRowResults = companion && companion->shape.size() == 2 &&
+                               companion->shape[0] == N &&
+                               companion->shape[1] == 2 && srcEnc;
+    mlir::Value i;
+    if (perRowResults) {
+      i = emitTileAxisCoord(op, *srcTile, srcEnc, /*axis=*/0, rewriter, loc);
+      // Wrap exactly as the companion's own rank-1 make_range does. Lanes past
+      // the tile run beyond its rows, and the store under this convention is
+      // deliberately UNGUARDED because lanes sharing a row write the same
+      // value — which only stays true if a wrapped lane also reads the wrapped
+      // row's data. Leaving the row raw here let lanes 2N.. write a valid row
+      // address from a slot nobody filled.
+      auto cRows = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
+      i = mlir::arith::RemSIOp::create(rewriter, loc, i, cRows.getResult())
+              .getResult();
+    } else {
+      i = emitTileFlatIndex(op, *resTile, rewriter, loc);
+    }
+    const bool rowMajor = srcTile->order[0] == 1 && srcTile->order[1] == 0;
+    llvm::SmallVector<mlir::Value, 2> outs;
+    for (int64_t k = 0; k < 2; ++k) {
+      mlir::Value slot;
+      if (rowMajor) {
+        auto cTwo = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(2));
+        slot = mlir::arith::MulIOp::create(rewriter, loc, i, cTwo.getResult())
+                   .getResult();
+        if (k) {
+          auto cK = mlir::arith::ConstantOp::create(
+              rewriter, loc, rewriter.getI32IntegerAttr(1));
+          slot = mlir::arith::AddIOp::create(rewriter, loc, slot,
+                                             cK.getResult())
+                     .getResult();
+        }
+      } else {
+        slot = i;
+        if (k) {
+          auto cN = mlir::arith::ConstantOp::create(
+              rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
+          slot = mlir::arith::AddIOp::create(rewriter, loc, slot,
+                                             cN.getResult())
+                     .getResult();
+        }
+      }
+      outs.push_back(readLaneBandSlot(buf, slot, tpb, stageTy, src.getType(),
+                                      rewriter, loc));
+    }
+    rewriter.replaceOp(op, outs);
+    return mlir::success();
+  }
+};
+
+struct CatLowering : public mlir::OpConversionPattern<mlir::triton::CatOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::CatOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getLhs().getType());
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    if (!srcTy || !resTy || srcTy.getRank() != 1 || resTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(op, "cat: rank-1 only");
+    if (underDivergentControlFlow(op))
+      return rewriter.notifyMatchFailure(op, "cat: divergent control flow");
+    std::optional<TileInfo> resTile = shuffleTileFor(resTy, srcTy);
+    if (!resTile)
+      return rewriter.notifyMatchFailure(op, "cat: shape out of envelope");
+    const int64_t N = srcTy.getDimSize(0);
+    // A sub-tpb rank-2 companion would put the rank-1 operands (or the result)
+    // in the per-row convention instead of one-element-per-lane, and cat has no
+    // row to speak of. Refuse rather than read the wrong lane.
+    if (std::optional<TileInfo> companion =
+            findSubTpbRank2Companion(op, nullptr))
+      if (!companion->shape.empty() &&
+          (companion->shape[0] == N || companion->shape[0] == 2 * N))
+        return rewriter.notifyMatchFailure(
+            op, "cat: operands are under a sub-tpb companion mapping");
+    mlir::Value lhs = adaptor.getLhs();
+    mlir::Value rhs = adaptor.getRhs();
+    if (mlir::isa<mlir::RankedTensorType>(lhs.getType()) ||
+        mlir::isa<mlir::RankedTensorType>(rhs.getType()))
+      return rewriter.notifyMatchFailure(op, "cat: operands not scalarized");
+
+    const int64_t tpb = resTile->threadsPerBlock;
+    mlir::Type stageTy = metalStorageElementType(lhs.getType());
+    mlir::Value buf =
+        publishLaneBands({lhs, rhs}, tpb, stageTy, rewriter, loc);
+    // Result element p is lhs[p] below N and rhs[p - N] above it; the second
+    // band starts at slot tpb.
+    mlir::Value p = emitTileFlatIndex(op, *resTile, rewriter, loc);
+    auto cN = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
+    auto cShift = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb - N)));
+    mlir::Value isLhs =
+        mlir::arith::CmpIOp::create(rewriter, loc,
+                                    mlir::arith::CmpIPredicate::slt, p,
+                                    cN.getResult())
+            .getResult();
+    mlir::Value shifted =
+        mlir::arith::AddIOp::create(rewriter, loc, p, cShift.getResult())
+            .getResult();
+    mlir::Value slot =
+        mlir::arith::SelectOp::create(rewriter, loc, isLhs, p, shifted)
+            .getResult();
+    rewriter.replaceOp(op, readLaneBandSlot(buf, slot, 2 * tpb, stageTy,
+                                            lhs.getType(), rewriter, loc));
     return mlir::success();
   }
 };
@@ -22156,14 +22533,39 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   };
   moduleOp.walk([&](mlir::Operation *op) {
     llvm::TypeSwitch<mlir::Operation *, void>(op)
+        // join/split/cat are implemented as threadgroup shuffles, but only for
+        // the shape where each source element has a lane of its own — see
+        // JoinLowering. Outside it the pattern would decline, and a declined
+        // pattern kills the process here.
         .Case<mlir::triton::JoinOp>([&](auto o) {
-          reject(o, "tt.join is not implemented (this is what tl.join and "
-                    "tl.interleave lower to)");
+          if (!shuffleTileFor(o.getType(), o.getLhs().getType()) ||
+              underDivergentControlFlow(o))
+            reject(o, "tt.join is implemented for a rank-1 pair joined into an "
+                      "[N, 2] tile of at most one element per thread, outside "
+                      "divergent control flow (this is what tl.join and "
+                      "tl.interleave lower to)");
         })
-        .Case<mlir::triton::SplitOp>(
-            [&](auto o) { reject(o, "tt.split is not implemented"); })
-        .Case<mlir::triton::CatOp>(
-            [&](auto o) { reject(o, "tt.cat is not implemented"); })
+        .Case<mlir::triton::SplitOp>([&](auto o) {
+          if (!shuffleTileFor(o.getSrc().getType(), o.getResult(0).getType()) ||
+              underDivergentControlFlow(o))
+            reject(o, "tt.split is implemented for an [N, 2] tile of at most "
+                      "one element per thread, outside divergent control flow");
+        })
+        .Case<mlir::triton::CatOp>([&](auto o) {
+          auto srcTy =
+              mlir::dyn_cast<mlir::RankedTensorType>(o.getLhs().getType());
+          bool companionBound = false;
+          if (srcTy)
+            if (std::optional<TileInfo> c = findSubTpbRank2Companion(o, nullptr))
+              companionBound = !c->shape.empty() &&
+                               (c->shape[0] == srcTy.getDimSize(0) ||
+                                c->shape[0] == 2 * srcTy.getDimSize(0));
+          if (!shuffleTileFor(o.getType(), o.getLhs().getType()) ||
+              underDivergentControlFlow(o) || companionBound)
+            reject(o, "tt.cat is implemented for rank-1 operands of at most one "
+                      "element per thread, outside divergent control flow and "
+                      "outside a sub-tpb rank-2 companion mapping");
+        })
         .Case<mlir::triton::AssertOp>([&](auto o) {
           reject(o, "tl.device_assert is not implemented (MSL has no "
                     "host-visible assert channel)");
@@ -22418,6 +22820,14 @@ struct ConvertTritonGPUToMetalPass
   void runOnOperation() override {
     auto moduleOp = getOperation();
     auto *ctx = &getContext();
+
+    // Answered here, once, while the rank-2 tensors are all still present —
+    // before the validators, because whether a shuffle's operands are held per
+    // ROW or per LANE depends on it, and the pre-pass has to reach the same
+    // verdict the pattern will.
+    g_subTpbCompanionEnc = {};
+    g_subTpbCompanion =
+        computeSubTpbRank2Companion(moduleOp, &g_subTpbCompanionEnc);
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
@@ -23158,11 +23568,6 @@ struct ConvertTritonGPUToMetalPass
     llvm::DenseMap<mlir::Value, mlir::Value> reduceRowBufs;
     g_reduceRowBufs = &reduceRowBufs;
 
-    // Answered here, once, while the rank-2 tensors are all still present.
-    g_subTpbCompanionEnc = {};
-    g_subTpbCompanion =
-        computeSubTpbRank2Companion(moduleOp, &g_subTpbCompanionEnc);
-
     ReduceOutTileMap reduceOutTiles =
         precomputeRank2Axis1ReduceOutTiles(moduleOp);
 
@@ -23302,6 +23707,7 @@ struct ConvertTritonGPUToMetalPass
                  AddPtrLowering,
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
+                 JoinLowering, SplitLowering, CatLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
                  HistogramLowering,

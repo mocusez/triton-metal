@@ -682,9 +682,17 @@ def test_while_loop_two_carried_values_on_mps(n_elements):
 # returncode is a signal (crash); 1 is an ordinary Python exception.
 
 _UNSUPPORTED_SNIPPETS = {
-    "join": "tl.store(o_ptr + i, tl.sum(tl.join(v, v), axis=1))",
+    # `tt.join` itself is implemented now (see the shuffle tests below); an
+    # out-of-envelope join is still a rejection, and still has to be a clean
+    # one. num_warps=1 puts 32 threads under a 128-element joined tile.
+    "join_out_of_envelope": (
+        "j = tl.join(tl.load(x_ptr + tl.arange(0, 64)),\n"
+        "                tl.load(x_ptr + tl.arange(0, 64)))\n"
+        "    tl.store(o_ptr + tl.arange(0, 64)[:, None] * 2\n"
+        "             + tl.arange(0, 2)[None, :], j)"),
     "device_print": "tl.device_print('v', v)\n    tl.store(o_ptr + i, v)",
 }
+_UNSUPPORTED_NUM_WARPS = {"join_out_of_envelope": 1}
 
 
 @pytest.mark.parametrize("name", sorted(_UNSUPPORTED_SNIPPETS))
@@ -704,9 +712,9 @@ def test_unsupported_construct_fails_without_crashing(name, tmp_path):
         "    i = tl.arange(0, B)\n"
         "    v = tl.load(x_ptr + i)\n"
         f"    {_UNSUPPORTED_SNIPPETS[name]}\n"
-        "x = torch.rand(16, device='mps')\n"
+        "x = torch.rand(128, device='mps')\n"
         "o = torch.empty_like(x)\n"
-        "k[(1,)](x, o, B=16)\n"
+        f"k[(1,)](x, o, B=16, num_warps={_UNSUPPORTED_NUM_WARPS.get(name, 4)})\n"
     )
     proc = subprocess.run([sys.executable, str(script)], capture_output=True,
                           text=True, timeout=300)
@@ -862,6 +870,129 @@ def test_gather_computed_source(block):
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), (x * 2.0 + 1.0)[idx.long()],
                                atol=1e-6, rtol=1e-6)
+
+
+# --- tl.join / tl.split / tl.cat / tl.interleave ---------------------------
+#
+# Triton keeps these per-thread by choosing a layout where one thread owns both
+# columns of its row. This backend does not honour a layout's thread
+# assignment — it imposes `flat = localTid*E + iv` decomposed by `order` — so
+# under ITS mapping the join result's element (i, k) sits in lane i*2 + k while
+# source element i sits in lane i. They are real cross-lane moves and go
+# through threadgroup memory, except under the sub-tpb companion mapping, where
+# rank-1 values are already held per ROW and the join is a local select.
+#
+# Getting that distinction wrong is a silent wrong answer, not a crash: a
+# differential sweep caught join returning a0,b0,a0,b0,a1,b1,a1,b1 for
+# a0,b0,a1,b1,a2,b2,a3,b3. Hence the exact-equality assertions below across
+# both regimes — sub-tpb tiles (N*2 < tpb) and the exactly-full tile
+# (N*2 == tpb, reached by N=16/nw=1, N=32/nw=2, N=64/nw=4).
+
+
+@triton.jit
+def _join_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    a = tl.load(x_ptr + tl.arange(0, N))
+    j = tl.join(a, a + 100.0)
+    tl.store(o_ptr + tl.arange(0, N)[:, None] * 2 + tl.arange(0, 2)[None, :], j)
+
+
+@triton.jit
+def _split_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    off = tl.arange(0, N)[:, None] * 2 + tl.arange(0, 2)[None, :]
+    a, b = tl.split(tl.load(x_ptr + off))
+    tl.store(o_ptr + tl.arange(0, N), a * 10.0 + b)
+
+
+@triton.jit
+def _cat_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    a = tl.load(x_ptr + tl.arange(0, N))
+    tl.store(o_ptr + tl.arange(0, 2 * N),
+             tl.cat(a, a + 100.0, can_reorder=True))
+
+
+@triton.jit
+def _interleave_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    a = tl.load(x_ptr + tl.arange(0, N))
+    tl.store(o_ptr + tl.arange(0, 2 * N), tl.interleave(a, a + 100.0))
+
+
+def _shuffle_inputs(N):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    return torch.arange(2 * N, dtype=torch.float32, device="mps")
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("N", [1, 2, 4, 8, 16])
+def test_join_interleaves_two_rank1_tiles(N, num_warps):
+    torch = pytest.importorskip("torch")
+    x = _shuffle_inputs(N)
+    out = torch.zeros(2 * N, dtype=torch.float32, device="mps")
+    _join_kernel[(1,)](x, out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.stack([x[:N], x[:N] + 100.0], dim=1).reshape(-1)
+    assert torch.equal(out.cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("N", [1, 2, 4, 8, 16])
+def test_split_recovers_both_columns(N, num_warps):
+    torch = pytest.importorskip("torch")
+    x = _shuffle_inputs(N)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _split_kernel[(1,)](x, out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x[0:2 * N:2] * 10.0 + x[1:2 * N:2]
+    assert torch.equal(out.cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("N", [2, 8, 16])
+def test_cat_concatenates_rank1_tiles(N, num_warps):
+    torch = pytest.importorskip("torch")
+    x = _shuffle_inputs(N)
+    out = torch.zeros(2 * N, dtype=torch.float32, device="mps")
+    _cat_kernel[(1,)](x, out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    # `can_reorder=True` licenses any permutation, so the multiset is the
+    # contract; the concatenation order itself is not.
+    expected = torch.cat([x[:N], x[:N] + 100.0]).cpu()
+    assert torch.equal(out.cpu().sort().values, expected.sort().values)
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("N", [2, 8, 16])
+def test_interleave_matches_torch(N, num_warps):
+    torch = pytest.importorskip("torch")
+    x = _shuffle_inputs(N)
+    out = torch.zeros(2 * N, dtype=torch.float32, device="mps")
+    _interleave_kernel[(1,)](x, out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.stack([x[:N], x[:N] + 100.0], dim=1).reshape(-1)
+    assert torch.equal(out.cpu(), expected.cpu())
+
+
+@triton.jit
+def _join_i32_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    a = tl.load(x_ptr + tl.arange(0, N))
+    j = tl.join(a, a + 100)
+    tl.store(o_ptr + tl.arange(0, N)[:, None] * 2 + tl.arange(0, 2)[None, :], j)
+
+
+def test_join_i32_payload_stages_as_ui32():
+    """The metal buffer ops reject signless i32, so an integer payload has to
+    bridge through ui32 on the way into and out of the threadgroup slot."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 8
+    x = torch.arange(N, dtype=torch.int32, device="mps")
+    out = torch.zeros(2 * N, dtype=torch.int32, device="mps")
+    _join_i32_kernel[(1,)](x, out, N)
+    torch.mps.synchronize()
+    expected = torch.stack([x.cpu(), (x + 100).cpu()], dim=1).reshape(-1)
+    assert torch.equal(out.cpu(), expected)
 
 
 @triton.jit

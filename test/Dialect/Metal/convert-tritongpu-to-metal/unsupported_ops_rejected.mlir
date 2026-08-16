@@ -18,7 +18,7 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reject_join(%x: !tt.ptr<f32>) {
     %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{tt.join is not implemented}}
+    // expected-error @+1 {{tt.join is implemented for a rank-1 pair joined into an [N, 2] tile of at most one element per thread}}
     %j = tt.join %v, %v : tensor<128xf32, #blocked> -> tensor<128x2xf32, #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
     tt.return
   }
@@ -30,7 +30,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reject_split(%x: !tt.ptr<f32>) {
     %v = arith.constant dense<1.0> : tensor<128x2xf32, #blocked>
-    // expected-error @+1 {{tt.split is not implemented}}
+    // expected-error @+1 {{tt.split is implemented for an [N, 2] tile of at most one element per thread}}
     %a, %b = tt.split %v : tensor<128x2xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     tt.return
   }
