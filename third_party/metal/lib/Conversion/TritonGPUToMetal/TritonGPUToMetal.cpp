@@ -297,6 +297,14 @@ static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
 // only. Metal's rank-1/rank-2 reduce and histogram bodies re-evaluate their
 // whole source tile themselves, so wrapping their consumers in a source-sized
 // loop would duplicate output stores/atomics.
+//
+// `tt.dot` is a sink for the same reason: the matmul lowerings consume the A/B
+// tiles whole and produce the result themselves, so those tiles must not size
+// the tile loop. They are also commonly LARGER than the output — a `BM x BK` A
+// tile beats a `BM x BN` output whenever `BK > BN`, which BN=8 makes true for
+// every BK above 8. Letting A win handed the STORE an index decomposition built
+// from BK: a 32x16 output was walked as if it had 64 columns, and the matmul
+// returned wrong numbers with no diagnostic.
 static bool reachesOutputNotThroughAggregate(mlir::Value v) {
   llvm::SmallVector<mlir::Operation *, 8> wl;
   llvm::SmallPtrSet<mlir::Operation *, 8> seen;
@@ -308,7 +316,8 @@ static bool reachesOutputNotThroughAggregate(mlir::Value v) {
       continue;
     if (mlir::isa<mlir::triton::StoreOp, mlir::triton::AtomicRMWOp>(u))
       return true;
-    if (mlir::isa<mlir::triton::ReduceOp, mlir::triton::HistogramOp>(u))
+    if (mlir::isa<mlir::triton::ReduceOp, mlir::triton::HistogramOp,
+                  mlir::triton::DotOp, mlir::triton::DotScaledOp>(u))
       continue; // sink: do not traverse into the aggregate result
     for (auto res : u->getResults())
       for (auto *uu : res.getUsers())
@@ -847,8 +856,8 @@ static std::optional<TileInfo> findLargestRank2Tile(mlir::Operation *op) {
   mlir::Operation *modOp = op->getParentOfType<mlir::ModuleOp>();
   if (!modOp)
     return std::nullopt;
-  std::optional<TileInfo> tile;
-  int64_t bestSize = 0;
+  std::optional<TileInfo> tile, outTile;
+  int64_t bestSize = 0, bestOutSize = 0;
   modOp->walk([&](mlir::Operation *inner) {
     for (auto v : inner->getResults()) {
       auto info = tileFromTensor(v.getType());
@@ -862,12 +871,48 @@ static std::optional<TileInfo> findLargestRank2Tile(mlir::Operation *op) {
       int64_t sz = 1;
       for (auto s : info->shape)
         sz *= s;
+      // Two tiers, output-reaching first.
+      //
+      // This bijection has two consumers with opposite needs. A store's
+      // make_range wants the OUTPUT tile; a reduce's source make_range wants
+      // the reduce's INPUT tile, which by construction does not reach the
+      // store. Filtering unconditionally to output-reaching tensors serves the
+      // first and breaks the second (it leaves a pure rank-2 reduce with no
+      // tile at all), so prefer an output-reaching tile when one exists and
+      // fall back to the largest overall when none does.
+      //
+      // The preference is what matters for matmul: A is `BM x BK` and beats the
+      // `BM x BN` output whenever `BK > BN`, and letting it win made the store
+      // walk an 8x8 result as if it had 16 columns — silently wrong, at exact
+      // extents, for every BN=8 matmul with BK above 8.
       if (sz > bestSize) {
         bestSize = sz;
         tile = info;
       }
+      // Track the best RANK-2 tile that actually reaches an output, separately
+      // and without disturbing the largest-overall answer above.
+      if (info->rank == 2 && reachesOutputNotThroughAggregate(v) &&
+          sz > bestOutSize) {
+        bestOutSize = sz;
+        outTile = info;
+      }
     }
   });
+  // Prefer the output tile, but only when the largest-overall answer is ALSO
+  // rank-2 — i.e. when the two are comparable and one of them is simply an
+  // input that happened to be bigger.
+  //
+  // That is the matmul case: A is `BM x BK` and beats the `BM x BN` output
+  // whenever `BK > BN`, and letting it win made the store walk an 8x8 result as
+  // if it had 16 columns. Silently wrong, at exact extents, for every BN=8
+  // matmul with BK above 8.
+  //
+  // A rank-3 batched dot keeps the prior rule outright: its tiles are all the
+  // same size so "largest" is a tie there, and swapping which encoding wins
+  // changes `order`/`elemPerThread` under a lowering with its own geometry
+  // contract.
+  if (outTile && tile && tile->rank == 2)
+    return outTile;
   return tile;
 }
 

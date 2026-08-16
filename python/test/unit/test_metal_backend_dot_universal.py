@@ -1117,3 +1117,52 @@ def test_unclaimed_dot_is_rejected_not_crashed(capfd):
     torch.mps.synchronize()
     torch.testing.assert_close(c2.cpu(), a2.cpu() @ b2.cpu(),
                                atol=2e-4, rtol=2e-4)
+
+
+# --- BK > BN must not let the A tile define the output's geometry -----------
+#
+# `findLargestRank2Tile` returns the (thread, iv) -> element bijection that
+# every op in the kernel shares, including the STORE's address decomposition.
+# It picked the largest rank-2 tile in the module — and a matmul's A tile is
+# `BM x BK`, which beats the `BM x BN` output whenever BK > BN.
+#
+# The store then walked its result with BK columns: an 8x8 output with BK=16 ran
+# 4 tile-loop iterations decomposed `% 16` and read its 64-element result
+# scratch at indices up to 127. Wrong numbers, no diagnostic. BN=8 makes
+# `BK > BN` true for every BK above 8, so this reproduced at EXACT extents, not
+# only ragged ones — which is why the parametrization below sweeps both.
+
+
+@triton.jit
+def _bk_gt_bn_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
+                            BN: tl.constexpr, BK: tl.constexpr):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    om = pm * BM + tl.arange(0, BM)
+    on = pn * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@pytest.mark.parametrize("bm,bn,bk", [(8, 8, 16), (8, 8, 64), (16, 8, 32),
+                                      (32, 8, 64), (16, 16, 32), (32, 16, 64)])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_matmul_block_k_larger_than_block_n(bm, bn, bk, ragged):
+    m, n, k = (bm - 1, bn - 1, bk - 1) if ragged else (bm, bn, bk)
+    torch.manual_seed(bm * 100 + bn * 10 + bk)
+    a = torch.randn(m, k, dtype=torch.float32)
+    b = torch.randn(k, n, dtype=torch.float32)
+    c = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _bk_gt_bn_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
+        a.to("mps"), b.to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk,
+        num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
