@@ -485,3 +485,103 @@ def test_max_subarray_sum_matches_torch(N, window_size):
     torch.mps.synchronize()
     expected = inp.cpu().unfold(0, window_size, 1).sum(1).max()
     torch.testing.assert_close(out.cpu()[0], expected, atol=1e-5, rtol=1e-5)
+
+
+# --- atomics through an address that folded to a uniform pointer -------------
+#
+# `tl.atomic_add(out + offs * 0, v)` collapses the whole tile onto one cell, so
+# Triton folds the `tt.addptr` away and hands the backend a bare `tt.splat`.
+# The tensor branch used to require an addptr, and an op that matches no pattern
+# is a process kill here rather than an error: this shape crashed the caller on
+# 7 of 8 runs (SIGSEGV or abort, varying run to run).
+#
+# It is lowered rather than rejected because, unlike the store of the same
+# shape, it is not a race: every lane read-modify-writes the one cell
+# atomically, which is what the shape means. The sums below are exact, so a
+# dropped or duplicated lane shows up as a hard mismatch and not as noise.
+
+
+@triton.jit
+def _atomic_add_fold_to_one_cell(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets * 0, tl.load(In + offsets))
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("BLOCK", [1, 8, 32, 128, 1024])
+def test_atomic_add_uniform_address_accumulates_every_lane(BLOCK, num_warps):
+    inp = torch.ones(BLOCK, dtype=torch.float32, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+    _atomic_add_fold_to_one_cell[(1,)](inp, out, BLOCK, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == float(BLOCK)
+
+
+@triton.jit
+def _atomic_add_fold_to_one_cell_i32(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets * 0, tl.load(In + offsets))
+
+
+@pytest.mark.parametrize("BLOCK", [8, 64])
+def test_atomic_add_uniform_address_i32(BLOCK):
+    inp = torch.arange(BLOCK, dtype=torch.int32, device="mps")
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+    _atomic_add_fold_to_one_cell_i32[(1,)](inp, out, BLOCK)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == BLOCK * (BLOCK - 1) // 2
+
+
+@triton.jit
+def _atomic_add_uniform_masked(In, Out, KEEP, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(
+        Out + offsets * 0, tl.load(In + offsets), mask=(offsets == KEEP)
+    )
+
+
+@pytest.mark.parametrize("keep", [0, 5, 31])
+def test_atomic_add_uniform_address_masked_to_one_lane(keep):
+    BLOCK = 32
+    inp = torch.arange(BLOCK, dtype=torch.float32, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+    _atomic_add_uniform_masked[(1,)](inp, out, keep, BLOCK)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == float(keep)
+
+
+@triton.jit
+def _atomic_max_uniform(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_max(Out + offsets * 0, tl.load(In + offsets))
+
+
+def test_atomic_max_uniform_address_reduces_the_tile():
+    BLOCK = 64
+    torch.manual_seed(7)
+    inp = torch.randint(-500, 500, (BLOCK,), dtype=torch.int32, device="mps")
+    out = torch.full((1,), -2147483648, dtype=torch.int32, device="mps")
+    _atomic_max_uniform[(1,)](inp, out, BLOCK)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == inp.cpu().max().item()
+
+
+@triton.jit
+def _atomic_add_uniform_returns_old(In, Out, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    old = tl.atomic_add(Out + offsets * 0, tl.load(In + offsets))
+    tl.store(Old + offsets, old)
+
+
+def test_atomic_add_uniform_address_old_values_are_a_permutation():
+    # Every lane adds 1 to the same cell, so the fetched old values are the
+    # partial sums in whatever order the hardware serialized them: as a
+    # multiset, exactly 0..BLOCK-1. Order is not part of the contract.
+    BLOCK = 32
+    inp = torch.ones(BLOCK, dtype=torch.float32, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+    old = torch.empty(BLOCK, dtype=torch.float32, device="mps")
+    _atomic_add_uniform_returns_old[(1,)](inp, out, old, BLOCK)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == float(BLOCK)
+    assert sorted(old.cpu().tolist()) == [float(i) for i in range(BLOCK)]

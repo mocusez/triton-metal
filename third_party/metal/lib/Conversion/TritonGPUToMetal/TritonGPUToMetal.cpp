@@ -10530,10 +10530,19 @@ struct AtomicRmwLowering
       while (auto bitcast =
                  addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
         addressRoot = bitcast.getSrc();
-      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>())
+      // A tile whose offsets all fold to zero — `tl.atomic_add(p + offs * 0,
+      // v)`, or any BLOCK=1 tile — reaches the backend as a bare `tt.splat` of
+      // a scalar pointer with no addptr left to read the index from. Unlike a
+      // STORE, a uniform address is not a race here: every lane read-modify-
+      // writes the same location atomically, which is exactly what the shape
+      // means (accumulate a whole tile into one cell). So it is lowered rather
+      // than rejected, with the per-lane index degenerating to the scalar
+      // offset below the splat.
+      auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
+      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
         return rewriter.notifyMatchFailure(
-            op, "atomic_rmw: tensor form expects tt.addptr (optionally "
-                "bitcast) feeding ptr");
+            op, "atomic_rmw: tensor form expects tt.addptr or a splat scalar "
+                "ptr (optionally bitcast) feeding ptr");
       mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
       if (!memref)
         return rewriter.notifyMatchFailure(
@@ -10566,7 +10575,9 @@ struct AtomicRmwLowering
           convertedAddress = remapped;
       }
       mlir::Value idx =
-          emitLoadStoreIndex(*tile, convertedAddress, parentFor, rewriter, loc);
+          splatPtr ? emitSplatPtrIndex(addressRoot, rewriter, loc)
+                   : emitLoadStoreIndex(*tile, convertedAddress, parentFor,
+                                        rewriter, loc);
       mlir::Type resTy = payload->value.getType();
       auto kind = AtomicRmwKindAttr::get(rewriter.getContext(), payload->kind);
 
@@ -21795,6 +21806,21 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
       if (!mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
               tensorType.getEncoding())) {
         reject("atomic tensor form requires a blocked layout");
+        return;
+      }
+      // AtomicRmwLowering reads the device index from the address, and knows
+      // exactly two shapes: a `tt.addptr` tile, or a `tt.splat` of a scalar
+      // pointer (every offset folded away). Anything else matches no pattern,
+      // and an unmatched op is a PROCESS KILL in this pass rather than an
+      // error — the failed conversion's rollback dies. Name the shape here so
+      // the author gets a diagnostic and a usable process.
+      mlir::Value addressRoot = op.getPtr();
+      while (auto bitcast = addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
+        addressRoot = bitcast.getSrc();
+      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() &&
+          !addressRoot.getDefiningOp<mlir::triton::SplatOp>()) {
+        reject("atomic tensor address must be a tt.addptr tile or a splat "
+               "scalar pointer");
         return;
       }
     } else if (!op.getResult().use_empty()) {
