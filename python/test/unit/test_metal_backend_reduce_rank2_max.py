@@ -428,3 +428,111 @@ def test_softmax_rank2_half_end_to_end(dtype):
     tolerance = 2e-2 if dtype is torch.bfloat16 else 3e-3
     torch.testing.assert_close(out.cpu().float(), expected,
                                atol=tolerance, rtol=tolerance)
+
+
+# --- flat-position -> row must follow the tile's `order` -------------------
+#
+# The reduce result broadcast back into a rank-2 tile is read as rowBuf[row],
+# and `row` used to be computed as `flat / N` unconditionally — the row-major
+# formula. Triton picks the COLUMN-major order (`order = [0, 1]`) for shapes
+# like an Mx4 tile whose runtime column count is 1, and there the flat position
+# is `c*M + r`, so the row is `flat % M`.
+#
+# Under that layout the load/store address and mask decomposed with `% M` while
+# the rowBuf read used `/ N`: every thread read a DIFFERENT row's reduce result
+# than the one it was computing. A masked 2-D softmax came out wrong with no
+# diagnostic anywhere, which is why these assert VALUES, not compilability.
+
+
+@triton.jit
+def _masked_softmax_rank2_kernel(x_ptr, out_ptr, M, N, BM: tl.constexpr,
+                                 BN: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :], mask=mask,
+                other=-float("inf"))
+    e = tl.where(mask, tl.exp(v - tl.max(v, axis=1)[:, None]), 0.0)
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :],
+             e / tl.sum(e, axis=1)[:, None], mask=mask)
+
+
+@triton.jit
+def _masked_center_rank2_kernel(x_ptr, out_ptr, M, N, BM: tl.constexpr,
+                                BN: tl.constexpr):
+    """One reduce broadcast straight back — the minimal form of the bug, with
+    no second reduce to confuse the diagnosis."""
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :], mask=mask,
+                other=-float("inf"))
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :],
+             v - tl.max(v, axis=1)[:, None], mask=mask)
+
+
+@pytest.mark.parametrize("bm,bn", [(8, 4), (16, 4), (32, 4), (64, 4), (64, 2),
+                                   (64, 8)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_rank2_reduce_broadcast_single_runtime_column(bm, bn, num_warps):
+    """N == 1 with BN > 1 is what selects the column-major tile order."""
+    m, n = bm, 1
+    torch.manual_seed(bm * 31 + bn)
+    x = torch.rand(m, n, dtype=torch.float32)
+
+    out = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _masked_center_rank2_kernel[(1,)](x.to("mps"), out, m, n, BM=bm, BN=bn,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    # Only column 0 is unmasked, so v - rowmax is exactly 0 everywhere.
+    torch.testing.assert_close(out.cpu(), torch.zeros_like(x), atol=0, rtol=0)
+
+    out = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _masked_softmax_rank2_kernel[(1,)](x.to("mps"), out, m, n, BM=bm, BN=bn,
+                                       num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), torch.softmax(x, dim=1),
+                               atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("bm,bn", [(8, 4), (32, 4), (64, 8)])
+def test_rank2_reduce_broadcast_full_columns_still_correct(bm, bn):
+    """The row-major decomposition it used to assume must keep working."""
+    torch.manual_seed(bm + bn)
+    x = torch.rand(bm, bn, dtype=torch.float32)
+    out = torch.zeros(bm, bn, dtype=torch.float32, device="mps")
+    _masked_softmax_rank2_kernel[(1,)](x.to("mps"), out, bm, bn, BM=bm, BN=bn)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), torch.softmax(x, dim=1),
+                               atol=1e-6, rtol=1e-6)
+
+
+@triton.jit
+def _axis0_reduce_kernel(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rn, tl.sum(v, axis=0))
+
+
+def test_axis0_reduce_wide_tile_is_rejected_not_crashed(capfd):
+    """An axis=0 reduce with more columns than threads is deferred. That
+    decline used to happen INSIDE applyFullConversion, where a
+    notifyMatchFailure does not produce a catchable error — it segfaults the
+    process during the failed conversion's rollback, taking the caller with it.
+    Pre-pass rejections unwind cleanly, so this asserts both that the error is
+    catchable AND that the process can still compile afterwards."""
+    m, n = 2, 64  # tpb = 32 at num_warps=1, so N > tpb
+    x = torch.rand(m, n, dtype=torch.float32, device="mps")
+    out = torch.zeros(n, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _axis0_reduce_kernel[(1,)](x, out, M=m, N=n, num_warps=1)
+    assert "one output column per thread" in capfd.readouterr().err
+
+    # Still usable: a compile after the caught failure must succeed.
+    y = torch.rand(64, dtype=torch.float32, device="mps")
+    got = torch.zeros(64, dtype=torch.float32, device="mps")
+    _masked_center_rank2_kernel[(1,)](y.reshape(64, 1).to("mps"), got.reshape(64, 1),
+                                      64, 1, BM=64, BN=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(got.cpu(), torch.zeros(64), atol=0, rtol=0)

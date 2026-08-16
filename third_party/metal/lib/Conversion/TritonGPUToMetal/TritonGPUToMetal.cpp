@@ -177,6 +177,12 @@ struct TileInfo {
   // 2D-aware additions (`.omc/specs/deep-interview-metal-2d-maskedaccess-emitperiterindex.md`):
   int64_t rank;
   llvm::SmallVector<int64_t, 2> shape; // logical tile dim sizes
+  // The blocked encoding's `order`, fastest-varying dimension first. Anything
+  // that turns a thread's FLAT tile position back into per-axis coordinates
+  // needs it: `order = [1, 0]` means the flat index is `r*N + c`, `order =
+  // [0, 1]` means it is `c*M + r`, and assuming the first is silently wrong
+  // under the second (see rowOfFlat).
+  llvm::SmallVector<int64_t, 2> order;
 };
 
 // Per-op callers (LoadOp / StoreOp lowerings at :2036, :2394, :2494, :2571) pass
@@ -217,8 +223,9 @@ static std::optional<TileInfo> tileFromTensor(mlir::Type t) {
   // is multi-element along at least one dim).
   bool contiguous = llvm::any_of(sizePerThread,
                                   [](auto s) { return s > 1; });
-  TileInfo info{E, tpb, contiguous, rt.getRank(), {}};
+  TileInfo info{E, tpb, contiguous, rt.getRank(), {}, {}};
   for (auto s : rt.getShape()) info.shape.push_back(s);
+  for (auto d : blocked.getOrder()) info.order.push_back(d);
   return info;
 }
 
@@ -273,8 +280,11 @@ static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
   for (auto s : rt.getShape()) total *= s;
   bool contiguous =
       llvm::any_of(parent.getSizePerThread(), [](auto s) { return s > 1; });
-  TileInfo info{total / tpb, tpb, contiguous, rt.getRank(), {}};
+  TileInfo info{total / tpb, tpb, contiguous, rt.getRank(), {}, {}};
   for (auto s : rt.getShape()) info.shape.push_back(s);
+  // The slice's own view is rank-(R-1); the ORDER that matters is the parent's,
+  // which is what MakeRangeLowering's div/rem already keys on.
+  for (auto d : parent.getOrder()) info.order.push_back(d);
   return info;
 }
 
@@ -8846,16 +8856,32 @@ struct ReduceLowering
           mlir::UnrealizedConversionCastOp::create(
               rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{flatUI32})
               .getResult(0);
-      auto cOutN = mlir::arith::ConstantOp::create(
-          rewriter, loc,
-          rewriter.getI32IntegerAttr(static_cast<int32_t>(outTile->shape[1])));
-      mlir::Value row = mlir::arith::DivSIOp::create(rewriter, loc, flatI32,
-                                                     cOutN.getResult())
-                            .getResult();
+      // Which arithmetic turns the flat position back into a row depends on
+      // the tile's `order`, i.e. which axis varies fastest:
+      //   order = [1, 0] (row-major): flat = r*N + c  ->  row = flat / N
+      //   order = [0, 1] (col-major): flat = c*M + r  ->  row = flat % M
+      // Assuming row-major unconditionally was silently wrong under the other
+      // layout: the load/store address and mask decompose with `% M`, the
+      // rowBuf read with `/ N`, so every thread read a DIFFERENT row's reduce
+      // result than the one it was computing. Triton picks the column-major
+      // order for shapes like a Mx4 tile whose runtime column count is 1, which
+      // is how a masked 2-D softmax came out wrong with no diagnostic.
+      const bool rowMajor =
+          outTile->order.size() != 2 || outTile->order[0] == 1;
       auto cMrow = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+      mlir::Value row = flatI32;
+      if (rowMajor) {
+        auto cOutN = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(outTile->shape[1])));
+        row = mlir::arith::DivSIOp::create(rewriter, loc, flatI32,
+                                           cOutN.getResult())
+                  .getResult();
+      }
       // Threads past the tile's rows would otherwise read past rowBuf; their
-      // downstream store is already masked off.
+      // downstream store is already masked off. (Column-major needs this `% M`
+      // as the decomposition itself, not just as a guard.)
       row = mlir::arith::RemSIOp::create(rewriter, loc, row, cMrow.getResult())
                 .getResult();
       return mlir::UnrealizedConversionCastOp::create(
@@ -21939,6 +21965,28 @@ struct ConvertTritonGPUToMetalPass
               "tt.reduce axis=0 reduce supports f32/i32 "
               "sum/product/max/min (Session L3a2); other combines deferred");
           reduceOk = false;
+        }
+        // E_out > 1 (BN > tpb) is deferred in lowerRank2Axis0Reduce. That
+        // decline has to be made HERE: a pattern that declines inside
+        // `applyFullConversion` does not produce a catchable error, it
+        // SEGFAULTS the process during the failed conversion's rollback, so
+        // `tl.sum(x, axis=0)` with BN > threads-per-block killed any script
+        // that reached it, try/except included. Pre-pass rejections unwind
+        // cleanly and the process stays usable.
+        if (auto srcBlocked = mlir::dyn_cast_or_null<
+                mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding())) {
+          int64_t tpb = 1;
+          for (auto t : srcBlocked.getThreadsPerWarp())
+            tpb *= t;
+          for (auto w : srcBlocked.getWarpsPerCTA())
+            tpb *= w;
+          if (tpb > 0 && rtt.getDimSize(1) > tpb) {
+            red.emitOpError(
+                "rank-2 axis=0 reduce needs one output column per thread; "
+                "launch with threads-per-block >= the tile's column count, or "
+                "tile the columns across the grid");
+            reduceOk = false;
+          }
         }
         if (iOk && combineName == "arith.muli") {
           mlir::Value src = red.getSrcs().front();
