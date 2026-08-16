@@ -989,6 +989,58 @@ def test_rank3_xor_reduce_is_bit_exact():
     assert torch.equal(out.cpu(), ref)
 
 
+# --- i64 reduce ------------------------------------------------------------
+#
+# "reduce dtype must be f32 or i32" was a real wall: PyTorch hands out int64 for
+# every default integer tensor, so `tl.sum` over one is an ordinary thing to
+# write. MSL has native `long` arithmetic and `max`, and `Metal_Type` admits
+# ui64/si64, so the butterfly only had to learn the width — plus the loop
+# accumulator gates, since a BLOCK > tpb reduce folds through an `scf.for` whose
+# iter_arg is as wide as the tensor (the emitter hit an UNREACHABLE there).
+#
+# Values above 2**32 are deliberate: a 32-bit truncation anywhere would show up
+# as a hard mismatch rather than as a rounding difference.
+
+
+@triton.jit
+def _reduce_i64_kernel(x_ptr, o_ptr, N: tl.constexpr, KIND: tl.constexpr):
+    v = tl.load(x_ptr + tl.arange(0, N))
+    if KIND == 0:
+        tl.store(o_ptr, tl.sum(v, axis=0))
+    elif KIND == 1:
+        tl.store(o_ptr, tl.max(v, axis=0))
+    elif KIND == 2:
+        tl.store(o_ptr, tl.min(v, axis=0))
+    else:
+        tl.store(o_ptr, tl.xor_sum(v, axis=0))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("N", [32, 256, 1024])
+@pytest.mark.parametrize("kind", [0, 1, 2, 3])
+def test_reduce_i64_matches_torch(kind, N, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(N + kind)
+    lo = 0 if kind == 3 else -(2 ** 40)
+    x = torch.randint(lo, 2 ** 40, (N,), dtype=torch.int64)
+    out = torch.zeros(1, dtype=torch.int64, device="mps")
+    _reduce_i64_kernel[(1,)](x.to("mps"), out, N, kind, num_warps=num_warps)
+    torch.mps.synchronize()
+    if kind == 0:
+        expected = x.sum().item()
+    elif kind == 1:
+        expected = x.max().item()
+    elif kind == 2:
+        expected = x.min().item()
+    else:
+        expected = 0
+        for v in x.tolist():
+            expected ^= v
+    assert out.cpu()[0].item() == expected
+
+
 # --- rank-2 tl.gather ------------------------------------------------------
 #
 # The original gather is rank-1 axis-0: it stages the tile through a fill loop

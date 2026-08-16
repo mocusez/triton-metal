@@ -4191,7 +4191,14 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   bool isHalf = elemTy.isF16() || elemTy.isBF16();
   bool isFloat = isF32 || isHalf;
   bool isI32 = elemTy.isInteger(32);
-  if (!isFloat && !isI32)
+  // i64 rides the same butterfly. MSL has native `long` arithmetic and `max`,
+  // and `Metal_Type` admits ui64/si64, so only the storage type and the
+  // identity constants have to learn the width. PyTorch hands out int64 for
+  // every default integer tensor, so `tl.sum` over one is an ordinary thing to
+  // write — it used to be told the dtype "must be f32 or i32".
+  bool isI64 = elemTy.isInteger(64);
+  bool isInt = isI32 || isI64;
+  if (!isFloat && !isInt)
     return mlir::failure();
 
   // Identify the combine op (the pre-pass already validated, but be defensive).
@@ -4239,7 +4246,7 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // rather than shipped untested.
   if (isHalf && isMulF)
     return mlir::failure();
-  if (isI32 && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
+  if (isInt && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
     return mlir::failure();
   if (isMulF) {
     mlir::Value src = op.getSrcs().front();
@@ -4294,9 +4301,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // (bit-preserving two's-complement modular arithmetic); i32 signed-max uses
   // si32 so MSL emits `int32_t` and `max(...)` compares as signed. f32 passes
   // through.
+  auto ui64 = rewriter.getIntegerType(64, /*isSigned=*/false);
+  auto si64 = rewriter.getIntegerType(64, /*isSigned=*/true);
   mlir::Type storeTy = elemTy;
   if (isI32)
     storeTy = (isMaxI || isMinI) ? mlir::Type(si32) : mlir::Type(ui32);
+  else if (isI64)
+    storeTy = (isMaxI || isMinI) ? mlir::Type(si64) : mlir::Type(ui64);
 
   // Combine dispatch helper: emits metal.BinaryExpOp for storeTy values.
   // The MSL translator handles metal.BinaryExpOp for all scalar types;
@@ -4358,17 +4369,23 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
     // i32 add → 0; i32 product → 1; i32 signed-max → INT32_MIN
     // (max(x, INT_MIN) == x); i32 signed-min → INT32_MAX;
     // bitwise-and → ~0 (all ones); bitwise-or / xor → 0.
-    int32_t identVal = 0;
+    int64_t identVal = 0;
     if (isMulI)
       identVal = 1;
     else if (isMaxI)
-      identVal = std::numeric_limits<int32_t>::min();
+      identVal = isI64 ? std::numeric_limits<int64_t>::min()
+                       : static_cast<int64_t>(std::numeric_limits<int32_t>::min());
     else if (isMinI)
-      identVal = std::numeric_limits<int32_t>::max();
+      identVal = isI64 ? std::numeric_limits<int64_t>::max()
+                       : static_cast<int64_t>(std::numeric_limits<int32_t>::max());
     else if (isAndI)
       identVal = -1;
     auto z = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(identVal));
+        rewriter, loc,
+        isI64 ? mlir::cast<mlir::TypedAttr>(
+                    rewriter.getIntegerAttr(rewriter.getI64Type(), identVal))
+              : mlir::cast<mlir::TypedAttr>(rewriter.getI32IntegerAttr(
+                    static_cast<int32_t>(identVal))));
     return mlir::UnrealizedConversionCastOp::create(
                rewriter, loc, mlir::TypeRange{storeTy},
                mlir::ValueRange{z.getResult()})
@@ -4988,6 +5005,17 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
                        .getResult(0);
 
   // Tail handling: padded = (tid < BLOCK) ? inputScalarPT : identity.
+  //
+  // The identity is storeTy-typed, so the value has to be as well. Most paths
+  // above already bridged it; the direct-load one hands back the converted
+  // scalar in the tensor's own signless type, which only shows up once the
+  // width differs from the buffer's — i64 add stages as ui64 and the select
+  // then had an i64 operand against a ui64 one.
+  if (inputScalarPT.getType() != storeTy)
+    inputScalarPT = mlir::UnrealizedConversionCastOp::create(
+                        rewriter, loc, mlir::TypeRange{storeTy},
+                        mlir::ValueRange{inputScalarPT})
+                        .getResult(0);
   mlir::Value padded = inputScalarPT;
   if (BLOCK < tpb) {
     auto cBlock = mlir::arith::ConstantOp::create(
@@ -23880,7 +23908,8 @@ struct ConvertTritonGPUToMetalPass
           combineOk = true;
       } else if (combineName == "arith.addi") {
         if (auto intTy = mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
-          if (intTy.getWidth() == 32)
+          if (intTy.getWidth() == 32 ||
+              (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       } else if (combineName == "arith.muli" &&
                  (rtt.getRank() == 1 ||
@@ -23890,7 +23919,8 @@ struct ConvertTritonGPUToMetalPass
         // Axis=0 remains behind its dedicated gate above.
         if (auto intTy =
                 mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
-          if (intTy.getWidth() == 32)
+          if (intTy.getWidth() == 32 ||
+              (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       } else if ((combineName == "arith.andi" || combineName == "arith.ori" ||
                   combineName == "arith.xori") &&
@@ -23902,7 +23932,8 @@ struct ConvertTritonGPUToMetalPass
         // its dedicated gate above.
         if (auto intTy =
                 mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
-          if (intTy.getWidth() == 32)
+          if (intTy.getWidth() == 32 ||
+              (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       } else if (combineName == "arith.maximumf" ||
                  combineName == "arith.maxnumf" ||
@@ -23915,13 +23946,15 @@ struct ConvertTritonGPUToMetalPass
         // axis=1 unrolled per-row scan. Axis=0 returned through its own gate.
         if (auto intTy =
                 mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
-          if (intTy.getWidth() == 32)
+          if (intTy.getWidth() == 32 ||
+              (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       } else if (combineName == "arith.minsi") {
         // Signed i32 min follows the same rank-1/rank-2 paths as max.
         if (auto intTy =
                 mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
-          if (intTy.getWidth() == 32)
+          if (intTy.getWidth() == 32 ||
+              (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       }
       if (!combineOk) {
@@ -24532,11 +24565,14 @@ struct ConvertTritonGPUToMetalPass
       moduleOp.walk([&](mlir::scf::ForOp forOp) {
         for (mlir::Value iterArg : forOp.getRegionIterArgs()) {
           mlir::Type t = iterArg.getType();
+          // i64 joined the list when the rank-1 butterfly learned the width:
+          // a BLOCK > tpb reduce folds its per-thread elements in an scf.for,
+          // so the accumulator is as wide as the tensor.
           if (!(t.isF32() || t.isF16() || t.isBF16() || t.isInteger(32) ||
-                t.isInteger(1) ||
+                t.isInteger(64) || t.isInteger(1) ||
                 mlir::isa<mlir::triton::metal::MetalSimdgroupMatrixType>(t))) {
             forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
-                              "f32/f16/bf16/i32/i1 accumulator or "
+                              "f32/f16/bf16/i32/i64/i1 accumulator or "
                               "simdgroup_matrix after conversion");
             loopOk = false;
             break;
