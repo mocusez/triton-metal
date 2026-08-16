@@ -8008,6 +8008,156 @@ struct ScanLowering
 // gather index must be in [0, BLOCK).
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Any-rank, any-axis `tt.gather` — the shapes GatherLowering's rank-1 axis-0
+// fill loop does not cover.
+//
+// Same staging as the rank >= 3 reduce: publish the tile, barrier, then read
+// the element the per-lane index names. A gather only moves bits, so the
+// payload rides through the buffer in its Metal storage type.
+//===----------------------------------------------------------------------===//
+struct StagedGatherPlan {
+  TileInfo tile;
+  mlir::triton::gpu::BlockedEncodingAttr enc;
+  int axis;
+  int64_t extent;
+  int64_t stride;
+  mlir::Type stageTy;
+};
+
+static std::optional<StagedGatherPlan>
+planStagedGather(mlir::triton::GatherOp op) {
+  auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+  auto idxTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getIndices().getType());
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!srcTy || !idxTy || !resTy || srcTy.getRank() != idxTy.getRank() ||
+      srcTy.getRank() != resTy.getRank())
+    return std::nullopt;
+  if (!idxTy.getElementType().isInteger(32))
+    return std::nullopt;
+  auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      srcTy.getEncoding());
+  if (!enc)
+    return std::nullopt;
+  std::optional<TileInfo> tile = tileFromTensor(srcTy);
+  if (!tile || static_cast<int64_t>(tile->shape.size()) != srcTy.getRank())
+    return std::nullopt;
+  // Indices and result must share the source's shape apart from the gathered
+  // axis, which Triton guarantees, and the whole tile has to be publishable in
+  // one pass.
+  int64_t numElements = 1;
+  for (auto s : tile->shape)
+    numElements *= s;
+  if (numElements > tile->threadsPerBlock)
+    return std::nullopt;
+  for (int64_t d = 0; d < srcTy.getRank(); ++d)
+    if (idxTy.getDimSize(d) != resTy.getDimSize(d) ||
+        (d != static_cast<int64_t>(op.getAxis()) &&
+         idxTy.getDimSize(d) != srcTy.getDimSize(d)))
+      return std::nullopt;
+  const int axis = static_cast<int>(op.getAxis());
+  if (axis < 0 || axis >= srcTy.getRank())
+    return std::nullopt;
+  // The gathered axis is indexed directly, so source and result must agree on
+  // it too — a shorter result would need its own output mapping.
+  if (resTy.getDimSize(axis) != srcTy.getDimSize(axis))
+    return std::nullopt;
+  mlir::Type elemTy = srcTy.getElementType();
+  if (!elemTy.isF32() && !elemTy.isInteger(32) && !elemTy.isF16() &&
+      !elemTy.isBF16())
+    return std::nullopt;
+  if (underDivergentControlFlow(op))
+    return std::nullopt;
+
+  llvm::SmallVector<int64_t, 4> strides(tile->shape.size(), 1);
+  int64_t acc = 1;
+  for (unsigned d : enc.getOrder()) {
+    if (static_cast<size_t>(d) >= tile->shape.size())
+      return std::nullopt;
+    strides[d] = acc;
+    acc *= tile->shape[d];
+  }
+  return StagedGatherPlan{*tile, enc, axis, tile->shape[axis], strides[axis],
+                          metalStorageElementType(elemTy)};
+}
+
+struct StagedGatherLowering
+    : public mlir::OpConversionPattern<mlir::triton::GatherOp> {
+  // Benefit 0: GatherLowering's rank-1 axis-0 path handles BLOCK > tpb through
+  // its fill loop and stays the first choice.
+  StagedGatherLowering(const mlir::TypeConverter &tc, mlir::MLIRContext *ctx)
+      : OpConversionPattern(tc, ctx, /*benefit=*/0) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::GatherOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    std::optional<StagedGatherPlan> plan = planStagedGather(op);
+    if (!plan)
+      return rewriter.notifyMatchFailure(op, "staged gather: out of envelope");
+    mlir::Value src = adaptor.getSrc();
+    mlir::Value idx = adaptor.getIndices();
+    if (mlir::isa<mlir::RankedTensorType>(src.getType()) ||
+        mlir::isa<mlir::RankedTensorType>(idx.getType()))
+      return rewriter.notifyMatchFailure(op, "staged gather: not scalarized");
+    mlir::Type elemTy = src.getType();
+
+    auto bridge = [&](mlir::Value v, mlir::Type to) -> mlir::Value {
+      if (v.getType() == to)
+        return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{to}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+
+    const int64_t tpb = plan->tile.threadsPerBlock;
+    mlir::Value buf = publishLaneBands({bridge(src, plan->stageTy)}, tpb,
+                                       plan->stageTy, rewriter, loc);
+    mlir::Value flat = emitTileFlatIndex(op, plan->tile, rewriter, loc);
+    mlir::Value coord = emitTileCoordByOrder(op, plan->tile,
+                                             plan->enc.getOrder(), plan->axis,
+                                             rewriter, loc);
+    if (!coord)
+      return rewriter.notifyMatchFailure(op, "staged gather: no coordinate");
+    auto cStride = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(plan->stride)));
+    mlir::Value base =
+        mlir::arith::SubIOp::create(
+            rewriter, loc, flat,
+            mlir::arith::MulIOp::create(rewriter, loc, coord,
+                                        cStride.getResult())
+                .getResult())
+            .getResult();
+    // Triton leaves an out-of-range index undefined, but on a threadgroup
+    // buffer undefined means a real out-of-bounds access, so clamp into the
+    // axis — the same reason the rank-1 gather clamps its fill.
+    mlir::Value idxI32 = bridge(idx, rewriter.getI32Type());
+    auto cZero = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                 rewriter.getI32IntegerAttr(0));
+    auto cLast = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(plan->extent - 1)));
+    idxI32 = mlir::arith::MaxSIOp::create(rewriter, loc, idxI32,
+                                          cZero.getResult())
+                 .getResult();
+    idxI32 = mlir::arith::MinSIOp::create(rewriter, loc, idxI32,
+                                          cLast.getResult())
+                 .getResult();
+    mlir::Value slot =
+        mlir::arith::AddIOp::create(
+            rewriter, loc, base,
+            mlir::arith::MulIOp::create(rewriter, loc, idxI32,
+                                        cStride.getResult())
+                .getResult())
+            .getResult();
+    rewriter.replaceOp(op, readLaneBandSlot(buf, slot, tpb, plan->stageTy,
+                                            elemTy, rewriter, loc));
+    return mlir::success();
+  }
+};
+
 struct GatherLowering
     : public mlir::OpConversionPattern<mlir::triton::GatherOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -23131,6 +23281,10 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
     auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(gather.getSrc().getType());
     auto idxTy =
         mlir::dyn_cast<mlir::RankedTensorType>(gather.getIndices().getType());
+    // The staged fallback covers any rank and any axis at one element per
+    // thread; only what BOTH paths decline is an error.
+    if (planStagedGather(gather))
+      return;
     if (!srcTy || !idxTy || srcTy.getRank() != 1 || idxTy.getRank() != 1 ||
         gather.getAxis() != 0) {
       reject(gather, "tl.gather is implemented for a rank-1 gather along "
@@ -24312,6 +24466,7 @@ struct ConvertTritonGPUToMetalPass
                  TritonPreciseSqrtLowering, TritonPreciseDivFLowering,
                  TritonClampFLowering, TritonMulHiUILowering,
                  TritonExternElementwiseLowering, GatherLowering,
+                 StagedGatherLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathExp2Lowering,

@@ -989,6 +989,39 @@ def test_rank3_xor_reduce_is_bit_exact():
     assert torch.equal(out.cpu(), ref)
 
 
+# --- rank-2 tl.gather ------------------------------------------------------
+#
+# The original gather is rank-1 axis-0: it stages the tile through a fill loop
+# that can cover BLOCK > tpb. Any other rank or axis was a named rejection. The
+# staged fallback covers them at one element per thread, reading the element the
+# per-lane index names out of the published tile.
+
+
+@triton.jit
+def _gather_rank2_kernel(x_ptr, idx_ptr, o_ptr, M: tl.constexpr,
+                         N: tl.constexpr, AXIS: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(o_ptr + off,
+             tl.gather(tl.load(x_ptr + off), tl.load(idx_ptr + off), axis=AXIS))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_gather_rank2_both_axes(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    M, N = 4, 8
+    torch.manual_seed(axis * 7 + num_warps)
+    x = torch.randn(M, N, dtype=torch.float32)
+    idx = torch.randint(0, M if axis == 0 else N, (M, N), dtype=torch.int32)
+    out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    _gather_rank2_kernel[(1,)](x.to("mps"), idx.to("mps"), out, M, N, axis,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.gather(x, axis, idx.long()))
+
+
 # --- rank-2 tl.cumsum / tl.cumprod -----------------------------------------
 #
 # Scan was rank-1 axis-0 only: its distributed prefix-sum template builds one
