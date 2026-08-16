@@ -1,0 +1,347 @@
+"""The leet-triton kernels that nothing else in the tree exercises.
+
+25 of the 75 files in `leet-triton/` had neither a `__main__` runner nor a
+pytest test that loaded them, so their verbatim source had never been through
+this backend. Twenty-three of them turn out to run; this pins that down so a
+lowering change cannot quietly break one.
+
+The oracle is `TRITON_INTERPRET=1`, not a hand-written torch reference. What is
+under test here is the *backend*, so the comparison that matters is "the same
+Triton program, lowered by us, versus the same Triton program interpreted" —
+a torch reference would instead be re-testing whether the leet author's kernel
+is a correct implementation of its problem, which is not this suite's job.
+
+Each of the two runs is its own subprocess. A construct this backend declines
+inside `applyFullConversion` takes the process down rather than raising (see
+the pre-pass validators in TritonGPUToMetal.cpp), so an in-process run would
+lose the whole pytest session rather than fail one test.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_AS_SCRIPT = __name__ == "__main__"
+
+import torch
+
+if not _AS_SCRIPT:
+    import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+LEET = REPO_ROOT / "leet-triton"
+
+if not _AS_SCRIPT:
+    pytest.importorskip(
+        "triton._C.libtriton.metal",
+        reason="Metal backend pybind module not built into libtriton",
+    )
+    if not torch.backends.mps.is_available():
+        pytest.skip(
+            "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
+            allow_module_level=True,
+        )
+    if not LEET.is_dir():
+        pytest.skip("leet-triton fixtures not present", allow_module_level=True)
+
+
+def _load(name):
+    path = LEET / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(
+        "leet_uncovered_" + name.replace("-", "_"), path
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# name -> [builder(device) -> (solve args, indices of the args that are outputs)]
+#
+# A file may register more than one builder; each becomes its own test. Sizes
+# are deliberately small: the interpreter run is the wall-clock cost here, and
+# every one of these shapes already crosses the tile/threadgroup boundaries the
+# backend actually branches on.
+CASES = {}
+
+
+def _case(name):
+    def deco(fn):
+        CASES.setdefault(name, []).append(fn)
+        return fn
+
+    return deco
+
+
+def _rnd(*shape):
+    return torch.randn(*shape, dtype=torch.float32)
+
+
+@_case("easy-matrix-addition")
+def _(dev):
+    N = 64
+    return (_rnd(N, N).to(dev), _rnd(N, N).to(dev), torch.zeros(N, N, device=dev), N), [2]
+
+
+@_case("easy-matrix_multiplication")
+def _(dev):
+    M, N, K = 64, 32, 48
+    return (_rnd(M, N).to(dev), _rnd(N, K).to(dev),
+            torch.zeros(M, K, device=dev), M, N, K), [2]
+
+
+@_case("hard-causal_self-Attention")
+def _(dev):
+    M, d = 64, 32
+    return (_rnd(M, d).to(dev), _rnd(M, d).to(dev), _rnd(M, d).to(dev),
+            torch.zeros(M, d, device=dev), M, d), [3]
+
+
+@_case("hard-linear_self_attention")
+def _(dev):
+    M, D = 128, 64
+    return (_rnd(M, D).to(dev), _rnd(M, D).to(dev), _rnd(M, D).to(dev),
+            torch.zeros(M, D, device=dev), M, D), [3]
+
+
+@_case("hard-multi_agent_simulation")
+def _(dev):
+    N = 64
+    return (_rnd(N, 4).to(dev), torch.zeros(N, 4, device=dev), N), [1]
+
+
+@_case("hard-radix_sort")
+def _(dev):
+    N = 300
+    x = torch.randint(0, 1 << 20, (N,), dtype=torch.int32).to(dev)
+    return (x, torch.zeros(N, dtype=torch.int32, device=dev), N), [1]
+
+
+@_case("medium-dot_prodict")
+def _(dev):
+    n = 2048
+    return (_rnd(n).to(dev), _rnd(n).to(dev), torch.zeros(1, device=dev), n), [2]
+
+
+@_case("medium-gaussian_blur")
+def _(dev):
+    R, C, kr, kc = 64, 48, 3, 3
+    return (_rnd(R, C).to(dev), _rnd(kr, kc).to(dev),
+            torch.zeros(R, C, device=dev), R, C, kr, kc), [2]
+
+
+@_case("medium-histograming")
+def _(dev):
+    N, bins = 2000, 10
+    x = torch.randint(0, bins, (N,), dtype=torch.int32).to(dev)
+    return (x, torch.zeros(bins, dtype=torch.int32, device=dev), N, bins), [1]
+
+
+@_case("medium-int8_kv_cache_attnetion")
+def _(dev):
+    H, S, D = 4, 64, 32
+    k = torch.randint(-127, 127, (H, S, D), dtype=torch.int8).to(dev)
+    v = torch.randint(-127, 127, (H, S, D), dtype=torch.int8).to(dev)
+    ks = (_rnd(H, S).abs() * 0.01 + 0.01).to(dev)
+    vs = (_rnd(H, S).abs() * 0.01 + 0.01).to(dev)
+    return (_rnd(H, D).to(dev), k, v, ks, vs,
+            torch.zeros(H, D, device=dev), H, S, D), [5]
+
+
+@_case("medium-moe_top_k_gating")
+def _(dev):
+    M, E, k = 32, 8, 3
+    return (_rnd(M, E).to(dev), torch.zeros(M, k, device=dev),
+            torch.zeros(M, k, dtype=torch.int32, device=dev), M, E, k), [1, 2]
+
+
+@_case("medium-nearest_neighbor")
+def _(dev):
+    N = 64
+    return (_rnd(N, 3).to(dev),
+            torch.zeros(N, dtype=torch.int32, device=dev), N), [1]
+
+
+@_case("medium-parallel_merge")
+def _(dev):
+    M, N = 100, 80
+    return (_rnd(M).sort().values.to(dev), _rnd(N).sort().values.to(dev),
+            torch.zeros(M + N, device=dev), M, N), [2]
+
+
+@_case("medium-ppo_clipped_surrogate_loss")
+def _(dev):
+    B, S = 4, 32
+    return (_rnd(B * S).to(dev), _rnd(B * S).to(dev), _rnd(B * S).to(dev),
+            torch.zeros(1, device=dev), 0.2, B, S), [3]
+
+
+@_case("medium-prefix_sum")
+def _(dev):
+    n = 3000
+    return (_rnd(n).to(dev), torch.zeros(n, device=dev), n), [1]
+
+
+@_case("medium-rms_normalization")
+def _(dev):
+    N = 1024
+    return (_rnd(N).to(dev), 1.5, 0.25, torch.zeros(N, device=dev), N, 1e-5), [3]
+
+
+@_case("medium-rotary-positional-embedding")
+def _(dev):
+    M, D = 16, 64
+    return (_rnd(M, D).to(dev), _rnd(M, D).to(dev), _rnd(M, D).to(dev),
+            torch.zeros(M, D, device=dev), M, D), [3]
+
+
+@_case("medium-rotary-positional-embedding")
+def _(dev):
+    # D=2 makes BLOCK_SIZE_D = next_pow2(D/2) = 1, so the tile is 1x1 and every
+    # offset in the address folds to zero — the store's pointer is then a bare
+    # `tt.splat` with no `tt.addptr` under it. That had no lowering, and an
+    # unmatched op here kills the process (abort or SIGSEGV, varying run to run)
+    # rather than raising.
+    M, D = 1, 2
+    return (_rnd(M, D).to(dev), _rnd(M, D).to(dev), _rnd(M, D).to(dev),
+            torch.zeros(M, D, device=dev), M, D), [3]
+
+
+@_case("medium-softmax")
+def _(dev):
+    N = 1024
+    return (_rnd(N).to(dev), torch.zeros(N, device=dev), N), [1]
+
+
+def _ssm(dev):
+    b, t, d, n = 2, 16, 32, 8
+    return (_rnd(b, t, d).to(dev), _rnd(b, t, d).abs().to(dev),
+            (-_rnd(d, n).abs()).to(dev), _rnd(b, t, n).to(dev),
+            _rnd(b, t, n).to(dev), _rnd(d).to(dev),
+            torch.zeros(b, t, d, device=dev), b, t, d, n), [6]
+
+
+CASES["medium-ssm_selective_scan_1"] = [_ssm]
+CASES["medium-ssm_selective_scan_2"] = [_ssm]
+
+
+@_case("medium-top_k_selection")
+def _(dev):
+    N, k = 100, 5
+    return (_rnd(N).to(dev), torch.zeros(k, device=dev), N, k), [1]
+
+
+@_case("medium-top_p_sampling")
+def _(dev):
+    V = 512
+    return (_rnd(V).to(dev), torch.full((1,), 0.9, device=dev),
+            torch.full((1,), 1234, dtype=torch.int32, device=dev),
+            torch.zeros(1, dtype=torch.int32, device=dev), V), [3]
+
+
+@_case("medium-weight_dequantization")
+def _(dev):
+    M, N, T = 64, 64, 32
+    return (_rnd(M, N).to(dev), _rnd(M // T, N // T).to(dev),
+            torch.zeros(M, N, device=dev), M, N, T), [2]
+
+
+# Two of the twenty-five cannot run on any backend, for reasons in the file
+# rather than in this one. Listed rather than dropped so the count stays honest
+# and nobody re-derives the diagnosis.
+UNRUNNABLE = {
+    "medium-fp16_dot_product":
+        "the file hardcodes device='cuda' for its f32 accumulator",
+    "medium-int4_weight_only_quantized_matmul":
+        "the file masks an int8 tensor with the literal 0xF0, which Triton's "
+        "frontend rejects as out of range for int8 (fails identically under "
+        "TRITON_INTERPRET=1)",
+}
+
+
+def _run_child(name, variant, mode, out_path):
+    """One `solve()` call, its outputs saved as .npz. Runs as a subprocess."""
+    import numpy as np
+
+    dev = "cpu" if mode == "interp" else "mps"
+    torch.manual_seed(0)
+    args, out_idx = CASES[name][int(variant)](dev)
+    extra = {}
+    if name == "medium-top_p_sampling":
+        # The file's last step is torch.multinomial, whose RNG stream differs
+        # between CPU and MPS for the same seed; comparing the sampled token
+        # would measure only that. Swap in a deterministic pick and capture the
+        # renormalized distribution, which is what the kernels actually produce.
+        real = torch.multinomial
+
+        def deterministic(probs, n, *a, **kw):
+            extra["probs"] = probs.detach().cpu().to(torch.float32).numpy()
+            return probs.argmax().reshape(1)
+
+        torch.multinomial = deterministic
+        try:
+            _load(name).solve(*args)
+        finally:
+            torch.multinomial = real
+    else:
+        _load(name).solve(*args)
+    if dev == "mps":
+        torch.mps.synchronize()
+    saved = {str(i): args[i].cpu().to(torch.float32).numpy() for i in out_idx}
+    saved.update(extra)
+    np.savez(out_path, **saved)
+
+
+def _spawn(name, variant, mode, out_path):
+    env = dict(os.environ)
+    env.pop("TRITON_INTERPRET", None)
+    if mode == "interp":
+        env["TRITON_INTERPRET"] = "1"
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), name, str(variant), mode,
+         str(out_path)],
+        capture_output=True, text=True, env=env,
+    )
+
+
+if not _AS_SCRIPT:
+
+    _PARAMS = [(n, i) for n in sorted(CASES) for i in range(len(CASES[n]))]
+    _PARAMS += [(n, 0) for n in sorted(UNRUNNABLE)]
+
+    @pytest.mark.parametrize("name,variant", _PARAMS)
+    def test_leet_uncovered_matches_interpreter(name, variant, tmp_path):
+        if name in UNRUNNABLE:
+            pytest.skip(f"{name}: {UNRUNNABLE[name]}")
+        # Two of the corpus files are untracked in this working tree; skip
+        # rather than fail on a checkout that does not have them.
+        if not (LEET / f"{name}.py").is_file():
+            pytest.skip(f"{name}.py not present in leet-triton/")
+        import numpy as np
+
+        results = {}
+        for mode in ("mps", "interp"):
+            out = tmp_path / f"{mode}.npz"
+            proc = _spawn(name, variant, mode, out)
+            assert proc.returncode == 0, (
+                f"{name} [{mode}] exited {proc.returncode}\n"
+                f"--- stderr ---\n{proc.stderr[-3000:]}"
+            )
+            results[mode] = np.load(out)
+
+        got, want = results["mps"], results["interp"]
+        assert got.files == want.files
+        for key in want.files:
+            g, w = got[key], want[key]
+            assert g.shape == w.shape, f"{name}: arg {key} shape {g.shape} != {w.shape}"
+            scale = np.maximum(np.abs(w), 1.0)
+            err = float((np.abs(g - w) / scale).max()) if w.size else 0.0
+            assert err < 2e-3, f"{name}: arg {key} relerr {err:.3e} vs interpreter"
+
+
+if _AS_SCRIPT:
+    _run_child(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
