@@ -21911,6 +21911,53 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// `tt.scan` shapes ScanLowering cannot lower.
+//
+// It declines by `notifyMatchFailure`, which in this backend is a process kill
+// rather than an error (the failed conversion's rollback segfaults). A
+// `tl.associative_scan` with a `maximum` combine — a running maximum, which is
+// an ordinary thing to write — took the caller down with it.
+//
+// Kept in step with ScanLowering's own guards: the canonical segmented-sum and
+// affine forms have their own matchers and are admitted whatever their combine
+// looks like; everything else must be a rank-1, axis-0, f32/i32 scan whose
+// combine is add or mul.
+static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::ScanOp op) {
+    if (isCanonicalSegmentedSumScan(op) || isCanonicalAffineScan(op))
+      return;
+    auto reject = [&](llvm::StringRef what) {
+      op.emitOpError("Metal backend: ") << what;
+      valid = false;
+    };
+    if (op.getSrcs().size() != 1 || op.getNumResults() != 1) {
+      reject("tl.associative_scan carrying more than one value is implemented "
+             "only for the segmented-sum and affine forms");
+      return;
+    }
+    if (op.getAxis() != 0) {
+      reject("scan along an axis other than 0 is not implemented");
+      return;
+    }
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
+    if (!rtt || rtt.getRank() != 1) {
+      reject("scan is implemented for rank-1 tensors only");
+      return;
+    }
+    mlir::Type elemTy = rtt.getElementType();
+    const bool isI32 = elemTy.isInteger(32);
+    if (!elemTy.isF32() && !isI32) {
+      reject("scan is implemented for f32 and i32 only");
+      return;
+    }
+    if (!scanCombineKind(op, isI32))
+      reject("scan combine must be add or mul (tl.cumsum / tl.cumprod); other "
+             "associative_scan combines are not implemented");
+  });
+  return mlir::success(valid);
+}
+
 static mlir::LogicalResult validateDotScaledSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::DotScaledOp dot) {
@@ -21940,6 +21987,7 @@ struct ConvertTritonGPUToMetalPass
     auto *ctx = &getContext();
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
+        mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||
         mlir::failed(validateClampFSupport(moduleOp)) ||

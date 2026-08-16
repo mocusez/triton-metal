@@ -347,5 +347,11 @@ def test_noncanonical_single_operand_combine_remains_rejected():
         check=False,
     )
     assert result.returncode != 0, "non-canonical combine unexpectedly compiled"
+    assert result.returncode > 0, (
+        f"expected a clean non-zero exit, got returncode {result.returncode} "
+        "(negative means the process died on a signal)")
     diagnostics = result.stdout + result.stderr
-    assert "failed to legalize operation 'tt.scan'" in diagnostics, diagnostics
+    # See the matching note in test_metal_backend_segmented_scan.py: the scan
+    # pre-pass names the reason, where the old "failed to legalize" came from a
+    # decline inside applyFullConversion that took the process with it.
+    assert "scan combine must be add or mul" in diagnostics, diagnostics

@@ -862,3 +862,37 @@ def test_gather_computed_source(block):
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), (x * 2.0 + 1.0)[idx.long()],
                                atol=1e-6, rtol=1e-6)
+
+
+@triton.jit
+def _max_scan_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _running_max_scan_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs,
+             tl.associative_scan(tl.load(x_ptr + offs), 0, _max_scan_combine))
+
+
+def test_unsupported_scan_combine_is_rejected_not_crashed(capfd):
+    """Only add and mul scans are implemented. A running MAXIMUM is an ordinary
+    thing to write, and the decline lived inside ScanLowering — i.e. inside
+    applyFullConversion, where a notifyMatchFailure segfaults the caller rather
+    than raising. Asserts the caller survives with a named error."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = torch.rand(64, dtype=torch.float32, device="mps")
+    out = torch.zeros(64, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _running_max_scan_kernel[(1,)](x, out, BLOCK=64)
+    assert "scan combine must be add or mul" in capfd.readouterr().err
+
+    # Still usable afterwards: a rejection that poisons the context would be no
+    # better than the crash it replaced.
+    out2 = torch.zeros(16, dtype=torch.int32, device="mps")
+    _arange_rank2_col_kernel[(1,)](out2, M=4, N=4)
+    torch.mps.synchronize()
+    assert out2.cpu().tolist() == [p % 4 for p in range(16)]

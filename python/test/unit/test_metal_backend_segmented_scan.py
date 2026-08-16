@@ -267,8 +267,15 @@ def test_noncanonical_tuple_scan_remains_rejected():
     )
     result = _run_child(script)
     assert result.returncode != 0, "unsupported tuple scan unexpectedly compiled"
+    assert result.returncode > 0, (
+        f"expected a clean non-zero exit, got returncode {result.returncode} "
+        "(negative means the process died on a signal)")
     diagnostics = result.stdout + result.stderr
-    assert "failed to legalize operation 'tt.scan'" in diagnostics, diagnostics
+    # Named by the scan pre-pass rather than "failed to legalize". The old
+    # message came from a decline inside applyFullConversion, which in this
+    # backend segfaults the caller instead of raising; the pre-pass unwinds
+    # cleanly, hence the returncode assertion above.
+    assert "carrying more than one value" in diagnostics, diagnostics
 
 
 @pytest.mark.parametrize(
