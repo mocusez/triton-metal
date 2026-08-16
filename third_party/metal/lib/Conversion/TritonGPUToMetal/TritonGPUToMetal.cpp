@@ -16290,6 +16290,22 @@ static ScalarDotOp sdEmitScalarDot(
                            functionTile->threadsPerBlock));
     if (functionTile->contiguous)
       scalarDot->setAttr("metal.tile_contiguous", builder.getUnitAttr());
+    // Which way the flat (thread, iv) position decomposes into (row, col).
+    // `order = [0, 1]` means dim 0 varies fastest, i.e. `flat = col*M + row`;
+    // ScalarDotLowering's default is the row-major `flat = row*N + col`.
+    // Triton picks column-major for shapes like a 32x16 tile whose runtime
+    // column count is 1, and there the dot indexed A and B with `/16, %16`
+    // while the STORE addressed with `%32, /32` — every lane computed a
+    // different element than the one it stored. Wrong numbers, no diagnostic.
+    if (functionTile->order.size() == 2 && functionTile->order[0] == 0)
+      scalarDot->setAttr("metal.tile_column_major", builder.getUnitAttr());
+  } else if (auto resTile = tileFromTensor(resultTensorTy)) {
+    // `functionTile` is only computed for rank-3 results; a rank-2 dot takes
+    // the order straight off its own result tensor, which after the
+    // output-tile preference in findLargestRank2Tile is the same tile the store
+    // decomposes with.
+    if (resTile->order.size() == 2 && resTile->order[0] == 0)
+      scalarDot->setAttr("metal.tile_column_major", builder.getUnitAttr());
   }
   if (transposeA)
     scalarDot->setAttr("transpose_a", builder.getUnitAttr());
@@ -17253,12 +17269,28 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
           mlir::arith::RemSIOp::create(rewriter, loc, linI32,
                                        cMatrixElements.getResult())
               .getResult();
-      mlir::Value linRow =
-          mlir::arith::DivSIOp::create(rewriter, loc, matrixLin, cN.getResult())
-              .getResult();
-      mlir::Value linCol =
-          mlir::arith::RemSIOp::create(rewriter, loc, matrixLin, cN.getResult())
-              .getResult();
+      // Row-major `flat = row*N + col` unless the tile's order says dim 0
+      // varies fastest, in which case it is `flat = col*M + row`. Getting this
+      // wrong makes each lane compute a different element than the one it
+      // stores — see the `metal.tile_column_major` comment where it is set.
+      mlir::Value linRow, linCol;
+      if (op->hasAttr("metal.tile_column_major")) {
+        auto cM = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+        linRow = mlir::arith::RemSIOp::create(rewriter, loc, matrixLin,
+                                              cM.getResult())
+                     .getResult();
+        linCol = mlir::arith::DivSIOp::create(rewriter, loc, matrixLin,
+                                              cM.getResult())
+                     .getResult();
+      } else {
+        linRow = mlir::arith::DivSIOp::create(rewriter, loc, matrixLin,
+                                              cN.getResult())
+                     .getResult();
+        linCol = mlir::arith::RemSIOp::create(rewriter, loc, matrixLin,
+                                              cN.getResult())
+                     .getResult();
+      }
       gRow = mlir::arith::AddIOp::create(rewriter, loc,
                                          toI32(adaptor.getRowOrigin()), linRow)
                  .getResult();

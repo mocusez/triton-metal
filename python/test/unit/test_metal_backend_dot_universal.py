@@ -1166,3 +1166,41 @@ def test_matmul_block_k_larger_than_block_n(bm, bn, bk, ragged):
         num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _transb_single_column_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
+                                 BM: tl.constexpr, BN: tl.constexpr,
+                                 BK: tl.constexpr):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :],
+                      mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+        acc = tl.dot(av, tl.trans(bnk), acc)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@pytest.mark.parametrize("bm,bn,bk", [(32, 16, 16), (32, 16, 64), (64, 32, 32),
+                                      (16, 16, 16), (8, 8, 8)])
+def test_transb_single_runtime_column(bm, bn, bk):
+    """N == 1 flips the tile to column-major (Triton specializes the argument
+    to a constant), and ScalarDotLowering decomposed the flat position
+    row-major regardless: the dot indexed A and B with `/BN, %BN` while the
+    store addressed with `%BM, /BM`, so every lane computed a different element
+    than the one it stored."""
+    m, n, k = bm, 1, bk
+    torch.manual_seed(bm * 31 + bn)
+    a = torch.randn(m, k, dtype=torch.float32)
+    b = torch.randn(k, n, dtype=torch.float32)
+    c = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _transb_single_column_kernel[(1, 1)](
+        a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k,
+        BM=bm, BN=bn, BK=bk, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
