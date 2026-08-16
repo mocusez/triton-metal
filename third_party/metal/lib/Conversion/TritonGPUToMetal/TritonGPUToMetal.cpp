@@ -2459,6 +2459,172 @@ struct TritonPreciseDivFLowering
   }
 };
 
+// `triton.language.extra.libdevice` reaches the backend as `tt.extern_elementwise`
+// carrying the symbol declared by the backend's own libdevice module
+// (`third_party/metal/language/metal/libdevice.py`). Each symbol maps to an MSL
+// intrinsic that was verified to exist by compiling it through
+// `torch.mps.compile_shader` — MSL's math surface is close to, but not the same
+// as, CUDA's, and a wrong name would only surface as a shader-compile failure at
+// launch. Functions with no MSL equivalent (cbrt, erfc, expm1, log1p, hypot,
+// lgamma, tgamma, remainder, and the whole f64 / erfinv / Bessel family) are
+// deliberately absent from the Python module AND from this table, so using one
+// is a clean compile-time rejection rather than a bad shader.
+//
+// The `metal::precise::` namespace is used wherever it exists: Triton's default
+// dot/elementwise contract is IEEE, and MSL's unqualified names are permitted to
+// use the fast approximations. `__metal_fast_*` symbols opt into `metal::fast::`
+// explicitly, mirroring libdevice's own `fast_*` entry points.
+struct ExternSymbolInfo {
+  llvm::StringRef callee;
+  unsigned arity;
+};
+
+static std::optional<ExternSymbolInfo> metalExternSymbol(llvm::StringRef sym) {
+  static const llvm::StringMap<ExternSymbolInfo> table = {
+      // --- unary f32 -------------------------------------------------------
+      {"__metal_abs", {"metal::fabs", 1}},
+      {"__metal_floor", {"metal::floor", 1}},
+      {"__metal_ceil", {"metal::ceil", 1}},
+      {"__metal_trunc", {"metal::trunc", 1}},
+      {"__metal_rint", {"metal::rint", 1}},
+      {"__metal_nearbyint", {"metal::rint", 1}},
+      {"__metal_round", {"metal::round", 1}},
+      {"__metal_sqrt", {"metal::precise::sqrt", 1}},
+      {"__metal_rsqrt", {"metal::precise::rsqrt", 1}},
+      {"__metal_exp", {"metal::precise::exp", 1}},
+      {"__metal_exp2", {"metal::precise::exp2", 1}},
+      {"__metal_exp10", {"metal::precise::exp10", 1}},
+      {"__metal_log", {"metal::precise::log", 1}},
+      {"__metal_log2", {"metal::precise::log2", 1}},
+      {"__metal_log10", {"metal::precise::log10", 1}},
+      {"__metal_sin", {"metal::precise::sin", 1}},
+      {"__metal_cos", {"metal::precise::cos", 1}},
+      {"__metal_tan", {"metal::precise::tan", 1}},
+      {"__metal_sinh", {"metal::precise::sinh", 1}},
+      {"__metal_cosh", {"metal::precise::cosh", 1}},
+      {"__metal_tanh", {"metal::precise::tanh", 1}},
+      {"__metal_asin", {"metal::precise::asin", 1}},
+      {"__metal_acos", {"metal::precise::acos", 1}},
+      {"__metal_atan", {"metal::precise::atan", 1}},
+      {"__metal_asinh", {"metal::precise::asinh", 1}},
+      {"__metal_acosh", {"metal::precise::acosh", 1}},
+      {"__metal_atanh", {"metal::precise::atanh", 1}},
+      {"__metal_sinpi", {"metal::precise::sinpi", 1}},
+      {"__metal_cospi", {"metal::precise::cospi", 1}},
+      {"__metal_tanpi", {"metal::precise::tanpi", 1}},
+      {"__metal_saturatef", {"metal::saturate", 1}},
+      // erf has no MSL intrinsic; reuse the polynomial the emitter already
+      // emits into the module preamble for math.erf / tl.math.erf.
+      {"__metal_erf", {"__triton_erff", 1}},
+      // --- predicates (return i1, hence a separate result type below) ------
+      {"__metal_isnan", {"metal::isnan", 1}},
+      {"__metal_isinf", {"metal::isinf", 1}},
+      {"__metal_isfinite", {"metal::isfinite", 1}},
+      {"__metal_signbit", {"metal::signbit", 1}},
+      // --- binary ----------------------------------------------------------
+      {"__metal_atan2", {"metal::precise::atan2", 2}},
+      {"__metal_copysign", {"metal::copysign", 2}},
+      {"__metal_fdim", {"metal::fdim", 2}},
+      {"__metal_fmod", {"metal::fmod", 2}},
+      {"__metal_pow", {"metal::precise::pow", 2}},
+      {"__metal_powr", {"metal::precise::powr", 2}},
+      {"__metal_nextafter", {"metal::nextafter", 2}},
+      {"__metal_ldexp", {"metal::ldexp", 2}},
+      {"__metal_fmax", {"metal::fmax", 2}},
+      {"__metal_fmin", {"metal::fmin", 2}},
+      // --- ternary ---------------------------------------------------------
+      {"__metal_fma", {"metal::fma", 3}},
+      // --- fast (approximate) variants, matching libdevice's fast_* names --
+      {"__metal_fast_sinf", {"metal::fast::sin", 1}},
+      {"__metal_fast_cosf", {"metal::fast::cos", 1}},
+      {"__metal_fast_tanf", {"metal::fast::tan", 1}},
+      {"__metal_fast_expf", {"metal::fast::exp", 1}},
+      {"__metal_fast_exp10f", {"metal::fast::exp10", 1}},
+      {"__metal_fast_logf", {"metal::fast::log", 1}},
+      {"__metal_fast_log2f", {"metal::fast::log2", 1}},
+      {"__metal_fast_log10f", {"metal::fast::log10", 1}},
+      {"__metal_fast_powf", {"metal::fast::pow", 2}},
+      {"__metal_fast_dividef", {"metal::fast::divide", 2}},
+      // --- integer ---------------------------------------------------------
+      {"__metal_clz", {"metal::clz", 1}},
+      {"__metal_popc", {"metal::popcount", 1}},
+      {"__metal_brev", {"metal::reverse_bits", 1}},
+  };
+  auto it = table.find(sym);
+  if (it == table.end())
+    return std::nullopt;
+  return it->second;
+}
+
+struct TritonExternElementwiseLowering
+    : public mlir::OpConversionPattern<mlir::triton::ExternElementwiseOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::ExternElementwiseOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto info = metalExternSymbol(op.getSymbol());
+    if (!info)
+      return rewriter.notifyMatchFailure(
+          op, "extern_elementwise: no Metal intrinsic for symbol '" +
+                  op.getSymbol().str() + "'");
+    if (adaptor.getSrcs().size() != info->arity)
+      return rewriter.notifyMatchFailure(
+          op, "extern_elementwise: arity mismatch for '" +
+                  op.getSymbol().str() + "'");
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "extern_elementwise: result type");
+    // erf routes through the existing UnaryExpOp erfOp case rather than a bare
+    // call: `__triton_erff` is a polynomial the emitter writes into the module
+    // preamble, and that preamble is emitted only when an erfOp node is present.
+    // A MathIntrinsicOp naming it would compile to a call with no definition.
+    if (op.getSymbol() == "__metal_erf") {
+      auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
+                                            UnaryExpOperator::erfOp);
+      rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, kind,
+                                              adaptor.getSrcs()[0]);
+      return mlir::success();
+    }
+    // `Metal_Type` has no signless integer, so an integer intrinsic (clz,
+    // popcount, reverse_bits — all unsigned in MSL) has to be bridged through
+    // the explicit ui<N> type on the way in and back out, exactly as
+    // TritonMulHiUILowering does for tt.mulhiui. Float operands pass straight
+    // through: f32/f16/bf16 are Metal_Type members already.
+    auto loc = op.getLoc();
+    auto bridgeIn = [&](mlir::Value value) -> mlir::Value {
+      auto intTy = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+      if (!intTy || !intTy.isSignless() || intTy.getWidth() == 1)
+        return value;
+      auto unsignedTy = mlir::IntegerType::get(
+          rewriter.getContext(), intTy.getWidth(), mlir::IntegerType::Unsigned);
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{unsignedTy},
+                 mlir::ValueRange{value})
+          .getResult(0);
+    };
+    llvm::SmallVector<mlir::Value, 3> args;
+    for (mlir::Value src : adaptor.getSrcs())
+      args.push_back(bridgeIn(src));
+    mlir::Type callTy = resultTy;
+    if (auto resInt = mlir::dyn_cast<mlir::IntegerType>(resultTy))
+      if (resInt.isSignless() && resInt.getWidth() != 1)
+        callTy = mlir::IntegerType::get(rewriter.getContext(),
+                                        resInt.getWidth(),
+                                        mlir::IntegerType::Unsigned);
+    mlir::Value call =
+        MathIntrinsicOp::create(rewriter, loc, callTy,
+                                rewriter.getStringAttr(info->callee), args)
+            .getResult();
+    if (callTy != resultTy)
+      call = mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{resultTy},
+                 mlir::ValueRange{call})
+                 .getResult(0);
+    rewriter.replaceOp(op, call);
+    return mlir::success();
+  }
+};
+
 // Keep clamp's NaN contract explicit instead of composing the generic
 // metal.binary_exp min/max nodes, whose MSL spelling is shared by MLIR's
 // number-preferring and NaN-propagating arith variants.
@@ -22019,6 +22185,7 @@ struct ConvertTritonGPUToMetalPass
                  ScalarDotLowering,
                  TritonPreciseSqrtLowering, TritonPreciseDivFLowering,
                  TritonClampFLowering, TritonMulHiUILowering,
+                 TritonExternElementwiseLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathExp2Lowering,

@@ -506,6 +506,31 @@ def FmaOp : Metal_Op<"fma", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// MathIntrinsicOp
+//===----------------------------------------------------------------------===//
+
+def MathIntrinsicOp : Metal_Op<"math_intrinsic", [Pure]> {
+  let summary = "Call a named MSL math intrinsic";
+  let description = [{
+    Emits `<callee>(<args>...)` verbatim into MSL. This backs
+    `tt.extern_elementwise`, i.e. `triton.language.extra.libdevice`, whose
+    surface is far too wide to give each function its own dialect op or
+    `UnaryExpOperator` case.
+
+    `callee` is written into the generated shader unchanged, so it must only
+    ever come from the backend's own symbol table in `ExternElementwiseLowering`
+    — never from a user-supplied string. An unknown libdevice symbol is
+    rejected there rather than reaching this op.
+  }];
+
+  let arguments = (ins StrAttr:$callee, Variadic<Metal_Type>:$args);
+  let results = (outs Metal_Type:$result);
+
+  let assemblyFormat =
+      "$callee `(` $args `)` attr-dict `:` functional-type($args, $result)";
+}
+
+//===----------------------------------------------------------------------===//
 // ClampFOp
 //===----------------------------------------------------------------------===//
 

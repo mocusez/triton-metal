@@ -296,3 +296,141 @@ def test_canary_sqrt_with_divergent_const_offset():
     expected = torch.zeros(N, dtype=torch.float32)
     expected[: N - K] = torch.sqrt(x[K:])
     torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+
+
+# --- triton.language.extra.libdevice -------------------------------------
+#
+# `MetalBackend.get_module_map()` redirects `triton.language.extra.libdevice`
+# to `third_party/metal/language/metal/libdevice.py`. Before that it returned
+# `{}`, so every libdevice call resolved to the generic bodies-only shim and
+# failed with "cannot convert None of type NoneType to tensor".
+#
+# Each `__metal_*` symbol maps to an MSL intrinsic whose EXISTENCE was verified
+# by compiling it through torch.mps.compile_shader — a wrong name compiles fine
+# here and only fails when the shader is loaded, so these tests launch for real
+# rather than stopping at MSL text.
+
+from triton.language.extra import libdevice  # noqa: E402
+
+
+@triton.jit
+def _libdevice_unary_kernel(x_ptr, out_ptr, WHICH: tl.constexpr,
+                            BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    if WHICH == 0:
+        r = libdevice.asin(v)
+    elif WHICH == 1:
+        r = libdevice.acos(v)
+    elif WHICH == 2:
+        r = libdevice.atan(v)
+    elif WHICH == 3:
+        r = libdevice.sinh(v)
+    elif WHICH == 4:
+        r = libdevice.cosh(v)
+    elif WHICH == 5:
+        r = libdevice.tanh(v)
+    elif WHICH == 6:
+        r = libdevice.asinh(v)
+    elif WHICH == 7:
+        r = libdevice.atanh(v)
+    elif WHICH == 8:
+        r = libdevice.exp10(v)
+    elif WHICH == 9:
+        r = libdevice.log10(v)
+    elif WHICH == 10:
+        r = libdevice.rsqrt(v)
+    else:
+        r = libdevice.erf(v)
+    tl.store(out_ptr + offs, r)
+
+
+_LIBDEVICE_UNARY = [
+    (0, torch.asin), (1, torch.acos), (2, torch.atan), (3, torch.sinh),
+    (4, torch.cosh), (5, torch.tanh), (6, torch.asinh), (7, torch.atanh),
+    (8, lambda t: torch.pow(torch.tensor(10.0), t)), (9, torch.log10),
+    (10, torch.rsqrt), (11, torch.erf),
+]
+
+
+@pytest.mark.parametrize("which,reference", _LIBDEVICE_UNARY)
+def test_libdevice_unary_f32(which, reference):
+    torch.manual_seed(which)
+    # (0.05, 0.95) keeps every function in-domain, asin/acos/atanh included.
+    x = torch.rand(64, dtype=torch.float32) * 0.9 + 0.05
+    out = torch.empty(64, dtype=torch.float32, device="mps")
+    _libdevice_unary_kernel[(1,)](x.to("mps"), out, WHICH=which, BLOCK=64)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), reference(x), atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _libdevice_binary_kernel(x_ptr, out_ptr, WHICH: tl.constexpr,
+                             BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    if WHICH == 0:
+        r = libdevice.pow(v, v)
+    elif WHICH == 1:
+        r = libdevice.atan2(v, v + 1.0)
+    elif WHICH == 2:
+        r = libdevice.copysign(v, -v)
+    elif WHICH == 3:
+        r = libdevice.fmod(v * 10.0, 3.0)
+    else:
+        r = libdevice.fma(v, v, v)
+    tl.store(out_ptr + offs, r)
+
+
+_LIBDEVICE_BINARY = [
+    (0, lambda t: torch.pow(t, t)),
+    (1, lambda t: torch.atan2(t, t + 1.0)),
+    (2, lambda t: torch.copysign(t, -t)),
+    (3, lambda t: torch.fmod(t * 10.0, 3.0)),
+    (4, lambda t: t * t + t),
+]
+
+
+@pytest.mark.parametrize("which,reference", _LIBDEVICE_BINARY)
+def test_libdevice_binary_f32(which, reference):
+    torch.manual_seed(100 + which)
+    x = torch.rand(64, dtype=torch.float32) * 0.9 + 0.05
+    out = torch.empty(64, dtype=torch.float32, device="mps")
+    _libdevice_binary_kernel[(1,)](x.to("mps"), out, WHICH=which, BLOCK=64)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), reference(x), atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _libdevice_clz_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, libdevice.clz(tl.load(x_ptr + offs)))
+
+
+def test_libdevice_clz_i32():
+    """Integer intrinsics need the ui32 bridge: `Metal_Type` has no signless
+    integer, so a signless i32 operand would fail the op verifier."""
+    x = torch.tensor([1, 2, 255, 1 << 30] * 4, dtype=torch.int32)
+    out = torch.empty(16, dtype=torch.int32, device="mps")
+    _libdevice_clz_kernel[(1,)](x.to("mps"), out, BLOCK=16)
+    torch.mps.synchronize()
+    expected = torch.tensor([31, 30, 24, 1] * 4, dtype=torch.int32)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _libdevice_hypot_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    tl.store(out_ptr + offs, libdevice.hypot(v, v))
+
+
+def test_libdevice_missing_function_is_a_clean_error():
+    """MSL has no `hypot`, so it is deliberately absent from the Metal table.
+    Using it must name the missing function, not emit a shader that fails to
+    link (which is what a guessed-at symbol name would produce)."""
+    x = torch.rand(16, dtype=torch.float32, device="mps")
+    out = torch.empty(16, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception) as excinfo:
+        _libdevice_hypot_kernel[(1,)](x, out, BLOCK=16)
+    assert "hypot" in str(excinfo.value)

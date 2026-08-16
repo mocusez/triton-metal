@@ -226,9 +226,14 @@ class MetalBackend(BaseBackend):
         return MetalOptions(**args)
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        # No backend-specific libdevice for v1. Triton's core libdevice is
-        # already on the import path; not overriding it is the correct stub.
-        return {}
+        # Redirect `triton.language.extra.libdevice` to the Metal table. The
+        # generic shim in triton/language/extra/libdevice.py is bodies-only
+        # (`...`), so without this every libdevice call returned None and failed
+        # with "cannot convert None of type NoneType to tensor". See
+        # third_party/metal/language/metal/libdevice.py for which functions
+        # exist and why the rest deliberately do not.
+        from triton.language.extra.metal import libdevice
+        return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         # Register the Metal dialect on Triton's MLIRContext so the

@@ -6008,6 +6008,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::triton::metal::UnaryExpOp,
                     mlir::triton::metal::FmaOp,
                     mlir::triton::metal::ClampFOp,
+                    mlir::triton::metal::MathIntrinsicOp,
                     mlir::triton::metal::MulHiUIOp,
                     mlir::triton::metal::GetElementOp>(&op)) {
         _output << "\n";
@@ -6094,6 +6095,7 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             mlir::triton::metal::CastOp, mlir::triton::metal::BitcastOp,
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
             mlir::triton::metal::FmaOp, mlir::triton::metal::ClampFOp,
+            mlir::triton::metal::MathIntrinsicOp,
             mlir::triton::metal::MulHiUIOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
@@ -6845,6 +6847,16 @@ void ModuleTranslation::translate(mlir::triton::metal::FmaOp op) {
   translateValueOrVarName(op.getB());
   _output << ", ";
   translateValueOrVarName(op.getC());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::MathIntrinsicOp op) {
+  // `callee` is emitted verbatim. It is only ever set from the fixed symbol
+  // table in ExternElementwiseLowering (see TritonGPUToMetal.cpp), never from
+  // anything a kernel author controls.
+  _output << op.getCallee().str() << "(";
+  llvm::interleaveComma(op.getArgs(), _output,
+                        [&](mlir::Value arg) { translateValueOrVarName(arg); });
   _output << ")";
 }
 

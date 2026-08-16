@@ -208,6 +208,7 @@ private:
   void translate(mlir::triton::metal::BinaryExpOp op);
   void translate(mlir::triton::metal::FmaOp op);
   void translate(mlir::triton::metal::ClampFOp op);
+  void translate(mlir::triton::metal::MathIntrinsicOp op);
   void translate(mlir::triton::metal::MulHiUIOp op);
   void translate(mlir::triton::metal::YieldWhileOp op);
 
