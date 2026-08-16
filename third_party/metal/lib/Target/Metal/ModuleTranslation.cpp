@@ -6696,6 +6696,15 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   case OP::orOp:
     _output << "||";
     break;
+  case OP::bitAndOp:
+    _output << "&";
+    break;
+  case OP::bitOrOp:
+    _output << "|";
+    break;
+  case OP::bitXorOp:
+    _output << "^";
+    break;
   case OP::maxOp:
   case OP::minOp:
     llvm_unreachable("min/maxOp handled above via function-call form");

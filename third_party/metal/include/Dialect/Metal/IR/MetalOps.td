@@ -434,6 +434,14 @@ def BinaryExpOperatorMax : I64EnumAttrCase<"maxOp", 13>;
 // mirroring maxOp, so `arith.minsi` / `arith.minnumf` reduce combines lower to a
 // single BinaryExp node (identity INT32_MAX / +FLT_MAX in lowerRank1Reduce).
 def BinaryExpOperatorMin : I64EnumAttrCase<"minOp", 14>;
+// BITWISE and/or/xor, distinct from andOp/orOp above — those are the LOGICAL
+// `&&` / `||` and produce i1. These emit MSL `&` / `|` / `^` and keep the
+// operand width, so integer `tl.reduce` combines (`arith.andi` / `ori` / `xori`,
+// which is what `tl.xor_sum` and bitwise-mask reductions lower to) can be a
+// single BinaryExp node like addOp is. Identities: and → ~0, or/xor → 0.
+def BinaryExpOperatorBitAnd : I64EnumAttrCase<"bitAndOp", 15>;
+def BinaryExpOperatorBitOr  : I64EnumAttrCase<"bitOrOp", 16>;
+def BinaryExpOperatorBitXor : I64EnumAttrCase<"bitXorOp", 17>;
 
 def BinaryExpOperator : I64EnumAttr<
     "BinaryExpOperator", "",
@@ -451,7 +459,10 @@ def BinaryExpOperator : I64EnumAttr<
      BinaryExpOperatorAnd,
      BinaryExpOperatorOr,
      BinaryExpOperatorMax,
-     BinaryExpOperatorMin]> {
+     BinaryExpOperatorMin,
+     BinaryExpOperatorBitAnd,
+     BinaryExpOperatorBitOr,
+     BinaryExpOperatorBitXor]> {
   let cppNamespace = "mlir::triton::metal";
 }
 

@@ -790,6 +790,9 @@ void BinaryExpOp::build(OpBuilder &builder, OperationState &result,
   case OP::remOp:
   case OP::maxOp:
   case OP::minOp:
+  case OP::bitAndOp:
+  case OP::bitOrOp:
+  case OP::bitXorOp:
     result.addTypes(lhs.getType());
     break;
   case OP::eqOp:
@@ -828,6 +831,16 @@ llvm::LogicalResult BinaryExpOp::verify() {
   case OP::minOp:
     if (lhsType != resultType)
       return emitOpError() << "result type mismatch";
+    break;
+  case OP::bitAndOp:
+  case OP::bitOrOp:
+  case OP::bitXorOp:
+    // Bitwise: width-preserving, integers only (i1 included — a bitwise op on
+    // booleans is the same value as the logical one).
+    if (lhsType != resultType)
+      return emitOpError() << "result type mismatch";
+    if (!mlir::isa<mlir::IntegerType>(lhsType))
+      return emitOpError() << "bitwise operator requires integer operands";
     break;
   case OP::eqOp:
   case OP::neOp:

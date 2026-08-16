@@ -511,3 +511,70 @@ def test_leet_group_normalization(shape, groups):
     torch.mps.synchronize()
 
     torch.testing.assert_close(out.cpu(), expected, atol=5e-4, rtol=5e-4)
+
+
+# --- Bitwise integer combines (arith.andi / ori / xori) -------------------
+#
+# `tl.xor_sum` lowers to an arith.xori combine; and/or arrive through
+# hand-written `tl.reduce` combines. All three are associative+commutative
+# monoids, so they ride the same ui32 butterfly as arith.addi — the only new
+# pieces are the identity (~0 for and, 0 for or/xor) and the bitwise
+# metal.binary_exp operator (the pre-existing andOp/orOp are LOGICAL and emit
+# `&&`/`||` into an i1). Verified bit-exact rather than by tolerance: a wrong
+# identity or a logical-vs-bitwise mixup changes the answer exactly, never
+# approximately.
+
+
+@triton.jit
+def _bitwise_and_combine(a, b):
+    return a & b
+
+
+@triton.jit
+def _bitwise_or_combine(a, b):
+    return a | b
+
+
+@triton.jit
+def reduce_xor_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.xor_sum(tl.load(x_ptr + offs), 0))
+
+
+@triton.jit
+def reduce_and_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.reduce(tl.load(x_ptr + offs), 0, _bitwise_and_combine))
+
+
+@triton.jit
+def reduce_or_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.reduce(tl.load(x_ptr + offs), 0, _bitwise_or_combine))
+
+
+def _wrap_i32(value: int) -> int:
+    return (value + 2**31) % 2**32 - 2**31
+
+
+@pytest.mark.parametrize("block", [32, 64, 256, 1024])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("op", ["xor", "and", "or"])
+def test_reduce_rank1_bitwise_i32(block, num_warps, op):
+    torch.manual_seed(block * 31 + num_warps)
+    x_cpu = torch.randint(-(2**30), 2**30, (block,), dtype=torch.int32)
+    x = x_cpu.to("mps")
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+
+    kernel, identity, apply = {
+        "xor": (reduce_xor_rank1_kernel, 0, lambda a, b: a ^ b),
+        "and": (reduce_and_rank1_kernel, -1, lambda a, b: a & b),
+        "or": (reduce_or_rank1_kernel, 0, lambda a, b: a | b),
+    }[op]
+    kernel[(1,)](x, out, BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+
+    expected = identity
+    for value in x_cpu.tolist():
+        expected = apply(expected, value)
+    assert out.cpu().item() == _wrap_i32(expected)

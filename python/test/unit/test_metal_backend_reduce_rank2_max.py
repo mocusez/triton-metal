@@ -287,3 +287,73 @@ def test_nearest_neighbor_3d_computed_min_argmin(n_points):
     distances.fill_diagonal_(float("inf"))
     expected = distances.argmin(1).to(torch.int32)
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+# --- Bitwise integer combines along axis=1 --------------------------------
+#
+# Same three monoids as the rank-1 case (see
+# `test_metal_backend_reduce_rank1.py::test_reduce_rank1_bitwise_i32`), here
+# through the rank-2 unrolled per-row column scan. Like i32 product/extrema,
+# these require a direct unmasked tt.load — the computed-cone row scanner is
+# integer-sum only — which the convert pre-pass enforces.
+
+
+@triton.jit
+def _rank2_bitwise_and(a, b):
+    return a & b
+
+
+@triton.jit
+def _rank2_bitwise_or(a, b):
+    return a | b
+
+
+@triton.jit
+def reduce_xor_rank2_axis1_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                  N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M), tl.xor_sum(tl.load(x_ptr + offs), 1))
+
+
+@triton.jit
+def reduce_and_rank2_axis1_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                  N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M),
+             tl.reduce(tl.load(x_ptr + offs), 1, _rank2_bitwise_and))
+
+
+@triton.jit
+def reduce_or_rank2_axis1_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                 N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M),
+             tl.reduce(tl.load(x_ptr + offs), 1, _rank2_bitwise_or))
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (8, 16), (16, 32), (32, 8)])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("op", ["xor", "and", "or"])
+def test_reduce_rank2_axis1_bitwise_i32(shape, num_warps, op):
+    m, n = shape
+    torch.manual_seed(m * 977 + n * 31 + num_warps)
+    x_cpu = torch.randint(-(2**30), 2**30, (m, n), dtype=torch.int32)
+    x = x_cpu.to("mps")
+    out = torch.zeros(m, dtype=torch.int32, device="mps")
+
+    kernel, identity, apply = {
+        "xor": (reduce_xor_rank2_axis1_kernel, 0, lambda a, b: a ^ b),
+        "and": (reduce_and_rank2_axis1_kernel, -1, lambda a, b: a & b),
+        "or": (reduce_or_rank2_axis1_kernel, 0, lambda a, b: a | b),
+    }[op]
+    kernel[(1,)](x, out, M=m, N=n, num_warps=num_warps)
+    torch.mps.synchronize()
+
+    rows = x_cpu.tolist()
+    expected = []
+    for row in rows:
+        acc = identity
+        for value in row:
+            acc = apply(acc, value)
+        expected.append((acc + 2**31) % 2**32 - 2**31)
+    assert out.cpu().tolist() == expected

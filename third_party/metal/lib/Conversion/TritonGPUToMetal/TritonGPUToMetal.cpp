@@ -3397,9 +3397,17 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // Triton's tl.min on signed i32 emits arith.minsi (signed min). Mirrors
   // isMaxI: si32-typed accumulator + BinaryExpOp minOp, identity INT32_MAX.
   bool isMinI = mlir::isa<mlir::arith::MinSIOp>(combine);
+  // Bitwise integer monoids. `tl.xor_sum` lowers to arith.xori; bitwise
+  // and/or reductions come from hand-written `tl.reduce` combines. All three
+  // are associative and commutative, so they ride the same butterfly as add,
+  // with identities ~0 (and) / 0 (or, xor).
+  bool isAndI = mlir::isa<mlir::arith::AndIOp>(combine);
+  bool isOrI = mlir::isa<mlir::arith::OrIOp>(combine);
+  bool isXorI = mlir::isa<mlir::arith::XOrIOp>(combine);
+  bool isBitwiseI = isAndI || isOrI || isXorI;
   if (isF32 && !(isAddF || isMulF || isMaxF || isMinF))
     return mlir::failure();
-  if (isI32 && !(isAddI || isMulI || isMaxI || isMinI))
+  if (isI32 && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
     return mlir::failure();
   if (isMulF) {
     mlir::Value src = op.getSrcs().front();
@@ -3465,6 +3473,15 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // ArithAddILowering). We must use metal.BinaryExpOp directly here, mirroring
   // the rank-2 reduce body's approach (see :1530, :1729, :1739).
   auto emitCombine = [&](mlir::Value lhs, mlir::Value rhs) -> mlir::Value {
+    if (isBitwiseI) {
+      auto op = isAndI   ? BinaryExpOperator::bitAndOp
+                : isOrI  ? BinaryExpOperator::bitOrOp
+                         : BinaryExpOperator::bitXorOp;
+      auto opEnum = BinaryExpOperatorAttr::get(rewriter.getContext(), op);
+      return BinaryExpOp::create(rewriter, loc, lhs.getType(), opEnum, lhs,
+                                 rhs)
+          .getResult();
+    }
     if (isAddF || isMulF || isAddI || isMulI) {
       auto op = (isMulF || isMulI) ? BinaryExpOperator::mulOp
                                    : BinaryExpOperator::addOp;
@@ -3518,6 +3535,8 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
       identVal = std::numeric_limits<int32_t>::min();
     else if (isMinI)
       identVal = std::numeric_limits<int32_t>::max();
+    else if (isAndI)
+      identVal = -1;
     auto z = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getI32IntegerAttr(identVal));
     return mlir::UnrealizedConversionCastOp::create(
@@ -7877,9 +7896,15 @@ struct ReduceLowering
     bool isMulI = mlir::isa<mlir::arith::MulIOp>(combine);
     bool isMaxI = mlir::isa<mlir::arith::MaxSIOp>(combine);
     bool isMinI = mlir::isa<mlir::arith::MinSIOp>(combine);
+    // Bitwise integer monoids (identity ~0 for and, 0 for or/xor) — see the
+    // matching block in lowerRank1Reduce.
+    bool isAndI = mlir::isa<mlir::arith::AndIOp>(combine);
+    bool isOrI = mlir::isa<mlir::arith::OrIOp>(combine);
+    bool isXorI = mlir::isa<mlir::arith::XOrIOp>(combine);
+    bool isBitwiseI = isAndI || isOrI || isXorI;
     if (isF32 && !(isAddF || isMulF || isMaxF || isMinF))
       return mlir::failure();
-    if (isI32 && !(isAddI || isMulI || isMaxI || isMinI))
+    if (isI32 && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
       return mlir::failure();
 
     auto loc = op.getLoc();
@@ -8090,11 +8115,14 @@ struct ReduceLowering
       }
     }
 
-    // Combine enum: addOp for sum, mulOp for direct-load product, and maxOp /
-    // minOp for f32 extrema.
+    // Combine enum: addOp for sum, mulOp for direct-load product, maxOp /
+    // minOp for f32 extrema, and the bitwise trio for integer and/or/xor.
     auto combineEnum = BinaryExpOperatorAttr::get(
         rewriter.getContext(),
-        isMaxF   ? BinaryExpOperator::maxOp
+        isAndI   ? BinaryExpOperator::bitAndOp
+        : isOrI  ? BinaryExpOperator::bitOrOp
+        : isXorI ? BinaryExpOperator::bitXorOp
+        : isMaxF ? BinaryExpOperator::maxOp
         : isMinF ? BinaryExpOperator::minOp
         : (isMulF || isMulI) ? BinaryExpOperator::mulOp
                  : BinaryExpOperator::addOp);
@@ -8386,7 +8414,9 @@ struct ReduceLowering
               mlir::Value elt = emitColLoad(cJ.getResult());
               if (!rowSum)
                 rowSum = elt;
-              else if (isAddI || isMulI)
+              else if (isAddI || isMulI || isBitwiseI)
+                // Bitwise and/or/xor are width- and sign-agnostic, so like
+                // add/mul they combine directly on the ui32 storage value.
                 rowSum = BinaryExpOp::create(rewriter, loc, storeTy, combineEnum,
                                              rowSum, elt)
                              .getResult();
@@ -21466,6 +21496,18 @@ struct ConvertTritonGPUToMetalPass
                 mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
           if (intTy.getWidth() == 32)
             combineOk = true;
+      } else if ((combineName == "arith.andi" || combineName == "arith.ori" ||
+                  combineName == "arith.xori") &&
+                 (rtt.getRank() == 1 ||
+                  (rtt.getRank() == 2 && axes == 1))) {
+        // Bitwise i32 monoids (identity ~0 for and, 0 for or/xor). Rank-1 rides
+        // the ui32 butterfly, rank-2 axis=1 the unrolled per-row scan — the same
+        // two paths as arith.muli. `tl.xor_sum` lowers here. Axis=0 stays behind
+        // its dedicated gate above.
+        if (auto intTy =
+                mlir::dyn_cast_or_null<mlir::IntegerType>(combineEltTy))
+          if (intTy.getWidth() == 32)
+            combineOk = true;
       } else if (combineName == "arith.maximumf" ||
                  combineName == "arith.maxnumf" ||
                  combineName == "arith.minimumf" ||
@@ -21532,7 +21574,8 @@ struct ConvertTritonGPUToMetalPass
       // reaching failed-conversion teardown.
       if (rtt.getRank() == 2 && axes == 1 &&
           (combineName == "arith.muli" || combineName == "arith.maxsi" ||
-           combineName == "arith.minsi")) {
+           combineName == "arith.minsi" || combineName == "arith.andi" ||
+           combineName == "arith.ori" || combineName == "arith.xori")) {
         mlir::Value src = red.getSrcs().front();
         if (auto cvt =
                 src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
@@ -21540,8 +21583,8 @@ struct ConvertTritonGPUToMetalPass
         auto load = src.getDefiningOp<mlir::triton::LoadOp>();
         if (!load || load.getMask()) {
           red.emitOpError(
-              "rank-2 axis=1 i32 product/max/min requires a direct unmasked "
-              "tt.load");
+              "rank-2 axis=1 i32 product/max/min/bitwise requires a direct "
+              "unmasked tt.load");
           reduceOk = false;
           return;
         }
