@@ -6193,9 +6193,15 @@ static bool isCanonicalSegmentedSumScan(mlir::triton::ScanOp op) {
 //
 // This is deliberately structural rather than a generic tuple-scan lowering:
 // the Metal primitive below implements only affine-transform composition.
+//
+// `reverse` is accepted: the primitive mirrors each chunk in place and visits
+// chunks from the last one down, which is the only order-safe way to run a
+// NON-COMMUTATIVE combine backwards (the reverse recurrence
+// `A_t = x_t + a_t * A_(t+1)`, e.g. the GAE scan in
+// `leet-triton/medium-parallel_reverse_scan_gae.py`).
 static bool isCanonicalAffineScan(mlir::triton::ScanOp op) {
   if (op.getSrcs().size() != 2 || op->getNumResults() != 2 ||
-      op.getAxis() != 0 || op.getReverse())
+      op.getAxis() != 0)
     return false;
 
   auto lhsTy =
@@ -6449,6 +6455,10 @@ static mlir::LogicalResult lowerCanonicalSegmentedSumScan(
 // Lower the canonical affine scan through two in-place f32 threadgroup
 // buffers.  Padding uses the affine identity (a=1, x=0), allowing sub-tpb
 // chunk scans to execute the same barrier-uniform template as full tiles.
+// (a=1, x=0) is a TWO-SIDED identity, so the same padding is correct for a
+// reverse scan, where the tail lands at the FRONT of the reversed sequence.
+// Direction is otherwise entirely the primitive's business: this fill and the
+// per-element read below both address buffer slots by LOGICAL position.
 static mlir::LogicalResult
 lowerCanonicalAffineScan(mlir::triton::ScanOp op,
                          llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
@@ -6578,9 +6588,11 @@ lowerCanonicalAffineScan(mlir::triton::ScanOp op,
     StoreOp::create(rewriter, loc, x, xBuf, posUI);
   }
 
-  ThreadgroupAffinePrefixScanOp::create(rewriter, loc, aBuf, xBuf,
-                                        rewriter.getI64IntegerAttr(bufLen),
-                                        rewriter.getI64IntegerAttr(tpb));
+  auto affine = ThreadgroupAffinePrefixScanOp::create(
+      rewriter, loc, aBuf, xBuf, rewriter.getI64IntegerAttr(bufLen),
+      rewriter.getI64IntegerAttr(tpb), mlir::UnitAttr{});
+  if (op.getReverse())
+    affine->setAttr("reverse", rewriter.getUnitAttr());
 
   mlir::Value idxUI;
   auto resultTile = tileFromTensor(op->getResult(0).getType());
@@ -6608,7 +6620,55 @@ lowerCanonicalAffineScan(mlir::triton::ScanOp op,
   return mlir::success();
 }
 
-// W-C: `tt.scan` (cumsum) — inclusive prefix-sum over a rank-1 f32 tensor.
+// The monoid of a SINGLE-operand `tt.scan`, or `nullopt` when the combine
+// region is not one of the two `metal.threadgroup_prefix_sum` implements.
+//
+// The match is STRUCTURAL, not "what is the first op in the region": the region
+// must hold exactly one arithmetic op, it must combine the two block arguments
+// themselves, and its result must be what `tt.scan.return` yields. A first-op
+// sniff would accept `combine(l, r) = (l + r) * 2` as a cumsum and
+// `combine(l, r) = l * 2 + r` as a cumprod — both silently wrong answers, with
+// no diagnostic anywhere. Add and mul are the only cases; both are commutative,
+// so the two operand orders are equivalent.
+static std::optional<BinaryExpOperator>
+scanCombineKind(mlir::triton::ScanOp op, bool isI32) {
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return std::nullopt;
+  mlir::Block &body = op->getRegion(0).front();
+  if (body.getNumArguments() != 2)
+    return std::nullopt;
+
+  mlir::Operation *combine = nullptr;
+  for (mlir::Operation &nested : body) {
+    if (mlir::isa<mlir::triton::ScanReturnOp>(nested))
+      continue;
+    if (combine)
+      return std::nullopt; // more than one op: not a bare add/mul
+    combine = &nested;
+  }
+  auto ret = mlir::dyn_cast<mlir::triton::ScanReturnOp>(body.back());
+  if (!combine || !ret || ret->getNumOperands() != 1 ||
+      combine->getNumResults() != 1 ||
+      ret->getOperand(0) != combine->getResult(0) ||
+      combine->getNumOperands() != 2)
+    return std::nullopt;
+
+  mlir::Value lhs = body.getArgument(0), rhs = body.getArgument(1);
+  if (!((combine->getOperand(0) == lhs && combine->getOperand(1) == rhs) ||
+        (combine->getOperand(0) == rhs && combine->getOperand(1) == lhs)))
+    return std::nullopt;
+
+  if (isI32 ? mlir::isa<mlir::arith::AddIOp>(combine)
+            : mlir::isa<mlir::arith::AddFOp>(combine))
+    return BinaryExpOperator::addOp;
+  if (isI32 ? mlir::isa<mlir::arith::MulIOp>(combine)
+            : mlir::isa<mlir::arith::MulFOp>(combine))
+    return BinaryExpOperator::mulOp;
+  return std::nullopt;
+}
+
+// W-C: `tt.scan` (cumsum / cumprod) — inclusive prefix scan over a rank-1
+// f32/i32 tensor.
 //
 // Emits a DISTRIBUTED prefix-sum into a threadgroup buffer `scanbuf[BLOCK]`:
 //   1. fill an `inbuf[BLOCK]` threadgroup buffer with the scan INPUT cone,
@@ -6652,20 +6712,14 @@ struct ScanLowering
     if (!rtt || rtt.getRank() != 1 || !(scanEltTy.isF32() || scanIsI32))
       return rewriter.notifyMatchFailure(op, "scan: rank-1 f32/i32 only");
 
-    // Combine must be a plain add (cumsum) of the matching element type.
-    mlir::Operation *combine = nullptr;
-    if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
-      for (auto &nested : op->getRegion(0).front()) {
-        if (mlir::isa<mlir::triton::ScanReturnOp>(nested))
-          continue;
-        combine = &nested;
-        break;
-      }
-    const bool combineIsAdd =
-        combine && (scanIsI32 ? mlir::isa<mlir::arith::AddIOp>(combine)
-                              : mlir::isa<mlir::arith::AddFOp>(combine));
-    if (!combineIsAdd)
-      return rewriter.notifyMatchFailure(op, "scan: only add (cumsum)");
+    // Combine must be a plain add (cumsum) or mul (cumprod) of the two block
+    // arguments, in the matching element type.
+    auto combineKind = scanCombineKind(op, scanIsI32);
+    if (!combineKind)
+      return rewriter.notifyMatchFailure(op,
+                                         "scan: only add/mul (cumsum/cumprod)");
+    const bool combineIsMul =
+        *combineKind == BinaryExpOperator::mulOp;
 
     auto srcBlocked = mlir::dyn_cast_or_null<
         mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
@@ -6681,12 +6735,13 @@ struct ScanLowering
       return rewriter.notifyMatchFailure(op, "scan: empty tile");
     // Sub-tpb tiles (BLOCK < tpb) are PADDED up to one full tpb window instead
     // of getting a partial-window prefix-sum template. The tail positions
-    // [BLOCK, tpb) are filled with 0.0 — the identity for the addf combine — so
-    // every prefix of a position < BLOCK is unaffected and the template runs
-    // completely unchanged. That matters: a partial window would mean guarding
-    // the template's buffer writes, and on Metal a threadgroup_barrier inside
-    // divergent control flow is UB, so the guard and the barriers would have to
-    // be interleaved by hand. Padding sidesteps the hazard entirely.
+    // [BLOCK, tpb) are filled with the combine's identity (0 for add, 1 for
+    // mul), so every prefix of a position < BLOCK is unaffected and the
+    // template runs completely unchanged. That matters: a partial window would
+    // mean guarding the template's buffer writes, and on Metal a
+    // threadgroup_barrier inside divergent control flow is UB, so the guard and
+    // the barriers would have to be interleaved by hand. Padding sidesteps the
+    // hazard entirely.
     //
     // BLOCK < tpb is otherwise reachable ONLY here: tpb = 32 * num_warps, so
     // BLOCK >= 32 can always be made to fit by lowering num_warps, but a
@@ -6742,9 +6797,9 @@ struct ScanLowering
 
     // Staging element type. The metal buffer/element ops reject SIGNLESS i32
     // (same constraint the rank-1 reduce documents at `storeTy`), so an i32
-    // cumsum stages through ui32. That is exact for a SUM: two's-complement
-    // addition is bit-identical for signed and unsigned operands, so wrapping
-    // negative partial sums round-trip unchanged.
+    // cumsum stages through ui32. That is exact for both monoids here:
+    // two's-complement addition AND multiplication are bit-identical for signed
+    // and unsigned operands, so wrapping negative partials round-trip unchanged.
     mlir::Type stageTy = scanIsI32 ? mlir::Type(ui32) : mlir::Type(f32);
     // Prefer the function-entry pair `preprocessScanBuffers` reserved for this
     // scan; only fall back to a private allocation when the function was not
@@ -6794,8 +6849,8 @@ struct ScanLowering
       // Padded tail: `pos` may land in [BLOCK, tpb), where the cone has no
       // element — evaluating it there would emit a device load past the end of
       // the source tensor. Evaluate at a clamped-to-zero index instead and
-      // select the add-identity, branchless: no scf.if, so the barriers around
-      // this fill stay uniform for the whole threadgroup.
+      // select the combine's identity, branchless: no scf.if, so the barriers
+      // around this fill stay uniform for the whole threadgroup.
       mlir::Value inRange;
       mlir::Value evalPos = pos;
       if (padded) {
@@ -6815,16 +6870,19 @@ struct ScanLowering
       if (!val)
         return rewriter.notifyMatchFailure(op, "scan: input eval failed");
       if (padded) {
-        // Add-identity in the cone's own type; `val` is still signless here
-        // (the bridge to the ui32 staging type happens just below).
-        auto zeroAttr =
+        // Identity of THIS scan's monoid, in the cone's own type; `val` is
+        // still signless here (the bridge to the ui32 staging type happens just
+        // below). A cumprod padded with 0 would zero every prefix.
+        const int32_t unitI = combineIsMul ? 1 : 0;
+        const float unitF = combineIsMul ? 1.0f : 0.0f;
+        auto unitAttr =
             scanIsI32
-                ? mlir::cast<mlir::TypedAttr>(rewriter.getI32IntegerAttr(0))
-                : mlir::cast<mlir::TypedAttr>(rewriter.getF32FloatAttr(0.0f));
-        auto cZero = mlir::arith::ConstantOp::create(rewriter, loc, zeroAttr);
+                ? mlir::cast<mlir::TypedAttr>(rewriter.getI32IntegerAttr(unitI))
+                : mlir::cast<mlir::TypedAttr>(rewriter.getF32FloatAttr(unitF));
+        auto cUnit = mlir::arith::ConstantOp::create(rewriter, loc, unitAttr);
         val = mlir::arith::SelectOp::create(rewriter, loc, inRange,
                                             toSignlessInt(val, rewriter, loc),
-                                            cZero.getResult())
+                                            cUnit.getResult())
                   .getResult();
       }
       // Bridge signless i32 -> the ui32 staging type the buffer ops require.
@@ -6842,7 +6900,12 @@ struct ScanLowering
     auto prefix = ThreadgroupPrefixSumOp::create(
         rewriter, loc, inbuf, scanbuf,
         rewriter.getI64IntegerAttr(bufLen), rewriter.getI64IntegerAttr(tpb),
-        mlir::UnitAttr{});
+        mlir::UnitAttr{},
+        // Absent `combine` means add, so a cumsum keeps its previous emission
+        // byte for byte.
+        combineIsMul ? BinaryExpOperatorAttr::get(
+                           rewriter.getContext(), *combineKind)
+                     : BinaryExpOperatorAttr{});
     if (op.getReverse())
       prefix->setAttr("reverse", rewriter.getUnitAttr());
 

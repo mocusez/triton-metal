@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -554,17 +555,34 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicCasOp op) {
 
 void ModuleTranslation::translate(
     mlir::triton::metal::ThreadgroupPrefixSumOp op) {
-  // Inclusive prefix-sum (cumsum) of inbuf -> outbuf over `block` elements,
-  // tiled over E = block/tpb cyclic iv-blocks (pos = iv*tpb + tid). Per iv-block
-  // an in-place double-barriered Hillis-Steele inclusive scan runs across the
-  // tpb threads (its window is outbuf[base + 0..tpb), contiguous), then a
-  // running `carry` (sum of prior iv-blocks) is added. Validated bit-close to
-  // torch.cumsum (scan_spike.py). Barriers are OUTSIDE any per-thread branch so
-  // all threads reach them (caller guarantees uniform control flow).
+  // Inclusive prefix scan of inbuf -> outbuf over `block` elements, tiled over
+  // E = block/tpb cyclic iv-blocks (pos = iv*tpb + tid). Per iv-block an
+  // in-place double-barriered Hillis-Steele inclusive scan runs across the tpb
+  // threads (its window is outbuf[base + 0..tpb), contiguous), then a running
+  // `carry` (the combine of all prior iv-blocks) is folded in. Validated
+  // bit-close to torch.cumsum (scan_spike.py). Barriers are OUTSIDE any
+  // per-thread branch so all threads reach them (caller guarantees uniform
+  // control flow).
   const int64_t BLOCK = op.getBlock();
   const int64_t TPB = op.getTpb();
   const int64_t E = BLOCK / TPB;
   const bool REVERSE = op->hasAttr("reverse");
+  // Monoid: absent `combine` means add, so every cumsum caller predating the
+  // attribute keeps its exact emission. Only add/mul are meaningful here — both
+  // are commutative and associative, which is what lets the Hillis-Steele step
+  // fold neighbours in whatever order the threads reach them.
+  auto combineKind = op.getCombine().value_or(
+      mlir::triton::metal::BinaryExpOperator::addOp);
+  if (combineKind != mlir::triton::metal::BinaryExpOperator::addOp &&
+      combineKind != mlir::triton::metal::BinaryExpOperator::mulOp) {
+    op.emitError("metal.threadgroup_prefix_sum supports only the add and mul "
+                 "combines");
+    _emitFailed = true;
+    return;
+  }
+  const bool IS_MUL =
+      combineKind == mlir::triton::metal::BinaryExpOperator::mulOp;
+  const llvm::StringRef FOLD = IS_MUL ? "*=" : "+=";
   auto bufName = [&](mlir::Value m) -> std::string {
     while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
       if (cast.getInputs().size() != 1)
@@ -588,19 +606,28 @@ void ModuleTranslation::translate(
     return llvm::cast<MetalMemRefType>(m.getType()).getType();
   };
   const llvm::StringRef ELEM = typeToString(bufElemTy(op.getOutbuf()));
-  const std::string ZERO =
-      llvm::isa<mlir::FloatType>(bufElemTy(op.getOutbuf())) ? "0.0f" : "0";
+  const bool ELEM_IS_FLOAT =
+      llvm::isa<mlir::FloatType>(bufElemTy(op.getOutbuf()));
+  // Identity of the selected monoid, in the buffer's own element type.
+  const std::string UNIT =
+      IS_MUL ? (ELEM_IS_FLOAT ? "1.0f" : "1") : (ELEM_IS_FLOAT ? "0.0f" : "0");
   auto &os = _output;
-  os << "\n  // ---- metal.threadgroup_prefix_sum (cumsum) ----\n";
+  os << "\n  // ---- metal.threadgroup_prefix_sum ("
+     << (IS_MUL ? "cumprod" : "cumsum") << ") ----\n";
   os << "  {\n";
   os << "    uint _ps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
-  os << "    " << ELEM << " _ps_carry = " << ZERO << ";\n";
+  os << "    " << ELEM << " _ps_carry = " << UNIT << ";\n";
   os << "    for (uint _ps_k = 0u; _ps_k < " << S(E) << "u; ++_ps_k) {\n";
   if (REVERSE) {
     os << "      uint _ps_base = " << S(BLOCK)
        << "u - (_ps_k + 1u) * " << S(TPB) << "u;\n";
     os << "      uint _ps_orig = _ps_base + " << S(TPB - 1)
        << "u - _ps_tid;\n";
+    // Cross-thread read: `_ps_orig` is the slot thread `tpb-1-tid` filled, so
+    // the fill (or the previous chunk's write-back) must be visible first. The
+    // forward path reads only the slot this thread wrote itself and needs no
+    // such barrier.
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     os << "      " << OUT << "[_ps_base + _ps_tid] = " << IN
        << "[_ps_orig];\n";
   } else {
@@ -612,16 +639,16 @@ void ModuleTranslation::translate(
   os << "      for (uint _ps_off = 1u; _ps_off < " << S(TPB)
      << "u; _ps_off <<= 1) {\n";
   os << "        " << ELEM << " _ps_add = (_ps_tid >= _ps_off) ? " << OUT
-     << "[_ps_base + _ps_tid - _ps_off] : " << ZERO << ";\n";
+     << "[_ps_base + _ps_tid - _ps_off] : " << UNIT << ";\n";
   os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "        " << OUT << "[_ps_base + _ps_tid] += _ps_add;\n";
+  os << "        " << OUT << "[_ps_base + _ps_tid] " << FOLD << " _ps_add;\n";
   os << "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "      }\n";
   os << "      " << ELEM << " _ps_total = " << OUT << "[_ps_base + "
      << S(TPB - 1) << "u];\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "      " << OUT << "[_ps_base + _ps_tid] += _ps_carry;\n";
-  os << "      _ps_carry += _ps_total;\n";
+  os << "      " << OUT << "[_ps_base + _ps_tid] " << FOLD << " _ps_carry;\n";
+  os << "      _ps_carry " << FOLD << " _ps_total;\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   if (REVERSE) {
     os << "      " << ELEM << " _ps_result = " << OUT
@@ -782,16 +809,36 @@ void ModuleTranslation::translate(
   const std::string X = bufName(op.getX());
   auto S = [](int64_t value) { return std::to_string(value); };
   const int64_t E = BLOCK / TPB;
+  const bool REVERSE = op->hasAttr("reverse");
   auto &os = _output;
 
-  os << "\n  // ---- metal.threadgroup_affine_prefix_scan ----\n";
+  os << "\n  // ---- metal.threadgroup_affine_prefix_scan"
+     << (REVERSE ? " (reverse)" : "") << " ----\n";
   os << "  {\n";
   os << "    uint _aps_tid = id.x - tgid.x * " << S(TPB) << "u;\n";
   os << "    float _aps_carry_a = 1.0f;\n";
   os << "    float _aps_carry_x = 0.0f;\n";
   os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "    for (uint _aps_k = 0u; _aps_k < " << S(E) << "u; ++_aps_k) {\n";
-  os << "      uint _aps_base = _aps_k * " << S(TPB) << "u;\n";
+  if (REVERSE) {
+    // Visit chunks from the last one down, and mirror each chunk IN PLACE so
+    // the forward template below runs verbatim over the reversed sequence. The
+    // affine combine is not commutative, so the element order — not just the
+    // carry order — has to be the reversed one. Both halves of the swap are a
+    // cross-thread read, hence the barrier on either side.
+    os << "      uint _aps_base = " << S(BLOCK) << "u - (_aps_k + 1u) * "
+       << S(TPB) << "u;\n";
+    os << "      uint _aps_orig = _aps_base + " << S(TPB - 1)
+       << "u - _aps_tid;\n";
+    os << "      float _aps_mir_a = " << A << "[_aps_orig];\n";
+    os << "      float _aps_mir_x = " << X << "[_aps_orig];\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      " << A << "[_aps_base + _aps_tid] = _aps_mir_a;\n";
+    os << "      " << X << "[_aps_base + _aps_tid] = _aps_mir_x;\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  } else {
+    os << "      uint _aps_base = _aps_k * " << S(TPB) << "u;\n";
+  }
   os << "      for (uint _aps_off = 1u; _aps_off < " << S(TPB)
      << "u; _aps_off <<= 1) {\n";
   os << "        float _aps_cur_a = " << A << "[_aps_base + _aps_tid];\n";
@@ -830,6 +877,16 @@ void ModuleTranslation::translate(
         "_aps_total_x;\n";
   os << "      _aps_carry_a *= _aps_total_a;\n";
   os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  if (REVERSE) {
+    // Mirror the finished chunk back, so results land on their ORIGINAL logical
+    // positions — the conversion's per-element placeholder reads by position.
+    os << "      float _aps_out_a = " << A << "[_aps_base + _aps_tid];\n";
+    os << "      float _aps_out_x = " << X << "[_aps_base + _aps_tid];\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      " << A << "[_aps_orig] = _aps_out_a;\n";
+    os << "      " << X << "[_aps_orig] = _aps_out_x;\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  }
   os << "    }\n";
   os << "  }\n";
 }
@@ -5705,7 +5762,58 @@ void ModuleTranslation::translate(mlir::Region &region) {
         }
       }
     }
+    // Read-after-overwrite guard. A single-use `metal.get_element` is inlined
+    // at its USE, which is a different program point from its IR position: if
+    // anything writes that buffer in between, the inlined read observes the NEW
+    // contents. `_gae_carry_kernel` in
+    // `leet-triton/medium-parallel_reverse_scan_gae.py` is the minimal case —
+    // `local = work[b]; work[b] = carry; carry = local + coeff*carry` emitted
+    // the load AFTER the store, so `local` read back the carry just written and
+    // every block carry came out 0, with no diagnostic anywhere.
+    //
+    // A later non-Pure op holding the same memref is taken as a possible writer
+    // (metal.store, atomic_rmw/cas, tg_store_indexed, the threadgroup scan
+    // primitives). Reads are Pure, so this never trips on another read.
+    // Deliberately index-blind: the store's index is usually a DIFFERENT SSA
+    // value computing the same address (the conversion re-derives address
+    // arithmetic per use), so comparing indices would silently miss the very
+    // case this guards. Aliasing between two distinct memrefs is out of scope
+    // here, as everywhere else in this backend.
+    llvm::DenseMap<void *, int> lastMemRefWriter;
+    {
+      int writerIdx = 0;
+      for (auto &op : region.getOps()) {
+        op.walk([&](mlir::Operation *nested) {
+          if (mlir::isMemoryEffectFree(nested))
+            return;
+          for (mlir::Value operand : nested->getOperands())
+            if (llvm::isa<mlir::triton::metal::MetalMemRefType>(
+                    operand.getType()))
+              lastMemRefWriter[operand.getAsOpaquePointer()] = writerIdx;
+        });
+        ++writerIdx;
+      }
+    }
+    int opIdx = -1;
     for (auto &op : region.getOps()) {
+      ++opIdx;
+      bool readOverwrittenLater = false;
+      if (auto getEl =
+              llvm::dyn_cast<mlir::triton::metal::GetElementOp>(&op)) {
+        // `metal.alloca` is exempt. The TritonGPU pipeline never emits one; it
+        // belongs to the linalg→metal path, which uses a 1-element private
+        // alloca as a MUTABLE VARIABLE cell and reads it with `get_element`
+        // placed once, ahead of the stores that update it. There, re-evaluating
+        // the read at each use is the intended semantics, not a hazard.
+        bool isPrivateVar =
+            getEl.getMemref()
+                .getDefiningOp<mlir::triton::metal::AllocaOp>() != nullptr;
+        auto it =
+            lastMemRefWriter.find(getEl.getMemref().getAsOpaquePointer());
+        readOverwrittenLater = !isPrivateVar &&
+                               it != lastMemRefWriter.end() &&
+                               it->second > opIdx;
+      }
       // L1d2b inline-barrier contract — boundary set:
       //   { metal.barrier, metal.tg_load_indexed, metal.tg_store_indexed }.
       //
@@ -5753,9 +5861,11 @@ void ModuleTranslation::translate(mlir::Region &region) {
       // loop) will overwrite: inlining such a read at its use site moves it
       // PAST the overwrite and silently returns the wrong scan's data. Binding
       // it here pins the read to the scan's own position in IR order.
+      // `readOverwrittenLater` pins a device/threadgroup read the same way when
+      // a later op in this region overwrites the buffer it reads.
       if (op.getNumResults() == 1 && !op.getResult(0).use_empty() &&
-          (!op.getResult(0).hasOneUse() ||
-           op.hasAttr("metal.materialize")) &&
+          (!op.getResult(0).hasOneUse() || op.hasAttr("metal.materialize") ||
+           readOverwrittenLater) &&
           _letBound.find(&op) == _letBound.end() &&
           // Allowlist of pure inlineable value ops translateValue emits as a
           // standalone expression. Restricting to these keeps CSE safe (some

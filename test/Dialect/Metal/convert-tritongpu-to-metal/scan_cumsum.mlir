@@ -183,3 +183,109 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NOT: metal.threadgroup_alloca
 // CHECK: metal.threadgroup_segmented_prefix_sum {{.*}} {block = 4096 : i64, tpb = 256 : i64}
 // CHECK-NOT: tt.scan
+
+// -----
+
+// The other two monoids the scan lowering accepts, both from
+// `leet-triton/medium-parallel_reverse_scan_gae.py`: a single-operand MUL scan
+// (`tl.associative_scan(c, combine_fn=lambda l, r: l * r)`, the per-lane
+// `c^(block_end - t)` carry coefficient) and the two-state affine scan run
+// BACKWARDS (the GAE recurrence `A_t = delta_t + c * A_(t+1)`). Both were
+// `failed to legalize operation 'tt.scan'` before: the single-operand path
+// hardcoded add, and `isCanonicalAffineScan` rejected `reverse`.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @k_cumprod(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) attributes {noinline = false} {
+    %off = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %i = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %i_0 = tt.addptr %i, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %i_0 : tensor<1024x!tt.ptr<f32>, #blocked>
+    %cp = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %p = arith.mulf %a, %b : f32
+      tt.scan.return %p : f32
+    }) : (tensor<1024xf32, #blocked>) -> tensor<1024xf32, #blocked>
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %o_0, %cp : tensor<1024x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  tt.func public @k_cumprod_reverse(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) attributes {noinline = false} {
+    %off = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %i = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %i_0 = tt.addptr %i, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %i_0 : tensor<1024x!tt.ptr<f32>, #blocked>
+    %cp = "tt.scan"(%x) <{axis = 0 : i32, reverse = true}> ({
+    ^bb0(%a: f32, %b: f32):
+      %p = arith.mulf %a, %b : f32
+      tt.scan.return %p : f32
+    }) : (tensor<1024xf32, #blocked>) -> tensor<1024xf32, #blocked>
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %o_0, %cp : tensor<1024x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // Sub-tpb MUL scan: the padded tail [16, 128) must select the MUL identity.
+  // Padding a cumprod with the addf identity would zero every prefix instead.
+  tt.func public @k_cumprod_sub_tpb(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %n: i32) attributes {noinline = false} {
+    %x = arith.constant dense<0.000000e+00> : tensor<16xf32, #blocked>
+    %off = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked>
+    %m = tt.splat %n : i32 -> tensor<16xi32, #blocked>
+    %m_0 = arith.cmpi slt, %off, %m : tensor<16xi32, #blocked>
+    %x_1 = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %x_2 = tt.addptr %x_1, %off : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    %x_3 = tt.load %x_2, %m_0, %x : tensor<16x!tt.ptr<f32>, #blocked>
+    %cp = "tt.scan"(%x_3) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %p = arith.mulf %a, %b : f32
+      tt.scan.return %p : f32
+    }) : (tensor<16xf32, #blocked>) -> tensor<16xf32, #blocked>
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    tt.store %o_0, %cp, %m_0 : tensor<16x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  tt.func public @k_affine_reverse(%a_ptr: !tt.ptr<f32>, %x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) attributes {noinline = false} {
+    %off = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %ap = tt.splat %a_ptr : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ap_0 = tt.addptr %ap, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %av = tt.load %ap_0 : tensor<256x!tt.ptr<f32>, #blocked>
+    %xp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %xp_0 = tt.addptr %xp, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %xv = tt.load %xp_0 : tensor<256x!tt.ptr<f32>, #blocked>
+    %sc:2 = "tt.scan"(%av, %xv) <{axis = 0 : i32, reverse = true}> ({
+    ^bb0(%la: f32, %lx: f32, %ra: f32, %rx: f32):
+      %ca = arith.mulf %la, %ra : f32
+      %cm = arith.mulf %ra, %lx : f32
+      %cx = arith.addf %cm, %rx : f32
+      tt.scan.return %ca, %cx : f32, f32
+    }) : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>)
+    %o = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %o_0 = tt.addptr %o, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %o_0, %sc#1 : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// An absent `combine` still means add, so the cumsum kernels above keep their
+// attribute-free spelling; only the mul scans carry it.
+// CHECK-LABEL: metal.kernel k_cumprod
+// CHECK: metal.threadgroup_prefix_sum {{.*}} combine mulOp {block = 1024 : i64, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel k_cumprod_reverse
+// CHECK: metal.threadgroup_prefix_sum {{.*}} combine mulOp {block = 1024 : i64, reverse, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel k_cumprod_sub_tpb
+// CHECK: %[[UNIT:.*]] = arith.constant 1.000000e+00 : f32
+// CHECK: arith.select {{.*}}, %[[UNIT]] : f32
+// CHECK: metal.threadgroup_prefix_sum {{.*}} combine mulOp {block = 128 : i64, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel k_affine_reverse
+// CHECK: metal.threadgroup_affine_prefix_scan {{.*}} {block = 256 : i64, reverse, tpb = 128 : i64}
+// CHECK-NOT: tt.scan

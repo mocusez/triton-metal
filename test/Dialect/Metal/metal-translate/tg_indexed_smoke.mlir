@@ -36,7 +36,13 @@ module {
 
 // MSL: kernel void tg_indexed_smoke
 // MSL: threadgroup float v{{[0-9]+}}[16];
-// MSL: v{{[0-9]+}}[{{[0-9]+}}] = v{{[0-9]+}}[{{[0-9]+}}];
+// The device read is let-bound at its IR position rather than inlined into the
+// `tg_store_indexed` below it: `%arg0` is WRITTEN by the `metal.store` at the
+// end of this kernel, and an inlined read would be emitted at its use, which
+// for a use placed after such a store observes the new contents. See the
+// read-after-overwrite guard in `ModuleTranslation::translate(Region &)`.
+// MSL: float v{{[0-9]+}} = v{{[0-9]+}}[{{[0-9]+}}];
+// MSL: v{{[0-9]+}}[{{[0-9]+}}] = v{{[0-9]+}};
 // MSL: threadgroup_barrier(mem_flags::mem_threadgroup);
 // L1d2b inline-barrier contract: `metal.tg_load_indexed` is now
 // force-materialised as a named let-binding at its IR position rather

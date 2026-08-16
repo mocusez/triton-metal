@@ -1071,25 +1071,40 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
 
 def ThreadgroupPrefixSumOp : Metal_Op<"threadgroup_prefix_sum",
     [MemoryEffects<[MemRead, MemWrite]>]> {
-  let summary = "Inclusive prefix-sum (cumsum) over a threadgroup buffer";
+  let summary = "Inclusive prefix scan (cumsum / cumprod) over a threadgroup buffer";
   let description = [{
-    Reads `inbuf[0..block)` and writes the inclusive prefix-sum (cumsum) to
-    `outbuf[0..block)`, both `metal.threadgroup_alloca` f32 buffers of size
-    `block`. Tiled over `E = block/tpb` cyclic iv-blocks (logical position
+    Reads `inbuf[0..block)` and writes the inclusive prefix scan to
+    `outbuf[0..block)`, both `metal.threadgroup_alloca` buffers of size `block`.
+    Tiled over `E = block/tpb` cyclic iv-blocks (logical position
     `pos = iv*tpb + tid`): each iv-block runs a double-barriered Hillis-Steele
     inclusive scan across the `tpb` threads via an internal scratch buffer, with
-    a running `carry` = sum of all prior iv-blocks. Validated bit-close to
-    torch.cumsum (scan_spike.py). f32 add only. Side-effecting (not Pure) so it
-    is neither DCE'd nor CSE-merged; barriers inside must be reached by all
-    threads (caller ensures uniform control flow).
+    a running `carry` combining all prior iv-blocks. Validated bit-close to
+    torch.cumsum (scan_spike.py). Side-effecting (not Pure) so it is neither
+    DCE'd nor CSE-merged; barriers inside must be reached by all threads (caller
+    ensures uniform control flow).
+
+    `combine` selects the monoid: `addOp` (cumsum, identity 0) or `mulOp`
+    (cumprod, identity 1); absent means `addOp`, which keeps every pre-existing
+    cumsum spelling of this op unchanged. Both are commutative, so the
+    Hillis-Steele step order is free. The emitter rejects any other operator.
+
+    `reverse` runs the scan from the high end: chunks are visited from the last
+    one down, and each chunk is read/written through a mirrored index so the
+    forward template runs verbatim over the reversed sequence. That read is
+    cross-thread (thread `t` reads the slot thread `tpb-1-t` filled), so the
+    emitter barriers before it.
   }];
 
   let arguments = (ins Metal_MemRefType:$inbuf, Metal_MemRefType:$outbuf,
                        I64Attr:$block, I64Attr:$tpb,
-                       OptionalAttr<UnitAttr>:$reverse);
+                       OptionalAttr<UnitAttr>:$reverse,
+                       OptionalAttr<BinaryExpOperator>:$combine);
 
+  // `combine` prints symbolically and only when present, so every pre-existing
+  // cumsum spelling of this op round-trips unchanged.
   let assemblyFormat =
-      "$inbuf `,` $outbuf attr-dict `:` type($inbuf) `,` type($outbuf)";
+      "$inbuf `,` $outbuf (`combine` $combine^)? attr-dict `:` type($inbuf) "
+      "`,` type($outbuf)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1141,10 +1156,20 @@ def ThreadgroupAffinePrefixScanOp
     the chunk-local prefixes with the carry transform from prior chunks.
     Barriers are emitted outside per-lane conditionals; callers must place this
     op only in uniform control flow.
+
+    `reverse` scans from the high end, i.e. `out[i] = src[block-1] * ... * src[i]`
+    in the combine above — the composition `T_src[i] o ... o T_src[block-1]`,
+    which is the reverse recurrence `A_i = x_i + a_i * A_(i+1)`.  The combine is
+    NOT commutative, so this is implemented the only order-safe way: each chunk
+    is mirrored IN PLACE (thread `t` swaps with thread `tpb-1-t`, barriered on
+    both sides), the forward template runs verbatim over it, and the chunk is
+    mirrored back.  Chunks are visited from the last one down, so the carry
+    composes in reversed order too.
   }];
 
   let arguments = (ins Metal_MemRefType:$a, Metal_MemRefType:$x,
-                       I64Attr:$block, I64Attr:$tpb);
+                       I64Attr:$block, I64Attr:$tpb,
+                       OptionalAttr<UnitAttr>:$reverse);
 
   let assemblyFormat =
       "$a `,` $x attr-dict `:` type($a) `,` type($x)";
