@@ -1165,11 +1165,24 @@ struct MakeRangeLowering
         return mlir::success();
       }
     }
-    // Unsupported encoding (no blocked layout): keep the constant-0
-    // placeholder so we don't break legalization of edge cases.
-    auto zero = rewriter.getI32IntegerAttr(0);
-    rewriter.replaceOpWithNewOp<mlir::arith::ConstantOp>(op, zero);
-    return mlir::success();
+    // No decomposition applies. This used to emit a constant 0 "so we don't
+    // break legalization of edge cases" — but a `tt.make_range` IS a per-element
+    // index, so a constant 0 is not a placeholder, it is a wrong answer that
+    // compiles, runs, and returns silently corrupt data. `tl.arange(0, 2)`
+    // reshaped into a rank-3 hypercube axis (what tl.sort/tl.flip build) landed
+    // here and every element read back as 0.
+    //
+    // A single-element range is the one case where a constant is exactly right:
+    // its only value is `start`.
+    if (resTy.getNumElements() == 1) {
+      rewriter.replaceOpWithNewOp<mlir::arith::ConstantOp>(
+          op, rewriter.getI32IntegerAttr(static_cast<int32_t>(op.getStart())));
+      return mlir::success();
+    }
+    return rewriter.notifyMatchFailure(
+        op, "tt.make_range: no per-element index decomposition for this layout "
+            "(supported: rank-1 blocked, rank-2 slice-of-blocked, rank-3 "
+            "slice-of-slice-of-blocked)");
   }
 };
 
@@ -21406,6 +21419,32 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                     "tt.dot_scaled payload, not as a standalone cast");
         })
         .Default([](mlir::Operation *) {});
+  });
+  // `tt.make_range` is a per-element index, and MakeRangeLowering can only
+  // decompose one out of a blocked layout (rank-1), a slice-of-blocked (rank-2)
+  // or a slice-of-slice-of-blocked (rank-3). Anything else — in practice a
+  // `#ttg.linear` layout, which is what `tl.reshape`-ing an arange into a
+  // hypercube axis produces — has no per-element index at all.
+  //
+  // That case used to emit a constant 0 and compile clean, so `tl.arange(0,2)`
+  // reshaped into a rank-3 axis read back as 0 for every element: a silent
+  // wrong answer, the worst failure this backend can have. MakeRangeLowering
+  // now declines instead, and this pre-pass turns the decline into a named
+  // error rather than a bare "failed to legalize" that crashes teardown.
+  //
+  // A single-element range is exempt: its only value is `start`, so the
+  // constant the lowering emits for it is exactly right.
+  moduleOp.walk([&](mlir::triton::MakeRangeOp range) {
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(range.getType());
+    if (!rtt || rtt.getNumElements() == 1)
+      return;
+    mlir::Attribute enc = rtt.getEncoding();
+    if (mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr,
+                              mlir::triton::gpu::SliceEncodingAttr>(enc))
+      return;
+    reject(range, "tl.arange has no per-element index under this layout "
+                  "(rank>2 broadcasts of an arange, as tl.sort and tl.flip "
+                  "build, are not implemented)");
   });
   // A `torch.bool` tensor arrives as `!tt.ptr<i1>`, and Triton immediately
   // `tt.bitcast`s it to `!tt.ptr<i8>` around every access. `findBaseMemref`

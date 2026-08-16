@@ -717,3 +717,67 @@ def test_unsupported_construct_fails_without_crashing(name, tmp_path):
         f"{proc.stderr[-2000:]}")
     assert "Metal backend:" in proc.stderr, (
         f"{name}: no backend diagnostic in stderr:\n{proc.stderr[-2000:]}")
+
+
+# --- tt.make_range must never fall back to a constant ---------------------
+#
+# MakeRangeLowering used to end with "keep the constant-0 placeholder so we
+# don't break legalization of edge cases". But `tt.make_range` IS a per-element
+# index, so a constant 0 is not a placeholder — it is a wrong answer that
+# compiles, launches, and returns silently corrupt data.
+#
+# `tl.arange(0, 2)` reshaped into a rank-3 hypercube axis (exactly what
+# tl.sort / tl.flip build) gets a `#ttg.linear` layout, matched none of the
+# blocked / slice decompositions, and read back as 0 for EVERY element. The
+# rank-2 forms below were and remain correct; the rank-3 form must now be a
+# named error.
+
+
+@triton.jit
+def _arange_rank2_col_kernel(out_ptr, M: tl.constexpr, N: tl.constexpr):
+    h = tl.zeros((M, N), dtype=tl.int32) + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], h)
+
+
+@triton.jit
+def _arange_rank2_row_kernel(out_ptr, M: tl.constexpr, N: tl.constexpr):
+    h = tl.zeros((M, N), dtype=tl.int32) + tl.arange(0, M)[:, None]
+    tl.store(out_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], h)
+
+
+@triton.jit
+def _arange_rank3_kernel(out_ptr, B: tl.constexpr):
+    ar = tl.reshape(tl.arange(0, 2), (1, 2, 1))
+    h = tl.zeros((2, 2, 2), dtype=tl.int32) + ar
+    tl.store(out_ptr + tl.arange(0, B), tl.reshape(h, (B,)))
+
+
+@pytest.mark.parametrize("kernel,expected", [
+    (_arange_rank2_col_kernel, [p % 4 for p in range(16)]),
+    (_arange_rank2_row_kernel, [p // 4 for p in range(16)]),
+])
+def test_arange_broadcast_rank2_values(kernel, expected):
+    """The decompositions that DO exist keep producing real indices — the guard
+    against over-rejecting when the constant fallback was removed."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    out = torch.zeros(16, dtype=torch.int32, device="mps")
+    kernel[(1,)](out, M=4, N=4)
+    torch.mps.synchronize()
+    assert out.cpu().tolist() == expected
+
+
+def test_arange_broadcast_rank3_is_rejected_not_zeroed(capfd):
+    """Reinstating the constant-0 fallback would make this kernel run and
+    return all zeros, so the assertion is on the ERROR, not on any output.
+
+    The specific reason is an MLIR diagnostic on stderr; the Python exception
+    only carries the generic pass failure, so both are checked."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    out = torch.zeros(8, dtype=torch.int32, device="mps")
+    with pytest.raises(Exception):
+        _arange_rank3_kernel[(1,)](out, B=8)
+    assert "tl.arange has no per-element index" in capfd.readouterr().err
