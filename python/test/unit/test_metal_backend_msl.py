@@ -896,3 +896,81 @@ def test_unsupported_scan_combine_is_rejected_not_crashed(capfd):
     _arange_rank2_col_kernel[(1,)](out2, M=4, N=4)
     torch.mps.synchronize()
     assert out2.cpu().tolist() == [p % 4 for p in range(16)]
+
+
+@triton.jit
+def _subtpb_attention_kernel(Q, K, V, Out, M, N, d, sm_scale,
+                             BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr):
+    """The medium-softmax_attention.py shape, with the block sizes exposed."""
+    pid = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    q = tl.load(Q + pid * d + offs_d, mask=offs_d < d, other=0.0)
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask2 = (offs_n[:, None] < N) & (offs_d[None, :] < d)
+        k = tl.load(K + offs_n[:, None] * d + offs_d[None, :], mask=mask2,
+                    other=0.0)
+        qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
+        qk = tl.where(offs_n < N, qk, -float("inf"))
+        m_prev = m_i
+        m_i = tl.maximum(m_prev, tl.max(qk, axis=0))
+        alpha = tl.exp(m_prev - m_i)
+        p = tl.exp(qk - m_i)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        v = tl.load(V + offs_n[:, None] * d + offs_d[None, :], mask=mask2,
+                    other=0.0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+    tl.store(Out + pid * d + offs_d, acc / l_i, mask=offs_d < d)
+
+
+@pytest.mark.parametrize("d,block_n,num_warps", [(2, 32, 4), (2, 16, 2),
+                                                 (4, 16, 4)])
+def test_subtpb_rank1_crossing_is_rejected_not_wrong(d, block_n, num_warps,
+                                                     capfd):
+    """A rank-2 tile smaller than the threadgroup puts row n on thread n*cols,
+    not thread n, so a value that leaves the 2-D cone and is then combined with
+    a rank-1 mask reads under two different bijections. This returned WRONG
+    NUMBERS — `medium-softmax_attention.py` at head dim 2 under its own default
+    num_warps — with no diagnostic at all.
+
+    Asserted on the ERROR: nothing here should ever produce a plausible-looking
+    output again without the underlying layout mismatch being fixed."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    m, n = 4, 8
+    q = torch.randn(m, d, dtype=torch.float32, device="mps")
+    k = torch.randn(n, d, dtype=torch.float32, device="mps")
+    v = torch.randn(n, d, dtype=torch.float32, device="mps")
+    out = torch.zeros(m, d, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _subtpb_attention_kernel[(m,)](q, k, v, out, m, n, d, d ** -0.5,
+                                       BLOCK_N=block_n, BLOCK_D=d,
+                                       num_warps=num_warps)
+    assert "smaller than the threadgroup" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("d,block_n,num_warps", [(8, 32, 4), (4, 32, 4),
+                                                 (2, 32, 1)])
+def test_subtpb_guard_leaves_tpb_sized_tiles_alone(d, block_n, num_warps):
+    """The guard must key on the tile being SMALLER than the threadgroup, not
+    on the kernel shape: the same kernel with a tpb-sized tile is correct and
+    has to stay compilable."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    m, n = 4, 8
+    torch.manual_seed(d)
+    q = torch.randn(m, d, dtype=torch.float32)
+    k = torch.randn(n, d, dtype=torch.float32)
+    v = torch.randn(n, d, dtype=torch.float32)
+    out = torch.zeros(m, d, dtype=torch.float32, device="mps")
+    _subtpb_attention_kernel[(m,)](q.to("mps"), k.to("mps"), v.to("mps"), out,
+                                   m, n, d, d ** -0.5, BLOCK_N=block_n,
+                                   BLOCK_D=d, num_warps=num_warps)
+    torch.mps.synchronize()
+    ref = torch.softmax((q @ k.t()) * (d ** -0.5), dim=-1) @ v
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-4, rtol=2e-4)

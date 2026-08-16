@@ -21958,6 +21958,133 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// A rank-2 tile SMALLER than the threadgroup breaks the backend's one-bijection
+// premise, and only in a specific way.
+//
+// Every make_range, load and store in a kernel is supposed to share one
+// (thread, iv) -> element mapping. A rank-1 tile satisfies that with
+// `element == localTid`. A sub-tpb rank-2 tile does not: it puts row n on
+// thread `n * cols`. When the same value is consumed BOTH inside the 2-D cone
+// and by rank-1 ops, Triton materializes it twice and bridges the copies with a
+// `ttg.convert_layout : rank-1 slice-of-rank-2 -> rank-1 blocked`. The backend
+// passes that cvt through as an identity, so the value keeps the rank-2 mapping
+// while the rank-1 ops around it use localTid, and the answers are silently
+// wrong. `medium-softmax_attention.py` hits this at head dim 2 under its own
+// default num_warps.
+//
+// Reducing such a tile and STORING the result is fine and common — the two
+// mappings never meet, because StoreLowering re-derives its address. So the
+// rejection keys on the cvt result having a consumer that is not a store,
+// which is exactly the case where the mapping becomes observable. That mirrors
+// the reasoning in ConvertLayoutLowering's store-only relabel path.
+//
+// A real fix means making the two mappings identical everywhere at once.
+// Changing MakeRangeLowering alone (and then lowerRank1Reduce, and then
+// ReduceLowering's row read) fixes attention and breaks rank-2 reduce kernels
+// in turn, because StoreLowering's participation guard assumes localTid too;
+// the sites do not converge. See `.omc/fuzz/README.md`.
+// Does `v` come from a `tt.make_range` carrying a PLAIN rank-1 blocked
+// encoding — i.e. a value living under `element == localTid`? Slice-encoded
+// ranges belong to the 2-D cone and are not the hazard.
+static bool derivesFromRank1BlockedRange(mlir::Value v, int depth = 0) {
+  if (!v || depth > 8)
+    return false;
+  auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (rt && rt.getRank() == 1 &&
+      mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+          rt.getEncoding())) {
+    if (v.getDefiningOp<mlir::triton::MakeRangeOp>())
+      return true;
+  }
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || def->getNumRegions() != 0)
+    return false;
+  for (mlir::Value o : def->getOperands())
+    if (derivesFromRank1BlockedRange(o, depth + 1))
+      return true;
+  return false;
+}
+
+static mlir::LogicalResult
+validateSubTpbRank1Crossing(mlir::ModuleOp moduleOp) {
+  int64_t tpb = 0, smallestRank2 = 0;
+  moduleOp.walk([&](mlir::Operation *inner) {
+    for (auto v : inner->getResults()) {
+      auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+      if (!rt || rt.getRank() != 2)
+        return;
+      if (mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+        return;
+      auto ti = tileFromTensor(rt);
+      if (!ti || ti->shape.size() != 2)
+        return;
+      int64_t sz = ti->shape[0] * ti->shape[1];
+      if (sz > smallestRank2) {
+        smallestRank2 = sz;
+        tpb = ti->threadsPerBlock;
+      }
+    }
+  });
+  if (smallestRank2 <= 0 || tpb <= 0 || smallestRank2 >= tpb)
+    return mlir::success();
+
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
+    auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+    auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+    if (!srcRtt || !dstRtt || srcRtt.getRank() != 1 || dstRtt.getRank() != 1)
+      return;
+    auto sl = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+        srcRtt.getEncoding());
+    if (!sl ||
+        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            sl.getParent()) ||
+        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            dstRtt.getEncoding()))
+      return;
+    // Safe as long as the value never MIXES with another tensor: a store
+    // re-derives its own address, and a single-tensor-operand pure op (the
+    // `arith.truncf` an f16 reduce ends with, a cast) cannot bring a second
+    // bijection in. The hazard is an op with two or more tensor operands —
+    // `arith.select(cmpi(offs_n, N), qk, -inf)` in attention — where the other
+    // operand comes from a rank-1 make_range under `element == localTid`.
+    llvm::SmallVector<mlir::Value, 8> wl{cvt.getResult()};
+    llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+    bool mixes = false;
+    while (!wl.empty() && !mixes) {
+      mlir::Value v = wl.pop_back_val();
+      for (mlir::Operation *u : v.getUsers()) {
+        if (mlir::isa<mlir::triton::StoreOp>(u))
+          continue;
+        if (!seen.insert(u).second)
+          continue;
+        // Mixing with another 2-D-derived value is fine — same bijection.
+        // What is not is mixing with something under `element == localTid`,
+        // which is what a plain rank-1 blocked make_range produces.
+        bool hazard = !mlir::isMemoryEffectFree(u);
+        for (mlir::Value o : u->getOperands())
+          if (o != v && derivesFromRank1BlockedRange(o))
+            hazard = true;
+        if (hazard) {
+          mixes = true;
+          break;
+        }
+        for (mlir::Value r : u->getResults())
+          wl.push_back(r);
+      }
+    }
+    if (!mixes)
+      return;
+    cvt.emitOpError(
+        "Metal backend: a rank-2 tile smaller than the threadgroup cannot feed "
+        "a value into rank-1 ops (the two layouts disagree about which thread "
+        "holds which element). Raise the block size so the tile has at least "
+        "threads-per-block elements, or lower num_warps");
+    valid = false;
+  });
+  return mlir::success(valid);
+}
+
 static mlir::LogicalResult validateDotScaledSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::DotScaledOp dot) {
@@ -21988,6 +22115,7 @@ struct ConvertTritonGPUToMetalPass
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
+        mlir::failed(validateSubTpbRank1Crossing(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||
         mlir::failed(validateClampFSupport(moduleOp)) ||
