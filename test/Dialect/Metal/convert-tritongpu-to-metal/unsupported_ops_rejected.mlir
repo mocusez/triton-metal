@@ -38,13 +38,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// A rank-1 axis-0 gather IS implemented (GatherLowering); a rank-2 one is not,
+// and the message says which part is missing rather than claiming tt.gather as
+// a whole is absent.
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reject_gather(%x: !tt.ptr<f32>) {
-    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    %i = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
-    // expected-error @+1 {{tt.gather is not implemented}}
-    %g = tt.gather %v[%i] {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xi32, #blocked>) -> tensor<128xf32, #blocked>
+  tt.func public @reject_rank2_gather(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<8x32xf32, #blocked2>
+    %i = arith.constant dense<0> : tensor<8x32xi32, #blocked2>
+    // expected-error @+1 {{tl.gather is implemented for a rank-1 gather along axis 0 only}}
+    %g = tt.gather %v[%i] {axis = 1 : i32} : (tensor<8x32xf32, #blocked2>, tensor<8x32xi32, #blocked2>) -> tensor<8x32xf32, #blocked2>
     tt.return
   }
 }

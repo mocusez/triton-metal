@@ -7168,6 +7168,176 @@ struct ScanLowering
 };
 
 //===----------------------------------------------------------------------===//
+// `tt.gather` (tl.gather) — out[i] = src[idx[i]] along axis 0.
+//
+// A gather is an arbitrary cross-thread read: thread i's result lives wherever
+// idx[i] points, which is some other thread's element. The threadgroup buffer is
+// the only place all of them are simultaneously visible, so the shape is the
+// same staging the rank-1 scan uses:
+//
+//   fill  buf[pos] for each of this thread's E owned positions
+//   barrier
+//   read  buf[idx]   (idx is THIS element's index, already a per-thread scalar)
+//
+// The read goes through `metal.tg_load_indexed` rather than `metal.get_element`
+// on purpose: it force-materializes as a named let-binding at its IR position,
+// which is what keeps the load from being re-inlined after a later barrier (the
+// L1d2b inline-barrier contract — see `translate(mlir::Region&)`).
+//
+// Sub-tpb tiles are padded up to a full tpb window exactly as the scan pads,
+// so the fill stays barrier-uniform. The padding is never a legal target: a
+// gather index must be in [0, BLOCK).
+//===----------------------------------------------------------------------===//
+
+struct GatherLowering
+    : public mlir::OpConversionPattern<mlir::triton::GatherOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::GatherOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    if (op.getAxis() != 0)
+      return rewriter.notifyMatchFailure(op, "gather: axis=0 only");
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+    auto idxTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(op.getIndices().getType());
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    if (!srcTy || !idxTy || !resTy || srcTy.getRank() != 1 ||
+        idxTy.getRank() != 1 || resTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(op, "gather: rank-1 only");
+    mlir::Type elemTy = srcTy.getElementType();
+    const bool isI32 = elemTy.isInteger(32);
+    if (!elemTy.isF32() && !isI32)
+      return rewriter.notifyMatchFailure(op, "gather: f32/i32 payload only");
+    if (!idxTy.getElementType().isInteger(32))
+      return rewriter.notifyMatchFailure(op, "gather: i32 indices only");
+
+    auto blocked = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(srcTy.getEncoding());
+    if (!blocked)
+      return rewriter.notifyMatchFailure(op, "gather: no blocked encoding");
+    int64_t tpb = 1;
+    for (auto t : blocked.getThreadsPerWarp()) tpb *= t;
+    for (auto w : blocked.getWarpsPerCTA()) tpb *= w;
+    if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+      return rewriter.notifyMatchFailure(op, "gather: tpb not power-of-two");
+    int64_t BLOCK = srcTy.getDimSize(0);
+    if (BLOCK <= 0 || resTy.getDimSize(0) != BLOCK ||
+        idxTy.getDimSize(0) != BLOCK)
+      return rewriter.notifyMatchFailure(
+          op, "gather: src/indices/result must share one extent");
+    const int64_t bufLen = std::max(BLOCK, tpb);
+    if (bufLen % tpb != 0)
+      return rewriter.notifyMatchFailure(op,
+                                         "gather: BLOCK not a multiple of tpb");
+    int64_t E = bufLen / tpb;
+    if (E < 1 || E > 64 || (E & (E - 1)) != 0)
+      return rewriter.notifyMatchFailure(
+          op, "gather: E=BLOCK/tpb outside [1,64] pow2");
+
+    mlir::Value src = op.getSrc();
+    if (!rank1ConeSupported(src, 0))
+      return rewriter.notifyMatchFailure(op, "gather: source cone unsupported");
+
+    auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+    auto i32 = rewriter.getI32Type();
+    // The metal buffer ops reject signless i32, so an i32 payload stages as
+    // ui32 — a bit-preserving reinterpretation, and a gather only ever copies
+    // the bits.
+    mlir::Type stageTy = isI32 ? mlir::Type(ui32) : elemTy;
+
+    mlir::Value tidLocal = emitLocalTid(rewriter, loc, tpb);
+    auto bufTy = MetalMemRefType::get(rewriter.getContext(), stageTy, bufLen);
+    mlir::Value buf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+
+    // Inside a loop the single static allocation is reused every trip, so this
+    // trip's fill would race the previous trip's reads. Same write-after-read
+    // hazard the scan and the rank-2 rowBuf fill guard against, and likewise
+    // only observable once a threadgroup spans more than one SIMD-group.
+    if (findOutermostScfFor(op))
+      BarrierOp::create(rewriter, loc);
+
+    for (int64_t k = 0; k < E; ++k) {
+      mlir::Value pos = tidLocal;
+      if (k > 0) {
+        auto cKtpb = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(k * tpb)));
+        pos = mlir::arith::AddIOp::create(rewriter, loc, tidLocal,
+                                          cKtpb.getResult())
+                  .getResult();
+      }
+      // Padded tail: evaluating the cone at a position past BLOCK would emit a
+      // device load off the end of the source tensor. Clamp the EVALUATION
+      // index instead; the value stored there is never a legal gather target.
+      // Branchless, so the barrier below stays uniform for the threadgroup.
+      mlir::Value evalPos = pos;
+      if (BLOCK < bufLen) {
+        auto cBlock = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(BLOCK)));
+        auto cZero = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(0));
+        mlir::Value inRange =
+            mlir::arith::CmpIOp::create(rewriter, loc,
+                                        mlir::arith::CmpIPredicate::slt, pos,
+                                        cBlock.getResult())
+                .getResult();
+        evalPos = mlir::arith::SelectOp::create(rewriter, loc, inRange, pos,
+                                                cZero.getResult())
+                      .getResult();
+      }
+      mlir::Value val = evalRank1ValueAt(src, evalPos, rewriter, loc, 0);
+      if (!val)
+        return rewriter.notifyMatchFailure(op, "gather: source eval failed");
+      if (val.getType() != stageTy)
+        val = mlir::UnrealizedConversionCastOp::create(
+                  rewriter, loc, mlir::TypeRange{stageTy},
+                  mlir::ValueRange{val})
+                  .getResult(0);
+      mlir::Value posUI =
+          mlir::UnrealizedConversionCastOp::create(
+              rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{pos})
+              .getResult(0);
+      TgStoreIndexedOp::create(rewriter, loc, buf, posUI, val);
+    }
+    BarrierOp::create(rewriter, loc);
+
+    // Clamp the index into the buffer. Triton leaves an out-of-range gather
+    // index undefined, but "undefined" on a threadgroup buffer is an actual
+    // out-of-bounds access, so pin it to a defined element instead.
+    mlir::Value idx = adaptor.getIndices();
+    if (idx.getType() != i32)
+      idx = mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{idx})
+                .getResult(0);
+    auto cZero = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(0));
+    auto cLast = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(BLOCK - 1)));
+    idx = mlir::arith::MaxSIOp::create(rewriter, loc, idx, cZero.getResult())
+              .getResult();
+    idx = mlir::arith::MinSIOp::create(rewriter, loc, idx, cLast.getResult())
+              .getResult();
+    mlir::Value idxUI =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{idx})
+            .getResult(0);
+
+    mlir::Value result =
+        TgLoadIndexedOp::create(rewriter, loc, stageTy, buf, idxUI).getResult();
+    if (stageTy != elemTy)
+      result = mlir::UnrealizedConversionCastOp::create(
+                   rewriter, loc, mlir::TypeRange{elemTy},
+                   mlir::ValueRange{result})
+                   .getResult(0);
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Rank-2 axis=0 (per-COLUMN) reduce → rank-1 [N] (Session L3a2).
 //
 // `tt.reduce(tile[BM,BN], axis=0)` sums each column over its BM rows. Unlike
@@ -21397,8 +21567,6 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
             [&](auto o) { reject(o, "tt.split is not implemented"); })
         .Case<mlir::triton::CatOp>(
             [&](auto o) { reject(o, "tt.cat is not implemented"); })
-        .Case<mlir::triton::GatherOp>(
-            [&](auto o) { reject(o, "tt.gather is not implemented"); })
         .Case<mlir::triton::AssertOp>([&](auto o) {
           reject(o, "tl.device_assert is not implemented (MSL has no "
                     "host-visible assert channel)");
@@ -21419,6 +21587,23 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                     "tt.dot_scaled payload, not as a standalone cast");
         })
         .Default([](mlir::Operation *) {});
+  });
+  // tt.gather is implemented for the rank-1 axis-0 shape (GatherLowering);
+  // anything else has no lowering, so name what is missing rather than letting
+  // it reach dialect conversion.
+  moduleOp.walk([&](mlir::triton::GatherOp gather) {
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(gather.getSrc().getType());
+    auto idxTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(gather.getIndices().getType());
+    if (!srcTy || !idxTy || srcTy.getRank() != 1 || idxTy.getRank() != 1 ||
+        gather.getAxis() != 0) {
+      reject(gather, "tl.gather is implemented for a rank-1 gather along "
+                     "axis 0 only");
+      return;
+    }
+    mlir::Type elemTy = srcTy.getElementType();
+    if (!elemTy.isF32() && !elemTy.isInteger(32))
+      reject(gather, "tl.gather is implemented for f32 and i32 payloads only");
   });
   // `tt.make_range` is a per-element index, and MakeRangeLowering can only
   // decompose one out of a blocked layout (rank-1), a slice-of-blocked (rank-2)
@@ -22356,7 +22541,7 @@ struct ConvertTritonGPUToMetalPass
                  ScalarDotLowering,
                  TritonPreciseSqrtLowering, TritonPreciseDivFLowering,
                  TritonClampFLowering, TritonMulHiUILowering,
-                 TritonExternElementwiseLowering,
+                 TritonExternElementwiseLowering, GatherLowering,
                  MathSinLowering, MathCosLowering,
                  MathSqrtLowering, MathErfLowering,
                  MathExpLowering, MathExp2Lowering,

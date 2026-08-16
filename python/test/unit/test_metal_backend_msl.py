@@ -683,7 +683,6 @@ def test_while_loop_two_carried_values_on_mps(n_elements):
 
 _UNSUPPORTED_SNIPPETS = {
     "join": "tl.store(o_ptr + i, tl.sum(tl.join(v, v), axis=1))",
-    "gather": "tl.store(o_ptr + i, tl.gather(v, i, axis=0))",
     "device_print": "tl.device_print('v', v)\n    tl.store(o_ptr + i, v)",
 }
 
@@ -781,3 +780,85 @@ def test_arange_broadcast_rank3_is_rejected_not_zeroed(capfd):
     with pytest.raises(Exception):
         _arange_rank3_kernel[(1,)](out, B=8)
     assert "tl.arange has no per-element index" in capfd.readouterr().err
+
+
+# --- tl.gather ------------------------------------------------------------
+#
+# A gather is an arbitrary cross-thread read, so the whole tile stages through
+# the threadgroup buffer: fill, barrier, then read at the index. The barrier is
+# the correctness-critical part — without it a thread can read a slot whose
+# owner has not written it yet — which is why these run at num_warps > 1, where
+# a missing barrier actually shows up, and assert bit-exact equality (a gather
+# only copies bits, so anything but exact is a real bug).
+
+
+@triton.jit
+def _gather_f32_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    ix = tl.load(idx_ptr + offs)
+    tl.store(out_ptr + offs, tl.gather(v, ix, axis=0))
+
+
+@triton.jit
+def _gather_i32_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs,
+             tl.gather(tl.load(x_ptr + offs), tl.load(idx_ptr + offs), axis=0))
+
+
+@triton.jit
+def _gather_computed_source_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr):
+    """The staged source is a computed cone, not a bare load, so the fill has to
+    re-derive it per logical position."""
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs) * 2.0 + 1.0
+    tl.store(out_ptr + offs, tl.gather(v, tl.load(idx_ptr + offs), axis=0))
+
+
+@pytest.mark.parametrize("block", [8, 32, 256, 1024])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_gather_f32_permutation(block, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(block + num_warps)
+    x = torch.rand(block, dtype=torch.float32)
+    idx = torch.randperm(block).to(torch.int32)
+    out = torch.empty(block, dtype=torch.float32, device="mps")
+    _gather_f32_kernel[(1,)](x.to("mps"), idx.to("mps"), out, BLOCK=block,
+                             num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x[idx.long()])
+
+
+@pytest.mark.parametrize("block", [32, 256])
+def test_gather_i32_payload(block):
+    """i32 stages through ui32; a gather only copies bits, so the round trip
+    must be exact including negative values."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(block)
+    x = torch.randint(-(2**30), 2**30, (block,), dtype=torch.int32)
+    idx = torch.randperm(block).to(torch.int32)
+    out = torch.empty(block, dtype=torch.int32, device="mps")
+    _gather_i32_kernel[(1,)](x.to("mps"), idx.to("mps"), out, BLOCK=block)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x[idx.long()])
+
+
+@pytest.mark.parametrize("block", [32, 256])
+def test_gather_computed_source(block):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(block * 7)
+    x = torch.rand(block, dtype=torch.float32)
+    idx = torch.randperm(block).to(torch.int32)
+    out = torch.empty(block, dtype=torch.float32, device="mps")
+    _gather_computed_source_kernel[(1,)](x.to("mps"), idx.to("mps"), out,
+                                         BLOCK=block)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), (x * 2.0 + 1.0)[idx.long()],
+                               atol=1e-6, rtol=1e-6)
