@@ -9393,6 +9393,27 @@ static mlir::Value accumulateScalarAddPtrOffsets(
   return acc;
 }
 
+// Device index for an access through a bare `tt.splat` of a SCALAR pointer.
+//
+// A BLOCK=1 access folds `splat(ptr) + arange(0, 1)` down to just the splat, so
+// the whole tile is one address and there is no per-thread term at all. The
+// index is whatever scalar addptr offsets sit below the splat — zero for a bare
+// kernel argument, typically `program_id` when BLOCK=1 makes each program own
+// one element.
+static mlir::Value emitSplatPtrIndex(mlir::Value origPtr,
+                                     mlir::ConversionPatternRewriter &rewriter,
+                                     mlir::Location loc) {
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  mlir::Value offI32 = accumulateScalarAddPtrOffsets(origPtr, rewriter, loc);
+  if (!offI32)
+    offI32 = mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getI32IntegerAttr(0))
+                 .getResult();
+  return mlir::UnrealizedConversionCastOp::create(
+             rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{offI32})
+      .getResult(0);
+}
+
 // As above, but also walks the SHAPE ops (`tt.broadcast` / `tt.expand_dims`)
 // that a 2D tile address threads between its addptr levels.
 //
@@ -10251,9 +10272,17 @@ struct StoreLowering
       }
     }
 
-    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>())
+    // A BLOCK=1 store folds `splat(ptr) + arange(0, 1)` down to a bare
+    // `tt.splat` of a scalar pointer — the same shape LoadLowering and
+    // MaskedLoadLowering already accept on the read side. Without it the op had
+    // no pattern at all, and "no matched legalization pattern" is a PROCESS KILL
+    // in this backend rather than an error: the verbatim leet-triton RoPE kernel
+    // at D=2 (BLOCK_SIZE_D = next_pow2(D/2) = 1, so a 1x1 tile) took the caller
+    // down, sometimes with abort and sometimes with SIGSEGV.
+    auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
+    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
-          op, "tt.store expects a tt.addptr feeding ptr");
+          op, "tt.store expects a tt.addptr or a splat scalar ptr feeding ptr");
     mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -10262,9 +10291,21 @@ struct StoreLowering
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.store operand missing ttg.blocked layout");
+    int64_t numElements = 1;
+    for (auto s : tile->shape)
+      numElements *= s;
+    // Single-element tiles only. A uniform pointer under a wider tile puts every
+    // lane on ONE address holding values that need not agree — a race, not a
+    // store — so that shape keeps failing instead of silently picking a winner.
+    if (splatPtr && numElements != 1)
+      return rewriter.notifyMatchFailure(
+          op, "tt.store through a uniform splat pointer is supported only for a "
+              "single-element tile");
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value idx =
-        emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter, loc);
+        splatPtr ? emitSplatPtrIndex(storePtr, rewriter, loc)
+                 : emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter,
+                                      loc);
     mlir::Value sval = castToMemrefStorage(convertedVal, memref, rewriter, loc);
     // Sub-tpb store guard. When the stored tensor has FEWER elements than the
     // threadgroup has threads AND there is no tile loop (E <= 1), the threads
@@ -10277,9 +10318,6 @@ struct StoreLowering
     // with `if (localTid < numElements)`. For numElements >= tpb, or whenever
     // a tile loop is present (E > 1, indices span exactly [0, numElements)),
     // no guard is emitted — byte-identical to the prior emission.
-    int64_t numElements = 1;
-    for (auto s : tile->shape)
-      numElements *= s;
     bool needGuard =
         tile->elemPerThread <= 1 && numElements < tile->threadsPerBlock;
     // Under a sub-tpb companion the index is the companion's ROW coordinate,
@@ -11174,9 +11212,14 @@ struct MaskedStoreLowering
       }
     }
 
-    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>())
+    // Splat scalar pointer, same folded BLOCK=1 shape the unmasked store above
+    // accepts. This is the path the leet-triton RoPE kernel actually took: its
+    // stores carry a mask, so exempting only the unmasked pattern left the
+    // crash exactly where it was.
+    auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
+    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
-          op, "tt.store expects a tt.addptr feeding ptr");
+          op, "tt.store expects a tt.addptr or a splat scalar ptr feeding ptr");
     mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -11186,6 +11229,15 @@ struct MaskedStoreLowering
     if (!tile)
       return rewriter.notifyMatchFailure(
           op, "tt.store operand missing ttg.blocked layout");
+    if (splatPtr) {
+      int64_t splatElements = 1;
+      for (auto s : tile->shape)
+        splatElements *= s;
+      if (splatElements != 1)
+        return rewriter.notifyMatchFailure(
+            op, "tt.store through a uniform splat pointer is supported only "
+                "for a single-element tile");
+    }
     auto parentFor = findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
     mlir::Value cond;
     if (peeledCvt) {
@@ -11343,7 +11395,9 @@ struct MaskedStoreLowering
 
     // Real device-memory index (unchanged from prior emission).
     mlir::Value realIdx =
-        emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter, loc);
+        splatPtr ? emitSplatPtrIndex(storePtr, rewriter, loc)
+                 : emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter,
+                                      loc);
 
     // Phase B emission (matches the spec's sketch §"Goal" for the
     // threadgroup-scratch path):
@@ -22040,6 +22094,34 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
     reject(range, "tl.arange has no per-element index under this layout "
                   "(rank>2 broadcasts of an arange, as tl.sort and tl.flip "
                   "build, are not implemented)");
+  });
+  // An UNMASKED `tt.store` through a bare `tt.splat` of a scalar pointer puts
+  // every element of the tile on ONE address. StoreLowering handles the
+  // single-element tile, which is what a BLOCK=1 access folds down to and what
+  // the leet-triton RoPE kernel produces at D=2. A wider tile is a race between
+  // lanes holding values that need not agree, and Triton does reach it:
+  // `tl.store(p + tl.zeros((8,), tl.int32), v)` folds the zero offset away and
+  // leaves exactly this op, which used to abort the process.
+  //
+  // MASKED is deliberately exempt, and not as a courtesy: a mask can single out
+  // one lane, which is the whole point of the shape. medium-linear_recurrence.py
+  // writes its per-chunk transform with `tl.store(chunk_ptr + chunk_idx +
+  // offs * 0, v, mask=(offs == last))` — the `offs * 0` folds the address to a
+  // splat while the mask leaves exactly one writer. Rejecting on the pointer
+  // alone broke five passing tests.
+  moduleOp.walk([&](mlir::triton::StoreOp store) {
+    if (store.getMask())
+      return;
+    if (!store.getPtr().getDefiningOp<mlir::triton::SplatOp>())
+      return;
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(store.getPtr().getType());
+    if (!rtt || rtt.getNumElements() <= 1)
+      return;
+    reject(store,
+           "an unmasked store through a uniform (tt.splat) pointer sends every "
+           "element of the tile to one address, which is a race, not a store; "
+           "only a single-element tile is supported. Keep the per-element "
+           "offset (tl.arange) in the address, or mask down to one lane");
   });
   // A `torch.bool` tensor arrives as `!tt.ptr<i1>`, and Triton immediately
   // `tt.bitcast`s it to `!tt.ptr<i8>` around every access. `findBaseMemref`

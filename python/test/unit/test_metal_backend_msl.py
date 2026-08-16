@@ -1018,3 +1018,99 @@ def test_unit_axis_reduce_is_rejected_not_crash(num_warps):
     o = torch.zeros(32, dtype=torch.float32, device="mps")
     with pytest.raises(Exception):
         _unit_axis_reduce_kernel[(1,)](x, o, 32, BN=32, num_warps=num_warps)
+
+
+@triton.jit
+def _splat_store_1x1_kernel(x_ptr, o_ptr, M, N, BM: tl.constexpr,
+                            BN: tl.constexpr):
+    rm = tl.arange(0, BM)[:, None]
+    rn = tl.arange(0, BN)[None, :]
+    off = rm * N + rn
+    mask = (rm < M) & (rn < N)
+    tl.store(o_ptr + off, tl.load(x_ptr + off, mask=mask, other=0.0) * 2.0,
+             mask=mask)
+
+
+@pytest.mark.parametrize("bm,bn,num_warps", [
+    # 1x1 is the shape that had no store pattern at all: both offsets fold to
+    # zero, so the address is a bare `tt.splat` of the argument rather than a
+    # `tt.addptr`.
+    (1, 1, 1), (1, 1, 4),
+    # Neighbours that already worked, kept so a regression here is visible as a
+    # narrowing rather than a total failure.
+    (1, 2, 4), (2, 1, 4), (2, 2, 4), (1, 32, 4), (32, 1, 4),
+])
+def test_splat_pointer_store_single_element(bm, bn, num_warps):
+    """A store whose address folded down to a uniform splat.
+
+    `tl.store(p + 0*N + 0, v)` at BLOCK=1 leaves `tt.store(tt.splat(p), v)`,
+    which matched no pattern — and in this backend an unmatched op is a process
+    kill during rollback, not an error. It killed the caller of the verbatim
+    leet-triton RoPE kernel at head dim 2 (BLOCK_SIZE_D = next_pow2(D/2) = 1),
+    sometimes with abort and sometimes with SIGSEGV.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(bm * 37 + bn)
+    x = torch.rand(bm, bn, dtype=torch.float32)
+    o = torch.zeros(bm, bn, dtype=torch.float32, device="mps")
+    _splat_store_1x1_kernel[(1,)](x.to("mps"), o, bm, bn, BM=bm, BN=bn,
+                                  num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(o.cpu(), x * 2.0, atol=1e-6, rtol=1e-6)
+
+
+@triton.jit
+def _splat_masked_store_kernel(x_ptr, o_ptr, D, BD: tl.constexpr):
+    rm = tl.arange(0, 1)[:, None]
+    rd = tl.arange(0, BD)[None, :]
+    off = rm * D + rd
+    mask = rd < D // 2
+    tl.store(o_ptr + off, tl.load(x_ptr + off, mask=mask, other=0.0) + 1.0,
+             mask=mask)
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_splat_pointer_store_keeps_its_mask(num_warps):
+    """The masked store is a separate pattern from the unmasked one.
+
+    This is the shape RoPE actually produced: M==1 is specialized away so the
+    row half of the mask folds, but the column bound survives on a runtime `D`,
+    so the 1x1 tile reaches the MASKED store. Exempting only the unmasked
+    pattern left the crash exactly where it was.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(num_warps)
+    x = torch.rand(1, 2, dtype=torch.float32)
+    o = torch.zeros(1, 2, dtype=torch.float32, device="mps")
+    _splat_masked_store_kernel[(1,)](x.to("mps"), o, 2, BD=1,
+                                     num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.stack([x[:, 0] + 1.0, torch.zeros(1)], dim=1)
+    torch.testing.assert_close(o.cpu(), expected, atol=1e-6, rtol=1e-6)
+
+
+@triton.jit
+def _splat_store_wide_kernel(x_ptr, o_ptr, BLOCK: tl.constexpr):
+    z = tl.zeros((BLOCK,), tl.int32)
+    tl.store(o_ptr + z, tl.load(x_ptr + z) * 2.0)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_splat_pointer_store_wide_tile_is_rejected_not_crash(num_warps):
+    """The same uniform address under a tile of more than one element.
+
+    Triton reaches it — a zero offset folds away — but it is a race: eight lanes
+    hold different values for one address. Declining it inside conversion took
+    the process down, so it is named in the pre-pass instead.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = torch.rand(8, dtype=torch.float32, device="mps")
+    o = torch.zeros(8, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _splat_store_wide_kernel[(1,)](x, o, BLOCK=8, num_warps=num_warps)
