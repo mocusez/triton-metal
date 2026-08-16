@@ -346,8 +346,8 @@ findTileInfo(mlir::triton::FuncOp funcOp) {
       hasAggregate = true;
   });
 
-  std::optional<TileInfo> result;
-  int64_t bestSize = 0;
+  std::optional<TileInfo> result, outResult;
+  int64_t bestSize = 0, bestOutSize = 0;
   funcOp.walk([&](mlir::Operation *op) {
     for (auto v : op->getResults()) {
       auto info = tileFromTensor(v.getType());
@@ -369,8 +369,23 @@ findTileInfo(mlir::triton::FuncOp funcOp) {
         bestSize = sz;
         result = info;
       }
+      // Same output-reaching preference `findLargestRank2Tile` applies, for the
+      // same reason and — critically — so the two AGREE. This one sets the tile
+      // loop's TRIP COUNT while that one sets the index decomposition, and they
+      // must describe one tile: a matmul at num_warps>=2 took E=32 from the A
+      // tile here and `flat = tid*8 + iv` from the 32x16 output there, so the
+      // loop ran four times too many and read its 512-element result scratch
+      // past the end. Wrong numbers on ~75% of launches — it looked like a race
+      // precisely because the overrun read whatever happened to be there.
+      if (info->rank == 2 && reachesOutputNotThroughAggregate(v) &&
+          sz > bestOutSize) {
+        bestOutSize = sz;
+        outResult = info;
+      }
     }
   });
+  if (outResult && result && result->rank == 2)
+    return outResult;
   return result;
 }
 

@@ -1204,3 +1204,50 @@ def test_transb_single_runtime_column(bm, bn, bk):
         BM=bm, BN=bn, BK=bk, num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _multiwarp_multitile_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
+                                       BM: tl.constexpr, BN: tl.constexpr,
+                                       BK: tl.constexpr):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    om = pm * BM + tl.arange(0, BM)
+    on = pn * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_multiwarp_multitile_matmul_is_deterministic(num_warps):
+    """The tile loop's TRIP COUNT and its INDEX DECOMPOSITION have to describe
+    the same tile. They came from two different walkers, and once one preferred
+    the output tile and the other still took the largest, a num_warps>=2 matmul
+    took E=32 from the A tile and `flat = tid*8 + iv` from the 32x16 output — so
+    the loop ran four times too many and read its 512-element result scratch
+    past the end.
+
+    That failed on roughly three launches in four, which reads as a race and is
+    not one, so this repeats the launch: a single run passes too often to catch
+    it."""
+    bm, bn, bk = 32, 16, 64
+    m, n, k = 64, 32, 192
+    torch.manual_seed(0)
+    a = torch.rand(m, k, dtype=torch.float32)
+    b = torch.rand(k, n, dtype=torch.float32)
+    ref = a @ b
+    a_mps, b_mps = a.to("mps"), b.to("mps")
+    for _ in range(8):
+        c = torch.zeros(m, n, dtype=torch.float32, device="mps")
+        _multiwarp_multitile_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
+            a_mps, b_mps, c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=num_warps)
+        torch.mps.synchronize()
+        torch.testing.assert_close(c.cpu(), ref, atol=2e-4, rtol=2e-4)
