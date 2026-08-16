@@ -31,6 +31,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
 namespace mlir {
@@ -21352,6 +21353,86 @@ validateCanonicalMultiTileDotSupport(mlir::ModuleOp moduleOp) {
 // Failed dialect conversion tears down regions unsafely for a residual illegal
 // DotScaledOp, so unsupported formats/shapes must stop here with the real
 // envelope diagnostic rather than an assertion in conversion cleanup.
+// Triton ops the Metal backend does not implement.
+//
+// Without this they reach `applyFullConversion` with no pattern, and the
+// failed-conversion teardown then takes the process down: `tt.assert` and
+// `tt.gather` SIGSEGV (exit 139) and `tt.join` aborts (exit 134), all AFTER
+// printing "failed to legalize operation ...". A crash is not a diagnosis — it
+// gives a kernel author no way to tell "this backend can't do that yet" from
+// "the compiler is broken", and it takes the whole pytest process with it.
+//
+// Rejecting here, before any conversion runs, turns each into an ordinary
+// compile error naming the construct and what to use instead.
+//
+// Kept deliberately in sync with what IS implemented: an op listed here must
+// have no lowering pattern, and adding a pattern means deleting its entry.
+static mlir::LogicalResult
+validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  auto reject = [&](mlir::Operation *op, llvm::StringRef message) {
+    op->emitOpError("Metal backend: ") << message;
+    valid = false;
+  };
+  moduleOp.walk([&](mlir::Operation *op) {
+    llvm::TypeSwitch<mlir::Operation *, void>(op)
+        .Case<mlir::triton::JoinOp>([&](auto o) {
+          reject(o, "tt.join is not implemented (this is what tl.join and "
+                    "tl.interleave lower to)");
+        })
+        .Case<mlir::triton::SplitOp>(
+            [&](auto o) { reject(o, "tt.split is not implemented"); })
+        .Case<mlir::triton::CatOp>(
+            [&](auto o) { reject(o, "tt.cat is not implemented"); })
+        .Case<mlir::triton::GatherOp>(
+            [&](auto o) { reject(o, "tt.gather is not implemented"); })
+        .Case<mlir::triton::AssertOp>([&](auto o) {
+          reject(o, "tl.device_assert is not implemented (MSL has no "
+                    "host-visible assert channel)");
+        })
+        .Case<mlir::triton::PrintOp>([&](auto o) {
+          reject(o, "tl.device_print is not implemented (MSL has no printf)");
+        })
+        .Case<mlir::triton::ElementwiseInlineAsmOp>([&](auto o) {
+          reject(o, "tl.inline_asm_elementwise is not implemented (its payload "
+                    "is PTX, which Metal cannot consume)");
+        })
+        .Case<mlir::triton::CallOp>([&](auto o) {
+          reject(o, "calls to non-inlined functions are not implemented; drop "
+                    "`noinline=True` so the callee is inlined");
+        })
+        .Case<mlir::triton::FpToFpOp>([&](auto o) {
+          reject(o, "fp8 conversions are supported only as a fully consumed "
+                    "tt.dot_scaled payload, not as a standalone cast");
+        })
+        .Default([](mlir::Operation *) {});
+  });
+  // A `torch.bool` tensor arrives as `!tt.ptr<i1>`, and Triton immediately
+  // `tt.bitcast`s it to `!tt.ptr<i8>` around every access. `findBaseMemref`
+  // chases THROUGH that bitcast on purpose — the f32 atomic min/max expansion
+  // needs the original buffer so it can pick the real MSL atomic pointer type —
+  // so the store lands on an i1-element memref holding an i8 value and fails to
+  // legalize. That failure then takes the process down (exit 139/134) instead
+  // of raising, same as the ops above.
+  //
+  // Rejecting the argument type is both narrower and more useful than
+  // rejecting the bitcast: it names the dtype the caller actually chose, and it
+  // cannot catch the f32→i32 atomic bitcasts, whose arguments are `!tt.ptr<f32>`.
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    for (auto [i, argTy] : llvm::enumerate(func.getArgumentTypes())) {
+      auto ptrTy = mlir::dyn_cast<mlir::triton::PointerType>(argTy);
+      if (ptrTy && ptrTy.getPointeeType().isInteger(1)) {
+        func.emitOpError("Metal backend: argument #")
+            << i
+            << " is a bool (i1) tensor, which is not supported; pass an int8 "
+               "tensor instead";
+        valid = false;
+      }
+    }
+  });
+  return mlir::success(valid);
+}
+
 static mlir::LogicalResult validateDotScaledSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::DotScaledOp dot) {
@@ -21380,7 +21461,8 @@ struct ConvertTritonGPUToMetalPass
     auto moduleOp = getOperation();
     auto *ctx = &getContext();
 
-    if (mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
+    if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
+        mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||
         mlir::failed(validateClampFSupport(moduleOp)) ||
         mlir::failed(validateMulHiUISupport(moduleOp)) ||

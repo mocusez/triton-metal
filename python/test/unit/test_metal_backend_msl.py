@@ -670,3 +670,50 @@ def test_while_loop_two_carried_values_on_mps(n_elements):
         chunk = x_cpu[start:start + block]
         expected[:chunk.numel()] += chunk
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+# --- Unsupported constructs must fail, not crash --------------------------
+#
+# Before `validateUnsupportedOpsRejected`, these reached applyFullConversion
+# with no pattern and the failed-conversion teardown killed the process:
+# tt.assert and tt.gather with SIGSEGV, tt.join with an abort. In-process
+# assertions cannot catch that — the crash takes pytest down with it — so the
+# check runs in a subprocess and asserts on the EXIT STATUS. A negative
+# returncode is a signal (crash); 1 is an ordinary Python exception.
+
+_UNSUPPORTED_SNIPPETS = {
+    "join": "tl.store(o_ptr + i, tl.sum(tl.join(v, v), axis=1))",
+    "gather": "tl.store(o_ptr + i, tl.gather(v, i, axis=0))",
+    "device_print": "tl.device_print('v', v)\n    tl.store(o_ptr + i, v)",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_UNSUPPORTED_SNIPPETS))
+def test_unsupported_construct_fails_without_crashing(name, tmp_path):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    import subprocess
+    import sys
+
+    script = tmp_path / f"unsupported_{name}.py"
+    script.write_text(
+        "import torch, triton\n"
+        "import triton.language as tl\n"
+        "@triton.jit\n"
+        "def k(x_ptr, o_ptr, B: tl.constexpr):\n"
+        "    i = tl.arange(0, B)\n"
+        "    v = tl.load(x_ptr + i)\n"
+        f"    {_UNSUPPORTED_SNIPPETS[name]}\n"
+        "x = torch.rand(16, device='mps')\n"
+        "o = torch.empty_like(x)\n"
+        "k[(1,)](x, o, B=16)\n"
+    )
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True,
+                          text=True, timeout=300)
+    assert proc.returncode > 0, (
+        f"{name}: expected a clean non-zero exit, got returncode "
+        f"{proc.returncode} (negative means the process died on a signal)\n"
+        f"{proc.stderr[-2000:]}")
+    assert "Metal backend:" in proc.stderr, (
+        f"{name}: no backend diagnostic in stderr:\n{proc.stderr[-2000:]}")

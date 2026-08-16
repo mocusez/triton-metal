@@ -1,0 +1,92 @@
+// RUN: triton-metal-opt --convert-tritongpu-to-metal --verify-diagnostics --split-input-file %s
+//
+// Triton ops the Metal backend does not implement must be rejected up front by
+// `validateUnsupportedOpsRejected`, BEFORE any conversion runs.
+//
+// This is not cosmetic. Reaching `applyFullConversion` with no pattern printed
+// "failed to legalize operation ..." and then took the PROCESS down in
+// failed-conversion teardown: tt.assert and tt.gather with SIGSEGV (exit 139),
+// tt.join with an abort (exit 134). A crash gives a kernel author no way to
+// tell "this backend can't do that yet" from "the compiler is broken", and it
+// kills the whole pytest process along the way.
+//
+// Each case below therefore pins BOTH that the construct is refused and the
+// wording that tells the author what to do instead. Implementing one of these
+// means deleting its entry in the validator and its case here.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_join(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tt.join is not implemented}}
+    %j = tt.join %v, %v : tensor<128xf32, #blocked> -> tensor<128x2xf32, #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_split(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128x2xf32, #blocked>
+    // expected-error @+1 {{tt.split is not implemented}}
+    %a, %b = tt.split %v : tensor<128x2xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_gather(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %i = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    // expected-error @+1 {{tt.gather is not implemented}}
+    %g = tt.gather %v[%i] {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xi32, #blocked>) -> tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_assert(%x: !tt.ptr<f32>) {
+    %c = arith.constant dense<true> : tensor<128xi1, #blocked>
+    // expected-error @+1 {{tl.device_assert is not implemented}}
+    tt.assert %c, "boom" : tensor<128xi1, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_print(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tl.device_print is not implemented}}
+    tt.print " v: " {hex = false, isSigned = array<i32: 0>} : %v : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// A `torch.bool` output arrives as `!tt.ptr<i1>`, which Triton bitcasts to
+// `!tt.ptr<i8>` at every access. `findBaseMemref` chases through that bitcast
+// deliberately (the f32 atomic min/max expansion needs the ORIGINAL buffer to
+// pick its MSL atomic pointer type), so the store lands on an i1-element memref
+// holding an i8 value and fails to legalize — taking the process with it.
+// Rejecting the ARGUMENT type is narrower than rejecting the bitcast: it names
+// the dtype the caller chose, and cannot catch the atomic bitcasts, whose
+// arguments are `!tt.ptr<f32>`.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // expected-error @+1 {{argument #0 is a bool (i1) tensor, which is not supported}}
+  tt.func public @reject_bool_arg(%o: !tt.ptr<i1>) {
+    tt.return
+  }
+}
