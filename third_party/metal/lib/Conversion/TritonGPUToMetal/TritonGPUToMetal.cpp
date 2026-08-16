@@ -10394,32 +10394,39 @@ struct StoreLowering
 //===----------------------------------------------------------------------===//
 using AtomicCasScratchMap = llvm::DenseMap<mlir::Operation *, mlir::Value>;
 
-// Scalar CAS is a per-program operation, while every Metal thread executes the
-// kernel body. Hoist one single-element threadgroup buffer for each result-used
-// scalar CAS so lane zero can publish the fetched old value to its peers after
-// the compare-exchange. Tensor CAS is already per-lane and needs no scratch.
-static void preprocessScalarAtomicCasScratch(
-    mlir::ModuleOp moduleOp, AtomicCasScratchMap &scratchMap) {
+// A scalar CAS or RMW is a per-program operation, while every Metal thread
+// executes the kernel body. Hoist one single-element threadgroup buffer for
+// each result-used scalar atomic so lane zero can publish the fetched old value
+// to its peers after the read-modify-write. The tensor forms are already
+// per-lane and need no scratch.
+static void preprocessScalarAtomicScratch(mlir::ModuleOp moduleOp,
+                                          AtomicCasScratchMap &scratchMap) {
   moduleOp.walk([&](mlir::triton::FuncOp funcOp) {
     if (funcOp.getBody().empty())
       return;
-    llvm::SmallVector<mlir::triton::AtomicCASOp> scalarCas;
+    // (op, value whose type decides the slot's element type)
+    llvm::SmallVector<std::pair<mlir::Operation *, mlir::Value>> scalarAtomics;
     funcOp.walk([&](mlir::triton::AtomicCASOp cas) {
       if (!mlir::isa<mlir::RankedTensorType>(cas.getCmp().getType()) &&
           !cas.getResult().use_empty())
-        scalarCas.push_back(cas);
+        scalarAtomics.emplace_back(cas.getOperation(), cas.getCmp());
     });
-    if (scalarCas.empty())
+    funcOp.walk([&](mlir::triton::AtomicRMWOp rmw) {
+      if (!mlir::isa<mlir::RankedTensorType>(rmw.getVal().getType()) &&
+          !rmw.getResult().use_empty())
+        scalarAtomics.emplace_back(rmw.getOperation(), rmw.getVal());
+    });
+    if (scalarAtomics.empty())
       return;
 
     mlir::OpBuilder builder(funcOp.getContext());
     builder.setInsertionPointToStart(&funcOp.getBody().front());
-    for (mlir::triton::AtomicCASOp cas : scalarCas) {
-      mlir::Type storageTy = metalStorageElementType(cas.getCmp().getType());
+    for (auto [op, typedValue] : scalarAtomics) {
+      mlir::Type storageTy = metalStorageElementType(typedValue.getType());
       auto scratchTy =
           MetalMemRefType::get(funcOp.getContext(), storageTy, /*size=*/1);
-      scratchMap[cas.getOperation()] =
-          ThreadgroupAllocaOp::create(builder, cas.getLoc(), scratchTy)
+      scratchMap[op] =
+          ThreadgroupAllocaOp::create(builder, op->getLoc(), scratchTy)
               .getResult();
     }
   });
@@ -10427,7 +10434,12 @@ static void preprocessScalarAtomicCasScratch(
 
 struct AtomicRmwLowering
     : public mlir::OpConversionPattern<mlir::triton::AtomicRMWOp> {
-  using OpConversionPattern::OpConversionPattern;
+  AtomicRmwLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
+                    const AtomicCasScratchMap *scratchMap)
+      : OpConversionPattern(tc, ctx), scratchMap(scratchMap) {}
+
+  const AtomicCasScratchMap *scratchMap;
+
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::AtomicRMWOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
@@ -10441,10 +10453,17 @@ struct AtomicRmwLowering
     const bool isMax = op.getAtomicRmwOp() == mlir::triton::RMWOp::MAX;
     const bool isUMin = op.getAtomicRmwOp() == mlir::triton::RMWOp::UMIN;
     const bool isUMax = op.getAtomicRmwOp() == mlir::triton::RMWOp::UMAX;
+    const bool isAnd = op.getAtomicRmwOp() == mlir::triton::RMWOp::AND;
+    const bool isOr = op.getAtomicRmwOp() == mlir::triton::RMWOp::OR;
+    const bool isXor = op.getAtomicRmwOp() == mlir::triton::RMWOp::XOR;
+    const bool isXchg = op.getAtomicRmwOp() == mlir::triton::RMWOp::XCHG;
     const bool isAdd = isIntAdd || isFAdd;
-    if (!isAdd && !isMin && !isMax && !isUMin && !isUMax)
+    const bool isBitwise = isAnd || isOr || isXor;
+    if (!isAdd && !isMin && !isMax && !isUMin && !isUMax && !isBitwise &&
+        !isXchg)
       return rewriter.notifyMatchFailure(
-          op, "atomic_rmw: only add/fadd/min/max/umin/umax supported");
+          op, "atomic_rmw: only add/fadd/min/max/umin/umax/and/or/xor/xchg "
+              "supported");
 
     struct AtomicPayload {
       mlir::Value value;
@@ -10487,6 +10506,29 @@ struct AtomicRmwLowering
         }
         return AtomicPayload{castToMemrefStorage(value, memref, rewriter, loc),
                              AtomicRmwKind::Add};
+      }
+      if (isBitwise || isXchg) {
+        // No ordered-bit reinterpretation here: the payload is the value, so it
+        // only has to reach the memref's storage type. MSL gives the bitwise
+        // fetch functions 32-bit overloads only; exchange also has an
+        // atomic_float one.
+        if (isXchg && value.getType().isF32() && memTy.isF32())
+          return AtomicPayload{value, AtomicRmwKind::Xchg};
+        if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+            memInt.getWidth() != 32) {
+          payloadError =
+              isXchg ? "atomic_rmw: exchange requires an f32 or 32-bit integer "
+                       "payload with matching storage"
+                     : "atomic_rmw: bitwise and/or/xor require a 32-bit "
+                       "integer payload and 32-bit integer storage";
+          return std::nullopt;
+        }
+        AtomicRmwKind kind = isAnd   ? AtomicRmwKind::And
+                             : isOr  ? AtomicRmwKind::Or
+                             : isXor ? AtomicRmwKind::Xor
+                                     : AtomicRmwKind::Xchg;
+        return AtomicPayload{castToMemrefStorage(value, memref, rewriter, loc),
+                             kind};
       }
       if (isMin || isMax) {
         if (!valueInt || valueInt.getWidth() != 32 || !hasStorageWidth(32)) {
@@ -10656,9 +10698,7 @@ struct AtomicRmwLowering
       return mlir::success();
     }
 
-    if (!op.getResult().use_empty())
-      return rewriter.notifyMatchFailure(
-          op, "atomic_rmw: scalar old-value broadcast is not implemented");
+    const bool scalarResultUsed = !op.getResult().use_empty();
     mlir::Value val = adaptor.getVal();
 
     // Add keeps its historical constant-true restriction. Min/max/umin/umax
@@ -10742,20 +10782,69 @@ struct AtomicRmwLowering
       guard = mlir::arith::AndIOp::create(rewriter, loc, guard,
                                           adaptor.getMask())
                   .getResult();
+    // The scalar old value is fetched by lane zero alone, so it has to be
+    // published before the other lanes can read it — the same threadgroup slot
+    // plus barrier that the scalar CAS uses, allocated by
+    // `preprocessScalarAtomicScratch`. The slot carries the memref's STORAGE
+    // type; the atomic's own result may be the signed/unsigned view of it
+    // (min/max), so both directions bridge with a bit-preserving cast.
+    mlir::Value scratch;
+    mlir::Type scratchTy;
+    if (scalarResultUsed) {
+      if (!scratchMap)
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: scalar result scratch map unavailable");
+      auto it = scratchMap->find(op.getOperation());
+      if (it == scratchMap->end())
+        return rewriter.notifyMatchFailure(
+            op, "atomic_rmw: scalar result scratch was not preallocated");
+      scratch = it->second;
+      scratchTy = mlir::cast<MetalMemRefType>(scratch.getType()).getType();
+    }
+
     auto ifOp = mlir::scf::IfOp::create(rewriter, loc, guard,
                                         /*withElseRegion=*/false);
     {
       mlir::OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPointToStart(ifOp.thenBlock());
       auto kind = AtomicRmwKindAttr::get(rewriter.getContext(), payload->kind);
-      AtomicRmwOp::create(rewriter, loc, resTy, kind, payload->value, memref,
-                          idxUI32);
+      auto atomic = AtomicRmwOp::create(rewriter, loc, resTy, kind,
+                                        payload->value, memref, idxUI32);
+      if (scalarResultUsed) {
+        mlir::Value old = atomic.getResult();
+        if (old.getType() != scratchTy)
+          old = mlir::UnrealizedConversionCastOp::create(
+                    rewriter, loc, mlir::TypeRange{scratchTy},
+                    mlir::ValueRange{old})
+                    .getResult(0);
+        auto zeroIdx = ConstantOp::create(rewriter, loc, ui32,
+                                          rewriter.getIntegerAttr(ui32, 0));
+        TgStoreIndexedOp::create(rewriter, loc, scratch, zeroIdx.getResult(),
+                                 old);
+      }
     }
-    // The old-value result is unused (checked above); replace with the value
-    // operand — in its ORIGINAL converted type, which is what any (nonexistent)
-    // consumer would have expected — as a type-matched dummy so the op
-    // legalizes.
-    rewriter.replaceOp(op, val);
+
+    if (!scalarResultUsed) {
+      // The old-value result is unused; replace with the value operand — in its
+      // ORIGINAL converted type, which is what any (nonexistent) consumer would
+      // have expected — as a type-matched dummy so the op legalizes.
+      rewriter.replaceOp(op, val);
+      return mlir::success();
+    }
+
+    BarrierOp::create(rewriter, loc);
+    auto zeroIdx =
+        ConstantOp::create(rewriter, loc, ui32, rewriter.getIntegerAttr(ui32, 0));
+    mlir::Value oldValue = TgLoadIndexedOp::create(rewriter, loc, scratchTy,
+                                                   scratch, zeroIdx.getResult())
+                               .getResult();
+    mlir::Type expectedTy = val.getType();
+    if (oldValue.getType() != expectedTy)
+      oldValue = mlir::UnrealizedConversionCastOp::create(
+                     rewriter, loc, mlir::TypeRange{expectedTy},
+                     mlir::ValueRange{oldValue})
+                     .getResult(0);
+    rewriter.replaceOp(op, oldValue);
     return mlir::success();
   }
 };
@@ -21791,8 +21880,14 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
     const bool isMax = kind == mlir::triton::RMWOp::MAX;
     const bool isUMin = kind == mlir::triton::RMWOp::UMIN;
     const bool isUMax = kind == mlir::triton::RMWOp::UMAX;
-    if (!isIntAdd && !isFAdd && !isMin && !isMax && !isUMin && !isUMax) {
-      reject("only add/fadd/min/max/umin/umax atomics are supported");
+    const bool isAnd = kind == mlir::triton::RMWOp::AND;
+    const bool isOr = kind == mlir::triton::RMWOp::OR;
+    const bool isXor = kind == mlir::triton::RMWOp::XOR;
+    const bool isXchg = kind == mlir::triton::RMWOp::XCHG;
+    if (!isIntAdd && !isFAdd && !isMin && !isMax && !isUMin && !isUMax &&
+        !isAnd && !isOr && !isXor && !isXchg) {
+      reject("only add/fadd/min/max/umin/umax/and/or/xor/xchg atomics are "
+             "supported");
       return;
     }
 
@@ -21823,9 +21918,6 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
                "scalar pointer");
         return;
       }
-    } else if (!op.getResult().use_empty()) {
-      reject("scalar atomic old-value broadcast is not implemented");
-      return;
     }
 
     mlir::Type valueType = getAtomicScalarType(op.getVal().getType());
@@ -21840,6 +21932,21 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
     if (isIntAdd) {
       if (!valueInt || valueInt.getWidth() != 32 || !storageType.isInteger(32))
         reject("64-bit integer atomic add is unsupported");
+      return;
+    }
+    if (isAnd || isOr || isXor) {
+      if (!valueInt || valueInt.getWidth() != 32 ||
+          !storageType.isInteger(32))
+        reject("bitwise atomic and/or/xor require a 32-bit integer payload; "
+               "MSL has no 64-bit bitwise atomic");
+      return;
+    }
+    if (isXchg) {
+      if (!((valueType.isF32() && storageType.isF32()) ||
+            (valueInt && valueInt.getWidth() == 32 &&
+             storageType.isInteger(32))))
+        reject("atomic exchange requires an f32 or 32-bit integer payload with "
+               "matching storage");
       return;
     }
     if (isMin || isMax) {
@@ -23004,11 +23111,11 @@ struct ConvertTritonGPUToMetalPass
       }
     }
 
-    // Scalar CAS old-value broadcast scratch. This must be hoisted before the
-    // function shell is converted so it dominates the lane-zero CAS and the
-    // post-barrier load in AtomicCasLowering.
+    // Scalar CAS/RMW old-value broadcast scratch. This must be hoisted before
+    // the function shell is converted so it dominates the lane-zero atomic and
+    // the post-barrier load in AtomicCasLowering / AtomicRmwLowering.
     AtomicCasScratchMap atomicCasScratchMap;
-    preprocessScalarAtomicCasScratch(moduleOp, atomicCasScratchMap);
+    preprocessScalarAtomicScratch(moduleOp, atomicCasScratchMap);
 
     // L1d2c Phase B pre-conversion sentinel emission. For every tt.func with
     // a masked tt.store, hoist one `metal.threadgroup_alloca<tpb × T>` per
@@ -23197,7 +23304,7 @@ struct ConvertTritonGPUToMetalPass
                  BroadcastLowering, ReshapeLowering, TransLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
-                 AtomicRmwLowering, HistogramLowering,
+                 HistogramLowering,
                  ArithMuliLowering, ArithAddILowering,
                  ArithAddFLowering, ArithCmpILowering, ArithCmpFLowering,
                  ArithAndILowering,
@@ -23242,6 +23349,7 @@ struct ConvertTritonGPUToMetalPass
     // populated by `preprocessMaskedStoreSentinels` above. See L1d2c Phase B.
     patterns.add<MaskedStoreLowering>(typeConverter, ctx, &scratchMap);
     patterns.add<AtomicCasLowering>(typeConverter, ctx, &atomicCasScratchMap);
+    patterns.add<AtomicRmwLowering>(typeConverter, ctx, &atomicCasScratchMap);
 
     // W-C scan: ScanLowering fills a threadgroup scanbuf + registers the result
     // placeholder in `scanBufMap`, consulted by the rich cone evaluator (g_scan-

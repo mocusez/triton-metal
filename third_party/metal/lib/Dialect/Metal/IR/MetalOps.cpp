@@ -577,6 +577,25 @@ llvm::LogicalResult AtomicRmwOp::verify() {
       return emitOpError(
           "u64 atomic min/max does not support a consumed old-value result");
     break;
+  case AtomicRmwKind::And:
+  case AtomicRmwKind::Or:
+  case AtomicRmwKind::Xor:
+    // MSL has no atomic_ulong overload for the bitwise fetch functions, so
+    // these are 32-bit integer only.
+    if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+        memInt.getWidth() != 32)
+      return emitOpError("bitwise and/or/xor require a 32-bit integer "
+                         "value/result and 32-bit integer storage");
+    break;
+  case AtomicRmwKind::Xchg:
+    // `atomic_exchange_explicit` additionally has an atomic_float overload.
+    if (valueType.isF32() && memType.isF32())
+      break;
+    if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+        memInt.getWidth() != 32)
+      return emitOpError("exchange requires f32 storage/value or a 32-bit "
+                         "integer storage/value");
+    break;
   }
   return checkIndex(*this, memRef, getIndex());
 }

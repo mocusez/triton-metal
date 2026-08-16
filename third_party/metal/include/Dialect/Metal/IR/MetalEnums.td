@@ -25,11 +25,20 @@ def AtomicRmwKind_Max  : I32EnumAttrCase<"Max",  1>;
 def AtomicRmwKind_UMin : I32EnumAttrCase<"UMin", 2>;
 def AtomicRmwKind_Min  : I32EnumAttrCase<"Min",  3>;
 def AtomicRmwKind_UMax : I32EnumAttrCase<"UMax", 4>;
+// Bitwise and exchange. MSL has these for 32-bit atomics only
+// (`atomic_fetch_and_explicit` has no atomic_ulong overload), and exchange
+// additionally works on atomic_float — all four verified by compiling them
+// through `torch.mps.compile_shader`, not from the spec.
+def AtomicRmwKind_And  : I32EnumAttrCase<"And",  5>;
+def AtomicRmwKind_Or   : I32EnumAttrCase<"Or",   6>;
+def AtomicRmwKind_Xor  : I32EnumAttrCase<"Xor",  7>;
+def AtomicRmwKind_Xchg : I32EnumAttrCase<"Xchg", 8>;
 
 def AtomicRmwKindAttr : I32EnumAttr<
     "AtomicRmwKind", "Atomic read-modify-write operation",
     [AtomicRmwKind_Add, AtomicRmwKind_Max, AtomicRmwKind_UMin,
-     AtomicRmwKind_Min, AtomicRmwKind_UMax]> {
+     AtomicRmwKind_Min, AtomicRmwKind_UMax, AtomicRmwKind_And,
+     AtomicRmwKind_Or, AtomicRmwKind_Xor, AtomicRmwKind_Xchg]> {
   let cppNamespace = "mlir::triton::metal";
 }
 

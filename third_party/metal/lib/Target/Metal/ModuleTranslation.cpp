@@ -936,6 +936,26 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
     function = is64 ? "atomic_max_explicit" : "atomic_fetch_max_explicit";
     atomicTy = is64 ? "atomic_ulong" : "atomic_uint";
     break;
+  // Bitwise and exchange take the value in its own type — no ordered-bit
+  // reinterpretation, so no `as_type` wrapper. 32-bit only; the pass rejects
+  // wider payloads because MSL has no atomic_ulong overload for them.
+  case mlir::triton::metal::AtomicRmwKind::And:
+    function = "atomic_fetch_and_explicit";
+    atomicTy = valueInt && valueInt.isUnsigned() ? "atomic_uint" : "atomic_int";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::Or:
+    function = "atomic_fetch_or_explicit";
+    atomicTy = valueInt && valueInt.isUnsigned() ? "atomic_uint" : "atomic_int";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::Xor:
+    function = "atomic_fetch_xor_explicit";
+    atomicTy = valueInt && valueInt.isUnsigned() ? "atomic_uint" : "atomic_int";
+    break;
+  case mlir::triton::metal::AtomicRmwKind::Xchg:
+    function = "atomic_exchange_explicit";
+    if (valueInt)
+      atomicTy = valueInt.isUnsigned() ? "atomic_uint" : "atomic_int";
+    break;
   }
   if (resultUsed) {
     unsigned idx = _varCount++;
@@ -947,14 +967,20 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
   _output << "[";
   translateValueOrVarName(op.getIndex());
   _output << "], ";
+  // Only the min/max kinds reinterpret their payload: they implement Triton's
+  // ordered-bit f32 expansion, where the value arrives as the bit pattern to
+  // compare. Add, the bitwise kinds and exchange pass their value through.
+  bool casted = true;
   if (op.getKind() == mlir::triton::metal::AtomicRmwKind::Max ||
       op.getKind() == mlir::triton::metal::AtomicRmwKind::Min)
     _output << "as_type<int32_t>(";
   else if (op.getKind() == mlir::triton::metal::AtomicRmwKind::UMin ||
            op.getKind() == mlir::triton::metal::AtomicRmwKind::UMax)
     _output << (is64 ? "as_type<ulong>(" : "as_type<uint32_t>(");
+  else
+    casted = false;
   translateValueOrVarName(op.getValue());
-  if (op.getKind() != mlir::triton::metal::AtomicRmwKind::Add)
+  if (casted)
     _output << ")";
   _output << ", memory_order_relaxed)";
   printDelim();

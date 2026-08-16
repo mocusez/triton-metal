@@ -585,3 +585,96 @@ def test_atomic_add_uniform_address_old_values_are_a_permutation():
     torch.mps.synchronize()
     assert out.cpu()[0].item() == float(BLOCK)
     assert sorted(old.cpu().tolist()) == [float(i) for i in range(BLOCK)]
+
+
+# --- bitwise / exchange RMW kinds, and the scalar old-value broadcast --------
+#
+# `tt.atomic_rmw` accepted add/fadd/min/max/umin/umax only; and/or/xor/xchg were
+# rejected outright even though MSL has all four (verified by compiling
+# `atomic_fetch_and_explicit` and friends through `torch.mps.compile_shader` —
+# 32-bit only, there is no atomic_ulong bitwise overload, while exchange also
+# has an atomic_float one).
+
+
+@triton.jit
+def _atomic_bitwise_scalar(In, Out, OP: tl.constexpr):
+    v = tl.load(In)
+    if OP == 0:
+        tl.atomic_and(Out, v)
+    elif OP == 1:
+        tl.atomic_or(Out, v)
+    else:
+        tl.atomic_xor(Out, v)
+
+
+@pytest.mark.parametrize(
+    "op, initial, value, expected",
+    [
+        (0, 0b1011, 0b0110, 0b0010),
+        (1, 0b1001, 0b0110, 0b1111),
+        (2, 0b1011, 0b0110, 0b1101),
+        (0, -1, 0x0F0F0F0F, 0x0F0F0F0F),
+        (2, -1, -1, 0),
+    ],
+)
+def test_atomic_bitwise_scalar_i32(op, initial, value, expected):
+    inp = torch.full((1,), value, dtype=torch.int32, device="mps")
+    out = torch.full((1,), initial, dtype=torch.int32, device="mps")
+    _atomic_bitwise_scalar[(1,)](inp, out, op)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == expected
+
+
+@triton.jit
+def _atomic_xor_tensor(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_xor(Out + offsets, tl.load(In + offsets))
+
+
+def test_atomic_xor_tensor_i32():
+    BLOCK = 64
+    torch.manual_seed(3)
+    inp = torch.randint(0, 1 << 20, (BLOCK,), dtype=torch.int32, device="mps")
+    out = torch.randint(0, 1 << 20, (BLOCK,), dtype=torch.int32, device="mps")
+    ref = out.cpu() ^ inp.cpu()
+    _atomic_xor_tensor[(1,)](inp, out, BLOCK)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref, atol=0, rtol=0)
+
+
+@triton.jit
+def _atomic_xchg_scalar(In, Out):
+    tl.atomic_xchg(Out, tl.load(In))
+
+
+def test_atomic_xchg_scalar_f32_replaces_the_cell():
+    inp = torch.full((1,), 4.5, dtype=torch.float32, device="mps")
+    out = torch.full((1,), -1.0, dtype=torch.float32, device="mps")
+    _atomic_xchg_scalar[(1,)](inp, out)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == 4.5
+
+
+@triton.jit
+def _atomic_add_scalar_returns_old(Out, Seen, BLOCK: tl.constexpr):
+    # One ticket per program; every lane of the program must observe the SAME
+    # ticket, which is what the threadgroup publish + barrier is for.
+    old = tl.atomic_add(Out, 1)
+    pid = tl.program_id(0)
+    tl.store(Seen + pid * BLOCK + tl.arange(0, BLOCK), old)
+
+
+def test_atomic_add_scalar_old_value_reaches_every_lane():
+    G, BLOCK = 4, 32
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+    seen = torch.full((G * BLOCK,), -1, dtype=torch.int32, device="mps")
+    _atomic_add_scalar_returns_old[(G,)](out, seen, BLOCK, num_warps=2)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == G
+    tickets = seen.cpu().reshape(G, BLOCK)
+    # Uniform within a program...
+    for row in tickets.tolist():
+        assert len(set(row)) == 1, row
+    # ...and one distinct ticket per program. Which program drew which is up to
+    # the hardware's serialization and is not part of the contract.
+    assert sorted(tickets[:, 0].tolist()) == list(range(G))
