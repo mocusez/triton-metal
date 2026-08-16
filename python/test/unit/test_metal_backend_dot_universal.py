@@ -1069,3 +1069,51 @@ def test_dot_transposed_b(kernel, size, bk):
                    BM=m, BN=n, BK=bk, num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _dot_runtime_extent_one_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
+                                   BM: tl.constexpr, BN: tl.constexpr,
+                                   BK: tl.constexpr):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def test_unclaimed_dot_is_rejected_not_crashed(capfd):
+    """A matmul with a runtime extent of 1 matches no tier: Triton specializes
+    the argument to a constant, which changes the tile order and puts the shape
+    outside every matcher's envelope.
+
+    Before, that unclaimed dot reached applyFullConversion, where a decline does
+    not raise — it segfaults the process during the failed conversion's
+    rollback. The assertion is therefore that the caller SURVIVES with a named
+    error, not merely that compilation failed."""
+    a = torch.rand(16, 16, dtype=torch.float32, device="mps")
+    b = torch.rand(16, 1, dtype=torch.float32, device="mps")
+    c = torch.zeros(16, 1, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _dot_runtime_extent_one_kernel[(1, 1)](a, b, c, 16, 1, 16,
+                                               BM=16, BN=16, BK=16,
+                                               num_warps=1)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+    # The process must still be able to compile: a rejection that poisons the
+    # context is no better than the crash it replaced.
+    a2 = torch.rand(16, 16, dtype=torch.float32, device="mps")
+    b2 = torch.rand(16, 16, dtype=torch.float32, device="mps")
+    c2 = torch.zeros(16, 16, dtype=torch.float32, device="mps")
+    _dot_runtime_extent_one_kernel[(1, 1)](a2, b2, c2, 16, 16, 16,
+                                           BM=16, BN=16, BK=16, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c2.cpu(), a2.cpu() @ b2.cpu(),
+                               atol=2e-4, rtol=2e-4)

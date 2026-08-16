@@ -22509,6 +22509,34 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    // Every tier that can claim a `tt.dot` has now run, so a surviving one has
+    // no lowering at all. Say so here rather than letting it reach
+    // `applyFullConversion`: a decline in there does not raise, it SEGFAULTS
+    // the process during the failed conversion's rollback (verified with a
+    // hand-written module whose only oddity is an unpatterned op). A matmul
+    // with a runtime extent of 1 — Triton specializes the argument to a
+    // constant, which changes the tile order and puts the shape outside every
+    // matcher's envelope — killed the calling process rather than reporting
+    // anything.
+    //
+    // Deliberately after the convert-layout classification: a module that both
+    // has an unclaimed dot and an out-of-envelope cvt keeps the cvt's more
+    // specific diagnostic, which existing negative fixtures pin.
+    {
+      bool dotsOk = true;
+      moduleOp.walk([&](mlir::triton::DotOp dot) {
+        dot.emitOpError(
+            "Metal backend: no matmul lowering matched this tl.dot. Shapes "
+            "with a runtime extent of 1, a transposed-B address at BLOCK=8, "
+            "and non-power-of-two tiles are outside every tier's envelope");
+        dotsOk = false;
+      });
+      if (!dotsOk) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     // Scalar CAS old-value broadcast scratch. This must be hoisted before the
     // function shell is converted so it dominates the lane-zero CAS and the
     // post-barrier load in AtomicCasLowering.
