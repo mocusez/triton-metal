@@ -7545,6 +7545,177 @@ scanCombineKind(mlir::triton::ScanOp op, bool isI32) {
 // Envelope: rank-1, f32/i32, add combine, axis=0, forward or reverse, BLOCK a
 // multiple of tpb with E = BLOCK/tpb in [1,64] pow2 (mirrors the rank-1 reduce
 // spt-fold envelope). The scan INPUT cone must be `rank1ConeSupported`.
+//===----------------------------------------------------------------------===//
+// rank >= 2 `tt.scan` — `tl.cumsum` / `tl.cumprod` along either axis of a tile.
+//
+// Scan was rank-1 axis-0 only: the distributed prefix-sum template below builds
+// one threadgroup buffer per BLOCK-long run, which has no meaning once the tile
+// has rows. This takes the same staged route as the rank >= 3 reduce — publish
+// the tile, barrier, then each lane accumulates its own axis prefix — so both
+// axes and any rank work at one element per thread.
+//
+// Unlike the reduce there is no output-mapping question: a scan's result has
+// the SAME shape as its source, so the value this lane owes is the prefix at
+// this lane's own coordinates.
+//===----------------------------------------------------------------------===//
+struct StagedScanPlan {
+  TileInfo tile;
+  mlir::triton::gpu::BlockedEncodingAttr enc;
+  int axis;
+  int64_t extent;
+  int64_t stride;
+  mlir::Type stageTy;
+  BinaryExpOperator combineKind;
+  bool reverse;
+};
+
+static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
+  if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
+    return std::nullopt;
+  auto srcTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!srcTy || srcTy.getRank() < 2)
+    return std::nullopt;
+  auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      srcTy.getEncoding());
+  if (!enc)
+    return std::nullopt;
+  std::optional<TileInfo> tile = tileFromTensor(srcTy);
+  if (!tile || static_cast<int64_t>(tile->shape.size()) != srcTy.getRank())
+    return std::nullopt;
+  int64_t numElements = 1;
+  for (auto s : tile->shape)
+    numElements *= s;
+  if (numElements > tile->threadsPerBlock)
+    return std::nullopt;
+  const int axis = static_cast<int>(op.getAxis());
+  if (axis < 0 || axis >= srcTy.getRank())
+    return std::nullopt;
+  const int64_t extent = tile->shape[axis];
+  if (extent < 2 || extent > 64)
+    return std::nullopt;
+  if (underDivergentControlFlow(op))
+    return std::nullopt;
+
+  mlir::Type elemTy = srcTy.getElementType();
+  const bool isI32 = elemTy.isInteger(32);
+  if (!isI32 && !elemTy.isF32() && !elemTy.isF16() && !elemTy.isBF16())
+    return std::nullopt;
+  std::optional<BinaryExpOperator> kind = scanCombineKind(op, isI32);
+  if (!kind)
+    return std::nullopt;
+
+  llvm::SmallVector<int64_t, 4> strides(tile->shape.size(), 1);
+  int64_t acc = 1;
+  for (unsigned d : enc.getOrder()) {
+    if (static_cast<size_t>(d) >= tile->shape.size())
+      return std::nullopt;
+    strides[d] = acc;
+    acc *= tile->shape[d];
+  }
+  mlir::Type stageTy = metalStorageElementType(elemTy);
+  return StagedScanPlan{*tile,   enc,     axis,  extent,
+                        strides[axis], stageTy, *kind, op.getReverse()};
+}
+
+struct StagedScanLowering
+    : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
+  // Benefit 0: the rank-1 distributed template wins wherever it applies.
+  StagedScanLowering(const mlir::TypeConverter &tc, mlir::MLIRContext *ctx)
+      : OpConversionPattern(tc, ctx, /*benefit=*/0) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    std::optional<StagedScanPlan> plan = planStagedScan(op);
+    if (!plan)
+      return rewriter.notifyMatchFailure(op, "staged scan: out of envelope");
+    mlir::Value scalar = adaptor.getSrcs().front();
+    if (mlir::isa<mlir::RankedTensorType>(scalar.getType()))
+      return rewriter.notifyMatchFailure(op, "staged scan: not scalarized");
+    mlir::Type elemTy = scalar.getType();
+
+    auto bridge = [&](mlir::Value v, mlir::Type to) -> mlir::Value {
+      if (v.getType() == to)
+        return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{to}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+
+    const int64_t tpb = plan->tile.threadsPerBlock;
+    mlir::Value buf = publishLaneBands({bridge(scalar, plan->stageTy)}, tpb,
+                                       plan->stageTy, rewriter, loc);
+    mlir::Value flat = emitTileFlatIndex(op, plan->tile, rewriter, loc);
+    mlir::Value coord = emitTileCoordByOrder(op, plan->tile,
+                                             plan->enc.getOrder(), plan->axis,
+                                             rewriter, loc);
+    if (!coord)
+      return rewriter.notifyMatchFailure(op, "staged scan: no coordinate");
+    auto cStride = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(plan->stride)));
+    mlir::Value base =
+        mlir::arith::SubIOp::create(
+            rewriter, loc, flat,
+            mlir::arith::MulIOp::create(rewriter, loc, coord,
+                                        cStride.getResult())
+                .getResult())
+            .getResult();
+
+    // Identity of the monoid, so a position outside this lane's prefix can be
+    // folded in without changing the answer. Selecting in the SIGNLESS element
+    // type keeps `arith.select` legal (it rejects the signed/unsigned Metal
+    // storage types); the casts around it are no-ops in MSL.
+    mlir::TypedAttr identityAttr =
+        mlir::isa<mlir::FloatType>(elemTy)
+            ? mlir::cast<mlir::TypedAttr>(rewriter.getFloatAttr(
+                  elemTy, plan->combineKind == BinaryExpOperator::mulOp ? 1.0
+                                                                        : 0.0))
+            : mlir::cast<mlir::TypedAttr>(rewriter.getIntegerAttr(
+                  elemTy, plan->combineKind == BinaryExpOperator::mulOp ? 1 : 0));
+    mlir::Value identity =
+        mlir::arith::ConstantOp::create(rewriter, loc, identityAttr).getResult();
+    auto opEnum =
+        BinaryExpOperatorAttr::get(rewriter.getContext(), plan->combineKind);
+
+    mlir::Value result;
+    for (int64_t k = 0; k < plan->extent; ++k) {
+      mlir::Value slot = base;
+      if (k > 0) {
+        auto cOff = mlir::arith::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(k * plan->stride)));
+        slot = mlir::arith::AddIOp::create(rewriter, loc, base, cOff.getResult())
+                   .getResult();
+      }
+      mlir::Value v = readLaneBandSlot(buf, slot, tpb, plan->stageTy, elemTy,
+                                       rewriter, loc);
+      // Inclusive prefix: positions up to this lane's coordinate (or from it,
+      // for a reverse scan) contribute; the rest fold in as the identity.
+      auto cK = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(k)));
+      mlir::Value inPrefix =
+          mlir::arith::CmpIOp::create(rewriter, loc,
+                                      plan->reverse
+                                          ? mlir::arith::CmpIPredicate::sge
+                                          : mlir::arith::CmpIPredicate::sle,
+                                      cK.getResult(), coord)
+              .getResult();
+      v = mlir::arith::SelectOp::create(rewriter, loc, inPrefix, v, identity)
+              .getResult();
+      mlir::Value staged = bridge(v, plan->stageTy);
+      result = result ? BinaryExpOp::create(rewriter, loc, plan->stageTy,
+                                            opEnum, result, staged)
+                            .getResult()
+                      : staged;
+    }
+    rewriter.replaceOp(op, bridge(result, elemTy));
+    return mlir::success();
+  }
+};
+
 struct ScanLowering
     : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
   ScanLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
@@ -23116,11 +23287,23 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
              "only for the segmented-sum and affine forms");
       return;
     }
+    // A rank >= 2 scan goes to the staged fallback; `planStagedScan` is its
+    // envelope and is asked here so a shape it declines is named rather than
+    // reaching conversion unmatched.
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
+    if (rtt && rtt.getRank() >= 2) {
+      if (planStagedScan(op))
+        return;
+      reject("rank >= 2 scan is implemented for a blocked tile of at most one "
+             "element per thread, along an axis of extent 2..64, with an "
+             "add or mul combine (tl.cumsum / tl.cumprod) on f32, f16, bf16 or "
+             "i32, outside divergent control flow");
+      return;
+    }
     if (op.getAxis() != 0) {
       reject("scan along an axis other than 0 is not implemented");
       return;
     }
-    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
     if (!rtt || rtt.getRank() != 1) {
       reject("scan is implemented for rank-1 tensors only");
       return;
@@ -24154,6 +24337,9 @@ struct ConvertTritonGPUToMetalPass
     llvm::DenseMap<mlir::Value, mlir::Value> scanBufMap;
     g_scanBuffers = &scanBufMap;
     patterns.add<ScanLowering>(typeConverter, ctx, &scanBufMap, &scanBufPool);
+    // Fallback for the shapes the rank-1 template cannot express (rank >= 2,
+    // either axis). Benefit 0, so it only sees what ScanLowering declines.
+    patterns.add<StagedScanLowering>(typeConverter, ctx);
 
     // Structural type conversion for user-written control flow: rewrites the
     // iter-arg / result / block-arg / yield types of `scf.for` / `scf.if`

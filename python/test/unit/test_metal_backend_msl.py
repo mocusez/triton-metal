@@ -989,6 +989,75 @@ def test_rank3_xor_reduce_is_bit_exact():
     assert torch.equal(out.cpu(), ref)
 
 
+# --- rank-2 tl.cumsum / tl.cumprod -----------------------------------------
+#
+# Scan was rank-1 axis-0 only: its distributed prefix-sum template builds one
+# threadgroup buffer per BLOCK-long run, which means nothing once the tile has
+# rows. The staged fallback publishes the tile and lets each lane accumulate its
+# own axis prefix, so both axes work. A scan's result has the same shape as its
+# source, so unlike the reduce there is no output-mapping question.
+
+
+@triton.jit
+def _cumsum_rank2_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
+                         AXIS: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(o_ptr + off, tl.cumsum(tl.load(x_ptr + off), axis=AXIS))
+
+
+@triton.jit
+def _cumprod_rank2_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
+                          AXIS: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(o_ptr + off, tl.cumprod(tl.load(x_ptr + off), axis=AXIS))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_cumsum_rank2_both_axes(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    M, N = 4, 8
+    torch.manual_seed(axis * 10 + num_warps)
+    x = torch.randn(M, N, dtype=torch.float32)
+    out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    _cumsum_rank2_kernel[(1,)](x.to("mps"), out, M, N, axis,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x.cumsum(axis), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_cumprod_rank2_is_bit_exact(axis):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    M, N = 4, 8
+    torch.manual_seed(axis)
+    # Small integers keep every partial product exactly representable, so the
+    # identity element (1, not 0) is pinned by an equality rather than a
+    # tolerance.
+    x = torch.randint(1, 4, (M, N)).float()
+    out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    _cumprod_rank2_kernel[(1,)](x.to("mps"), out, M, N, axis, num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.cumprod(axis))
+
+
+def test_cumsum_rank2_i32_bridges_through_storage_type():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    M, N = 4, 8
+    torch.manual_seed(3)
+    x = torch.randint(-50, 50, (M, N), dtype=torch.int32)
+    out = torch.zeros(M, N, dtype=torch.int32, device="mps")
+    _cumsum_rank2_kernel[(1,)](x.to("mps"), out, M, N, 1, num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.cumsum(1, dtype=torch.int32))
+
+
 # --- tl.join / tl.split / tl.cat / tl.interleave ---------------------------
 #
 # Triton keeps these per-thread by choosing a layout where one thread owns both
