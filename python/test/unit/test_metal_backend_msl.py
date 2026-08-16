@@ -574,3 +574,99 @@ def test_e5m2_decode_embedding_covers_every_encoding():
     # and signaling bits are deliberately outside the Metal contract.
     bf16 = f16.to(torch.float32).to(torch.bfloat16)
     assert torch.equal(bf16[is_finite].to(torch.float32), e5m2[is_finite].to(torch.float32))
+
+
+# --- scf.while (a Python `while` in a kernel) -----------------------------
+#
+# Triton lowers a Python `while` to `scf.while (inits) { cond } do { body }`.
+# The emitter previously had no case for it and died on an `llvm_unreachable`
+# ("translateValue: unexpected op scf.while") that aborts the process instead
+# of raising. MSL has no multi-value loop carry, so each carried value becomes
+# a temp declared ahead of the loop and the whole thing emits as
+# `while (true) { <before>; if (!cond) break; <after>; }`.
+
+
+@triton.jit
+def while_accumulate_kernel(x_ptr, out_ptr, n_trips, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    n = 0
+    while n < n_trips:
+        acc += tl.load(x_ptr + offs)
+        n += 1
+    tl.store(out_ptr + offs, acc)
+
+
+def test_while_loop_compiles_to_msl():
+    src = ASTSource(
+        fn=while_accumulate_kernel,
+        signature={
+            "x_ptr": "*fp32", "out_ptr": "*fp32", "n_trips": "i32",
+            "BLOCK": "constexpr",
+        },
+        constexprs={"BLOCK": 128},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    compiled = triton.compile(src, target=target, options={"num_warps": 4})
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    # The loop must be an unconditional `while (true)` with an explicit break:
+    # the predicate is recomputed from the carried temps at the top of every
+    # trip, which a C-style `while (<cond>)` could not express once the
+    # predicate reads values the body updates.
+    assert "while (true)" in msl, f"missing while(true) in MSL:\n{msl}"
+    assert "break;" in msl, f"missing loop break in MSL:\n{msl}"
+    # Carried values are plain temps declared BEFORE the loop, so the
+    # zero-trip case yields the init unchanged.
+    assert re.search(r"float v\d+ = 0\.0", msl), (
+        f"carried accumulator not initialised before the loop:\n{msl}")
+
+
+@pytest.mark.parametrize("n_trips", [0, 1, 3, 7])
+def test_while_loop_runs_on_mps(n_trips):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(n_trips)
+    x = torch.rand(16, dtype=torch.float32, device="mps")
+    out = torch.zeros(16, dtype=torch.float32, device="mps")
+    while_accumulate_kernel[(1,)](x, out, n_trips, BLOCK=16)
+    torch.mps.synchronize()
+    # n_trips == 0 must leave the accumulator at its init, i.e. the predicate
+    # is evaluated BEFORE the first body run.
+    torch.testing.assert_close(out.cpu(), (x * n_trips).cpu(),
+                               atol=1e-6, rtol=1e-6)
+
+
+@triton.jit
+def while_block_walk_kernel(x_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+    """Two carried values (a tensor accumulator and a scalar offset) plus a
+    masked load, i.e. the shape a hand-written `while` over blocks takes."""
+    offs = tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    start = 0
+    while start < n_elements:
+        mask = (start + offs) < n_elements
+        acc += tl.load(x_ptr + start + offs, mask=mask, other=0.0)
+        start += BLOCK
+    tl.store(out_ptr + offs, acc)
+
+
+@pytest.mark.parametrize("n_elements", [16, 64, 100, 1024])
+def test_while_loop_two_carried_values_on_mps(n_elements):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(n_elements)
+    block = 16
+    x_cpu = torch.rand(n_elements, dtype=torch.float32)
+    out = torch.zeros(block, dtype=torch.float32, device="mps")
+    while_block_walk_kernel[(1,)](x_cpu.to("mps"), out, n_elements, BLOCK=block)
+    torch.mps.synchronize()
+
+    expected = torch.zeros(block, dtype=torch.float32)
+    for start in range(0, n_elements, block):
+        chunk = x_cpu[start:start + block]
+        expected[:chunk.numel()] += chunk
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)

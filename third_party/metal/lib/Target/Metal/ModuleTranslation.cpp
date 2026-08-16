@@ -388,7 +388,8 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
             mlir::triton::metal::SimdgroupFusedStoreOp,
-            mlir::scf::IfOp, mlir::scf::ForOp>(
+            mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
+            mlir::scf::ConditionOp>(
           [&](auto &op) { printable = true; })
       .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
         // do nothing
@@ -397,13 +398,16 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
       .Case<mlir::scf::YieldOp>([&](auto &op) {
         // Yielding into a result-bearing `scf.if` produces assignment
         // statements to the temp vars pre-declared before the `if`. Yields in
-        // void `scf.if` are no-ops.
+        // void `scf.if` are no-ops. A yield into `scf.while` always writes the
+        // carried temps back.
         printable = false;
         if (auto parentIf =
                 llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp())) {
           if (parentIf.getNumResults() > 0)
             printable = true;
         }
+        if (llvm::isa_and_nonnull<mlir::scf::WhileOp>(op->getParentOp()))
+          printable = true;
       })
       .Default([&](Operation *) {
         if (opInst->use_empty()) {
@@ -447,6 +451,8 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
           [&](auto &op) { translate(op); })
       .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ForOp>([&](auto &op) { translate(op); })
+      .Case<mlir::scf::WhileOp>([&](auto &op) { translate(op); })
+      .Case<mlir::scf::ConditionOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::YieldOp>([&](auto &op) { translate(op); })
       .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
         // do nothing;
@@ -1680,7 +1686,124 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
   translate(op.getRegion());
 }
 
+// A Python `while` in a @triton.jit kernel lowers to
+//
+//   %r:N = scf.while (%a0 = %init0, ...) {
+//            %c = <predicate over %a0..>
+//            scf.condition(%c) %a0, ...        // forwards the block args
+//          } do {
+//          ^bb0(%b0, ...):
+//            ...body...
+//            scf.yield %next0, ...
+//          }
+//
+// MSL has no multi-value loop carry, so each carried value becomes a temp
+// declared before the loop and the whole thing emits as
+//
+//   T v0 = init0; ...
+//   bool vC;
+//   while (true) {
+//     { ...before ops...  vC = <predicate>; }
+//     if (!vC) break;
+//     { ...after ops...   v0 = next0; ... }
+//   }
+//
+// The two regions keep their own C scopes (that is just what `translate(Region)`
+// emits) which is why `scf.condition` MUST forward the before-region block
+// arguments verbatim: anything else would forward a value whose MSL temp is
+// scoped inside the before block and therefore dead by the time the after block
+// reads it. Every kernel shape Triton emits satisfies this; anything else is
+// rejected loudly rather than mistranslated.
+void ModuleTranslation::translate(mlir::scf::WhileOp op) {
+  auto &beforeRegion = op.getBefore();
+  auto &afterRegion = op.getAfter();
+  auto condOp =
+      mlir::dyn_cast<mlir::scf::ConditionOp>(beforeRegion.front().getTerminator());
+  if (!condOp) {
+    llvm::errs() << "[metal] scf.while: before region is not terminated by "
+                    "scf.condition\n";
+    llvm_unreachable("Unexpected operation");
+  }
+  bool forwardsBlockArgs =
+      condOp.getArgs().size() == beforeRegion.getNumArguments();
+  for (auto [i, forwarded] : llvm::enumerate(condOp.getArgs()))
+    if (forwarded != beforeRegion.getArgument(i))
+      forwardsBlockArgs = false;
+  if (!forwardsBlockArgs) {
+    llvm::errs() << "[metal] scf.while: scf.condition must forward the "
+                    "before-region block arguments unchanged\n";
+    llvm_unreachable("Unexpected operation");
+  }
+
+  // One MSL temp per carried value; before-arg, after-arg and loop result all
+  // alias it.
+  llvm::SmallVector<unsigned, 8> carried;
+  for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+    mlir::Value init = op.getOperand(i);
+    unsigned idx = _varCount++;
+    carried.push_back(idx);
+    _buffers[beforeRegion.getArgument(i).getAsOpaquePointer()] = idx;
+    _buffers[afterRegion.getArgument(i).getAsOpaquePointer()] = idx;
+    _buffers[op.getResult(i).getAsOpaquePointer()] = idx;
+    _output << typeToString(init.getType()) << " v" << idx << " = ";
+    if (auto *initDef = init.getDefiningOp())
+      translateValue(initDef);
+    else
+      translateVarName(init);
+    _output << ";\n";
+    indent();
+  }
+  _scfWhileCarried[op.getOperation()] = carried;
+
+  unsigned condIdx = _varCount++;
+  _scfWhileCond[op.getOperation()] = condIdx;
+  _output << "bool v" << condIdx << " = false;\n";
+  indent();
+  _output << "while (true) ";
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    translate(beforeRegion);
+    _output << "\n";
+    indent();
+    _output << "if (!v" << condIdx << ") break;";
+    _output << "\n";
+    indent();
+    translate(afterRegion);
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+}
+
+void ModuleTranslation::translate(mlir::scf::ConditionOp op) {
+  auto parent = mlir::cast<mlir::scf::WhileOp>(op->getParentOp());
+  auto it = _scfWhileCond.find(parent.getOperation());
+  assert(it != _scfWhileCond.end() &&
+         "scf.condition: parent scf.while has no predicate temp");
+  _output << "v" << it->second << " = ";
+  translateValueOrVarName(op.getCondition());
+  _output << ";";
+}
+
 void ModuleTranslation::translate(mlir::scf::YieldOp op) {
+  // scf::WhileOp parent: write every yielded value back to its carried temp.
+  if (auto parentWhile =
+          llvm::dyn_cast_or_null<mlir::scf::WhileOp>(op->getParentOp())) {
+    auto it = _scfWhileCarried.find(parentWhile.getOperation());
+    assert(it != _scfWhileCarried.end() &&
+           "scf.yield: parent scf.while has no carried temps");
+    for (auto [i, yielded] : llvm::enumerate(op.getOperands())) {
+      if (i)
+        _output << "\n", indent();
+      _output << "v" << it->second[i] << " = ";
+      translateValueOrVarName(yielded);
+      _output << ";";
+    }
+    return;
+  }
   // scf::IfOp parent: existing single-result assignment path.
   if (auto parentIf =
           llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp())) {

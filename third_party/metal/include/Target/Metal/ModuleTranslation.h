@@ -59,6 +59,16 @@ private:
   // loops keep using `_scfForIterArg` above (byte-identical emission).
   std::map<mlir::Operation *, llvm::SmallVector<unsigned, 8>>
       _scfForIterArgsMulti;
+  // `scf.while` (a Python `while` in a @triton.jit kernel). MSL has no
+  // multi-value loop carry, so the carried values become plain temps declared
+  // before the loop: `_scfWhileCarried` maps the op to those temp indices (in
+  // iter-arg order) and `_scfWhileCond` to the temp holding the `scf.condition`
+  // predicate. The before/after region block arguments and the loop results all
+  // resolve to the SAME temps through `_buffers`, which is sound only because
+  // the emitter requires `scf.condition` to forward the before-region block
+  // arguments unchanged — the shape Triton's while-loop lowering always emits.
+  std::map<mlir::Operation *, llvm::SmallVector<unsigned, 8>> _scfWhileCarried;
+  std::map<mlir::Operation *, unsigned> _scfWhileCond;
   // L1d2b inline-barrier contract: maps an op whose result has been
   // force-materialized as a named MSL let-binding to that temp's index.
   // Currently populated for `metal.tg_load_indexed` at statement-walk
@@ -174,6 +184,8 @@ private:
   void translate(mlir::triton::metal::ReturnOp op);
   void translate(mlir::scf::IfOp op);
   void translate(mlir::scf::ForOp op);
+  void translate(mlir::scf::WhileOp op);
+  void translate(mlir::scf::ConditionOp op);
   void translate(mlir::scf::YieldOp op);
   void translate(mlir::Region &region);
 
