@@ -1594,7 +1594,8 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
                              ? op.getRegionIterArgs()[0].getType()
                              : mlir::Type();
   if (singleIterArgTy &&
-      (singleIterArgTy.isF32() || singleIterArgTy.isInteger(32) ||
+      (singleIterArgTy.isF32() || singleIterArgTy.isF16() ||
+       singleIterArgTy.isBF16() || singleIterArgTy.isInteger(32) ||
        singleIterArgTy.isInteger(1))) {
     unsigned accIdx = _varCount++;
     _scfForIterArg[op.getOperation()] = accIdx;
@@ -1637,7 +1638,8 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
     }
   } else if (op.getNumRegionIterArgs() >= 2 &&
              llvm::all_of(op.getRegionIterArgs(), [](mlir::Value v) {
-               return v.getType().isF32() || v.getType().isInteger(32) ||
+               return v.getType().isF32() || v.getType().isF16() ||
+                      v.getType().isBF16() || v.getType().isInteger(32) ||
                       v.getType().isInteger(1);
              })) {
     // Multi-accumulator reduce loop (K-way ILP): declare one MSL temp per

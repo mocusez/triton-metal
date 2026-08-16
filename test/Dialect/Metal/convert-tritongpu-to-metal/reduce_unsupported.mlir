@@ -129,13 +129,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// f16 dtype on supported combine op (addf) → "reduce dtype must be f32 or i32 in Session L3".
+// f16 addf now reduces in its own type, but only over a DIRECT unmasked load —
+// the computed-cone re-emitter is f32-only. A constant source is a computed
+// cone, so this stays rejected, with the message naming the real restriction.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_f16(%x_ptr: !tt.ptr<f16>) {
     %x = arith.constant dense<0.0> : tensor<16x32xf16, #blocked>
-    // expected-error @+1 {{reduce dtype must be f32 or i32 in Session L3}}
+    // expected-error @+1 {{rank-2 axis=1 f16/bf16 reduce requires a direct unmasked tt.load}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f16, %b: f16):
       %s = arith.addf %a, %b : f16

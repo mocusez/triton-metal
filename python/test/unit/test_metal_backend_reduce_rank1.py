@@ -578,3 +578,75 @@ def test_reduce_rank1_bitwise_i32(block, num_warps, op):
     for value in x_cpu.tolist():
         expected = apply(expected, value)
     assert out.cpu().item() == _wrap_i32(expected)
+
+
+# --- f16 / bf16 reduces --------------------------------------------------
+#
+# Half reduces in ITS OWN type rather than being promoted to f32. Triton's
+# contract is that the combine runs in the tensor's element type; accumulating
+# in f32 and truncating would make this backend disagree with every other one
+# in a way no tolerance-based test would ever flag.
+#
+# Asserted BIT-EXACT by choosing half-integer inputs whose running total stays
+# exactly representable, so the answer does not depend on association order. A
+# tolerance here would pass just as happily on an f32-promoted accumulator,
+# which is the bug this is guarding against.
+
+
+@triton.jit
+def reduce_sum_rank1_half_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.load(x_ptr + offs), axis=0))
+
+
+@triton.jit
+def reduce_max_rank1_half_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.max(tl.load(x_ptr + offs), axis=0))
+
+
+@triton.jit
+def reduce_sum_rank1_half_cone_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.load(x_ptr + offs) * 2.0, axis=0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block", [32, 64, 256, 1024])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_reduce_rank1_half_sum_is_exact(dtype, block, num_warps):
+    torch.manual_seed(block + num_warps)
+    x = torch.randint(-4, 5, (block,)).to(dtype) * 0.5
+    exact = x.double().sum().item()
+    assert abs(exact) < 256, "test inputs must keep the sum exactly representable"
+    out = torch.zeros(1, dtype=dtype, device="mps")
+    reduce_sum_rank1_half_kernel[(1,)](x.to("mps"), out, BLOCK=block,
+                                       num_warps=num_warps)
+    torch.mps.synchronize()
+    assert out.cpu().double().item() == exact
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block", [32, 256, 1024])
+def test_reduce_rank1_half_max_is_exact(dtype, block):
+    torch.manual_seed(block)
+    x = (torch.rand(block, dtype=dtype) - 0.5)
+    out = torch.zeros(1, dtype=dtype, device="mps")
+    reduce_max_rank1_half_kernel[(1,)](x.to("mps"), out, BLOCK=block)
+    torch.mps.synchronize()
+    # Max is an element selection, so it is exact whatever the identity is —
+    # unless the tail fill uses a non-half -inf, which is the failure this
+    # catches.
+    assert out.cpu().item() == x.max().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_reduce_rank1_half_computed_cone(dtype):
+    """Rank-1 (unlike rank-2 axis=1) re-derives a computed cone per element;
+    that re-emitter must keep the half type instead of widening."""
+    torch.manual_seed(7)
+    x = torch.randint(-4, 5, (64,)).to(dtype) * 0.5
+    out = torch.zeros(1, dtype=dtype, device="mps")
+    reduce_sum_rank1_half_cone_kernel[(1,)](x.to("mps"), out, BLOCK=64)
+    torch.mps.synchronize()
+    assert out.cpu().double().item() == (x.double() * 2).sum().item()

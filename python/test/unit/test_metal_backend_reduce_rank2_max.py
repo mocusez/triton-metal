@@ -357,3 +357,74 @@ def test_reduce_rank2_axis1_bitwise_i32(shape, num_warps, op):
             acc = apply(acc, value)
         expected.append((acc + 2**31) % 2**32 - 2**31)
     assert out.cpu().tolist() == expected
+
+
+# --- f16 / bf16 axis=1 reduces -------------------------------------------
+#
+# Same own-type rule as the rank-1 path (see
+# `test_metal_backend_reduce_rank1.py::test_reduce_rank1_half_sum_is_exact`),
+# here through the per-row column scan. Restricted to a DIRECT unmasked load:
+# the computed-cone re-emitter is f32-only, which the convert pre-pass now
+# reports by name instead of letting dialect conversion fail bare.
+
+
+@triton.jit
+def reduce_sum_rank2_half_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                 N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M), tl.sum(tl.load(x_ptr + offs), axis=1))
+
+
+@triton.jit
+def reduce_max_rank2_half_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                 N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(out_ptr + tl.arange(0, M), tl.max(tl.load(x_ptr + offs), axis=1))
+
+
+@triton.jit
+def softmax_rank2_half_kernel(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    v = tl.load(x_ptr + offs)
+    e = tl.exp(v - tl.max(v, axis=1)[:, None])
+    tl.store(out_ptr + offs, e / tl.sum(e, axis=1)[:, None])
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (8, 16), (16, 32)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_reduce_rank2_axis1_half_sum_is_exact(shape, dtype):
+    m, n = shape
+    torch.manual_seed(m * 31 + n)
+    x = torch.randint(-4, 5, (m, n)).to(dtype) * 0.5
+    out = torch.zeros(m, dtype=dtype, device="mps")
+    reduce_sum_rank2_half_kernel[(1,)](x.to("mps"), out, M=m, N=n)
+    torch.mps.synchronize()
+    assert out.cpu().double().tolist() == x.double().sum(1).tolist()
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (16, 32)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_reduce_rank2_axis1_half_max_is_exact(shape, dtype):
+    m, n = shape
+    torch.manual_seed(m * 17 + n)
+    x = torch.rand(m, n, dtype=dtype) - 0.5
+    out = torch.zeros(m, dtype=dtype, device="mps")
+    reduce_max_rank2_half_kernel[(1,)](x.to("mps"), out, M=m, N=n)
+    torch.mps.synchronize()
+    assert out.cpu().tolist() == x.amax(1).tolist()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_softmax_rank2_half_end_to_end(dtype):
+    """The shape half reduces exist for: max and sum over a row, each
+    broadcast back into the tile."""
+    m, n = 8, 16
+    torch.manual_seed(3)
+    x = torch.rand(m, n, dtype=dtype) - 0.5
+    out = torch.zeros(m, n, dtype=dtype, device="mps")
+    softmax_rank2_half_kernel[(1,)](x.to("mps"), out, M=m, N=n)
+    torch.mps.synchronize()
+    expected = torch.softmax(x.float(), dim=1)
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 3e-3
+    torch.testing.assert_close(out.cpu().float(), expected,
+                               atol=tolerance, rtol=tolerance)

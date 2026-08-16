@@ -3529,9 +3529,19 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
     return mlir::failure();
 
   mlir::Type elemTy = rtt.getElementType();
+  // Half precision reduces in ITS OWN type, not promoted to f32: MSL has native
+  // `half` / `bfloat` arithmetic, and Triton's contract is that the combine runs
+  // in the tensor's element type. Accumulating in f32 and truncating would give
+  // a different (more accurate) answer than the same kernel on any other
+  // backend, which is exactly the kind of silent divergence this backend
+  // refuses elsewhere. `metal.binary_exp` and the threadgroup buffer both
+  // accept f16/bf16 already, so the butterfly is type-generic; only the
+  // identity constants had to learn the element type.
   bool isF32 = elemTy.isF32();
+  bool isHalf = elemTy.isF16() || elemTy.isBF16();
+  bool isFloat = isF32 || isHalf;
   bool isI32 = elemTy.isInteger(32);
-  if (!isF32 && !isI32)
+  if (!isFloat && !isI32)
     return mlir::failure();
 
   // Identify the combine op (the pre-pass already validated, but be defensive).
@@ -3571,7 +3581,13 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   bool isOrI = mlir::isa<mlir::arith::OrIOp>(combine);
   bool isXorI = mlir::isa<mlir::arith::XOrIOp>(combine);
   bool isBitwiseI = isAndI || isOrI || isXorI;
-  if (isF32 && !(isAddF || isMulF || isMaxF || isMinF))
+  if (isFloat && !(isAddF || isMulF || isMaxF || isMinF))
+    return mlir::failure();
+  // Half stays on the sum/extrema monoids: those are what softmax and layer
+  // norm need. A half PRODUCT would also have to satisfy the direct-unmasked-
+  // load precondition below, and nothing exercises it, so it is left rejected
+  // rather than shipped untested.
+  if (isHalf && isMulF)
     return mlir::failure();
   if (isI32 && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
     return mlir::failure();
@@ -3670,30 +3686,28 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // return type must be signless') and then bridged to storeTy (ui32 for add,
   // si32 for signed-max) via unrealized_conversion_cast.
   auto buildIdentityVal = [&]() -> mlir::Value {
-    if (isF32 && isAddF)
-      return mlir::arith::ConstantOp::create(
-                 rewriter, loc, rewriter.getF32FloatAttr(0.0f))
-          .getResult();
-    if (isF32 && isMulF)
-      return mlir::arith::ConstantOp::create(
-                 rewriter, loc, rewriter.getF32FloatAttr(1.0f))
-          .getResult();
-    if (isF32 && isMaxF) {
-      return mlir::arith::ConstantOp::create(
-                 rewriter, loc,
-                 rewriter.getF32FloatAttr(
-                     -std::numeric_limits<float>::infinity()))
-          .getResult();
-    }
-    if (isF32 && isMinF) {
+    // Built in the tensor's own float type, so the f16/bf16 tail fill gets a
+    // half-typed ±inf / 0 rather than an f32 one the arith.constant verifier
+    // would reject. `getFloatAttr` rounds the double to the target semantics,
+    // and every identity here (0, 1, ±inf) is exactly representable in f16,
+    // bf16 and f32 alike.
+    if (isFloat) {
+      double identity = 0.0;
+      if (isMulF)
+        identity = 1.0;
+      else if (isMaxF)
+        identity = -std::numeric_limits<double>::infinity();
+      else if (isMinF)
+        identity = std::numeric_limits<double>::infinity();
       return mlir::arith::ConstantOp::create(
                  rewriter, loc,
-                 rewriter.getF32FloatAttr(
-                     std::numeric_limits<float>::infinity()))
+                 mlir::cast<mlir::TypedAttr>(
+                     rewriter.getFloatAttr(elemTy, identity)))
           .getResult();
     }
     // i32 add → 0; i32 product → 1; i32 signed-max → INT32_MIN
-    // (max(x, INT_MIN) == x); i32 signed-min → INT32_MAX.
+    // (max(x, INT_MIN) == x); i32 signed-min → INT32_MAX;
+    // bitwise-and → ~0 (all ones); bitwise-or / xor → 0.
     int32_t identVal = 0;
     if (isMulI)
       identVal = 1;
@@ -8034,7 +8048,12 @@ struct ReduceLowering
     if (op.getAxis() != 1)
       return mlir::failure();
     mlir::Type elemTy = rtt.getElementType();
-    bool isF32 = elemTy.isF32();
+    // Half reduces in its own type, like the rank-1 path — see the identity
+    // block in lowerRank1Reduce for why it is not promoted to f32. Everything
+    // below that used `isF32` is really "is a float", since the column scan
+    // carries the element type through metal.binary_exp and the row buffer.
+    bool isHalf = elemTy.isF16() || elemTy.isBF16();
+    bool isF32 = elemTy.isF32() || isHalf;
     bool isI32 = elemTy.isInteger(32);
     if (!isF32 && !isI32)
       return mlir::failure();
@@ -8157,7 +8176,12 @@ struct ReduceLowering
     if (loadOp && !loadOp.getMask()) {
       reprLoad = loadOp;
     } else {
-      if (!isF32)
+      // Half rides the direct-load row scan only. The computed-cone re-emitter
+      // (evalRank2ConeAt) rebuilds arithmetic in the cone's own types, and
+      // nothing exercises it at half precision, so it stays rejected rather
+      // than shipped untested — the half softmax shape (max/sum over a plain
+      // load, broadcast back) goes through the direct-load path.
+      if (!isF32 || isHalf)
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed-cone src supported for f32 only");
       // Inc 2.5 (M<=tpb): each fill thread reduces its OWN row (r==localTid), so
@@ -8541,13 +8565,15 @@ struct ReduceLowering
               initVal = emitColLoad(cColLo.getResult());
               colLower = cOne.getResult();
             } else {
+              // In the tensor's own float type: an f32-typed constant would
+              // fail the arith.constant verifier on an f16/bf16 accumulator.
+              double identity = isMaxF ? -std::numeric_limits<double>::infinity()
+                                : isMulF ? 1.0
+                                         : 0.0;
               initVal = mlir::arith::ConstantOp::create(
                             rewriter, loc,
-                            rewriter.getF32FloatAttr(
-                                isMaxF
-                                    ? -std::numeric_limits<float>::infinity()
-                                : isMulF ? 1.0f
-                                         : 0.0f))
+                            mlir::cast<mlir::TypedAttr>(
+                                rewriter.getFloatAttr(elemTy, identity)))
                             .getResult();
             }
             auto colFor = mlir::scf::ForOp::create(
@@ -21640,8 +21666,13 @@ struct ConvertTritonGPUToMetalPass
       // tl.max emits arith.maxnumf (IEEE maxNum) while
       // arith.maximumf uses IEEE maximum; both map to MSL max.
       bool combineOk = false;
+      // f16/bf16 sums and extrema reduce in their own type (see the identity
+      // block in lowerRank1Reduce). Half PRODUCT is deliberately not admitted.
+      bool halfSumOrExtrema =
+          combineEltTy && (combineEltTy.isF16() || combineEltTy.isBF16()) &&
+          (rtt.getRank() == 1 || (rtt.getRank() == 2 && axes == 1));
       if (combineName == "arith.addf") {
-        if (combineEltTy && combineEltTy.isF32())
+        if (combineEltTy && (combineEltTy.isF32() || halfSumOrExtrema))
           combineOk = true;
       } else if (combineName == "arith.mulf" &&
                  (rtt.getRank() == 1 ||
@@ -21678,7 +21709,7 @@ struct ConvertTritonGPUToMetalPass
                  combineName == "arith.maxnumf" ||
                  combineName == "arith.minimumf" ||
                  combineName == "arith.minnumf") {
-        if (combineEltTy && combineEltTy.isF32())
+        if (combineEltTy && (combineEltTy.isF32() || halfSumOrExtrema))
           combineOk = true;
       } else if (combineName == "arith.maxsi") {
         // Signed i32 max is supported by the rank-1 butterfly and the rank-2
@@ -21751,6 +21782,25 @@ struct ConvertTritonGPUToMetalPass
           red.emitOpError(
               "rank-2 axis=1 i32 product/max/min/bitwise requires a direct "
               "unmasked tt.load");
+          reduceOk = false;
+          return;
+        }
+      }
+      // Half rides the same direct-load row scan; its computed-cone path is
+      // not implemented (see the isHalf gate in ReduceLowering). Reject here so
+      // the shape fails with this message instead of a bare "failed to
+      // legalize" out of dialect conversion.
+      if (rtt.getRank() == 2 && axes == 1 && combineEltTy &&
+          (combineEltTy.isF16() || combineEltTy.isBF16())) {
+        mlir::Value src = red.getSrcs().front();
+        if (auto cvt =
+                src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+          src = cvt.getSrc();
+        auto load = src.getDefiningOp<mlir::triton::LoadOp>();
+        if (!load || load.getMask()) {
+          red.emitOpError(
+              "rank-2 axis=1 f16/bf16 reduce requires a direct unmasked "
+              "tt.load");
           reduceOk = false;
           return;
         }
@@ -22244,11 +22294,12 @@ struct ConvertTritonGPUToMetalPass
       moduleOp.walk([&](mlir::scf::ForOp forOp) {
         for (mlir::Value iterArg : forOp.getRegionIterArgs()) {
           mlir::Type t = iterArg.getType();
-          if (!(t.isF32() || t.isInteger(32) || t.isInteger(1) ||
+          if (!(t.isF32() || t.isF16() || t.isBF16() || t.isInteger(32) ||
+                t.isInteger(1) ||
                 mlir::isa<mlir::triton::metal::MetalSimdgroupMatrixType>(t))) {
             forOp.emitOpError("Metal backend: scf.for iter_arg must be a scalar "
-                              "f32/i32/i1 accumulator or simdgroup_matrix after "
-                              "conversion");
+                              "f32/f16/bf16/i32/i1 accumulator or "
+                              "simdgroup_matrix after conversion");
             loopOk = false;
             break;
           }
