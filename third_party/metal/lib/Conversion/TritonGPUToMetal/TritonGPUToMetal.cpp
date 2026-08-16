@@ -15420,6 +15420,56 @@ struct SdScaleInfo {
   bool rhsKPack = true;
 };
 
+// `metal.scalar_dot` is emitted at the DOT (or at the enclosing accumulation
+// `scf.for`), but its `output_indices` come from the pointer arithmetic of the
+// STORE that consumes the accumulator — arithmetic Triton emits AFTER the loop.
+// Handing those SSA values to an op that sits before the loop builds IR whose
+// operands do not dominate their use; the pass then dies in the verifier with
+// "operand #0 does not dominate this use" (the `arith.divsi` ScalarDotLowering
+// derives from `output_indices`).
+//
+// Rematerialize the value's defining cone immediately before the insertion
+// point instead. The cone is pure index arithmetic over values that already
+// dominate the loop (`offset_row`, a kernel argument), so cloning is exact;
+// CSE folds the duplicate away when the original happened to dominate anyway.
+// Returns null when the cone cannot be replayed, in which case the caller
+// leaves `output_indices` empty and ScalarDotLowering falls back to
+// decomposing the linear thread index (the behaviour that predates
+// `output_indices`).
+static mlir::Value
+sdMakeAvailableBefore(mlir::Value v, mlir::Operation *insertBefore,
+                      const mlir::DominanceInfo &dom,
+                      llvm::DenseMap<mlir::Value, mlir::Value> &memo,
+                      int depth = 0) {
+  if (!v)
+    return {};
+  if (dom.properlyDominates(v, insertBefore))
+    return v;
+  if (depth > 8)
+    return {};
+  if (auto it = memo.find(v); it != memo.end())
+    return it->second;
+  mlir::Operation *def = v.getDefiningOp();
+  // A block argument that does not dominate cannot be replayed at all.
+  if (!def || def->getNumRegions() != 0 || !mlir::isPure(def))
+    return {};
+  llvm::SmallVector<mlir::Value, 4> newOperands;
+  for (mlir::Value operand : def->getOperands()) {
+    mlir::Value avail =
+        sdMakeAvailableBefore(operand, insertBefore, dom, memo, depth + 1);
+    if (!avail)
+      return {};
+    newOperands.push_back(avail);
+  }
+  mlir::OpBuilder builder(insertBefore);
+  mlir::Operation *clone = builder.clone(*def);
+  clone->setOperands(newOperands);
+  for (auto [orig, cloned] :
+       llvm::zip(def->getResults(), clone->getResults()))
+    memo[orig] = cloned;
+  return clone->getResult(mlir::cast<mlir::OpResult>(v).getResultNumber());
+}
+
 static ScalarDotOp sdEmitScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
@@ -15553,9 +15603,24 @@ static ScalarDotOp sdEmitScalarDot(
     mlir::Value outputStrideDynamic =
         findAxisStride(store.getPtr(), /*axis=*/0);
     auto outputStrideOpt = sdConstStride(cParts.rowContrib);
-    if (outputStrideDynamic || (outputStrideOpt && *outputStrideOpt > 0))
-      outputIndices.assign({cParts.rowContrib, cParts.colContrib,
-                            emitStride(outputStrideDynamic, outputStrideOpt)});
+    if (outputStrideDynamic || (outputStrideOpt && *outputStrideOpt > 0)) {
+      // The store's row/col arithmetic may live after `insertBefore` (dot
+      // inside an accumulation loop, store after it) — replay it here so the
+      // operands dominate. See sdMakeAvailableBefore.
+      mlir::DominanceInfo dom(
+          insertBefore->getParentOfType<mlir::triton::FuncOp>());
+      llvm::DenseMap<mlir::Value, mlir::Value> memo;
+      mlir::Value rowContrib =
+          sdMakeAvailableBefore(cParts.rowContrib, insertBefore, dom, memo);
+      mlir::Value colContrib =
+          sdMakeAvailableBefore(cParts.colContrib, insertBefore, dom, memo);
+      mlir::Value outputStride =
+          emitStride(outputStrideDynamic, outputStrideOpt);
+      mlir::Value availStride =
+          sdMakeAvailableBefore(outputStride, insertBefore, dom, memo);
+      if (rowContrib && colContrib && availStride)
+        outputIndices.assign({rowContrib, colContrib, availStride});
+    }
   }
 
   llvm::SmallVector<mlir::Value, 2> scaleBufs;
