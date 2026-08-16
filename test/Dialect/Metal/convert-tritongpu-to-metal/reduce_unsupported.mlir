@@ -7,18 +7,20 @@
 // policy; this fixture exercises the pre-pass rejection gate.
 
 // -----
-// Rank-3 input → "multi-axis or rank>2".
+// Rank >= 3 IS implemented now, by the staged fallback, but only for a tile it
+// can publish in one pass. 16x8x8 is 1024 elements over 128 threads, so it
+// stays rejected — and the message names the envelope instead of a session.
 #blocked3d = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [2, 4, 4], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
 #slice3d = #ttg.slice<{dim = 0, parent = #blocked3d}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_rank3(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<0.0> : tensor<8x4x4xf32, #blocked3d>
-    // expected-error @+1 {{reduce with rank not in {1, 2} not supported (rank-1 added in Option β; rank>2 requires Session L3b)}}
+    %x = arith.constant dense<0.0> : tensor<16x8x8xf32, #blocked3d>
+    // expected-error @+1 {{rank >= 3 reduce is implemented for a blocked tile of at most one element per thread}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32
       tt.reduce.return %s : f32
-    }) {axis = 0 : i32} : (tensor<8x4x4xf32, #blocked3d>) -> tensor<4x4xf32, #slice3d>
+    }) {axis = 0 : i32} : (tensor<16x8x8xf32, #blocked3d>) -> tensor<8x8xf32, #slice3d>
     tt.return
   }
 }
@@ -104,26 +106,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// Rank-2 axis=1 i32 product/extrema currently support a direct unmasked load
-// only. Keep the adjacent computed-cone shape behind a stable diagnostic.
+// Rank-2 axis=1 i32 product/extrema over a COMPUTED cone: the row scanner wants
+// a direct unmasked load, and the staged fallback that now covers the shape
+// needs the tile to fit one element per thread. 32x16 is 512 over 128 threads,
+// so neither takes it and the row scanner's diagnostic stands.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_maxsi_computed_deferred(%x_ptr: !tt.ptr<i32>) {
     %r0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
     %r1 = tt.expand_dims %r0 {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
-    %offs = tt.broadcast %r1 : tensor<1x16xi32, #blocked> -> tensor<8x16xi32, #blocked>
-    %sp = tt.splat %x_ptr : !tt.ptr<i32> -> tensor<8x16x!tt.ptr<i32>, #blocked>
-    %ap = tt.addptr %sp, %offs : tensor<8x16x!tt.ptr<i32>, #blocked>, tensor<8x16xi32, #blocked>
-    %x = tt.load %ap : tensor<8x16x!tt.ptr<i32>, #blocked>
-    %one = arith.constant dense<1> : tensor<8x16xi32, #blocked>
-    %computed = arith.addi %x, %one : tensor<8x16xi32, #blocked>
+    %offs = tt.broadcast %r1 : tensor<1x16xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<i32> -> tensor<32x16x!tt.ptr<i32>, #blocked>
+    %ap = tt.addptr %sp, %offs : tensor<32x16x!tt.ptr<i32>, #blocked>, tensor<32x16xi32, #blocked>
+    %x = tt.load %ap : tensor<32x16x!tt.ptr<i32>, #blocked>
+    %one = arith.constant dense<1> : tensor<32x16xi32, #blocked>
+    %computed = arith.addi %x, %one : tensor<32x16xi32, #blocked>
     // expected-error @+1 {{rank-2 axis=1 i32 product/max/min/bitwise requires a direct unmasked tt.load}}
     %r = "tt.reduce"(%computed) ({
     ^bb0(%a: i32, %b: i32):
       %m = arith.maxsi %a, %b : i32
       tt.reduce.return %m : i32
-    }) {axis = 1 : i32} : (tensor<8x16xi32, #blocked>) -> tensor<8xi32, #slice1>
+    }) {axis = 1 : i32} : (tensor<32x16xi32, #blocked>) -> tensor<32xi32, #slice1>
     tt.return
   }
 }

@@ -775,19 +775,21 @@ def test_arange_broadcast_rank2_values(kernel, expected):
     assert out.cpu().tolist() == expected
 
 
-def test_arange_broadcast_rank3_is_rejected_not_zeroed(capfd):
-    """Reinstating the constant-0 fallback would make this kernel run and
-    return all zeros, so the assertion is on the ERROR, not on any output.
+def test_arange_broadcast_rank3_carries_real_indices():
+    """This used to be a rejection: an arange reshaped into a rank-3 axis had no
+    per-element index, and before that it silently read back as 0 for every
+    element. It is decomposable now — the axis comes from the reshape and the
+    value from the tile coordinate — so the assertion is on the VALUES.
 
-    The specific reason is an MLIR diagnostic on stderr; the Python exception
-    only carries the generic pass failure, so both are checked."""
+    Zeros here would mean the constant fallback is back, which is the original
+    silent wrong answer; `[0,0,1,1,0,0,1,1]` is `h[i,j,k] = j` flattened."""
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
     out = torch.zeros(8, dtype=torch.int32, device="mps")
-    with pytest.raises(Exception):
-        _arange_rank3_kernel[(1,)](out, B=8)
-    assert "tl.arange has no per-element index" in capfd.readouterr().err
+    _arange_rank3_kernel[(1,)](out, B=8)
+    torch.mps.synchronize()
+    assert out.cpu().tolist() == [0, 0, 1, 1, 0, 0, 1, 1]
 
 
 # --- tl.gather ------------------------------------------------------------
@@ -870,6 +872,121 @@ def test_gather_computed_source(block):
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), (x * 2.0 + 1.0)[idx.long()],
                                atol=1e-6, rtol=1e-6)
+
+
+# --- rank >= 3: tl.sort / tl.flip and the staged reduce --------------------
+#
+# `tl.sort` reshapes its tile into a `[2] * log2(N)` hypercube and drives it
+# with `x ^ xor_sum(x, axis, keep_dims=True)` per axis. Two things had to exist
+# for that: an arange reshaped into one cube axis has to answer with that axis's
+# coordinate (it used to have no per-element index at all), and a rank >= 3
+# reduce has to lower (it was rejected outright).
+#
+# Both regressed silently in development rather than failing, which is why
+# these assert exact permutations rather than tolerances:
+#   * the size-2 arange that came out `#ttg.blocked` instead of `#ttg.linear`
+#     answered with the raw lane id, and the compare direction — an XOR of two
+#     cube coordinates — half-sorted the input;
+#   * the staged reduce fed its result to a rank-(N-1) consumer at the wrong
+#     coordinates, correct for axis 0 and wrong for every other axis, because
+#     dropping the SLOWEST axis happens to leave the flat index alone.
+
+
+@triton.jit
+def _sort_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.sort(tl.load(x_ptr + i)))
+
+
+@triton.jit
+def _sort_desc_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.sort(tl.load(x_ptr + i), descending=True))
+
+
+@triton.jit
+def _flip_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.flip(tl.load(x_ptr + i), 0))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("N", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("kernel,ref", [
+    (_sort_kernel, lambda x: x.sort().values),
+    (_sort_desc_kernel, lambda x: x.sort(descending=True).values),
+    (_flip_kernel, lambda x: x.flip(0)),
+])
+def test_hypercube_sort_and_flip(kernel, ref, N, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(N * 31 + num_warps)
+    # A permutation makes any misplaced element a hard mismatch.
+    x = torch.randperm(N).float()
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    kernel[(1,)](x.to("mps"), out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), ref(x))
+
+
+@triton.jit
+def _rank3_reduce_kernel(x_ptr, o_ptr, B: tl.constexpr, M: tl.constexpr,
+                         K: tl.constexpr, AXIS: tl.constexpr):
+    v = tl.load(x_ptr + tl.arange(0, B)[:, None, None] * (M * K)
+                + tl.arange(0, M)[None, :, None] * K
+                + tl.arange(0, K)[None, None, :])
+    r = tl.sum(v, axis=AXIS)
+    if AXIS == 2:
+        tl.store(o_ptr + tl.arange(0, B)[:, None] * M
+                 + tl.arange(0, M)[None, :], r)
+    elif AXIS == 1:
+        tl.store(o_ptr + tl.arange(0, B)[:, None] * K
+                 + tl.arange(0, K)[None, :], r)
+    else:
+        tl.store(o_ptr + tl.arange(0, M)[:, None] * K
+                 + tl.arange(0, K)[None, :], r)
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_rank3_reduce_every_axis(axis):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    B, M, K = 2, 4, 8              # 64 elements, one per thread at num_warps=4
+    torch.manual_seed(axis)
+    x = torch.randn(B, M, K, dtype=torch.float32)
+    shape = {0: (M, K), 1: (B, K), 2: (B, M)}[axis]
+    out = torch.zeros(shape, dtype=torch.float32, device="mps")
+    _rank3_reduce_kernel[(1,)](x.to("mps"), out, B, M, K, axis, num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x.sum(axis), atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _rank3_xor_kernel(x_ptr, o_ptr, B: tl.constexpr, M: tl.constexpr,
+                      K: tl.constexpr):
+    v = tl.load(x_ptr + tl.arange(0, B)[:, None, None] * (M * K)
+                + tl.arange(0, M)[None, :, None] * K
+                + tl.arange(0, K)[None, None, :])
+    tl.store(o_ptr + tl.arange(0, B)[:, None] * K + tl.arange(0, K)[None, :],
+             tl.xor_sum(v, axis=1))
+
+
+def test_rank3_xor_reduce_is_bit_exact():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    B, M, K = 2, 4, 8
+    torch.manual_seed(5)
+    x = torch.randint(0, 1 << 20, (B, M, K), dtype=torch.int32)
+    out = torch.zeros(B, K, dtype=torch.int32, device="mps")
+    _rank3_xor_kernel[(1,)](x.to("mps"), out, B, M, K, num_warps=4)
+    torch.mps.synchronize()
+    ref = torch.zeros(B, K, dtype=torch.int32)
+    for m in range(M):
+        ref ^= x[:, m, :]
+    assert torch.equal(out.cpu(), ref)
 
 
 # --- tl.join / tl.split / tl.cat / tl.interleave ---------------------------
