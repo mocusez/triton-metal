@@ -1651,7 +1651,11 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     result layout conversion uses a different blocked encoding. The reduction
     trip count is `reduction_extent` (normally equal to `stride_a`).  A
     `transpose_a` unit attribute changes A's physical index to
-    `k*stride_a + gRow`; an optional `weight_buf` multiplies each product by
+    `k*stride_a + gRow`; a `transpose_b` unit attribute likewise changes B's to
+    `gCol*stride_b + k`, which is what `tl.dot(a, tl.trans(b))` means when b is
+    stored `[N, K]` (an `nn.Linear` weight, among others). Without it the
+    matcher's peel through `tt.trans` silently dropped the transpose and indexed
+    B as if it were `[K, N]`; an optional `weight_buf` multiplies each product by
     `weight_buf[k]`.  Together these two narrow extensions represent the
     weighted Gram matrix `X.T @ diag(W) @ X` used by logistic-regression
     Hessians without pretending its dot-operand layout conversions are generic

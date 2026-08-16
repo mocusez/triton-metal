@@ -1002,3 +1002,70 @@ def test_dot_multiwarp_msl_predicates(num_warps):
         # Single-warp Branch A: shared buffer is [elems], not [num_warps][elems].
         assert "_stage_shared[sgid]" not in msl, (
             "single-warp MSL should not slice _stage_shared by sgid")
+
+
+# --- transposed B ---------------------------------------------------------
+#
+# `tl.dot(a, tl.trans(b))` with b stored [N, K] is how any nn.Linear-style
+# matmul is written, and it was SILENTLY WRONG at 64x64 tiles: the multi-tile
+# simdgroup matcher declines there on its register guard, and the scalar-dot
+# tier that picks the dot up peeled through the `tt.trans` to reach the root
+# load — discarding the transpose and indexing B as if it were [K, N].
+#
+# The same is true of the address-transposed form `b + n*K + k`, which carries
+# no `tt.trans` at all: every simdgroup matcher detects trans-B by looking for
+# that op, so it staged an ordinary [K, N] tile with `stride_b` read off the
+# unit row axis.
+#
+# Both are checked against torch here, and the tile sizes span the tiers: 16/32
+# take a simdgroup path, 64 falls to scalar_dot.
+
+
+@triton.jit
+def _transb_trans_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
+                         BN: tl.constexpr, BK: tl.constexpr):
+    """b is [N, K]; the transpose is a real tt.trans."""
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :],
+                      mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+        acc = tl.dot(av, tl.trans(bnk), acc)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@triton.jit
+def _transb_address_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
+                           BN: tl.constexpr, BK: tl.constexpr):
+    """b is [N, K] and the transpose lives only in the address arithmetic."""
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        ok = k + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * K + ok[:, None],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@pytest.mark.parametrize("kernel", [_transb_trans_kernel, _transb_address_kernel])
+@pytest.mark.parametrize("size,bk", [(16, 16), (32, 32), (64, 64), (64, 32)])
+def test_dot_transposed_b(kernel, size, bk):
+    torch.manual_seed(size + bk)
+    m = n = k = size
+    a = torch.rand(m, k, dtype=torch.float32)
+    b = torch.rand(k, n, dtype=torch.float32)
+    c = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    kernel[(1, 1)](a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k,
+                   BM=m, BN=n, BK=bk, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)

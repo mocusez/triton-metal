@@ -14697,6 +14697,21 @@ static mlir::LogicalResult tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) 
   // K-offset's `splat(iv)` for a stride.
   mlir::Value strideA = findAxisStride(loadA.getPtr(), /*axis=*/0);
   mlir::Value strideB = findAxisStride(loadB.getPtr(), /*axis=*/0);
+  // B can be transposed in the ADDRESS with no `tt.trans` in sight: `b + n*K +
+  // k` keeps the tile axes [k, n] but puts the large stride on the column. The
+  // `bTransposed` detection above only sees a `tt.trans`, so this shape was
+  // staged as an ordinary [K, N] tile — with `stride_b` read off the (unit) row
+  // axis, so the emitted index was `k*8 + n` instead of `n*K + k`. Silently
+  // wrong, and the form a hand-written trans-B matmul naturally takes.
+  //
+  // Decline it here rather than growing a second transpose path: the scalar-dot
+  // tier detects exactly this address shape and indexes it correctly, and
+  // declining in a preprocess matcher just means the next tier claims the dot.
+  if (!bTransposed && !strideB) {
+    mlir::Value strideBCol = findAxisStride(loadB.getPtr(), /*axis=*/1);
+    if (strideBCol)
+      return mlir::failure();
+  }
   mlir::Value aBaseRow = findOriginScalarInPtrChain(loadA.getPtr(), /*axis=*/0);
   mlir::Value bNOrigin = findOriginScalarInPtrChain(loadB.getPtr(), bNAxis);
 
@@ -15767,6 +15782,36 @@ static bool sdIsByteToFp8PayloadBitcast(mlir::triton::BitcastOp bitcast) {
 
 // Peel a dot operand back through convert_layout / extf / trans and the
 // frontend's single-use byte-to-FP8 payload bitcast to its load.
+// `sdPeelToLoad` walks THROUGH `tt.trans` to reach the root load, because the
+// matcher needs the load for its strides and base pointer. That peel silently
+// discards the transpose: `tl.dot(a, tl.trans(b))` and `tl.dot(a, b)` peel to
+// the same load, and the emitted scalar_dot indexed B as if it were never
+// transposed — a wrong answer that compiles and runs. Callers ask this whether
+// the transpose was there, and pass it on as `transpose_b`.
+static bool sdConeCrossesTranspose(mlir::Value v) {
+  for (int i = 0; i < 8 && v; ++i) {
+    if (v.getDefiningOp<mlir::triton::LoadOp>()) return false;
+    if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      v = cvt.getSrc();
+      continue;
+    }
+    if (auto ext = v.getDefiningOp<mlir::arith::ExtFOp>()) {
+      v = ext.getIn();
+      continue;
+    }
+    if (v.getDefiningOp<mlir::triton::TransOp>())
+      return true;
+    if (auto bitcast = v.getDefiningOp<mlir::triton::BitcastOp>();
+        bitcast && sdIsByteToFp8PayloadBitcast(bitcast) &&
+        bitcast.getResult().hasOneUse()) {
+      v = bitcast.getSrc();
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
 static mlir::triton::LoadOp sdPeelToLoad(mlir::Value v) {
   for (int i = 0; i < 8 && v; ++i) {
     if (auto ld = v.getDefiningOp<mlir::triton::LoadOp>()) return ld;
@@ -15907,7 +15952,7 @@ static ScalarDotOp sdEmitScalarDot(
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
     mlir::Value reductionExtent = {}, bool transposeA = false,
-    const SdScaleInfo *scaleInfo = nullptr) {
+    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false) {
   // Strides: A/B leading-dim (row) multiplier. For ordinary contiguous
   // row-major inputs the A row stride equals the (masked) K extent, so it is
   // also the default reduction trip count. The weighted-Gram path supplies a
@@ -15927,9 +15972,43 @@ static ScalarDotOp sdEmitScalarDot(
     return {};
   mlir::Value strideADynamic =
       findAxisStride(aLoad.getPtr(), /*axis=*/transposeA ? 1 : 0);
+  // `stride_b` is the multiplier of B's SLOW axis in the load's own pointer
+  // arithmetic, i.e. axis 0, transposed or not. What the transpose changes is
+  // which logical index that axis carries — N instead of K — and therefore only
+  // which side of the multiply it lands on in the emitter, not where the stride
+  // is read from.
   mlir::Value strideBDynamic = findAxisStride(bLoad.getPtr(), /*axis=*/0);
   auto strideAOpt = sdConstStride(aParts.rowContrib);
   auto strideBOpt = sdConstStride(bParts.rowContrib);
+  // B can be transposed WITHOUT a `tt.trans`, purely in the address: `b + n*K +
+  // k` leaves the tile axes as [k, n] but puts the large stride on the COLUMN
+  // index. `stride_b` is read off the row contribution, so that shape was
+  // indexed as `k*1 + n` — a wrong answer that compiles, and the form a
+  // hand-written trans-B matmul naturally takes.
+  //
+  // Detect it by reading which axis actually carries the stride, not by
+  // guessing: a unit row stride together with a non-unit column stride is the
+  // transposed layout, and `transpose_b`'s `col*stride_b + k` is exactly its
+  // index once `stride_b` comes from the column side.
+  if (!transposeB) {
+    mlir::Value strideBColDynamic =
+        findAxisStride(bLoad.getPtr(), /*axis=*/1);
+    auto strideBColOpt = sdConstStride(bParts.colContrib);
+    // A bare `k[:, None]` row index has no multiply at all, so sdConstStride
+    // reports nullopt rather than 1. That is only readable as stride 1 when the
+    // COLUMN axis demonstrably carries one, which `bigColStride` below
+    // establishes — so the two conditions are checked together and neither
+    // alone claims anything.
+    const bool unitRowStride =
+        !strideBDynamic && (!strideBOpt || *strideBOpt == 1);
+    const bool bigColStride =
+        strideBColDynamic || (strideBColOpt && *strideBColOpt > 1);
+    if (unitRowStride && bigColStride) {
+      transposeB = true;
+      strideBDynamic = strideBColDynamic;
+      strideBOpt = strideBColOpt;
+    }
+  }
   if ((!strideADynamic && (!strideAOpt || *strideAOpt <= 0)) ||
       (!strideBDynamic && (!strideBOpt || *strideBOpt <= 0)))
     return {};
@@ -16169,13 +16248,15 @@ static ScalarDotOp sdEmitScalarDot(
   }
   if (transposeA)
     scalarDot->setAttr("transpose_a", builder.getUnitAttr());
+  if (transposeB)
+    scalarDot->setAttr("transpose_b", builder.getUnitAttr());
   // Zero-init dot accumulator -> eligible for the SIMD-group fast path (the
   // accumulator starts at simdgroup_matrix_zero; tail M/N and ragged K are
   // handled by masked staged loads whose extents ScalarDotLowering derives from
   // the store mask when present, else the full tile bounds). The warp count is
   // recovered in the pattern from the tile's threadsPerBlock.
   if (batchTile == 1 && sdIsZeroInit(cInit) && !weightLoad && !transposeA &&
-      !scaleInfo)
+      !transposeB && !scaleInfo)
     scalarDot->setAttr("metal.simdgroup", builder.getUnitAttr());
   replaceTarget.replaceAllUsesWith(scalarDot.getResult());
   return scalarDot;
@@ -16555,7 +16636,9 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
   auto cvtA = dot.getA().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
   auto cvtB = dot.getB().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
   if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
-                       resultTensorTy))
+                       resultTensorTy, {}, {}, /*transposeA=*/false,
+                       /*scaleInfo=*/nullptr,
+                       sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();
 
   if (resCvt) resCvt.erase();
@@ -16631,7 +16714,9 @@ static mlir::LogicalResult tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
 
   mlir::Value cInit = forOp.getInitArgs()[0];
   if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
-                       resultTensorTy))
+                       resultTensorTy, {}, {}, /*transposeA=*/false,
+                       /*scaleInfo=*/nullptr,
+                       sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();
 
   if (resCvt) resCvt.erase();
@@ -17536,17 +17621,33 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                     .getResult(),
                 aLogicalIdx)
                 .getResult();
+        // A transposed B is stored [N, K], so its element is at
+        // `col*stride_b + k` rather than `k*stride_b + col`. Mirrors
+        // `transpose_a` above.
+        mlir::Value bLogicalIdx;
+        if (op->hasAttr("transpose_b")) {
+          bLogicalIdx =
+              mlir::arith::AddIOp::create(
+                  b, loc,
+                  mlir::arith::MulIOp::create(b, loc, bPhysicalCol, strideBI32)
+                      .getResult(),
+                  bPhysicalK)
+                  .getResult();
+        } else {
+          bLogicalIdx =
+              mlir::arith::AddIOp::create(
+                  b, loc,
+                  mlir::arith::MulIOp::create(b, loc, bPhysicalK, strideBI32)
+                      .getResult(),
+                  bPhysicalCol)
+                  .getResult();
+        }
         mlir::Value bIdx =
             mlir::arith::AddIOp::create(
                 b, loc,
                 mlir::arith::AddIOp::create(b, loc, bBaseI32, bBatchI32)
                     .getResult(),
-                mlir::arith::AddIOp::create(
-                    b, loc,
-                    mlir::arith::MulIOp::create(b, loc, bPhysicalK, strideBI32)
-                        .getResult(),
-                    bPhysicalCol)
-                    .getResult())
+                bLogicalIdx)
                 .getResult();
         auto aVal = GetElementOp::create(b, loc, aElem, adaptor.getABuf(),
                                          toUi32(aIdx));
@@ -17644,7 +17745,42 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
   }
 };
 
+// True when B's LOAD ADDRESS is transposed with no `tt.trans` in the IR: the
+// row index carries no stride and the column index carries a real one, i.e.
+// `b + n*K + k`. Every simdgroup matcher below detects trans-B by looking for a
+// `tt.trans` and otherwise stages B as an ordinary [K, N] tile, reading
+// `stride_b` off the (unit) row axis — so this shape came out as `k*stride + n`
+// instead of `n*K + k`. Silently wrong, and the form a hand-written trans-B
+// matmul naturally takes.
+//
+// Declining here sends the dot to the scalar-dot tier, which detects the same
+// address shape and indexes it correctly. That is cheaper and far safer than
+// teaching four separate simdgroup matchers a second transpose path.
+static bool dotBAddressIsTransposed(mlir::triton::DotOp dot) {
+  // Peel the whole cone, not just the immediate defining op: Triton usually
+  // wraps the trans in a `ttg.convert_layout` on its way to the dot, and
+  // checking only the top op made a genuine `tl.trans` look like an
+  // address-transposed load.
+  if (sdConeCrossesTranspose(dot.getB()))
+    return false; // a real tt.trans; the matchers already handle it
+  auto bLoad = sdPeelToLoad(dot.getB());
+  if (!bLoad)
+    return false;
+  if (findAxisStride(bLoad.getPtr(), /*axis=*/0))
+    return false; // row axis carries the stride: ordinary [K, N]
+  SdPtrParts parts = sdSplitPtr(bLoad.getPtr());
+  if (auto rowStride = sdConstStride(parts.rowContrib))
+    if (*rowStride != 1)
+      return false;
+  if (findAxisStride(bLoad.getPtr(), /*axis=*/1))
+    return true;
+  auto colStride = sdConstStride(parts.colContrib);
+  return colStride && *colStride > 1;
+}
+
 static void rewriteSingleDot(mlir::triton::DotOp dot) {
+  if (dotBAddressIsTransposed(dot))
+    return;
   // Matmul track session 4c-3: try canonical 3-iter_arg unroll first
   // (real Triton matmul shape with a_ptrs/b_ptrs/acc iter_args).
   if (mlir::succeeded(tryUnrollCanonical3IterArgDot(dot))) return;
