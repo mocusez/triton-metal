@@ -931,6 +931,91 @@ static std::optional<TileInfo> findLargestRank2Tile(mlir::Operation *op) {
   return tile;
 }
 
+// The rank-2 tile that breaks the one-bijection premise, if the kernel has one.
+//
+// Everything in this backend assumes one (thread, iv) -> element mapping per
+// kernel, which a rank-1 tile meets with `element == localTid`. A rank-2 tile
+// SMALLER than the threadgroup does not: it puts row n on thread `n * cols`. A
+// rank-1 value derived from its cone therefore carries a different mapping than
+// its rank-1 siblings, and the two meet — silently — wherever they are combined.
+//
+// Every site that has to agree about the mapping asks HERE, so the answers
+// cannot drift apart. There are four, and they must move together; changing any
+// subset leaves a different pair disagreeing (see the commit that added this):
+//   * MakeRangeLowering       hands back the companion's ROW coordinate
+//   * lowerRank1Reduce        rebuilds its source by logical position
+//   * ReduceLowering          reads the row buffer at the row coordinate
+//   * StoreLowering           drops its `localTid < numElements` guard
+//
+// Returns nullopt for every kernel whose rank-2 tile is tpb-sized or larger,
+// which keeps `localTid` and their emission byte for byte.
+// Answered ONCE, on the pristine module, and cached here.
+//
+// Deciding it per call was the first attempt and it is wrong: conversion
+// replaces the rank-2 `tt.load` early, so a site that asks late sees a module
+// with no rank-2 tensor results left and is told there is no companion. The
+// sites then disagree — the store kept a `localTid < rows` guard while the
+// range had already been re-mapped, and a 4x8 rowsum wrote row 0 and left the
+// other three at zero. Asking a fixed answer is the whole point.
+static std::optional<TileInfo> g_subTpbCompanion;
+static mlir::triton::gpu::BlockedEncodingAttr g_subTpbCompanionEnc;
+
+static std::optional<TileInfo>
+computeSubTpbRank2Companion(mlir::ModuleOp modOp,
+                            mlir::triton::gpu::BlockedEncodingAttr *encOut) {
+  std::optional<TileInfo> best;
+  mlir::triton::gpu::BlockedEncodingAttr bestEnc;
+  int64_t bestSize = 0;
+  modOp.walk([&](mlir::Operation *inner) {
+    for (auto v : inner->getResults()) {
+      auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+      if (!rt || rt.getRank() != 2)
+        continue;
+      if (mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
+        continue;
+      auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+          rt.getEncoding());
+      if (!enc)
+        continue;
+      auto ti = tileFromTensor(rt);
+      if (!ti || ti->shape.size() != 2)
+        continue;
+      int64_t sz = ti->shape[0] * ti->shape[1];
+      if (sz > bestSize) {
+        bestSize = sz;
+        best = ti;
+        bestEnc = enc;
+      }
+    }
+  });
+  if (!best || !bestEnc || best->threadsPerBlock <= 0 ||
+      bestSize >= best->threadsPerBlock)
+    return std::nullopt;
+  // Callers identify a rank-1 value as the ROW index by its extent, and a
+  // SQUARE tile makes that impossible: rows and columns are the same length,
+  // so a column index would be re-mapped to the row coordinate. That breaks
+  // batch normalization (8x8 tile, axis=0 reduce), which was correct before.
+  //
+  // Declining every square tile is what makes the extent test sound. It costs
+  // nothing here: the shape with the demonstrated wrong answer is a head dim
+  // far smaller than BLOCK_N, and squareness is checked rather than the
+  // kernel's reduce axes because those are rewritten DURING conversion — a
+  // module walk answers differently depending on which site asks, which is
+  // exactly the drift this function exists to prevent.
+  if (best->shape[0] == best->shape[1])
+    return std::nullopt;
+  if (encOut)
+    *encOut = bestEnc;
+  return best;
+}
+
+static std::optional<TileInfo> findSubTpbRank2Companion(
+    mlir::Operation *op, mlir::triton::gpu::BlockedEncodingAttr *encOut) {
+  if (g_subTpbCompanion && encOut)
+    *encOut = g_subTpbCompanionEnc;
+  return g_subTpbCompanion;
+}
+
 // One coordinate of the current element under that shared bijection: the flat
 // per-iter tile index (`localTid*E + iv` contiguous, `localTid + iv*tpb`
 // strided) decomposed by the parent layout's `order`. `axis` is the tile axis
@@ -1165,6 +1250,31 @@ struct MakeRangeLowering
               return mlir::success();
             }
           }
+        }
+      }
+    }
+    // 1D path, sub-tpb companion case FIRST: hand back the companion tile's ROW
+    // coordinate so a rank-1 range and the 2-D cone are the same mapping. See
+    // findSubTpbRank2Companion for why all four sites move together.
+    if (auto info = tileFromTensor(resTy)) {
+      if (info->rank == 1) {
+        mlir::triton::gpu::BlockedEncodingAttr companionEnc;
+        auto companion = findSubTpbRank2Companion(op, &companionEnc);
+        if (companion && companionEnc &&
+            resTy.getDimSize(0) == companion->shape[0]) {
+          mlir::Value row = emitTileAxisCoord(op, *companion, companionEnc,
+                                              /*axis=*/0, rewriter, loc);
+          // emitTileAxisCoord returns the raw coordinate; lanes past the tile
+          // run beyond its rows, so wrap as the reduce's own row read does.
+          auto cRows = mlir::arith::ConstantOp::create(
+              rewriter, loc,
+              rewriter.getI32IntegerAttr(
+                  static_cast<int32_t>(companion->shape[0])));
+          row = mlir::arith::RemSIOp::create(rewriter, loc, row,
+                                             cRows.getResult())
+                    .getResult();
+          rewriter.replaceOp(op, row);
+          return mlir::success();
         }
       }
     }
@@ -3822,7 +3932,19 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
   // 1:N change, no tileFromTensor change — see
   // .omc/plans/option-beta-spt-load-lowering.md.
   mlir::Value inputScalarPT;
-  if (sliceSource) {
+  // Under a sub-tpb companion the per-thread scalar carries the rank-2 mapping,
+  // so combining it once per thread counts each logical element `cols` times —
+  // the sum came out exactly that factor too large. Rebuild by logical position
+  // instead, which is what the slice path already does and is mapping-agnostic.
+  // Requires an evaluable cone; without one, fall through rather than decline,
+  // because a decline here is a process kill.
+  bool companionRebuild = false;
+  if (!sliceSource) {
+    if (auto companion = findSubTpbRank2Companion(op, nullptr))
+      companionRebuild = BLOCK == companion->shape[0] &&
+                         rank1ConeSupported(op.getSrcs().front(), 0);
+  }
+  if (sliceSource || companionRebuild) {
     // The converted adaptor scalar follows the slice's replicated physical
     // layout, not a one-thread-per-logical-element rank-1 layout. Rebuild the
     // logical source at positions `localTid + k*tpb` instead. A preceding
@@ -8956,7 +9078,23 @@ struct ReduceLowering
     // localTid (each fill thread owns its own row). Applying `flat / N` there
     // feeds the next reduce the wrong row — chained softmax's `s` regresses
     // exactly that way.
-    if (tileLoop && outTile && outTile->elemPerThread > 1 && outIs2D) {
+    // The companion re-maps every rank-1 make_range to the ROW coordinate, so
+    // the consumer addresses by that coordinate; read the row buffer the same
+    // way or the two disagree.
+    mlir::triton::gpu::BlockedEncodingAttr companionEnc;
+    if (auto companion = findSubTpbRank2Companion(op, &companionEnc);
+        companion && companionEnc && companion->shape[0] == M) {
+      mlir::Value row = emitTileAxisCoord(op, *companion, companionEnc,
+                                          /*axis=*/0, rewriter, loc);
+      auto cRows = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+      row = mlir::arith::RemSIOp::create(rewriter, loc, row, cRows.getResult())
+                .getResult();
+      outIdxUI32 = mlir::UnrealizedConversionCastOp::create(
+                       rewriter, loc, mlir::TypeRange{ui32},
+                       mlir::ValueRange{row})
+                       .getResult(0);
+    } else if (tileLoop && outTile && outTile->elemPerThread > 1 && outIs2D) {
       mlir::Value flat = emitPerIterIndex(*outTile, tileLoop, rewriter, loc);
       outIdxUI32 = rowOfFlat(flat);
     } else if (tileLoop && outTile && outTile->elemPerThread > 1 &&
@@ -10144,6 +10282,15 @@ struct StoreLowering
       numElements *= s;
     bool needGuard =
         tile->elemPerThread <= 1 && numElements < tile->threadsPerBlock;
+    // Under a sub-tpb companion the index is the companion's ROW coordinate,
+    // already wrapped into [0, rows), so EVERY lane addresses in range and the
+    // guard's `localTid < numElements` would instead silence all but the first
+    // few rows. Lanes sharing a row write the same value to the same address.
+    if (needGuard) {
+      if (auto companion = findSubTpbRank2Companion(op, nullptr))
+        if (numElements == companion->shape[0])
+          needGuard = false;
+    }
     if (!needGuard) {
       StoreOp::create(rewriter, loc, sval, memref, idx);
       rewriter.eraseOp(op);
@@ -11083,7 +11230,16 @@ struct MaskedStoreLowering
       int64_t numElements = 1;
       for (auto s : tile->shape)
         numElements *= s;
-      if (tile->elemPerThread <= 1 &&
+      //
+      // Exempt under a sub-tpb companion, for the reason spelled out at the
+      // unmasked store: the index is the companion's ROW coordinate wrapped
+      // into [0, rows), so no lane is out of tile and `localTid < rows` would
+      // silence every row but the first. A 4x8 rowsum on 64 threads wrote row
+      // 0 and left rows 1-3 at zero with this guard still attached.
+      bool companionExempt = false;
+      if (auto companion = findSubTpbRank2Companion(op, nullptr))
+        companionExempt = numElements == companion->shape[0];
+      if (tile->elemPerThread <= 1 && !companionExempt &&
           numElements < tile->threadsPerBlock) {
         mlir::Value localTid =
             emitLocalTid(rewriter, loc, tile->threadsPerBlock);
@@ -22020,108 +22176,6 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
 // ReduceLowering's row read) fixes attention and breaks rank-2 reduce kernels
 // in turn, because StoreLowering's participation guard assumes localTid too;
 // the sites do not converge. See `.omc/fuzz/README.md`.
-// Does `v` come from a `tt.make_range` carrying a PLAIN rank-1 blocked
-// encoding — i.e. a value living under `element == localTid`? Slice-encoded
-// ranges belong to the 2-D cone and are not the hazard.
-static bool derivesFromRank1BlockedRange(mlir::Value v, int depth = 0) {
-  if (!v || depth > 8)
-    return false;
-  auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
-  if (rt && rt.getRank() == 1 &&
-      mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-          rt.getEncoding())) {
-    if (v.getDefiningOp<mlir::triton::MakeRangeOp>())
-      return true;
-  }
-  mlir::Operation *def = v.getDefiningOp();
-  if (!def || def->getNumRegions() != 0)
-    return false;
-  for (mlir::Value o : def->getOperands())
-    if (derivesFromRank1BlockedRange(o, depth + 1))
-      return true;
-  return false;
-}
-
-static mlir::LogicalResult
-validateSubTpbRank1Crossing(mlir::ModuleOp moduleOp) {
-  int64_t tpb = 0, smallestRank2 = 0;
-  moduleOp.walk([&](mlir::Operation *inner) {
-    for (auto v : inner->getResults()) {
-      auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
-      if (!rt || rt.getRank() != 2)
-        return;
-      if (mlir::isa<mlir::triton::PointerType>(rt.getElementType()))
-        return;
-      auto ti = tileFromTensor(rt);
-      if (!ti || ti->shape.size() != 2)
-        return;
-      int64_t sz = ti->shape[0] * ti->shape[1];
-      if (sz > smallestRank2) {
-        smallestRank2 = sz;
-        tpb = ti->threadsPerBlock;
-      }
-    }
-  });
-  if (smallestRank2 <= 0 || tpb <= 0 || smallestRank2 >= tpb)
-    return mlir::success();
-
-  bool valid = true;
-  moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
-    auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
-    auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
-    if (!srcRtt || !dstRtt || srcRtt.getRank() != 1 || dstRtt.getRank() != 1)
-      return;
-    auto sl = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
-        srcRtt.getEncoding());
-    if (!sl ||
-        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-            sl.getParent()) ||
-        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-            dstRtt.getEncoding()))
-      return;
-    // Safe as long as the value never MIXES with another tensor: a store
-    // re-derives its own address, and a single-tensor-operand pure op (the
-    // `arith.truncf` an f16 reduce ends with, a cast) cannot bring a second
-    // bijection in. The hazard is an op with two or more tensor operands —
-    // `arith.select(cmpi(offs_n, N), qk, -inf)` in attention — where the other
-    // operand comes from a rank-1 make_range under `element == localTid`.
-    llvm::SmallVector<mlir::Value, 8> wl{cvt.getResult()};
-    llvm::SmallPtrSet<mlir::Operation *, 8> seen;
-    bool mixes = false;
-    while (!wl.empty() && !mixes) {
-      mlir::Value v = wl.pop_back_val();
-      for (mlir::Operation *u : v.getUsers()) {
-        if (mlir::isa<mlir::triton::StoreOp>(u))
-          continue;
-        if (!seen.insert(u).second)
-          continue;
-        // Mixing with another 2-D-derived value is fine — same bijection.
-        // What is not is mixing with something under `element == localTid`,
-        // which is what a plain rank-1 blocked make_range produces.
-        bool hazard = !mlir::isMemoryEffectFree(u);
-        for (mlir::Value o : u->getOperands())
-          if (o != v && derivesFromRank1BlockedRange(o))
-            hazard = true;
-        if (hazard) {
-          mixes = true;
-          break;
-        }
-        for (mlir::Value r : u->getResults())
-          wl.push_back(r);
-      }
-    }
-    if (!mixes)
-      return;
-    cvt.emitOpError(
-        "Metal backend: a rank-2 tile smaller than the threadgroup cannot feed "
-        "a value into rank-1 ops (the two layouts disagree about which thread "
-        "holds which element). Raise the block size so the tile has at least "
-        "threads-per-block elements, or lower num_warps");
-    valid = false;
-  });
-  return mlir::success(valid);
-}
-
 static mlir::LogicalResult validateDotScaledSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::DotScaledOp dot) {
@@ -22153,7 +22207,6 @@ struct ConvertTritonGPUToMetalPass
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateUnitAxisReduce(moduleOp)) ||
-        mlir::failed(validateSubTpbRank1Crossing(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||
         mlir::failed(validateClampFSupport(moduleOp)) ||
@@ -22890,6 +22943,11 @@ struct ConvertTritonGPUToMetalPass
     llvm::DenseMap<mlir::Value, mlir::Value> reduceRowBufs;
     g_reduceRowBufs = &reduceRowBufs;
 
+    // Answered here, once, while the rank-2 tensors are all still present.
+    g_subTpbCompanionEnc = {};
+    g_subTpbCompanion =
+        computeSubTpbRank2Companion(moduleOp, &g_subTpbCompanionEnc);
+
     ReduceOutTileMap reduceOutTiles =
         precomputeRank2Axis1ReduceOutTiles(moduleOp);
 
@@ -22945,6 +23003,7 @@ struct ConvertTritonGPUToMetalPass
       if (mlir::failed(mlir::applyPartialConversion(
               moduleOp, funcTarget, std::move(funcPatterns)))) {
         g_reduceRowBufs = nullptr;
+        g_subTpbCompanion = std::nullopt;
         g_axis0BroadcastExpands = nullptr;
         signalPassFailure();
         return;
@@ -22967,6 +23026,7 @@ struct ConvertTritonGPUToMetalPass
       g_replayOriginalReduceCones = false;
       if (mlir::failed(preReduceResult)) {
         g_reduceRowBufs = nullptr;
+        g_subTpbCompanion = std::nullopt;
         g_axis0BroadcastExpands = nullptr;
         signalPassFailure();
         return;

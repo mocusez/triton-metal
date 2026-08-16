@@ -926,44 +926,29 @@ def _subtpb_attention_kernel(Q, K, V, Out, M, N, d, sm_scale,
     tl.store(Out + pid * d + offs_d, acc / l_i, mask=offs_d < d)
 
 
-@pytest.mark.parametrize("d,block_n,num_warps", [(2, 32, 4), (2, 16, 2),
-                                                 (4, 16, 4)])
-def test_subtpb_rank1_crossing_is_rejected_not_wrong(d, block_n, num_warps,
-                                                     capfd):
+@pytest.mark.parametrize("d,block_n,num_warps", [
+    # tile SMALLER than the threadgroup — every one of these returned wrong
+    # numbers, with no diagnostic, before the four sites were made to agree.
+    (2, 32, 4), (2, 16, 2), (4, 16, 4), (2, 32, 2), (2, 64, 1),
+    # tile at or above tpb — correct before, and must stay byte-identical.
+    (8, 32, 4), (4, 32, 4), (2, 32, 1), (16, 32, 4), (8, 16, 2),
+])
+def test_subtpb_rank1_crossing(d, block_n, num_warps):
     """A rank-2 tile smaller than the threadgroup puts row n on thread n*cols,
-    not thread n, so a value that leaves the 2-D cone and is then combined with
-    a rank-1 mask reads under two different bijections. This returned WRONG
-    NUMBERS — `medium-softmax_attention.py` at head dim 2 under its own default
-    num_warps — with no diagnostic at all.
+    not on thread n. A value that leaves the 2-D cone and is then combined with
+    a rank-1 mask therefore reads under two different mappings, and
+    `medium-softmax_attention.py` returned wrong numbers at head dim 2 under
+    its own default num_warps.
 
-    Asserted on the ERROR: nothing here should ever produce a plausible-looking
-    output again without the underlying layout mismatch being fixed."""
+    Both regimes are swept together on purpose: the fix makes four sites agree
+    on the mapping, and getting any subset of them right leaves a different
+    pair disagreeing — which shows up as one half of this parametrization or
+    the other."""
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
     m, n = 4, 8
-    q = torch.randn(m, d, dtype=torch.float32, device="mps")
-    k = torch.randn(n, d, dtype=torch.float32, device="mps")
-    v = torch.randn(n, d, dtype=torch.float32, device="mps")
-    out = torch.zeros(m, d, dtype=torch.float32, device="mps")
-    with pytest.raises(Exception):
-        _subtpb_attention_kernel[(m,)](q, k, v, out, m, n, d, d ** -0.5,
-                                       BLOCK_N=block_n, BLOCK_D=d,
-                                       num_warps=num_warps)
-    assert "smaller than the threadgroup" in capfd.readouterr().err
-
-
-@pytest.mark.parametrize("d,block_n,num_warps", [(8, 32, 4), (4, 32, 4),
-                                                 (2, 32, 1)])
-def test_subtpb_guard_leaves_tpb_sized_tiles_alone(d, block_n, num_warps):
-    """The guard must key on the tile being SMALLER than the threadgroup, not
-    on the kernel shape: the same kernel with a tpb-sized tile is correct and
-    has to stay compilable."""
-    torch = pytest.importorskip("torch")
-    if not torch.backends.mps.is_available():
-        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    m, n = 4, 8
-    torch.manual_seed(d)
+    torch.manual_seed(d * 100 + block_n + num_warps)
     q = torch.randn(m, d, dtype=torch.float32)
     k = torch.randn(n, d, dtype=torch.float32)
     v = torch.randn(n, d, dtype=torch.float32)
@@ -974,6 +959,41 @@ def test_subtpb_guard_leaves_tpb_sized_tiles_alone(d, block_n, num_warps):
     torch.mps.synchronize()
     ref = torch.softmax((q @ k.t()) * (d ** -0.5), dim=-1) @ v
     torch.testing.assert_close(out.cpu(), ref, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _subtpb_rowsum_kernel(x_ptr, o_ptr, M, N, BM: tl.constexpr,
+                          BN: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :], mask=mask, other=0.0)
+    tl.store(o_ptr + rm, tl.sum(v, axis=1), mask=rm < M)
+
+
+@pytest.mark.parametrize("bm,bn,num_warps", [
+    # tile smaller than the threadgroup: 32 elements on 64 threads, and so on.
+    (4, 8, 2), (4, 8, 4), (4, 8, 8), (2, 16, 2), (16, 4, 4), (32, 2, 4),
+    (8, 16, 8), (16, 8, 8),
+    # tile at or above tpb — unchanged emission, kept in the same sweep.
+    (8, 8, 1), (16, 8, 2), (32, 8, 4),
+])
+def test_subtpb_rowsum(bm, bn, num_warps):
+    """The masked store takes a different path than the unmasked one and needs
+    the same exemption. With the guard left on, `localTid < rows` let only the
+    lanes below the row count store, and every one of those sits in row 0: a
+    4x8 rowsum wrote row 0 and left rows 1-3 at zero."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(bm * 100 + bn + num_warps)
+    x = torch.rand(bm, bn, dtype=torch.float32)
+    o = torch.zeros(bm, dtype=torch.float32, device="mps")
+    _subtpb_rowsum_kernel[(1,)](x.to("mps"), o, bm, bn, BM=bm, BN=bn,
+                                num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(o.cpu(), x.sum(1), atol=1e-5, rtol=1e-5)
+
 
 @triton.jit
 def _unit_axis_reduce_kernel(x_ptr, o_ptr, N, BN: tl.constexpr):
