@@ -21922,6 +21922,43 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
 // affine forms have their own matchers and are admitted whatever their combine
 // looks like; everything else must be a rank-1, axis-0, f32/i32 scan whose
 // combine is add or mul.
+// A rank-2 reduce over an axis of extent ONE, rejected before conversion.
+//
+// It is a no-op reduce, so nothing is lost by declining it, but the tile it
+// leaves behind is degenerate: `tl.arange(0, 1)` as the inner axis makes a
+// BLOCK_N x 1 tile, and both the reduce and the slice-encoded `tt.make_range`
+// over it fall off the end of their lowerings. In conversion that is a process
+// kill, and it takes the next compile in the same context with it — a sweep
+// over head dims lost the whole interpreter at head dim 1.
+//
+// This is not the sub-tpb crossing (see findSubTpbRank2Companion): it fails at
+// num_warps=1 too, where the tile is exactly threadgroup-sized and none of the
+// companion logic runs.
+static mlir::LogicalResult validateUnitAxisReduce(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::ReduceOp op) {
+    if (op.getSrcs().empty())
+      return;
+    auto srcTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+    if (!srcTy || srcTy.getRank() != 2)
+      return;
+    int32_t axis = static_cast<int32_t>(op.getAxis());
+    if (axis < 0 || axis >= srcTy.getRank())
+      return;
+    if (srcTy.getDimSize(axis) != 1)
+      return;
+    op.emitOpError("Metal backend: reduce over an axis of extent 1 is not "
+                   "supported (source ")
+        << srcTy << ", axis " << axis
+        << "). The reduce is a no-op; drop it, or give the axis a block size "
+           "of at least 2 — a BLOCK x 1 tile has no lowering for its "
+           "slice-encoded rank-1 values.";
+    valid = false;
+  });
+  return mlir::success(valid);
+}
+
 static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::ScanOp op) {
@@ -22115,6 +22152,7 @@ struct ConvertTritonGPUToMetalPass
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
+        mlir::failed(validateUnitAxisReduce(moduleOp)) ||
         mlir::failed(validateSubTpbRank1Crossing(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||

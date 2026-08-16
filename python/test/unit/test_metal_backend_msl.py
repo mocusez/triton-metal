@@ -974,3 +974,27 @@ def test_subtpb_guard_leaves_tpb_sized_tiles_alone(d, block_n, num_warps):
     torch.mps.synchronize()
     ref = torch.softmax((q @ k.t()) * (d ** -0.5), dim=-1) @ v
     torch.testing.assert_close(out.cpu(), ref, atol=2e-4, rtol=2e-4)
+
+@triton.jit
+def _unit_axis_reduce_kernel(x_ptr, o_ptr, N, BN: tl.constexpr):
+    rn = tl.arange(0, BN)
+    rd = tl.arange(0, 1)
+    v = tl.load(x_ptr + rn[:, None] + rd[None, :], mask=rn[:, None] < N,
+                other=0.0)
+    tl.store(o_ptr + rn, tl.sum(v, axis=1), mask=rn < N)
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_unit_axis_reduce_is_rejected_not_crash(num_warps):
+    """Reducing an axis of extent 1 is a no-op, but the BLOCK x 1 tile it
+    leaves has no lowering for its slice-encoded rank-1 values. It used to be
+    declined DURING conversion, which in this backend aborts the process and
+    poisons the context for the next compile — a head-dim sweep lost the whole
+    interpreter at head dim 1. Asserted as a catchable rejection."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = torch.rand(32, 1, dtype=torch.float32, device="mps")
+    o = torch.zeros(32, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _unit_axis_reduce_kernel[(1,)](x, o, 32, BN=32, num_warps=num_warps)
