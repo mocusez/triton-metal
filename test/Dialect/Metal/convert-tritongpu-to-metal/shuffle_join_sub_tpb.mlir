@@ -1,8 +1,10 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
-// `tt.join` / `tt.split` / `tt.cat` — what `tl.join`, `tl.split`, `tl.cat` and
-// `tl.interleave` lower to. All three were rejected outright.
+// `tt.join` / `tt.split` — what `tl.join`, `tl.split` and `tl.interleave` lower
+// to. Both were rejected outright. (`tl.cat` used to reach a `tt.cat` of its
+// own; upstream deleted that op, so `tl.cat` now lowers through this same
+// `tt.join` plus a permute and a reshape.)
 //
 // Triton picks layouts that keep them per-thread: the join result below is
 // `sizePerThread = [1, 2]`, i.e. one thread owns both columns of its row. This

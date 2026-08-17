@@ -46,6 +46,11 @@ class MetalOptions:
     maxnreg: int = None
     backend_name: str = "metal"
     instrumentation_mode: str = ""
+    # Injected unconditionally by jit.py from knobs.compilation, so the field
+    # has to exist even though Metal runs no sanitizer passes. It stays at the
+    # default unless the user sets TRITON_FPSAN_HOMOMORPHIC_CASTS, which is
+    # exactly when the contract layer below should speak up.
+    fpsan_homomorphic_casts: bool = False
     ir_override: str = None
 
     def __post_init__(self):
@@ -102,6 +107,8 @@ _OPT_WARN_UNSUPPORTED = {
         "Metal has no hardware fp8 dot path; the exact E5M2 scaled-dot path is software-only."
     ),
     "instrumentation_mode": "Metal runs no instrumentation passes.",
+    "fpsan_homomorphic_casts": "Metal runs no fp sanitizer, so there are no "
+                               "homomorphic casts to instrument.",
 }
 _OPT_REJECT_UNSUPPORTED = {
     "warp_size": "Apple GPUs have a fixed SIMD width of 32; warp_size must be 32 "

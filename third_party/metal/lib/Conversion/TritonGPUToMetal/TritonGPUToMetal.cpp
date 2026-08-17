@@ -3178,66 +3178,6 @@ struct SplitLowering : public mlir::OpConversionPattern<mlir::triton::SplitOp> {
   }
 };
 
-struct CatLowering : public mlir::OpConversionPattern<mlir::triton::CatOp> {
-  using OpConversionPattern::OpConversionPattern;
-  mlir::LogicalResult
-  matchAndRewrite(mlir::triton::CatOp op, OpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getLhs().getType());
-    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
-    if (!srcTy || !resTy || srcTy.getRank() != 1 || resTy.getRank() != 1)
-      return rewriter.notifyMatchFailure(op, "cat: rank-1 only");
-    if (underDivergentControlFlow(op))
-      return rewriter.notifyMatchFailure(op, "cat: divergent control flow");
-    std::optional<TileInfo> resTile = shuffleTileFor(resTy, srcTy);
-    if (!resTile)
-      return rewriter.notifyMatchFailure(op, "cat: shape out of envelope");
-    const int64_t N = srcTy.getDimSize(0);
-    // A sub-tpb rank-2 companion would put the rank-1 operands (or the result)
-    // in the per-row convention instead of one-element-per-lane, and cat has no
-    // row to speak of. Refuse rather than read the wrong lane.
-    if (std::optional<TileInfo> companion =
-            findSubTpbRank2Companion(op, nullptr))
-      if (!companion->shape.empty() &&
-          (companion->shape[0] == N || companion->shape[0] == 2 * N))
-        return rewriter.notifyMatchFailure(
-            op, "cat: operands are under a sub-tpb companion mapping");
-    mlir::Value lhs = adaptor.getLhs();
-    mlir::Value rhs = adaptor.getRhs();
-    if (mlir::isa<mlir::RankedTensorType>(lhs.getType()) ||
-        mlir::isa<mlir::RankedTensorType>(rhs.getType()))
-      return rewriter.notifyMatchFailure(op, "cat: operands not scalarized");
-
-    const int64_t tpb = resTile->threadsPerBlock;
-    mlir::Type stageTy = metalStorageElementType(lhs.getType());
-    mlir::Value buf =
-        publishLaneBands({lhs, rhs}, tpb, stageTy, rewriter, loc);
-    // Result element p is lhs[p] below N and rhs[p - N] above it; the second
-    // band starts at slot tpb.
-    mlir::Value p = emitTileFlatIndex(op, *resTile, rewriter, loc);
-    auto cN = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
-    auto cShift = mlir::arith::ConstantOp::create(
-        rewriter, loc,
-        rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb - N)));
-    mlir::Value isLhs =
-        mlir::arith::CmpIOp::create(rewriter, loc,
-                                    mlir::arith::CmpIPredicate::slt, p,
-                                    cN.getResult())
-            .getResult();
-    mlir::Value shifted =
-        mlir::arith::AddIOp::create(rewriter, loc, p, cShift.getResult())
-            .getResult();
-    mlir::Value slot =
-        mlir::arith::SelectOp::create(rewriter, loc, isLhs, p, shifted)
-            .getResult();
-    rewriter.replaceOp(op, readLaneBandSlot(buf, slot, 2 * tpb, stageTy,
-                                            lhs.getType(), rewriter, loc));
-    return mlir::success();
-  }
-};
-
 //===----------------------------------------------------------------------===//
 // arith.muli on tensor → arith.muli on scalar (identity under typeconverter).
 // arith.addi on tensor → arith.addi on scalar (identity under typeconverter).
@@ -24580,21 +24520,6 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
             reject(o, "tt.split is implemented for an [N, 2] tile of at most "
                       "one element per thread, outside divergent control flow");
         })
-        .Case<mlir::triton::CatOp>([&](auto o) {
-          auto srcTy =
-              mlir::dyn_cast<mlir::RankedTensorType>(o.getLhs().getType());
-          bool companionBound = false;
-          if (srcTy)
-            if (std::optional<TileInfo> c = findSubTpbRank2Companion(o, nullptr))
-              companionBound = !c->shape.empty() &&
-                               (c->shape[0] == srcTy.getDimSize(0) ||
-                                c->shape[0] == 2 * srcTy.getDimSize(0));
-          if (!shuffleTileFor(o.getType(), o.getLhs().getType()) ||
-              underDivergentControlFlow(o) || companionBound)
-            reject(o, "tt.cat is implemented for rank-1 operands of at most one "
-                      "element per thread, outside divergent control flow and "
-                      "outside a sub-tpb rank-2 companion mapping");
-        })
         .Case<mlir::triton::PrintOp>([&](auto o) {
           // Implemented through the debug buffer; only a print of something
           // the type converter cannot scalarize is left.
@@ -26434,7 +26359,7 @@ struct ConvertTritonGPUToMetalPass
                  AddPtrLowering,
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
-                 JoinLowering, SplitLowering, CatLowering,
+                 JoinLowering, SplitLowering,
                  PrintLowering, AssertLowering, BarrierLowering, FpToFpLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
