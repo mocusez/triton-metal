@@ -379,31 +379,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL-LABEL: kernel void dot_scaled_e8m0_bf16
 // MSL: for (int
 // MSL: & 255
-// MSL: == 255
+// MSL: == (int16_t)(255)
 // MSL: bfloat(NAN)
 
 // MSL-LABEL: kernel void dot_scaled_e8m0_fp16_factor16
-// MSL: / 16
+// The factor-16 scale index is an arith.divui, so it carries an UNSIGNED cast
+// and is distinct from the signed M/N coordinate divides. It is emitted after
+// the exponent reconstruction, hence the order of these two checks.
 // MSL: as_type<float>
+// MSL: / (uint32_t)(16)
 // MSL: & 255
 // MSL-NOT: NAN
 
 // MSL-LABEL: kernel void dot_scaled_e8m0_e5m2
-// MSL: / 32
-// MSL: == 255
+// MSL: / (uint32_t)(32)
+// MSL: == (int16_t)(255)
 // MSL: bfloat(NAN)
 // MSL: << 8
 // MSL: as_type<half>(uint16_t(
 // MSL: as_type<bfloat>
 
 // MSL-LABEL: kernel void dot_scaled_e8m0_e4m3
-// MSL: / 32
-// MSL: == 127
+// MSL: / (uint32_t)(32)
+// MSL: == (int16_t)(127)
 // MSL: & 127
 // MSL: as_type<bfloat>(uint16_t(
 
 // MSL-LABEL: kernel void dot_scaled_e8m0_e2m1_kpack
-// MSL: / 2
+// MSL: / (uint32_t)(2)
 // MSL: & 15
 // MSL: & 7
 // MSL: as_type<bfloat>(uint16_t(

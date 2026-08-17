@@ -80,7 +80,9 @@ def test_dynamic_scalar_n_compiles_to_msl():
     # block, and a per-thread store. The mask now reads the ACTUAL index cone
     # `pid*BLOCK + (id.x - pid*tpb) < n` (per-thread correct for grid>1) rather
     # than the old collapsed global `id.x < n`. See MaskedLoad/StoreLowering.
-    assert "< v" in msl or "< n" in msl, (
+    # The compare carries an explicit signedness cast (see `signednessCast` in
+    # ModuleTranslation.cpp): signless i32 buffers are declared `uint32_t`.
+    assert "< (int32_t)(v" in msl or "< (int32_t)(n" in msl, (
         f"MSL missing per-thread mask cmp.\n--- MSL ---\n{msl}\n"
     )
     assert "if (" in msl, f"MSL missing guard if-block.\n--- MSL ---\n{msl}\n"

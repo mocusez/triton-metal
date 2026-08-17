@@ -320,8 +320,8 @@ def test_dot_scaled_e8m0_bf16_compiles_to_msl():
         "as_type<bfloat>",
         "bfloat(NAN)",
         "& 255",
-        "== 255",
-        "/ 32",
+        "== (int16_t)(255)",
+        "/ (uint32_t)(32)",
     ):
         assert needle in msl, f"scaled-dot MSL output missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
 
@@ -351,7 +351,7 @@ def test_dot_scaled_e8m0_e5m2_compiles_to_msl():
         "<< 8",
         "bfloat",
         "& 255",
-        "/ 32",
+        "/ (uint32_t)(32)",
     ):
         assert needle in msl, f"E5M2 scaled-dot MSL output missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
 
@@ -380,9 +380,9 @@ def test_dot_scaled_e8m0_e4m3_compiles_to_msl():
         for needle in (
             "as_type<bfloat>",
             "bfloat(NAN)",
-            "== 127",
+            "== (int16_t)(127)",
             "& 127",
-            "/ 32",
+            "/ (uint32_t)(32)",
         ):
             assert needle in msl, f"E4M3 scaled-dot MSL for {payload_type} missing {needle!r}.\n--- MSL ---\n{msl}\n"
 
@@ -457,19 +457,32 @@ def test_dot_scaled_e8m0_e2m1_compiles_to_msl(lhs_k_pack, rhs_k_pack):
     for needle in (
         "as_type<bfloat>",
         "bfloat(NAN)",
-        "/ 2",
+        "/ (uint32_t)(2)",
         "& 15",
         "& 7",
-        "/ 32",
+        "/ (uint32_t)(32)",
     ):
         assert needle in msl, f"E2M1 scaled-dot MSL missing {needle!r}.\n--- MSL ---\n{msl}\n"
 
     # Prove that the per-operand packing flags reach scalar_dot lowering.  The
     # generated variable numbers are intentionally ignored: only the physical
     # coordinate divided by two distinguishes K packing from outer M/N packing.
-    lhs_outer_address = bool(re.search(r"\(\(v\d+ / 16\) / 2\)", msl))
-    rhs_outer_address = "% 16) / 2)" in msl
-    k_packed_address = bool(re.search(r"\(v\d+ / 2\)", msl))
+    # Each integer op spells its own signedness onto its operands
+    # (`signednessCast`): the M/N coordinate divide is arith.divsi, the packing
+    # divide-by-two is arith.divui. The K-packed form stays distinguishable
+    # because only there is a BARE variable the unsigned divisor applies to.
+    lhs_outer_address = bool(
+        re.search(
+            r"\(uint32_t\)\(\(\(int32_t\)\(v\d+\) / \(int32_t\)\(16\)\)\) / \(uint32_t\)\(2\)",
+            msl,
+        )
+    )
+    rhs_outer_address = "% (int32_t)(16))) / (uint32_t)(2)" in msl
+    # K packing divides a BARE coordinate; outer packing divides the
+    # parenthesised M/N expression above, so the two stay distinguishable.
+    k_packed_address = bool(
+        re.search(r"\(uint32_t\)\(v\d+\) / \(uint32_t\)\(2\)", msl)
+    )
     assert lhs_outer_address is not lhs_k_pack
     assert rhs_outer_address is not rhs_k_pack
     assert k_packed_address is (lhs_k_pack or rhs_k_pack)

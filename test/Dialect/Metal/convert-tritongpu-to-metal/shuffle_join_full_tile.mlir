@@ -35,7 +35,7 @@
 // MSL: threadgroup_barrier(mem_flags::mem_threadgroup);
 // The read is clamped: lanes past the tile still execute it, and an
 // out-of-range threadgroup access is undefined rather than merely wasted.
-// MSL: = v[[BUF]][min((int)(max(
+// MSL: = v[[BUF]][min((int32_t)(max(
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 2], warpsPerCTA = [1, 1], order = [1, 0]}>

@@ -49,7 +49,7 @@ module {
 // region (its own C scope) and read after that scope closes.
 // CHECK: bool v[[COND:[0-9]+]] = false
 // CHECK: while (true)
-// CHECK: v[[COND]] = (v[[N]] < 8)
+// CHECK: v[[COND]] = ((int32_t)(v[[N]]) < (int32_t)(8))
 // CHECK: if (!v[[COND]]) break;
 // CHECK: v[[ACC]] = (v[[ACC]]) + (1.0
 // CHECK: v[[N]] = (v[[N]] + 1)

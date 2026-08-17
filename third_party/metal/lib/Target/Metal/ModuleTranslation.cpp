@@ -127,6 +127,46 @@ static llvm::StringRef typeToString(mlir::Type type) {
   llvm_unreachable("wrong type");
 }
 
+// MSL takes signed-vs-unsigned semantics from the C TYPE of the operand
+// expression, but in MLIR the signedness lives in the OP: slt vs ult, divsi vs
+// divui, remsi vs remui, shrsi vs shrui, sitofp vs uitofp, extsi vs extui.
+// Triton spells both `tl.int32` and `tl.uint32` as a signless i32 and lets the
+// op carry the distinction, and `metalStorageElementType` declares a signless
+// device buffer as `uint32_t`. Because a load is inlined at its use site, an
+// uncast operand silently turns every SIGNED operation on loaded data into an
+// unsigned one — `x < 0` never fires, `x.to(tl.float32)` yields 2^32, `//`,
+// `%` and `>>` are all wrong, and `tl.sort` orders negatives last.
+//
+// So an op that cares must spell its own signedness on the operand. Returns the
+// C-style cast prefix to wrap the operand in, or "" when signedness cannot
+// change the result (i1 is `bool`; non-integers carry no signedness).
+// arith.minsi/maxsi have always done this inline — this is the same rule,
+// hoisted so every signedness-sensitive op can apply it.
+static llvm::StringRef signednessCast(mlir::Type type, bool wantSigned) {
+  // An elementwise op can still be TENSOR-typed at this point — the emitter
+  // renders it once per element, inlining the operand's buffer read — so the
+  // signedness that matters is the element's. Without this, `math.absi` on a
+  // tile emitted `abs(v0[i])` on a `uint32_t` buffer, which is the identity.
+  if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(type))
+    type = shaped.getElementType();
+  auto intTy = llvm::dyn_cast<mlir::IntegerType>(type);
+  if (!intTy)
+    return "";
+  switch (intTy.getWidth()) {
+  case 8:
+    return wantSigned ? "(int8_t)" : "(uint8_t)";
+  case 16:
+    return wantSigned ? "(int16_t)" : "(uint16_t)";
+  case 32:
+    return wantSigned ? "(int32_t)" : "(uint32_t)";
+  case 64:
+    return wantSigned ? "(int64_t)" : "(uint64_t)";
+  default:
+    // i1 renders as `bool`, where signed and unsigned agree.
+    return "";
+  }
+}
+
 void ModuleTranslation::indent() {
   for (int i = 0; i < _curIndent; i++)
     _output << "  ";
@@ -6342,6 +6382,15 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       return;
     }
   }
+  // Emit an operand with the signedness the CONSUMING OP asks for (see
+  // `signednessCast`). Routes through translateValueOrVarName so a block
+  // argument or one result of a multi-result op still resolves.
+  auto emitAs = [&](mlir::Value v, bool wantSigned) {
+    llvm::StringRef cast = signednessCast(v.getType(), wantSigned);
+    _output << cast << "(";
+    translateValueOrVarName(v);
+    _output << ")";
+  };
   llvm::TypeSwitch<Operation *>(opInst)
       .Case<mlir::triton::metal::ConstantOp, mlir::triton::metal::GetElementOp,
             mlir::triton::metal::TgLoadIndexedOp,
@@ -6361,6 +6410,10 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // as new fixtures land.
         using P = mlir::arith::CmpIPredicate;
         const char *opStr = nullptr;
+        // MSL spells the signed and unsigned relations identically, so the
+        // predicate's signedness has to reach the operands as a cast — see
+        // `signednessCast`. eq/ne compare bit patterns and need neither.
+        bool wantSigned = true;
         switch (op.getPredicate()) {
         case P::eq:  opStr = " == "; break;
         case P::ne:  opStr = " != "; break;
@@ -6368,18 +6421,18 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         case P::sle: opStr = " <= "; break;
         case P::sgt: opStr = " > ";  break;
         case P::sge: opStr = " >= "; break;
-        case P::ult: opStr = " < ";  break;
-        case P::ule: opStr = " <= "; break;
-        case P::ugt: opStr = " > ";  break;
-        case P::uge: opStr = " >= "; break;
+        case P::ult: opStr = " < ";  wantSigned = false; break;
+        case P::ule: opStr = " <= "; wantSigned = false; break;
+        case P::ugt: opStr = " > ";  wantSigned = false; break;
+        case P::uge: opStr = " >= "; wantSigned = false; break;
         }
         // Operands may be block arguments (e.g. an scf.for induction var fed
         // straight into a comparison by the computed-cone reduce evaluator),
         // so route through translateValueOrVarName, not translateValue.
         _output << "(";
-        translateValueOrVarName(op.getLhs());
+        emitAs(op.getLhs(), wantSigned);
         _output << opStr;
-        translateValueOrVarName(op.getRhs());
+        emitAs(op.getRhs(), wantSigned);
         _output << ")";
       })
       .Case<mlir::arith::CmpFOp>([&](mlir::arith::CmpFOp op) {
@@ -6661,34 +6714,22 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       .Case<mlir::arith::DivSIOp>([&](mlir::arith::DivSIOp op) {
         // Used by 2D MakeRangeLowering: `row = idx / BLOCK_N`. MSL integer
-        // divsion follows C semantics, which matches arith.divsi for the
-        // non-negative thread indices we emit here.
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
+        // division follows C semantics, which matches arith.divsi ONLY when
+        // both operands are read as signed — a signless device buffer is
+        // declared `uint32_t`, so the cast is what makes `x // 2` truncate
+        // toward zero instead of dividing 4294967295 by 2.
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/true);
         _output << " / ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/true);
         _output << ")";
       })
       .Case<mlir::arith::RemSIOp>([&](mlir::arith::RemSIOp op) {
         // Used by 2D MakeRangeLowering: `col = idx % BLOCK_N`.
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/true);
         _output << " % ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/true);
         _output << ")";
       })
       .Case<mlir::arith::AndIOp>([&](mlir::arith::AndIOp op) {
@@ -6709,20 +6750,17 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       })
       // L2: Elementwise integer arith emitter cases. Each mirrors the SubI
       // shape — emit `(lhs <op> rhs)` with the MSL built-in operator.
-      // Signed/unsigned semantics are carried by operand dtype.
+      // Signed/unsigned semantics come from the OP, spelled onto the operands
+      // by `emitAs` — NOT from the operand's own C type, which is `uint32_t`
+      // for any signless device buffer.
       // See `.omc/specs/deep-interview-leet-triton-l2-int-arith-broad.md`.
       .Case<mlir::arith::ShRSIOp>([&](mlir::arith::ShRSIOp op) {
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
+        // Arithmetic (sign-propagating) shift: MSL gives one only if the
+        // shifted operand is signed.
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/true);
         _output << " >> ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/true);
         _output << ")";
       })
       .Case<mlir::arith::ShLIOp>([&](mlir::arith::ShLIOp op) {
@@ -6768,31 +6806,19 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << ")";
       })
       .Case<mlir::arith::DivUIOp>([&](mlir::arith::DivUIOp op) {
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
+        // Unsigned by construction — spelled explicitly so the result does not
+        // depend on how the operand's buffer happens to be declared.
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/false);
         _output << " / ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/false);
         _output << ")";
       })
       .Case<mlir::arith::RemUIOp>([&](mlir::arith::RemUIOp op) {
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/false);
         _output << " % ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/false);
         _output << ")";
       })
       .Case<mlir::arith::MinSIOp, mlir::arith::MinUIOp, mlir::arith::MaxSIOp,
@@ -6800,36 +6826,24 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // MSL `min`/`max` (used by e.g. tl.swizzle2d's group-size clamp). Cast
         // both operands to the op's signedness so the overload isn't ambiguous
         // when one operand is `tgid.x` (uint) and the other signed arithmetic.
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
+        // Cast at the operand's own WIDTH — the old hardcoded `(int)`/`(uint)`
+        // truncated an i64 min/max to 32 bits.
         bool isMin =
             mlir::isa<mlir::arith::MinSIOp, mlir::arith::MinUIOp>(op);
         bool isSigned =
             mlir::isa<mlir::arith::MinSIOp, mlir::arith::MaxSIOp>(op);
-        const char *cast = isSigned ? "(int)(" : "(uint)(";
-        _output << (isMin ? "min(" : "max(") << cast;
-        emit(op->getOperand(0));
-        _output << "), " << cast;
-        emit(op->getOperand(1));
-        _output << "))";
+        _output << (isMin ? "min(" : "max(");
+        emitAs(op->getOperand(0), isSigned);
+        _output << ", ";
+        emitAs(op->getOperand(1), isSigned);
+        _output << ")";
       })
       .Case<mlir::arith::ShRUIOp>([&](mlir::arith::ShRUIOp op) {
-        auto emit = [&](mlir::Value v) {
-          // Route through translateValueOrVarName so a specific result of a
-          // MULTI-result op (e.g. one field of a 2-iter_arg scf.for like
-          // speculative decoding's `chosen_k`) resolves via _buffers instead of
-          // hitting the translateValue default on the whole op.
-          translateValueOrVarName(v);
-        };
+        // Logical (zero-filling) shift — requires an unsigned left operand.
         _output << "(";
-        emit(op.getLhs());
+        emitAs(op.getLhs(), /*wantSigned=*/false);
         _output << " >> ";
-        emit(op.getRhs());
+        emitAs(op.getRhs(), /*wantSigned=*/false);
         _output << ")";
       })
       .Case<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
@@ -6850,8 +6864,25 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // its cone leaves the original `x.to(f32)` extf use-empty) would become
         // `float(v3);` == `float v3;` — a redefinition. The C-style form is a
         // valid no-op as a statement and identical as an expression.
+        //
+        // The result cast alone is not enough: for sitofp/uitofp the INPUT's
+        // signedness decides which number the integer bits denote, and for
+        // extsi/extui it decides sign- vs zero-extension. A signless device
+        // buffer is declared `uint32_t`, so an uncast input made
+        // `x.to(tl.float32)` on a negative i32 produce 2^32 instead of -1.
+        // The float-input conversions (fptosi/fptoui/extf/truncf) and trunci
+        // (which only keeps low bits) are unaffected.
+        mlir::Operation *conv = op.getOperation();
+        bool wantSigned =
+            mlir::isa<mlir::arith::SIToFPOp, mlir::arith::ExtSIOp>(conv);
+        bool inputSignednessMatters =
+            wantSigned ||
+            mlir::isa<mlir::arith::UIToFPOp, mlir::arith::ExtUIOp>(conv);
         _output << "(" << typeToString(op.getType()) << ")(";
-        translateValueOrVarName(op.getIn());
+        if (inputSignednessMatters)
+          emitAs(op.getIn(), wantSigned);
+        else
+          translateValueOrVarName(op.getIn());
         _output << ")";
       })
       .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
@@ -7172,12 +7203,26 @@ void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
 
 void ModuleTranslation::translate(mlir::triton::metal::MulHiUIOp op) {
   auto intTy = mlir::cast<mlir::IntegerType>(op.getResult().getType());
+  // Widen through an unsigned cast at the operand's OWN width. A signless i32
+  // constant is printed as a SIGNED literal (0xD2511F53 comes out as
+  // -766436013), and `(uint64_t)(-766436013)` SIGN-extends to
+  // 0xFFFFFFFFD2511F53, so the high half of the product was garbage. Only
+  // constant operands were affected — a value loaded from a device buffer is
+  // already declared `uint32_t` — which is why a standalone `tl.umulhi` on
+  // loaded data was exact while philox (`tl.rand`/`tl.randint`/`tl.randn`,
+  // whose round multipliers are constants) silently produced the wrong stream.
+  auto emitWide = [&](mlir::Value v) {
+    _output << "((uint64_t)" << signednessCast(v.getType(), /*wantSigned=*/false)
+            << "(";
+    translateValueOrVarName(v);
+    _output << "))";
+  };
   if (intTy.getWidth() == 32) {
-    _output << "(uint32_t)((((uint64_t)(";
-    translateValueOrVarName(op.getX());
-    _output << ")) * ((uint64_t)(";
-    translateValueOrVarName(op.getY());
-    _output << "))) >> 32u)";
+    _output << "(uint32_t)((";
+    emitWide(op.getX());
+    _output << " * ";
+    emitWide(op.getY());
+    _output << ") >> 32u)";
     return;
   }
 
@@ -7187,27 +7232,25 @@ void ModuleTranslation::translate(mlir::triton::metal::MulHiUIOp op) {
   //   t = x1*y0 + high(x0*y0)
   //   hi = x1*y1 + high(t) + high(low(t) + x0*y1)
   // Each intermediate fits in uint64_t, so this is exact without uint128.
-  auto emitX = [&] { translateValueOrVarName(op.getX()); };
-  auto emitY = [&] { translateValueOrVarName(op.getY()); };
   auto emitX0 = [&] {
-    _output << "((uint64_t)(";
-    emitX();
-    _output << ") & 0xfffffffful)";
+    _output << "(";
+    emitWide(op.getX());
+    _output << " & 0xfffffffful)";
   };
   auto emitY0 = [&] {
-    _output << "((uint64_t)(";
-    emitY();
-    _output << ") & 0xfffffffful)";
+    _output << "(";
+    emitWide(op.getY());
+    _output << " & 0xfffffffful)";
   };
   auto emitX1 = [&] {
-    _output << "((uint64_t)(";
-    emitX();
-    _output << ") >> 32u)";
+    _output << "(";
+    emitWide(op.getX());
+    _output << " >> 32u)";
   };
   auto emitY1 = [&] {
-    _output << "((uint64_t)(";
-    emitY();
-    _output << ") >> 32u)";
+    _output << "(";
+    emitWide(op.getY());
+    _output << " >> 32u)";
   };
   auto emitT = [&] {
     _output << "(";

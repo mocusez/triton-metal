@@ -66,7 +66,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // address value v6), not the old local-only `localtid*8 + iv` — which was itself
 // wrong for grid>1 (missing the pid*BLOCK program offset).
 // MSL: int v{{[0-9]+}} = ((tgid.x * 1024) + (((id.x - (tgid.x * 128)) * 8) + v{{[0-9]+}}));
-// MSL: bool v{{[0-9]+}} = (v{{[0-9]+}} < v{{[0-9]+}}[0]);
+// MSL: bool v{{[0-9]+}} = ((int32_t)(v{{[0-9]+}}) < (int32_t)(v{{[0-9]+}}[0]));
 // MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: return;

@@ -62,7 +62,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // Mask reads the FULL index cone `pid*1024 + localtid + iv*128 < N` (address v6),
 // not the old local-only form (which was wrong for grid>1).
 // MSL: int v{{[0-9]+}} = ((tgid.x * 1024) + ((id.x - (tgid.x * 128)) + (v{{[0-9]+}} * 128)));
-// MSL: bool v{{[0-9]+}} = (v{{[0-9]+}} < v{{[0-9]+}}[0]);
+// MSL: bool v{{[0-9]+}} = ((int32_t)(v{{[0-9]+}}) < (int32_t)(v{{[0-9]+}}[0]));
 // MSL: if (v{{[0-9]+}})
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: return;

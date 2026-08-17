@@ -82,8 +82,11 @@ def test_block_size_larger_than_threads_compiles_to_msl():
         # stable token shape, not on SSA value names (v4, v5, ...).
         "(id.x - (tgid.x * 128))",
         "* 128))",
-        # Mask check against n_elements (wrapped scalar arg).
-        "< v",
+        # Mask check against n_elements (wrapped scalar arg). arith.cmpi spells
+        # its own signedness onto both operands, so the comparison reads
+        # `(int32_t)(idx) < (int32_t)(n)` — a signless device buffer is declared
+        # `uint32_t`, and without the cast this would be an unsigned compare.
+        "< (int32_t)(v",
     ):
         assert needle in msl, (
             f"MSL output missing required substring {needle!r}.\n"
