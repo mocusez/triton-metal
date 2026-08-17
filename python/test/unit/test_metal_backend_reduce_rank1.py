@@ -650,3 +650,102 @@ def test_reduce_rank1_half_computed_cone(dtype):
     reduce_sum_rank1_half_cone_kernel[(1,)](x.to("mps"), out, BLOCK=64)
     torch.mps.synchronize()
     assert out.cpu().double().item() == (x.double() * 2).sum().item()
+
+
+# ---------------------------------------------------------------------------
+# Combines that are MORE THAN ONE OPERATION.
+#
+# Every combine above is a single binary op, and that was the blind spot: the
+# backend identified the combine by taking the FIRST op of the region and
+# reducing with that operator, discarding the rest. `tl.where(a*a > b*b, a, b)`
+# has `arith.mulf` first, so a max-abs reduction silently returned the PRODUCT
+# of its inputs — bit for bit, with no diagnostic. A single-op region is the one
+# shape that walk gets right, so nothing in this file could catch it.
+#
+# The region is now replayed per element by `ReduceRankNLowering`, so what these
+# assert is that a multi-op combine computes ITS OWN function.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _maxabs_combine(a, b):
+    return tl.where(a * a > b * b, a, b)
+
+
+@triton.jit
+def _mul_plus_combine(a, b):
+    # f(a, b) = (1 + a)(1 + b) - 1: associative and commutative, and its first
+    # region op is arith.mulf — the shape that used to reduce as a product.
+    return a * b + a + b
+
+
+@triton.jit
+def _add_headed_max_combine(a, b):
+    # First region op is arith.addf, so this used to reduce as a SUM. Also
+    # covers a literal captured from outside the combine region.
+    return tl.maximum(a + 0.0, b)
+
+
+@triton.jit
+def reduce_maxabs_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.reduce(tl.load(x_ptr + offs), 0, _maxabs_combine))
+
+
+@triton.jit
+def reduce_mulplus_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.reduce(tl.load(x_ptr + offs), 0, _mul_plus_combine))
+
+
+@triton.jit
+def reduce_addheaded_rank1_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.reduce(tl.load(x_ptr + offs), 0, _add_headed_max_combine))
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("block", [8, 32, 64])
+def test_reduce_rank1_multi_op_combine_is_not_its_first_op(block, num_warps):
+    if block > 32 * num_warps:
+        pytest.skip("staged combine needs at most one element per thread")
+    torch.manual_seed(block * 31 + num_warps)
+    x = torch.rand(block) * 2 - 1
+    out = torch.zeros(1, device="mps")
+    reduce_maxabs_rank1_kernel[(1,)](x.to("mps"), out, BLOCK=block,
+                                     num_warps=num_warps)
+    torch.mps.synchronize()
+    want = x[x.abs().argmax()].item()
+    got = out.cpu().item()
+    # The product is what the first-op walk produced; assert we are not that.
+    assert got == pytest.approx(want, abs=1e-6), (
+        f"max-abs combine gave {got}, want {want} "
+        f"(product would be {x.double().prod().item()})")
+
+
+@pytest.mark.parametrize("num_warps", [1, 2])
+@pytest.mark.parametrize("block", [8, 32])
+def test_reduce_rank1_mul_plus_combine(block, num_warps):
+    if block > 32 * num_warps:
+        pytest.skip("staged combine needs at most one element per thread")
+    torch.manual_seed(block + num_warps)
+    x = torch.rand(block) * 0.4 + 0.4
+    out = torch.zeros(1, device="mps")
+    reduce_mulplus_rank1_kernel[(1,)](x.to("mps"), out, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    want = ((1.0 + x.double()).prod() - 1.0).item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_reduce_rank1_combine_with_captured_literal(dtype):
+    """`tl.maximum(a + 0.0, b)` reduces as a MAX, not as the sum its first op
+    suggests — and its f16 literal must be emitted as `half(...)`, or MSL's
+    `max(float, half)` is ambiguous and the shader will not compile."""
+    torch.manual_seed(11)
+    x = torch.rand(32, dtype=dtype)
+    out = torch.zeros(1, dtype=dtype, device="mps")
+    reduce_addheaded_rank1_kernel[(1,)](x.to("mps"), out, BLOCK=32)
+    torch.mps.synchronize()
+    assert out.cpu().item() == x.max().item()

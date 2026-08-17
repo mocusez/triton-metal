@@ -6521,9 +6521,21 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             _output << (v.getValue().isZero() ? "false" : "true");
           else
             _output << v.getValue();
-        } else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
+        } else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue())) {
+          // A bare literal is a `float` in MSL, so a half-typed constant in an
+          // expression silently promotes its neighbours: `half_v + 0.0` is a
+          // float, and `metal::max(float, half)` is then AMBIGUOUS and the
+          // shader fails to compile. Spell the constant in its own type.
+          // (Reached once a `tt.reduce` combine region containing a literal is
+          // replayed per element at f16/bf16.)
+          mlir::Type fty = v.getType();
+          const bool narrow = fty.isF16() || fty.isBF16();
+          if (narrow)
+            _output << typeToString(fty) << "(";
           emitFloatLiteral(_output, v);
-        else
+          if (narrow)
+            _output << ")";
+        } else
           llvm_unreachable("Unexpected arith.constant attribute kind");
       })
       .Case<mlir::UnrealizedConversionCastOp>(

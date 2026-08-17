@@ -4457,6 +4457,168 @@ static mlir::Value emitScalarChain(
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// What a `tt.reduce` combine region actually IS.
+//
+// Every reduce path used to identify the combine by walking to the FIRST
+// non-terminator op of the region and treating the whole reduction as that
+// operator. Nothing checked that the region held only that one op, so a combine
+// whose first op happened to be an admitted monoid was silently lowered as that
+// monoid and the rest of the region was DISCARDED:
+//
+//   tl.where(a*a > b*b, a, b)   first op arith.mulf -> reduced as a PRODUCT
+//   a*b + a + b                 first op arith.mulf -> reduced as a PRODUCT
+//   tl.maximum(a + 0.0, b)      first op arith.addf -> reduced as a SUM
+//
+// Confirmed bit for bit against torch: the max-abs combine returned the exact
+// product of its inputs. It survived because EVERY combine in the test suite is
+// a single binary op, which is the one shape the walk gets right; a first op
+// OUTSIDE the admitted set was rejected, so the gate looked like it worked.
+//
+// `reduceCombineBinaryOp` is that walk done honestly, and it is the ONLY way
+// the monoid paths may identify their operator. Anything it declines is either
+// a general combine (below) or a named rejection — never a guess.
+//===----------------------------------------------------------------------===//
+
+// The single binary op a monoid combine region consists of, or null.
+//
+// Requires the region to be exactly `{ binop(arg0, arg1), reduce_return(binop) }`
+// on one block: one non-terminator op, both of its operands the region's own
+// block arguments, and the terminator yielding precisely its result. A region
+// that computes anything else is NOT this operator, however it begins.
+static mlir::Operation *reduceCombineBinaryOp(mlir::triton::ReduceOp op) {
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return nullptr;
+  mlir::Block &body = op->getRegion(0).front();
+  if (body.getNumArguments() != 2)
+    return nullptr;
+  mlir::Operation *combine = nullptr;
+  mlir::triton::ReduceReturnOp ret;
+  for (auto &nested : body) {
+    if (auto r = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(nested)) {
+      ret = r;
+      continue;
+    }
+    if (combine)
+      return nullptr; // more than one op: not a bare binary combine
+    combine = &nested;
+  }
+  if (!combine || !ret)
+    return nullptr;
+  if (combine->getNumOperands() != 2 || combine->getNumResults() != 1)
+    return nullptr;
+  // Both operands must be the block arguments, in either order — `a op b` and
+  // `b op a` are the same monoid for everything admitted here (all of add, mul,
+  // min, max, and, or, xor are commutative). An operand that is anything else
+  // (a constant, a captured value) makes this not a plain fold.
+  mlir::Value x = combine->getOperand(0), y = combine->getOperand(1);
+  mlir::Value a0 = body.getArgument(0), a1 = body.getArgument(1);
+  if (!((x == a0 && y == a1) || (x == a1 && y == a0)))
+    return nullptr;
+  if (ret->getNumOperands() != 1 || ret->getOperand(0) != combine->getResult(0))
+    return nullptr;
+  return combine;
+}
+
+// Ops a combine region may contain for `emitClonedCombine` to be able to
+// replay it per element. Each one has a scalar spelling in
+// `ModuleTranslation::translateValue`, which is what makes cloning the region
+// into the reduction viable at all — no new MSL emission is required.
+static bool reduceCombineOpIsClonable(mlir::Operation *op) {
+  return mlir::isa<
+      mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
+      mlir::arith::DivFOp, mlir::arith::NegFOp, mlir::arith::MaximumFOp,
+      mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp, mlir::arith::MinNumFOp,
+      mlir::arith::AddIOp, mlir::arith::SubIOp, mlir::arith::MulIOp,
+      mlir::arith::DivSIOp, mlir::arith::DivUIOp, mlir::arith::RemSIOp,
+      mlir::arith::RemUIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
+      mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
+      mlir::arith::ShRUIOp, mlir::arith::MaxSIOp, mlir::arith::MaxUIOp,
+      mlir::arith::MinSIOp, mlir::arith::MinUIOp, mlir::arith::CmpFOp,
+      mlir::arith::CmpIOp, mlir::arith::SelectOp, mlir::arith::ConstantOp,
+      mlir::arith::ExtFOp, mlir::arith::TruncFOp, mlir::arith::SIToFPOp,
+      mlir::arith::UIToFPOp, mlir::arith::FPToSIOp, mlir::arith::ExtSIOp,
+      mlir::arith::ExtUIOp, mlir::arith::TruncIOp, mlir::math::ExpOp,
+      mlir::math::LogOp, mlir::math::SqrtOp, mlir::math::RsqrtOp,
+      mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
+      mlir::math::FloorOp, mlir::math::CeilOp, mlir::math::AbsIOp,
+      mlir::math::AbsFOp, mlir::triton::ReduceReturnOp>(op);
+}
+
+// True when the combine region can be replayed per element by cloning it.
+// Single source, single result, one block, every op clonable, and no value
+// captured from outside the region (a capture would not dominate the point the
+// clone is emitted at).
+static bool reduceCombineIsClonable(mlir::triton::ReduceOp op) {
+  if (op.getSrcs().size() != 1 || op->getNumResults() != 1)
+    return false;
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return false;
+  mlir::Block &body = op->getRegion(0).front();
+  if (body.getNumArguments() != 2)
+    return false;
+  auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(body.getTerminator());
+  if (!ret || ret->getNumOperands() != 1)
+    return false;
+  for (auto &nested : body) {
+    if (!reduceCombineOpIsClonable(&nested))
+      return false;
+    for (mlir::Value v : nested.getOperands()) {
+      if (v.getParentBlock() == &body)
+        continue;
+      // A SCALAR constant defined outside is fine — the clone re-materialises
+      // it. Triton hoists `a + 0.0`'s literal out of the combine region, so
+      // refusing every capture would refuse the commonest multi-op combine
+      // there is. Anything else captured is a value from the surrounding
+      // computation, which conversion may already have replaced.
+      auto *def = v.getDefiningOp();
+      if (def && mlir::isa<mlir::arith::ConstantOp>(def) &&
+          !mlir::isa<mlir::ShapedType>(v.getType()))
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Replay a combine region on two scalars. `lhs`/`rhs` take the places of the
+// region's block arguments and the yielded value is returned. The caller must
+// have checked `reduceCombineIsClonable`.
+//
+// ORDER MATTERS: an associative combine need not be commutative (`lambda a, b:
+// a` is a legal reducer), so every caller passes the LOWER logical position as
+// `lhs`. Cloning preserves that; a BinaryExpOp-based fold could not express it.
+static mlir::Value emitClonedCombine(mlir::triton::ReduceOp op, mlir::Value lhs,
+                                     mlir::Value rhs,
+                                     mlir::ConversionPatternRewriter &rewriter,
+                                     mlir::Location loc) {
+  mlir::Block &body = op->getRegion(0).front();
+  mlir::IRMapping map;
+  map.map(body.getArgument(0), lhs);
+  map.map(body.getArgument(1), rhs);
+  // Re-materialise the scalar constants the region captures from outside (see
+  // reduceCombineIsClonable). Cloning them here rather than referencing the
+  // originals keeps the emitted cone self-contained, so nothing depends on
+  // where conversion has moved the original constant to.
+  for (auto &nested : body)
+    for (mlir::Value v : nested.getOperands()) {
+      if (v.getParentBlock() == &body || map.contains(v))
+        continue;
+      if (auto *def = v.getDefiningOp())
+        map.map(v, rewriter.clone(*def)->getResult(
+                       mlir::cast<mlir::OpResult>(v).getResultNumber()));
+    }
+  mlir::Value yielded;
+  for (auto &nested : body) {
+    if (auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(nested)) {
+      yielded = map.lookupOrDefault(ret->getOperand(0));
+      break;
+    }
+    rewriter.clone(nested, map);
+  }
+  return yielded;
+}
+
 // Match the exact two-source/two-result reducer emitted by
 // `tl.argmax(x, axis=0)`. Keeping this structural matcher deliberately narrow
 // prevents the dedicated pairwise lowering below from claiming arbitrary
@@ -4838,15 +5000,12 @@ lowerRank1Reduce(mlir::triton::ReduceOp op,
     return mlir::failure();
 
   // Identify the combine op (the pre-pass already validated, but be defensive).
-  mlir::Operation *combine = nullptr;
-  if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
-    for (auto &nested : op->getRegion(0).front()) {
-      if (mlir::isa<mlir::triton::ReduceReturnOp>(nested))
-        continue;
-      combine = &nested;
-      break;
-    }
-  }
+  // This asks `reduceCombineBinaryOp`, which admits ONLY a region that is
+  // exactly one binary op over the two block arguments. Taking the region's
+  // first op instead — what this used to do — lowered `tl.where(a*a > b*b, a,
+  // b)` as a product. A multi-op region declines here and is picked up by the
+  // benefit-0 `ReduceRankNLowering`, which replays the region per element.
+  mlir::Operation *combine = reduceCombineBinaryOp(op);
   if (!combine)
     return mlir::failure();
   bool isAddF = mlir::isa<mlir::arith::AddFOp>(combine);
@@ -5876,14 +6035,8 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
     return mlir::failure();
   if (!rtt.getElementType().isF32())
     return mlir::failure();
-  // Combine must be addf.
-  mlir::Operation *combine = nullptr;
-  if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
-    for (auto &nested : op->getRegion(0).front())
-      if (!mlir::isa<mlir::triton::ReduceReturnOp>(nested)) {
-        combine = &nested;
-        break;
-      }
+  // Combine must be addf — and be ONLY that (see reduceCombineBinaryOp).
+  mlir::Operation *combine = reduceCombineBinaryOp(op);
   if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
     return mlir::failure();
 
@@ -8999,13 +9152,7 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1) ||
       !(eltTy.isF32() || eltTy.isInteger(32)))
     return mlir::failure();
-  mlir::Operation *combine = nullptr;
-  if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
-    for (auto &n : op->getRegion(0).front())
-      if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
-        combine = &n;
-        break;
-      }
+  mlir::Operation *combine = reduceCombineBinaryOp(op);
   if (!combine)
     return mlir::failure();
 
@@ -9856,6 +10003,13 @@ struct RankNReducePlan {
   llvm::SmallVector<int64_t, 4> srcStrides; // flat = sum(coord[d] * stride[d])
   mlir::Type stageTy;
   BinaryExpOperator combineKind;
+  // When set, the combine is NOT one of the `BinaryExpOperator` monoids and
+  // `combineKind` is meaningless: the fold replays the reduce's own region per
+  // element with `emitClonedCombine` instead. The axis fold is sequential and
+  // ordered, so a general combine needs no identity element and keeps its
+  // operand order — which is what makes an associative-but-not-commutative
+  // reducer (`lambda a, b: a`) come out right too.
+  bool generalCombine = false;
 };
 
 static std::optional<RankNReducePlan>
@@ -9864,7 +10018,13 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     return std::nullopt;
   auto srcTy =
       mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
-  if (!srcTy || srcTy.getRank() < 2)
+  // Rank 1 is admitted ONLY for a general (region-replayed) combine. The rank-1
+  // butterfly in `lowerRank1Reduce` is faster and owns every monoid; letting
+  // this fallback claim rank-1 monoids too would change which path a working
+  // kernel takes, for no gain.
+  const bool rank1General =
+      srcTy && srcTy.getRank() == 1 && !reduceCombineBinaryOp(op);
+  if (!srcTy || (srcTy.getRank() < 2 && !rank1General))
     return std::nullopt;
   auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
       srcTy.getEncoding());
@@ -9884,27 +10044,55 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   if (axis < 0 || axis >= srcTy.getRank())
     return std::nullopt;
   const int64_t extent = tile->shape[axis];
-  if (extent < 2 || extent > 64)
+  // The fold is UNROLLED, one threadgroup read plus one combine per element, so
+  // the bound is an emitted-code budget rather than a correctness limit. Rank 1
+  // gets a larger one because there the axis IS the whole block: capping it at
+  // 64 would refuse the ordinary `tl.reduce(x, 0, my_combine)` over a 128- or
+  // 256-wide tile. A butterfly would make this O(log n) and lift the bound.
+  const int64_t extentBudget = (srcTy.getRank() == 1) ? 256 : 64;
+  if (extent < 2 || extent > extentBudget)
     return std::nullopt;
   if (underDivergentControlFlow(op))
     return std::nullopt;
 
-  mlir::Operation *combine = nullptr;
-  if (op->getNumRegions() > 0 && !op->getRegion(0).empty())
-    for (auto &nested : op->getRegion(0).front()) {
-      if (mlir::isa<mlir::triton::ReduceReturnOp>(nested))
-        continue;
-      combine = &nested;
-      break;
-    }
-  if (!combine)
-    return std::nullopt;
+  // ONE binary op over the two block arguments, or nothing. A region that does
+  // more than that is not this operator however it begins — see
+  // `reduceCombineBinaryOp`. It falls through to the general path below.
+  mlir::Operation *combine = reduceCombineBinaryOp(op);
 
   mlir::Type elemTy = srcTy.getElementType();
   const bool isI32 = elemTy.isInteger(32);
   const bool isFloat = elemTy.isF32() || elemTy.isF16() || elemTy.isBF16();
   if (!isI32 && !isFloat)
     return std::nullopt;
+
+  llvm::SmallVector<int64_t, 4> genStrides(tile->shape.size(), 1);
+  if (!combine) {
+    // General combine: replay the region per element. The axis fold below is
+    // sequential, so no identity element is needed and nothing has to be
+    // classified — the region IS the specification.
+    if (!reduceCombineIsClonable(op))
+      return std::nullopt;
+    mlir::MLIRContext *gctx = op.getContext();
+    // Integers stage through si32: a general region can compare (`a*a > b*b`),
+    // and MSL takes signedness from the C type of the operand, not from the op.
+    mlir::Type genStageTy =
+        isI32 ? mlir::Type(mlir::IntegerType::get(gctx, 32,
+                                                  mlir::IntegerType::Signed))
+              : elemTy;
+    int64_t gacc = 1;
+    for (unsigned d : enc.getOrder()) {
+      if (static_cast<size_t>(d) >= tile->shape.size())
+        return std::nullopt;
+      genStrides[d] = gacc;
+      gacc *= tile->shape[d];
+    }
+    RankNReducePlan gplan{*tile,          enc,        axis,
+                          extent,         genStrides[axis], genStrides,
+                          genStageTy,     BinaryExpOperator::addOp};
+    gplan.generalCombine = true;
+    return gplan;
+  }
 
   const bool isAddF = mlir::isa<mlir::arith::AddFOp>(combine);
   const bool isMulF = mlir::isa<mlir::arith::MulFOp>(combine);
@@ -10016,7 +10204,14 @@ struct ReduceRankNLowering
     }
 
     mlir::Value base;
-    if (keepDims) {
+    if (plan->tile.shape.size() == 1) {
+      // Rank 1: the result is a SCALAR every lane must hold, so every lane
+      // folds the same whole block starting at slot 0. There is no output tile
+      // to project from and no axis coordinate to drop.
+      base = mlir::arith::ConstantOp::create(rewriter, loc,
+                                             rewriter.getI32IntegerAttr(0))
+                 .getResult();
+    } else if (keepDims) {
       // Drop this lane's axis coordinate out of its own flat index.
       mlir::Value flat = emitTileFlatIndex(op, plan->tile, rewriter, loc);
       mlir::Value coord = emitTileCoordByOrder(op, plan->tile,
@@ -10090,6 +10285,10 @@ struct ReduceRankNLowering
 
     auto opEnum =
         BinaryExpOperatorAttr::get(rewriter.getContext(), plan->combineKind);
+    // The fold walks the axis in INCREASING coordinate order and always passes
+    // the accumulated prefix as the left operand, so a combine that is
+    // associative but not commutative (`lambda a, b: a`) folds the same way
+    // Triton's reference semantics do.
     mlir::Value result;
     for (int64_t k = 0; k < plan->extent; ++k) {
       mlir::Value slot = base;
@@ -10102,10 +10301,28 @@ struct ReduceRankNLowering
       }
       mlir::Value v = readLaneBandSlot(buf, slot, tpb, plan->stageTy,
                                        plan->stageTy, rewriter, loc);
-      result = result ? BinaryExpOp::create(rewriter, loc, plan->stageTy,
-                                            opEnum, result, v)
-                            .getResult()
-                      : v;
+      if (!result) {
+        result = v;
+        continue;
+      }
+      if (plan->generalCombine) {
+        // Replay the reduce's own region. Both operands are bridged back to the
+        // op's element type first: the region was written against it, and the
+        // staging type may be a signedness-carrying alias of it.
+        mlir::Type ety = op.getSrcs().front().getType();
+        if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(ety))
+          ety = rt.getElementType();
+        mlir::Value combined = emitClonedCombine(op, bridge(result, ety),
+                                                 bridge(v, ety), rewriter, loc);
+        if (!combined)
+          return rewriter.notifyMatchFailure(
+              op, "rank-N reduce: combine region yielded nothing");
+        result = bridge(combined, plan->stageTy);
+        continue;
+      }
+      result = BinaryExpOp::create(rewriter, loc, plan->stageTy, opEnum, result,
+                                   v)
+                   .getResult();
     }
     rewriter.replaceOp(op, bridge(result, scalar.getType()));
     return mlir::success();
@@ -10162,15 +10379,7 @@ struct ReduceLowering
     if (!isF32 && !isI32)
       return mlir::failure();
     // Defensive combine-op check (the L3 pre-pass already enforced this).
-    mlir::Operation *combine = nullptr;
-    if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
-      for (auto &nested : op->getRegion(0).front()) {
-        if (mlir::isa<mlir::triton::ReduceReturnOp>(nested))
-          continue;
-        combine = &nested;
-        break;
-      }
-    }
+    mlir::Operation *combine = reduceCombineBinaryOp(op);
     if (!combine)
       return mlir::failure();
     // Combine kinds: f32 sum/product/max/min and i32
@@ -21507,14 +21716,8 @@ static void reassociateLoopCarriedSumReduce(mlir::ModuleOp moduleOp) {
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(R.getSrcs()[0].getType());
     if (!rtt || rtt.getRank() != 1 || !rtt.getElementType().isF32())
       continue;
-    // Reduce combine must be arith.addf (sum).
-    mlir::Operation *combine = nullptr;
-    if (R->getNumRegions() > 0 && !R->getRegion(0).empty())
-      for (auto &n : R->getRegion(0).front())
-        if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
-          combine = &n;
-          break;
-        }
+    // Reduce combine must be arith.addf (sum) — and be ONLY that.
+    mlir::Operation *combine = reduceCombineBinaryOp(R);
     if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
       continue;
     // Source must be an scf.for result whose yield is `addf(iterArg, delta)`.
@@ -21590,13 +21793,7 @@ static void reassociateLoopCarriedAxis0Reduce(mlir::ModuleOp moduleOp) {
       continue;
     if (R.getAxis() != 0)
       continue;
-    mlir::Operation *combine = nullptr;
-    if (R->getNumRegions() > 0 && !R->getRegion(0).empty())
-      for (auto &n : R->getRegion(0).front())
-        if (!mlir::isa<mlir::triton::ReduceReturnOp>(n)) {
-          combine = &n;
-          break;
-        }
+    mlir::Operation *combine = reduceCombineBinaryOp(R);
     // Every combine lowerRank2Axis0Reduce supports also has an elementwise
     // scalarizing lowering for its loop-carried tensor update op, so the
     // reassociated outer `s = combine(s, reduce)` legalizes: f32 sum/max
@@ -25349,18 +25546,20 @@ struct ConvertTritonGPUToMetalPass
                              ? mlir::Type{}
                              : red.getSrcs().front().getType();
       auto rtt = mlir::dyn_cast_or_null<mlir::RankedTensorType>(srcTy);
-      // Combine-op probe: walk the reduce region's first non-terminator op.
+      // Combine-op probe. This asks `reduceCombineBinaryOp`, so `combineName`
+      // is set ONLY when the region is exactly one binary op over the two block
+      // arguments. It used to name the region's FIRST op, which let a multi-op
+      // combine pass every gate below under the identity of an operator it does
+      // not compute — `tl.where(a*a > b*b, a, b)` was reduced as a product.
+      // A region with no name here is not rejected on that account: the staged
+      // `planRankNReduce` fallback replays such a region per element, and
+      // `stagedFallback` below is what admits it.
       llvm::StringRef combineName;
       mlir::Type combineEltTy;
-      if (red->getNumRegions() > 0 && !red->getRegion(0).empty()) {
-        for (auto &op : red->getRegion(0).front()) {
-          if (mlir::isa<mlir::triton::ReduceReturnOp>(op))
-            continue;
-          combineName = op.getName().getStringRef();
-          if (op.getNumResults() > 0)
-            combineEltTy = op.getResult(0).getType();
-          break;
-        }
+      if (mlir::Operation *cmb = reduceCombineBinaryOp(red)) {
+        combineName = cmb->getName().getStringRef();
+        if (cmb->getNumResults() > 0)
+          combineEltTy = cmb->getResult(0).getType();
       }
       // 1) rank check. rank-1 and rank-2 have their own specialisations; rank
       // >= 3 goes through the staged `ReduceRankNLowering`, whose envelope is
@@ -25612,10 +25811,28 @@ struct ConvertTritonGPUToMetalPass
               (intTy.getWidth() == 64 && rtt.getRank() == 1))
             combineOk = true;
       }
+      // The staged fallback replays ANY clonable combine region per element, so
+      // a combine none of the monoid gates admit is still supported when
+      // `planRankNReduce` claims it. Ask before rejecting.
+      if (!combineOk && stagedFallback)
+        return;
       if (!combineOk) {
         if (combineName == "arith.addf" || combineName == "arith.addi") {
           // It's a supported combine op shape but wrong dtype (e.g. f16).
           red.emitOpError("reduce dtype must be f32 or i32 in Session L3");
+          reduceOk = false;
+          return;
+        }
+        if (combineName.empty()) {
+          // Not one binary op over the block arguments, and not clonable
+          // either. Name what is missing rather than the op that happens to
+          // come first — that mislabelling is what made this silently wrong.
+          red.emitOpError(
+              "reduce combine is neither a single binary op over the two "
+              "combine arguments nor a region this backend can replay per "
+              "element (see reduceCombineOpIsClonable for the admitted ops); "
+              "it must also reduce a tile of at most one element per thread "
+              "over an axis of extent 2..64");
           reduceOk = false;
           return;
         }
