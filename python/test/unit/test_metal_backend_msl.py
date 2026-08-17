@@ -989,6 +989,122 @@ def test_rank3_xor_reduce_is_bit_exact():
     assert torch.equal(out.cpu(), ref)
 
 
+# --- i16 and torch.bool tensors --------------------------------------------
+#
+# i16 had no Metal storage type (`Metal_Type` has ui16 but no signless i16), and
+# a `torch.bool` argument was rejected outright: Triton re-types the POINTER at
+# every access (`ptr<i1>` -> `ptr<i8>`, since the buffer really is a byte per
+# element) while the argument stays `!tt.ptr<i1>`, so the memref kept an i1
+# pointee and the per-element offset ended up underneath the cast where no index
+# path could see it.
+
+
+@triton.jit
+def _i16_add_kernel(x_ptr, y_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.load(x_ptr + i) + tl.load(y_ptr + i))
+
+
+@triton.jit
+def _i16_masked_kernel(x_ptr, o_ptr, N: tl.constexpr, M):
+    i = tl.arange(0, N)
+    v = tl.load(x_ptr + i, mask=i < M, other=7)
+    tl.store(o_ptr + i, v * 2, mask=i < M)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_i16_elementwise(num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(num_warps)
+    x = torch.randint(-300, 300, (N,), dtype=torch.int16)
+    y = torch.randint(-300, 300, (N,), dtype=torch.int16)
+    out = torch.zeros(N, dtype=torch.int16, device="mps")
+    _i16_add_kernel[(1,)](x.to("mps"), y.to("mps"), out, N,
+                          num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x + y)
+
+
+def test_i16_masked_load_and_store():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N, M = 64, 30
+    torch.manual_seed(16)
+    x = torch.randint(-300, 300, (N,), dtype=torch.int16)
+    out = torch.zeros(N, dtype=torch.int16, device="mps")
+    _i16_masked_kernel[(1,)](x.to("mps"), out, N, M)
+    torch.mps.synchronize()
+    expected = torch.zeros(N, dtype=torch.int16)
+    expected[:M] = x[:M] * 2
+    assert torch.equal(out.cpu(), expected)
+
+
+@triton.jit
+def _bool_copy_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.load(x_ptr + i))
+
+
+@triton.jit
+def _bool_predicate_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i, tl.load(x_ptr + i) > 0.0)
+
+
+@triton.jit
+def _bool_mask_kernel(m_ptr, a_ptr, b_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o_ptr + i,
+             tl.where(tl.load(m_ptr + i), tl.load(a_ptr + i),
+                      tl.load(b_ptr + i)))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_bool_tensor_round_trip(num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(num_warps)
+    x = torch.randint(0, 2, (N,)) == 1
+    out = torch.zeros(N, dtype=torch.bool, device="mps")
+    _bool_copy_kernel[(1,)](x.to("mps"), out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x)
+
+
+def test_bool_tensor_as_output_of_a_comparison():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(2)
+    x = torch.randn(N, dtype=torch.float32)
+    out = torch.zeros(N, dtype=torch.bool, device="mps")
+    _bool_predicate_kernel[(1,)](x.to("mps"), out, N)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x > 0)
+
+
+def test_bool_tensor_as_a_mask():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(3)
+    m = torch.randint(0, 2, (N,)) == 1
+    a = torch.randn(N, dtype=torch.float32)
+    b = torch.randn(N, dtype=torch.float32)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _bool_mask_kernel[(1,)](m.to("mps"), a.to("mps"), b.to("mps"), out, N)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.where(m, a, b))
+
+
 # --- i64 reduce ------------------------------------------------------------
 #
 # "reduce dtype must be f32 or i32" was a real wall: PyTorch hands out int64 for

@@ -56,7 +56,8 @@ namespace {
 // i8 stays signless (it is already in `Metal_Type`). Signless i32/i64 storage
 // uses the corresponding unsigned Metal type, then bridges back after loads;
 // this keeps PyTorch's standard int64 index tensors usable without changing
-// their bit representation. i16 remains out of scope.
+// their bit representation. i16 joins them: `Metal_Type` has ui16 but not a
+// signless i16, so a torch.int16 tensor needs the same bridge.
 static mlir::Type metalStorageElementType(mlir::Type t) {
   // Metal has no FP8 scalar type.  E4M3FN/E5M2 payloads accepted by the exact
   // software dot_scaled path are ABI-compatible one-byte buffers and are
@@ -64,9 +65,19 @@ static mlir::Type metalStorageElementType(mlir::Type t) {
   // becomes legal merely because its pointer storage is byte-backed.
   if (mlir::isa<mlir::Float8E4M3FNType, mlir::Float8E5M2Type>(t))
     return mlir::IntegerType::get(t.getContext(), 8);
+  // A `torch.bool` buffer is one BYTE per element. Triton knows that and
+  // bitcasts `!tt.ptr<i1>` to `!tt.ptr<i8>` before touching it, but
+  // `findBaseMemref` deliberately chases through pointer bitcasts (the f32
+  // atomic min/max expansion needs the original buffer), so the memref kept the
+  // i1 pointee and an i8 value landed on an i1-element buffer. Storing the
+  // pointee as i8 is what the hardware layout already is.
+  if (auto boolTy = llvm::dyn_cast<mlir::IntegerType>(t))
+    if (boolTy.getWidth() == 1)
+      return mlir::IntegerType::get(t.getContext(), 8);
   if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(t))
     if (intTy.isSignless() &&
-        (intTy.getWidth() == 32 || intTy.getWidth() == 64))
+        (intTy.getWidth() == 16 || intTy.getWidth() == 32 ||
+         intTy.getWidth() == 64))
       return mlir::IntegerType::get(t.getContext(), intTy.getWidth(),
                                     mlir::IntegerType::Unsigned);
   return t;
@@ -10624,6 +10635,19 @@ emitLoadStoreIndex(const TileInfo &tile, mlir::Value convertedOffset,
       .getResult(0);
 }
 
+// Address root of a tensor access, with pointer bitcasts peeled off.
+//
+// Triton bitcasts the POINTER, not the tile: `tl.load` of a torch.bool tensor
+// arrives as `tt.load(tt.bitcast(tt.addptr(...) : ptr<i1> -> ptr<i8>))`, and
+// the same shape shows up for the f32 atomic min/max expansion. The addptr that
+// carries the per-element offset is underneath, so both the shape test and the
+// converted offset have to look through the cast.
+static mlir::Value peelPointerBitcasts(mlir::Value ptr) {
+  while (auto bitcast = ptr.getDefiningOp<mlir::triton::BitcastOp>())
+    ptr = bitcast.getSrc();
+  return ptr;
+}
+
 struct LoadLowering
     : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -10638,8 +10662,9 @@ struct LoadLowering
     // then reads the SAME address. Triton produces this whenever the
     // per-element offset folds to zero — e.g. a BLOCK=1 tile, where
     // `tl.arange(0, 1) * stride` is constant 0 and the addptr disappears.
-    auto splatPtr = op.getPtr().getDefiningOp<mlir::triton::SplatOp>();
-    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
+    mlir::Value addressRoot = peelPointerBitcasts(op.getPtr());
+    auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
+    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
           op, "tt.load expects a tt.addptr or a splat scalar ptr feeding ptr");
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
@@ -10669,7 +10694,14 @@ struct LoadLowering
     } else {
       auto parentFor =
           findOutermostScfFor(op); // Wall 13 fix: tile loop, not user loop
-      idx = emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter, loc);
+      // BitcastLowering models a pointer bitcast as a memref VIEW, so its
+      // converted result no longer carries the addptr offset; read that from
+      // the wrapped addptr's conversion instead.
+      mlir::Value convertedPtr = adaptor.getPtr();
+      if (addressRoot != op.getPtr())
+        if (mlir::Value remapped = rewriter.getRemappedValue(addressRoot))
+          convertedPtr = remapped;
+      idx = emitLoadStoreIndex(*tile, convertedPtr, parentFor, rewriter, loc);
     }
     auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
     // L2b: get_element yields the memref STORAGE type (ui32 for an i32 ptr).
@@ -11025,8 +11057,9 @@ struct MaskedLoadLowering
     // `tt.splat` of a scalar pointer. Accept that shape just like
     // LoadLowering does for unmasked loads; the scalar addptr chain below the
     // splat still carries the program offset.
-    auto splatPtr = op.getPtr().getDefiningOp<mlir::triton::SplatOp>();
-    if (!op.getPtr().getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
+    mlir::Value addressRoot = peelPointerBitcasts(op.getPtr());
+    auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
+    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
           op, "tt.load expects a tt.addptr or a splat scalar ptr feeding ptr");
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
@@ -11035,20 +11068,19 @@ struct MaskedLoadLowering
                                          "memref source not MetalMemRefType");
     auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
     auto elemTy = memrefTy.getType();
-    // Accept FloatType OR a width-8/width-32/width-64 integer STORAGE type.
+    // Accept FloatType OR any integer STORAGE type the buffer ops admit.
     // `elemTy` is the memref storage type, so an i32 ptr already presents as
-    // ui32 here (routed by metalStorageElementType); i8 stays signless i8, and
-    // i64 is used by PyTorch class-index tensors. i1/i16 remain unsupported.
+    // ui32 here (routed by metalStorageElementType); i8 stays signless i8, i16
+    // bridges through ui16, i64 is what PyTorch class-index tensors are, and a
+    // torch.bool buffer presents as its real i8 storage.
     {
       bool isFloat = mlir::isa<mlir::FloatType>(elemTy);
       auto intTy = mlir::dyn_cast<mlir::IntegerType>(elemTy);
-      bool isI8 = intTy && intTy.getWidth() == 8;
-      bool isI32 = intTy && intTy.getWidth() == 32;
-      bool isI64 = intTy && intTy.getWidth() == 64;
-      if (!isFloat && !isI8 && !isI32 && !isI64)
+      unsigned width = intTy ? intTy.getWidth() : 0;
+      if (!isFloat && width != 8 && width != 16 && width != 32 && width != 64)
         return rewriter.notifyMatchFailure(
-            op, "masked tt.load: only float, i8, i32 and i64 element types "
-                "supported");
+            op, "masked tt.load: only float and 8/16/32/64-bit integer element "
+                "types supported");
     }
 
     auto tile = tileFromLoadPtrTensor(op.getPtr().getType());
@@ -11113,7 +11145,11 @@ struct MaskedLoadLowering
                   mlir::ValueRange{offI32})
                   .getResult(0);
       } else {
-        idx = emitLoadStoreIndex(*tile, adaptor.getPtr(), parentFor, rewriter,
+        mlir::Value convertedMaskedPtr = adaptor.getPtr();
+        if (addressRoot != op.getPtr())
+          if (mlir::Value remapped = rewriter.getRemappedValue(addressRoot))
+            convertedMaskedPtr = remapped;
+        idx = emitLoadStoreIndex(*tile, convertedMaskedPtr, parentFor, rewriter,
                                  loc);
       }
       auto getEl = GetElementOp::create(rewriter, loc, elemTy, memref, idx);
@@ -11328,6 +11364,9 @@ struct StoreLowering
     // element's address.
     mlir::Value storePtr = op.getPtr();
     mlir::Value convertedPtr = adaptor.getPtr();
+    if (storePtr != op.getPtr())
+      if (mlir::Value remapped = rewriter.getRemappedValue(storePtr))
+        convertedPtr = remapped;
     mlir::Value convertedVal = adaptor.getValue();
     if (auto cvt =
             op.getPtr().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
@@ -11371,6 +11410,9 @@ struct StoreLowering
     // in this backend rather than an error: the verbatim leet-triton RoPE kernel
     // at D=2 (BLOCK_SIZE_D = next_pow2(D/2) = 1, so a 1x1 tile) took the caller
     // down, sometimes with abort and sometimes with SIGSEGV.
+    // Same pointer-bitcast peel as the load side: a torch.bool store arrives as
+    // `tt.store(tt.bitcast(tt.addptr(...)), ...)`.
+    storePtr = peelPointerBitcasts(storePtr);
     auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
     if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
@@ -12367,6 +12409,9 @@ struct MaskedStoreLowering
     // just i), so it is layout-agnostic and reconciles the two.
     mlir::Value storePtr = op.getPtr();
     mlir::Value convertedPtr = adaptor.getPtr();
+    if (storePtr != op.getPtr())
+      if (mlir::Value remapped = rewriter.getRemappedValue(storePtr))
+        convertedPtr = remapped;
     mlir::Value convertedVal = adaptor.getValue();
     bool peeledCvt = false;
     if (auto cvt =
@@ -12408,6 +12453,9 @@ struct MaskedStoreLowering
     // accepts. This is the path the leet-triton RoPE kernel actually took: its
     // stores carry a mask, so exempting only the unmasked pattern left the
     // crash exactly where it was.
+    // Same pointer-bitcast peel as the load side: a torch.bool store arrives as
+    // `tt.store(tt.bitcast(tt.addptr(...)), ...)`.
+    storePtr = peelPointerBitcasts(storePtr);
     auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
     if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
       return rewriter.notifyMatchFailure(
@@ -23392,18 +23440,6 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   // Rejecting the argument type is both narrower and more useful than
   // rejecting the bitcast: it names the dtype the caller actually chose, and it
   // cannot catch the f32→i32 atomic bitcasts, whose arguments are `!tt.ptr<f32>`.
-  moduleOp.walk([&](mlir::triton::FuncOp func) {
-    for (auto [i, argTy] : llvm::enumerate(func.getArgumentTypes())) {
-      auto ptrTy = mlir::dyn_cast<mlir::triton::PointerType>(argTy);
-      if (ptrTy && ptrTy.getPointeeType().isInteger(1)) {
-        func.emitOpError("Metal backend: argument #")
-            << i
-            << " is a bool (i1) tensor, which is not supported; pass an int8 "
-               "tensor instead";
-        valid = false;
-      }
-    }
-  });
   return mlir::success(valid);
 }
 
@@ -23548,6 +23584,72 @@ static mlir::LogicalResult validateDotScaledSupport(mlir::ModuleOp moduleOp) {
 // Pass entry point.
 //===----------------------------------------------------------------------===//
 
+// Push a `!tt.ptr<i1>` -> `!tt.ptr<i8>` tile bitcast down to the base pointer.
+//
+// A `torch.bool` access arrives as `tt.load(tt.bitcast(tt.addptr(...)))`:
+// Triton knows the buffer is one byte per element and re-types the POINTER,
+// leaving the per-element offset underneath the cast. Every load/store index
+// path reads that offset from its operand's conversion, and the converted
+// bitcast is a memref VIEW rather than an integer, so the index came out
+// non-integral and tripped an assertion inside `emitLoadStoreIndex`.
+//
+// Rewriting `bitcast(addptr(base, off))` into `addptr(bitcast(base), off)` puts
+// the cast where the backend already handles it — on the base, which
+// `findBaseMemref` chases through — and leaves the offset chain intact. Scoped
+// to the i1 -> i8 pointee change so that the f32 atomic min/max expansion, the
+// other producer of pointer bitcasts, keeps its exact IR shape.
+static void preprocessBoolPointerBitcasts(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::BitcastOp> work;
+  moduleOp.walk([&](mlir::triton::BitcastOp bitcast) {
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getSrc().getType());
+    auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getType());
+    if (!srcTy || !dstTy)
+      return;
+    auto srcPtr = mlir::dyn_cast<mlir::triton::PointerType>(srcTy.getElementType());
+    auto dstPtr = mlir::dyn_cast<mlir::triton::PointerType>(dstTy.getElementType());
+    if (!srcPtr || !dstPtr || !srcPtr.getPointeeType().isInteger(1) ||
+        !dstPtr.getPointeeType().isInteger(8))
+      return;
+    if (bitcast.getSrc().getDefiningOp<mlir::triton::AddPtrOp>())
+      work.push_back(bitcast);
+  });
+  for (mlir::triton::BitcastOp bitcast : work) {
+    mlir::OpBuilder builder(bitcast);
+    auto dstTy = mlir::cast<mlir::RankedTensorType>(bitcast.getType());
+    mlir::Type dstElem = dstTy.getElementType();
+    // Walk down the addptr chain, rebuilding it on a re-typed base.
+    llvm::SmallVector<mlir::triton::AddPtrOp> chain;
+    mlir::Value cur = bitcast.getSrc();
+    while (auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      chain.push_back(addptr);
+      cur = addptr.getPtr();
+    }
+    mlir::Value base = cur;
+    mlir::Type baseTy = base.getType();
+    if (auto baseTensor = mlir::dyn_cast<mlir::RankedTensorType>(baseTy))
+      baseTy = mlir::RankedTensorType::get(baseTensor.getShape(), dstElem,
+                                           baseTensor.getEncoding());
+    else if (auto basePtr = mlir::dyn_cast<mlir::triton::PointerType>(baseTy))
+      baseTy = mlir::triton::PointerType::get(
+          mlir::cast<mlir::triton::PointerType>(dstElem).getPointeeType(),
+          basePtr.getAddressSpace());
+    else
+      continue;
+    mlir::Value newBase = mlir::triton::BitcastOp::create(
+        builder, bitcast.getLoc(), baseTy, base);
+    for (mlir::triton::AddPtrOp addptr : llvm::reverse(chain)) {
+      auto resTy = mlir::cast<mlir::RankedTensorType>(addptr.getType());
+      newBase = mlir::triton::AddPtrOp::create(
+          builder, addptr.getLoc(),
+          mlir::RankedTensorType::get(resTy.getShape(), dstElem,
+                                      resTy.getEncoding()),
+          newBase, addptr.getOffset());
+    }
+    bitcast.getResult().replaceAllUsesWith(newBase);
+    bitcast.erase();
+  }
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -23555,6 +23657,8 @@ struct ConvertTritonGPUToMetalPass
   void runOnOperation() override {
     auto moduleOp = getOperation();
     auto *ctx = &getContext();
+
+    preprocessBoolPointerBitcasts(moduleOp);
 
     // Answered here, once, while the rank-2 tensors are all still present —
     // before the validators, because whether a shuffle's operands are held per

@@ -78,24 +78,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// A `torch.bool` output arrives as `!tt.ptr<i1>`, which Triton bitcasts to
-// `!tt.ptr<i8>` at every access. `findBaseMemref` chases through that bitcast
-// deliberately (the f32 atomic min/max expansion needs the ORIGINAL buffer to
-// pick its MSL atomic pointer type), so the store lands on an i1-element memref
-// holding an i8 value and fails to legalize — taking the process with it.
-// Rejecting the ARGUMENT type is narrower than rejecting the bitcast: it names
-// the dtype the caller chose, and cannot catch the atomic bitcasts, whose
-// arguments are `!tt.ptr<f32>`.
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  // expected-error @+1 {{argument #0 is a bool (i1) tensor, which is not supported}}
-  tt.func public @reject_bool_arg(%o: !tt.ptr<i1>) {
-    tt.return
-  }
-}
-
-// -----
-
 // `tt.make_range` is a per-element index. MakeRangeLowering can decompose one
 // out of a blocked layout (rank-1), a slice-of-blocked (rank-2) or a
 // slice-of-slice-of-blocked (rank-3); a `#ttg.linear` layout — what reshaping
