@@ -240,3 +240,173 @@ def test_staged_transpose_masked(rows, cols, BLOCK_N, num_warps):
         f"nw={num_warps} max-abs-err={(out - expected).abs().max().item()}\n"
         f"out=\n{out.cpu()}\nexpected=\n{expected.cpu()}"
     )
+
+
+# --------------------------------------------------------------------------
+# `tl.trans` and rank-2 `tl.reshape` — the one-rank-2-tile premise.
+#
+# The tests above transpose through the ADDRESS (`store(o + xi*N + yi, tile)`),
+# which never puts a second rank-2 tile shape in the kernel. `tl.trans` and a
+# shape-changing `tl.reshape` do, and until 2026-08-17 the backend answered
+# every index range from one module-wide tile (`findLargestRank2Tile`) and
+# forwarded `tt.trans` unconditionally. The measured result:
+#
+#   * a standalone `tl.trans` stored the UNtransposed tile — silently, at every
+#     non-square shape and at every square shape of at least threadgroup size
+#     (4x4 and sub-tpb 8x8 happened to come out right, which is why nothing in
+#     this suite noticed);
+#   * `tl.reshape(v, (8, 16))` of a 16x8 tile wrote with the SOURCE row stride,
+#     leaving 65 of 128 output slots at zero;
+#   * `tl.reshape` of a rank-1 tile into a rank-2 one took the process down
+#     (SIGSEGV/SIGABRT on 9 of 30 runs of one shape) because the rank-2 range
+#     found no rank-2 tile and `MakeRangeLowering` declined inside the
+#     conversion.
+#
+# Every `tl.trans` in `leet-triton/` sits inside a `tl.dot`, where the matmul
+# matchers walk through it on their own terms — which is exactly why these
+# shapes need their own coverage.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def trans_store_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.load(x_ptr + i[:, None] * N + j[None, :])
+    tl.store(o_ptr + j[:, None] * M + i[None, :], tl.trans(v))
+
+
+@pytest.mark.parametrize(
+    "M,N,num_warps",
+    [
+        # Non-square: the load tile is [M,N] and the store tile [N,M], so the
+        # two ranges must decompose against different row lengths.
+        pytest.param(16, 8, 4, id="16x8_nw4"),
+        pytest.param(8, 16, 4, id="8x16_nw4"),
+        pytest.param(64, 16, 4, id="64x16_nw4"),
+        pytest.param(4, 8, 1, id="4x8_nw1"),
+        pytest.param(8, 4, 2, id="8x4_nw2"),
+        # Square: one shape, but the two sides' `order` differ, so forwarding
+        # the trans is only right if nothing re-encoded it on the way.
+        pytest.param(16, 16, 4, id="16x16_nw4"),
+        pytest.param(32, 32, 4, id="32x32_nw4"),
+        # Sub-threadgroup squares — the two that were accidentally correct
+        # before the fix, kept as controls.
+        pytest.param(8, 8, 4, id="8x8_nw4"),
+        pytest.param(4, 4, 1, id="4x4_nw1"),
+    ],
+)
+def test_trans_rank2_stored(M, N, num_warps):
+    device = "mps"
+    x = torch.arange(M * N, dtype=torch.float32, device=device).reshape(M, N)
+    out = torch.zeros(N, M, dtype=torch.float32, device=device)
+    trans_store_kernel[(1,)](x, out, M, N, num_warps=num_warps)
+    expected = x.cpu().t().contiguous()
+    assert torch.equal(out.cpu(), expected), (
+        f"tl.trans {M}x{N} nw={num_warps}\nout=\n{out.cpu()}\n"
+        f"expected=\n{expected}"
+    )
+
+
+@triton.jit
+def trans_reduce_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.load(x_ptr + i[:, None] * N + j[None, :])
+    tl.store(o_ptr + tl.arange(0, N), tl.sum(tl.trans(v), 1))
+
+
+def test_trans_feeding_reduce():
+    """A reduce re-derives its own coordinates, so this path was already right
+    before the fix — pinned so the fix cannot regress it."""
+    M, N = 16, 8
+    x = torch.arange(M * N, dtype=torch.float32, device="mps").reshape(M, N)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    trans_reduce_kernel[(1,)](x, out, M, N)
+    assert torch.allclose(out.cpu(), x.cpu().t().sum(1), atol=1e-5)
+
+
+@triton.jit
+def reshape_rank2_kernel(
+    x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
+    P: tl.constexpr, Q: tl.constexpr
+):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.load(x_ptr + i[:, None] * N + j[None, :])
+    r = tl.reshape(v, (P, Q))
+    p = tl.arange(0, P)
+    q = tl.arange(0, Q)
+    tl.store(o_ptr + p[:, None] * Q + q[None, :], r)
+
+
+@pytest.mark.parametrize(
+    "M,N,P,Q",
+    [
+        pytest.param(16, 8, 8, 16, id="16x8_to_8x16"),
+        pytest.param(16, 16, 8, 32, id="16x16_to_8x32"),
+        pytest.param(32, 32, 16, 64, id="32x32_to_16x64"),
+        pytest.param(8, 8, 4, 16, id="8x8_to_4x16"),
+    ],
+)
+def test_reshape_rank2_shape_change(M, N, P, Q):
+    x = torch.arange(M * N, dtype=torch.float32, device="mps").reshape(M, N)
+    out = torch.zeros(P, Q, dtype=torch.float32, device="mps")
+    reshape_rank2_kernel[(1,)](x, out, M, N, P, Q)
+    expected = x.cpu().reshape(P, Q)
+    assert torch.equal(out.cpu(), expected), (
+        f"tl.reshape {M}x{N}->{P}x{Q}: "
+        f"{int((out.cpu() == 0).sum())} of {P * Q} slots left at zero"
+    )
+
+
+@triton.jit
+def reshape_rank1_to_rank2_kernel(
+    x_ptr, o_ptr, B: tl.constexpr, P: tl.constexpr, Q: tl.constexpr
+):
+    v = tl.reshape(tl.load(x_ptr + tl.arange(0, B)), (P, Q))
+    p = tl.arange(0, P)
+    q = tl.arange(0, Q)
+    tl.store(o_ptr + p[:, None] * Q + q[None, :], v)
+
+
+@pytest.mark.parametrize(
+    "P,Q",
+    [
+        pytest.param(8, 16, id="8x16"),
+        pytest.param(16, 8, id="16x8"),
+        pytest.param(4, 4, id="4x4"),
+        pytest.param(32, 32, id="32x32"),
+        pytest.param(2, 64, id="2x64"),
+    ],
+)
+def test_reshape_rank1_to_rank2(P, Q):
+    """Was a process kill, not a wrong answer: the rank-2 range found only the
+    rank-1 source tile and `MakeRangeLowering` declined mid-conversion."""
+    B = P * Q
+    x = torch.arange(B, dtype=torch.float32, device="mps")
+    out = torch.zeros(P, Q, dtype=torch.float32, device="mps")
+    reshape_rank1_to_rank2_kernel[(1,)](x, out, B, P, Q)
+    assert torch.equal(out.cpu().reshape(-1), x.cpu())
+
+
+@triton.jit
+def reshape_rank2_to_rank1_kernel(
+    x_ptr, o_ptr, B: tl.constexpr, P: tl.constexpr, Q: tl.constexpr
+):
+    p = tl.arange(0, P)
+    q = tl.arange(0, Q)
+    v = tl.load(x_ptr + p[:, None] * Q + q[None, :])
+    tl.store(o_ptr + tl.arange(0, B), tl.reshape(v, (B,)))
+
+
+@pytest.mark.parametrize(
+    "P,Q", [pytest.param(8, 16, id="8x16"), pytest.param(16, 8, id="16x8")]
+)
+def test_reshape_rank2_to_rank1(P, Q):
+    """The direction that always worked — the control for the pair."""
+    B = P * Q
+    x = torch.arange(B, dtype=torch.float32, device="mps").reshape(P, Q)
+    out = torch.zeros(B, dtype=torch.float32, device="mps")
+    reshape_rank2_to_rank1_kernel[(1,)](x, out, B, P, Q)
+    assert torch.equal(out.cpu(), x.cpu().reshape(-1))
