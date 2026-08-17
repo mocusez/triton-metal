@@ -23836,6 +23836,24 @@ static int32_t debugDtypeTag(mlir::Type t) {
   return 4;
 }
 
+// `tl.debug_barrier()` -> `ttg.barrier`, which had no lowering at all: the
+// decline happened INSIDE applyFullConversion and took the process down with a
+// SIGSEGV rather than raising. `metal.barrier` already emits exactly the right
+// thing (`threadgroup_barrier(mem_flags::mem_threadgroup)`), so this is a
+// direct substitution. The addrSpace attribute is dropped — Metal's
+// threadgroup barrier orders threadgroup and device memory together, which is
+// at least as strong as any subset ttg.barrier can name.
+struct BarrierLowering
+    : public mlir::OpConversionPattern<mlir::triton::gpu::BarrierOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::gpu::BarrierOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<BarrierOp>(op);
+    return mlir::success();
+  }
+};
+
 struct PrintLowering : public mlir::OpConversionPattern<mlir::triton::PrintOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
@@ -25012,7 +25030,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
                  JoinLowering, SplitLowering, CatLowering,
-                 PrintLowering, AssertLowering, FpToFpLowering,
+                 PrintLowering, AssertLowering, BarrierLowering, FpToFpLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
                  HistogramLowering,

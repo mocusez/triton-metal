@@ -6705,6 +6705,16 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         translateValueOrVarName(op.getOperand());
         _output << ")";
       })
+      .Case<mlir::math::AbsIOp>([&](mlir::math::AbsIOp op) {
+        // Integer `tl.abs`. Had no case at all, so it fell through to the
+        // translateValue default and aborted the process with an UNREACHABLE.
+        // MSL's `abs` picks its overload from the argument type, so the operand
+        // must be spelled SIGNED (a signless device buffer is `uint32_t`, on
+        // which abs is the identity).
+        _output << "abs(";
+        emitAs(op.getOperand(), /*wantSigned=*/true);
+        _output << ")";
+      })
       .Case<mlir::math::CeilOp>([&](mlir::math::CeilOp op) {
         // Scalar tl.ceil survives conversion for runtime loop bounds, e.g.
         // ceil(N / BLOCK_SIZE) in chunked kernels.

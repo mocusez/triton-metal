@@ -264,3 +264,24 @@ def test_randn_is_finite_and_standard_normal():
     assert int(v.isinf().sum()) == 0
     assert abs(v.mean().item()) < 0.1, v.mean().item()
     assert 0.9 < v.std().item() < 1.1, v.std().item()
+
+
+@triton.jit
+def _abs_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    tl.store(out_ptr + i, tl.abs(tl.load(x_ptr + i)))
+
+
+def test_integer_abs():
+    """`math.absi` had no emitter case and aborted with an UNREACHABLE.
+
+    It is also the case that pinned the tensor-typed hole in `signednessCast`:
+    an elementwise op can still be tensor-typed at the emitter, and taking the
+    operand type verbatim left `abs()` applied to a `uint32_t` — the identity.
+    """
+    x = torch.tensor([-1, -2, 3, -100, 5, -7, 0, -2147483647] * 2,
+                     device="mps", dtype=torch.int32)
+    out = torch.zeros(16, device="mps", dtype=torch.int32)
+    _abs_kernel[(1,)](x, out, 16)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.cpu().abs()), out.cpu().tolist()
