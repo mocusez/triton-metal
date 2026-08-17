@@ -23959,6 +23959,41 @@ struct ConvertTritonGPUToMetalPass
     g_subTpbCompanion =
         computeSubTpbRank2Companion(moduleOp, &g_subTpbCompanionEnc);
 
+    // A rank-3 `tl.dot` is claimed by the scalar-dot path, whose geometry comes
+    // from the kernel's LARGEST tile. That is the result only while
+    // K <= min(M, N): A is B*M*K and B is B*K*N, so a bigger K makes an operand
+    // win the tiebreak and the claim declines. What the author then saw was a
+    // `ttg.convert_layout` diagnostic about the operands' dot_op layouts —
+    // true, but three steps removed from the actual limit. Name the limit.
+    //
+    // Fixing it for real means teaching the tile-preference rule about rank 3,
+    // and that rule is shared with the tile loop's trip count: the two must
+    // describe ONE tile, and moving only one of them is what once made a
+    // matmul wrong on three launches in four.
+    {
+      bool dotOk = true;
+      moduleOp.walk([&](mlir::triton::DotOp dot) {
+        auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+        auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
+        if (!resTy || !aTy || resTy.getRank() != 3 || aTy.getRank() != 3)
+          return;
+        const int64_t M = resTy.getDimSize(1), N = resTy.getDimSize(2);
+        const int64_t K = aTy.getDimSize(2);
+        if (K > std::min(M, N)) {
+          dot.emitOpError()
+              << "Metal backend: a 3-D batched tl.dot is implemented for "
+                 "K <= min(M, N) (got M=" << M << ", N=" << N << ", K=" << K
+              << "); the tile geometry is taken from the largest tile, and a "
+                 "larger K makes an operand rather than the result win it";
+          dotOk = false;
+        }
+      });
+      if (!dotOk) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateUnitAxisReduce(moduleOp)) ||

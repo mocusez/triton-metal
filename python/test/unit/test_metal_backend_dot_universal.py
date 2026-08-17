@@ -1284,3 +1284,49 @@ def test_int8_dot_matches_torch_exactly(M, N, K, num_warps):
                            num_warps=num_warps)
     torch.mps.synchronize()
     assert torch.equal(c.cpu(), a.to(torch.int32) @ b.to(torch.int32))
+
+
+# --- 3-D batched dot ---------------------------------------------------------
+#
+# A batched `tl.dot` works when K <= min(M, N) and is a named rejection above
+# it. The scalar-dot path takes its geometry from the kernel's largest tile,
+# which is the result only up to that point: A is B*M*K and B is B*K*N, so a
+# bigger K makes an operand win the tiebreak and nothing claims the dot. What
+# the author used to see was a `ttg.convert_layout` diagnostic about the
+# operands' dot_op layouts — true, and three steps removed from the real limit.
+
+
+@triton.jit
+def _batched_dot_kernel(A, B, C, BATCH: tl.constexpr, M: tl.constexpr,
+                        N: tl.constexpr, K: tl.constexpr):
+    b = tl.arange(0, BATCH)[:, None, None]
+    am = b * (M * K) + tl.arange(0, M)[None, :, None] * K + tl.arange(0, K)[None, None, :]
+    bm = b * (K * N) + tl.arange(0, K)[None, :, None] * N + tl.arange(0, N)[None, None, :]
+    cm = b * (M * N) + tl.arange(0, M)[None, :, None] * N + tl.arange(0, N)[None, None, :]
+    tl.store(C + cm, tl.dot(tl.load(A + am), tl.load(B + bm)))
+
+
+@pytest.mark.parametrize("BATCH, M, N, K", [(2, 16, 16, 16), (2, 32, 32, 32),
+                                            (4, 32, 32, 32), (2, 64, 16, 16),
+                                            (8, 16, 16, 16)])
+def test_batched_dot_matches_torch(BATCH, M, N, K):
+    torch.manual_seed(BATCH * 100 + M + K)
+    a = torch.rand(BATCH, M, K, dtype=torch.float32)
+    b = torch.rand(BATCH, K, N, dtype=torch.float32)
+    c = torch.zeros(BATCH, M, N, dtype=torch.float32, device="mps")
+    _batched_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, BATCH, M, N, K)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c.cpu(), torch.bmm(a, b), atol=1e-4, rtol=1e-4)
+
+
+def test_batched_dot_beyond_the_envelope_is_named(capfd):
+    """K above min(M, N) has to say what the limit is, not report a layout
+    conversion three steps downstream of it."""
+    BATCH, M, N, K = 2, 32, 32, 64
+    a = torch.rand(BATCH, M, K, dtype=torch.float32, device="mps")
+    b = torch.rand(BATCH, K, N, dtype=torch.float32, device="mps")
+    c = torch.zeros(BATCH, M, N, dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        _batched_dot_kernel[(1,)](a, b, c, BATCH, M, N, K)
+    assert "3-D batched tl.dot is implemented for K <= min(M, N)" in \
+        capfd.readouterr().err
