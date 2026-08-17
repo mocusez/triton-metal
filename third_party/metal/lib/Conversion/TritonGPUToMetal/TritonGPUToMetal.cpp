@@ -20349,10 +20349,16 @@ static mlir::Type remapStoreSideConeType(mlir::Type ty,
                                      newEnc);
 }
 
+// `allowLoads` admits `tt.load` into the cone. A load is not memory-effect-free,
+// but it is idempotent: re-reading the same buffer at re-encoded addresses costs
+// traffic, never meaning. The store-side pointer/mask cones do not need it (an
+// address cone is pure index arithmetic) and keep the stricter rule; the
+// consumer-side rewrite below does, because the operand it has to bring along is
+// usually a second `tt.load`.
 static bool collectStoreSideEncodingCone(
     mlir::Value root, mlir::Attribute fromEnc, mlir::Attribute toEnc,
     llvm::SmallVectorImpl<mlir::Operation *> &ordered,
-    llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
+    llvm::SmallPtrSetImpl<mlir::Operation *> &seen, bool allowLoads = false) {
   if (!isStoreSideEncodingConeValue(root, fromEnc, toEnc))
     return false;
   auto *def = root.getDefiningOp();
@@ -20360,13 +20366,16 @@ static bool collectStoreSideEncodingCone(
     return true;
   if (!seen.insert(def).second)
     return true;
-  if (def->getNumResults() != 1 || def->getNumRegions() != 0 ||
-      !mlir::isMemoryEffectFree(def))
+  const bool pureEnough =
+      mlir::isMemoryEffectFree(def) ||
+      (allowLoads && mlir::isa<mlir::triton::LoadOp>(def));
+  if (def->getNumResults() != 1 || def->getNumRegions() != 0 || !pureEnough)
     return false;
   if (!remapStoreSideConeType(def->getResult(0).getType(), fromEnc, toEnc))
     return false;
   for (mlir::Value operand : def->getOperands())
-    if (!collectStoreSideEncodingCone(operand, fromEnc, toEnc, ordered, seen))
+    if (!collectStoreSideEncodingCone(operand, fromEnc, toEnc, ordered, seen,
+                                      allowLoads))
       return false;
   ordered.push_back(def);
   return true;
@@ -20375,10 +20384,12 @@ static bool collectStoreSideEncodingCone(
 static mlir::Value cloneStoreSideEncodingCone(mlir::Value root,
                                               mlir::Attribute fromEnc,
                                               mlir::Attribute toEnc,
-                                              mlir::Operation *insertBefore) {
+                                              mlir::Operation *insertBefore,
+                                              bool allowLoads = false) {
   llvm::SmallVector<mlir::Operation *, 16> ordered;
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-  if (!collectStoreSideEncodingCone(root, fromEnc, toEnc, ordered, seen))
+  if (!collectStoreSideEncodingCone(root, fromEnc, toEnc, ordered, seen,
+                                    allowLoads))
     return nullptr;
 
   mlir::IRMapping mapping;
@@ -20404,10 +20415,12 @@ static mlir::Value cloneStoreSideEncodingCone(mlir::Value root,
 
 static bool canCloneStoreSideEncodingCone(mlir::Value root,
                                           mlir::Attribute fromEnc,
-                                          mlir::Attribute toEnc) {
+                                          mlir::Attribute toEnc,
+                                          bool allowLoads = false) {
   llvm::SmallVector<mlir::Operation *, 16> ordered;
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-  if (!collectStoreSideEncodingCone(root, fromEnc, toEnc, ordered, seen))
+  if (!collectStoreSideEncodingCone(root, fromEnc, toEnc, ordered, seen,
+                                    allowLoads))
     return false;
   return root.getDefiningOp() ||
          !mlir::isa<mlir::RankedTensorType>(root.getType());
@@ -20498,6 +20511,174 @@ static bool normalizeStoreSideBlockedDivergentCvt(
   return true;
 }
 
+// L1d3: carry the relabel to the CONSUMERS instead of moving data across lanes.
+//
+// `ConvertLayoutLowering`'s staged transpose (Path 3) can only exchange ONE
+// element per thread. With more, the publish and the read both sit inside the
+// scalarized tile loop, and the slot a lane needs at iteration `iv` is written
+// by some other lane at some other iteration — no barrier placed inside that
+// loop makes that safe, and splitting the loop is not something a conversion
+// pattern can do. So `tl.trans(x) * tl.load(y)` compiled only while
+// `M*N <= 32*num_warps`; above it the shape was refused outright.
+//
+// It does not have to move anything. Every op below the relabel is per-element,
+// and this backend re-derives each lane's element index from `tt.make_range`.
+// Re-encode the FORWARD cone — the elementwise ops, the pure loads feeding them,
+// and the terminal stores' address cones — into the cvt's SOURCE layout and drop
+// the cvt. Each lane then loads, computes and stores a DIFFERENT element than it
+// did before, and the set of (address, value) pairs is unchanged. Free at any
+// sizePerThread, with no threadgroup memory and no barrier.
+//
+// `normalizeStoreSideBlockedDivergentCvt` is the degenerate case of this, where
+// the cone is a single `tt.store`; it runs first and this picks up what it
+// declines.
+//
+// Conservative by construction — every one of these bails leaves the existing
+// staged-transpose/reject classifier in charge:
+//   * the cone must terminate in stores, so there is something to anchor the
+//     rewrite; a cone value read by anything else keeps the old layout contract;
+//   * only single-result, region-free, per-element ops are re-encoded (no
+//     reduce/scan/dot, which carry their own layout contracts);
+//   * everything stays in the cvt's own block, so no region boundary is crossed;
+//   * an outside operand must be a cone this backend can clone into the source
+//     encoding — index arithmetic and pure loads.
+static bool normalizeConsumerSideBlockedDivergentCvt(
+    mlir::triton::gpu::ConvertLayoutOp cvt) {
+  auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+  auto dstRtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+  if (!isSameShapeRank2BlockedPair(srcRtt, dstRtt))
+    return false;
+  mlir::Attribute srcEnc = srcRtt.getEncoding();
+  mlir::Attribute dstEnc = dstRtt.getEncoding();
+  if (!srcEnc || !dstEnc || srcEnc == dstEnc)
+    return false;
+  mlir::Block *block = cvt->getBlock();
+
+  // 1) Walk forward to the stores, collecting the per-element ops on the way.
+  llvm::SmallVector<mlir::Operation *, 8> coneOps;
+  llvm::SmallPtrSet<mlir::Operation *, 8> coneSet;
+  llvm::SmallVector<mlir::triton::StoreOp, 4> stores;
+  llvm::SmallVector<mlir::Value, 8> wl{cvt.getResult()};
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    for (mlir::Operation *user : v.getUsers()) {
+      if (user->getBlock() != block)
+        return false;
+      if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(user)) {
+        // Only as the stored VALUE. A cone value used as an address would mean
+        // the relabel is observable in the addressing too, which this rewrite
+        // does not model.
+        if (store.getValue() != v)
+          return false;
+        if (!llvm::is_contained(stores, store))
+          stores.push_back(store);
+        continue;
+      }
+      if (!coneSet.insert(user).second)
+        continue;
+      // Layout-relabelling ops are excluded even though they pass every
+      // structural test below. `tt.trans` and `tt.reshape` lower to a plain
+      // operand forward whose correctness depends on how the two sides
+      // linearize (`transIsFlatIdentity`); re-encoding one of them out of that
+      // agreement is the defect this rewrite must not reintroduce, and a
+      // chained `ttg.convert_layout` has its own classification to go through.
+      if (mlir::isa<mlir::triton::TransOp, mlir::triton::ReshapeOp,
+                    mlir::triton::gpu::ConvertLayoutOp>(user))
+        return false;
+      // Result count FIRST: `dyn_cast` on a null Type asserts, and a
+      // multi-result consumer (a tuple `tt.reduce`) does reach here.
+      if (user->getNumResults() != 1 || user->getNumRegions() != 0 ||
+          !mlir::isMemoryEffectFree(user))
+        return false;
+      auto rt =
+          mlir::dyn_cast<mlir::RankedTensorType>(user->getResult(0).getType());
+      if (!rt || rt.getShape() != dstRtt.getShape() ||
+          rt.getEncoding() != dstEnc)
+        return false;
+      coneOps.push_back(user);
+      wl.push_back(user->getResult(0));
+    }
+  }
+  if (stores.empty())
+    return false;
+
+  // 2) Outside operands of the cone, and the stores' address cones, must be
+  // clonable into the source encoding. Check them ALL before rewriting anything.
+  auto isConeValue = [&](mlir::Value v) {
+    if (v == cvt.getResult())
+      return true;
+    mlir::Operation *d = v.getDefiningOp();
+    return d && coneSet.count(d);
+  };
+  llvm::SmallVector<std::pair<mlir::OpOperand *, mlir::Value>, 8> externalUses;
+  for (mlir::Operation *op : coneOps)
+    for (mlir::OpOperand &use : op->getOpOperands()) {
+      mlir::Value v = use.get();
+      if (isConeValue(v))
+        continue;
+      if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
+        continue; // a scalar means the same thing under either layout
+      if (!canCloneStoreSideEncodingCone(v, dstEnc, srcEnc,
+                                         /*allowLoads=*/true))
+        return false;
+      externalUses.push_back({&use, v});
+    }
+  for (auto store : stores) {
+    auto ptrRtt =
+        mlir::dyn_cast<mlir::RankedTensorType>(store.getPtr().getType());
+    if (!ptrRtt || ptrRtt.getShape() != dstRtt.getShape() ||
+        ptrRtt.getEncoding() != dstEnc)
+      return false;
+    if (!canCloneStoreSideEncodingCone(store.getPtr(), dstEnc, srcEnc))
+      return false;
+    if (mlir::Value mask = store.getMask()) {
+      auto maskRtt = mlir::dyn_cast<mlir::RankedTensorType>(mask.getType());
+      if (!maskRtt || maskRtt.getShape() != dstRtt.getShape() ||
+          maskRtt.getEncoding() != dstEnc)
+        return false;
+      if (!canCloneStoreSideEncodingCone(mask, dstEnc, srcEnc))
+        return false;
+    }
+  }
+
+  // 3) Rewrite. Clone the outside cones first, while the types they are cloned
+  // from are still the destination encoding.
+  for (auto [use, v] : externalUses) {
+    mlir::Value re = cloneStoreSideEncodingCone(v, dstEnc, srcEnc,
+                                                use->getOwner(),
+                                                /*allowLoads=*/true);
+    if (!re)
+      return false; // checked above; a partial rewrite is not possible here
+    use->set(re);
+  }
+  for (auto store : stores) {
+    mlir::Value newPtr = cloneStoreSideEncodingCone(store.getPtr(), dstEnc,
+                                                    srcEnc,
+                                                    store.getOperation());
+    if (!newPtr)
+      return false;
+    store->setOperand(0, newPtr);
+    if (store.getMask()) {
+      mlir::Value newMask = cloneStoreSideEncodingCone(
+          store.getMask(), dstEnc, srcEnc, store.getOperation());
+      if (!newMask)
+        return false;
+      store->setOperand(2, newMask);
+    }
+  }
+  for (mlir::Operation *op : coneOps) {
+    mlir::Type newTy =
+        remapStoreSideConeType(op->getResult(0).getType(), dstEnc, srcEnc);
+    if (!newTy)
+      return false;
+    op->getResult(0).setType(newTy);
+  }
+  cvt.getResult().replaceAllUsesWith(cvt.getSrc());
+  cvt.erase();
+  return true;
+}
+
 static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> cvts;
   moduleOp.walk(
@@ -20527,7 +20708,11 @@ static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
       continue;
     if (!cvt->getParentOp())
       continue;
-    normalizeStoreSideBlockedDivergentCvt(cvt);
+    if (normalizeStoreSideBlockedDivergentCvt(cvt))
+      continue;
+    if (!cvt->getParentOp())
+      continue;
+    normalizeConsumerSideBlockedDivergentCvt(cvt);
   }
 }
 

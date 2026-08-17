@@ -10,19 +10,20 @@ tg_load_indexed[dstIdx] -> barrier -> replaceOp`.
 Honest divergences from the spec's AC.T2 / AC.T4 envelope (surface, do
 not silently work around):
 
-* The leet `easy-matrix_transpose.py` kernel as shipped (BLOCK_N=16,
-  default num_warps=4) lowers to a TTGIR whose `ttg.convert_layout`
-  endpoints have `sizePerThread=[1,2]` / `[2,1]` (the post-coalesce
-  vectorized shape). L1d2 restricts to `sizePerThread=[1,1]` only; the
-  vectorized path is L1d3 territory. To exercise the [1,1] envelope at
-  the leet's 16x16 shape we MUST force `num_warps=8` (256 threads ==
-  16*16 elements per tile, one element per thread).
+* The tests below force `num_warps=8` at the leet's 16x16 shape (256
+  threads == 16*16 elements, one element per thread) because the STAGED
+  body is what they exist to cover, and it only ever handles one element
+  per thread. The shipped kernel's own default (BLOCK_N=16, num_warps=4)
+  lowers to `sizePerThread=[1,2]` / `[2,1]` instead.
 
-* AC.T2's 32x32 and 48x80 cases land outside the [1,1] envelope under
-  any practical `num_warps`: 32x32=1024 elements would need 1024
-  threads/threadgroup (32 warps with `warp_size=32`) which exceeds Apple
-  Silicon's per-threadgroup thread budget, and 48x80=3840 is
-  unreachable. They are left for L1d3 (vectorized staging).
+* SUPERSEDED by L1d3 (`normalizeConsumerSideBlockedDivergentCvt`): the
+  `sizePerThread > 1` shapes this note used to call unreachable — the
+  leet default, and 32x32 under any practical `num_warps` — no longer
+  need the staged body at all. The relabel is carried by re-encoding the
+  consumer cone, so no data crosses lanes and the element count per
+  thread stops mattering. Covered by
+  `test_trans_combined_with_second_tile` at the bottom of this file and
+  by `convert_layout_consumer_reencode.mlir`.
 
 * The masked transpose path (the canonical leet pattern with `mask=...`
   on both load and store) currently exhibits a downstream miscompile
@@ -410,3 +411,87 @@ def test_reshape_rank2_to_rank1(P, Q):
     out = torch.zeros(B, dtype=torch.float32, device="mps")
     reshape_rank2_to_rank1_kernel[(1,)](x, out, B, P, Q)
     assert torch.equal(out.cpu(), x.cpu().reshape(-1))
+
+
+# --------------------------------------------------------------------------
+# L1d3: a transposed tile COMBINED with a second tile.
+#
+# `tl.trans(x) * tl.load(y)` leaves a rank-2 blocked->blocked relabel between
+# two genuinely different lane mappings, and the staged transpose above can only
+# exchange one element per thread — with more, the publish and the read both sit
+# inside the scalarized tile loop and the slot a lane needs at iteration `iv` is
+# written by another lane at some other iteration. So this compiled only while
+# `M*N <= 32*num_warps`; 12 of the 18 cases below were refused outright.
+#
+# The fix moves the LAYOUT instead of the data: the forward cone (the multiply,
+# the second load, the store's address cone) is re-encoded into the transposed
+# layout and the relabel is erased. No threadgroup memory, no barrier, and no
+# dependence on sizePerThread at all.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def trans_times_tile_kernel(
+    x_ptr, y_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr
+):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.trans(tl.load(x_ptr + i[:, None] * N + j[None, :]))
+    w = tl.load(y_ptr + j[:, None] * M + i[None, :])
+    tl.store(o_ptr + j[:, None] * M + i[None, :], v * w)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4, 8])
+@pytest.mark.parametrize(
+    "M,N",
+    [
+        pytest.param(16, 16, id="16x16"),
+        pytest.param(16, 8, id="16x8"),
+        pytest.param(8, 16, id="8x16"),
+        pytest.param(32, 32, id="32x32"),
+        pytest.param(64, 16, id="64x16"),
+        pytest.param(8, 8, id="8x8"),
+    ],
+)
+def test_trans_combined_with_second_tile(M, N, num_warps):
+    x = torch.arange(M * N, dtype=torch.float32, device="mps").reshape(M, N)
+    y = torch.arange(N * M, dtype=torch.float32, device="mps").reshape(N, M) * 0.5
+    out = torch.zeros(N, M, dtype=torch.float32, device="mps")
+    trans_times_tile_kernel[(1,)](x, y, out, M, N, num_warps=num_warps)
+    expected = x.cpu().t().contiguous() * y.cpu()
+    assert torch.equal(out.cpu(), expected), (
+        f"trans*tile {M}x{N} nw={num_warps}\nout=\n{out.cpu()}\n"
+        f"expected=\n{expected}"
+    )
+
+
+@triton.jit
+def trans_plus_scalar_masked_kernel(
+    x_ptr, o_ptr, rows, M: tl.constexpr, N: tl.constexpr
+):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.trans(tl.load(x_ptr + i[:, None] * N + j[None, :]))
+    tl.store(
+        o_ptr + j[:, None] * M + i[None, :],
+        v + 1.0,
+        mask=j[:, None] < rows,
+    )
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize(
+    "M,N", [pytest.param(16, 16, id="16x16"), pytest.param(32, 16, id="32x16")]
+)
+def test_trans_elementwise_masked_store(M, N, num_warps):
+    """The store's MASK cone has to be re-encoded alongside its address cone."""
+    rows = N // 2
+    x = torch.arange(M * N, dtype=torch.float32, device="mps").reshape(M, N)
+    out = torch.zeros(N, M, dtype=torch.float32, device="mps")
+    trans_plus_scalar_masked_kernel[(1,)](x, out, rows, M, N, num_warps=num_warps)
+    expected = torch.zeros(N, M)
+    expected[:rows] = x.cpu().t()[:rows] + 1.0
+    assert torch.equal(out.cpu(), expected), (
+        f"masked trans {M}x{N} nw={num_warps}\nout=\n{out.cpu()}\n"
+        f"expected=\n{expected}"
+    )

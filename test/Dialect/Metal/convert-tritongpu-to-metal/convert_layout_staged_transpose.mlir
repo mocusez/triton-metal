@@ -9,13 +9,19 @@
 // Both barriers are `mem_threadgroup` (BarrierOp has no flag operand —
 // the MSL emitter pins `mem_threadgroup` per `MetalOps.td` §BarrierOp).
 //
-// The loaded tile is ALSO stored untransposed via %y_ptr, so the cvt's
-// producer cone is NOT self-contained. The converted result additionally
-// passes through arith.addf before its store, preventing the store-side
-// normalizer from re-encoding that store and erasing the cvt. Together these
-// force both normalizers to bail (a self-contained or store-only cvt would
-// instead collapse to a direct gather/scatter), keeping this fixture's
-// coverage on the staged-transpose fallback body.
+// Reaching the staged body takes work, because THREE normalizers get a turn
+// first and each one erases the cvt where it can:
+//   * the loaded tile is ALSO stored untransposed via %y_ptr, so the cvt's
+//     producer cone is not self-contained and `normalizeBlockedDivergentCvt`
+//     bails;
+//   * the converted result passes through arith.addf before its store, so
+//     `normalizeStoreSideBlockedDivergentCvt` (store-only consumers) bails;
+//   * the result ALSO feeds a `tt.reduce`, which carries a region and its own
+//     layout contract, so the L1d3 consumer-side re-encode
+//     (`normalizeConsumerSideBlockedDivergentCvt`) bails too. Without this the
+//     cvt would be rewritten away into the reduce-free cone and the staged body
+//     would never run — that rewrite is the right answer whenever it applies,
+//     and this fixture exists for what is left.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked_t = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 2], warpsPerCTA = [1, 8], order = [0, 1]}>
@@ -36,10 +42,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %x_splat_t = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #blocked_t>
     %x_addr_t = tt.addptr %x_splat_t, %offs_t : tensor<16x16x!tt.ptr<f32>, #blocked_t>, tensor<16x16xi32, #blocked_t>
     tt.store %x_addr_t, %x_cvt_used : tensor<16x16x!tt.ptr<f32>, #blocked_t>
+    // Region-bearing consumer: keeps the L1d3 consumer-side re-encode out.
+    %red = "tt.reduce"(%x_cvt) <{axis = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<16x16xf32, #blocked_t>) -> tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked_t}>>
+    %ridx = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_t}>>
+    %rsp = tt.splat %y_ptr : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 1, parent = #blocked_t}>>
+    %rp = tt.addptr %rsp, %ridx : tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 1, parent = #blocked_t}>>, tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_t}>>
+    tt.store %rp, %red : tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 1, parent = #blocked_t}>>
     tt.return
   }
 }
 
+// The 256-element buffer is the cvt's; the reduce allocates a 16-element row
+// buffer of its own, which is why the size is pinned here.
 // CHECK-LABEL: metal.kernel cvt_staged_transpose_16x16
 // CHECK: %[[BUF:.+]] = metal.threadgroup_alloca : !metal.memref<256 x f32>
 // CHECK: metal.tg_store_indexed %[[BUF]]

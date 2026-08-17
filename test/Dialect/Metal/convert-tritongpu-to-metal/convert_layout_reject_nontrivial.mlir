@@ -43,33 +43,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// -----
-// Section 2: rank-2 blocked↔blocked transpose-shaped cvt but with
-// sizePerThread > 1 on both sides (the canonical leet `easy-matrix_transpose`
-// post-coalesce shape). The cvt first feeds elementwise arith and only then a
-// store, so the store-side normalizer must not rewrite it; vectorized cvt
-// staging remains L1d3 territory.
-
-#blocked2a = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
-#blocked2b = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @cvt_reject_size_per_thread_gt_one(%x_ptr: !tt.ptr<f32>, %y_ptr: !tt.ptr<f32>) {
-    %offs = arith.constant dense<0> : tensor<16x16xi32, #blocked2a>
-    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #blocked2a>
-    %x_addr = tt.addptr %x_splat, %offs : tensor<16x16x!tt.ptr<f32>, #blocked2a>, tensor<16x16xi32, #blocked2a>
-    %x_val = tt.load %x_addr : tensor<16x16x!tt.ptr<f32>, #blocked2a>
-    // External (non-cone) use → keeps the cone non-self-contained.
-    %y_splat = tt.splat %y_ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #blocked2a>
-    %y_addr = tt.addptr %y_splat, %offs : tensor<16x16x!tt.ptr<f32>, #blocked2a>, tensor<16x16xi32, #blocked2a>
-    tt.store %y_addr, %x_val : tensor<16x16x!tt.ptr<f32>, #blocked2a>
-    // expected-error @+1 {{deferred to L1d3}}
-    %x_cvt = ttg.convert_layout %x_val : tensor<16x16xf32, #blocked2a> -> tensor<16x16xf32, #blocked2b>
-    %one_b = arith.constant dense<1.000000e+00> : tensor<16x16xf32, #blocked2b>
-    %x_add = arith.addf %x_cvt, %one_b : tensor<16x16xf32, #blocked2b>
-    %offs_b = arith.constant dense<0> : tensor<16x16xi32, #blocked2b>
-    %x_splat_b = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #blocked2b>
-    %x_addr_b = tt.addptr %x_splat_b, %offs_b : tensor<16x16x!tt.ptr<f32>, #blocked2b>, tensor<16x16xi32, #blocked2b>
-    tt.store %x_addr_b, %x_add : tensor<16x16x!tt.ptr<f32>, #blocked2b>
-    tt.return
-  }
-}
+// Section 2 USED to live here — a rank-2 blocked↔blocked transpose-shaped cvt
+// with sizePerThread > 1 on both sides, the canonical leet
+// `easy-matrix_transpose` post-coalesce shape, rejected because the staged body
+// can only exchange one element per thread. That is what L1d3 implements, by
+// re-encoding the consumer cone instead of moving data, so the shape now
+// compiles and its coverage moved to
+// `convert_layout_consumer_reencode.mlir`.
