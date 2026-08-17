@@ -165,13 +165,50 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
   return ROCDL::BallotOp::create(rewriter, loc, type, cmp);
 }
 
+Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value timer;
+  switch (getISAFamily()) {
+  case ISAFamily::RDNA3:
+  case ISAFamily::RDNA4m:
+  case ISAFamily::RDNA4:
+  case ISAFamily::GFX1250: {
+    Value msg = b.i32_val(/*MSG_RTN_GET_REALTIME=*/131);
+    timer = LLVM::createLLVMIntrinsicCallOp(
+                rewriter, loc, "llvm.amdgcn.s.sendmsg.rtn.i64", i64_ty, {msg})
+                .getResult(0);
+    break;
+  }
+  default:
+    timer = LLVM::createLLVMIntrinsicCallOp(
+                rewriter, loc, "llvm.amdgcn.s.memrealtime", i64_ty, {})
+                .getResult(0);
+    break;
+  }
+  // The clock generator runs at 100 MHz, so each tick is 10 ns.
+  return b.mul(timer, b.i64_val(10));
+}
+
+StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
+  switch (scope) {
+  case MemSyncScope::CTA:
+    return "workgroup";
+  case MemSyncScope::GPU:
+    return "agent";
+  case MemSyncScope::SYSTEM:
+    return {};
+  }
+  llvm_unreachable("unknown memory synchronization scope");
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   b.barrier(targets);
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
+                                Operation * /*sourceOp*/) const {
   triton::amdgpu::ClusterBarrierArriveOp::create(rewriter, loc);
   triton::amdgpu::ClusterBarrierWaitOp::create(rewriter, loc);
 }
@@ -182,9 +219,8 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
-  if (ctaId.has_value()) {
+                              Value ctaId, Value val, Value pred) const {
+  if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }
@@ -200,9 +236,9 @@ TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Type elemTy,
-                              Value pred, Operation *localLoadOp) const {
-  if (ctaId.has_value()) {
+                              Value ctaId, Type elemTy, Value pred,
+                              Operation *localLoadOp) const {
+  if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }
@@ -211,7 +247,8 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   bool addAliasGroup = localLoadOp && requiresAliasInfoForAsyncOps() &&
                        isSyncedViaAsyncWait(localLoadOp);
   return mlir::LLVM::AMD::llLoad(rewriter, loc, ptr, elemTy, pred, falseVal, {},
-                                 triton::CacheModifier::NONE, addAliasGroup);
+                                 triton::CacheModifier::NONE,
+                                 /*isVolatile=*/false, addAliasGroup);
 }
 
 Value TargetInfo::shuffleXor(RewriterBase &rewriter, Location loc, Value val,
@@ -370,29 +407,6 @@ static bool warpReduceSwap16or32(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-static bool warpReduceSwap16(RewriterBase &rewriter, Location loc,
-                             SmallVector<Value> &acc, triton::ReduceOp op,
-                             unsigned reduceLaneIdMask) {
-  Operation *reduxOp = op.getSingleCombiner();
-  if (!reduxOp)
-    return false;
-
-  bool mfma16Case = reduceLaneIdMask == 16;
-  if (!mfma16Case)
-    return false;
-
-  Value val = acc[0];
-  unsigned bits = val.getType().getIntOrFloatBitWidth();
-  if (bits > 32)
-    return false;
-
-  StringRef intrinsic = "llvm.amdgcn.permlane16.swap";
-  for (auto i = 0; i < acc.size(); i++) {
-    acc[i] = permuteAndReduce(rewriter, loc, intrinsic, acc[i], reduxOp);
-  }
-  return true;
-}
-
 bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
                             SmallVector<Value> &acc, triton::ReduceOp op,
                             unsigned reduceLaneIdMask) const {
@@ -401,9 +415,7 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
   if (getISAFamily() == ISAFamily::CDNA4 &&
       warpReduceSwap16or32(rewriter, loc, acc, op, reduceLaneIdMask))
     return true;
-  if ((getISAFamily() == ISAFamily::GFX1250) &&
-      warpReduceSwap16(rewriter, loc, acc, op, reduceLaneIdMask))
-    return true;
+
   if (reduceLaneIdMask != (getWarpSize() - 1))
     return false;
   // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
@@ -737,6 +749,10 @@ bool TargetInfo::supportsMultiCTALaunch() const {
   return targetFeatures.supportsMultiCTALaunch();
 }
 
+unsigned TargetInfo::getMaxMulticastMaskPopcount() const {
+  return targetFeatures.getMaxMulticastMaskPopcount();
+}
+
 bool TargetInfo::supportsTDM() const { return targetFeatures.supportsTDM(); }
 
 bool TargetInfo::supportsClusterLoadBitWidth(int biwWidth) const {
@@ -800,6 +816,7 @@ TargetInfo::getSharedLdStTiles(int32_t vecBitwidth) const {
   case ISAFamily::RDNA1:
   case ISAFamily::RDNA2:
   case ISAFamily::RDNA3:
+  case ISAFamily::RDNA4m:
     if (vecBitwidth == 128)
       return {/*load tile*/ {{}, {0, 1, 4}}, /*store tile*/ {}};
     break;

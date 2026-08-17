@@ -83,8 +83,7 @@ class Tensor:
 
     @property
     def data(self):
-        t = self.storage
-        return t.data if isinstance(t, Storage) else t
+        return self.storage.data
 
     def dim(self):
         return self.ndim
@@ -225,7 +224,7 @@ def wrap_torch_tensor(torch_tensor, dtype=None, shape=None, shape_max=None, layo
     if shape_max is None:
         shape_max = list(shape)
     if layout is None:
-        # For a strided (dense) tensor we only track which dimension has unit stride.
+        # For a strided tensor we only track which dimension has unit stride.
         # This is consistent with how we expand `shape` for packed sub-byte dtypes.
         major_dim = torch_tensor.stride().index(1) if 1 in torch_tensor.stride() else -1
         layout = StridedLayout(major_dim=major_dim - torch_tensor.ndim)
@@ -233,7 +232,15 @@ def wrap_torch_tensor(torch_tensor, dtype=None, shape=None, shape_max=None, layo
 
 
 def convert_layout(tensor: Tensor, layout: Layout, **layout_transformation_kwargs):
+    """Convert `tensor` storage encoding to `layout`.
+
+    Returns `tensor` unchanged when its existing storage is already valid for
+    `layout`. This operation does not clone, densify, or canonicalize physical
+    strides of a tensor that is already in the requested encoding.
+    """
     shape = list(tensor.shape)
+    if not layout_transformation_kwargs and tensor.storage.layout.can_preserve_storage_as(layout, len(shape)):
+        return tensor
     # convert `tensor` into canonical form
     transformation = tensor.storage.layout.make_transformation(shape, tensor.dtype == FP4)
     canonical_data = transformation.unswizzle_data(tensor.storage.data)
@@ -245,8 +252,6 @@ def convert_layout(tensor: Tensor, layout: Layout, **layout_transformation_kwarg
 
 
 def dtype_to_torch_dtype(dtype: DataType) -> torch.dtype:
-    if dtype is None:
-        return None
     if not isinstance(dtype, DataType):
         return dtype
     return {
@@ -291,13 +296,10 @@ def torch_dtype_to_dtype(dtype: torch.dtype) -> DataType:
 
 def empty(shape: tuple[int], dtype: DataType, device: torch.device, layout=None,
           allow_implicit_conversion: bool = False):
-    storage_shape = list(shape)
     storage_dtype = torch.uint8 if dtype == FP4 else dtype_to_torch_dtype(dtype)
     initial_layout = layout if isinstance(layout, StridedLayout) else StridedLayout()
-    # pack sub-byte datatype along last dimension
-    order = initial_layout.order(len(storage_shape))
-    dim = order[0]
-    storage_shape[dim] = storage_shape[dim] // (storage_dtype.itemsize * 8 // dtype.bitwidth)
+    storage_shape = initial_layout.storage_shape(list(shape), dtype == FP4)
+    order = initial_layout.order(len(shape))
     # storage strides
     strides = [0] * len(storage_shape)
     running = 1
@@ -306,7 +308,6 @@ def empty(shape: tuple[int], dtype: DataType, device: torch.device, layout=None,
         running *= storage_shape[d]
     storage = torch.empty_strided(storage_shape, strides, device=device, dtype=storage_dtype)
     ret = wrap_torch_tensor(storage, dtype=dtype, shape=shape, layout=initial_layout)
-    assert initial_layout == ret.storage.layout or allow_implicit_conversion
     if allow_implicit_conversion:
         ret = convert_layout(ret, layout)
     return ret

@@ -1,8 +1,11 @@
 import pytest
 import torch
+import triton
+import triton.language as tl
 from triton._internal_testing import is_cuda
 
 from triton_kernels.matmul import matmul, matmul_torch, PrecisionConfig
+from triton_kernels.matmul_details._matmul import _compute_packed_n_w
 from triton_kernels.matmul_details.opt_flags import InapplicableConstraint, scoped_opt_flags_constraints
 from triton_kernels.matmul_details.opt_flags_details import opt_flags_nvidia
 from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE, downcast_to_mxfp
@@ -10,6 +13,7 @@ from triton_kernels.tensor import FP4, UINT8, Storage, Tensor, convert_layout, w
 from triton_kernels.tensor_details import layout
 from triton_kernels.tensor_details.layout import BlackwellMX4ValueShuffledLayout
 from triton_kernels.tensor_details.layout_details.blackwell_scale import BlackwellMXScaleLayout
+from triton_kernels.tensor_details.ragged_tensor import make_ragged_tensor_metadata_torch
 from triton_kernels.testing import assert_close
 
 
@@ -104,6 +108,49 @@ def test_matmul_hopper_mxfp4_rhs_scale_padding_is_masked(device, constraints):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@triton.jit
+def _hopper_rhs_packed_n_extent(out, n: tl.constexpr):
+    tl.store(out, _compute_packed_n_w(n, 4, "HOPPER_VALUE"))
+
+
+@pytest.mark.parametrize("n", [258, 320])
+def test_matmul_hopper_mxfp4_rhs_packed_n_padding(device, n):
+    if device != "cuda" or not torch.cuda.is_available() or not is_cuda():
+        pytest.skip("requires CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires Hopper")
+
+    torch.manual_seed(0)
+    # Hopper MXFP4 RHS values are stored with N packed by 4 and then padded in
+    # packed space. The generic kernel must ceil-divide before padding and wrap
+    # using that padded packed width.
+    packed_n = torch.empty((1, ), dtype=torch.int32, device=device)
+    _hopper_rhs_packed_n_extent[(1, )](packed_n, n)
+    assert packed_n.item() == 128
+
+    m, k = 64, 2048
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    weight_fp = torch.randn((n, k), device=device, dtype=torch.bfloat16).T
+    weight_val, weight_scale = downcast_to_mxfp(weight_fp, torch.uint8, axis=-2)
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=-2, num_warps=8)
+    b = convert_layout(wrap_torch_tensor(weight_val, dtype=FP4), value_layout)
+    b_scale = convert_layout(wrap_torch_tensor(weight_scale, dtype=UINT8), scale_layout)
+    assert b.storage.data.shape[-1] == packed_n.item()
+    precision_config = PrecisionConfig(
+        b_mx_scale=b_scale,
+        b_microblock_size=MXFP_BLOCK_SIZE.value,
+        out_dtype=a.dtype,
+    )
+
+    with scoped_opt_flags_constraints({"is_persistent": False, "block_n": 256}):
+        expected = matmul_torch(a, b, None, precision_config=precision_config)
+        actual = matmul(a, b, None, precision_config=precision_config)
+
+    assert torch.isfinite(actual).all()
+    assert_close(expected, actual, maxtol=3e-2, rmstol=None)
+
+
 @pytest.mark.parametrize("n, expected", [(64, 128), (200, 256)])
 def test_compute_block_n_blackwell_scale_aligns_to_128(n, expected):
     precision_config = PrecisionConfig(
@@ -112,6 +159,12 @@ def test_compute_block_n_blackwell_scale_aligns_to_128(n, expected):
     )
     block_n, block_n_tma = opt_flags_nvidia.compute_block_n(n, None, precision_config)
     assert block_n == block_n_tma == expected
+
+
+def test_compute_num_warps_uses_two_warp_floor():
+    precision_config = PrecisionConfig()
+    assert opt_flags_nvidia.compute_num_warps(16, 256, False, precision_config, {}) == 2
+    assert opt_flags_nvidia.compute_num_warps(16, 256, False, precision_config, {"num_warps": 1}) == 1
 
 
 def test_matmul_blackwell_scale_small_n(device):
@@ -132,6 +185,45 @@ def test_matmul_blackwell_scale_small_n(device):
     tri_y = matmul(a, b, None, precision_config=precision_config)
     ref_y = matmul_torch(a.to(torch.bfloat16), b, None, precision_config=precision_config)
     assert_close(ref_y, tri_y, maxtol=3e-2, rmstol=None)
+
+
+@pytest.mark.parametrize("split_k", [1, 2])
+def test_matmul_clc(device, split_k):
+    if device != "cuda" or not torch.cuda.is_available() or not is_cuda():
+        pytest.skip("requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires Blackwell or newer")
+
+    torch.manual_seed(0)
+    m, n, k = 4096, 1024, 128
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b = torch.randn((k, n), device=device, dtype=torch.bfloat16)
+    with scoped_opt_flags_constraints({
+            "clc": True,
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 64,
+            "split_k": split_k,
+    }):
+        tri_y = matmul(a, b, None)
+
+    ref_y = matmul_torch(a, b, None, precision_config=PrecisionConfig())
+    assert_close(ref_y, tri_y, maxtol=3e-2, rmstol=None)
+
+
+def test_matmul_clc_rejects_ragged_m_grid(device):
+    if device != "cuda" or not torch.cuda.is_available() or not is_cuda():
+        pytest.skip("requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires Blackwell or newer")
+
+    slice_sizes = torch.tensor([64, 0, 64], dtype=torch.int32, device=device)
+    metadata = make_ragged_tensor_metadata_torch(slice_sizes, 128)
+    a = torch.randn((128, 64), device=device, dtype=torch.bfloat16)
+    b = torch.randn((3, 64, 128), device=device, dtype=torch.bfloat16)
+    with scoped_opt_flags_constraints({"clc": True}):
+        with pytest.raises(InapplicableConstraint, match="host-known grid"):
+            matmul(a, b, None, a_ragged_metadata=metadata)
 
 
 def test_matmul_blackwell_shuffled_mxfp4_weight(device):

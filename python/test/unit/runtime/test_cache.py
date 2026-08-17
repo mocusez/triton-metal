@@ -1,6 +1,7 @@
 import expecttest
 import importlib.util
 import itertools
+import multiprocessing
 import os
 import re
 import gc
@@ -14,6 +15,60 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hip
+from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
+    fresh_knobs.cache.dir = str(tmp_path)
+    manager = FileCacheManager("key")
+    metadata_path = manager.put("{}", "kernel.json", binary=False)
+    artifact_path = manager.put("binary", "kernel.cubin", binary=False)
+
+    manager.put_group("kernel.json", {
+        "kernel.json": metadata_path,
+        "kernel.cubin": artifact_path,
+    })
+    assert manager.get_group("kernel.json") == {
+        "kernel.json": metadata_path,
+        "kernel.cubin": artifact_path,
+    }
+
+    os.remove(artifact_path)
+    assert manager.get_group("kernel.json") is None
+
+
+def test_remote_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
+
+    class DictRemoteCacheBackend:
+        data = {}
+
+        def __init__(self, key):
+            self.key = key
+
+        def get(self, filenames):
+            return {filename: self.data[filename] for filename in filenames if filename in self.data}
+
+        def put(self, filename, data):
+            self.data[filename] = data
+
+    fresh_knobs.cache.dir = str(tmp_path)
+    fresh_knobs.cache.remote_manager_class = DictRemoteCacheBackend
+    DictRemoteCacheBackend.data = {}
+
+    manager = RemoteCacheManager("key")
+    manager.put("{}", "kernel.json", binary=False)
+    manager.put(b"binary", "kernel.cubin")
+    manager.put_group("kernel.json", {
+        "kernel.json": "unused-local-path",
+        "kernel.cubin": "unused-local-path",
+    })
+
+    group = manager.get_group("kernel.json")
+    assert group is not None
+    assert set(group) == {"kernel.json", "kernel.cubin"}
+
+    del DictRemoteCacheBackend.data["kernel.cubin"]
+    assert manager.get_group("kernel.json") is None
 
 
 @triton.jit
@@ -104,6 +159,68 @@ def test_nested2_change():
     baseline = kernel.cache_key
     updated = apply_src_change(kernel, 'i + 1', 'i + 2', function_0)
     assert baseline != updated
+
+
+ORDER_DEPENDENT_CONSTEXPR = tl.constexpr(42)
+
+
+@triton.jit
+def order_dependent_inner():
+    return ORDER_DEPENDENT_CONSTEXPR
+
+
+@triton.jit
+def order_dependent_outer():
+    order_dependent_inner()
+
+
+def test_cache_key_independent_of_dependency_hash_order():
+    functions = (order_dependent_inner, order_dependent_outer)
+
+    for function in functions:
+        function.hash = None
+        function.used_global_vals = {}
+    cold_key = order_dependent_outer.cache_key
+
+    for function in functions:
+        function.hash = None
+        function.used_global_vals = {}
+    order_dependent_inner.cache_key
+    prehashed_key = order_dependent_outer.cache_key
+
+    assert prehashed_key == cold_key
+
+
+def test_cache_key_independent_of_globals_dict_identity():
+
+    def make_child(value):
+        shared = tl.constexpr(value)
+
+        @triton.jit
+        def child():
+            return shared
+
+        return child
+
+    child_a = make_child(1)
+    child_b = make_child(2)
+
+    @triton.jit
+    def parent():
+        child_a()
+        child_b()
+
+    functions = (child_a, child_b, parent)
+
+    def key_after_prehashing(first, second):
+        for function in functions:
+            function.hash = None
+            function.used_global_vals = {}
+        first.cache_key
+        second.cache_key
+        return parent.cache_key
+
+    assert key_after_prehashing(child_a, child_b) == key_after_prehashing(child_b, child_a)
 
 
 def test_combine_fn_change():
@@ -421,6 +538,40 @@ def test_cache_closure():
         closure[(1, )]()
 
     assert "cst has changed since we compiled this kernel, from constexpr[42] to constexpr[43]" in str(e.value)
+
+
+CLOSURE_SHADOW_GLOBAL = tl.constexpr(3)
+
+
+def test_cache_closure_shadows_global():
+
+    def make_closure(value):
+        CLOSURE_SHADOW_GLOBAL = value
+
+        @triton.jit
+        def closure():
+            return CLOSURE_SHADOW_GLOBAL
+
+        return closure
+
+    first = make_closure(tl.constexpr(7))
+    second = make_closure(tl.constexpr(9))
+    same_as_first = make_closure(tl.constexpr(7))
+    captures_none = make_closure(None)
+
+    first_key = first.cache_key
+    second_key = second.cache_key
+    same_as_first_key = same_as_first.cache_key
+    captures_none.cache_key
+
+    def tracked_values(fn):
+        return {name: value for (name, _), (value, _) in fn.used_global_vals.items()}
+
+    assert first_key != second_key
+    assert first_key == same_as_first_key
+    assert tracked_values(first)["CLOSURE_SHADOW_GLOBAL"].value == 7
+    assert tracked_values(second)["CLOSURE_SHADOW_GLOBAL"].value == 9
+    assert "CLOSURE_SHADOW_GLOBAL" not in tracked_values(captures_none)
 
 
 @triton.jit
@@ -978,9 +1129,11 @@ def test_module_load_unload(device, fresh_knobs):
 
     # we should hit the kernel unload call to decrese the counter from 1 to 0
     counter = 1
+    owner_pid = os.getpid()
 
     def kernel_unload(*args, **kwargs):
         nonlocal counter
+        assert os.getpid() == owner_pid
         counter -= 1
 
     # turn off python garbage collector, so the callback is not called
@@ -994,6 +1147,14 @@ def test_module_load_unload(device, fresh_knobs):
 
     assert counter == 1
     assert pre_compile.module is not None
+
+    if "fork" in multiprocessing.get_all_start_methods():
+        child = multiprocessing.get_context("fork").Process(target=pre_compile.__del__)
+        child.start()
+        child.join()
+        assert child.exitcode == 0
+        assert counter == 1
+
     pre_compile.__del__()
 
     assert counter == 0

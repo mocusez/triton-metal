@@ -1,39 +1,54 @@
 #include "Session/Session.h"
+#include "Backend/Backend.h"
 #include "Context/Python.h"
 #include "Context/Shadow.h"
 #include "Data/TraceData.h"
 #include "Data/TreeData.h"
 #include "Profiler/Cupti/CuptiProfiler.h"
 #include "Profiler/Instrumentation/InstrumentationProfiler.h"
+#include "Profiler/Profiler.h"
 #include "Profiler/RocprofSDK/RocprofSDKProfiler.h"
 #include "Profiler/Roctracer/RoctracerProfiler.h"
 #include "Utility/Errors.h"
 #include "Utility/String.h"
+#include <algorithm>
+#include <functional>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace proton {
 
 namespace {
 
 Profiler *makeProfiler(const std::string &name) {
-  if (proton::toLower(name) == "cupti") {
-    return &CuptiProfiler::instance();
-  } else if (proton::toLower(name) == "rocprofiler") {
-    return &RocprofSDKProfiler::instance();
-  } else if (proton::toLower(name) == "roctracer") {
-    return &RoctracerProfiler::instance();
-  } else if (proton::toLower(name) == "instrumentation") {
-    return &InstrumentationProfiler::instance();
+  const auto profilers = getProfilerRegistrations();
+  auto itr = std::find_if(profilers.begin(), profilers.end(),
+                          [&](const ProfilerRegistration &entry) {
+                            return proton::toLower(name) ==
+                                   proton::toLower(entry.getName());
+                          });
+  if (itr == profilers.end()) {
+    throw makeInvalidArgument("Unknown profiler: " + name);
   }
-  throw makeInvalidArgument("Unknown profiler: " + name);
+  return itr->getInstance()();
 }
 
 std::unique_ptr<Data> makeData(const std::string &dataName,
                                const std::string &path,
-                               ContextSource *contextSource) {
+                               ContextSource *contextSource,
+                               Profiler *profiler) {
   if (toLower(dataName) == "tree") {
     return std::make_unique<TreeData>(path, contextSource);
   } else if (toLower(dataName) == "trace") {
-    return std::make_unique<TraceData>(path, contextSource);
+    return std::make_unique<TraceData>(
+        path, contextSource,
+        [timestampAlignment =
+             dynamic_cast<TimestampAlignmentInterface *>(profiler)]() {
+          return timestampAlignment ? timestampAlignment->getTimestampOffsetNs()
+                                    : 0;
+        });
   }
   throw makeInvalidArgument("Unknown data: " + dataName);
 }
@@ -98,7 +113,7 @@ std::unique_ptr<Session> SessionManager::makeSession(
   auto *profiler = makeProfiler(profilerName);
   profiler = validateAndSetProfilerMode(profiler, mode);
   auto contextSource = makeContextSource(contextSourceName);
-  auto data = makeData(dataName, path, contextSource.get());
+  auto data = makeData(dataName, path, contextSource.get(), profiler);
   auto *session =
       new Session(path, profiler, std::move(contextSource), std::move(data));
   return std::unique_ptr<Session>(session);

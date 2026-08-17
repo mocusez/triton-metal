@@ -30,7 +30,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonMetal ${CMAKE_CURRENT_SOURCE_DIR}/triton_metal.cc)
   target_link_libraries(TritonMetal PRIVATE
     Python3::Module
-    pybind11::headers
+    nanobind-static
     MLIRTritonMetal
     MLIRTritonMetalTarget
     MLIRTritonMetalTransforms

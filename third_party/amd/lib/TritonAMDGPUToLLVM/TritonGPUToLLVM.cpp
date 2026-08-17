@@ -63,7 +63,6 @@ public:
     addIllegalDialect<triton::instrument::TritonInstrumentDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
-    addLegalOp<triton::amdgpu::InstructionSchedHint>();
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -112,7 +111,7 @@ struct ConvertTritonAMDGPUToLLVM
     if (targetInfo.requiresAliasInfoForAsyncOps())
       AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
 
-    ModuleMembarAnalysis membarPass(&allocation,
+    ModuleMembarAnalysis membarPass(allocation,
                                     mlir::triton::AMD::membarFilter);
     membarPass.run();
 
@@ -173,6 +172,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateElementwiseOpToLLVMPatterns(typeConverter, patterns, ftz,
                                              axisInfoAnalysis, allocation,
                                              targetInfo, AMDBenefit);
+    AMD::populateFpCastOpToLLVMPatterns(typeConverter, patterns, ftz,
+                                        axisInfoAnalysis, allocation,
+                                        targetInfo, AMDBenefit);
     AMD::populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo, patterns,
                                            axisInfoAnalysis, AMDBenefit);
     AMD::populateMaskedOpsToLLVMPatterns(patterns, targetInfo);

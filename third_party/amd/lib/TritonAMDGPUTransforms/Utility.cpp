@@ -2,6 +2,7 @@
 
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
@@ -148,7 +149,7 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
 // pad,  r1, r5,  r9, r13, r17, r21, r25
 // r29, pad, r2,  r6, r10, r14, r18, r22
 // r26, r30, pad, r3 ....
-static ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
+ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     ttg::DotOperandEncodingAttr dotOpEnc, ttg::TensorOrMemDesc srcTy,
     ArrayRef<unsigned> sharedOrder, bool useAsyncCopy, unsigned warpSize) {
   auto *ctx = srcTy.getContext();
@@ -528,4 +529,13 @@ composePaddedLayout(const TargetFeatures &targetFeatures, int opIdx,
   }
 
   return {};
+}
+
+Value createUpdateTDMDescriptorOp(OpBuilder &builder, Location loc, Value desc,
+                                  ValueRange addOffsets, Value pred) {
+  auto updateOp = mlir::triton::amdgpu::UpdateTensorDescriptorOp::create(
+      builder, loc, desc.getType(), desc, addOffsets,
+      /*set_bounds=*/ValueRange{}, pred);
+  updateOp.setClampBounds(true);
+  return updateOp.getResult();
 }

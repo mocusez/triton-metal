@@ -9,7 +9,9 @@ version = "0.1.0"
 python = "3.12.*"
 cmake = ">=3.20,<4"
 ninja = ">=1.11"
-pybind11 = ">=2.13"
+# Upstream switched the Python bindings from pybind11 to nanobind (#10283);
+# the version is pinned to match python/requirements.txt exactly.
+nanobind = "==2.10.2"
 setuptools = ">=40.8"
 wheel = "*"
 pip = "*"

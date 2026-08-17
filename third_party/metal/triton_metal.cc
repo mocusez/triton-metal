@@ -1,7 +1,7 @@
-// Metal backend pybind init.
+// Metal backend nanobind init.
 //
 // `init_triton_metal` is invoked from python/src/main.cc as
-// `init_triton_metal(m.def_submodule("metal"))`, so the bindings below
+// `init_triton_metal(sub)` for `sub = m.def_submodule("metal")`, so the bindings below
 // land on the Python side as `triton._C.libtriton.metal.<symbol>`. The
 // MetalBackend in python/triton/backends/metal/compiler.py drives the
 // MSL stage through `load_dialects` + `ttgir_to_msl`.
@@ -22,13 +22,14 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
 
 #include <string>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
-void init_triton_metal(py::module &&m) {
+void init_triton_metal(py::module_ &m) {
   // Register the Metal dialect on Triton's shared MLIRContext. Called
   // from MetalBackend.load_dialects(ctx) once per compile. Other
   // dialects the conversion produces (scf, arith) are already
@@ -92,9 +93,12 @@ void init_triton_metal(py::module &&m) {
     py::list debugMessages;
     if (auto messages =
             mod->getAttrOfType<mlir::ArrayAttr>("metal.debug_messages"))
-      for (mlir::Attribute attr : messages)
-        debugMessages.append(
-            py::str(mlir::cast<mlir::StringAttr>(attr).getValue().str()));
+      for (mlir::Attribute attr : messages) {
+        // nanobind's `str` has no std::string ctor; pass (data, size) so an
+        // embedded NUL in a user format string cannot truncate the message.
+        llvm::StringRef s = mlir::cast<mlir::StringAttr>(attr).getValue();
+        debugMessages.append(py::str(s.data(), s.size()));
+      }
 
     std::string buffer;
     llvm::raw_string_ostream os(buffer);

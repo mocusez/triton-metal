@@ -58,7 +58,13 @@ def DotOpInterface : OpInterface<"DotOpInterface"> {
       /*desc=*/"Verify the dimensions of the A and B DotOp operands.",
       /*retType=*/"bool",
       /*methodName=*/"verifyDims",
-      /*args=*/(ins)>,
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImpl=*/ [{
+        auto aShape = cast<ShapedType>($_op.getA().getType()).getShape();
+        auto bShape = cast<ShapedType>($_op.getB().getType()).getShape();
+        return aShape.back() == bShape[bShape.size() - 2];
+      }]>,
   InterfaceMethod<
       /*desc=*/"Verify the dimensions of the DotOp output.",
       /*retType=*/"bool",
@@ -145,6 +151,26 @@ def PredicatedOpInterface : OpInterface<"PredicatedOpInterface"> {
       /*retType=*/"::mlir::Type",
       /*methodName=*/"getPredicateOperandTypeLike",
       /*args=*/(ins)>
+  ];
+}
+
+def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
+  let description = [{
+    Common interface for atomic operations with memory-ordering semantics.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the atomic memory-ordering semantic.",
+      /*retType=*/"::mlir::triton::MemSemantic",
+      /*methodName=*/"getMemSemantic",
+      /*args=*/(ins),
+      /*defaultImplementation=*/[{
+        return $_op.getSem();
+      }]
+    >
   ];
 }
 

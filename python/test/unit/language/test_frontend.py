@@ -385,6 +385,105 @@ def test_tuple_assignment_respects_prior_constexpr_annotation():
     run_parser(kernel)
 
 
+def test_tuple_assignment_constexpr_tuple_matches_annassign():
+
+    @triton.jit
+    def kernel():
+        a: tl.constexpr
+        a, b = (0, 1), 2
+
+        assigned_a: tl.constexpr = (0, 1)
+        assigned_b = 2
+
+        tl.static_assert(a == assigned_a)
+        tl.static_assert(a.type == ((0, 1)).type)
+        tl.static_assert(assigned_a.type == ((0, 1)).type)
+        tl.static_assert(b.dtype == tl.int32)
+        tl.static_assert(assigned_b.dtype == tl.int32)
+
+    run_parser(kernel)
+
+
+def test_tuple_assignment_constexpr_tuple_normalizes_recursively():
+
+    @triton.jit
+    def kernel():
+        a: tl.constexpr
+        a, b = ((0, 1), (2, 3)), 4
+
+        assigned_a: tl.constexpr = ((0, 1), (2, 3))
+
+        tl.static_assert(a == assigned_a)
+        tl.static_assert(a.type == (((0, 1), (2, 3))).type)
+        tl.static_assert(assigned_a.type == (((0, 1), (2, 3))).type)
+        tl.static_assert(b.dtype == tl.int32)
+
+    run_parser(kernel)
+
+
+def test_tuple_assignment_rejects_too_many_values():
+
+    @triton.jit
+    def kernel():
+        a, b = (1, 2, 3)  # noqa: F841
+
+    with pytest.raises(CompilationError, match="too many values to unpack"):
+        run_parser(kernel)
+
+
+def test_tuple_assignment_rejects_too_few_values():
+
+    @triton.jit
+    def kernel():
+        a, b, c = (1, 2)  # noqa: F841
+
+    with pytest.raises(CompilationError, match=r"not enough values to unpack \(expected 3, got 2\)"):
+        run_parser(kernel)
+
+
+def test_tuple_assignment_rejects_nested_mismatch():
+
+    @triton.jit
+    def kernel():
+        (a, b), c = ((1, 2, 3), 4)  # noqa: F841
+
+    with pytest.raises(CompilationError, match="too many values to unpack"):
+        run_parser(kernel)
+
+
+def test_tuple_assignment_rejects_starred_target():
+
+    @triton.jit
+    def kernel():
+        a, *rest = (1, 2, 3)  # noqa: F841
+
+    with pytest.raises(CompilationError, match="starred assignment targets are not supported"):
+        run_parser(kernel)
+
+
+def test_list_comprehension_if_filter():
+
+    @triton.jit
+    def kernel():
+        # an `if` filter drops the elements whose condition is false
+        vals: tl.constexpr = [x for x in (10, 20, 30, 40) if x >= 30]
+        tl.static_assert(len(vals) == 2)
+        tl.static_assert(vals[0] == 30)
+        tl.static_assert(vals[1] == 40)
+
+        # multiple `if` clauses compose as "and"
+        multi: tl.constexpr = [x for x in (0, 1, 2, 3, 4, 5) if x > 1 if x % 2 == 0]
+        tl.static_assert(len(multi) == 2)
+        tl.static_assert(multi[0] == 2)
+        tl.static_assert(multi[1] == 4)
+
+        # an unfiltered comprehension is unchanged
+        allv: tl.constexpr = [x for x in (10, 20, 30, 40)]
+        tl.static_assert(len(allv) == 4)
+
+    run_parser(kernel)
+
+
 def test_named_expr_respects_prior_constexpr_annotation():
 
     @triton.jit
@@ -753,6 +852,15 @@ def test_atomic_min_float_negative_value():
 
 @filecheck_test
 @triton.jit
+def test_atomic_poll():
+    # CHECK-LABEL: test_atomic_poll
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll relaxed, sys, %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, sem="relaxed", scope="sys")
+
+
+@filecheck_test
+@triton.jit
 def test_atomic_min_float64_negative_value():
     # CHECK-LABEL: test_atomic_min_float64_negative_value
     BLOCK: tl.constexpr = 128
@@ -764,6 +872,36 @@ def test_atomic_min_float64_negative_value():
     # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
     # CHECK: {{.*}} = tt.atomic_rmw umax, acq_rel, gpu
     tl.atomic_min(ptrs, val, mask=True)
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_poll_timeout():
+    # CHECK-LABEL: test_atomic_poll_timeout
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll acquire, gpu, %{{.*}}, %{{.*}} timeout %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, timeout_ns=1000)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_tensor_pointer():
+    ptrs = tl.full((1, ), 0, tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptrs, 1)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_release_semantics():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, sem="release")
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_negative_timeout():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, timeout_ns=-1)
 
 
 @pytest.mark.interpreter
@@ -799,6 +937,52 @@ def test_return_promotion():
 
         c = tuple_return(tmp)
         tl.static_assert(c.type == tl.tuple_type([tl.int32, tl.int32]))
+
+    run_parser(kernel)
+
+
+def test_fp8_div_mod_promotion():
+    # `/` and `%` do not exist natively for floats narrower than fp32, so the
+    # result of a division or modulo with a floating operand is promoted to
+    # fp32 -- one rule covering fp8, fp16 and bfloat16, tensor and scalar
+    # operands alike. Other ops keep the existing promotions (same fp8 stays
+    # that fp8, mixed fp8 goes to float16).
+
+    @triton.jit
+    def kernel():
+        x = tl.full((8, ), 0, tl.float16).to(tl.float8e5)
+        y = tl.full((8, ), 0, tl.float16).to(tl.float8e5)
+        z = tl.full((8, ), 0, tl.float16).to(tl.float8e4nv)
+        h = tl.full((8, ), 0, tl.float16)
+        b = tl.full((8, ), 0, tl.bfloat16)
+        d = tl.full((8, ), 0, tl.float64)
+        i = tl.full((8, ), 0, tl.int32)
+        tl.static_assert((x / y).dtype == tl.float32)
+        tl.static_assert((x / z).dtype == tl.float32)
+        tl.static_assert((x % y).dtype == tl.float32)
+        tl.static_assert((x * y).dtype == tl.float8e5)
+        tl.static_assert((x * z).dtype == tl.float16)
+        # fp16 and bfloat16 division/modulo upcast through the same rule
+        tl.static_assert((h / h).dtype == tl.float32)
+        tl.static_assert((h % h).dtype == tl.float32)
+        tl.static_assert((b / b).dtype == tl.float32)
+        tl.static_assert((h * h).dtype == tl.float16)
+        tl.static_assert((b * b).dtype == tl.bfloat16)
+        # integer division and modulo keep integer promotion
+        tl.static_assert((i // i).dtype == tl.int32)
+        tl.static_assert((i % i).dtype == tl.int32)
+        # A scalar operand doesn't participate in promotion, so / and % against
+        # a narrow float tensor must upcast to fp32 for the same reason, while other
+        # ops keep the tensor's type.
+        tl.static_assert((2.0 / x).dtype == tl.float32)
+        tl.static_assert((x / 2.0).dtype == tl.float32)
+        tl.static_assert((x % 2).dtype == tl.float32)
+        tl.static_assert((h / 2.0).dtype == tl.float32)
+        tl.static_assert((d / 2.0).dtype == tl.float64)
+        tl.static_assert((d % 2.0).dtype == tl.float64)
+        tl.static_assert((x * 2.0).dtype == tl.float8e5)
+        tl.static_assert((h * 2.0).dtype == tl.float16)
+        tl.static_assert((i // 2).dtype == tl.int32)
 
     run_parser(kernel)
 
@@ -1102,3 +1286,15 @@ def test_aggregate_replace_ir():
     # Original aggregate still references original tensor.
     # CHECK: call @{{.*}}anchor{{.*}}([[A]])
     anchor(state.vals)
+
+
+def test_dot_fp16_accumulator():
+
+    @triton.jit
+    def fp16_acc_kernel():
+        c = tl.zeros([16, 16], dtype=tl.float16)
+        a = tl.full([16, 16], 1, dtype=tl.float16)
+        b = tl.full([16, 16], 1, dtype=tl.float16)
+        tl.dot(a, b, c)
+
+    run_parser(fp16_acc_kernel)

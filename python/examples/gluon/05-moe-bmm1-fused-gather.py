@@ -8,10 +8,10 @@ import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
 import triton.experimental.gluon.language.nvidia.blackwell as blackwell
 import triton.experimental.gluon.language.nvidia.blackwell.tma as tma
-from triton.experimental.gluon.language.nvidia.blackwell import float2
 import triton.experimental.gluon.language.nvidia.hopper.mbarrier as mbarrier
 import triton.language.extra.libdevice as libdevice
 from triton.testing import do_bench_cudagraph
+from triton._internal_testing import random_float, random_int
 
 from triton_kernels.distributed import make_expt_dict_uniform
 from triton_kernels.matmul import (
@@ -28,7 +28,6 @@ from triton_kernels.tensor import (
     FP4,
     RaggedTensorMetadata,
     Tensor,
-    convert_layout,
     make_ragged_tensor_metadata,
     wrap_torch_tensor,
 )
@@ -37,7 +36,7 @@ from triton_kernels.tensor_details.layout import (
     BlackwellMX4ValueShuffledLayout,
     make_default_matmul_mxfp4_w_scale_layout,
 )
-from triton_kernels.testing import alloc_rand, assert_close
+from triton_kernels.testing import alloc_rand, assert_close, convert_layout
 from triton_kernels.topk import topk
 
 # ===-----------------------------------------------------------------------===#
@@ -129,52 +128,8 @@ def alloc_ring_barriers(
 
 
 @gluon.jit
-def pack_e4m3x2(values):
-    return gl.inline_asm_elementwise(
-        """
-        {
-            .reg .f32 lane<2>;
-            mov.b64 {lane0, lane1}, $1;
-            cvt.rn.satfinite.e4m3x2.f32 $0, lane1, lane0;
-        }
-        """,
-        "=h,l",
-        [values.value],
-        dtype=gl.int16,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def pack_u16x2(x0, x1):
-    return gl.inline_asm_elementwise(
-        """
-        mov.b32 $0, { $1, $2 };
-        """,
-        "=r,h,h",
-        [x0, x1],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def pack_fp8x4(values):
-    lhs, rhs = gl.split(values.reshape((values.shape[0], values.shape[1] // 2, 2)))
-    return pack_u16x2(lhs, rhs)
-
-
-@gluon.jit
 def _split_m(values):
     return gl.split(values.reshape((2, values.shape[0] // 2, values.shape[1])).permute((1, 2, 0)))
-
-
-@gluon.jit
-def _split_m_float2(values):
-    lhs, rhs = _split_m(values.value)
-    return float2.Float2Tensor(lhs), float2.Float2Tensor(rhs)
 
 
 @gluon.jit
@@ -185,7 +140,7 @@ def split_m_subtiles(values, subtile_factor: gl.constexpr):
         if (1 << split_level) < subtile_factor:
             next_subtiles = ()
             for subtile_idx in gl.static_range(1 << split_level):
-                lhs, rhs = _split_m_float2(subtiles[subtile_idx])
+                lhs, rhs = _split_m(subtiles[subtile_idx])
                 next_subtiles += (lhs, rhs)
             subtiles = next_subtiles
     return subtiles
@@ -244,8 +199,8 @@ class PartitionArgs:
     SCALE_SIZE_INNER: gl.constexpr
     MXFP_BLOCK_SIZE: gl.constexpr
 
-    SWIGLU_ALPHA: gl.constexpr
-    SWIGLU_LIMIT: gl.constexpr
+    SWIGLU_ALPHA: gl.tensor
+    SWIGLU_LIMIT: gl.tensor
     REDUCTION_N: gl.constexpr
     FLEXPOINT_SATURATE_INF: gl.constexpr
 
@@ -256,6 +211,9 @@ class PartitionArgs:
     FORCE_EPILOGUE_WARPS_N1: gl.constexpr
     REUSE_GATHER_INDICES: gl.constexpr
     INLINE_MMA_INPUT_RELEASE: gl.constexpr
+
+    # This optional config is only used to test FPSAN.
+    REVERSE_K_TILES: gl.constexpr
 
     @gluon.jit
     def apply_block_schedule(self, block_id: gl.tensor) -> tuple[gl.tensor, gl.tensor, gl.tensor, gl.tensor]:
@@ -346,7 +304,8 @@ def load_activations(p: PartitionArgs):
             )
 
         for ki in range(p.K_TILES):
-            off_k_x = ki * p.BLOCK_K
+            tile_k = p.K_TILES - 1 - ki if p.REVERSE_K_TILES else ki
+            off_k_x = tile_k * p.BLOCK_K
             idx, phase, issued = issue_activation_tile(p, idx, phase, issued, offs_x_m, off_k_x, tile_x_bytes)
 
 
@@ -365,7 +324,8 @@ def load_weights(p: PartitionArgs):
 
         scale_idx = slice_idx * p.SCALE_FLAT_N + pid_n * p.SCALE_BLOCK_N_DIV
         for ki in range(p.K_TILES):
-            off_k_scale = ki * p.BLOCK_K // (p.MXFP_BLOCK_SIZE * p.SCALE_SIZE_INNER)
+            tile_k = p.K_TILES - 1 - ki if p.REVERSE_K_TILES else ki
+            off_k_scale = tile_k * p.BLOCK_K // (p.MXFP_BLOCK_SIZE * p.SCALE_SIZE_INNER)
 
             w_empty_bar = p.w_empty_bars.index(idx)
             w_ready_bar = p.w_ready_bars.index(idx)
@@ -374,8 +334,8 @@ def load_weights(p: PartitionArgs):
 
             mbarrier.wait(w_empty_bar, phase, pred=issued >= p.w_num_bufs)
             mbarrier.expect(w_ready_bar, bytes_per_stage)
-            tma.async_copy_global_to_shared(p.w_desc, [slice_idx, ki, pid_n, 0, 0], w_ready_bar, w_buf)
-            tma.async_copy_global_to_shared(
+            tma.async_load(p.w_desc, [slice_idx, tile_k, pid_n, 0, 0], w_ready_bar, w_buf)
+            tma.async_load(
                 p.scale_desc,
                 [0, scale_idx, off_k_scale, 0, 0],
                 w_ready_bar,
@@ -445,30 +405,39 @@ def mma_partition(p: PartitionArgs):
 
 
 @gluon.jit
-def store_packed_out(
-    p: PartitionArgs,
-    packed_out,
-    off_m,
-    out_off_n_packed,
-    shape_m,
-    slice_offset,
-):
-    values = pack_fp8x4(packed_out)
-    layout: gl.constexpr = values.type.layout
-    offs_m = off_m + gl.arange(0, values.shape[0], layout=gl.SliceLayout(1, layout))
-    offs_n = out_off_n_packed + gl.arange(0, values.shape[1], layout=gl.SliceLayout(0, layout))
-    mask_m = gl.expand_dims(offs_m < shape_m, 1)
-    mask_n = gl.expand_dims(offs_n < (p.out_desc.shape[1] + 3) // 4, 0)
-    mask = mask_m & mask_n
-    ptrs = p.out_ptr.cast(gl.pointer_type(gl.int32), bitcast=True)
-    ptrs = ptrs + gl.expand_dims(slice_offset + offs_m, 1) * (p.out_desc.strides[0] // 4)
-    ptrs = ptrs + gl.expand_dims(offs_n, 0) * p.out_desc.strides[1]
-    gl.store(ptrs, values, mask=mask)
+def pack_fp8_pairs(values):
+    fp8 = values.to(gl.float8e4nv)
+    low, high = gl.split(fp8.reshape((fp8.shape[0], fp8.shape[1] // 2, 2)))
+    low = low.to(gl.uint8, bitcast=True)
+    high = high.to(gl.uint8, bitcast=True)
+    return low.to(gl.uint16) | (high.to(gl.uint16) << 8)
 
 
 @gluon.jit
-def _swiglu_step1(acc_packed, limit):
-    gelu, linear = float2.unpack2(acc_packed)
+def store_out(
+    p: PartitionArgs,
+    values,
+    off_m,
+    out_off_n,
+    shape_m,
+    slice_offset,
+):
+    layout: gl.constexpr = values.type.layout
+    offs_m = off_m + gl.arange(0, values.shape[0], layout=gl.SliceLayout(1, layout))
+    offs_n = out_off_n // 2 + gl.arange(0, values.shape[1], layout=gl.SliceLayout(0, layout))
+    mask_m = gl.expand_dims(offs_m < shape_m, 1)
+    mask_n = gl.expand_dims(offs_n < (p.out_desc.shape[1] + 1) // 2, 0)
+    mask = gl.max_constancy(mask_m & mask_n, [1, 2])
+    ptrs = p.out_ptr.cast(gl.pointer_type(gl.uint16), bitcast=True)
+    ptrs = ptrs + gl.expand_dims(slice_offset + offs_m, 1) * (p.out_desc.strides[0] // 2)
+    ptrs = ptrs + gl.expand_dims(offs_n, 0) * p.out_desc.strides[1]
+    ptrs = gl.max_contiguous(gl.multiple_of(ptrs, [1, 4]), [1, 2])
+    gl.store(ptrs, gl.convert_layout(values, ptrs.type.layout), mask=mask)
+
+
+@gluon.jit
+def _swiglu_step1(acc, limit):
+    gelu, linear = gl.split(acc.reshape((acc.shape[0], acc.shape[1] // 2, 2)))
     gelu = gl.minimum(gelu.to(gl.float32), limit)
     linear = gl.clamp(linear.to(gl.float32), -limit, limit)
     return gelu, linear
@@ -478,15 +447,7 @@ def _swiglu_step1(acc_packed, limit):
 def _swiglu_step2(gelu, linear, alpha):
     den = 1.0 + libdevice.exp(-alpha * gelu)
     activated = gelu / den
-    activated_packed = float2.pack(activated, axis=1)
-    linear_packed = float2.pack(linear, axis=1)
-    return float2.fma(activated_packed, linear_packed, activated_packed)
-
-
-@gluon.jit
-def pack_fp8_out_fragment(out_packed, out_recip):
-    scaled_out_packed = out_packed * float2.full_like(out_packed, out_recip)
-    return pack_e4m3x2(scaled_out_packed)
+    return blackwell.fma2(activated, linear, activated)
 
 
 @gluon.jit
@@ -508,7 +469,7 @@ def epilogue_direct_store(
     acc_packed,
     out_recip,
     off_m,
-    out_off_n_packed,
+    out_off_n,
     shape_m,
     slice_offset,
     store_layout: gl.constexpr,
@@ -517,13 +478,14 @@ def epilogue_direct_store(
     acc_packed_subtiles = split_m_subtiles(acc_packed, p.SWIGLU_SUBTILE_FACTOR)
     for frag_idx in gl.static_range(p.SWIGLU_SUBTILE_FACTOR):
         gelu, linear = _swiglu_step1(acc_packed_subtiles[frag_idx], p.SWIGLU_LIMIT)
-        out_packed = _swiglu_step2(gelu, linear, p.SWIGLU_ALPHA)
-        packed_fp8 = gl.convert_layout(pack_fp8_out_fragment(out_packed, out_recip), store_layout)
-        store_packed_out(
+        out = _swiglu_step2(gelu, linear, p.SWIGLU_ALPHA)
+        out = blackwell.mul2(out, out_recip)
+        out = gl.convert_layout(pack_fp8_pairs(out), store_layout)
+        store_out(
             p,
-            packed_fp8,
+            out,
             off_m + frag_idx * frag_rows,
-            out_off_n_packed,
+            out_off_n,
             shape_m,
             slice_offset,
         )
@@ -532,10 +494,14 @@ def epilogue_direct_store(
 @gluon.jit
 def apply_bias_and_scale(
     p: PartitionArgs,
+    acc_fpsan_probe_ptr: gl.tensor | None,
     idx,
     phase,
     pid_n,
     slice_idx,
+    off_m,
+    shape_m,
+    slice_offset,
     split_layout: gl.constexpr,
     bias_layout: gl.constexpr,
     acc_scale,
@@ -552,18 +518,21 @@ def apply_bias_and_scale(
     )
     mbarrier.wait(acc_ready_bar, phase)
     acc_regs = acc_buf.load().permute((1, 0))
+    if acc_fpsan_probe_ptr is not None:
+        probe_layout: gl.constexpr = acc_regs.type.layout
+        probe_offs_m = off_m + gl.arange(0, p.BLOCK_M, layout=gl.SliceLayout(1, probe_layout))[:, None]
+        probe_offs_n = off_n + gl.arange(0, p.BLOCK_N, layout=gl.SliceLayout(0, probe_layout))[None, :]
+        probe_mask = (probe_offs_m < shape_m) & (probe_offs_n < p.out_desc.shape[1] * p.REDUCTION_N)
+        probe_ptrs = acc_fpsan_probe_ptr + (slice_offset + probe_offs_m) * (p.out_desc.shape[1] * p.REDUCTION_N)
+        gl.store(probe_ptrs + probe_offs_n, acc_regs, mask=probe_mask)
     mbarrier.arrive(acc_empty_bar)
     idx, phase = advance(idx, phase, p.acc_num_bufs)
     acc = gl.convert_layout(acc_regs, split_layout)
-    acc_packed = float2.pack(acc, axis=1)
-    bias_packed = float2.pack(bias, axis=1)
-    bias_packed = float2.Float2Tensor(gl.convert_layout(bias_packed.value, acc_packed.value.type.layout))
-    acc_packed = float2.fma(acc_packed, float2.full_like(acc_packed, acc_scale), bias_packed)
-    return idx, phase, acc_packed
+    return idx, phase, blackwell.fma2(acc, acc_scale, bias)
 
 
 @gluon.jit
-def epilogue_partition(p: PartitionArgs):
+def epilogue_partition(p: PartitionArgs, acc_fpsan_probe_ptr: gl.tensor | None):
     idx = 0
     phase = 0
 
@@ -589,13 +558,17 @@ def epilogue_partition(p: PartitionArgs):
         pid_m, pid_n, slice_idx, slice_offset = p.apply_block_schedule(block_id)
         off_m = pid_m * p.BLOCK_M
         shape_m = gl.load(p.x_slice_sizes + slice_idx)
-        out_off_n_packed = pid_n * (p.BLOCK_N // p.REDUCTION_N // 4)
+        out_off_n = pid_n * (p.BLOCK_N // p.REDUCTION_N)
         idx, phase, acc_packed = apply_bias_and_scale(
             p,
+            acc_fpsan_probe_ptr,
             idx,
             phase,
             pid_n,
             slice_idx,
+            off_m,
+            shape_m,
+            slice_offset,
             split_layout,
             bias_layout,
             acc_scale,
@@ -605,14 +578,14 @@ def epilogue_partition(p: PartitionArgs):
             acc_packed,
             out_recip,
             off_m,
-            out_off_n_packed,
+            out_off_n,
             shape_m,
             slice_offset,
             store_layout,
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["SWIGLU_ALPHA", "SWIGLU_LIMIT"])
 def ws_matmul_kernel(
     x_desc: tma.tensor_descriptor,
     w_desc: tma.tensor_descriptor,
@@ -639,8 +612,8 @@ def ws_matmul_kernel(
     K: gl.constexpr,
     NUM_SLICES: gl.constexpr,
     #
-    SWIGLU_ALPHA: gl.constexpr,
-    SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_ALPHA,
+    SWIGLU_LIMIT,
     REDUCTION_N: gl.constexpr,
     #
     FLEXPOINT_SATURATE_INF: gl.constexpr,
@@ -668,6 +641,10 @@ def ws_matmul_kernel(
     SCALE_SIZE_OUTER: gl.constexpr,
     SCALE_SIZE_INNER: gl.constexpr,
     MXFP_BLOCK_SIZE: gl.constexpr,
+
+    # These optional configs are only used to test FPSAN.
+    REVERSE_K_TILES: gl.constexpr,
+    acc_fpsan_probe_ptr: gl.tensor | None,
 ):
     use_2cta: gl.constexpr = gl.num_ctas() > 1
     gl.static_assert(gl.num_ctas() == 1 or gl.num_ctas() == 2, "kernel supports at most 2 CTAs")
@@ -790,11 +767,12 @@ def ws_matmul_kernel(
         FORCE_EPILOGUE_WARPS_N1=FORCE_EPILOGUE_WARPS_N1,
         REUSE_GATHER_INDICES=REUSE_GATHER_INDICES,
         INLINE_MMA_INPUT_RELEASE=INLINE_MMA_INPUT_RELEASE,
+        REVERSE_K_TILES=REVERSE_K_TILES,
     )
 
     gl.warp_specialize(
         [
-            (epilogue_partition, (p, )),
+            (epilogue_partition, (p, acc_fpsan_probe_ptr)),
             (load_activations, (p, )),
             (load_weights, (p, )),
             (mma_partition, (p, )),
@@ -890,6 +868,7 @@ class KernelConfig:
     FORCE_EPILOGUE_WARPS_N1: bool = False
     REUSE_GATHER_INDICES: bool = False
     INLINE_MMA_INPUT_RELEASE: bool = False
+    REVERSE_K_TILES: bool = False
 
     LOAD_ACTIVATION_REGS: int = 112
     LOAD_WEIGHT_REGS: int = 48
@@ -1107,6 +1086,7 @@ def matmul(
     c: torch.Tensor,
     fused_activation: FusedActivation,
     p: KernelConfig | None = None,
+    acc_fpsan_probe: torch.Tensor | None = None,
 ):
     specs = fused_activation.specs
     assert specs.name == "swiglu"
@@ -1231,6 +1211,9 @@ def matmul(
         SCALE_SIZE_OUTER=p.SCALE_SIZE_OUTER,
         SCALE_SIZE_INNER=p.SCALE_SIZE_INNER,
         MXFP_BLOCK_SIZE=p.MXFP_BLOCK_SIZE,
+        #
+        REVERSE_K_TILES=p.REVERSE_K_TILES,
+        acc_fpsan_probe_ptr=acc_fpsan_probe,
         #
         num_warps=p.NUM_WARPS,
         num_ctas=p.NUM_CTAS,
@@ -1363,22 +1346,22 @@ def init_routing_data(c: MLPConfig, batch_size: int, local_rank: int, device: st
 
 
 def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, uniform_routing: bool = False,
-                 reference: bool = False) -> PreparedCase:
+                 reference: bool = False, p: KernelConfig | None = None) -> PreparedCase:
     torch.manual_seed(seed)
 
-    local_rank = int(torch.randint(0, c.num_expert_shards, size=()).item())
+    local_rank = random_int(0, c.num_expert_shards, warmup_value=seed % c.num_expert_shards)
     k, n = c.hidden_size, c.intermediate_size
     n_expts_local = c.num_experts // c.num_expert_shards
     ragged_metadata, gather_indx = init_routing_data(c, batch_size, local_rank, device, uniform_routing)
-    p = None if reference else select_kernel_config(ragged_metadata.expected_slice_size)
+    p = None if reference else (p or select_kernel_config(ragged_metadata.expected_slice_size))
     x = alloc_randn((batch_size, k), dtype=torch.float8_e4m3fn, device=device)
     w, w_scale = alloc_randn_fp4((n_expts_local, k, n), device=device, p=p)
     bias = alloc_randn((n_expts_local, n), dtype=torch.float32, device=device)
 
-    swiglu_alpha = float(torch.rand((), device=device).item()) / 5 + 1.0
-    swiglu_limit = float(torch.rand((), device=device).item()) / 5 + 1.3
+    swiglu_alpha = random_float(device=device) / 5 + 1.0
+    swiglu_limit = random_float(device=device) / 5 + 1.3
     fused_activation = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), fn_arg_do_not_specialize=("alpha", "limit"), reduction_n=2),
         (swiglu_alpha, swiglu_limit),
     )
 
@@ -1435,6 +1418,10 @@ def run_kernel(prepared: PreparedCase, kernel, precision_config: PrecisionConfig
 def run_provider(prepared: PreparedCase, provider: str) -> tuple[torch.Tensor, PrecisionConfig]:
     precision_config = make_precision_config(prepared)
     kernel = matmul if provider == "example" else reference_matmul
+    if provider != "example":
+        activation = prepared.fused_activation
+        prepared = replace(prepared, fused_activation=replace(activation,
+                                                              specs=replace(activation.specs, name="swiglu_dynamic")))
     y = run_kernel(prepared, kernel, precision_config, make_output_buffer(prepared))
     return y, precision_config
 
@@ -1492,7 +1479,8 @@ def is_blackwell():
 @pytest.mark.parametrize("c", [GPT_OSS_120B_CONFIG])
 @pytest.mark.parametrize("batch_size", get_batch_sizes(GPT_OSS_120B_CONFIG))
 @pytest.mark.skipif(not is_blackwell(), reason="Gluon MoE BMM1 fused-gather is only supported on Blackwell GPUs")
-def test_op(c: MLPConfig, batch_size: tuple[int, ...]):
+@pytest.mark.enable_warmup(min_capability=10)
+def test_op(c: MLPConfig, batch_size: int):
     prepared = prepare_case(c, batch_size, device=f"cuda:{torch.cuda.current_device()}")
     ref_y, ref_precision = run_provider(prepared, "reference")
     cand_y, cand_precision = run_provider(prepared, "example")
@@ -1500,7 +1488,7 @@ def test_op(c: MLPConfig, batch_size: tuple[int, ...]):
     assert_close(
         ref_y.to(torch.float32),
         cand_y.to(torch.float32),
-        maxtol=0.125,
+        maxtol=0.126,
         rmstol=None,
         description=f"{description}:out",
         verbose=False,
@@ -1517,6 +1505,62 @@ def test_op(c: MLPConfig, batch_size: tuple[int, ...]):
             description=f"{description}:out_scale",
             verbose=False,
         )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Gluon MoE BMM1 fused-gather is only supported on Blackwell GPUs")
+@pytest.mark.enable_warmup(min_capability=10)
+def test_op_consan():
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.instrumentation_mode = "consan"
+        test_op(GPT_OSS_120B_CONFIG, batch_size=128)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Gluon MoE BMM1 fused-gather is only supported on Blackwell GPUs")
+def test_op_fpsan():
+    p0 = _select_tiny16_config(4)
+    assert p0 is not None
+    p0 = replace(p0, X_NUM_BUFS=2, W_NUM_BUFS=2)
+    p1 = replace(
+        p0,
+        BLOCK_M=32,
+        X_GATHER_MULTICAST=False,
+        W_SCALE_MULTICAST=False,
+        REUSE_GATHER_INDICES=True,
+        INLINE_MMA_INPUT_RELEASE=True,
+        REVERSE_K_TILES=True,
+    )
+    configs = (p0, p1)
+
+    def run(p: KernelConfig) -> torch.Tensor:
+        prepared = prepare_case(
+            GPT_OSS_120B_CONFIG,
+            batch_size=128,
+            device=f"cuda:{torch.cuda.current_device()}",
+            p=p,
+        )
+        for off_k in range(0, prepared.x.shape[1], p.BLOCK_K):
+            prepared.x[:, off_k:off_k + p.BLOCK_K] = (448.0, 0.015625, -448.0, 1.0)[(off_k // p.BLOCK_K) % 4]
+        precision_config = make_precision_config(prepared)
+        acc_fpsan_probe = torch.zeros(
+            (prepared.out_shape[0], prepared.out_shape[1] * prepared.fused_activation.specs.reduction_n),
+            dtype=torch.float32,
+            device=prepared.x.device,
+        )
+        run_kernel(
+            prepared,
+            lambda **kwargs: matmul(**kwargs, p=p, acc_fpsan_probe=acc_fpsan_probe),
+            precision_config,
+            make_output_buffer(prepared),
+        )
+        return acc_fpsan_probe.view(torch.int32)
+
+    normal = tuple(run(p) for p in configs)
+    assert not torch.equal(*normal)
+
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.instrumentation_mode = "fpsan"
+        fpsan = tuple(run(p) for p in configs)
+    assert torch.equal(*fpsan)
 
 
 # ===-----------------------------------------------------------------------===#

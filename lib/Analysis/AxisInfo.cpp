@@ -146,6 +146,35 @@ public:
   }
 };
 
+class BitcastOpAxisInfoVisitor final
+    : public AxisInfoVisitorImpl<triton::BitcastOp> {
+public:
+  using AxisInfoVisitorImpl<triton::BitcastOp>::AxisInfoVisitorImpl;
+
+  AxisInfo
+  getAxisInfo(triton::BitcastOp op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    AxisInfo info = operands[0]->getValue();
+    if (!isa<PointerType>(getElementTypeOrSelf(op.getSrc().getType())))
+      return info;
+
+    int64_t srcBytes =
+        std::max<int64_t>(1, getPointeeBitWidth(op.getSrc().getType()) / 8);
+    int64_t dstBytes =
+        std::max<int64_t>(1, getPointeeBitWidth(op.getType()) / 8);
+    if (srcBytes == dstBytes)
+      return info;
+
+    AxisInfo::DimVectorT divisibility = info.getDivisibility();
+    // Every former element becomes a group base after the bitcast.
+    for (unsigned dim = 0; dim < divisibility.size(); ++dim)
+      if (info.getContiguity(dim) > 1)
+        divisibility[dim] = gcd(divisibility[dim], srcBytes);
+    return AxisInfo(AxisInfo::DimVectorT(info.getRank(), 1), divisibility,
+                    info.getConstancy(), info.getConstantValue());
+  }
+};
+
 class UnrealizedConversionCastOpAxisInfoVisitor final
     : public AxisInfoVisitorImpl<mlir::UnrealizedConversionCastOp> {
 public:
@@ -704,8 +733,14 @@ public:
     auto srcSuffixProducts = getSuffixProducts(srcShape);
     auto dstSuffixProducts = getSuffixProducts(dstShape);
 
+    // Unit contiguity makes every element a group base, so divisibility from
+    // such a dimension applies globally. AxisInfo normalization propagates
+    // this fact within one value, but reshape can lose the source axis that
+    // carries it, so seed every destination axis before refining it below.
+    int64_t globalDivisibility = srcInfo.getGlobalDivisibility();
+
     AxisInfo::DimVectorT contiguity(dstTy.getRank(), 1);
-    AxisInfo::DimVectorT divisibility(dstTy.getRank(), 1);
+    AxisInfo::DimVectorT divisibility(dstTy.getRank(), globalDivisibility);
     AxisInfo::DimVectorT constancy(dstTy.getRank(), 1);
 
     for (int dstDim = 0; dstDim < dstTy.getRank(); ++dstDim) {
@@ -747,9 +782,11 @@ public:
           // unchanged. When the run is truncated, later group bases can start
           // inside the original run, so divisibility must be clamped
           // accordingly.
-          divisibility[dstDim] = dstContiguity == srcContiguity
-                                     ? srcDivisibility
-                                     : std::min(srcDivisibility, dstContiguity);
+          int64_t dstDivisibility =
+              dstContiguity == srcContiguity
+                  ? srcDivisibility
+                  : std::min(srcDivisibility, dstContiguity);
+          divisibility[dstDim] = std::max(globalDivisibility, dstDivisibility);
         }
         continue;
       }
@@ -777,9 +814,6 @@ public:
         }
         constancy[dstDim] = dstConstancy;
       }
-      // Divisibility stays the same when the constant block is split
-      // even for constancy == 1.
-      divisibility[dstDim] = srcDivisibility;
     }
 
     return AxisInfo(contiguity, divisibility, constancy,
@@ -960,8 +994,12 @@ public:
                                   rhsInfo.getConstancy(d), condConstancy[d]));
           contiguity.push_back(gcd(lhsInfo.getContiguity(d),
                                    rhsInfo.getContiguity(d), condConstancy[d]));
+          // getDivisibilityFromContiguity does not see condConstancy; clamp
+          // by the just-computed output contiguity so the result remains
+          // sound when condConstancy reduces it below the input contiguities.
           divisibility.push_back(
-              getDivisibilityFromContiguity(lhsInfo, rhsInfo, d));
+              gcd(getDivisibilityFromContiguity(lhsInfo, rhsInfo, d),
+                  contiguity.back()));
         }
       }
       if (lhsInfo.getConstantValue().has_value() &&
@@ -1172,7 +1210,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   CastOpAxisInfoVisitor<arith::ExtUIOp>,
                   CastOpAxisInfoVisitor<arith::TruncIOp>,
                   CastOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
-                  CastOpAxisInfoVisitor<triton::BitcastOp>,
+                  BitcastOpAxisInfoVisitor,
                   CastOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
   visitors.append<PoisonOpAxisInfoVisitor>();

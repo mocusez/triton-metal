@@ -7,6 +7,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -96,7 +97,7 @@ matchReduxKind(triton::ReduceOp op, int computeCapability,
   Operation *reduceOp = op.getSingleCombiner();
   if (!reduceOp)
     return std::nullopt;
-  if (computeCapability == 100 && reduceOp->getResultTypes()[0].isF32()) {
+  if (computeCapability / 10 == 10 && reduceOp->getResultTypes()[0].isF32()) {
     if (isa<arith::MinimumFOp, arith::MaximumFOp>(reduceOp))
       useNanQualifier = true;
     if (isa<arith::MaxNumFOp, arith::MaximumFOp>(reduceOp))
@@ -146,14 +147,34 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                                   NVVM::VoteSyncKind::ballot);
 }
 
+Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
+  return LLVM::createLLVMIntrinsicCallOp(
+             rewriter, loc, "llvm.nvvm.read.ptx.sreg.globaltimer", i64_ty, {})
+      .getResult(0);
+}
+
+StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
+  switch (scope) {
+  case MemSyncScope::CTA:
+    return "block";
+  case MemSyncScope::GPU:
+    return "device";
+  case MemSyncScope::SYSTEM:
+    return {};
+  }
+  llvm_unreachable("unknown memory synchronization scope");
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   b.barrier(targets);
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
-  triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
+                                Operation *sourceOp) const {
+  auto barrier = triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+  triton::nvidia_gpu::copyClusterBarrierMbarOffset(sourceOp, barrier);
 }
 
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
@@ -189,6 +210,11 @@ static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
   return builder.launch(rewriter, loc, clusterPtrTy, /*hasSideEffect=*/false);
 }
 
+Value TargetInfo::mapDShared(RewriterBase &rewriter, Location loc, Value ptr,
+                             Value ctaId, Value pred) const {
+  return ctaId ? mapa(rewriter, loc, ptr, ctaId, pred) : ptr;
+}
+
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
   switch (bitwidth) {
   case 8:
@@ -204,8 +230,7 @@ static std::string getConstraintForBitwidth(unsigned bitwidth) {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
+                              Value ctaId, Value val, Value pred) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -294,13 +319,13 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
-    ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
+  if (ctaId) {
+    ptr = mapa(rewriter, loc, ptr, ctaId, pred);
   }
 
   PTXBuilder builder;
   auto st = builder.create("st")
-                ->o(ctaId.has_value() ? "shared::cluster" : "shared::cta")
+                ->o(ctaId ? "shared::cluster" : "shared::cta")
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
@@ -325,8 +350,8 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Type loadTy,
-                              Value pred, Operation *localLoadOp) const {
+                              Value ctaId, Type loadTy, Value pred,
+                              Operation *) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -411,13 +436,13 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
-    ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
+  if (ctaId) {
+    ptr = mapa(rewriter, loc, ptr, ctaId, pred);
   }
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o(ctaId.has_value() ? "shared::cluster" : "shared::cta")
+                ->o(ctaId ? "shared::cluster" : "shared::cta")
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
 
@@ -528,6 +553,41 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
     return true;
   }
   return false;
+}
+
+unsigned TargetInfo::getReductionTreeArity(Operation *combinerOp) const {
+  int computeCapability = getComputeCapability();
+  Type resultType = combinerOp->getResult(0).getType();
+  // Consumer Blackwell lacks ternary forms; Thor only supports FP32.
+  if (computeCapability < 90 || computeCapability / 10 == 12 ||
+      (computeCapability / 10 == 11 && !resultType.isF32()))
+    return 2;
+
+  if (computeCapability >= 100 && getPtxVersion() >= 88 &&
+      isa<arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp,
+          arith::MinNumFOp>(combinerOp) &&
+      resultType.isF32())
+    return 3;
+
+  if (resultType.isInteger(32) &&
+      isa<arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp, arith::MaxUIOp>(
+          combinerOp))
+    return 3;
+
+  auto vectorType = dyn_cast<VectorType>(resultType);
+  if (!vectorType || vectorType.getNumElements() != 2)
+    return 2;
+
+  Type elementType = vectorType.getElementType();
+  if (elementType.isInteger(16) &&
+      isa<LLVM::SMinOp, LLVM::SMaxOp, LLVM::UMinOp, LLVM::UMaxOp>(combinerOp))
+    return 3;
+  if ((elementType.isF16() || elementType.isBF16()) &&
+      isa<LLVM::MinNumOp, LLVM::MaxNumOp, LLVM::MinimumOp, LLVM::MaximumOp>(
+          combinerOp))
+    return 3;
+
+  return 2;
 }
 
 std::string TargetInfo::getMulhiFuncName(Type resultElementTy) const {

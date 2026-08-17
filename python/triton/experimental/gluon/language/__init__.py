@@ -45,6 +45,7 @@ from ._core import (
     atomic_max,
     atomic_min,
     atomic_or,
+    atomic_poll,
     atomic_xchg,
     atomic_xor,
     bank_conflicts,
@@ -86,6 +87,7 @@ from ._core import (
     barrier,
     to_linear_layout,
     to_tensor,
+    expect_zero,
     warp_specialize,
     where,
 )
@@ -137,3 +139,4 @@ from ._standard import (
 from . import nvidia
 from . import amd
 from . import extra
+from . import fpsan

@@ -216,7 +216,6 @@ def translate_kernels(kernels: list[GlobalValue], target: TranslatorTarget) -> s
             if value.original_value.is_gluon():
                 return True
             return False
-        assert isinstance(value.original_value, object)
         if isinstance(value.original_value, type | FunctionType | JITCallable):
             return True
         if isinstance(value.original_value, int | float | tl.constexpr):
@@ -262,13 +261,12 @@ def translate_paths(kernel_paths: list[str], target: TranslatorTarget) -> str:
 
 
 def convert_triton_to_gluon(src: list[JITCallable], target: TranslatorTarget) -> str:
-    kernels = [
-        GlobalValue.wrap(
-            kernel,
-            getattr(getattr(kernel, "fn", kernel), "__name__", ""),
-            lambda: builtins,
-        ) for kernel in src
-    ]
+
+    def wrap_global(kernel):
+        name = getattr(getattr(kernel, "fn", kernel), "__name__", "")
+        return GlobalValue.wrap(kernel, name, lambda: (name, builtins))
+
+    kernels = [wrap_global(kernel) for kernel in src]
     return translate_kernels(kernels, target=target)
 
 

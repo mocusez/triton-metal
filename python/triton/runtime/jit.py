@@ -96,7 +96,7 @@ class DependenciesFinder(ast.NodeVisitor):
         return self.hasher.hexdigest()
 
     def _update_hash(self, func):
-        assert isinstance(func, JITCallable)
+        func_key = func.cache_key
         # Merge our used_global_vals with those of the called function,
         # after checking that all overlapping values are consistent.
         for k in self.used_global_vals.keys() & func.used_global_vals.keys():
@@ -109,7 +109,6 @@ class DependenciesFinder(ast.NodeVisitor):
                 )
         self.used_global_vals.update(func.used_global_vals)
         # update hash
-        func_key = func.cache_key
         func_key += str(getattr(func, "noinline", False))
         self.hasher.update(func_key.encode("utf-8"))
 
@@ -162,12 +161,10 @@ class DependenciesFinder(ast.NodeVisitor):
             return None
 
         def name_lookup(name):
-            val = self.globals.get(name, None)
-            if val is not None:
-                return val, self.globals
-            val = self.nonlocals.get(name, None)
-            if val is not None:
-                return val, self.nonlocals
+            if name in self.nonlocals:
+                return self.nonlocals[name], self.nonlocals
+            if name in self.globals:
+                return self.globals[name], self.globals
             return None, None
 
         val, var_dict = name_lookup(node.id)
@@ -189,7 +186,7 @@ class DependenciesFinder(ast.NodeVisitor):
         lhs_name = getattr(lhs, "__name__", "")
         if lhs is None or lhs_name in self.supported_modules:
             return None
-        ret = getattr(lhs, node.attr)
+        ret = getattr(lhs, node.attr, None)
         self.record_reference(ret)
         return ret
 
@@ -231,13 +228,17 @@ class DependenciesFinder(ast.NodeVisitor):
         visit_defaults(node.defaults)
 
     def visitAssnTarget(self, node):
-        # Target is either a single string, or a list of strings (if the assn
-        # target is a tuple).
+        # Target is either a single string, or a (possibly nested) list of strings if the assign target is a tuple.
         target = self.visit(node)
-        if isinstance(target, list):
-            self.local_names |= set(target)
-        else:
-            self.local_names.add(target)
+
+        def _add(t):
+            if isinstance(t, list):
+                for sub in t:
+                    _add(sub)
+            else:
+                self.local_names.add(t)
+
+        _add(target)
 
     def visit_Assign(self, node):
         if len(node.targets) != 1:
@@ -525,9 +526,11 @@ class JITCallable:
             self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
 
             from triton.language.core import constexpr
-            self.hash += str([(name, val)
-                              for (name, _), (val, _) in self.used_global_vals.items()
-                              if isinstance(val, constexpr)])
+            constexpr_globals = [(name, val)
+                                 for (name, _), (val, _) in self.used_global_vals.items()
+                                 if isinstance(val, constexpr)]
+            constexpr_globals.sort(key=lambda item: (item[0], repr(item[1])))
+            self.hash += str(constexpr_globals)
             self.hash = hashlib.sha256(self.hash.encode("utf-8")).hexdigest()
         return self.hash
 
@@ -539,7 +542,6 @@ class JITCallable:
     # Our unit tests do this, for example.
     def parse(self):
         tree = ast.parse(self._src)
-        assert isinstance(tree, ast.Module)
         assert len(tree.body) == 1
         assert isinstance(tree.body[0], ast.FunctionDef)
         return tree
@@ -583,6 +585,19 @@ class JitFunctionInfo:
     jit_function: JITFunction
 
 
+def _replace_jit_callables(obj):
+    if isinstance(obj, list):
+        return [_replace_jit_callables(arg) for arg in obj]
+    elif is_namedtuple(obj):
+        results = [_replace_jit_callables(arg) for arg in obj]
+        return obj.__class__(*results)
+    elif isinstance(obj, tuple):
+        return tuple(_replace_jit_callables(arg) for arg in obj)
+    elif isinstance(obj, JITCallable):
+        return obj.cache_key
+    return obj
+
+
 def compute_cache_key(kernel_key_cache, specialization, options):
     key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
@@ -590,19 +605,7 @@ def compute_cache_key(kernel_key_cache, specialization, options):
         return cache_key
 
     # Replace JITCallable objects with their hash, so the cache key will change if the src is updated
-    def replace_callables(obj):
-        if isinstance(obj, list):
-            return [replace_callables(arg) for arg in obj]
-        elif is_namedtuple(obj):
-            results = [replace_callables(arg) for arg in obj]
-            return obj.__class__(*results)
-        elif isinstance(obj, tuple):
-            return tuple(replace_callables(arg) for arg in obj)
-        elif isinstance(obj, JITCallable):
-            return obj.cache_key
-        return obj
-
-    cache_key = str(replace_callables(specialization)) + str(options)
+    cache_key = str(_replace_jit_callables(specialization)) + str(options)
     kernel_key_cache[key] = cache_key
     return cache_key
 
@@ -720,6 +723,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
     def run(self, *args, grid, warmup, **kwargs):
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+        kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
 
         # parse options
         device = driver.active.get_current_device()
@@ -761,7 +765,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         if not warmup:
             # canonicalize grid
-            assert grid is not None
             if callable(grid):
                 grid = grid(bound_args)
             grid_size = len(grid)
@@ -974,7 +977,6 @@ def jit(
     """
 
     def decorator(fn: T) -> JITFunction[T]:
-        assert callable(fn)
         if knobs.runtime.interpret:
             from .interpreter import InterpretedFunction
             return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize,
