@@ -10741,7 +10741,7 @@ struct LoadLowering
 // emitted by the Triton frontend BEFORE the arith op — splat lowering is
 // already in place, so no broadcast work is needed here.
 //
-// Envelope: f32 only; unmasked only; load only. See
+// Envelope: unmasked only; load only; any dtype the memref can store. See
 // `.omc/specs/deep-interview-leet-triton-l3a-tileloop-compiler-a-scalar-load.md`.
 //===----------------------------------------------------------------------===//
 struct ScalarLoadLowering
@@ -10757,24 +10757,9 @@ struct ScalarLoadLowering
     // `!metal.memref<? x f32>` (kernel-arg block argument rewritten by
     // FuncOpLowering). Tensor-of-ptr shapes go to LoadLowering /
     // MaskedLoadLowering.
-    mlir::Type elemTy;
-    if (auto ptrTy = mlir::dyn_cast<mlir::triton::PointerType>(
-            op.getPtr().getType())) {
-      elemTy = ptrTy.getPointeeType();
-    } else if (auto memTy = mlir::dyn_cast<MetalMemRefType>(
-                   op.getPtr().getType())) {
-      elemTy = memTy.getType();
-    } else {
+    if (!mlir::isa<mlir::triton::PointerType, MetalMemRefType>(
+            op.getPtr().getType()))
       return mlir::failure();  // tensor / unknown — not our case
-    }
-    // Envelope: f32 or i32. i32 is routed through ui32 storage (see
-    // metalStorageElementType) and bridged back to signless i32 for the result.
-    bool isF32 = mlir::isa<mlir::FloatType>(elemTy) &&
-                 mlir::cast<mlir::FloatType>(elemTy).getWidth() == 32;
-    bool isI32 = elemTy.isInteger(32);
-    if (!isF32 && !isI32)
-      return rewriter.notifyMatchFailure(
-          op, "scalar tt.load: only f32/i32 supported");
     auto loc = op.getLoc();
     auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
     // Resolve the base memref + accumulated scalar index across the WHOLE
@@ -10797,15 +10782,31 @@ struct ScalarLoadLowering
                               rewriter, loc, mlir::TypeRange{ui32},
                               mlir::ValueRange{idxI32})
                               .getResult(0);
-    // Read the STORAGE-typed element (f32 → f32; i32 → ui32), then bridge back
-    // to the Triton element type so downstream signless arith sees i32.
-    mlir::Type storageTy = metalStorageElementType(elemTy);
+    // Read the STORAGE-typed element, then bridge back to the Triton element
+    // type so downstream signless arith sees the original type. The storage
+    // type is taken from the MEMREF, not recomputed from the pointee: after a
+    // pointer bitcast those two disagree, and the memref is what the read
+    // actually goes through — the tensor `LoadLowering` above already reads it
+    // this way, and reading it the same way here is what lets the two paths
+    // agree on which dtypes exist.
+    //
+    // There is deliberately no dtype gate. The old one admitted f32/i32 only,
+    // a leftover from the original scalar-load spec, and every other dtype
+    // took `notifyMatchFailure` INSIDE `applyFullConversion` — which on this
+    // backend corrupts the rollback and kills the process (SIGTRAP/SIGBUS/
+    // SIGSEGV, intermittently) rather than raising. So a bare
+    // `v = tl.load(scalar_ptr)` on an i8/i16/f16 scalar was an unusable
+    // crash, while the identical tensor load worked: the tensor path has
+    // never had a dtype gate either.
+    auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
+    mlir::Type storageTy = memrefTy.getType();
+    mlir::Type wantTy = op.getType();
     mlir::Value el =
         GetElementOp::create(rewriter, loc, storageTy, memref, idxUi32)
             .getResult();
-    if (storageTy != elemTy)
+    if (storageTy != wantTy)
       el = mlir::UnrealizedConversionCastOp::create(
-               rewriter, loc, mlir::TypeRange{elemTy}, mlir::ValueRange{el})
+               rewriter, loc, mlir::TypeRange{wantTy}, mlir::ValueRange{el})
                .getResult(0);
     rewriter.replaceOp(op, el);
     return mlir::success();

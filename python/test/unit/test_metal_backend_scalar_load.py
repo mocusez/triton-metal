@@ -105,3 +105,66 @@ def test_masked_load_with_neg_inf_other(N: int, BLOCK: int) -> None:
     assert torch.all(torch.isinf(tail) & (tail < 0)), (
         f"N={N},BLOCK={BLOCK}: tail should be -inf, got {tail[:8].tolist()}"
     )
+
+
+# The dtype envelope. `ScalarLoadLowering` admitted f32/i32 only -- a leftover
+# from this session's original spec -- while the TENSOR load path next to it has
+# never had a dtype gate at all, taking whatever the memref stores. So
+# `v = tl.load(scalar_ptr)` on an i8/i16/f16 scalar declined inside
+# `applyFullConversion`, and that decline does not raise on this backend: the
+# rollback leaves the module unverifiable and the process dies (SIGTRAP, SIGBUS
+# or SIGSEGV, intermittently -- 8 kills in 30 runs for the i64 shape, so a retry
+# could look clean). The identical load written as a 1-element TENSOR worked
+# throughout, which is why nothing in the suite noticed.
+#
+# f32/i32 are kept as the controls: they are the two that always worked.
+_SCALAR_DTYPES = [
+    ("int8", 1),
+    ("int16", 2),
+    ("int32", 3),
+    ("int64", 4),
+    ("float16", 5),
+    ("bfloat16", 6),
+    ("float32", 7),
+]
+
+
+@triton.jit
+def _scalar_load_dtype_kernel(s_ptr, out_ptr, BLOCK: tl.constexpr):
+    v = tl.load(s_ptr)
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, offs.to(tl.float32) + v.to(tl.float32))
+
+
+@pytest.mark.parametrize("dtype_name,value", _SCALAR_DTYPES)
+def test_scalar_load_dtype_envelope(dtype_name: str, value: int) -> None:
+    BLOCK = 64
+    dtype = getattr(torch, dtype_name)
+    s = torch.full((1,), value, dtype=dtype, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.float32, device="mps")
+    _scalar_load_dtype_kernel[(1,)](s, out, BLOCK)
+    torch.mps.synchronize()
+
+    expected = torch.arange(BLOCK, dtype=torch.float32) + float(value)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _scalar_load_negative_kernel(s_ptr, out_ptr):
+    tl.store(out_ptr, tl.load(s_ptr).to(tl.float32))
+
+
+@pytest.mark.parametrize("dtype_name", ["int8", "int16", "int32", "int64"])
+def test_scalar_load_negative_int(dtype_name: str) -> None:
+    """A negative scalar: storage is unsigned, so the sitofp must say signed.
+
+    Widening the dtype envelope moved i8/i16/i64 onto the same ui-storage
+    bridge i32 already used, which is the path that was silently wrong before
+    the op-carries-signedness fix. Pin it here for the widths that just arrived.
+    """
+    dtype = getattr(torch, dtype_name)
+    s = torch.full((1,), -7, dtype=dtype, device="mps")
+    out = torch.zeros(1, dtype=torch.float32, device="mps")
+    _scalar_load_negative_kernel[(1,)](s, out)
+    torch.mps.synchronize()
+    assert out.cpu().item() == -7.0
