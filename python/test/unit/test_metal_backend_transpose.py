@@ -549,3 +549,52 @@ def test_permute_rank3(A, B, C, perm, num_warps):
         f"tl.permute {A}x{B}x{C} perm={perm} nw={num_warps}\n"
         f"out={out.cpu()[:16].tolist()}\nexpected={expected[:16].tolist()}"
     )
+
+
+# --------------------------------------------------------------------------
+# The full-tile exchange: a permute whose tile holds MORE than one element per
+# thread.
+#
+# `ConvertLayoutLowering`'s staged transpose can only ever move one element per
+# thread — above that its publish and its read both sit inside the scalarized
+# tile loop, and the slot a lane needs at iteration `iv` is written by another
+# lane at some other iteration. So `tl.permute` compiled only while the tile fit
+# one element per thread, which at num_warps=1 means 32 elements.
+#
+# The way through is to split the tile loop: publish the whole tile in one loop,
+# barrier, read it in the next. That split happens where the loop is BUILT
+# (`FuncOpLowering` splices the body into the `scf.for`), because a conversion
+# pattern cannot fission a loop it is running inside. The body is partitioned by
+# DEPENDENCE — everything the exchanged value is built from goes in the first
+# loop, everything else in the second, and values needed on both sides are
+# recomputed rather than carried across.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_warps", [1, 2])
+@pytest.mark.parametrize(
+    "perm",
+    [(0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)],
+    ids=lambda p: "".join(str(d) for d in p),
+)
+@pytest.mark.parametrize(
+    "A,B,C",
+    [
+        pytest.param(2, 4, 8, id="2x4x8"),
+        pytest.param(4, 4, 4, id="4x4x4"),
+        pytest.param(8, 4, 2, id="8x4x2"),
+    ],
+)
+def test_permute_rank3_exchanged(A, B, C, perm, num_warps):
+    """Both forms of the exchange. Above one element per thread the tile loop
+    runs more than once and the publish/read pair has to span a SPLIT loop;
+    at exactly one element there is no loop and the pair is straight-line code
+    with a barrier between. Neither shape compiled before."""
+    x = torch.arange(A * B * C, dtype=torch.float32, device="mps")
+    out = torch.zeros(A * B * C, dtype=torch.float32, device="mps")
+    permute_rank3_kernel[(1,)](x, out, A, B, C, *perm, num_warps=num_warps)
+    expected = x.cpu().reshape(A, B, C).permute(*perm).reshape(-1)
+    assert torch.equal(out.cpu(), expected), (
+        f"exchanged tl.permute {A}x{B}x{C} perm={perm} nw={num_warps}\n"
+        f"out={out.cpu()[:16].tolist()}\nexpected={expected[:16].tolist()}"
+    )

@@ -16,6 +16,7 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -200,6 +201,83 @@ struct TileInfo {
   // under the second (see rowOfFlat).
   llvm::SmallVector<int64_t, 2> order;
 };
+
+//===----------------------------------------------------------------------===//
+// The row-major element index a lane holds under a tensor's OWN layout.
+//
+// Everything else in this backend IMPOSES one (thread, iv) -> element bijection
+// and ignores what the layout says. That is right while the layout carries no
+// meaning — any bijection works for elementwise and reduce cones, provided every
+// op shares it — and wrong the moment two values in a kernel are related BY a
+// layout change. A transpose or a permute IS such a relation, and it lives
+// nowhere else in the IR.
+//
+// Every TritonGPU distributed layout converts to a `LinearLayout` over the
+// tensor's shape: each bit of (register, lane, warp, block) XORs in one basis
+// vector per output dimension. Evaluate that, then fold the per-dimension
+// coordinates into a row-major offset. The XOR is per DIMENSION, so the strides
+// cannot be folded into the bases — accumulate each dimension first, then take
+// the dot product.
+//
+// Row-major on purpose: a staged exchange indexes its buffer by ELEMENT, so both
+// sides compute their own index off their own layout and neither needs the
+// other's inverse.
+//===----------------------------------------------------------------------===//
+struct LayoutIndexPlan {
+  enum Coord { Register, Lane, Warp };
+  struct Term {
+    Coord coord;
+    int bit;
+    int32_t basis;
+  };
+  // One term list per output dimension, plus that dimension's row-major stride.
+  llvm::SmallVector<llvm::SmallVector<Term, 8>, 4> dimTerms;
+  llvm::SmallVector<int64_t, 4> rowMajorStride;
+  // Counted from the BASIS ARRAYS, never from the terms: a broadcast bit has a
+  // zero basis and contributes no term, but it still costs a thread.
+  int laneBits = 0;
+  int warpBits = 0;
+  int threadsPerBlock() const { return 1 << (laneBits + warpBits); }
+  // How many elements one thread holds under THIS layout.
+  int64_t elemPerThread = 1;
+};
+
+//===----------------------------------------------------------------------===//
+// The full-tile cross-lane exchange.
+//
+// `ConvertLayoutLowering`'s staged transpose can only move ONE element per
+// thread. Above that, its publish and its read both sit inside the scalarized
+// tile loop, and the slot a lane needs at iteration `iv` is written by another
+// lane at some OTHER iteration — no barrier placed inside that loop makes it
+// safe. That is the wall behind every remaining refusal in this family: a
+// `tl.permute` on a tile bigger than the threadgroup, and any relabel the L1d3
+// consumer re-encode declines.
+//
+// The way through is to split the tile loop: publish the whole tile in one loop,
+// barrier, read it in the next. The split has to happen where the loop is BUILT
+// — `FuncOpLowering` splices the function body into one `scf.for` — because a
+// conversion pattern cannot fission a loop it is running inside.
+//
+// The plan is decided before the conversion and consulted by three sites, which
+// must agree by construction:
+//   * the pre-pass rewrites the cvt into a publish/read PAIR and reorders the
+//     body so everything the publish needs precedes it;
+//   * `FuncOpLowering` emits two loops, split at the publish;
+//   * `ConvertLayoutLowering` lowers each half against its own layout's index.
+//===----------------------------------------------------------------------===//
+struct TileExchangePlan {
+  LayoutIndexPlan src;
+  LayoutIndexPlan dst;
+  int64_t numElements = 0;
+  mlir::Type elemTy;
+};
+// Keyed by the marked `ttg.convert_layout` op (publish and read share a plan).
+static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
+// The hoisted threadgroup buffer, allocated once in the function prologue so it
+// dominates both loops. Keyed the same way.
+static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
+static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
+
 
 // Per-op callers (LoadOp / StoreOp lowerings at :2036, :2394, :2494, :2571) pass
 // tensor<...x!tt.ptr<...>> and need a valid TileInfo. The kernel-level walker
@@ -777,6 +855,33 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // compute a per-iteration index via `emitPerIterIndex`. `tileInfo` was
     // captured at the very start of matchAndRewrite while the original
     // body was still intact.
+    // The exchange's buffer is allocated in the PROLOGUE whether or not the
+    // body gets split, because at one element per thread there is no loop to
+    // split and the publish and read are plain straight-line ops.
+    mlir::Operation *exchangePublish = nullptr;
+    for (mlir::Operation &o : emptyBlock) {
+      auto attr = o.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      if (attr && attr.getValue() == "publish" && g_tileExchange.count(&o)) {
+        exchangePublish = &o;
+        break;
+      }
+    }
+    if (exchangePublish) {
+      const TileExchangePlan &plan = g_tileExchange[exchangePublish];
+      auto bufTy = MetalMemRefType::get(rewriter.getContext(), plan.elemTy,
+                                        plan.numElements);
+      if (lastProloguePtr)
+        rewriter.setInsertionPointAfter(lastProloguePtr);
+      else
+        rewriter.setInsertionPointToStart(&emptyBlock);
+      mlir::Value buf =
+          ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+      for (auto &entry : g_tileExchange)
+        g_tileExchangeBuf[entry.first] = buf;
+      // The inner split recomputes the body's first op from this, so extending
+      // the prologue is all that is needed here.
+      lastProloguePtr = buf.getDefiningOp();
+    }
     if (tileInfo && tileInfo->elemPerThread > 1 && !emptyBlock.empty()) {
       mlir::Operation *returnOp = &emptyBlock.back();
       mlir::Block::iterator firstOrigBodyIt =
@@ -794,12 +899,42 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           loc, rewriter.getI32IntegerAttr(tileInfo->elemPerThread));
       auto cStep = mlir::arith::ConstantOp::create(rewriter, 
           loc, rewriter.getI32IntegerAttr(1));
-      auto forOp = mlir::scf::ForOp::create(rewriter, 
-          loc, cZero.getResult(), cE.getResult(), cStep.getResult());
-      auto &forBlock = forOp.getRegion().front();
-      auto forYieldIt = std::prev(forBlock.end());
-      forBlock.getOperations().splice(forYieldIt, emptyBlock.getOperations(),
-                                       firstOrigBodyIt, returnIt);
+      // A full-tile cross-lane exchange splits the loop in two: the whole tile
+      // is published in the first, a barrier separates them, and the second
+      // reads it back. One loop cannot do it — the slot a lane needs at
+      // iteration `iv` is written by another lane at some other iteration — and
+      // this is the only place the loop is built, so it is the only place the
+      // fission can happen. See `planTileExchange`.
+      mlir::Operation *publish = exchangePublish;
+      // The exchange's own element count must be the loop's trip count, or the
+      // publish would cover only part of the tile.
+      if (publish &&
+          g_tileExchange[publish].src.elemPerThread != tileInfo->elemPerThread)
+        publish = nullptr;
+      if (publish) {
+        mlir::Block::iterator publishIt = std::next(publish->getIterator());
+        auto for1 = mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
+                                             cE.getResult(), cStep.getResult());
+        auto &b1 = for1.getRegion().front();
+        b1.getOperations().splice(std::prev(b1.end()),
+                                  emptyBlock.getOperations(), firstOrigBodyIt,
+                                  publishIt);
+        rewriter.setInsertionPointAfter(for1);
+        BarrierOp::create(rewriter, loc);
+        auto for2 = mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
+                                             cE.getResult(), cStep.getResult());
+        auto &b2 = for2.getRegion().front();
+        b2.getOperations().splice(std::prev(b2.end()),
+                                  emptyBlock.getOperations(),
+                                  std::next(for2->getIterator()), returnIt);
+      } else {
+        auto forOp = mlir::scf::ForOp::create(rewriter,
+            loc, cZero.getResult(), cE.getResult(), cStep.getResult());
+        auto &forBlock = forOp.getRegion().front();
+        auto forYieldIt = std::prev(forBlock.end());
+        forBlock.getOperations().splice(forYieldIt, emptyBlock.getOperations(),
+                                         firstOrigBodyIt, returnIt);
+      }
     }
 
     rewriter.eraseOp(op);
@@ -1467,107 +1602,146 @@ struct LinearRangeAxis {
 static std::optional<LinearRangeAxis>
 linearRangeHypercubeAxis(mlir::triton::MakeRangeOp op);
 
-struct LinearRangePlan {
-  enum Coord { Register, Lane, Warp };
-  // (which coordinate, which bit of it, what to XOR in) — already filtered to
-  // the bits that contribute anything.
-  llvm::SmallVector<std::tuple<Coord, int, int32_t>, 8> terms;
-  // Counted from the BASIS ARRAYS, not from `terms`. A broadcast bit has a zero
-  // basis and contributes no term, but it still costs a thread — deriving the
-  // thread count from the filtered terms halved it for `warp = [[4], [0]]` and
-  // would have put `localTid` on the wrong threadgroup stride.
-  int laneBits = 0;
-  int warpBits = 0;
-  int threadsPerBlock() const { return 1 << (laneBits + warpBits); }
-};
-
-static std::optional<LinearRangePlan>
-planLinearRange(mlir::triton::MakeRangeOp op) {
-  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
-  if (!resTy || resTy.getRank() != 1)
+static std::optional<LayoutIndexPlan>
+planLayoutIndex(mlir::RankedTensorType rtt) {
+  if (!rtt || !rtt.getEncoding())
     return std::nullopt;
-  auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::LinearEncodingAttr>(
-      resTy.getEncoding());
-  if (!enc)
+  if (!mlir::isa<mlir::triton::gpu::DistributedEncodingTrait>(
+          rtt.getEncoding()))
     return std::nullopt;
-  const mlir::triton::LinearLayout &ll = enc.getLinearLayout();
-  if (ll.getNumOutDims() != 1)
-    return std::nullopt;
-  mlir::StringAttr outDim = *ll.getOutDimNames().begin();
-  if (ll.getOutDimSize(outDim) != resTy.getDimSize(0))
+  mlir::triton::LinearLayout ll = mlir::triton::gpu::toLinearLayout(rtt);
+  const int64_t rank = rtt.getRank();
+  llvm::SmallVector<mlir::StringAttr, 4> outDims(ll.getOutDimNames().begin(),
+                                                 ll.getOutDimNames().end());
+  if (static_cast<int64_t>(outDims.size()) != rank)
     return std::nullopt;
 
-  LinearRangePlan plan;
-  auto *ctx = op.getContext();
-  auto take = [&](const char *name, LinearRangePlan::Coord coord) -> bool {
+  LayoutIndexPlan plan;
+  plan.dimTerms.resize(rank);
+  plan.rowMajorStride.assign(rank, 1);
+  for (int64_t d = rank - 2; d >= 0; --d)
+    plan.rowMajorStride[d] = plan.rowMajorStride[d + 1] * rtt.getDimSize(d + 1);
+
+  auto *ctx = rtt.getContext();
+  auto take = [&](const char *name, LayoutIndexPlan::Coord coord) -> bool {
     auto dim = mlir::StringAttr::get(ctx, name);
-    const auto &bases = ll.getBases();
-    auto it = bases.find(dim);
-    if (it == bases.end())
-      return true; // absent input dim contributes nothing
+    auto it = ll.getBases().find(dim);
+    if (it == ll.getBases().end())
+      return true;
+    if (coord == LayoutIndexPlan::Lane)
+      plan.laneBits = static_cast<int>(it->second.size());
+    if (coord == LayoutIndexPlan::Warp)
+      plan.warpBits = static_cast<int>(it->second.size());
+    if (coord == LayoutIndexPlan::Register)
+      plan.elemPerThread = int64_t{1} << it->second.size();
     for (size_t b = 0; b < it->second.size(); ++b) {
       const std::vector<int32_t> &basis = it->second[b];
-      if (basis.size() != 1)
-        return false; // swizzled across output dims; not rank-1 shaped
-      if (coord == LinearRangePlan::Lane)
-        plan.laneBits = static_cast<int>(it->second.size());
-      if (coord == LinearRangePlan::Warp)
-        plan.warpBits = static_cast<int>(it->second.size());
-      if (basis[0] == 0)
-        continue; // broadcast bit — contributes nothing to the element index
-      plan.terms.push_back({coord, static_cast<int>(b), basis[0]});
+      if (static_cast<int64_t>(basis.size()) != rank)
+        return false;
+      for (int64_t d = 0; d < rank; ++d)
+        if (basis[d] != 0)
+          plan.dimTerms[d].push_back({coord, static_cast<int>(b), basis[d]});
     }
     return true;
   };
-  // Lane first so `laneBits` is set before anyone reads it.
-  if (!take("lane", LinearRangePlan::Lane) ||
-      !take("warp", LinearRangePlan::Warp) ||
-      !take("register", LinearRangePlan::Register))
+  if (!take("lane", LayoutIndexPlan::Lane) ||
+      !take("warp", LayoutIndexPlan::Warp) ||
+      !take("register", LayoutIndexPlan::Register))
     return std::nullopt;
-  // A multi-CTA block basis would need the CTA id, which this backend does not
-  // thread into the index math. num_ctas is 1 everywhere here, so a non-zero
-  // block basis means something unexpected — decline rather than ignore it.
+  // A non-zero block basis would need the CTA id, which this backend never
+  // threads into the index math. num_ctas is 1 everywhere here, so anything
+  // else is unexpected — decline rather than silently drop it.
   {
-    auto dim = mlir::StringAttr::get(ctx, "block");
-    const auto &bases = ll.getBases();
-    auto it = bases.find(dim);
-    if (it != bases.end())
+    auto it = ll.getBases().find(mlir::StringAttr::get(ctx, "block"));
+    if (it != ll.getBases().end())
       for (const std::vector<int32_t> &basis : it->second)
-        if (basis.size() != 1 || basis[0] != 0)
-          return std::nullopt;
+        for (int32_t v : basis)
+          if (v != 0)
+            return std::nullopt;
   }
   if (plan.laneBits <= 0)
     return std::nullopt;
-  // ⚠️ The two linear-range paths impose OPPOSITE mappings and must never meet.
-  //
-  // `linearRangeHypercubeAxis` IMPOSES the backend's own bijection (the flat
-  // (thread, iv) index decomposed by the cube's `order`) because everything
-  // around a `tl.sort` — its loads, stores and reduces — already speaks it. This
-  // path READS the layout's own bijection instead, because for `tl.permute`
-  // that layout is the only place the permutation exists. Both are correct
-  // alone; a kernel holding one of each would have two element mappings and
-  // combine them silently, which is how this backend's worst bugs have always
-  // looked.
-  //
-  // So decline outright if any range in the same function takes the other path.
-  // A kernel that both sorts and permutes gets a named refusal rather than a
-  // plausible answer.
-  //
-  // This walk reads the IR, which conversion mutates — but only in the safe
-  // direction: `linearRangeHypercubeAxis` needs `tt.reshape` USERS, and the
-  // conversion only ever removes those, so a clash can disappear between the
-  // pre-pass and the pattern and never appear. The pre-pass is therefore the
-  // stricter of the two, which is the way round that cannot miscompile.
-  if (auto func = op->getParentOfType<mlir::triton::FuncOp>()) {
-    bool clash = false;
-    func.walk([&](mlir::triton::MakeRangeOp other) {
-      if (other != op && linearRangeHypercubeAxis(other))
-        clash = true;
-    });
-    if (clash)
-      return std::nullopt;
-  }
   return plan;
+}
+
+// Emit `index(op)` for a plan: XOR the contributing bits per output dimension,
+// then take the row-major dot product. `ivOverride` lets a caller name the tile
+// loop iteration explicitly, which the two-loop exchange needs because its
+// publish and its read live in DIFFERENT loops.
+static mlir::Value
+emitLayoutElementIndex(mlir::Operation *op, const LayoutIndexPlan &plan,
+                       mlir::ConversionPatternRewriter &rewriter,
+                       mlir::Location loc, mlir::Value ivOverride = {}) {
+  auto i32 = rewriter.getI32Type();
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto cst = [&](int64_t v) {
+    return mlir::arith::ConstantOp::create(
+               rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(v)))
+        .getResult();
+  };
+  auto toI32 = [&](mlir::Value v) {
+    return mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{v})
+        .getResult(0);
+  };
+  mlir::Value tid = toI32(
+      ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
+          .getResult());
+  mlir::Value tg = toI32(
+      ThreadgroupIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
+          .getResult());
+  mlir::Value localTid =
+      mlir::arith::SubIOp::create(
+          rewriter, loc, tid,
+          mlir::arith::MulIOp::create(rewriter, loc, tg,
+                                      cst(plan.threadsPerBlock()))
+              .getResult())
+          .getResult();
+  mlir::Value lane = mlir::arith::RemSIOp::create(rewriter, loc, localTid,
+                                                  cst(1 << plan.laneBits))
+                         .getResult();
+  mlir::Value warp = mlir::arith::DivSIOp::create(rewriter, loc, localTid,
+                                                  cst(1 << plan.laneBits))
+                         .getResult();
+  mlir::Value iv = ivOverride;
+  if (!iv)
+    if (auto parentFor = findOutermostScfFor(op))
+      iv = parentFor.getInductionVar();
+
+  mlir::Value total;
+  for (size_t d = 0; d < plan.dimTerms.size(); ++d) {
+    mlir::Value acc;
+    for (const LayoutIndexPlan::Term &t : plan.dimTerms[d]) {
+      mlir::Value src = t.coord == LayoutIndexPlan::Lane   ? lane
+                        : t.coord == LayoutIndexPlan::Warp ? warp
+                                                           : iv;
+      if (!src)
+        return {}; // a register basis with no tile loop to index it
+      mlir::Value bit =
+          mlir::arith::AndIOp::create(
+              rewriter, loc,
+              mlir::arith::ShRSIOp::create(rewriter, loc, src, cst(t.bit))
+                  .getResult(),
+              cst(1))
+              .getResult();
+      mlir::Value term =
+          mlir::arith::MulIOp::create(rewriter, loc, bit, cst(t.basis))
+              .getResult();
+      acc = acc ? mlir::arith::XOrIOp::create(rewriter, loc, acc, term)
+                      .getResult()
+                : term;
+    }
+    if (!acc)
+      continue; // this dimension is entirely broadcast: coordinate 0
+    if (plan.rowMajorStride[d] != 1)
+      acc = mlir::arith::MulIOp::create(rewriter, loc, acc,
+                                        cst(plan.rowMajorStride[d]))
+                .getResult();
+    total = total ? mlir::arith::AddIOp::create(rewriter, loc, total, acc)
+                        .getResult()
+                  : acc;
+  }
+  return total ? total : cst(0);
 }
 
 static std::optional<LinearRangeAxis>
@@ -1615,6 +1789,47 @@ linearRangeHypercubeAxis(mlir::triton::MakeRangeOp op) {
   return LinearRangeAxis{*tile, enc, axis};
 }
 
+// POLICY for the general linear-range path; `planLayoutIndex` is the MECHANISM,
+// shared with the staged tile exchange so the two can never describe different
+// element mappings.
+//
+// `tl.permute` folds its whole permutation into the load index's `#ttg.linear`
+// layout and leaves the reshape and the transpose as flat identities, so that
+// layout is the only place the permutation exists and imposing this backend's
+// own mapping erases the op.
+//
+// ⚠️ The two linear-range paths impose OPPOSITE mappings and must never meet.
+// `linearRangeHypercubeAxis` IMPOSES this backend's bijection because everything
+// around a `tl.sort` already speaks it; this one READS the layout's. A kernel
+// holding one of each would carry two element mappings and combine them
+// silently, so decline outright when any range in the same function takes the
+// other path. That walk reads IR the conversion mutates, but only in the safe
+// direction: a hypercube range needs `tt.reshape` USERS and the conversion only
+// removes those, so a clash can disappear between the pre-pass and the pattern
+// and never appear — the pre-pass is the stricter of the two.
+static std::optional<LayoutIndexPlan>
+planLinearRange(mlir::triton::MakeRangeOp op) {
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!resTy || resTy.getRank() != 1)
+    return std::nullopt;
+  if (!mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(
+          resTy.getEncoding()))
+    return std::nullopt;
+  std::optional<LayoutIndexPlan> plan = planLayoutIndex(resTy);
+  if (!plan)
+    return std::nullopt;
+  if (auto func = op->getParentOfType<mlir::triton::FuncOp>()) {
+    bool clash = false;
+    func.walk([&](mlir::triton::MakeRangeOp other) {
+      if (other != op && linearRangeHypercubeAxis(other))
+        clash = true;
+    });
+    if (clash)
+      return std::nullopt;
+  }
+  return plan;
+}
+
 struct MakeRangeLowering
     : public mlir::OpConversionPattern<mlir::triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1654,72 +1869,17 @@ struct MakeRangeLowering
       }
     }
     // General linear layout: evaluate the basis vectors. See `planLinearRange`.
-    if (std::optional<LinearRangePlan> plan = planLinearRange(op)) {
-      auto i32 = rewriter.getI32Type();
-      auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
-      auto cst = [&](int32_t v) {
-        return mlir::arith::ConstantOp::create(rewriter, loc,
-                                               rewriter.getI32IntegerAttr(v))
-            .getResult();
-      };
-      auto toI32 = [&](mlir::Value v) {
-        return mlir::UnrealizedConversionCastOp::create(
-                   rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{v})
-            .getResult(0);
-      };
-      mlir::Value tid = toI32(
-          ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
-              .getResult());
-      mlir::Value tg = toI32(ThreadgroupIdOp::create(
-                                 rewriter, loc, ui32,
-                                 rewriter.getStringAttr("x"))
-                                 .getResult());
-      // Threads per threadgroup as THIS layout counts them. Taking it from a
-      // TileInfo instead would be a second, independent answer to the same
-      // question.
-      const int32_t tpb = plan->threadsPerBlock();
-      mlir::Value localTid = mlir::arith::SubIOp::create(
-                                 rewriter, loc, tid,
-                                 mlir::arith::MulIOp::create(rewriter, loc, tg,
-                                                             cst(tpb))
-                                     .getResult())
-                                 .getResult();
-      mlir::Value lane =
-          mlir::arith::RemSIOp::create(rewriter, loc, localTid,
-                                       cst(1 << plan->laneBits))
-              .getResult();
-      mlir::Value warp =
-          mlir::arith::DivSIOp::create(rewriter, loc, localTid,
-                                       cst(1 << plan->laneBits))
-              .getResult();
-      mlir::Value iv;
-      if (auto parentFor = findOutermostScfFor(op))
-        iv = parentFor.getInductionVar();
-
-      mlir::Value acc = cst(op.getStart());
-      bool ok = true;
-      for (auto [coord, bit, basis] : plan->terms) {
-        mlir::Value src = coord == LinearRangePlan::Lane   ? lane
-                          : coord == LinearRangePlan::Warp ? warp
-                                                           : iv;
-        if (!src) { // a register basis with no tile loop to index it
-          ok = false;
-          break;
+    if (std::optional<LayoutIndexPlan> plan = planLinearRange(op)) {
+      if (mlir::Value idx = emitLayoutElementIndex(op, *plan, rewriter, loc)) {
+        if (op.getStart() != 0) {
+          auto start = mlir::arith::ConstantOp::create(
+              rewriter, loc,
+              rewriter.getI32IntegerAttr(static_cast<int32_t>(op.getStart())));
+          idx = mlir::arith::AddIOp::create(rewriter, loc, idx,
+                                            start.getResult())
+                    .getResult();
         }
-        mlir::Value b =
-            mlir::arith::AndIOp::create(
-                rewriter, loc,
-                mlir::arith::ShRSIOp::create(rewriter, loc, src, cst(bit))
-                    .getResult(),
-                cst(1))
-                .getResult();
-        mlir::Value term =
-            mlir::arith::MulIOp::create(rewriter, loc, b, cst(basis))
-                .getResult();
-        acc = mlir::arith::XOrIOp::create(rewriter, loc, acc, term).getResult();
-      }
-      if (ok) {
-        rewriter.replaceOp(op, acc);
+        rewriter.replaceOp(op, idx);
         return mlir::success();
       }
     }
@@ -2145,6 +2305,47 @@ struct ConvertLayoutLowering
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // Path 0: one half of a full-tile exchange (see `planTileExchange`). Must
+    // come before the identity check — the publish is deliberately a SELF
+    // relabel, and forwarding it would drop the store.
+    if (auto tag = op->getAttrOfType<mlir::StringAttr>(kExchangeAttr)) {
+      auto planIt = g_tileExchange.find(op.getOperation());
+      auto bufIt = g_tileExchangeBuf.find(op.getOperation());
+      if (planIt == g_tileExchange.end() || bufIt == g_tileExchangeBuf.end())
+        return rewriter.notifyMatchFailure(op, "exchange plan missing");
+      const TileExchangePlan &plan = planIt->second;
+      auto loc = op.getLoc();
+      auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+      const bool isPublish = tag.getValue() == "publish";
+      // Each half asks its OWN layout where the lane's element lives; the
+      // buffer is indexed by element, so neither needs the other's inverse.
+      mlir::Value idx = emitLayoutElementIndex(
+          op, isPublish ? plan.src : plan.dst, rewriter, loc);
+      if (!idx)
+        return rewriter.notifyMatchFailure(op, "exchange index unavailable");
+      mlir::Value idxU = mlir::UnrealizedConversionCastOp::create(
+                             rewriter, loc, mlir::TypeRange{ui32},
+                             mlir::ValueRange{idx})
+                             .getResult(0);
+      if (isPublish) {
+        TgStoreIndexedOp::create(rewriter, loc, bufIt->second, idxU,
+                                 adaptor.getSrc());
+        // At one element per thread there is no tile loop, so this is the only
+        // barrier between the publish and the read. With a loop, the one
+        // `FuncOpLowering` puts BETWEEN the two loops is the real separator and
+        // this one would just be a per-iteration cost.
+        if (!findOutermostScfFor(op))
+          BarrierOp::create(rewriter, loc);
+        // The result is unused by construction; forward the source so the op
+        // legalizes.
+        rewriter.replaceOp(op, adaptor.getSrc());
+      } else {
+        auto loaded = TgLoadIndexedOp::create(rewriter, loc, plan.elemTy,
+                                              bufIt->second, idxU);
+        rewriter.replaceOp(op, loaded.getResult());
+      }
+      return mlir::success();
+    }
     // Path 1: structural identity (srcTy == dstTy).
     if (op.getSrc().getType() == op.getResult().getType()) {
       rewriter.replaceOp(op, adaptor.getSrc());
@@ -20920,6 +21121,151 @@ static bool normalizeConsumerSideBlockedDivergentCvt(
   return true;
 }
 
+// Rewrite one out-of-envelope `ttg.convert_layout` into a publish/read PAIR and
+// reorder the body so the split `FuncOpLowering` performs is legal. Returns
+// false — changing nothing — whenever any precondition fails, which leaves the
+// caller's existing refusal in charge.
+//
+// The body is partitioned by DEPENDENCE, not by position: everything the
+// exchanged value is built from goes in the first loop, everything else in the
+// second. Values needed on both sides are recomputed in the second, which is
+// only sound because the partition admits pure ops (and `tt.load`, a read that
+// is idempotent) — anything else and this declines.
+static bool planTileExchange(mlir::triton::gpu::ConvertLayoutOp cvt) {
+  auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+  auto dstRtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+  if (!srcRtt || !dstRtt || srcRtt.getShape() != dstRtt.getShape() ||
+      srcRtt.getElementType() != dstRtt.getElementType())
+    return false;
+  // RANK-1 only, and the boundary is empirical rather than principled: it is
+  // the shape `tl.permute` actually produces (Triton reshapes to rank-1 before
+  // the relabel), and rank-2 has the L1d3 consumer re-encode ahead of it.
+  //
+  // ⚠️ Admitting rank 3 was tried and takes the process down: those kernels had
+  // never reached the conversion before — the refusal ran first — and the
+  // rank-3 addptr they arrive with trips an older assertion
+  // (`emitLoadStoreIndex`: "tt.addptr offset must scalarize to an integer")
+  // that has nothing to do with the exchange. Widening this needs that fixed
+  // first, and a crash is not a diagnosis.
+  if (srcRtt.getRank() != 1)
+    return false;
+  std::optional<LayoutIndexPlan> srcPlan = planLayoutIndex(srcRtt);
+  std::optional<LayoutIndexPlan> dstPlan = planLayoutIndex(dstRtt);
+  if (!srcPlan || !dstPlan)
+    return false;
+  // Both sides must enumerate the same threads and the same elements per
+  // thread, or "the tile loop" is two different loops and there is nothing to
+  // split. One element per thread is left to the existing single-loop staged
+  // body, which is byte-for-byte what it was.
+  // Both sides must enumerate the same threads and the same elements per
+  // thread, or "the tile loop" is two different loops and there is nothing to
+  // split. One element per thread is admitted too: there is no tile loop then,
+  // so the publish, the barrier and the read are simply straight-line code —
+  // and that case still needs this path, because the older single-loop staged
+  // body only ever took rank-2 blocked pairs.
+  if (srcPlan->threadsPerBlock() != dstPlan->threadsPerBlock() ||
+      srcPlan->elemPerThread != dstPlan->elemPerThread)
+    return false;
+  mlir::Block *blk = cvt->getBlock();
+  if (!blk || !mlir::isa<mlir::triton::FuncOp>(blk->getParentOp()))
+    return false; // only the function's own top-level body is splittable
+
+  // 1) Everything the published value is built from.
+  llvm::SmallPtrSet<mlir::Operation *, 32> preSet;
+  {
+    llvm::SmallVector<mlir::Value, 32> wl{cvt.getSrc()};
+    while (!wl.empty()) {
+      mlir::Value v = wl.pop_back_val();
+      mlir::Operation *d = v.getDefiningOp();
+      if (!d || d->getBlock() != blk || !preSet.insert(d).second)
+        continue;
+      if (!mlir::isMemoryEffectFree(d) &&
+          !mlir::isa<mlir::triton::LoadOp>(d))
+        return false;
+      for (mlir::Value o : d->getOperands())
+        wl.push_back(o);
+    }
+  }
+
+  // 2) Values that cross the split: defined in the publish cone, read by
+  // something that has to run after the barrier. Each is recomputed on the far
+  // side, so its whole cone must be clonable — it is, by (1).
+  llvm::SmallVector<mlir::Operation *, 16> postOps;
+  for (mlir::Operation &o : *blk) {
+    if (&o == cvt.getOperation() || preSet.count(&o) ||
+        o.hasTrait<mlir::OpTrait::IsTerminator>())
+      continue;
+    postOps.push_back(&o);
+  }
+
+  auto loc = cvt.getLoc();
+  mlir::OpBuilder b(cvt);
+  // 3) The publish: a self-relabel carrying the marker. Its result is unused;
+  // `ConvertLayoutLowering` emits the threadgroup store and nothing else.
+  auto publish = mlir::triton::gpu::ConvertLayoutOp::create(b, loc, srcRtt,
+                                                            cvt.getSrc());
+  publish->setAttr(kExchangeAttr, b.getStringAttr("publish"));
+  // 4) The read. Its operand is a placeholder: the value it produces comes out
+  // of the buffer, and a real operand would be a value from the FIRST loop,
+  // which by construction does not dominate here.
+  mlir::Value placeholder =
+      mlir::arith::ConstantOp::create(
+          b, loc, mlir::DenseElementsAttr::get(
+                      srcRtt, b.getZeroAttr(srcRtt.getElementType())))
+          .getResult();
+  auto read = mlir::triton::gpu::ConvertLayoutOp::create(b, loc, dstRtt,
+                                                         placeholder);
+  read->setAttr(kExchangeAttr, b.getStringAttr("read"));
+  cvt.getResult().replaceAllUsesWith(read.getResult());
+  cvt.erase();
+
+  // 5) Move the publish cone ahead of the publish, in its original relative
+  // order, and everything else after the read. Cross-boundary values are then
+  // recomputed on the far side.
+  // Both moves target a FIXED anchor, so the iteration orders are opposite:
+  // `moveAfter(read)` walks backwards (each op lands directly after the anchor,
+  // pushing the previous one along), `moveBefore(publish)` walks forwards. Using
+  // reverse for both put the publish cone in reverse dependency order — uses
+  // above defs, which the conversion met as an addptr whose offset had not been
+  // scalarized yet.
+  for (mlir::Operation *op : llvm::reverse(postOps))
+    op->moveAfter(read.getOperation());
+  llvm::SmallVector<mlir::Operation *, 32> preOrdered;
+  for (mlir::Operation &o : *blk)
+    if (preSet.count(&o))
+      preOrdered.push_back(&o);
+  for (mlir::Operation *op : preOrdered)
+    op->moveBefore(publish.getOperation());
+
+  mlir::IRMapping mapping;
+  b.setInsertionPointAfter(read.getOperation());
+  std::function<mlir::Value(mlir::Value)> recompute =
+      [&](mlir::Value v) -> mlir::Value {
+    if (mlir::Value already = mapping.lookupOrNull(v))
+      return already;
+    mlir::Operation *d = v.getDefiningOp();
+    if (!d || !preSet.count(d))
+      return v;
+    for (mlir::Value o : d->getOperands())
+      recompute(o);
+    mlir::Operation *clone = b.clone(*d, mapping);
+    return mapping.lookupOrNull(v) ? mapping.lookup(v) : clone->getResult(0);
+  };
+  for (mlir::Operation *op : postOps)
+    for (mlir::OpOperand &use : op->getOpOperands()) {
+      mlir::Operation *d = use.get().getDefiningOp();
+      if (d && preSet.count(d))
+        use.set(recompute(use.get()));
+    }
+
+  TileExchangePlan plan{*srcPlan, *dstPlan, srcRtt.getNumElements(),
+                        srcRtt.getElementType()};
+  g_tileExchange[publish.getOperation()] = plan;
+  g_tileExchange[read.getOperation()] = plan;
+  return true;
+}
+
 static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> cvts;
   moduleOp.walk(
@@ -24782,6 +25128,8 @@ struct ConvertTritonGPUToMetalPass
     // matchers have consumed the tiles that are theirs. Stale entries would
     // point at freed ops from the previous kernel in the same process.
     g_makeRangeOwnTile.clear();
+    g_tileExchange.clear();
+    g_tileExchangeBuf.clear();
 
     // A rank-3 `tl.dot` is claimed by the scalar-dot path, whose geometry comes
     // from the kernel's LARGEST tile. That is the result only while
@@ -25479,6 +25827,10 @@ struct ConvertTritonGPUToMetalPass
     // `ConvertLayoutLowering`). See
     // `.omc/specs/deep-interview-leet-triton-l1d2-staged-transpose-body.md`.
     bool cvtOk = true;
+    // Collect first, decide after: `planTileExchange` REWRITES the body (it
+    // splits the cvt into a publish/read pair and reorders around it), and
+    // mutating inside a walk is not allowed.
+    llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp, 4> outOfEnvelope;
     moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
       auto srcTy = cvt.getSrc().getType();
       auto dstTy = cvt.getResult().getType();
@@ -25547,12 +25899,20 @@ struct ConvertTritonGPUToMetalPass
             return mlir::isa<mlir::triton::StoreOp>(u);
           }))
         return;
+      outOfEnvelope.push_back(cvt);
+    });
+    // The full-tile exchange takes what is left, when it can: two loops, publish
+    // then read, which is the only way to move more than one element per thread
+    // across lanes. Anything it declines keeps the refusal.
+    for (auto cvt : outOfEnvelope) {
+      if (planTileExchange(cvt))
+        continue;
       cvt.emitOpError(
           "ttg.convert_layout: broader staged-transpose deferred to L1d3 "
           "(rank≠2 or shape/elem-type change or non-blocked encoding or "
           "sizePerThread > 1)");
       cvtOk = false;
-    });
+    }
     if (!cvtOk) {
       signalPassFailure();
       return;
