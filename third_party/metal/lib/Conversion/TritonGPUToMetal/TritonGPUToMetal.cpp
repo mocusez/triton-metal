@@ -18149,7 +18149,10 @@ static bool sdDotEligible(mlir::triton::DotOp dot) {
   if (dot->getParentOfType<mlir::scf::ForOp>()) return false;
   auto rt = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   int64_t M = 0, N = 0;
-  if (!rt || !rt.getElementType().isF32() ||
+  // i32 accumulates an INTEGER dot (int8 x int8 -> i32, what a quantized
+  // matmul writes). It rides the scalar K-loop only: Apple's simdgroup matrix
+  // units are floating-point, so the fast path below stays float-only.
+  if (!rt || !(rt.getElementType().isF32() || rt.getElementType().isInteger(32)) ||
       !sdGetMatrixShape(rt, M, N))
     return false;
   if (M % 8 != 0 || N % 8 != 0) return false;
@@ -18479,8 +18482,10 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: expected rank-2 or rank-3 result");
     auto elemTy = resTy.getElementType();
-    if (!elemTy.isF32())
-      return rewriter.notifyMatchFailure(op, "scalar_dot: non-f32 result");
+    const bool isIntegerDot = elemTy.isInteger(32);
+    if (!elemTy.isF32() && !isIntegerDot)
+      return rewriter.notifyMatchFailure(op,
+                                         "scalar_dot: non-f32/i32 result");
     bool hasScales = !adaptor.getScaleBufs().empty();
     if (hasScales && (adaptor.getScaleBufs().size() != 2 ||
                       adaptor.getScaleParams().size() != 5))
@@ -18550,7 +18555,7 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                         : factorWarps(numWarps, mTiles, nTiles);
     // `TRITON_METAL_SCALAR_DOT` forces the scalar reduction — an escape hatch
     // for debugging / A-B perf comparison, exercised by the scalar lit test.
-    if (B == 1 && op->hasAttr("metal.simdgroup") &&
+    if (B == 1 && !isIntegerDot && op->hasAttr("metal.simdgroup") &&
         !::getenv("TRITON_METAL_SCALAR_DOT") &&
         tileInfo->elemPerThread > 1 &&
         parentFor && M % 8 == 0 && N % 8 == 0 && wf) {
@@ -18849,6 +18854,10 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                         mlir::Type ty) -> mlir::Value {
       if (ty == elemTy)
         return v;
+      // An integer dot widens its i8 operands to the i32 accumulator instead
+      // — signed, because Triton's int8 dot is signed.
+      if (isIntegerDot)
+        return mlir::arith::ExtSIOp::create(b, loc, elemTy, v).getResult();
       return mlir::arith::ExtFOp::create(b, loc, elemTy, v).getResult();
     };
 
@@ -19230,20 +19239,30 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                                     bScaleStride, gCol, k);
         mlir::Value aF = extToF32(b, aPayload, computeElem);
         mlir::Value bF = extToF32(b, bPayload, computeElem);
+        // An integer dot multiplies and accumulates in i32 — same loop, integer
+        // arithmetic. Its per-element product cannot overflow before the sum
+        // does: both operands came from i8.
         mlir::Value product =
-            mlir::arith::MulFOp::create(b, loc, aF, bF).getResult();
+            isIntegerDot
+                ? mlir::arith::MulIOp::create(b, loc, aF, bF).getResult()
+                : mlir::arith::MulFOp::create(b, loc, aF, bF).getResult();
         if (adaptor.getWeightBuf()) {
           auto weight = GetElementOp::create(
               b, loc, weightMemTy.getType(), adaptor.getWeightBuf(),
               toUi32(k));
-          product = mlir::arith::MulFOp::create(
-                        b, loc, product, weight.getResult())
-                        .getResult();
+          product = isIntegerDot
+                        ? mlir::arith::MulIOp::create(b, loc, product,
+                                                      weight.getResult())
+                              .getResult()
+                        : mlir::arith::MulFOp::create(b, loc, product,
+                                                      weight.getResult())
+                              .getResult();
         }
-        auto newAcc =
-            mlir::arith::AddFOp::create(b, loc, acc, product);
-        mlir::scf::YieldOp::create(b, loc,
-                                   mlir::ValueRange{newAcc.getResult()});
+        mlir::Value newAcc =
+            isIntegerDot
+                ? mlir::arith::AddIOp::create(b, loc, acc, product).getResult()
+                : mlir::arith::AddFOp::create(b, loc, acc, product).getResult();
+        mlir::scf::YieldOp::create(b, loc, mlir::ValueRange{newAcc});
       }
       return kLoop.getResult(0);
     };

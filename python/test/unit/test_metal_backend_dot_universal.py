@@ -1251,3 +1251,36 @@ def test_multiwarp_multitile_matmul_is_deterministic(num_warps):
             a_mps, b_mps, c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=num_warps)
         torch.mps.synchronize()
         torch.testing.assert_close(c.cpu(), ref, atol=2e-4, rtol=2e-4)
+
+
+# --- int8 x int8 -> i32 ------------------------------------------------------
+#
+# An integer `tl.dot` was rejected: every dot path checked for an f32 result, so
+# the operands' `#ttg.dot_op` conversions survived to dialect conversion and
+# failed there. It rides the scalar_dot K-loop, which is shape-generic — the
+# simdgroup fast path stays float-only because Apple's matrix units are.
+#
+# The comparison is exact: int8 operands in [-8, 8) over K <= 64 cannot overflow
+# i32, so any difference from torch is a real error and not rounding.
+
+
+@triton.jit
+def _int8_dot_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    am = tl.arange(0, M)[:, None] * K + tl.arange(0, K)[None, :]
+    bm = tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]
+    cm = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(C + cm, tl.dot(tl.load(A + am), tl.load(B + bm), out_dtype=tl.int32))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("M, N, K", [(16, 16, 16), (32, 32, 32), (16, 32, 64),
+                                     (64, 16, 16), (32, 16, 8)])
+def test_int8_dot_matches_torch_exactly(M, N, K, num_warps):
+    torch.manual_seed(M * N + K)
+    a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
+    b = torch.randint(-8, 8, (K, N), dtype=torch.int8)
+    c = torch.zeros(M, N, dtype=torch.int32, device="mps")
+    _int8_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, M, N, K,
+                           num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(c.cpu(), a.to(torch.int32) @ b.to(torch.int32))
