@@ -85,6 +85,17 @@ void init_triton_metal(py::module &&m) {
         threadsPerGroup = 32;
     }
 
+    // Debug-record message table. `tl.device_print` / `tl.device_assert` write
+    // an INDEX into this table from the device; the launcher needs the strings
+    // to format what it reads back, and its presence is also how the launcher
+    // knows to bind the trailing debug buffer at all.
+    py::list debugMessages;
+    if (auto messages =
+            mod->getAttrOfType<mlir::ArrayAttr>("metal.debug_messages"))
+      for (mlir::Attribute attr : messages)
+        debugMessages.append(
+            py::str(mlir::cast<mlir::StringAttr>(attr).getValue().str()));
+
     std::string buffer;
     llvm::raw_string_ostream os(buffer);
     if (mlir::failed(
@@ -92,7 +103,7 @@ void init_triton_metal(py::module &&m) {
       throw std::runtime_error(
           "Metal backend: MLIR -> MSL translation failed");
     }
-    return py::make_tuple(buffer, threadsPerGroup);
+    return py::make_tuple(buffer, threadsPerGroup, debugMessages);
   });
 
   // The Metal backend is MPS-only: kernels are launched via

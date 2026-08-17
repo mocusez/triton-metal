@@ -54,30 +54,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reject_assert(%x: !tt.ptr<f32>) {
-    %c = arith.constant dense<true> : tensor<128xi1, #blocked>
-    // expected-error @+1 {{tl.device_assert is not implemented}}
-    tt.assert %c, "boom" : tensor<128xi1, #blocked>
-    tt.return
-  }
-}
-
-// -----
-
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reject_print(%x: !tt.ptr<f32>) {
-    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{tl.device_print is not implemented}}
-    tt.print " v: " {hex = false, isSigned = array<i32: 0>} : %v : tensor<128xf32, #blocked>
-    tt.return
-  }
-}
-
-// -----
-
 // `tt.make_range` is a per-element index. MakeRangeLowering can decompose one
 // out of a blocked layout (rank-1), a slice-of-blocked (rank-2) or a
 // slice-of-slice-of-blocked (rank-3); a `#ttg.linear` layout — what reshaping

@@ -314,7 +314,12 @@ class MetalBackend(BaseBackend):
         # In-process TTGIR -> Metal dialect -> MSL text. The pybind in
         # third_party/metal/triton_metal.cc drives the conversion pass
         # and the ModuleTranslation emitter; we only forward the module.
-        msl, threads_per_group = libmetal.ttgir_to_msl(mod)
+        msl, threads_per_group, debug_messages = libmetal.ttgir_to_msl(mod)
+        # `tl.device_print` / `tl.device_assert` write records into a trailing
+        # buffer the launcher binds; these are the strings it formats them
+        # with, and a non-empty list is also how the launcher knows the kernel
+        # has that extra parameter at all.
+        metadata["debug_messages"] = list(debug_messages)
         # A kernel that IS one `metal.fused_attention` runs on a single warp,
         # so the launch needs 32 threads whatever `num_warps` the source asked
         # for. Recorded separately rather than by overwriting `num_warps`: that

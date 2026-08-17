@@ -311,6 +311,20 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
             << ")]],\n";
     _varCount++;
   }
+  // The debug buffer is a trailing parameter, present only in kernels that
+  // print or assert, so every other kernel's signature is unchanged. The
+  // launcher binds it at exactly this slot — the count of real arguments —
+  // which both sides derive from the same compile.
+  bool usesDebugRecords = false;
+  op.walk([&](mlir::triton::metal::DebugRecordOp) {
+    usesDebugRecords = true;
+    return mlir::WalkResult::interrupt();
+  });
+  if (usesDebugRecords) {
+    _output << "  device uint32_t *__triton_dbg [[buffer(" << _varCount
+            << ")]],\n";
+    _varCount++;
+  }
   _output << "  uint3 id [[thread_position_in_grid]]";
   // Conditionally add the threadgroup-position parameter only when the
   // kernel body references it (via metal.threadgroup_id). This keeps
@@ -429,6 +443,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::SimdgroupStoreOp,
             mlir::triton::metal::SimdgroupFusedStoreOp,
             mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
+            mlir::triton::metal::DebugRecordOp,
             mlir::scf::ConditionOp>(
           [&](auto &op) { printable = true; })
       .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
@@ -491,6 +506,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
           [&](auto &op) { translate(op); })
       .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ForOp>([&](auto &op) { translate(op); })
+      .Case<mlir::triton::metal::DebugRecordOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::WhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ConditionOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::YieldOp>([&](auto &op) { translate(op); })
@@ -935,6 +951,87 @@ void ModuleTranslation::translate(
   }
   os << "    }\n";
   os << "  }\n";
+}
+
+
+// One fixed-size record appended to the trailing debug buffer.
+//
+// Word 0 of the buffer is the count; each record is six words:
+//   [kind | dtype << 8, msg id, program id, lane, value bits, reserved]
+// The slot comes from an atomic increment, so a full buffer DROPS records
+// instead of overwriting — the host compares the count it reads against the
+// cap and says how many it lost. `metal.debug_record`'s optional predicate is
+// what makes an assert record only on failure.
+void ModuleTranslation::translate(mlir::triton::metal::DebugRecordOp op) {
+  const unsigned cap = 1024;
+  if (op.getPred()) {
+    _output << "if (";
+    translateValueOrVarName(op.getPred());
+    _output << ") {\n";
+    indent();
+  }
+  unsigned slot = _varCount++;
+  _output << "uint v" << slot
+          << " = atomic_fetch_add_explicit((device atomic_uint*)"
+             "&__triton_dbg[0], 1u, memory_order_relaxed);\n";
+  indent();
+  _output << "if (v" << slot << " < " << cap << "u) {\n";
+  indent();
+  unsigned base = _varCount++;
+  _output << "uint v" << base << " = 1u + v" << slot << " * 6u;\n";
+  indent();
+  const unsigned header =
+      static_cast<unsigned>(op.getKind()) |
+      (static_cast<unsigned>(op.getDtypeTag()) << 8);
+  _output << "__triton_dbg[v" << base << " + 0u] = " << header << "u;\n";
+  indent();
+  _output << "__triton_dbg[v" << base << " + 1u] = "
+          << static_cast<unsigned>(op.getMsgId()) << "u;\n";
+  indent();
+  _output << "__triton_dbg[v" << base << " + 2u] = tgid.x;\n";
+  indent();
+  _output << "__triton_dbg[v" << base << " + 3u] = ";
+  if (mlir::Value lane = op.getLane()) {
+    // The ELEMENT this record belongs to, which is the threadgroup-local index
+    // — `id.x` is global and would label every program's records with the
+    // wrong element.
+    _output << "uint32_t(";
+    translateValueOrVarName(lane);
+    _output << ")";
+  } else {
+    _output << "id.x";
+  }
+  _output << ";\n";
+  indent();
+  _output << "__triton_dbg[v" << base << " + 4u] = ";
+  if (mlir::Value value = op.getValue()) {
+    mlir::Type ty = value.getType();
+    if (ty.isF32()) {
+      _output << "as_type<uint32_t>(";
+      translateValueOrVarName(value);
+      _output << ")";
+    } else if (ty.isF16() || ty.isBF16()) {
+      _output << "uint32_t(as_type<ushort>(";
+      translateValueOrVarName(value);
+      _output << "))";
+    } else {
+      _output << "uint32_t(";
+      translateValueOrVarName(value);
+      _output << ")";
+    }
+  } else {
+    _output << "0u";
+  }
+  _output << ";\n";
+  indent();
+  _output << "__triton_dbg[v" << base << " + 5u] = 0u;\n";
+  indent();
+  _output << "}\n";
+  if (op.getPred()) {
+    indent();
+    _output << "}\n";
+  }
+  indent();
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
@@ -6292,9 +6389,16 @@ void ModuleTranslation::translateValue(Operation *opInst) {
       .Case<mlir::arith::ConstantOp>([&](mlir::arith::ConstantOp op) {
         // arith.constant (signless integer or float) survives in the masked
         // path as the upper-bound N of the comparison. Emit as a literal.
-        if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue()))
-          _output << v.getValue();
-        else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
+        if (auto v = llvm::dyn_cast<IntegerAttr>(op.getValue())) {
+          // A one-bit APInt prints as -1 for `true`, and -1 is not `true` in
+          // arithmetic: `cond ^ -1` is nonzero for BOTH values of cond, so a
+          // negated predicate came out always-true. `tl.device_assert` fired on
+          // every passing kernel because of it.
+          if (v.getType().isInteger(1))
+            _output << (v.getValue().isZero() ? "false" : "true");
+          else
+            _output << v.getValue();
+        } else if (auto v = llvm::dyn_cast<FloatAttr>(op.getValue()))
           emitFloatLiteral(_output, v);
         else
           llvm_unreachable("Unexpected arith.constant attribute kind");

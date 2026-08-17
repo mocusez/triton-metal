@@ -238,6 +238,80 @@ class MetalUtils:
         }
 
 
+
+# --- device_print / device_assert -------------------------------------------
+#
+# MSL has neither printf nor a host-visible assert channel, so a kernel that
+# uses either gets one extra `device uint32_t*` parameter and writes fixed-size
+# records into it: word 0 is an atomically incremented count, then six words per
+# record — [kind | dtype << 8, message id, program id, lane, value bits, 0].
+#
+# Records past the cap are DROPPED rather than overwriting, which is why the
+# count is compared against it below: a truncated log says so instead of
+# quietly being short. Output is sorted by (program, lane) because the slot
+# order is whatever the hardware handed out, and an unstable log is a poor
+# debugging tool.
+_DEBUG_RECORD_CAP = 1024
+_DEBUG_RECORD_WORDS = 6
+_DEBUG_KIND_PRINT = 0
+_DEBUG_KIND_ASSERT = 1
+
+
+def _format_debug_value(dtype_tag: int, bits: int) -> str:
+    import struct
+    raw = bits & 0xFFFFFFFF
+    if dtype_tag == 2:  # f32
+        return repr(struct.unpack("<f", struct.pack("<I", raw))[0])
+    if dtype_tag == 3:  # f16 / bf16, in the low half
+        return repr(struct.unpack("<e", struct.pack("<H", raw & 0xFFFF))[0])
+    if dtype_tag == 1:  # unsigned
+        return str(raw)
+    if dtype_tag == 0:  # signed
+        return str(raw - (1 << 32) if raw >= (1 << 31) else raw)
+    return ""
+
+
+def _report_debug_records(buffer, messages):
+    import sys
+    import torch
+
+    torch.mps.synchronize()
+    words = buffer.cpu().tolist()
+    count = words[0] & 0xFFFFFFFF
+    kept = min(count, _DEBUG_RECORD_CAP)
+    records = []
+    for i in range(kept):
+        base = 1 + i * _DEBUG_RECORD_WORDS
+        header = words[base] & 0xFFFFFFFF
+        records.append((
+            words[base + 2] & 0xFFFFFFFF,  # program id
+            words[base + 3] & 0xFFFFFFFF,  # lane
+            header & 0xFF,                 # kind
+            (header >> 8) & 0xFF,          # dtype tag
+            words[base + 1] & 0xFFFFFFFF,  # message id
+            words[base + 4] & 0xFFFFFFFF,  # value bits
+        ))
+    records.sort(key=lambda r: (r[0], r[1]))
+
+    failures = []
+    for pid, lane, kind, dtype_tag, msg_id, bits in records:
+        message = messages[msg_id] if msg_id < len(messages) else f"<{msg_id}>"
+        if kind == _DEBUG_KIND_ASSERT:
+            failures.append(f"{message} (program {pid}, lane {lane})")
+            continue
+        value = _format_debug_value(dtype_tag, bits)
+        suffix = f": {value}" if value else ""
+        print(f"pid ({pid}, 0, 0) idx ({lane}) {message}{suffix}",
+              file=sys.stderr)
+    if count > kept:
+        print(f"[triton-metal] {count - kept} further debug record(s) dropped: "
+              f"the per-launch buffer holds {_DEBUG_RECORD_CAP}",
+              file=sys.stderr)
+    if failures:
+        raise RuntimeError("Device assertion failed: " + failures[0] + (
+            f" (and {len(failures) - 1} more)" if len(failures) > 1 else ""))
+
+
 class MetalLauncher:
     """Full-fidelity Triton launcher: `(gridX, gridY, gridZ, stream,
     function, kernel_metadata, launch_metadata, launch_enter_hook,
@@ -280,6 +354,11 @@ class MetalLauncher:
         ws = 32
         tpg = getattr(metadata, "threads_per_group", None)
         self._threadgroup = (tpg if tpg else nw * ws, 1, 1)
+        # `tl.device_print` / `tl.device_assert` compile to records written into
+        # a trailing `device uint32_t*` parameter. A non-empty message table is
+        # how we know the kernel HAS that parameter: both sides come from the
+        # same compile, and the emitter puts it at exactly the argument count.
+        self._debug_messages = list(getattr(metadata, "debug_messages", ()) or ())
 
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata,
                  launch_metadata, launch_enter_hook, launch_exit_hook, *args):
@@ -325,7 +404,18 @@ class MetalLauncher:
             else:
                 call_args.append(arg)
 
+        debug_buffer = None
+        if self._debug_messages:
+            import torch
+            debug_buffer = torch.zeros(
+                1 + _DEBUG_RECORD_CAP * _DEBUG_RECORD_WORDS,
+                dtype=torch.int32, device="mps")
+            call_args.append(debug_buffer)
+
         function(*call_args, threads=threads, group_size=group_size)
+
+        if debug_buffer is not None:
+            _report_debug_records(debug_buffer, self._debug_messages)
 
         # Pure zero-copy path (all inputs already MPS + contiguous) leaves
         # writeback empty. CPU / non-contiguous inputs are mirrored back in

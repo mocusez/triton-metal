@@ -23354,12 +23354,17 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                       "element per thread, outside divergent control flow and "
                       "outside a sub-tpb rank-2 companion mapping");
         })
-        .Case<mlir::triton::AssertOp>([&](auto o) {
-          reject(o, "tl.device_assert is not implemented (MSL has no "
-                    "host-visible assert channel)");
-        })
         .Case<mlir::triton::PrintOp>([&](auto o) {
-          reject(o, "tl.device_print is not implemented (MSL has no printf)");
+          // Implemented through the debug buffer; only a print of something
+          // the type converter cannot scalarize is left.
+          for (mlir::Value arg : o.getArgs()) {
+            auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
+            if (rtt && !mlir::isa<mlir::triton::gpu::BlockedEncodingAttr,
+                                  mlir::triton::gpu::SliceEncodingAttr>(
+                           rtt.getEncoding()))
+              reject(o, "tl.device_print needs a blocked or slice layout for "
+                        "each tensor argument");
+          }
         })
         .Case<mlir::triton::ElementwiseInlineAsmOp>([&](auto o) {
           reject(o, "tl.inline_asm_elementwise is not implemented (its payload "
@@ -23739,6 +23744,182 @@ static void preprocessInlineCalls(mlir::ModuleOp moduleOp) {
       callee.erase();
   }
 }
+
+//===----------------------------------------------------------------------===//
+// tt.print / tt.assert -> metal.debug_record.
+//
+// MSL has no printf and no host-visible assert channel, so both go through a
+// trailing `device uint32_t*` buffer the launcher binds: the kernel appends
+// fixed-size records, the host formats them once the dispatch completes. The
+// message strings live in a module attribute the pybind hands to the launcher
+// alongside the MSL text, so the device only ever writes an index.
+//
+// A print of a tensor records one line PER LANE, which is what the CUDA
+// backend does too. Records are capped in the emitter; the host reports the
+// overflow rather than silently truncating.
+//===----------------------------------------------------------------------===//
+static constexpr llvm::StringLiteral kDebugMessagesAttr = "metal.debug_messages";
+
+// Interns `message` in the module's table and returns its index.
+static int32_t internDebugMessage(mlir::ModuleOp moduleOp,
+                                  llvm::StringRef message) {
+  llvm::SmallVector<mlir::Attribute> messages;
+  if (auto existing =
+          moduleOp->getAttrOfType<mlir::ArrayAttr>(kDebugMessagesAttr))
+    messages.assign(existing.begin(), existing.end());
+  for (auto [i, attr] : llvm::enumerate(messages))
+    if (mlir::cast<mlir::StringAttr>(attr).getValue() == message)
+      return static_cast<int32_t>(i);
+  messages.push_back(mlir::StringAttr::get(moduleOp.getContext(), message));
+  moduleOp->setAttr(kDebugMessagesAttr,
+                    mlir::ArrayAttr::get(moduleOp.getContext(), messages));
+  return static_cast<int32_t>(messages.size() - 1);
+}
+
+static int32_t debugDtypeTag(mlir::Type t) {
+  if (t.isF32())
+    return 2;
+  if (t.isF16() || t.isBF16())
+    return 3;
+  if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(t))
+    return intTy.isUnsigned() ? 1 : 0;
+  return 4;
+}
+
+struct PrintLowering : public mlir::OpConversionPattern<mlir::triton::PrintOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::PrintOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto moduleOp = op->getParentOfType<mlir::ModuleOp>();
+    if (!moduleOp)
+      return rewriter.notifyMatchFailure(op, "print: no module");
+    for (auto [value, original] :
+         llvm::zip(adaptor.getArgs(), op.getArgs())) {
+      if (mlir::isa<mlir::RankedTensorType>(value.getType()))
+        return rewriter.notifyMatchFailure(op, "print: operand not scalarized");
+      // A tile smaller than the threadgroup leaves the surplus lanes holding
+      // nothing, and printing those would bury the real lines in garbage. Same
+      // guard the store of such a tile carries.
+      mlir::Value inTile;
+      mlir::Value lane;
+      if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(original.getType()))
+        if (std::optional<TileInfo> tile = tileFromTensor(rtt)) {
+          lane = emitLocalTid(rewriter, op.getLoc(), tile->threadsPerBlock);
+          int64_t numElements = 1;
+          for (auto dim : tile->shape)
+            numElements *= dim;
+          if (tile->elemPerThread <= 1 &&
+              numElements < tile->threadsPerBlock) {
+            auto cNum = mlir::arith::ConstantOp::create(
+                rewriter, op.getLoc(),
+                rewriter.getI32IntegerAttr(static_cast<int32_t>(numElements)));
+            inTile = mlir::arith::CmpIOp::create(
+                         rewriter, op.getLoc(),
+                         mlir::arith::CmpIPredicate::slt,
+                         emitLocalTid(rewriter, op.getLoc(),
+                                      tile->threadsPerBlock),
+                         cNum.getResult())
+                         .getResult();
+          }
+        }
+      // Triton's prefix already ends in its own separator (`"v: "`), so the
+      // host must not add a second one.
+      std::string label = op.getPrefix().str();
+      while (!label.empty() && (label.back() == ' ' || label.back() == ':'))
+        label.pop_back();
+      if (op.getArgs().size() > 1) {
+        // Several values under one prefix: number them so the host output can
+        // be read back to the call.
+        size_t index = 0;
+        for (mlir::Value arg : op.getArgs()) {
+          if (arg == original)
+            break;
+          ++index;
+        }
+        label += " [" + std::to_string(index) + "]";
+      }
+      // The buffer ops reject signless integers, so the payload rides in its
+      // storage type; the tag records what the bits mean so the host reads
+      // them back the way the kernel meant them.
+      const int32_t tag = debugDtypeTag(value.getType());
+      mlir::Type stageTy = metalStorageElementType(value.getType());
+      mlir::Value staged = value;
+      if (staged.getType() != stageTy)
+        staged = mlir::UnrealizedConversionCastOp::create(
+                     rewriter, op.getLoc(), mlir::TypeRange{stageTy},
+                     mlir::ValueRange{staged})
+                     .getResult(0);
+      DebugRecordOp::create(
+          rewriter, op.getLoc(), rewriter.getI32IntegerAttr(0),
+          rewriter.getI32IntegerAttr(internDebugMessage(moduleOp, label)),
+          rewriter.getI32IntegerAttr(tag), staged, inTile, lane);
+    }
+    if (op.getArgs().empty())
+      DebugRecordOp::create(
+          rewriter, op.getLoc(), rewriter.getI32IntegerAttr(0),
+          rewriter.getI32IntegerAttr(
+              internDebugMessage(moduleOp, op.getPrefix().str())),
+          rewriter.getI32IntegerAttr(4), mlir::Value(), mlir::Value(),
+          mlir::Value());
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+struct AssertLowering
+    : public mlir::OpConversionPattern<mlir::triton::AssertOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::AssertOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto moduleOp = op->getParentOfType<mlir::ModuleOp>();
+    if (!moduleOp)
+      return rewriter.notifyMatchFailure(op, "assert: no module");
+    mlir::Value cond = adaptor.getCondition();
+    if (mlir::isa<mlir::RankedTensorType>(cond.getType()) ||
+        !cond.getType().isInteger(1))
+      return rewriter.notifyMatchFailure(op, "assert: condition not a scalar i1");
+    // Record when the condition is FALSE.
+    auto trueAttr = mlir::arith::ConstantOp::create(
+        rewriter, op.getLoc(), rewriter.getBoolAttr(true));
+    mlir::Value failed = mlir::arith::XOrIOp::create(rewriter, op.getLoc(), cond,
+                                                     trueAttr.getResult())
+                             .getResult();
+    // A tile smaller than the threadgroup leaves the surplus lanes holding
+    // nothing, and their condition is whatever that garbage compares to — so
+    // without this guard every such kernel reports an assertion failure.
+    mlir::Value lane;
+    if (auto rtt =
+            mlir::dyn_cast<mlir::RankedTensorType>(op.getCondition().getType()))
+      if (std::optional<TileInfo> tile = tileFromTensor(rtt)) {
+        lane = emitLocalTid(rewriter, op.getLoc(), tile->threadsPerBlock);
+        int64_t numElements = 1;
+        for (auto dim : tile->shape)
+          numElements *= dim;
+        if (tile->elemPerThread <= 1 && numElements < tile->threadsPerBlock) {
+          auto cNum = mlir::arith::ConstantOp::create(
+              rewriter, op.getLoc(),
+              rewriter.getI32IntegerAttr(static_cast<int32_t>(numElements)));
+          mlir::Value inTile =
+              mlir::arith::CmpIOp::create(rewriter, op.getLoc(),
+                                          mlir::arith::CmpIPredicate::slt, lane,
+                                          cNum.getResult())
+                  .getResult();
+          failed = mlir::arith::AndIOp::create(rewriter, op.getLoc(), failed,
+                                               inTile)
+                       .getResult();
+        }
+      }
+    DebugRecordOp::create(
+        rewriter, op.getLoc(), rewriter.getI32IntegerAttr(1),
+        rewriter.getI32IntegerAttr(
+            internDebugMessage(moduleOp, op.getMessage().str())),
+        rewriter.getI32IntegerAttr(4), mlir::Value(), failed, lane);
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
 
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
@@ -24661,6 +24842,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
                  JoinLowering, SplitLowering, CatLowering,
+                 PrintLowering, AssertLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
                  HistogramLowering,

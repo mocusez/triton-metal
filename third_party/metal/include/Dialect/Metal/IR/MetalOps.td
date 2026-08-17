@@ -210,6 +210,43 @@ def TgLoadIndexedOp : Metal_Op<"tg_load_indexed", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// DebugRecordOp
+//===----------------------------------------------------------------------===//
+
+def DebugRecordOp : Metal_Op<"debug_record", [AttrSizedOperandSegments]> {
+  let summary = "Append one record to the kernel's host-readable debug buffer.";
+  let description = [{
+    What `tl.device_print` and `tl.device_assert` lower to. MSL has no printf
+    and no host-visible assert channel, so the kernel writes fixed-size records
+    into a trailing `device uint32_t*` buffer the launcher binds, and the host
+    formats them after the dispatch completes.
+
+    `kind` is 0 for a print and 1 for an assert; `msg_id` indexes the module's
+    `metal.debug_messages` table, which the launcher receives alongside the MSL
+    text. `pred`, when present, gates the record — an assert records only when
+    its condition is FALSE. `value` is the scalar being printed; `dtype_tag`
+    tells the host how to read its bits back (0 = i32, 1 = u32, 2 = f32,
+    3 = f16, 4 = other).
+
+    The record slot comes from an atomic increment of word 0, so a full buffer
+    drops records rather than overwriting: the host reports the count it saw
+    against the cap.
+  }];
+
+  let arguments = (ins I32Attr:$kind, I32Attr:$msg_id, I32Attr:$dtype_tag,
+                       Optional<Metal_Type>:$value, Optional<I1>:$pred,
+                       Optional<I32>:$lane);
+
+  // Each optional operand gets its own keyword and no leading comma: with a
+  // shared separator the parser commits to the first optional group and then
+  // reports "expected 'if'" on a record that only carries a lane.
+  let assemblyFormat = [{
+    `kind` `=` $kind `,` `msg` `=` $msg_id (`value` $value^ `:` type($value))?
+    (`if` $pred^)? (`lane` $lane^)? attr-dict
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // StoreOp
 //===----------------------------------------------------------------------===//
 

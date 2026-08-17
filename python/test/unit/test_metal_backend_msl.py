@@ -690,7 +690,13 @@ _UNSUPPORTED_SNIPPETS = {
         "                tl.load(x_ptr + tl.arange(0, 64)))\n"
         "    tl.store(o_ptr + tl.arange(0, 64)[:, None] * 2\n"
         "             + tl.arange(0, 2)[None, :], j)"),
-    "device_print": "tl.device_print('v', v)\n    tl.store(o_ptr + i, v)",
+    # `tl.device_print` is implemented now (it writes into the launcher's debug
+    # buffer); inline asm never will be, since its payload is PTX.
+    "inline_asm": (
+        "v = tl.inline_asm_elementwise('mov $0, $1;', '=r,r', [v],\n"
+        "                                  dtype=tl.float32, is_pure=True,"
+        " pack=1)\n"
+        "    tl.store(o_ptr + i, v)"),
 }
 _UNSUPPORTED_NUM_WARPS = {"join_out_of_envelope": 1}
 
@@ -987,6 +993,81 @@ def test_rank3_xor_reduce_is_bit_exact():
     for m in range(M):
         ref ^= x[:, m, :]
     assert torch.equal(out.cpu(), ref)
+
+
+# --- tl.device_print / tl.device_assert -------------------------------------
+#
+# MSL has neither printf nor a host-visible assert channel, so both were
+# rejected — leaving no way to look inside a running kernel. They now write
+# fixed-size records into a trailing buffer the launcher binds, and the host
+# formats them after the dispatch: word 0 is an atomically incremented count,
+# then six words per record, with only the message INDEX crossing to the device.
+#
+# The lane recorded is the threadgroup-LOCAL one, and a tile smaller than the
+# threadgroup guards its surplus lanes — without that guard an assert fired for
+# every lane past the tile, on garbage those lanes never loaded.
+
+
+@triton.jit
+def _device_print_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    pid = tl.program_id(0)
+    i = tl.arange(0, N)
+    v = tl.load(x_ptr + pid * N + i)
+    tl.device_print("v", v)
+    tl.store(o_ptr + pid * N + i, v)
+
+
+@triton.jit
+def _device_assert_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    v = tl.load(x_ptr + i)
+    tl.device_assert(v >= 0.0, "must be non-negative")
+    tl.store(o_ptr + i, v)
+
+
+def test_device_print_emits_one_record_per_element(capfd):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 8
+    x = torch.arange(2 * N, dtype=torch.float32, device="mps")
+    out = torch.zeros(2 * N, dtype=torch.float32, device="mps")
+    _device_print_kernel[(2,)](x, out, N)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.cpu())
+    lines = [l for l in capfd.readouterr().err.splitlines() if l.startswith("pid (")]
+    # One line per element of each program's tile, and no lines for the lanes
+    # past it.
+    assert len(lines) == 2 * N, lines[:4]
+    assert "v: 0.0" in lines[0]
+    # Sorted by (program, lane), so the log is stable run to run.
+    assert lines[0].startswith("pid (0, 0, 0) idx (0)")
+    assert lines[N].startswith("pid (1, 0, 0) idx (0)")
+
+
+@pytest.mark.parametrize("N", [16, 32])
+def test_device_assert_stays_quiet_when_it_holds(N):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    # N == 32 is a FULL tile at num_warps=1, so the predicate is unguarded —
+    # which is where a `cond ^ true` that always evaluated true showed up.
+    x = torch.rand(N, dtype=torch.float32, device="mps")
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _device_assert_kernel[(1,)](x, out, N, num_warps=1, debug=True)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.cpu())
+
+
+def test_device_assert_raises_with_its_message():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = -torch.rand(16, dtype=torch.float32, device="mps") - 1.0
+    out = torch.zeros(16, dtype=torch.float32, device="mps")
+    with pytest.raises(RuntimeError, match="must be non-negative"):
+        _device_assert_kernel[(1,)](x, out, 16, debug=True)
+        torch.mps.synchronize()
 
 
 # --- tt.call: @triton.jit(noinline=True) ------------------------------------
