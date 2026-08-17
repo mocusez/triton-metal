@@ -37,3 +37,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// A per-lane `other` is the one shape MaskedLoadLowering cannot yield on its
+// masked-off branch, and its decline used to happen inside
+// `applyFullConversion` -- whose rollback leaves the module unverifiable
+// ("entry block must have N arguments to match function signature", since
+// FuncOpLowering already rewrote the signature) and kills the process on the
+// way out. Rejecting it up front is what keeps the error catchable.
+//
+// The pre-pass shares `maskedLoadOtherIsUniform` with the pattern itself, so
+// the two cannot drift into rejecting different sets.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @per_lane_other_tensor(%x_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f32>) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %offs : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %mask = arith.constant dense<true> : tensor<128xi1, #blocked>
+    // `other` varies per lane: it is the range itself, not a uniform value.
+    %other = arith.sitofp %offs : tensor<128xi32, #blocked> to tensor<128xf32, #blocked>
+    // expected-error @+1 {{a masked tt.load's `other` must be uniform across lanes}}
+    %v = tt.load %ap, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    %osp = tt.splat %o_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %oap = tt.addptr %osp, %offs : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oap, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+// A select is uniform only when its CONDITION is scalar. A tensor condition
+// picks a different arm per lane, so it stays out even though both arms are
+// splat constants.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @per_lane_other_select(%x_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f32>) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %offs : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %mask = arith.constant dense<true> : tensor<128xi1, #blocked>
+    %lo = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %hi = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %half = arith.constant dense<64> : tensor<128xi32, #blocked>
+    %cond = arith.cmpi slt, %offs, %half : tensor<128xi32, #blocked>
+    %other = arith.select %cond, %lo, %hi : tensor<128xi1, #blocked>, tensor<128xf32, #blocked>
+    // expected-error @+1 {{a masked tt.load's `other` must be uniform across lanes}}
+    %v = tt.load %ap, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    %osp = tt.splat %o_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %oap = tt.addptr %osp, %offs : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oap, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}

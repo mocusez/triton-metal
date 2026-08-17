@@ -66,12 +66,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // -----
 // A two-source reducer that is close to argmax but selects the HIGHER index on
 // ties must not be claimed by the canonical argmax lowering.
+//
+// It is now refused one gate earlier, as a multi-value reduce, rather than by
+// the single-result combine allowlist noticing `arith.cmpf`. Same verdict, and
+// the reason is the accurate one: the shape has two sources, which is what the
+// lowering cannot do. The allowlist only ever caught this by accident -- see
+// the `maxnumf` pair at the end of this file, whose first region op IS on the
+// allowlist and which therefore crashed the process instead.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_argmax_near_miss(%x_ptr: !tt.ptr<f32>) {
     %x = arith.constant dense<1.0> : tensor<32xf32, #blocked>
     %idx = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
-    // expected-error @+1 {{reduce combine requires Session L3c (future) — got arith.cmpf}}
+    // expected-error @+1 {{multi-value tt.reduce is implemented only for the canonical rank-1 argmax and rank-2 axis=1 argmin pairs}}
     %r:2 = "tt.reduce"(%x, %idx) ({
     ^bb0(%lhs_value: f32, %lhs_index: i32, %rhs_value: f32, %rhs_index: i32):
       %equal = arith.cmpf oeq, %lhs_value, %rhs_value : f32
@@ -245,6 +252,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %product = arith.mulf %a, %b : f32
       tt.reduce.return %product : f32
     }) {axis = 1 : i32} : (tensor<16x32xf32, #blocked>) -> tensor<16xf32, #slice1>
+    tt.return
+  }
+}
+
+// -----
+// A multi-value `tl.reduce((a, b), axis, combine)` that is neither of the two
+// canonical paired forms (rank-1 argmax, rank-2 axis=1 argmin) has no lowering:
+// `ReduceLowering::matchAndRewrite` bails on `op.getSrcs().size() != 1`.
+//
+// That decline used to happen INSIDE `applyFullConversion`, which SIGSEGVs the
+// process during the failed conversion's rollback. The shape below is the one
+// that reached it: a tuple combine whose FIRST region op is `arith.maxnumf`
+// looks exactly like a supported single-value max reduce to the combine
+// allowlist, so it sailed past every earlier gate. The same reduce written with
+// `tl.where` was rejected all along, by accident, because `arith.cmpf` is not
+// an admitted combine -- i.e. the crashing shape was precisely the one that
+// looked supported.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_tuple_maxnum_pair(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %y = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{multi-value tt.reduce is implemented only for the canonical rank-1 argmax and rank-2 axis=1 argmin pairs}}
+    %r:2 = "tt.reduce"(%x, %y) ({
+    ^bb0(%a1: f32, %b1: f32, %a2: f32, %b2: f32):
+      %m1 = arith.maxnumf %a1, %a2 : f32
+      %m2 = arith.maxnumf %b1, %b2 : f32
+      tt.reduce.return %m1, %m2 : f32, f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (f32, f32)
     tt.return
   }
 }

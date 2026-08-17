@@ -16,6 +16,34 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // A pointer loaded out of memory and dereferenced -- `p = tl.load(pp)` then
+  // `tl.load(p.to(tl.pointer_type(tl.float32)) + i)`. This one reached the
+  // conversion because the scalar i64 load it starts with is supported; only
+  // the cast has no pattern.
+  tt.func public @reject_int_to_ptr(%pp: !tt.ptr<i64>) {
+    %p = tt.load %pp : !tt.ptr<i64>
+    // expected-error @+1 {{casting an integer to a pointer is not supported}}
+    %q = tt.int_to_ptr %p : i64 -> !tt.ptr<f32>
+    %v = tt.load %q : !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_ptr_to_int(%x: !tt.ptr<f32>, %o: !tt.ptr<i64>) {
+    // expected-error @+1 {{casting a pointer to an integer is not supported}}
+    %n = tt.ptr_to_int %x : !tt.ptr<f32> -> i64
+    tt.store %o, %n : !tt.ptr<i64>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reject_join(%x: !tt.ptr<f32>) {
     %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
     // expected-error @+1 {{tt.join is implemented for a rank-1 pair joined into an [N, 2] tile of at most one element per thread}}

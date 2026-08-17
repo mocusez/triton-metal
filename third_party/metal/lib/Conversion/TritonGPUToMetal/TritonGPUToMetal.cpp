@@ -11032,6 +11032,37 @@ extractSplatConstantAttr(mlir::Value other) {
   return std::nullopt;
 }
 
+// Can the masked-load path yield this `other` on the masked-off branch?
+//
+// ONE definition, used by both `MaskedLoadLowering` (below) and the pre-pass
+// rejection in `runOnOperation`. They must not be able to disagree: a pre-pass
+// that rejects MORE than the pattern declines turns working kernels into
+// errors, and one that rejects LESS lets the decline happen inside
+// `applyFullConversion`, which corrupts the rollback and kills the process.
+// Sharing the predicate is what makes that drift impossible.
+static bool maskedLoadOtherIsUniform(mlir::Value other) {
+  if (!other)
+    return true; // no `other` at all — the masked-off branch yields zero
+  if (extractSplatConstantAttr(other))
+    return true; // splat constant
+  if (other.getDefiningOp<mlir::triton::SplatOp>())
+    return true; // runtime-uniform splat of a scalar
+  // `arith.select` with a SCALAR condition is uniform by construction: the
+  // condition cannot vary per lane, so every lane takes the same arm and the
+  // whole select scalarizes through `ArithSelectLowering`. This is the shape a
+  // host-side TMA descriptor lowers to — its padding mode picks between a NaN
+  // splat and a zero splat on a uniform i1 kernel argument — so accepting it
+  // is what lets `TensorDescriptor.load` work at all. A TENSOR condition is
+  // genuinely per-lane and stays out.
+  if (auto sel = other.getDefiningOp<mlir::arith::SelectOp>()) {
+    if (mlir::isa<mlir::RankedTensorType>(sel.getCondition().getType()))
+      return false;
+    return maskedLoadOtherIsUniform(sel.getTrueValue()) &&
+           maskedLoadOtherIsUniform(sel.getFalseValue());
+  }
+  return false;
+}
+
 struct MaskedLoadLowering
     : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -11048,7 +11079,7 @@ struct MaskedLoadLowering
     if (op.getOther()) {
       otherSplatAttr = extractSplatConstantAttr(op.getOther());
       if (!otherSplatAttr) {
-        if (!op.getOther().getDefiningOp<mlir::triton::SplatOp>())
+        if (!maskedLoadOtherIsUniform(op.getOther()))
           return rewriter.notifyMatchFailure(
               op, "tt.load dynamic `other` requires a uniform tt.splat");
         dynamicOther = adaptor.getOther();
@@ -23433,6 +23464,25 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
           if (!other.isF32() && !other.isF16() && !other.isBF16())
             reject(o, "fp8 conversion is implemented against f32, f16 or bf16");
         })
+        // Casting between an integer and a pointer has no lowering, and cannot
+        // have a useful one on this backend: a Metal kernel reaches memory only
+        // through the `device T*` arguments it was bound, so a pointer
+        // synthesized from an integer names an address no buffer binding
+        // covers. `tl.load(p.to(tl.pointer_type(tl.float32)))` — an
+        // indirection through a pointer stored in a tensor — is the shape that
+        // gets here, and it needs a real buffer-table indirection, not a cast.
+        .Case<mlir::triton::IntToPtrOp>([&](auto o) {
+          reject(o, "casting an integer to a pointer is not supported — a "
+                    "Metal kernel can only address the buffers bound as its "
+                    "arguments, so a pointer loaded from memory cannot be "
+                    "dereferenced; pass the target buffer as its own kernel "
+                    "argument instead");
+        })
+        .Case<mlir::triton::PtrToIntOp>([&](auto o) {
+          reject(o, "casting a pointer to an integer is not supported — a "
+                    "Metal buffer argument has no numeric device address to "
+                    "expose");
+        })
         .Default([](mlir::Operation *) {});
   });
   // tt.gather is implemented for the rank-1 axis-0 shape (GatherLowering);
@@ -24166,6 +24216,33 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    // A per-lane `other` is the one shape `MaskedLoadLowering` cannot yield on
+    // its masked-off branch. Its decline is a `notifyMatchFailure` INSIDE
+    // `applyFullConversion`, and this backend does not survive that: the failed
+    // conversion's rollback leaves the module unverifiable ("entry block must
+    // have N arguments to match function signature", because FuncOpLowering
+    // already rewrote the signature) and the process dies on the way out —
+    // SIGTRAP, SIGBUS or SIGSEGV, intermittently, so a retry can even look
+    // fine. Reject it here instead, sharing the pattern's own predicate so the
+    // two can never disagree about which shapes are supported.
+    bool otherUniformOk = true;
+    moduleOp.walk([&](mlir::triton::LoadOp load) {
+      if (!load.getMask() || !load.getOther())
+        return;
+      if (maskedLoadOtherIsUniform(load.getOther()))
+        return;
+      load.emitOpError(
+          "Metal backend: a masked tt.load's `other` must be uniform across "
+          "lanes — a splat constant, a tt.splat of a scalar, or a select "
+          "between those on a scalar condition; a per-lane `other` tensor "
+          "needs a per-lane blend the masked-load path does not emit");
+      otherUniformOk = false;
+    });
+    if (!otherUniformOk) {
+      signalPassFailure();
+      return;
+    }
+
     // Drop `tl.assume` hints (+ their now-dead predicate cones) before anything
     // walks the body: they are result-less LLVM-dialect ops the conversion has
     // no pattern for, and every structural matcher below is happier not seeing
@@ -24377,6 +24454,32 @@ struct ConvertTritonGPUToMetalPass
               "rank-2 axis=1 argmin requires blocked 0 < M <= tpb and N > 0");
           reduceOk = false;
         }
+        return;
+      }
+      // Everything below this line classifies a SINGLE-result reduce by its
+      // combine op. A multi-value `tl.reduce((a, b), axis, combine)` that is
+      // neither canonical form above reaches
+      // `ReduceLowering::matchAndRewrite`'s third line,
+      // `if (op.getSrcs().size() != 1) return mlir::failure();` — an
+      // in-conversion decline, which on this backend SEGFAULTS during the
+      // failed conversion's rollback instead of raising. Mirror that one line
+      // here, and nowhere wider: the two canonical paired reductions have
+      // already returned, and every rank>=3 form was answered by
+      // `planRankNReduce` (which itself requires srcs==1 && results==1).
+      //
+      // The kill was reachable only when the combine's FIRST op happened to be
+      // on the allowlist below — `tl.maximum` on a tuple looked exactly like a
+      // supported `arith.maxnumf` reduce and sailed through. A tuple argmax
+      // written with `tl.where` was rejected all along, by accident, because
+      // `arith.cmpf` is not an admitted combine. That is why this gap survived:
+      // the shape that crashes is the one that looks supported.
+      if (red.getSrcs().size() != 1) {
+        red.emitOpError(
+            "multi-value tt.reduce is implemented only for the canonical "
+            "rank-1 argmax and rank-2 axis=1 argmin pairs; a general "
+            "tuple combine requires a lockstep multi-accumulator reduce")
+            << " (got " << red.getSrcs().size() << " operands)";
+        reduceOk = false;
         return;
       }
       // Rank-2 axis=1 ships via the rank-2 ReduceLowering body. Rank-2 axis=0

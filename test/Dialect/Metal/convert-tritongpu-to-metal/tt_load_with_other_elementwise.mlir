@@ -45,6 +45,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %o_addr, %x_val : tensor<128x!tt.ptr<i32>, #blocked>
     tt.return
   }
+
+  // `other` as an `arith.select` between two splat constants on a SCALAR
+  // condition. This is uniform by construction -- the condition cannot vary
+  // per lane, so every lane takes the same arm -- but it is not spelled as a
+  // `tt.splat`, and the masked path used to accept only the literal splat
+  // shapes and decline this one.
+  //
+  // The declining mattered: a `notifyMatchFailure` inside
+  // `applyFullConversion` leaves the module unverifiable on this backend
+  // ("entry block must have N arguments to match function signature",
+  // FuncOpLowering having already rewritten it) and the process dies rather
+  // than raising.
+  //
+  // The shape is written by hand because the Python frontend cannot produce
+  // it: Triton's canonicalizer sinks a scalar-condition select BELOW the
+  // splat, so `tl.where(uniform, a, b)` always arrives as a `tt.splat`. The
+  // tensor-armed form is generated later, by the host-side TMA descriptor
+  // lowering, whose padding mode selects between a NaN splat and a zero splat
+  // on a uniform i1 kernel argument -- which is why `TensorDescriptor.load`
+  // could not compile before.
+  tt.func public @load_with_uniform_select_other(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %pad: i1) {
+    %c100_i32 = arith.constant 100 : i32
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %n_splat = tt.splat %c100_i32 : i32 -> tensor<128xi32, #blocked>
+    %mask = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %nan = arith.constant dense<0x7FC00000> : tensor<128xf32, #blocked>
+    %zero = arith.constant dense<0.000000e+00> : tensor<128xf32, #blocked>
+    %other = arith.select %pad, %nan, %zero : tensor<128xf32, #blocked>
+    %v = tt.load %x_addr, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    %o_splat = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %o_addr = tt.addptr %o_splat, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %o_addr, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 }
 
 // The masked load lowers to an scf.if whose then-branch yields the loaded
@@ -67,5 +103,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: 5.000000e-01
 
 // MSL-LABEL: kernel void load_with_dynamic_other_i32
+// MSL: if (
+// MSL: else
+
+// The select survives as a SCALAR select feeding the scf.if's else branch:
+// the whole thing scalarizes, one arm per lane-independent constant.
+// CHECK-LABEL: metal.kernel load_with_uniform_select_other
+// CHECK: arith.select
+// CHECK: scf.if
+
+// MSL-LABEL: kernel void load_with_uniform_select_other
 // MSL: if (
 // MSL: else
