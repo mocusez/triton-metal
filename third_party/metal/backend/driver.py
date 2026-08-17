@@ -12,7 +12,7 @@ import os
 import platform
 
 from triton.backends.compiler import GPUTarget
-from triton.backends.driver import DriverBase
+from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
 
 
 @functools.lru_cache(maxsize=1)
@@ -345,6 +345,25 @@ class MetalLauncher:
         self._arg_types = [
             sig[n] for n, keep in zip(fn_arg_names, self._arg_mask) if keep
         ]
+        # A host-side `TensorDescriptor` is ONE entry in the signature and SEVEN
+        # kernel parameters. The frontend flattens it to
+        # `base, *shape, *strides, padding=="nan", round_f32_to_tf32, *shape,
+        # *strides` (shape and strides appear twice: once as the i64 pair the
+        # descriptor carries, once as the i32/i64 pair that survives descriptor
+        # lowering), and the MSL signature has a slot for each. Passing the
+        # descriptor object through as a single argument is what MPS rejected
+        # with a bare "Unsupported argument type".
+        #
+        # `expand_signature` / `decompose_descriptor` are Triton's own, shared
+        # with the NVIDIA launcher, so the two sides cannot drift on the order.
+        # `tensordesc_meta` is None here on purpose: Metal has no hardware
+        # descriptor object, so the decomposed form IS the calling convention.
+        self._has_tensordesc = any(
+            isinstance(t, str) and t.startswith("tensordesc")
+            for t in self._arg_types
+        )
+        if self._has_tensordesc:
+            self._arg_types = expand_signature(self._arg_types, None, "")
         # num_warps × warp_size = threadgroup x-dim. Default to 4×32=128.
         # `threads_per_group`, when the compiler set it, overrides that: a
         # kernel that lowers to a single `metal.fused_attention` runs its whole
@@ -380,6 +399,14 @@ class MetalLauncher:
         group_size = (gx, gy, gz)
 
         filtered_args = [a for a, keep in zip(args, self._arg_mask) if keep]
+        if self._has_tensordesc:
+            expanded = []
+            for a in filtered_args:
+                if type(a).__name__ == "TensorDescriptor":
+                    expanded.extend(decompose_descriptor(a))
+                else:
+                    expanded.append(a)
+            filtered_args = expanded
         call_args = []
         writeback = []  # (orig, device_tensor) for non-MPS / non-contiguous inputs
         for arg, ty in zip(filtered_args, self._arg_types):
@@ -392,14 +419,23 @@ class MetalLauncher:
                 call_args.append(dev_t)
                 if dev_t is not t:
                     writeback.append((t, dev_t))
-            elif ty == "u64":
+            elif ty in ("u64", "i64", "i1"):
                 # compile_shader cannot bind a Python int directly to the
                 # device uint64_t[1] slot emitted for scalar Triton arguments.
                 # Materialize that one slot as an MPS tensor; the compiled
                 # kernel still sees the same by-value scalar at vN[0].
+                #
+                # i64 and i1 join u64 because a host-side `TensorDescriptor`
+                # decomposes into exactly those: its shape and strides arrive as
+                # i64 and its `padding == "nan"` / `round_f32_to_tf32` flags as
+                # i1, which the emitter gives `device uint64_t*` and
+                # `device bool*` slots. 64-bit shape/stride values are
+                # non-negative by the descriptor's own invariants, so the
+                # unsigned storage the emitter picked loses nothing.
                 import torch
+                dtype = (torch.bool if ty == "i1" else torch.uint64)
                 call_args.append(
-                    torch.tensor([arg], dtype=torch.uint64, device="mps")
+                    torch.tensor([arg], dtype=dtype, device="mps")
                 )
             else:
                 call_args.append(arg)
