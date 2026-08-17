@@ -678,3 +678,82 @@ def test_atomic_add_scalar_old_value_reaches_every_lane():
     # ...and one distinct ticket per program. Which program drew which is up to
     # the hardware's serialization and is not part of the contract.
     assert sorted(tickets[:, 0].tolist()) == list(range(G))
+
+
+# --- f16 atomic add ---------------------------------------------------------
+#
+# MSL has no atomic half, so `tl.atomic_add` on an f16 buffer was rejected. It
+# is emulated with a compare-exchange loop over the 32-bit word that CONTAINS
+# the element: read the pair, add into this element's lane, swap the pair back,
+# retry if another thread got there first. The word is 4-byte aligned because
+# the buffer base is and the index is masked down to an even element.
+#
+# bf16 is deliberately still refused. The identical helper works on its own, but
+# putting that loop inside another loop — which is what a BLOCK > tpb tile does
+# — makes Apple's shader compiler service die with
+# XPC_ERROR_CONNECTION_INTERRUPTED while building the pipeline state.
+# Reproducible in raw MSL with no Triton involved, and only for bfloat.
+
+
+@triton.jit
+def _atomic_add_f16_rows(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets, tl.load(In + offsets))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("BLOCK", [8, 64, 256])
+def test_atomic_add_f16_accumulates_across_programs(BLOCK, num_warps):
+    inp = torch.ones(BLOCK, dtype=torch.float16, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.float16, device="mps")
+    _atomic_add_f16_rows[(4,)](inp, out, BLOCK, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.full((BLOCK,), 4.0, dtype=torch.float16))
+
+
+@triton.jit
+def _atomic_add_f16_one_cell(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets * 0, tl.load(In + offsets))
+
+
+@pytest.mark.parametrize("BLOCK", [8, 64])
+def test_atomic_add_f16_contended_single_cell(BLOCK):
+    # Every lane hits the same half, so this only comes out right if the
+    # compare-exchange actually retries.
+    inp = torch.ones(BLOCK, dtype=torch.float16, device="mps")
+    out = torch.zeros(1, dtype=torch.float16, device="mps")
+    _atomic_add_f16_one_cell[(1,)](inp, out, BLOCK)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == float(BLOCK)
+
+
+@triton.jit
+def _atomic_add_f16_old(In, Out, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Old + offsets, tl.atomic_add(Out + offsets, tl.load(In + offsets)))
+
+
+def test_atomic_add_f16_returns_the_old_value():
+    BLOCK = 64
+    inp = torch.ones(BLOCK, dtype=torch.float16, device="mps")
+    out = torch.full((BLOCK,), 3.0, dtype=torch.float16, device="mps")
+    old = torch.zeros(BLOCK, dtype=torch.float16, device="mps")
+    _atomic_add_f16_old[(1,)](inp, out, old, BLOCK)
+    torch.mps.synchronize()
+    assert torch.equal(old.cpu(), torch.full((BLOCK,), 3.0, dtype=torch.float16))
+    assert torch.equal(out.cpu(), torch.full((BLOCK,), 4.0, dtype=torch.float16))
+
+
+@triton.jit
+def _atomic_add_bf16_rows(In, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets, tl.load(In + offsets))
+
+
+def test_atomic_add_bf16_is_rejected_with_a_reason(capfd):
+    inp = torch.ones(64, dtype=torch.bfloat16, device="mps")
+    out = torch.zeros(64, dtype=torch.bfloat16, device="mps")
+    with pytest.raises(Exception):
+        _atomic_add_bf16_rows[(1,)](inp, out, 64)
+    assert "bf16 atomic add is unsupported" in capfd.readouterr().err

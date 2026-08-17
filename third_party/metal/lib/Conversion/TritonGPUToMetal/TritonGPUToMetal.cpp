@@ -11626,8 +11626,15 @@ struct AtomicRmwLowering
       };
 
       if (isFAdd) {
-        if (!value.getType().isF32() || !memTy.isF32()) {
-          payloadError = "atomic_rmw: fadd requires f32 value and storage";
+        // Half has no atomic instruction; the emitter expands it into a
+        // compare-exchange loop over the containing 32-bit word. bf16 is
+        // deliberately NOT admitted — see the pre-pass for the Apple compiler
+        // bug that rules it out.
+        const bool halfPair = value.getType().isF16() && memTy.isF16();
+        if (!(value.getType().isF32() && memTy.isF32()) && !halfPair) {
+          payloadError =
+              "atomic_rmw: fadd requires an f32 or f16 value and matching "
+              "storage";
           return std::nullopt;
         }
         return AtomicPayload{value, AtomicRmwKind::Add};
@@ -11794,11 +11801,15 @@ struct AtomicRmwLowering
         {
           mlir::OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
+          // Any float element type, not just f32: a masked-off lane's old
+          // value is unspecified by Triton's contract, but it still has to be
+          // type-correct, and half atomics reach here now.
           mlir::TypedAttr zeroAttr =
-              resTy.isF32() ? mlir::cast<mlir::TypedAttr>(
-                                  rewriter.getFloatAttr(resTy, 0.0))
-                            : mlir::cast<mlir::TypedAttr>(
-                                  rewriter.getIntegerAttr(resTy, 0));
+              mlir::isa<mlir::FloatType>(resTy)
+                  ? mlir::cast<mlir::TypedAttr>(
+                        rewriter.getFloatAttr(resTy, 0.0))
+                  : mlir::cast<mlir::TypedAttr>(
+                        rewriter.getIntegerAttr(resTy, 0));
           mlir::Value zero =
               ConstantOp::create(rewriter, loc, resTy, zeroAttr).getResult();
           mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{zero});
@@ -23065,8 +23076,22 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
     auto valueInt = mlir::dyn_cast<mlir::IntegerType>(valueType);
 
     if (isFAdd) {
-      if (!valueType.isF32() || !storageType.isF32())
-        reject("atomic fadd requires f32 value and storage");
+      // f16 is emulated with a compare-exchange loop over the containing
+      // 32-bit word. bf16 would be the same code, and the helper does work on
+      // its own — but placing that loop inside ANOTHER loop, which is what a
+      // BLOCK > tpb tile does, makes Apple's shader compiler service die with
+      // XPC_ERROR_CONNECTION_INTERRUPTED while building the pipeline state.
+      // Reproducible in raw MSL with no Triton involved, and only for bfloat;
+      // the identical half kernel builds. So bf16 atomics are refused here
+      // rather than shipped to fail at load time in shapes we cannot predict.
+      if (valueType.isBF16()) {
+        reject("bf16 atomic add is unsupported: Apple's shader compiler fails "
+               "to build the compare-exchange loop it needs (use f16 or f32)");
+        return;
+      }
+      const bool halfPair = valueType.isF16() && storageType.isF16();
+      if (!(valueType.isF32() && storageType.isF32()) && !halfPair)
+        reject("atomic fadd requires an f32 or f16 value with matching storage");
       return;
     }
     if (isIntAdd) {

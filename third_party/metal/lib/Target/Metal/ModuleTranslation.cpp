@@ -190,6 +190,46 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
                   "  return sign * y;\n"
                   "}\n\n";
       }
+      // MSL has no atomic half. `tl.atomic_add` on an f16/bf16 buffer becomes a
+      // compare-exchange loop over the 32-bit word that CONTAINS the element:
+      // load the pair, add into this element's lane, swap the pair back, retry
+      // if another thread got there first. The word is 4-byte aligned because
+      // the buffer base is and the index is masked to an even element.
+      bool hasHalfAtomic = false;
+      m.walk([&](mlir::triton::metal::AtomicRmwOp aop) {
+        if (aop.getKind() == mlir::triton::metal::AtomicRmwKind::Add &&
+            aop.getValue().getType().isF16()) {
+          hasHalfAtomic = true;
+          return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+      });
+      if (hasHalfAtomic) {
+        for (llvm::StringRef ty : {"half"}) {
+          output << "static inline " << ty << " __triton_atomic_add_"
+                 << (ty == "half" ? "half" : "bfloat") << "(device " << ty
+                 << "* base, uint idx, " << ty << " v) {\n"
+                    "  device atomic_uint* word = (device atomic_uint*)(base + "
+                    "(idx & ~1u));\n"
+                    "  uint lane = idx & 1u;\n"
+                    "  uint old = atomic_load_explicit(word, "
+                    "memory_order_relaxed);\n"
+                    "  uint desired;\n"
+                    "  "
+                 << ty << " prev;\n"
+                    "  do {\n"
+                    "    "
+                 << ty << "2 pair = as_type<" << ty << "2>(old);\n"
+                    "    prev = pair[lane];\n"
+                    "    pair[lane] = prev + v;\n"
+                    "    desired = as_type<uint>(pair);\n"
+                    "  } while (!atomic_compare_exchange_weak_explicit("
+                    "word, &old, desired, memory_order_relaxed, "
+                    "memory_order_relaxed));\n"
+                    "  return prev;\n"
+                    "}\n\n";
+        }
+      }
       emittedPreamble = true;
     }
     ModuleTranslation translator{module, output};
@@ -912,6 +952,28 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
   const bool resultUsed = !op.getResult().use_empty();
   auto valueInt = llvm::dyn_cast<mlir::IntegerType>(op.getValue().getType());
   const bool is64 = valueInt && valueInt.getWidth() == 64;
+
+  // Half add has no atomic instruction; it goes through the preamble's
+  // compare-exchange helper, which takes the BASE pointer and the element index
+  // (it has to mask the index down to the containing 32-bit word itself).
+  if (op.getKind() == mlir::triton::metal::AtomicRmwKind::Add &&
+      (op.getValue().getType().isF16() || op.getValue().getType().isBF16())) {
+    if (resultUsed) {
+      unsigned idx = _varCount++;
+      _buffers[op.getResult().getAsOpaquePointer()] = idx;
+      _output << typeToString(op.getResult().getType()) << " v" << idx << " = ";
+    }
+    _output << (op.getValue().getType().isF16() ? "__triton_atomic_add_half("
+                                                : "__triton_atomic_add_bfloat(");
+    translateVarName(op.getMemref());
+    _output << ", ";
+    translateValueOrVarName(op.getIndex());
+    _output << ", ";
+    translateValueOrVarName(op.getValue());
+    _output << ")";
+    printDelim();
+    return;
+  }
   const char *function = "atomic_fetch_add_explicit";
   llvm::StringRef atomicTy = "atomic_float";
   switch (op.getKind()) {

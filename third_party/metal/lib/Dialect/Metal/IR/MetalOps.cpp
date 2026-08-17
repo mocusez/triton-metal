@@ -554,10 +554,16 @@ llvm::LogicalResult AtomicRmwOp::verify() {
   case AtomicRmwKind::Add:
     if (valueType.isF32() && memType.isF32())
       break;
+    // Half add is emulated with a compare-exchange loop over the containing
+    // 32-bit word (see the emitter's preamble helper), so it takes the same op
+    // with a half value and half storage. bf16 is excluded: Apple's shader
+    // compiler cannot build that loop nested inside a tile loop.
+    if (valueType.isF16() && memType.isF16())
+      break;
     if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
         memInt.getWidth() != 32)
-      return emitOpError(
-          "add requires f32 storage/value or a 32-bit integer storage/value");
+      return emitOpError("add requires f32/f16 storage/value or a 32-bit "
+                         "integer storage/value");
     break;
   case AtomicRmwKind::Min:
   case AtomicRmwKind::Max:
