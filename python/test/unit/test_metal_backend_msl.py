@@ -989,6 +989,77 @@ def test_rank3_xor_reduce_is_bit_exact():
     assert torch.equal(out.cpu(), ref)
 
 
+# --- tt.call: @triton.jit(noinline=True) ------------------------------------
+#
+# `noinline` is a compile-time hint — it keeps Triton's own inliner off the
+# callee so the IR stays small — not a semantic requirement, and this backend
+# emits one MSL kernel per `tt.func` with no device-function surface. So the
+# call is inlined at the IR level instead of being rejected; the MSL compiler
+# inlines small functions anyway.
+#
+# The fixed point matters: a callee body can itself contain a call, and the copy
+# cloned into the caller carries it along, so one pass over the call list left
+# the nested case still holding a `tt.call`.
+
+
+@triton.jit(noinline=True)
+def _noinline_scale(v, k):
+    return v * k + 1.0
+
+
+@triton.jit(noinline=True)
+def _noinline_inner(v):
+    return v * 3.0
+
+
+@triton.jit(noinline=True)
+def _noinline_outer(v):
+    return _noinline_inner(v) + 1.0
+
+
+@triton.jit
+def _call_once_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    acc = tl.load(x_ptr + i)
+    tl.store(o_ptr + i, acc + _noinline_scale(tl.sum(acc, axis=0), 2.0))
+
+
+@triton.jit
+def _call_nested_kernel(x_ptr, o_ptr, N: tl.constexpr):
+    i = tl.arange(0, N)
+    acc = tl.load(x_ptr + i)
+    tl.store(o_ptr + i, acc + _noinline_outer(tl.sum(acc, axis=0)))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_noinline_call_is_inlined(num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(num_warps)
+    x = torch.rand(N, dtype=torch.float32)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _call_once_kernel[(1,)](x.to("mps"), out, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x + (x.sum() * 2.0 + 1.0)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+def test_noinline_call_of_a_noinline_callee():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N = 64
+    torch.manual_seed(9)
+    x = torch.rand(N, dtype=torch.float32)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _call_nested_kernel[(1,)](x.to("mps"), out, N)
+    torch.mps.synchronize()
+    expected = x + (x.sum() * 3.0 + 1.0)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
 # --- i16 and torch.bool tensors --------------------------------------------
 #
 # i16 had no Metal storage type (`Metal_Type` has ui16 but no signless i16), and

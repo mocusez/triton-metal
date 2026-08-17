@@ -23366,8 +23366,12 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                     "is PTX, which Metal cannot consume)");
         })
         .Case<mlir::triton::CallOp>([&](auto o) {
-          reject(o, "calls to non-inlined functions are not implemented; drop "
-                    "`noinline=True` so the callee is inlined");
+          // Whatever `preprocessInlineCalls` could inline is already gone; a
+          // call that survives has a callee it could not take (more than one
+          // block, or no body at all).
+          reject(o, "calls to non-inlined functions are implemented by inlining "
+                    "the callee, which needs a single-block body; this one has "
+                    "control flow the inliner cannot take");
         })
         .Case<mlir::triton::FpToFpOp>([&](auto o) {
           reject(o, "fp8 conversions are supported only as a fully consumed "
@@ -23675,6 +23679,67 @@ static void preprocessBoolPointerBitcasts(mlir::ModuleOp moduleOp) {
   }
 }
 
+// Inline `tt.call` to a `noinline` callee.
+//
+// `@triton.jit(noinline=True)` is a compile-time hint — it keeps Triton's own
+// inliner off the callee so the IR stays small — not a semantic requirement.
+// This backend emits one MSL kernel per `tt.func` and has no device-function
+// surface, so honouring the hint would mean building one; inlining the body
+// gives the same numerics, and the MSL compiler inlines small functions anyway.
+//
+// The frontend already refuses a noinline callee with tensor arguments
+// ("marked noinline, but was called with non-scalar argument"), so what reaches
+// here is scalar in and scalar out. Callees with more than one block are left
+// alone and named by the pre-pass rather than half-inlined.
+static void preprocessInlineCalls(mlir::ModuleOp moduleOp) {
+  llvm::SmallPtrSet<mlir::Operation *, 4> inlinedCallees;
+  // To a fixed point: a callee body can itself contain a call, and the copy
+  // this pass clones into the caller carries it along. Triton forbids
+  // recursion, so the depth is bounded by the call graph; the counter is a
+  // backstop, not the termination argument.
+  for (int round = 0; round < 16; ++round) {
+  bool changed = false;
+  llvm::SmallVector<mlir::triton::CallOp> calls;
+  moduleOp.walk([&](mlir::triton::CallOp call) { calls.push_back(call); });
+  for (mlir::triton::CallOp call : calls) {
+    auto callee = mlir::dyn_cast_or_null<mlir::triton::FuncOp>(
+        mlir::SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+    if (!callee || callee.getBody().empty() ||
+        !callee.getBody().hasOneBlock())
+      continue;
+    mlir::Block &body = callee.getBody().front();
+    auto ret = mlir::dyn_cast<mlir::triton::ReturnOp>(body.getTerminator());
+    if (!ret || ret.getNumOperands() != call.getNumResults())
+      continue;
+
+    mlir::IRMapping map;
+    for (auto [arg, operand] :
+         llvm::zip(body.getArguments(), call.getOperands()))
+      map.map(arg, operand);
+    mlir::OpBuilder builder(call);
+    for (mlir::Operation &op : body.without_terminator())
+      builder.clone(op, map);
+    llvm::SmallVector<mlir::Value, 4> results;
+    for (mlir::Value v : ret.getOperands())
+      results.push_back(map.lookupOrDefault(v));
+    call.getOperation()->replaceAllUsesWith(results);
+    call.erase();
+    inlinedCallees.insert(callee.getOperation());
+    changed = true;
+  }
+  if (!changed)
+    break;
+  }
+  // A private callee with no remaining callers would otherwise be converted as
+  // a kernel of its own.
+  for (mlir::Operation *op : inlinedCallees) {
+    auto callee = mlir::cast<mlir::triton::FuncOp>(op);
+    if (callee.isPrivate() && mlir::SymbolTable::symbolKnownUseEmpty(
+                                  callee, callee->getParentOp()))
+      callee.erase();
+  }
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -23683,6 +23748,7 @@ struct ConvertTritonGPUToMetalPass
     auto moduleOp = getOperation();
     auto *ctx = &getContext();
 
+    preprocessInlineCalls(moduleOp);
     preprocessBoolPointerBitcasts(moduleOp);
 
     // Answered here, once, while the rank-2 tensors are all still present —
