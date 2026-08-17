@@ -279,6 +279,40 @@ static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
   auto rt = mlir::dyn_cast<mlir::RankedTensorType>(t);
   if (!rt || rt.getRank() < 1)
     return std::nullopt;
+  // A rank-1 `#ttg.linear` address tile. `tl.permute` on a rank-3 tile folds the
+  // whole permutation into the LOAD's index layout (see `planLinearRange`), and
+  // the load's pointer tensor inherits it. Only `rank` is consumed downstream
+  // (`emitLoadStoreIndex` branches on nothing else and passes the scalarized
+  // offset through), and the index itself has already been emitted correctly by
+  // `MakeRangeLowering`, so the geometry here only has to be self-consistent.
+  //
+  // Widening rather than rejecting, for the reason a rejection would be wrong:
+  // the sibling blocked path has no dtype or layout gate at all, and declining
+  // here is a `notifyMatchFailure` INSIDE the conversion, which this backend
+  // does not survive.
+  if (auto lin = mlir::dyn_cast_or_null<mlir::triton::gpu::LinearEncodingAttr>(
+          rt.getEncoding())) {
+    if (rt.getRank() != 1)
+      return std::nullopt;
+    const mlir::triton::LinearLayout &ll = lin.getLinearLayout();
+    if (ll.getNumOutDims() != 1)
+      return std::nullopt;
+    int64_t tpb = 1;
+    auto *ctx = rt.getContext();
+    for (const char *dim : {"lane", "warp"}) {
+      auto it = ll.getBases().find(mlir::StringAttr::get(ctx, dim));
+      if (it != ll.getBases().end())
+        tpb <<= it->second.size();
+    }
+    if (tpb == 0)
+      return std::nullopt;
+    int64_t total = rt.getNumElements();
+    TileInfo info{std::max<int64_t>(1, total / tpb), tpb, /*contiguous=*/false,
+                  rt.getRank(), {}, {}};
+    info.shape.push_back(total);
+    info.order.push_back(0);
+    return info;
+  }
   auto slice = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
       rt.getEncoding());
   if (!slice)
@@ -1408,6 +1442,134 @@ struct LinearRangeAxis {
   int axis;
 };
 
+// A rank-1 `tt.make_range` under a `#ttg.linear` layout, evaluated DIRECTLY out
+// of the layout's basis vectors.
+//
+// This is the general case the hypercube path below is a special case of, and
+// what `tl.permute` on a rank-3 tile arrives as: Triton folds the whole
+// permutation into the LOAD's index layout and leaves the reshape and the
+// transpose as pure relabels (both are flat identities — see
+// `transIsFlatIdentity`). So the permutation exists nowhere except in this
+// layout, and imposing the backend's own `element == localTid` mapping on it
+// erases the op: `tl.permute(v, (2,0,1))` would come back a plain copy.
+//
+// A linear layout maps the bits of (register, lane, warp, block) to an element
+// offset by XOR-ing in one basis vector per SET bit. Register bits index the
+// per-thread element (the tile loop's `iv`), lane and warp bits split the
+// threadgroup-local thread id at the layout's own warp size. A zero basis is a
+// BROADCAST — two threads holding the same element — which XOR handles for free
+// and which is why the emitted expression must not assume a bijection.
+//
+// The hypercube path is tried FIRST and is deliberately keyed on what a range is
+// reshaped INTO rather than on its layout, because `tl.sort` gives some of its
+// size-2 ranges a plain `#ttg.blocked` layout; this one only ever sees what that
+// path declined.
+static std::optional<LinearRangeAxis>
+linearRangeHypercubeAxis(mlir::triton::MakeRangeOp op);
+
+struct LinearRangePlan {
+  enum Coord { Register, Lane, Warp };
+  // (which coordinate, which bit of it, what to XOR in) — already filtered to
+  // the bits that contribute anything.
+  llvm::SmallVector<std::tuple<Coord, int, int32_t>, 8> terms;
+  // Counted from the BASIS ARRAYS, not from `terms`. A broadcast bit has a zero
+  // basis and contributes no term, but it still costs a thread — deriving the
+  // thread count from the filtered terms halved it for `warp = [[4], [0]]` and
+  // would have put `localTid` on the wrong threadgroup stride.
+  int laneBits = 0;
+  int warpBits = 0;
+  int threadsPerBlock() const { return 1 << (laneBits + warpBits); }
+};
+
+static std::optional<LinearRangePlan>
+planLinearRange(mlir::triton::MakeRangeOp op) {
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!resTy || resTy.getRank() != 1)
+    return std::nullopt;
+  auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::LinearEncodingAttr>(
+      resTy.getEncoding());
+  if (!enc)
+    return std::nullopt;
+  const mlir::triton::LinearLayout &ll = enc.getLinearLayout();
+  if (ll.getNumOutDims() != 1)
+    return std::nullopt;
+  mlir::StringAttr outDim = *ll.getOutDimNames().begin();
+  if (ll.getOutDimSize(outDim) != resTy.getDimSize(0))
+    return std::nullopt;
+
+  LinearRangePlan plan;
+  auto *ctx = op.getContext();
+  auto take = [&](const char *name, LinearRangePlan::Coord coord) -> bool {
+    auto dim = mlir::StringAttr::get(ctx, name);
+    const auto &bases = ll.getBases();
+    auto it = bases.find(dim);
+    if (it == bases.end())
+      return true; // absent input dim contributes nothing
+    for (size_t b = 0; b < it->second.size(); ++b) {
+      const std::vector<int32_t> &basis = it->second[b];
+      if (basis.size() != 1)
+        return false; // swizzled across output dims; not rank-1 shaped
+      if (coord == LinearRangePlan::Lane)
+        plan.laneBits = static_cast<int>(it->second.size());
+      if (coord == LinearRangePlan::Warp)
+        plan.warpBits = static_cast<int>(it->second.size());
+      if (basis[0] == 0)
+        continue; // broadcast bit — contributes nothing to the element index
+      plan.terms.push_back({coord, static_cast<int>(b), basis[0]});
+    }
+    return true;
+  };
+  // Lane first so `laneBits` is set before anyone reads it.
+  if (!take("lane", LinearRangePlan::Lane) ||
+      !take("warp", LinearRangePlan::Warp) ||
+      !take("register", LinearRangePlan::Register))
+    return std::nullopt;
+  // A multi-CTA block basis would need the CTA id, which this backend does not
+  // thread into the index math. num_ctas is 1 everywhere here, so a non-zero
+  // block basis means something unexpected — decline rather than ignore it.
+  {
+    auto dim = mlir::StringAttr::get(ctx, "block");
+    const auto &bases = ll.getBases();
+    auto it = bases.find(dim);
+    if (it != bases.end())
+      for (const std::vector<int32_t> &basis : it->second)
+        if (basis.size() != 1 || basis[0] != 0)
+          return std::nullopt;
+  }
+  if (plan.laneBits <= 0)
+    return std::nullopt;
+  // ⚠️ The two linear-range paths impose OPPOSITE mappings and must never meet.
+  //
+  // `linearRangeHypercubeAxis` IMPOSES the backend's own bijection (the flat
+  // (thread, iv) index decomposed by the cube's `order`) because everything
+  // around a `tl.sort` — its loads, stores and reduces — already speaks it. This
+  // path READS the layout's own bijection instead, because for `tl.permute`
+  // that layout is the only place the permutation exists. Both are correct
+  // alone; a kernel holding one of each would have two element mappings and
+  // combine them silently, which is how this backend's worst bugs have always
+  // looked.
+  //
+  // So decline outright if any range in the same function takes the other path.
+  // A kernel that both sorts and permutes gets a named refusal rather than a
+  // plausible answer.
+  //
+  // This walk reads the IR, which conversion mutates — but only in the safe
+  // direction: `linearRangeHypercubeAxis` needs `tt.reshape` USERS, and the
+  // conversion only ever removes those, so a clash can disappear between the
+  // pre-pass and the pattern and never appear. The pre-pass is therefore the
+  // stricter of the two, which is the way round that cannot miscompile.
+  if (auto func = op->getParentOfType<mlir::triton::FuncOp>()) {
+    bool clash = false;
+    func.walk([&](mlir::triton::MakeRangeOp other) {
+      if (other != op && linearRangeHypercubeAxis(other))
+        clash = true;
+    });
+    if (clash)
+      return std::nullopt;
+  }
+  return plan;
+}
+
 static std::optional<LinearRangeAxis>
 linearRangeHypercubeAxis(mlir::triton::MakeRangeOp op) {
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
@@ -1488,6 +1650,76 @@ struct MakeRangeLowering
               emitTileCoordByOrder(op, hyper->tile, hyper->enc.getOrder(),
                                    hyper->axis, rewriter, loc)) {
         rewriter.replaceOp(op, coord);
+        return mlir::success();
+      }
+    }
+    // General linear layout: evaluate the basis vectors. See `planLinearRange`.
+    if (std::optional<LinearRangePlan> plan = planLinearRange(op)) {
+      auto i32 = rewriter.getI32Type();
+      auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+      auto cst = [&](int32_t v) {
+        return mlir::arith::ConstantOp::create(rewriter, loc,
+                                               rewriter.getI32IntegerAttr(v))
+            .getResult();
+      };
+      auto toI32 = [&](mlir::Value v) {
+        return mlir::UnrealizedConversionCastOp::create(
+                   rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{v})
+            .getResult(0);
+      };
+      mlir::Value tid = toI32(
+          ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"))
+              .getResult());
+      mlir::Value tg = toI32(ThreadgroupIdOp::create(
+                                 rewriter, loc, ui32,
+                                 rewriter.getStringAttr("x"))
+                                 .getResult());
+      // Threads per threadgroup as THIS layout counts them. Taking it from a
+      // TileInfo instead would be a second, independent answer to the same
+      // question.
+      const int32_t tpb = plan->threadsPerBlock();
+      mlir::Value localTid = mlir::arith::SubIOp::create(
+                                 rewriter, loc, tid,
+                                 mlir::arith::MulIOp::create(rewriter, loc, tg,
+                                                             cst(tpb))
+                                     .getResult())
+                                 .getResult();
+      mlir::Value lane =
+          mlir::arith::RemSIOp::create(rewriter, loc, localTid,
+                                       cst(1 << plan->laneBits))
+              .getResult();
+      mlir::Value warp =
+          mlir::arith::DivSIOp::create(rewriter, loc, localTid,
+                                       cst(1 << plan->laneBits))
+              .getResult();
+      mlir::Value iv;
+      if (auto parentFor = findOutermostScfFor(op))
+        iv = parentFor.getInductionVar();
+
+      mlir::Value acc = cst(op.getStart());
+      bool ok = true;
+      for (auto [coord, bit, basis] : plan->terms) {
+        mlir::Value src = coord == LinearRangePlan::Lane   ? lane
+                          : coord == LinearRangePlan::Warp ? warp
+                                                           : iv;
+        if (!src) { // a register basis with no tile loop to index it
+          ok = false;
+          break;
+        }
+        mlir::Value b =
+            mlir::arith::AndIOp::create(
+                rewriter, loc,
+                mlir::arith::ShRSIOp::create(rewriter, loc, src, cst(bit))
+                    .getResult(),
+                cst(1))
+                .getResult();
+        mlir::Value term =
+            mlir::arith::MulIOp::create(rewriter, loc, b, cst(basis))
+                .getResult();
+        acc = mlir::arith::XOrIOp::create(rewriter, loc, acc, term).getResult();
+      }
+      if (ok) {
+        rewriter.replaceOp(op, acc);
         return mlir::success();
       }
     }
@@ -20439,6 +20671,15 @@ static bool normalizeStoreSideBlockedDivergentCvt(
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
   auto dstRtt =
       mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+  // ⚠️ A rank-1 `#ttg.linear` -> blocked pair was tried here and REVERTED. It
+  // is what `tl.permute` leaves when the tile holds more than one element per
+  // thread, and re-encoding the store's address cone into the linear layout
+  // does make it compile — with 39 SILENT WRONG ANSWERS. The address then says
+  // the lane holds logical element `L(f)`, but the value it actually holds
+  // comes from a chain of relabels that are identities under THIS backend's
+  // flat mapping, not under the layout's, and the two only coincide when every
+  // relabel in between agrees. Proving that is the one-bijection problem again,
+  // not a predicate; the shape keeps its clean refusal until it is solved.
   if (!isSameShapeRank2BlockedPair(srcRtt, dstRtt))
     return false;
   mlir::Attribute srcEnc = srcRtt.getEncoding();
@@ -23921,8 +24162,10 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                               mlir::triton::gpu::SliceEncodingAttr>(enc))
       return;
     // A linear-layout range that resolves to one hypercube axis IS decomposable
-    // now (`linearRangeHypercubeAxis`, which MakeRangeLowering calls too).
-    if (linearRangeHypercubeAxis(range))
+    // now (`linearRangeHypercubeAxis`, which MakeRangeLowering calls too), and
+    // so is one whose basis vectors can simply be evaluated (`planLinearRange`,
+    // likewise) — that is what a rank-3 `tl.permute` arrives as.
+    if (linearRangeHypercubeAxis(range) || planLinearRange(range))
       return;
     reject(range, "tl.arange has no per-element index under this layout "
                   "(rank>2 broadcasts of an arange, as tl.sort and tl.flip "

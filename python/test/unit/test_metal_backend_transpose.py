@@ -495,3 +495,57 @@ def test_trans_elementwise_masked_store(M, N, num_warps):
         f"masked trans {M}x{N} nw={num_warps}\nout=\n{out.cpu()}\n"
         f"expected=\n{expected}"
     )
+
+
+# --------------------------------------------------------------------------
+# Rank-3 `tl.permute` — the same premise one rank up.
+#
+# Triton does not lower a rank-3 permute into index arithmetic the way it does a
+# rank-2 transpose. It folds the WHOLE permutation into the load index's
+# `#ttg.linear` layout and leaves the reshape and the transpose as flat
+# identities, so the permutation exists nowhere else in the IR. This backend
+# imposes its own `element == localTid` mapping on every range, which erased the
+# op outright — `tl.permute` came back a plain copy — and the shape was
+# therefore refused with "tl.arange has no per-element index under this layout".
+#
+# `planLinearRange` evaluates the layout's basis vectors instead: element index
+# = XOR of one basis per set bit of (register, lane, warp). A zero basis is a
+# broadcast (two threads holding one element), which XOR handles for free.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def permute_rank3_kernel(
+    x_ptr, o_ptr, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+    P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr
+):
+    i = tl.arange(0, A * B * C)
+    v = tl.reshape(tl.load(x_ptr + i), (A, B, C))
+    t = tl.permute(v, (P0, P1, P2))
+    tl.store(o_ptr + i, tl.reshape(t, (A * B * C,)))
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize(
+    "perm",
+    [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)],
+    ids=lambda p: "".join(str(d) for d in p),
+)
+@pytest.mark.parametrize(
+    "A,B,C",
+    [
+        pytest.param(2, 4, 8, id="2x4x8"),
+        pytest.param(4, 4, 4, id="4x4x4"),
+        pytest.param(2, 2, 16, id="2x2x16"),
+        pytest.param(8, 4, 2, id="8x4x2"),
+    ],
+)
+def test_permute_rank3(A, B, C, perm, num_warps):
+    x = torch.arange(A * B * C, dtype=torch.float32, device="mps")
+    out = torch.zeros(A * B * C, dtype=torch.float32, device="mps")
+    permute_rank3_kernel[(1,)](x, out, A, B, C, *perm, num_warps=num_warps)
+    expected = x.cpu().reshape(A, B, C).permute(*perm).reshape(-1)
+    assert torch.equal(out.cpu(), expected), (
+        f"tl.permute {A}x{B}x{C} perm={perm} nw={num_warps}\n"
+        f"out={out.cpu()[:16].tolist()}\nexpected={expected[:16].tolist()}"
+    )

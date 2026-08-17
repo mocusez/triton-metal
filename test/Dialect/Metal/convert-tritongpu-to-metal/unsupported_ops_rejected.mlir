@@ -82,19 +82,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// `tt.make_range` is a per-element index. MakeRangeLowering can decompose one
-// out of a blocked layout (rank-1), a slice-of-blocked (rank-2) or a
-// slice-of-slice-of-blocked (rank-3); a `#ttg.linear` layout — what reshaping
-// an arange into a hypercube axis produces — has no per-element index at all.
+// A `#ttg.linear` `tt.make_range` USED to be refused here, because
+// MakeRangeLowering could only decompose a blocked layout (rank-1), a
+// slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and
+// emitting a constant 0 for anything else made every element of `tl.arange(0,2)`
+// reshaped into a rank-3 axis read back as 0 — a silent wrong answer.
 //
-// This used to emit a constant 0 and compile clean, so every element of
-// `tl.arange(0, 2)` reshaped into a rank-3 axis read back as 0. A silent wrong
-// answer, not a missing feature.
-#linear = #ttg.linear<{register = [], lane = [[0], [1], [0], [0], [0]], warp = [[0], [0]], block = []}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reject_linear_layout_make_range(%o: !tt.ptr<i32>) {
-    // expected-error @+1 {{tl.arange has no per-element index under this layout}}
-    %r = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #linear>
-    tt.return
-  }
-}
+// It is no longer refused: `planLinearRange` evaluates the layout's basis
+// vectors directly, which is what a rank-3 `tl.permute` needs (Triton folds the
+// whole permutation into the load's index layout and leaves the reshape and the
+// transpose as flat identities). Coverage moved to
+// `make_range_linear_layout.mlir`; the rejection above it stays for a layout
+// neither path can decode.
