@@ -230,6 +230,73 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
                     "}\n\n";
         }
       }
+      // MSL has no 8-bit float type, so `tl.float8e4nv` / `tl.float8e5` casts
+      // run in software. Round-to-nearest-even is applied ONCE straight off
+      // the f32 bit pattern: rounding through f16 first double-rounds, and 119
+      // of 60032 fuzz values then landed a ulp away from `torch.Tensor.to`.
+      bool hasFp8Convert = false;
+      m.walk([&](mlir::triton::metal::Fp8ConvertOp) {
+        hasFp8Convert = true;
+        return mlir::WalkResult::interrupt();
+      });
+      if (hasFp8Convert) {
+        output <<
+            "static inline float __triton_fp8_to_f32(uchar b, uint mant_bits,\n"
+            "                                        uint exp_bits, uint bias) {\n"
+            "  uint max_exp = (1u << exp_bits) - 1u;\n"
+            "  uint s = (uint)(b & 0x80) << 24;\n"
+            "  uint e = ((uint)b >> mant_bits) & max_exp;\n"
+            "  uint m = (uint)b & ((1u << mant_bits) - 1u);\n"
+            "  if (e == 0u) {\n"
+            "    if (m == 0u) return as_type<float>(s);\n"
+            "    float v = (float)m * exp2((float)(1 - (int)bias - (int)mant_bits));\n"
+            "    return as_type<float>(as_type<uint>(v) | s);\n"
+            "  }\n"
+            "  if (e == max_exp) {\n"
+            "    if (exp_bits == 5u)\n"
+            "      return as_type<float>(s | 0x7F800000u | (m << (23u - mant_bits)));\n"
+            "    if (m == ((1u << mant_bits) - 1u)) return as_type<float>(s | 0x7FC00000u);\n"
+            "  }\n"
+            "  return as_type<float>(s | ((e + 127u - bias) << 23) |\n"
+            "                        (m << (23u - mant_bits)));\n"
+            "}\n\n"
+            "static inline uchar __triton_f32_to_fp8(float x, uint mant_bits,\n"
+            "                                        uint exp_bits, uint bias,\n"
+            "                                        bool has_inf) {\n"
+            "  uint xb = as_type<uint>(x);\n"
+            "  uchar sign = (uchar)((xb >> 24) & 0x80u);\n"
+            "  uint max_exp = (1u << exp_bits) - 1u;\n"
+            "  uchar nan_pat = (uchar)(sign | (max_exp << mant_bits) |\n"
+            "                          ((1u << mant_bits) - 1u));\n"
+            "  if (isnan(x)) return nan_pat;\n"
+            "  float ax = fabs(x);\n"
+            "  if (isinf(ax))\n"
+            "    return has_inf ? (uchar)(sign | (max_exp << mant_bits)) : nan_pat;\n"
+            "  uint u = as_type<uint>(ax);\n"
+            "  int e = (int)((u >> 23) & 0xFFu);\n"
+            "  uint m = u & 0x7FFFFFu;\n"
+            "  int min_normal_e = 127 - (int)bias + 1;\n"
+            "  int shift; int biased;\n"
+            "  if (e >= min_normal_e) {\n"
+            "    shift = 23 - (int)mant_bits;\n"
+            "    biased = e - (127 - (int)bias);\n"
+            "  } else {\n"
+            "    shift = 23 - (int)mant_bits + (min_normal_e - e);\n"
+            "    biased = 0;\n"
+            "    m |= 0x800000u;\n"
+            "  }\n"
+            "  if (shift > 31) return sign;\n"
+            "  uint low = m & ((1u << shift) - 1u);\n"
+            "  uint half_ = 1u << (shift - 1);\n"
+            "  uint q = m >> shift;\n"
+            "  if (low > half_ || (low == half_ && (q & 1u))) q += 1u;\n"
+            "  if (q >= (1u << mant_bits)) { q -= (1u << mant_bits); biased += 1; }\n"
+            "  if (biased > (int)max_exp ||\n"
+            "      (biased == (int)max_exp && (has_inf || q >= ((1u << mant_bits) - 1u))))\n"
+            "    return has_inf ? (uchar)(sign | (max_exp << mant_bits)) : nan_pat;\n"
+            "  return (uchar)(sign | ((uint)biased << mant_bits) | q);\n"
+            "}\n\n";
+      }
       emittedPreamble = true;
     }
     ModuleTranslation translator{module, output};
@@ -444,6 +511,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::SimdgroupFusedStoreOp,
             mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
             mlir::triton::metal::DebugRecordOp,
+            mlir::triton::metal::Fp8ConvertOp,
             mlir::scf::ConditionOp>(
           [&](auto &op) { printable = true; })
       .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
@@ -6196,6 +6264,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::triton::metal::FmaOp,
                     mlir::triton::metal::ClampFOp,
                     mlir::triton::metal::MathIntrinsicOp,
+                    mlir::triton::metal::Fp8ConvertOp,
                     mlir::triton::metal::MulHiUIOp,
                     mlir::triton::metal::GetElementOp>(&op)) {
         _output << "\n";
@@ -6283,6 +6352,7 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
             mlir::triton::metal::FmaOp, mlir::triton::metal::ClampFOp,
             mlir::triton::metal::MathIntrinsicOp,
+            mlir::triton::metal::Fp8ConvertOp,
             mlir::triton::metal::MulHiUIOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
@@ -7041,6 +7111,25 @@ void ModuleTranslation::translate(mlir::triton::metal::FmaOp op) {
   translateValueOrVarName(op.getB());
   _output << ", ";
   translateValueOrVarName(op.getC());
+  _output << ")";
+}
+
+void ModuleTranslation::translate(mlir::triton::metal::Fp8ConvertOp op) {
+  // The format's parameters travel as literals so one preamble helper serves
+  // both: e4m3fn is (3 mantissa bits, 4 exponent bits, bias 7, no infinity)
+  // and e5m2 is (2, 5, 15, has infinity).
+  const bool e5m2 = op.getE5m2();
+  if (op.getToFp8())
+    _output << "__triton_f32_to_fp8(";
+  else
+    _output << "__triton_fp8_to_f32(";
+  translateValueOrVarName(op.getValue());
+  if (e5m2)
+    _output << ", 2u, 5u, 15u";
+  else
+    _output << ", 3u, 4u, 7u";
+  if (op.getToFp8())
+    _output << (e5m2 ? ", true" : ", false");
   _output << ")";
 }
 

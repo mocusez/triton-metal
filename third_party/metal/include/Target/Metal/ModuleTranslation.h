@@ -121,6 +121,7 @@ private:
   void translate(mlir::triton::metal::TgStoreIndexedOp op);
   void translate(mlir::triton::metal::StoreOp op);
   void translate(mlir::triton::metal::DebugRecordOp op);
+  void translate(mlir::triton::metal::Fp8ConvertOp op);
   void translate(mlir::triton::metal::ThreadgroupPrefixSumOp op);
   void translate(mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp op);
   void translate(mlir::triton::metal::ThreadgroupAffinePrefixScanOp op);

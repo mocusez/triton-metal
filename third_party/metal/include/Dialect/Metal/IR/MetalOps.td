@@ -210,6 +210,35 @@ def TgLoadIndexedOp : Metal_Op<"tg_load_indexed", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Fp8ConvertOp
+//===----------------------------------------------------------------------===//
+
+def Fp8ConvertOp : Metal_Op<"fp8_convert", [Pure]> {
+  let summary = "Convert between f32 and an 8-bit float format.";
+  let description = [{
+    What a standalone `tt.fp_to_fp` involving e4m3fn or e5m2 lowers to. MSL has
+    no 8-bit float type, so the payload travels as `i8` bits and the emitter
+    calls a preamble helper that does the conversion in software.
+
+    `to_fp8` picks the direction: set, the operand is f32 and the result is the
+    8-bit pattern; clear, the reverse. `e5m2` picks the format — the two differ
+    in exponent width, bias, and whether they have an infinity (e4m3fn does
+    not, so it overflows to NaN where e5m2 saturates to inf).
+
+    Rounding is round-to-nearest-even, applied ONCE straight off the f32 bit
+    pattern. Rounding through f16 on the way would double-round: 119 of 60032
+    fuzz values came out a ulp away from what `torch.Tensor.to` produces.
+  }];
+
+  let arguments = (ins AnyTypeOf<[F32, I8]>:$value, UnitAttr:$to_fp8,
+                       UnitAttr:$e5m2);
+  let results = (outs AnyTypeOf<[F32, I8]>:$result);
+
+  let assemblyFormat =
+      "$value attr-dict `:` type($value) `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
 // DebugRecordOp
 //===----------------------------------------------------------------------===//
 

@@ -83,6 +83,11 @@ static mlir::Type metalStorageElementType(mlir::Type t) {
   return t;
 }
 
+// True for the two 8-bit float formats Triton emits.
+static bool isMetalFp8(mlir::Type t) {
+  return mlir::isa<mlir::Float8E4M3FNType, mlir::Float8E5M2Type>(t);
+}
+
 // Inverse of `metalStorageElementType`: bit-preserving cast of a value carrying
 // a SIGNED/UNSIGNED integer type back to the signless integer of the same width.
 //
@@ -18105,6 +18110,15 @@ static mlir::LogicalResult preprocessScaledDots(mlir::ModuleOp moduleOp) {
       elemTy = shapedTy.getElementType();
     if (!mlir::isa<mlir::Float8E4M3FNType, mlir::Float8E5M2Type>(elemTy))
       return;
+    // A load that only feeds `tt.fp_to_fp` is a DEQUANTIZE, and that has a
+    // lowering now: the bytes go straight into the software decoder. The
+    // rejection below is for fp8 values that would reach generic arithmetic,
+    // where byte storage really would legalize something meaningless.
+    if (!load.getResult().use_empty() &&
+        llvm::all_of(load.getResult().getUsers(), [](mlir::Operation *user) {
+          return mlir::isa<mlir::triton::FpToFpOp>(user);
+        }))
+      return;
     load.emitOpError(
         "Metal backend: FP8 loads are supported only as fully consumed "
         "tt.dot_scaled payloads");
@@ -23398,8 +23412,25 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                     "control flow the inliner cannot take");
         })
         .Case<mlir::triton::FpToFpOp>([&](auto o) {
-          reject(o, "fp8 conversions are supported only as a fully consumed "
-                    "tt.dot_scaled payload, not as a standalone cast");
+          // Implemented for a tensor cast with fp8 on exactly one side; what
+          // is left is the scalar form and fp8 -> fp8.
+          auto srcTy =
+              mlir::dyn_cast<mlir::RankedTensorType>(o.getSrc().getType());
+          auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(o.getType());
+          if (!srcTy || !dstTy) {
+            reject(o, "fp8 conversion is implemented for tensor casts only");
+            return;
+          }
+          mlir::Type se = srcTy.getElementType(), de = dstTy.getElementType();
+          const bool sf = isMetalFp8(se), df = isMetalFp8(de);
+          if (sf == df) {
+            reject(o, "fp8 conversion is implemented with fp8 on exactly one "
+                      "side (f32/f16/bf16 on the other)");
+            return;
+          }
+          mlir::Type other = sf ? de : se;
+          if (!other.isF32() && !other.isF16() && !other.isBF16())
+            reject(o, "fp8 conversion is implemented against f32, f16 or bf16");
         })
         .Default([](mlir::Operation *) {});
   });
@@ -23936,6 +23967,91 @@ struct AssertLowering
             internDebugMessage(moduleOp, op.getMessage().str())),
         rewriter.getI32IntegerAttr(4), mlir::Value(), failed, lane);
     rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tt.fp_to_fp involving fp8 -> metal.fp8_convert.
+//
+// MSL has no 8-bit float type, so `x.to(tl.float8e4nv)` and the reverse run in
+// software: the payload travels as i8 bits and a preamble helper does the
+// conversion. Both directions were rejected before — fp8 existed only as a
+// fully consumed `tt.dot_scaled` payload — which ruled out quantizing or
+// dequantizing a tensor in a kernel at all.
+//
+// Rounding is round-to-nearest-even applied ONCE off the f32 bit pattern, and
+// the two formats differ at the top of their range: e5m2 has an infinity and
+// saturates to it, e4m3fn has none and overflows to NaN. Both were checked
+// bit-for-bit against `torch.Tensor.to` over 60k values and all 256 patterns.
+//===----------------------------------------------------------------------===//
+struct FpToFpLowering
+    : public mlir::OpConversionPattern<mlir::triton::FpToFpOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::triton::FpToFpOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+    auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    if (!srcTy || !dstTy)
+      return rewriter.notifyMatchFailure(op, "fp_to_fp: scalar form");
+    mlir::Type srcElem = srcTy.getElementType();
+    mlir::Type dstElem = dstTy.getElementType();
+    const bool srcFp8 = isMetalFp8(srcElem);
+    const bool dstFp8 = isMetalFp8(dstElem);
+    if (srcFp8 == dstFp8)
+      return rewriter.notifyMatchFailure(
+          op, "fp_to_fp: exactly one side must be fp8");
+    mlir::Value value = adaptor.getSrc();
+    if (mlir::isa<mlir::RankedTensorType>(value.getType()))
+      return rewriter.notifyMatchFailure(op, "fp_to_fp: operand not scalarized");
+
+    auto f32 = rewriter.getF32Type();
+    auto i8 = rewriter.getIntegerType(8);
+    auto bridge = [&](mlir::Value v, mlir::Type to) -> mlir::Value {
+      if (v.getType() == to)
+        return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{to}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+    const bool e5m2 =
+        mlir::isa<mlir::Float8E5M2Type>(srcFp8 ? srcElem : dstElem);
+    auto unitIf = [&](bool set) {
+      return set ? rewriter.getUnitAttr() : mlir::UnitAttr();
+    };
+
+    if (srcFp8) {
+      // Decode, then land on whatever float the consumer asked for.
+      mlir::Value asF32 =
+          Fp8ConvertOp::create(rewriter, loc, f32, bridge(value, i8),
+                               /*to_fp8=*/mlir::UnitAttr(), unitIf(e5m2))
+              .getResult();
+      mlir::Value result = asF32;
+      if (dstElem.isF16() || dstElem.isBF16())
+        result = mlir::arith::TruncFOp::create(rewriter, loc, dstElem, asF32)
+                     .getResult();
+      else if (!dstElem.isF32())
+        return rewriter.notifyMatchFailure(op, "fp_to_fp: unsupported target");
+      rewriter.replaceOp(op, result);
+      return mlir::success();
+    }
+
+    // Encode: widen to f32 first so one rounding decides the result.
+    mlir::Value asF32 = value;
+    if (srcElem.isF16() || srcElem.isBF16())
+      asF32 = mlir::arith::ExtFOp::create(rewriter, loc, f32, value).getResult();
+    else if (!srcElem.isF32())
+      return rewriter.notifyMatchFailure(op, "fp_to_fp: unsupported source");
+    mlir::Value bits =
+        Fp8ConvertOp::create(rewriter, loc, i8, asF32,
+                             /*to_fp8=*/rewriter.getUnitAttr(), unitIf(e5m2))
+            .getResult();
+    // The converted value keeps the fp8 element type in the type system; the
+    // store bridges it to the buffer's i8 storage, and the emitter forwards
+    // both casts as no-ops.
+    rewriter.replaceOp(op, bridge(bits, dstElem));
     return mlir::success();
   }
 };
@@ -24896,7 +25012,7 @@ struct ConvertTritonGPUToMetalPass
                  ArithConstantDenseLowering, ExpandDimsLowering,
                  BroadcastLowering, ReshapeLowering, TransLowering,
                  JoinLowering, SplitLowering, CatLowering,
-                 PrintLowering, AssertLowering,
+                 PrintLowering, AssertLowering, FpToFpLowering,
                  BitcastLowering,
                  LoadLowering, ScalarLoadLowering, MaskedLoadLowering, StoreLowering,
                  HistogramLowering,

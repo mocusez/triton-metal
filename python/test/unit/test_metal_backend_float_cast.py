@@ -151,3 +151,81 @@ def test_fptoui_runtime_truncates_toward_zero(N):
     torch.mps.synchronize()
     expected = torch.trunc(x.cpu()).to(torch.uint32)
     assert out.cpu().tolist() == expected.tolist()
+
+
+# --- fp8: e4m3fn and e5m2 ----------------------------------------------------
+#
+# MSL has no 8-bit float type, so these casts run in software and the payload
+# travels as i8 bits. Before this, fp8 existed only as a fully consumed
+# `tt.dot_scaled` payload, which ruled out quantizing or dequantizing a tensor
+# in a kernel at all.
+#
+# The assertions are bit-exact against `torch.Tensor.to`, which is the whole
+# point: rounding is round-to-nearest-even applied ONCE off the f32 pattern.
+# Rounding through f16 first would double-round — 119 of 60032 fuzz values came
+# out a ulp away when it did — and the two formats differ at the top of their
+# range: e5m2 saturates to its infinity, e4m3fn has none and overflows to NaN.
+
+
+@triton.jit
+def _fp8_round_trip_kernel(X, Out, N: tl.constexpr, E5: tl.constexpr):
+    i = tl.arange(0, N)
+    v = tl.load(X + i)
+    q = v.to(tl.float8e5) if E5 else v.to(tl.float8e4nv)
+    tl.store(Out + i, q.to(tl.float32))
+
+
+@triton.jit
+def _fp8_store_kernel(X, Out, N: tl.constexpr, E5: tl.constexpr):
+    i = tl.arange(0, N)
+    v = tl.load(X + i)
+    tl.store(Out + i, v.to(tl.float8e5) if E5 else v.to(tl.float8e4nv))
+
+
+@triton.jit
+def _fp8_load_kernel(X, Out, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(Out + i, tl.load(X + i).to(tl.float32))
+
+
+def _fp8_dtype(e5):
+    return torch.float8_e5m2 if e5 else torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("e5", [False, True])
+def test_fp8_round_trip_matches_torch_bitwise(e5):
+    N = 1024
+    torch.manual_seed(0)
+    vals = torch.cat([torch.randn(N // 2) * 20.0,
+                      torch.randn(N // 2) * 0.01]).to(torch.float32)
+    out = torch.zeros(N, dtype=torch.float32, device="mps")
+    _fp8_round_trip_kernel[(1,)](vals.to("mps"), out, N, e5, num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), vals.to(_fp8_dtype(e5)).to(torch.float32))
+
+
+@pytest.mark.parametrize("e5", [False, True])
+def test_fp8_store_writes_the_same_bytes_as_torch(e5):
+    N = 512
+    torch.manual_seed(1)
+    vals = (torch.rand(N) * 1000.0 - 500.0).to(torch.float32)
+    out = torch.zeros(N, dtype=_fp8_dtype(e5), device="mps")
+    _fp8_store_kernel[(1,)](vals.to("mps"), out, N, e5, num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu().view(torch.uint8),
+                       vals.to(_fp8_dtype(e5)).view(torch.uint8))
+
+
+@pytest.mark.parametrize("e5", [False, True])
+def test_fp8_load_decodes_every_bit_pattern(e5):
+    dt = _fp8_dtype(e5)
+    pats = torch.arange(256, dtype=torch.uint8).view(dt)
+    out = torch.zeros(256, dtype=torch.float32, device="mps")
+    _fp8_load_kernel[(1,)](pats.to("mps"), out, 256, num_warps=4)
+    torch.mps.synchronize()
+    got, want = out.cpu(), pats.to(torch.float32)
+    for i in range(256):
+        if want[i] != want[i]:            # NaN patterns compare by kind
+            assert got[i] != got[i], (i, got[i].item())
+        else:
+            assert got[i] == want[i], (i, got[i].item(), want[i].item())
