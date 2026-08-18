@@ -1301,6 +1301,113 @@ static std::optional<TileInfo> cachedMakeRangeOwnTile(mlir::Operation *op) {
   return it->second;
 }
 
+// The rank-2 axis a rank-1 `tt.make_range` indexes when its cone reaches the
+// tile through a unit-dim-inserting `tt.reshape` instead of a `tt.expand_dims`.
+//
+// `x[:, None]` and `x[None, :]` are the same operation twice over, but only the
+// `tt.expand_dims` spelling gives the range a `#ttg.slice` encoding — and that
+// encoding is the ONLY thing that tells `MakeRangeLowering` to decompose the
+// flat index by axis. Upstream #10555 rewrote the descriptor lowering's offset
+// expansion to emit one `tt.reshape` instead of an `expand_dims` chain, so the
+// range fell through to the rank-1 fallback and handed back a bare `localTid`.
+// The tile then indexed its column by `flat % BLOCK_N` while the offset that
+// addressed it counted to `tpb`: the same one-buffer-two-mappings shape as the
+// rest of this file, and it showed up as a 2-D descriptor load whose rows past
+// the first were all `other`.
+//
+// The whole rank-1 cone must end in such a reshape. A range that ALSO feeds a
+// genuine rank-1 use carries both conventions at once, and there is no single
+// scalar that means both — those keep the rank-1 answer they have always had.
+struct UnitDimReshapeAxis {
+  mlir::triton::gpu::BlockedEncodingAttr enc;
+  int axis;
+};
+
+static std::optional<UnitDimReshapeAxis>
+makeRangeUnitDimReshapeAxis(mlir::triton::MakeRangeOp op) {
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!resTy || resTy.getRank() != 1)
+    return std::nullopt;
+  // A slice-encoded range already names its axis and a linear one carries the
+  // real mapping in its bases; both are answered before this path is asked.
+  if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr,
+                            mlir::triton::gpu::LinearEncodingAttr>(
+          resTy.getEncoding()))
+    return std::nullopt;
+  const int64_t n = resTy.getDimSize(0);
+  if (n <= 1)
+    return std::nullopt;
+
+  llvm::SmallVector<mlir::Value, 16> wl{op.getResult()};
+  llvm::SmallPtrSet<mlir::Value, 16> seen;
+  std::optional<UnitDimReshapeAxis> found;
+  while (!wl.empty()) {
+    mlir::Value v = wl.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    for (mlir::Operation *user : v.getUsers()) {
+      auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(user);
+      if (!reshape) {
+        // Step over the elementwise ops the descriptor rewrite leaves between
+        // the range and the reshape (`arith.extsi` to i64) — and nothing else.
+        // A user that consumes the range without producing another rank-1
+        // value of the same length is a rank-1 use, and the cone escapes.
+        bool stepped = false;
+        for (mlir::Value res : user->getResults()) {
+          auto rt = mlir::dyn_cast<mlir::RankedTensorType>(res.getType());
+          if (rt && rt.getRank() == 1 && rt.getDimSize(0) == n) {
+            wl.push_back(res);
+            stepped = true;
+          }
+        }
+        if (!stepped)
+          return std::nullopt;
+        continue;
+      }
+      auto srcTy =
+          mlir::dyn_cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+      auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+      if (!srcTy || srcTy.getRank() != 1 || srcTy.getDimSize(0) != n || !dstTy ||
+          dstTy.getRank() != 2)
+        return std::nullopt; // not a unit-dim insertion; leave it alone
+      auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+          dstTy.getEncoding());
+      if (!enc || enc.getOrder().size() != 2)
+        return std::nullopt;
+      int axis = -1;
+      for (int d = 0; d < 2; ++d) {
+        if (dstTy.getDimSize(d) == 1)
+          continue;
+        if (axis >= 0 || dstTy.getDimSize(d) != n)
+          return std::nullopt; // reshapes elements around, not just unit dims
+        axis = d;
+      }
+      if (axis < 0)
+        return std::nullopt;
+      UnitDimReshapeAxis here{enc, axis};
+      if (!found)
+        found = here;
+      else if (found->enc != here.enc || found->axis != here.axis)
+        return std::nullopt; // one range read two ways — no single answer
+    }
+  }
+  return found;
+}
+
+// Answered ONCE before the conversion, for the same reason `g_makeRangeOwnTile`
+// is: the walk is FORWARD through users, and `applyFullConversion` erases the
+// reshape as it goes, so a site that asked late would be told there is none.
+static llvm::DenseMap<mlir::Operation *, UnitDimReshapeAxis>
+    g_makeRangeReshapeAxis;
+
+static std::optional<UnitDimReshapeAxis>
+cachedMakeRangeReshapeAxis(mlir::Operation *op) {
+  auto it = g_makeRangeReshapeAxis.find(op);
+  if (it == g_makeRangeReshapeAxis.end())
+    return std::nullopt;
+  return it->second;
+}
+
 // The rank-2 tile that breaks the one-bijection premise, if the kernel has one.
 //
 // Everything in this backend assumes one (thread, iv) -> element mapping per
@@ -1972,6 +2079,21 @@ struct MakeRangeLowering
           rewriter.replaceOp(op, row);
           return mlir::success();
         }
+      }
+    }
+    // Unit-dim `tt.reshape` path: the same rank-2 decomposition the slice path
+    // above does, for a range that reaches its tile through a reshape rather
+    // than a `tt.expand_dims`. Placed LAST among the rank-2 readings so it can
+    // only claim ranges that would otherwise fall to the rank-1 answer below —
+    // every range the other paths already answer keeps emitting what it did.
+    if (auto rax = cachedMakeRangeReshapeAxis(op)) {
+      std::optional<TileInfo> tile = cachedMakeRangeOwnTile(op);
+      if (!tile)
+        tile = findLargestRank2Tile(op);
+      if (tile && tile->rank == 2 && tile->shape.size() == 2) {
+        rewriter.replaceOp(op, emitTileAxisCoord(op, *tile, rax->enc, rax->axis,
+                                                 rewriter, loc));
+        return mlir::success();
       }
     }
     // 1D path: emit a real per-thread index value so that downstream
@@ -3034,17 +3156,6 @@ struct JoinLowering : public mlir::OpConversionPattern<mlir::triton::JoinOp> {
         mlir::isa<mlir::RankedTensorType>(rhs.getType()))
       return rewriter.notifyMatchFailure(op, "join: operands not scalarized");
 
-    mlir::Value col =
-        emitTileAxisCoord(op, *tile, enc, /*axis=*/1, rewriter, loc);
-    auto cZero =
-        mlir::arith::ConstantOp::create(rewriter, loc,
-                                        rewriter.getI32IntegerAttr(0));
-    mlir::Value isRhs =
-        mlir::arith::CmpIOp::create(rewriter, loc,
-                                    mlir::arith::CmpIPredicate::ne, col,
-                                    cZero.getResult())
-            .getResult();
-
     // Which lane holds source element `row` depends on which of the backend's
     // two rank-1 conventions is in force, and getting it wrong is a silent
     // wrong answer — the differential sweep caught `join` returning
@@ -3058,9 +3169,36 @@ struct JoinLowering : public mlir::OpConversionPattern<mlir::triton::JoinOp> {
     mlir::triton::gpu::BlockedEncodingAttr companionEnc;
     std::optional<TileInfo> companion =
         findSubTpbRank2Companion(op, &companionEnc);
-    const bool perRowOperands = companion && companion->shape.size() == 2 &&
+    const bool perRowOperands = companion && companionEnc &&
+                                companion->shape.size() == 2 &&
                                 companion->shape[0] == srcTy.getDimSize(0) &&
                                 companion->shape[1] == 2;
+    // Decompose against the mapping the OPERANDS are actually held under, not
+    // against this op's own result type. Those are the same attribute in every
+    // kernel that has no `ttg.convert_layout` over the joined tile — but
+    // `tl.cat` now lowers to join + convert_layout + trans + reshape (upstream
+    // deleted `tt.cat`), `normalizeBlockedDivergentCvts` re-encodes the join's
+    // result into the far side of that cvt, and the two sides carry OPPOSITE
+    // `order`. Taking the row from the companion and the column from the
+    // re-encoded result is two index mappings inside one op: a sub-tpb
+    // `tl.cat` then wrote a[i] and a[i]+100 into the SAME lane pair and lost
+    // half the elements. `companion->shape == [N, 2] == tile->shape` is already
+    // established above, so only the `order` can differ.
+    const TileInfo &coordTile = perRowOperands ? *companion : *tile;
+    mlir::triton::gpu::BlockedEncodingAttr coordEnc =
+        perRowOperands ? companionEnc : enc;
+
+    mlir::Value col =
+        emitTileAxisCoord(op, coordTile, coordEnc, /*axis=*/1, rewriter, loc);
+    auto cZero =
+        mlir::arith::ConstantOp::create(rewriter, loc,
+                                        rewriter.getI32IntegerAttr(0));
+    mlir::Value isRhs =
+        mlir::arith::CmpIOp::create(rewriter, loc,
+                                    mlir::arith::CmpIPredicate::ne, col,
+                                    cZero.getResult())
+            .getResult();
+
     if (perRowOperands) {
       rewriter.replaceOp(op, mlir::arith::SelectOp::create(rewriter, loc, isRhs,
                                                            rhs, lhs)
@@ -3075,7 +3213,7 @@ struct JoinLowering : public mlir::OpConversionPattern<mlir::triton::JoinOp> {
     mlir::Value buf =
         publishLaneBands({lhs, rhs}, tpb, stageTy, rewriter, loc);
     mlir::Value row =
-        emitTileAxisCoord(op, *tile, enc, /*axis=*/0, rewriter, loc);
+        emitTileAxisCoord(op, coordTile, coordEnc, /*axis=*/0, rewriter, loc);
     auto cTpb = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
     mlir::Value band = mlir::arith::SelectOp::create(rewriter, loc, isRhs,
@@ -3125,12 +3263,19 @@ struct SplitLowering : public mlir::OpConversionPattern<mlir::triton::SplitOp> {
     mlir::triton::gpu::BlockedEncodingAttr companionEnc;
     std::optional<TileInfo> companion =
         findSubTpbRank2Companion(op, &companionEnc);
-    const bool perRowResults = companion && companion->shape.size() == 2 &&
+    const bool perRowResults = companion && companionEnc &&
+                               companion->shape.size() == 2 &&
                                companion->shape[0] == N &&
                                companion->shape[1] == 2 && srcEnc;
+    // Same rule as join: under the companion convention the coordinate comes
+    // from the mapping the rank-1 RESULTS are held under, never from this op's
+    // own (possibly re-encoded) source type. See the note there.
+    const TileInfo &coordTile = perRowResults ? *companion : *srcTile;
+    mlir::triton::gpu::BlockedEncodingAttr coordEnc =
+        perRowResults ? companionEnc : srcEnc;
     mlir::Value i;
     if (perRowResults) {
-      i = emitTileAxisCoord(op, *srcTile, srcEnc, /*axis=*/0, rewriter, loc);
+      i = emitTileAxisCoord(op, coordTile, coordEnc, /*axis=*/0, rewriter, loc);
       // Wrap exactly as the companion's own rank-1 make_range does. Lanes past
       // the tile run beyond its rows, and the store under this convention is
       // deliberately UNGUARDED because lanes sharing a row write the same
@@ -3144,7 +3289,15 @@ struct SplitLowering : public mlir::OpConversionPattern<mlir::triton::SplitOp> {
     } else {
       i = emitTileFlatIndex(op, *resTile, rewriter, loc);
     }
-    const bool rowMajor = srcTile->order[0] == 1 && srcTile->order[1] == 0;
+    // The slot layout has to be read off the SAME encoding that produced `i`,
+    // or the row index and the row stride come from two different orders.
+    llvm::SmallVector<int64_t, 2> slotOrder(srcTile->order.begin(),
+                                            srcTile->order.end());
+    if (perRowResults) {
+      slotOrder.assign(coordEnc.getOrder().begin(), coordEnc.getOrder().end());
+    }
+    const bool rowMajor = slotOrder.size() == 2 && slotOrder[0] == 1 &&
+                          slotOrder[1] == 0;
     llvm::SmallVector<mlir::Value, 2> outs;
     for (int64_t k = 0; k < 2; ++k) {
       mlir::Value slot;
@@ -25250,6 +25403,7 @@ struct ConvertTritonGPUToMetalPass
     // matchers have consumed the tiles that are theirs. Stale entries would
     // point at freed ops from the previous kernel in the same process.
     g_makeRangeOwnTile.clear();
+    g_makeRangeReshapeAxis.clear();
     g_tileExchange.clear();
     g_tileExchangeBuf.clear();
 
@@ -26094,6 +26248,11 @@ struct ConvertTritonGPUToMetalPass
         auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(range.getType());
         if (!rtt)
           return;
+        // Read here, alongside the other forward walk, because the conversion
+        // erases the reshape this one looks for. Cheap and empty for every
+        // kernel whose `[:, None]` is still spelled `tt.expand_dims`.
+        if (auto rax = makeRangeUnitDimReshapeAxis(range))
+          g_makeRangeReshapeAxis[range.getOperation()] = *rax;
         auto slice = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
             rtt.getEncoding());
         if (!slice ||
