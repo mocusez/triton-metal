@@ -24746,6 +24746,31 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
           reject(o, "tl.inline_asm_elementwise is not implemented (its payload "
                     "is PTX, which Metal cannot consume)");
         })
+        // Ops upstream added while this backend was out of tree. None has a
+        // lowering here, and the `.Default` below is a no-op, so without these
+        // they reach `applyFullConversion` unclaimed — which on this backend is
+        // not a diagnostic but a SIGABRT on the way out (see the
+        // `notifyMatchFailure` note on the load validators). Measured:
+        // `tt.map_elementwise` took the process down inside
+        // `test_line_info.py::test_map_elementwise_has_lineinfo`.
+        //
+        // Naming each one rather than rejecting a category, so the message says
+        // what the author wrote and a later implementation deletes one line.
+        .Case<mlir::triton::MapElementwiseOp>([&](auto o) {
+          reject(o, "tl.map_elementwise is not implemented");
+        })
+        .Case<mlir::triton::UnsplatOp>([&](auto o) {
+          reject(o, "tt.unsplat (a tensor collapsed back to the scalar every "
+                    "lane holds) is not implemented");
+        })
+        .Case<mlir::triton::AtomicPollOp>([&](auto o) {
+          reject(o, "tl.atomic_poll is not implemented (Metal has no "
+                    "equivalent of the poll-until-condition primitive)");
+        })
+        .Case<mlir::triton::DescriptorReduceOp>([&](auto o) {
+          reject(o, "a reducing descriptor store is not implemented; the "
+                    "descriptor load and store paths are");
+        })
         .Case<mlir::triton::CallOp>([&](auto o) {
           // Whatever `preprocessInlineCalls` could inline is already gone; a
           // call that survives has a callee it could not take (more than one
