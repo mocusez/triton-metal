@@ -49,8 +49,16 @@ def _install_torch_stream_shim():
     module. Each attribute is `hasattr`-guarded so a future real
     `torch.{mps,cpu}.Stream` is never overwritten.
     See `.omc/plans/tutorial02-fused-softmax-fix-consensus.md` AC7/AC7a/R3.
+
+    A torch-less interpreter is tolerated: backend discovery imports this module
+    eagerly, so raising here would make `import triton` itself fail. Without
+    torch there is nothing to shim and nothing to launch — `load_binary` raises
+    the explicit MPS-only error instead.
     """
-    import torch
+    try:
+        import torch
+    except ImportError:
+        return
 
     class _NoopStream:
         def synchronize(self):
