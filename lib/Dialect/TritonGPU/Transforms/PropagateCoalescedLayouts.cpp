@@ -217,18 +217,26 @@ public:
     // compatibility, so the gate rejected the pass's own intended target.
     // Wall 6 fix: pipeline wiring is the gate.
 
-    // Phase 1 (Wall 6): insert cvts before qualifying spt=1 rank-1 reduces.
-    // Must run before phase 2; SC1 invariant guarantees phase 2 will not
-    // re-process these inserted cvts (their direction is opposite to what
-    // isCoalesceDownConvert matches).
-    SmallVector<ReduceOp> reduceCandidates;
-    mod.walk([&](ReduceOp r) { reduceCandidates.push_back(r); });
-    OpBuilder builder(&getContext());
-    for (ReduceOp r : reduceCandidates)
-      (void)insertReduceCvt(builder, r);
-
-    // Phase 2: collect candidate convert_layout ops first; mutating during
+    // Phase 2 FIRST: collect candidate convert_layout ops; mutating during the
     // walk would invalidate iterators.
+    //
+    // ⚠️ Order matters, and it is the opposite of what it looks like. Phase 1
+    // inserts an spt=1 -> spt=N cvt immediately before a qualifying reduce, and
+    // that cvt lands between Coalesce's DOWN-convert and the reduce — which is
+    // precisely the edge phase 2 matches on (`isSafeRewriteTarget` wants the
+    // down-convert's single user to BE the reduce). Running phase 1 first
+    // therefore disabled phase 2 on every kernel where Coalesce had already
+    // produced a down-convert, leaving BOTH cvts in place: exactly the
+    // round trip `cvt spt4->spt1` then `cvt spt1->spt4`, which is what
+    // `test/TritonGPU/coalesce-propagate-reduce.mlir` had been failing on.
+    //
+    // With phase 2 first, the down-convert is folded into the reduce and phase
+    // 1 then sees an operand that is already spt=N and declines — one cvt
+    // removed instead of one added. The kernels phase 1 exists for (no
+    // down-convert in the IR at all, e.g. the fused-softmax tutorial) offer
+    // phase 2 no candidate, so they are unaffected by the swap. The SC1
+    // invariant still holds and is now structural rather than incidental:
+    // phase 2 has finished before any inserted cvt exists.
     SmallVector<ConvertLayoutOp> candidates;
     mod.walk([&](ConvertLayoutOp cvt) {
       if (isCoalesceDownConvert(cvt) && isSafeRewriteTarget(cvt))
@@ -264,6 +272,17 @@ public:
         LDBG("erased down-convert; reduce now consumes coalesced layout");
       }
     }
+
+    // Phase 1 (Wall 6): insert cvts before the qualifying spt=1 rank-1 reduces
+    // phase 2 did not already give a coalesced operand to. This unblocks the
+    // B2.3 spt-fold path in lowerRank1Reduce for kernels where no down-convert
+    // existed in the IR (e.g. the fused-softmax tutorial, whose load directly
+    // produces spt=[1]).
+    SmallVector<ReduceOp> reduceCandidates;
+    mod.walk([&](ReduceOp r) { reduceCandidates.push_back(r); });
+    OpBuilder builder(&getContext());
+    for (ReduceOp r : reduceCandidates)
+      (void)insertReduceCvt(builder, r);
   }
 };
 

@@ -6,9 +6,18 @@
 // the load to sizePerThread=[4] and inserts a down-convert back to the
 // default sizePerThread=[1] before the reduce.
 //
-// On the Metal target, the new propagate-coalesced-layouts pass removes
-// the down-convert and lets the reduce consume the sizePerThread=[4] layout
-// directly. On other targets the pass is a no-op (target gate).
+// propagate-coalesced-layouts removes the down-convert and lets the reduce
+// consume the sizePerThread=[4] layout directly.
+//
+// ⚠️ The pass is NOT target-gated, and the second RUN line is here to pin that
+// down rather than to contradict it. The gate was removed deliberately: the
+// Metal compiler stitches `ttg.target = "cuda:80"` via
+// `_TTGPUIR_PARSER_STUB_TRIPLE` for parser compatibility, so a
+// `starts_with("metal:")` check rejected the pass's own intended target.
+// PIPELINE WIRING is the gate — only `third_party/metal/backend/compiler.py`
+// adds this pass — so a module that reaches it behaves the same whatever its
+// target string says. The CUDA checks below asserted the deleted gate and had
+// been failing ever since; they now assert what the pass does.
 //
 // METAL: #ttg.blocked<{sizePerThread = [4]
 // METAL-LABEL: tt.func public @reduce_sum_rank1
@@ -20,8 +29,9 @@
 // CUDA: #ttg.blocked<{sizePerThread = [4]
 // CUDA-LABEL: tt.func public @reduce_sum_rank1
 // CUDA: tt.load {{.*}} : tensor<1024x!tt.ptr<f32>, #{{[a-z0-9]+}}>
-// CUDA: ttg.convert_layout {{.*}} : tensor<1024xf32, #{{[a-z0-9]+}}> -> tensor<1024xf32, #
-// CUDA: "tt.reduce"
+// CUDA-NOT: ttg.convert_layout {{.*}} : tensor<1024xf32, #{{[a-z0-9]+}}> -> tensor<1024xf32, #
+// CUDA: "tt.reduce"({{.*}}) <{axis = 0 : i32}>
+// CUDA: (tensor<1024xf32, #{{[a-z0-9]+}}>)
 module {
   tt.func public @reduce_sum_rank1(
       %X: !tt.ptr<f32> {tt.divisibility = 16 : i32},
