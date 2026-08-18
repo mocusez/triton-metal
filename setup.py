@@ -283,7 +283,7 @@ class CMakeBuild(build_ext):
             "-DTRITON_BUILD_PYTHON_MODULE=ON",
             "-DPython3_EXECUTABLE:FILEPATH=" + sys.executable,
             "-DPython3_INCLUDE_DIR=" + python_include_dir,
-            "-DTRITON_CODEGEN_BACKENDS=" + ';'.join([b.name for b in backends if not b.is_external]),
+            "-DTRITON_CODEGEN_BACKENDS=" + ';'.join(CODEGEN_BACKENDS),
             "-DTRITON_PLUGIN_DIRS=" + ';'.join([b.src_dir for b in backends if b.is_external]),
             "-DTRITON_WHEEL_DIR=" + wheeldir,
             f"-DTRITON_CACHE_PATH={get_triton_cache_path()}",
@@ -385,7 +385,28 @@ class CMakeBuild(build_ext):
                                   cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd", "metal"]), *BackendInstaller.copy_externals()]
+# Backends compiled into libtriton.  This list cannot be narrowed: core
+# TritonGPU's WarpSpecialization passes include the NVIDIA NVWS dialect headers
+# and python/src/gluon_ir.cc includes the AMD TritonAMDGPU ones, so a build
+# missing either backend does not compile.  Which backends a *wheel ships* is a
+# separate question -- see get_wheel_backends().
+CODEGEN_BACKENDS = ["nvidia", "amd", "metal"]
+
+
+def get_wheel_backends():
+    """Backends whose Python package (driver/compiler plus the language and
+    tools extras) ships in the wheel.
+
+    Defaults to every compiled backend.  Narrowing it with
+    `TRITON_WHEEL_BACKENDS` builds a platform-specific wheel -- e.g. a macOS
+    Metal wheel that still compiles the dialects the core needs to link, but
+    does not carry the NVIDIA Linux toolchain payload that can never run there.
+    """
+    names = os.environ.get("TRITON_WHEEL_BACKENDS", ";".join(CODEGEN_BACKENDS))
+    return [name for name in re.split(r"[;,]", names) if name.strip()]
+
+
+backends = [*BackendInstaller.copy(get_wheel_backends()), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -576,8 +597,10 @@ def get_triton_version_suffix():
 # keep it separate for easy substitution
 TRITON_VERSION = "3.8.0" + get_triton_version_suffix()
 
-# Dynamically define supported Python versions and classifiers
-MIN_PYTHON = (3, 10)
+# Dynamically define supported Python versions and classifiers.  A stable-ABI
+# build is tagged cp312-abi3, so 3.10/3.11 cannot install it -- keep the
+# metadata honest rather than advertising a floor the wheel tag refuses.
+MIN_PYTHON = (3, 12) if check_env_flag("TRITON_STABLE_ABI") else (3, 10)
 MAX_PYTHON = (3, 14)
 
 PYTHON_REQUIRES = f">={MIN_PYTHON[0]}.{MIN_PYTHON[1]},<{MAX_PYTHON[0]}.{MAX_PYTHON[1] + 1}"
