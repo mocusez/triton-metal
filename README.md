@@ -80,7 +80,8 @@ cd $(pixi run python -c 'from build_helpers import get_cmake_dir; print(get_cmak
 ninja triton-opt
 lit -v test/Dialect/Metal
 
-# pytest GPU smoke tests (Metal/MPS required)
+# pytest GPU smoke tests (Metal/MPS required — a real Apple Silicon machine;
+# these cannot run on GitHub Actions runners, see Known limitations)
 pixi run pytest python/test/unit/test_metal_backend_*.py -s --tb=short
 
 # end-to-end LeetGPU-style kernels
@@ -134,7 +135,17 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 - **Runtime shells out to `xcrun`** at every launch — no MSL caching across processes yet.
 - **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`). For broader distribution it should be re-tagged to the minimum supported macOS.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
-- **No macOS CI** — verification is currently manual on developer machines.
+- **No GPU CI — GitHub Actions cannot run the Metal/MPS tests.** GitHub-hosted macOS
+  runners are virtualized and expose no usable Metal device to PyTorch: MPS is either
+  reported unavailable, or reported available while every allocation fails, with MPS
+  memory capped near 1 GB ([actions/runner-images#9918](https://github.com/actions/runner-images/issues/9918),
+  [community#155306](https://github.com/orgs/community/discussions/155306)). What CI can
+  still do is compile: `.github/workflows/metal-backend-ci.yml` builds the backend and
+  runs `lit test/Dialect/Metal/`, and 59 of the 64 `test_metal_backend_*.py` files gate
+  themselves on `torch.backends.mps.is_available()`, so they skip rather than fail on a
+  runner. Read a green CI as "it builds and the MLIR checks hold", never as "the kernels
+  compute the right answer" — end-to-end correctness is verified manually on an Apple
+  Silicon machine.
 
 ---
 
