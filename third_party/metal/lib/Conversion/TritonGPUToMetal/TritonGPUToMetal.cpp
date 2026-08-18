@@ -1408,6 +1408,39 @@ cachedMakeRangeReshapeAxis(mlir::Operation *op) {
   return it->second;
 }
 
+// The `order` a slice-encoded rank-1 range must decompose with when its own
+// parent encoding is a PHANTOM — a rank-2 blocked layout that no non-degenerate
+// rank-2 tensor in the module carries.
+//
+// Triton emits one whenever a kernel's inner dim has no `tt.divisibility = 16`:
+// the tile does not vectorize, so a `gamma[None, :]` cone gets a `#blocked1` of
+// its own — usually with the OPPOSITE `order` — and is bridged to the real tile
+// by a `ttg.convert_layout` over a degenerate `1xN`. The range is still the
+// COLUMN of the real tile, but `emitTileAxisCoord` took the divisor from that
+// tile and the order from `#blocked1`, making the column `flat / 64` here and
+// `flat % 64` for every other range over the same tile. A token-embedding
+// layernorm was then wrong in every element but column 0 at D = 33, and exact
+// at D = 32 and D = 48.
+//
+// Only phantoms are re-read. A kernel that genuinely holds two rank-2 tiles of
+// different `order` — a staged `tl.trans`, where `#blocked1` sits on a real
+// 16x8 tensor — keeps its parent's order; substituting there is what the
+// `makeRangeOwnRank2Tile` machinery already exists to get right, and overriding
+// it turned 15 transpose cases wrong in one build.
+//
+// Answered once in the pre-pass, like the two maps above: the walk reads rank-2
+// tensors the conversion is about to erase.
+static llvm::DenseMap<mlir::Operation *, llvm::SmallVector<int64_t, 2>>
+    g_makeRangePhantomOrder;
+
+static std::optional<llvm::SmallVector<int64_t, 2>>
+cachedMakeRangePhantomOrder(mlir::Operation *op) {
+  auto it = g_makeRangePhantomOrder.find(op);
+  if (it == g_makeRangePhantomOrder.end())
+    return std::nullopt;
+  return it->second;
+}
+
 // The rank-2 tile that breaks the one-bijection premise, if the kernel has one.
 //
 // Everything in this backend assumes one (thread, iv) -> element mapping per
@@ -1591,24 +1624,29 @@ static mlir::Value emitTileCoordByOrder(mlir::Operation *op,
       .getResult();
 }
 
+template <typename OrderT>
 static mlir::Value
-emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
-                  mlir::triton::gpu::BlockedEncodingAttr parent, int axis,
-                  mlir::ConversionPatternRewriter &rewriter,
-                  mlir::Location loc) {
+emitTileAxisCoordWithOrder(mlir::Operation *op, const TileInfo &tile,
+                           OrderT order, int axis,
+                           mlir::ConversionPatternRewriter &rewriter,
+                           mlir::Location loc) {
   mlir::Value idxI32 = emitTileFlatIndex(op, tile, rewriter, loc);
-  // Pick div/rem and the divisor based on the PARENT BlockedEncoding's `order`
-  // permutation. With order=[1,0] (dim 1 contiguous), the canonical
-  // linearization is `tid = row*N + col` (divisor = N), so axis=0 (row) = tid/N
-  // (div) and axis=1 (col) = tid%N (rem). With order=[0,1] (dim 0 contiguous),
+  // Pick div/rem and the divisor based on the `order` permutation. With
+  // order=[1,0] (dim 1 contiguous), the canonical linearization is
+  // `tid = row*N + col` (divisor = N), so axis=0 (row) = tid/N (div) and
+  // axis=1 (col) = tid%N (rem). With order=[0,1] (dim 0 contiguous),
   // linearization is `tid = col*M + row` (divisor = M), so axis=0 (row) = tid%M
   // (rem) and axis=1 (col) = tid/M (div). Pre-L1d2 the codebase only saw
   // order=[1,0] kernels; the L1d2 staged-transpose body's dst encoding is
   // order=[0,1] (`#blocked1` in matrix_transpose TTGIR), so this branch is now
   // load-bearing.
-  auto parentOrder = parent.getOrder();
-  bool rowMajor =
-      parentOrder.size() == 2 && parentOrder[0] == 1 && parentOrder[1] == 0;
+  //
+  // ⚠️ The order and the divisor are one linearization, so `order` must be the
+  // order of the tensor `tile` came from. The overload below passes the
+  // caller's parent encoding, which is that tensor in every kernel with a
+  // single rank-2 blocked layout; `makeRangePhantomParentOrder` is where the
+  // two come apart.
+  bool rowMajor = order.size() == 2 && order[0] == 1 && order[1] == 0;
   int64_t divisor = rowMajor ? tile.shape[1] : tile.shape[0];
   auto bn = mlir::arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(divisor));
@@ -1617,6 +1655,15 @@ emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
         .getResult();
   return mlir::arith::RemSIOp::create(rewriter, loc, idxI32, bn.getResult())
       .getResult();
+}
+
+static mlir::Value
+emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
+                  mlir::triton::gpu::BlockedEncodingAttr parent, int axis,
+                  mlir::ConversionPatternRewriter &rewriter,
+                  mlir::Location loc) {
+  return emitTileAxisCoordWithOrder(op, tile, parent.getOrder(), axis, rewriter,
+                                    loc);
 }
 
 // Largest non-pointer rank-`rank` blocked tensor in the module — the tile whose
@@ -1959,6 +2006,16 @@ struct MakeRangeLowering
           if (!tile)
             tile = findLargestRank2Tile(op);
           if (tile && tile->rank == 2 && tile->shape.size() == 2) {
+            // `parent` is the encoding of the tile in every kernel with one
+            // rank-2 blocked layout. When it is a phantom that no real rank-2
+            // tensor carries, the divisor below would come from the tile and
+            // the order from the phantom — one tile, two linearizations.
+            if (auto order = cachedMakeRangePhantomOrder(op)) {
+              rewriter.replaceOp(
+                  op, emitTileAxisCoordWithOrder(op, *tile, *order, axis,
+                                                 rewriter, loc));
+              return mlir::success();
+            }
             rewriter.replaceOp(op, emitTileAxisCoord(op, *tile, parent, axis,
                                                      rewriter, loc));
             return mlir::success();
@@ -25404,6 +25461,7 @@ struct ConvertTritonGPUToMetalPass
     // point at freed ops from the previous kernel in the same process.
     g_makeRangeOwnTile.clear();
     g_makeRangeReshapeAxis.clear();
+    g_makeRangePhantomOrder.clear();
     g_tileExchange.clear();
     g_tileExchangeBuf.clear();
 
@@ -26263,6 +26321,30 @@ struct ConvertTritonGPUToMetalPass
             slice.getParent());
         if (parent.getOrder().size() != 2)
           return; // the rank-3 cone path has its own decomposition
+        // Is `parent` a phantom — an encoding no real rank-2 tensor carries?
+        // Degenerate `1xN` / `Mx1` intermediates do not count: they are the
+        // expand_dims result on the way to a tile, and the whole point is that
+        // a phantom appears on nothing else.
+        {
+          bool onRealTile = false;
+          moduleOp.walk([&](mlir::Operation *inner) {
+            for (mlir::Value v : inner->getResults()) {
+              auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+              if (!rt || rt.getRank() != 2 || rt.getEncoding() != parent)
+                continue;
+              if (rt.getDimSize(0) > 1 && rt.getDimSize(1) > 1)
+                onRealTile = true;
+            }
+          });
+          if (!onRealTile) {
+            std::optional<TileInfo> real = findLargestRank2Tile(range);
+            if (real && real->order.size() == 2 &&
+                !std::equal(real->order.begin(), real->order.end(),
+                            parent.getOrder().begin(),
+                            parent.getOrder().end()))
+              g_makeRangePhantomOrder[range.getOperation()] = real->order;
+          }
+        }
         std::optional<TileInfo> own = makeRangeOwnRank2Tile(range);
         std::optional<TileInfo> global = findLargestRank2Tile(range);
         const bool globalUsable = global && global->rank == 2;
