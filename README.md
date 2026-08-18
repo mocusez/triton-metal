@@ -21,12 +21,12 @@ Triton kernel (Python @triton.jit)
         │   third_party/metal/lib/Target/Metal
         ▼
    MSL (Metal Shading Language source text)
-        │   third_party/metal/lib/Runtime
+        │   third_party/metal/backend/driver.py
         ▼
-   Runner (xcrun metal → .metallib → MTLComputePipelineState → dispatch)
+   torch.mps.compile_shader → dispatch on the MPS stream
 ```
 
-The runtime shells out to `xcrun -sdk macosx metal` at launch time to compile the emitted MSL into a `.metallib`, then dispatches via the Metal API. **Receiving machines must have Xcode (or the Command Line Tools' Metal toolchain) installed.**
+The backend's own pipeline stops at MSL text. Launching goes through PyTorch's MPS runtime: `torch.mps.compile_shader` compiles the emitted MSL and dispatches it directly against MPS tensors, zero-copy and ordered on the MPS stream. There is no `.metallib` stage and no native Metal runtime — `libtriton.so` links no Apple framework at all (`otool -L` shows only libz, libSystem and libc++). **An MPS-enabled PyTorch on Apple Silicon is therefore a hard runtime requirement**; without it the driver raises `Metal backend is MPS-only`.
 
 ---
 
@@ -34,8 +34,14 @@ The runtime shells out to `xcrun -sdk macosx metal` at launch time to compile th
 
 ### Prerequisites
 
-- Apple Silicon Mac (M1 or newer; the runtime currently targets `MTLGPUFamilyApple9` with fallback to Apple8..Apple1)
-- macOS 14+ (the SDK gate for Apple9 detection is `__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000`)
+To **run** a released wheel:
+
+- Apple Silicon Mac (M1 or newer)
+- macOS 26+ for the published wheel — it is tagged `macosx_26_0_arm64` after the build machine's SDK, see Known limitations
+- Python 3.12+ and an MPS-enabled PyTorch (`torch.backends.mps.is_available()`, and `torch.mps.compile_shader`, added in PyTorch 2.7). No Xcode or Metal toolchain is needed at run time — PyTorch compiles the shader.
+
+To **build from source**, additionally:
+
 - Xcode 15+ with Command Line Tools (`xcode-select --install`)
 - [pixi](https://pixi.sh) for environment management
 
@@ -52,25 +58,41 @@ pixi install
 pixi run install   # builds Triton + Metal backend in editable mode
 ```
 
-### Build a wheel for local testing
+### Build a release wheel
 
 ```bash
-pixi run python setup.py bdist_wheel
-# → dist/triton-*.whl  (~120 MB; bundles all backends + libtriton.so)
+TRITON_WHEEL_BACKENDS=metal TRITON_BUILD_PROTON=0 TRITON_STABLE_ABI=1 \
+    pixi run python setup.py bdist_wheel
+# → dist/triton-3.8.0+git<sha>-cp312-abi3-macosx_26_0_arm64.whl  (~59 MB)
 ```
 
-Install the wheel into a throwaway venv to verify it is self-contained:
+- `TRITON_WHEEL_BACKENDS=metal` ships only the Metal Python backend. All three
+  backends are still *compiled* — core TritonGPU includes the NVIDIA NVWS dialect
+  headers and `python/src/gluon_ir.cc` includes the AMD ones, so the build does not
+  narrow — but the wheel drops the NVIDIA Linux toolchain payload (ptxas, cupti,
+  ~281 MB unpacked) that could never run on macOS. Leaving it unset ships everything,
+  which is roughly a 120 MB wheel.
+- `TRITON_STABLE_ABI=1` tags the wheel `cp312-abi3`, so one artifact covers Python
+  3.12+ instead of a wheel per interpreter.
+- `TRITON_BUILD_PROTON=0` drops the CUDA/ROCm profiler.
+
+Install into a throwaway venv to verify it is self-contained:
 
 ```bash
 python3 -m venv /tmp/triton-test
+/tmp/triton-test/bin/pip install torch
 /tmp/triton-test/bin/pip install --no-deps dist/triton-*.whl
 /tmp/triton-test/bin/python -c "
-import triton
+from triton.backends import backends
 from triton.backends.metal.driver import MetalDriver
-print(MetalDriver().get_current_target())
+print(sorted(backends), MetalDriver().get_current_target())
 "
-# → GPUTarget(backend='metal', arch=9, warp_size=32)
+# → ['metal'] GPUTarget(backend='metal', arch=9, warp_size=32)
 ```
+
+Note that `python/test/unit/test_metal_backend_l1d2d_probe.py` cannot be part of a
+wheel check: it drives the `triton-metal-opt` / `triton-metal-translate` binaries out
+of the build directory, which no wheel carries.
 
 ### Run the tests
 
@@ -132,8 +154,9 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 - **No autotuning, no perf work.** Generated MSL is single-threadgroup-per-program and makes no use of SIMD-group reductions, threadgroup memory, or vectorized loads. Throughput will be **far** below what Metal-native kernels achieve.
 - **Op coverage is partial.** Many `tl.*` ops are unimplemented; you will hit `NYI` errors on non-trivial kernels.
 - **No general `tl.dot` / matmul lowering.** Correctness fallbacks cover selected proven f32 GEMM and Gram shapes, but arbitrary dot layouts remain unsupported. Broader SIMD-group-matrix mapping is future work.
-- **Runtime shells out to `xcrun`** at every launch — no MSL caching across processes yet.
-- **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`). For broader distribution it should be re-tagged to the minimum supported macOS.
+- **Launching requires PyTorch MPS.** `torch.mps.compile_shader` compiles the MSL once per process; nothing is cached across processes, and the compiled shader library lives and dies with the interpreter.
+- **The runtime tracks PyTorch's MPS surface.** Capabilities can regress with a torch upgrade: on torch 2.13 `torch.zeros(..., dtype=torch.float8_e4m3fn, device="mps")` fails with `Undefined type Float8_e4m3fn`, so the fp8 paths need torch 2.10-era MPS support even though the backend's own fp8 casts are unchanged.
+- **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`), so a wheel built on macOS 26 will not install on macOS 14/15. Nothing in `libtriton.so` links an Apple framework, so building with `MACOSX_DEPLOYMENT_TARGET` set lower is the fix — untested so far.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
 - **No GPU CI — GitHub Actions cannot run the Metal/MPS tests.** GitHub-hosted macOS
   runners are virtualized and expose no usable Metal device to PyTorch: MPS is either
@@ -154,7 +177,7 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 - **Performance pass:** SIMD-group primitives, threadgroup memory, vectorized loads, and a coarser tile-to-threadgroup mapping. The current generator leaves >10× on the table for memory-bound kernels.
 - **`tl.dot` lowering** onto Apple SIMD-group matrix instructions (Apple7+).
 - **Broader op coverage:** atomics, more transcendentals, integer reductions, gather/scatter beyond simple masked load.
-- **Compiled-kernel caching:** persist `.metallib` blobs across processes instead of re-invoking `xcrun` on every launch.
+- **Compiled-kernel caching:** persist the compiled shader library across processes instead of re-running `torch.mps.compile_shader` in every interpreter.
 - **Automated correctness suite** covering medium/hard LeetGPU and a subset of upstream Triton tutorials.
 - **Build-system convergence with upstream:** drop pixi, integrate the Metal backend behind the upstream `setup.py` backend-selection flow, and produce a properly-tagged wheel for general distribution.
 - **macOS CI** to gate regressions on Apple Silicon.
@@ -171,8 +194,7 @@ third_party/metal/
 ├── lib/Conversion/
 │   └── TritonGPUToMetal/          TTGIR → Metal Dialect lowering
 ├── lib/Dialect/Metal/             Dialect verifiers, canonicalization
-├── lib/Target/Metal/              Metal Dialect → MSL text translation
-└── lib/Runtime/                   xcrun + Metal API runner (Runtime.mm)
+└── lib/Target/Metal/              Metal Dialect → MSL text translation
 
 python/triton/backends/metal/      Installed Python entry point
 python/test/unit/test_metal_backend_*.py   GPU smoke tests
