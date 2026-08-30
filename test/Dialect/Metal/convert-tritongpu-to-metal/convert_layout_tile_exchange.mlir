@@ -42,6 +42,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.store %oa, %c : tensor<64x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // Two observable cross-lane relabels require three complete tile phases.
+  // Keeping both exchanges inside one scalarized register-band loop is a
+  // write/read race: the second exchange may need a slot that another lane
+  // publishes in a later loop iteration.
+  tt.func public @two_permute_exchanges(%x: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %o: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+    %one = arith.constant dense<1.0> : tensor<64xf32, #blocked>
+    %i = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %xs = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xs, %i : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %v = tt.load %xa : tensor<64x!tt.ptr<f32>, #blocked>
+    %first = ttg.convert_layout %v : tensor<64xf32, #blocked> -> tensor<64xf32, #linear>
+    %second = ttg.convert_layout %first : tensor<64xf32, #linear> -> tensor<64xf32, #blocked>
+    %sum = arith.addf %second, %one : tensor<64xf32, #blocked>
+    %os = tt.splat %o : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %os, %i : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    tt.store %oa, %sum : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 }
 
 // One buffer for the whole tile, allocated in the PROLOGUE so it dominates both
@@ -60,4 +79,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.barrier
 // CHECK: scf.for
 // CHECK: metal.tg_load_indexed %[[BUF]]
+// CHECK: metal.store
+
+// Each exchange owns a stable full-tile buffer, and each publish ends one
+// scalarized phase.  The middle phase reads the first buffer and publishes the
+// second before the next uniform barrier.
+// CHECK-LABEL: metal.kernel two_permute_exchanges
+// CHECK: %[[BUF0:.+]] = metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: %[[BUF1:.+]] = metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed %[[BUF0]]
+// CHECK: }
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed %[[BUF0]]
+// CHECK: metal.tg_store_indexed %[[BUF1]]
+// CHECK: }
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed %[[BUF1]]
 // CHECK: metal.store

@@ -175,6 +175,15 @@ sparse-optimized path.
 
 In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individual lowering features — arith constants, transcendentals, integer arithmetic, masked load with `other`, dynamic `N`, multi-program launch, 2D elementwise, and the standard `kernel[grid](...)` launch protocol.
 
+The current values-only `tl.topk` is supported for static `i32`, `f16`,
+`bf16`, and `f32` tensors, ascending or descending, along the final dimension.
+This includes rank-1/2/3 and multi-register-band inputs when the compiler's
+typed phase-exchange scratch stays within Metal's 32 KiB threadgroup-memory
+budget. The shared Triton frontend rules still apply (`k > 0`, power-of-two
+`k`, and `k <= N`); indices, dynamic shapes, non-final dimensions, and cases
+whose required phase scratch exceeds that budget are not part of this support
+contract.
+
 ---
 
 ## Known limitations

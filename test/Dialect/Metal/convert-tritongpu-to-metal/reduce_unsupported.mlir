@@ -7,20 +7,21 @@
 // policy; this fixture exercises the pre-pass rejection gate.
 
 // -----
-// Rank >= 3 IS implemented now, by the staged fallback, but only for a tile it
-// can publish in one pass. 16x8x8 is 1024 elements over 128 threads, so it
-// stays rejected — and the message names the envelope instead of a session.
+// Multi-band rank-N reduce is implemented through full-tile phases, but the
+// typed ping-pong pool remains bounded by Metal's 32 KiB threadgroup budget.
+// This one f32 materialization alone needs 64 KiB, so it is rejected with the
+// required and limit byte counts instead of reaching legalization.
 #blocked3d = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [2, 4, 4], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
 #slice3d = #ttg.slice<{dim = 0, parent = #blocked3d}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank3(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<0.0> : tensor<16x8x8xf32, #blocked3d>
-    // expected-error @+1 {{rank >= 3 reduce is implemented for a blocked tile of at most one element per thread}}
+  // expected-error @+1 {{full-tile exchange scratch needs 65536 bytes, exceeding the 32768-byte budget}}
+  tt.func public @reduce_rank3_over_budget(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<0.0> : tensor<128x64x2xf32, #blocked3d>
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32
       tt.reduce.return %s : f32
-    }) {axis = 0 : i32} : (tensor<16x8x8xf32, #blocked3d>) -> tensor<8x8xf32, #slice3d>
+    }) {axis = 2 : i32} : (tensor<128x64x2xf32, #blocked3d>) -> tensor<128x64xf32, #ttg.slice<{dim = 2, parent = #blocked3d}>>
     tt.return
   }
 }
