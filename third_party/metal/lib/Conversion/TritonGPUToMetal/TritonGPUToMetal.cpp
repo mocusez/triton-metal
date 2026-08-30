@@ -7215,9 +7215,10 @@ static bool rank2ConeSupported(mlir::Value v, int depth);
 // holds for the softmax shape where all operands are `(batch, N)` tiles).
 //
 // Increment 1 producers: tt.load, f32 arith {add,sub,mul,div,maximumf,
-// maxnumf} (BOTH operands recursed — two-tensor products like `q0*k0 + q1*k1`
-// are supported), unary math {exp,sqrt,log,sin,cos,erf,rsqrt}, tt.splat and
-// splat arith.constant. Broadcast/expand_dims (per-row / per-col), tl.where
+// maxnumf}, integer arith {add,sub,mul,divsi,divui,remsi,remui,bitwise,shift}
+// (BOTH operands recursed — two-tensor products like `q0*k0 + q1*k1` are
+// supported), unary math {exp,sqrt,log,sin,cos,erf,rsqrt}, tt.splat and splat
+// arith.constant. Broadcast/expand_dims (per-row / per-col), tl.where
 // (arith.select + cmp), and prior-reduce-result broadcast are Increment 2.
 // Returns null on any unsupported producer (caller bails to notifyMatchFailure).
 //===----------------------------------------------------------------------===//
@@ -7455,6 +7456,8 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
         evalRank2ConeAt(rhs, rVal, rowBase, nVal, rewriter, loc, depth + 1);
     if (!a || !b)
       return mlir::Value{};
+    a = toSignlessInt(a, rewriter, loc);
+    b = toSignlessInt(b, rewriter, loc);
     return make(a, b);
   };
   if (auto o = mlir::dyn_cast<mlir::arith::AddIOp>(def))
@@ -7468,6 +7471,22 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
   if (auto o = mlir::dyn_cast<mlir::arith::MulIOp>(def))
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
       return mlir::arith::MulIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::DivSIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::DivSIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::DivUIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::DivUIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::RemSIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::RemSIOp::create(rewriter, loc, a, b).getResult();
+    });
+  if (auto o = mlir::dyn_cast<mlir::arith::RemUIOp>(def))
+    return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+      return mlir::arith::RemUIOp::create(rewriter, loc, a, b).getResult();
     });
   // Boolean combine of per-element predicates — the rank-2 mask
   // `(rows<M) & (cols<N)` is `andi(broadcast(cmpi), broadcast(cmpi))`.
@@ -7934,10 +7953,13 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
                 mlir::arith::DivFOp, mlir::arith::MaximumFOp,
                 mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
                 mlir::arith::MinNumFOp, mlir::arith::AddIOp, mlir::arith::SubIOp,
-                mlir::arith::MulIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
-                mlir::arith::XOrIOp, mlir::arith::ShLIOp,
-                mlir::arith::ShRSIOp, mlir::arith::ShRUIOp,
-                mlir::arith::CmpIOp, mlir::arith::CmpFOp>(def))
+                mlir::arith::MulIOp, mlir::arith::DivSIOp,
+                mlir::arith::DivUIOp, mlir::arith::RemSIOp,
+                mlir::arith::RemUIOp, mlir::arith::AndIOp,
+                mlir::arith::OrIOp, mlir::arith::XOrIOp,
+                mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
+                mlir::arith::ShRUIOp, mlir::arith::CmpIOp,
+                mlir::arith::CmpFOp>(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1) &&
            rank2ConeSupported(def->getOperand(1), depth + 1);
   if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,

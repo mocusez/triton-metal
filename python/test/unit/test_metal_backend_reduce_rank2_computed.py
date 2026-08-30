@@ -67,6 +67,37 @@ def _sum_twoload(a_ptr, b_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
     tl.store(out_ptr + rm, tl.sum(xa * xb, axis=1))
 
 
+@triton.jit
+def _fft_like_remainder_twoload_reduce(
+    x_ptr,
+    real_ptr,
+    imag_ptr,
+    n_rows,
+    n_cols,
+    period,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BM + tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    row_mask = rows < n_rows
+    col_mask = cols < n_cols
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    xr = tl.load(x_ptr + 2 * cols, mask=col_mask, other=0.0)
+    xi = tl.load(x_ptr + 2 * cols + 1, mask=col_mask, other=0.0)
+    phase_i = (rows[:, None] * cols[None, :]) % period
+    phase = (phase_i.to(tl.float32) / period) * -6.283185307179586
+    c = tl.cos(phase)
+    s = tl.sin(phase)
+    real = tl.sum(tl.where(mask, xr[None, :] * c - xi[None, :] * s, 0.0), axis=1)
+    imag = tl.sum(tl.where(mask, xr[None, :] * s + xi[None, :] * c, 0.0), axis=1)
+
+    tl.store(real_ptr + rows, real, mask=row_mask)
+    tl.store(imag_ptr + rows, imag, mask=row_mask)
+
+
 SHAPES = [(8, 16), (4, 32), (128, 64)]
 
 
@@ -146,6 +177,39 @@ def test_reduce_sum_two_load_product(M, N):
     out = torch.zeros((M,), dtype=torch.float32).contiguous()
     _sum_twoload[(1, 1, 1)](a, b, out, M, N)
     torch.testing.assert_close(out.cpu(), (a * b).sum(dim=1), atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("n_rows,n_cols,block_m,block_n", [(17, 63, 32, 64), (65, 65, 32, 128)])
+def test_reduce_sum_fft_like_remainder_two_loads(n_rows, n_cols, block_m, block_n):
+    """DFT-shaped rank-2 cone with runtime tensor remainder and adjacent sums."""
+    torch.manual_seed(0xD7F + n_rows * 31 + n_cols)
+    source = torch.randn(n_cols, 2, dtype=torch.float32)
+    real = torch.empty(n_rows, dtype=torch.float32, device="mps")
+    imag = torch.empty(n_rows, dtype=torch.float32, device="mps")
+
+    _fft_like_remainder_twoload_reduce[(triton.cdiv(n_rows, block_m),)](
+        source.reshape(-1).to("mps"),
+        real,
+        imag,
+        n_rows,
+        n_cols,
+        n_cols,
+        BM=block_m,
+        BN=block_n,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+
+    rows = torch.arange(n_rows, dtype=torch.int64)[:, None]
+    cols = torch.arange(n_cols, dtype=torch.int64)[None, :]
+    phase_i = torch.remainder(rows * cols, n_cols)
+    phase = phase_i.to(torch.float64) / n_cols * -6.283185307179586
+    xr = source[:, 0].to(torch.float64)[None, :]
+    xi = source[:, 1].to(torch.float64)[None, :]
+    expected_real = (xr * torch.cos(phase) - xi * torch.sin(phase)).sum(dim=1)
+    expected_imag = (xr * torch.sin(phase) + xi * torch.cos(phase)).sum(dim=1)
+    torch.testing.assert_close(real.cpu().double(), expected_real, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(imag.cpu().double(), expected_imag, atol=5e-4, rtol=5e-4)
 
 
 # --- Increment 2: tt.where + per-column make_range broadcast + comparison ---
