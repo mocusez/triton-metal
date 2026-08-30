@@ -448,7 +448,16 @@ def get_package_dirs():
 
 
 def get_packages():
-    yield from find_packages(where="python")
+    # Editable installs leave backend and Proton symlinks in the source tree.
+    # Do not let those links override the wheel-specific package selection.
+    dynamic_package_prefixes = (
+        "triton.backends.",
+        "triton.language.extra.",
+        "triton.tools.extra.",
+        "triton.profiler",
+    )
+    yield from (package for package in find_packages(where="python")
+                if not package.startswith(dynamic_package_prefixes))
 
     for backend in backends:
         yield f"triton.backends.{backend.name}"
@@ -467,6 +476,39 @@ def get_packages():
 
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield "triton.profiler"
+
+
+def get_exclude_package_data():
+    excluded = {"": [
+        "__pycache__",
+        "__pycache__/*",
+        "*.py[cod]",
+        "_C/*.so",
+    ]}
+
+    # MANIFEST.in grafts python/triton, so backend links left by an editable
+    # install would otherwise be treated as package data of their parent.
+    dynamic_roots = (
+        ("triton.backends", "python/triton/backends", {backend.name for backend in backends}),
+        ("triton.language.extra", "python/triton/language/extra", {
+            name
+            for backend in backends if backend.language_dir
+            for name in os.listdir(backend.language_dir)
+        }),
+        ("triton.tools.extra", "python/triton/tools/extra", {
+            name
+            for backend in backends if backend.tools_dir
+            for name in os.listdir(backend.tools_dir)
+        }),
+    )
+    for package, root, included in dynamic_roots:
+        excluded[package] = [f"{path.name}/*" for path in Path(root).iterdir()
+                             if path.is_dir() and path.name not in included]
+
+    if not check_env_flag("TRITON_BUILD_PROTON", "ON"):
+        excluded["triton"] = ["profiler/*"]
+
+    return excluded
 
 
 def add_link_to_backends(external_only):
@@ -516,6 +558,11 @@ class plugin_bdist_wheel(bdist_wheel):
         return super().get_tag()
 
     def run(self):
+        # install_lib copies the entire build_lib tree into the wheel, so stale
+        # files from a build with different backend options must not survive.
+        build_lib = Path(self.get_finalized_command("build").build_lib)
+        if build_lib.exists():
+            shutil.rmtree(build_lib)
         add_links(external_only=True)
         super().run()
 
@@ -638,11 +685,7 @@ setup(
     package_dir=dict(get_package_dirs()),
     entry_points=get_entry_points(),
     include_package_data=True,
-    exclude_package_data={"": [
-        "__pycache__",
-        "__pycache__/*",
-        "*.py[cod]",
-    ]},
+    exclude_package_data=get_exclude_package_data(),
     package_data={
         # Headers and TableGen definitions copied into the wheel staging dir by
         # the wheel_headers CMake install component.  Paths are relative to the

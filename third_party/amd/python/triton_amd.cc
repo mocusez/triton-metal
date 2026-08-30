@@ -566,11 +566,7 @@ void init_triton_amd(py::module_ &m) {
           auto libraries = py::module_::import_("rocm_sdk")
                                .attr("find_libraries")("hipblaslt");
           auto path = libraries.attr("__getitem__")(0);
-          auto pathString = path.attr("__str__")();
-          const char *pathChars = PyUnicode_AsUTF8(pathString.ptr());
-          if (pathChars == nullptr)
-            throw py::python_error();
-          hipblasLtPath = pathChars;
+          hipblasLtPath = py::cast<std::string>(path.attr("__str__")());
         } catch (py::python_error &e) {
           e.restore();
           if (PyErr_ExceptionMatches(PyExc_ImportError) ||
