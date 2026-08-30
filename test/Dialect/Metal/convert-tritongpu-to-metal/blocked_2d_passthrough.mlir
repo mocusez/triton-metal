@@ -3,9 +3,8 @@
 // 2D blocked-layout foundation: the conversion pipeline now accepts
 // rank=2 tensors when computing tile info. This fixture exercises
 // `tileFromTensor` on a 2D blocked tensor that flows through the
-// already-lowered `tt.splat` op, then returns. No 2D load/store/arith
-// is performed (those require `tt.expand_dims` / `tt.broadcast` /
-// 2D mask lowering which are deferred to the next slice).
+// already-lowered `tt.splat` op, then returns. The fixture intentionally
+// isolates tile discovery; 2D load/store/arith are covered by dedicated tests.
 // See the implementation notes.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [2, 2], order = [1, 0]}>

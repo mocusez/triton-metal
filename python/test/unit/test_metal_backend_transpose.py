@@ -25,18 +25,10 @@ not silently work around):
   `test_trans_combined_with_second_tile` at the bottom of this file and
   by `convert_layout_consumer_reencode.mlir`.
 
-* The masked transpose path (the canonical leet pattern with `mask=...`
-  on both load and store) currently exhibits a downstream miscompile
-  when the cvt result flows into a masked-store's `scf.if` block — even
-  when mask is trivially true. The miscompile shows up as a deterministic
-  drop of writes from threads in non-zero warps and occasionally a race
-  on warp 0. This is INDEPENDENT of L1d2's staging-body correctness:
-  the unmasked transpose kernel (no `tt.load.mask` / `tt.store.mask`)
-  passes bit-exact. Until the masked-store + cvt-body interaction is
-  fixed, the masked path is marked xfail here. The fix likely belongs
-  in `MaskedStoreLowering` (materializing the cvt's threadgroup-load as
-  a top-level value before the `scf.if` body) and is out of L1d2's
-  stated scope.
+* The formerly failing masked transpose path now passes deterministically.
+  The direct address-arithmetic path avoids the cross-lane reload shape that
+  triggered the Apple codegen issue; the parametrized cases remain as plain
+  regression tests.
 """
 
 from __future__ import annotations
@@ -150,52 +142,6 @@ def transpose_kernel_masked(
 # block, with the body referencing `vN` rather than re-evaluating the
 # threadgroup load.
 #
-# However, the *runtime* miscompile this masked variant exhibits is NOT
-# fully eliminated by the inline-barrier contract. Empirically, even
-# with the spec-compliant MSL (let-binding hoisted out of the if-body;
-# additional probes attempted: trailing-barrier drop, `volatile`
-# qualifier on the let-binding, scf.if-condition let-binding) the
-# masked transpose still drops higher-warp lane stores and produces
-# the same warp-0-style result skew as the pre-L1d2b emit. The
-# unmasked staged-transpose, which differs only by the absence of the
-# `if (mask) { … }` wrapper around the trailing `metal.store`, passes
-# bit-exact with the identical cvt body and let-binding hoisted.
-#
-# Per-lane diagnosis (8x8 nw=2 single threadgroup, mask uniformly true):
-#   * out[0..7]  correct (lanes 0..7 wrote their transposed values).
-#   * out[8..14] equal lane (i+8)'s SHIFTED tg_load — as if those lanes'
-#     `id.x % 8` and `id.x / 8` mapped to lid+7 rather than lid. The
-#     pattern is a per-warp lane-aliasing miscompile when the cvt
-#     output flows into `if(mask){devstore;}` even though `mask` is
-#     uniformly true and the if-body touches no threadgroup memory.
-#
-# Conclusion: the Apple Metal compiler bug class that L1d2 surfaced is
-# broader than the inline-barrier theory hypothesised. Triggering the
-# miscompile does not require `tg_load_indexed` to be inlined into the
-# `scf.if` body — it occurs whenever a `threadgroup_barrier;
-# if (cond) { devstore; }` shape is present, even when the if-body
-# touches no threadgroup memory and `cond` is uniformly true at
-# runtime. Surfacing this divergence (per spec § "Reporting
-# expectations" item 6) rather than silently working around it.
-# Candidate next-step fix loci, all out of L1d2b non-goals:
-#   1. Materialise the masked-store's condition+address into thread-
-#      local let-bindings *before* the trailing barrier so the
-#      `scf.if` body becomes a pure device-memory store of pre-computed
-#      operands (will require touching `MaskedStoreLowering` or a new
-#      pre-emit MLIR pass).
-#   2. Drop the cvt body's trailing `metal.barrier` for single-cvt
-#      kernels (touches `ConvertLayoutLowering`).
-#   3. Lift the entire masked-store out of `scf.if` form via a select
-#      on the address (clamped-to-zero on masked-off lanes), avoiding
-#      the divergent control flow shape entirely (touches
-#      `MaskedStoreLowering`).
-#
-# Marking the parametrized cases `xfail(strict=False)` until the
-# correct fix locus is approved. AC.T2's parametrization over
-# (16×16 nw=8, 8×8 nw=2) is preserved per the spec so the regression
-# coverage stays in place once the eventual fix lands. The new canary
-# lit fixture is an AC.M2-level regression test for the let-binding
-# hoisting that the runtime case sits on top of.
 # RESOLVED 2026-06-03 (XPASS disposition): the L1d2c lane-aliasing
 # miscompile described above no longer reproduces. The single-threadgroup
 # (sizePerThread=[1,1], E=1) masked staged-transpose now lowers to a direct

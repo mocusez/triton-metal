@@ -1,15 +1,8 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s --check-prefix=METAL
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
-// MSL stage intentionally NOT checked here — see
-// the implementation notes: the IR emitted
-// by the 2D rank-2 branch of `MaskedLoadLowering` contains a useless
-// `i32 → !tt.ptr<f32> → ui32` round-trip cast that `triton-metal-translate`
-// rejects as an unregistered-dialect type. The Python frontend pathway
-// (verified via `test_metal_backend_vector_add_matrix.py::test_vector_add_2d_matrix`)
-// works because `libmetal.ttgir_to_msl` accepts the stray cast. AC2 of the
-// metal-deferred-followups plan will fix the cast emission at the source;
-// once that lands, this fixture should re-add the `triton-metal-translate
-// --mlir-to-msl | FileCheck %s --check-prefix=MSL` RUN line.
+// The full conversion-to-MSL path is checked here. The obsolete pointer-cast
+// bridge that once blocked `triton-metal-translate` no longer survives.
 //
 // 2D masked-load regression lock for the AC4-v6 follow-up.
 // Shape `tensor<16x256xf32>` with `sizePerThread=[1,4]`, `warpsPerCTA=[4,2]`
@@ -59,3 +52,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // METAL: scf.if
 // METAL: metal.get_element
 // METAL: metal.return
+// MSL-LABEL: kernel void add_2d_masked(
+// MSL: device float *
+// MSL: if (
+// MSL: = {{.*}}[{{.*}}];

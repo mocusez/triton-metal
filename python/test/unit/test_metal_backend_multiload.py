@@ -16,14 +16,9 @@ as the load index, discarding the actual offset arithmetic. As a result:
   * Pattern C (same base, derived offset `offs >> 1`): same drop as B —
     the kernel stored `ptr[id.x]` instead of `ptr[id.x >> 1]`.
 
-Post-fix status: Pattern A PASSES (the AddPtrLowering accumulator + new
-`emitLoadStoreIndex` 1D path now thread constant divergent offsets through
-the per-thread index). Patterns B and C remain BROKEN and are xfailed —
-they need a change to `MakeRangeLowering`'s constant-0 placeholder
-convention so per-thread arange values survive into the scalar IR. That
-change is explicitly out of scope for Phase B (see "Non-Goals" in
-the implementation notes) and is deferred to
-a follow-up session.
+Current status: all three patterns pass. The suite keeps the original failure
+shapes as regression guards for constant offsets, derived offsets, and
+multi-program pointer arithmetic.
 """
 
 from __future__ import annotations

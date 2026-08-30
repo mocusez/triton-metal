@@ -1,45 +1,9 @@
-"""Matmul track v4 canonical-3-iter-arg fitness test (f32 [8,8]).
+"""End-to-end f32 canonical-dot regression tests for 8x8 and 16x16 tiles.
 
-History:
-- iter-3 (L1d3): `preprocessDotCvtChains` strips the #blocked → #dot_op cvts
-  feeding tt.dot, lit-validated on `dot_canonical_preempt_single.mlir`.
-- iter-4: diagnosed the residual XFAIL as a coupled matcher + rewriter gap.
-- iter-5: matcher relax + `extractBK` generalization + `unwrapPtrToKernelArg`
-  extension (broadcast/expand_dims descent) — the MLIR conversion path
-  (`convert-tritongpu-to-metal`) now successfully unrolls both the [8,8,8]
-  (no-loop, single-dot fallback) and [16,16,16] (K_TILES=2, canonical-3
-  iter_arg unroll) shapes. Validated end-to-end at the MLIR level via
-  `test/Dialect/Metal/convert-tritongpu-to-metal/dot_canonical_preempt_3iterarg.mlir`.
-
-Why these cases still XFAIL after iter-5 (ESCALATED):
-The downstream MSL text emitter — invoked AFTER `convert-tritongpu-to-metal`
-inside `libmetal.ttgir_to_msl` — generates calls to legacy Metal intrinsic
-names (`simdgroup_matrix_multiply_accumulate`, `simdgroup_store_matrix`) that
-are no longer declared in the modern Metal toolchain (Metal 17.5 / clang
-32023.883). Sample [8,8,8] failure:
-
-    /var/.../triton-metal-*.metal:21:27:
-      error: use of undeclared identifier 'simdgroup_matrix_multiply_accumulate'
-        simdgroup_float8x8 v9 = simdgroup_matrix_multiply_accumulate(v8, v6, v7);
-    /var/.../triton-metal-*.metal:22:3:
-      error: use of undeclared identifier 'simdgroup_store_matrix';
-              did you mean 'simdgroup_store'?
-
-[16,16,16] hangs in `metalc` compilation (a separate symptom of the same MSL
-emitter mismatch). Both failure surfaces are in the MSL text emitter
-(`third_party/metal/lib/Target/MetalTranslation/`), not in the MLIR
-conversion path that iter-5 targets.
-
-iter-6 + iter-7 ship state (2026-05-20):
-- [8-8-8]: PASS (XFAIL removed by iter-6). FA-derived MSL emitter modernization
-  rewrote the 3 translate functions in `ModuleTranslation.cpp:354-400` to
-  modern Metal 17.5 surface — sufficient for [8-8-8] correctness.
-- [16-16-16]: still XFAIL (strict=True). iter-7 attempted to fix via strideC
-  extraction in `tryUnrollCanonical3IterArgDot` (TritonGPUToMetal.cpp:3265-3275)
-  but the fix was inert — failure mode unchanged (100% mismatch, 10.97 max abs
-  diff). Per iter-7 spec hard-stop protocol, strideC code change is preserved
-  as a strict improvement and the next probe (origin extractor verification)
-  is deferred to iter-8. See `_ITER78_16_REASON` below for full diagnostic.
+Both cases pass. Together they lock the modern SIMD-group matrix emitter, the
+canonical three-iter-arg loop unroller, staged device loads, accumulator
+initialization, and launcher argument filtering. The resolved failure history
+is summarized next to the tests instead of being presented as current status.
 """
 
 from __future__ import annotations
@@ -138,7 +102,7 @@ def dot_8x8_f32_kernel(
     ],
 )
 def test_dot_f32_8x8(M, N, K):
-    """v4 canonical-3-iter-arg fitness, contract-exact tile [8,8,8], f32 throughout.
+    """Canonical 8x8 tile with one or two K tiles, f32 throughout.
 
     On failure, TRITON_REPRODUCER_PATH=/tmp/dot-8x8-f32-fail.mlir captures the
     MLIR reproducer.

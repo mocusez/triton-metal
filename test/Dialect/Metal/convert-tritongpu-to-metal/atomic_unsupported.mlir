@@ -51,3 +51,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_add_scalar_dynamic_mask(%out_ptr: !tt.ptr<i32>, %v: i32, %mask: i1) {
+    // expected-error @+1 {{Metal backend: scalar atomic add/fadd requires a constant true mask}}
+    %old = tt.atomic_rmw add, acq_rel, gpu, %out_ptr, %v, %mask : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_fadd_scalar_dynamic_mask(%out_ptr: !tt.ptr<f32>, %v: f32, %mask: i1) {
+    // expected-error @+1 {{Metal backend: scalar atomic add/fadd requires a constant true mask}}
+    %old = tt.atomic_rmw fadd, acq_rel, gpu, %out_ptr, %v, %mask : (!tt.ptr<f32>, f32, i1) -> f32
+    tt.return
+  }
+}

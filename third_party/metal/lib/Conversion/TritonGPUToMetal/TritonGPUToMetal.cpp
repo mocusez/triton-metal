@@ -7191,6 +7191,7 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
                                      mlir::Value rowBase, mlir::Value nVal,
                                      mlir::ConversionPatternRewriter &rewriter,
                                      mlir::Location loc, int depth);
+static bool rank2ConeSupported(mlir::Value v, int depth);
 
 //===----------------------------------------------------------------------===//
 // Wall 17 (Case C): rank-2 axis=1 reduce over a COMPUTED tile.
@@ -7668,6 +7669,44 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
                .getResult();
   }
   return addr;
+}
+
+// Dry-run companion to `evalAddPtrChainAt`. A direct rank-2 reduce inside a
+// user loop must replay the original pointer expression because its tensor
+// offset can carry the loop induction variable and program base. Validate the
+// complete chain before emitting the row scan so an unsupported address cone
+// becomes a deterministic match failure rather than a partial conversion.
+static bool rank2AddPtrChainSupported(mlir::Value ptrVal, int depth) {
+  if (depth > 24)
+    return false;
+  mlir::Value cur = ptrVal;
+  bool sawOffset = false;
+  while (cur) {
+    bool peeled = true;
+    while (peeled) {
+      peeled = false;
+      if (auto sp = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+        cur = sp.getSrc();
+        peeled = true;
+      } else if (auto bc = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
+        cur = bc.getSrc();
+        peeled = true;
+      } else if (auto ed = cur.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+        cur = ed.getSrc();
+        peeled = true;
+      }
+    }
+    auto addPtr = cur.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!addPtr)
+      break;
+    mlir::Value offset = addPtr.getOffset();
+    if (mlir::isa<mlir::RankedTensorType>(offset.getType()) &&
+        !rank2ConeSupported(offset, depth + 1))
+      return false;
+    sawOffset = true;
+    cur = addPtr.getPtr();
+  }
+  return sawOffset;
 }
 
 // Find a representative `tt.load` anywhere in a computed cone — used to derive
@@ -9711,13 +9750,10 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
 // True if `root`'s expression tree reads `loop`'s induction variable or any of
 // its iter_args, i.e. the value genuinely changes from trip to trip.
 //
-// The rank-2 axis=1 reduce does NOT re-materialise the tile address from the
-// load's offset expression; it fabricates `rowBase = (r + tgid*tpb)*N` and adds
-// only the SCALAR tt.addptr offsets (accumulateScalarAddPtrOffsets drops
-// tensor-typed offsets). That form has no trip term, and the fill is hoisted
-// above the enclosing scf.for, so a trip-varying address would silently reduce
-// trip 0's tile on every iteration. Detect it and bail rather than emit code
-// that is quietly wrong.
+// The rank-2 axis=1 direct-load path must distinguish loop-invariant addresses,
+// which retain the established row-base fast path, from trip-varying addresses,
+// which replay the complete tt.addptr chain at each logical (row, col). This
+// walk finds the latter without treating mere lexical containment as variation.
 //
 // Lexical containment in the loop is deliberately NOT the test: an address that
 // is merely *computed* inside the loop but loop-invariant stays correct under
@@ -10798,6 +10834,19 @@ struct ReduceLowering
     // still correct; hoisting a genuinely varying tile is not.
     const bool loopCarriesState =
         tileLoop && tileLoop.getNumRegionIterArgs() > 0;
+    // Structural SCF conversion can fold a loop-varying scalar base into the
+    // load's tensor offset. In that form the scalar-offset walker below sees
+    // nothing and its historical `tgid*tpb*N` fallback drops both the trip and
+    // the real program stride. Replay the original pointer chain for direct
+    // loads in user loops; `evalAddPtrChainAt` already evaluates every scalar
+    // and tensor offset at the current logical (row, col).
+    const bool replayDirectAddress =
+        !computedCone && (loopVaryingAddr || loopCarriesState);
+    if (replayDirectAddress &&
+        !rank2AddPtrChainSupported(reprLoad.getPtr(), /*depth=*/0))
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 reduce: loop-varying direct-load address has an "
+              "unsupported producer");
     // A loop with iter_args is rebuilt by SCF structural type conversion. The
     // row buffer therefore must live at function entry (below), not merely
     // immediately before the old loop: the replacement loop may otherwise be
@@ -10991,20 +11040,29 @@ struct ReduceLowering
             StoreOp::create(rewriter, loc, hNew, tileBuf, idx);
           }
 
-          // Inner column reduction: rowCombine = combine_n elem(rowBase + n).
-          // For a direct load the element is device[rowBase + n]; for a
-          // computed cone (Wall 17 Case C) it is re-derived per (row, col) by
-          // `evalRank2ConeAt` reading the cone's device loads at rowBase + n.
+          // Inner column reduction: rowCombine = combine_n elem(row, n).
+          // Loop-varying direct loads replay their complete original pointer
+          // chain so tensor-carried trip/program bases are preserved. Other
+          // direct loads retain the established rowBase + n path. Computed
+          // cones are re-derived per (row, col) by `evalRank2ConeAt`.
           auto emitColLoad = [&](mlir::Value colOff) -> mlir::Value {
             if (computedCone)
               return evalRank2ConeAt(coneRoot, r, rowBase, colOff, rewriter,
                                      loc, /*depth=*/0);
-            auto colIdx =
-                mlir::arith::AddIOp::create(rewriter, loc, rowBase, colOff);
+            mlir::Value colIdx;
+            if (replayDirectAddress)
+              colIdx = evalAddPtrChainAt(reprLoad.getPtr(), r, rowBase, colOff,
+                                         rewriter, loc, /*depth=*/0);
+            else
+              colIdx = mlir::arith::AddIOp::create(rewriter, loc, rowBase,
+                                                   colOff)
+                           .getResult();
+            if (!colIdx)
+              return {};
             mlir::Value colIdxUI32 =
                 mlir::UnrealizedConversionCastOp::create(
                     rewriter, loc, mlir::TypeRange{ui32},
-                    mlir::ValueRange{colIdx.getResult()})
+                    mlir::ValueRange{colIdx})
                     .getResult(0);
             return GetElementOp::create(rewriter, loc, loadEltTy, memref,
                                         colIdxUI32)
@@ -11020,6 +11078,9 @@ struct ReduceLowering
             mlir::Value colLower = cColLo.getResult();
             if (isMinF) {
               initVal = emitColLoad(cColLo.getResult());
+              if (!initVal)
+                return rewriter.notifyMatchFailure(
+                    op, "rank-2 reduce: failed to replay direct-load address");
               colLower = cOne.getResult();
             } else {
               // In the tensor's own float type: an f32-typed constant would
@@ -11042,6 +11103,9 @@ struct ReduceLowering
               mlir::Value nIv = colFor.getInductionVar();
               mlir::Value acc = colFor.getRegionIterArgs()[0];
               mlir::Value elt = emitColLoad(nIv);
+              if (!elt)
+                return rewriter.notifyMatchFailure(
+                    op, "rank-2 reduce: failed to replay direct-load address");
               auto combined = BinaryExpOp::create(rewriter, loc, storeTy,
                                                   combineEnum, acc, elt);
               mlir::scf::YieldOp::create(rewriter, loc,
@@ -11061,6 +11125,9 @@ struct ReduceLowering
                   rewriter, loc,
                   rewriter.getI32IntegerAttr(static_cast<int32_t>(j)));
               mlir::Value elt = emitColLoad(cJ.getResult());
+              if (!elt)
+                return rewriter.notifyMatchFailure(
+                    op, "rank-2 reduce: failed to replay direct-load address");
               if (!rowSum)
                 rowSum = elt;
               else if (isAddI || isMulI || isBitwiseI)
@@ -12537,6 +12604,17 @@ struct StoreLowering
 //===----------------------------------------------------------------------===//
 using AtomicCasScratchMap = llvm::DenseMap<mlir::Operation *, mlir::Value>;
 
+static bool isConstantTrueMask(mlir::Value mask) {
+  auto cst = mask.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!cst)
+    return false;
+  if (auto b = mlir::dyn_cast<mlir::BoolAttr>(cst.getValue()))
+    return b.getValue();
+  if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+    return i.getValue().isOne();
+  return false;
+}
+
 // A scalar CAS or RMW is a per-program operation, while every Metal thread
 // executes the kernel body. Hoist one single-element threadgroup buffer for
 // each result-used scalar atomic so lane zero can publish the fetched old value
@@ -12857,19 +12935,10 @@ struct AtomicRmwLowering
 
     // Add keeps its historical constant-true restriction. Min/max/umin/umax
     // consume a scalar mask below, combined with the local-thread guard.
-    if (mlir::Value mask = op.getMask()) {
-      auto cst = mask.getDefiningOp<mlir::arith::ConstantOp>();
-      bool isTrue = false;
-      if (cst) {
-        if (auto b = mlir::dyn_cast<mlir::BoolAttr>(cst.getValue()))
-          isTrue = b.getValue();
-        else if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
-          isTrue = i.getValue().isOne();
-      }
-      if (isAdd && !isTrue)
-        return rewriter.notifyMatchFailure(
-            op, "atomic_rmw: non-trivial mask not supported");
-    }
+    if (mlir::Value mask = op.getMask();
+        mask && isAdd && !isConstantTrueMask(mask))
+      return rewriter.notifyMatchFailure(
+          op, "atomic_rmw: non-trivial mask not supported");
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -24428,6 +24497,11 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
 
     auto tensorType =
         mlir::dyn_cast<mlir::RankedTensorType>(op.getVal().getType());
+    if (!tensorType && (isIntAdd || isFAdd) && op.getMask() &&
+        !isConstantTrueMask(op.getMask())) {
+      reject("scalar atomic add/fadd requires a constant true mask");
+      return;
+    }
     if (tensorType) {
       if (tensorType.getRank() != 1 && tensorType.getRank() != 2) {
         reject("atomic tensor form requires rank 1 or rank 2");
@@ -24560,8 +24634,23 @@ static mlir::LogicalResult validateAtomicCasSupport(mlir::ModuleOp moduleOp) {
       return;
     }
     if (!mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
-            tensorType.getEncoding()))
+            tensorType.getEncoding())) {
       reject("atomic_cas tensor form requires a blocked layout");
+      return;
+    }
+
+    // AtomicCasLowering derives the per-element device index from a
+    // `tt.addptr` tile. Reject other tensor-pointer roots before dialect
+    // conversion mutates the function; otherwise the pattern's match failure
+    // reaches failed-conversion teardown instead of producing a useful error.
+    mlir::Value addressRoot = op.getPtr();
+    while (auto bitcast =
+               addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
+      addressRoot = bitcast.getSrc();
+    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      reject("atomic_cas tensor address must be a tt.addptr tile");
+      return;
+    }
   });
   return mlir::success(valid);
 }
@@ -24772,6 +24861,19 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
                     "the callee, which needs a single-block body; this one has "
                     "control flow the inliner cannot take");
         })
+        .Case<mlir::triton::ExternElementwiseOp>([&](auto o) {
+          auto info = metalExternSymbol(o.getSymbol());
+          if (!info) {
+            reject(o, "tt.extern_elementwise symbol '" + o.getSymbol().str() +
+                          "' has no Metal intrinsic");
+            return;
+          }
+          if (o.getSrcs().size() != info->arity)
+            reject(o, "tt.extern_elementwise symbol '" + o.getSymbol().str() +
+                          "' expects " + std::to_string(info->arity) +
+                          " operands, got " +
+                          std::to_string(o.getSrcs().size()));
+        })
         .Case<mlir::triton::FpToFpOp>([&](auto o) {
           // Implemented for a tensor cast with fp8 on exactly one side; what
           // is left is the scalar form and fp8 -> fp8.
@@ -24832,8 +24934,48 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
       return;
     }
     mlir::Type elemTy = srcTy.getElementType();
-    if (!elemTy.isF32() && !elemTy.isInteger(32))
+    if (!elemTy.isF32() && !elemTy.isInteger(32)) {
       reject(gather, "tl.gather is implemented for f32 and i32 payloads only");
+      return;
+    }
+    if (!idxTy.getElementType().isInteger(32)) {
+      reject(gather, "rank-1 gather requires i32 indices");
+      return;
+    }
+    auto blocked = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(srcTy.getEncoding());
+    if (!blocked) {
+      reject(gather, "rank-1 gather requires a blocked layout");
+      return;
+    }
+    int64_t tpb = 1;
+    for (int64_t threads : blocked.getThreadsPerWarp())
+      tpb *= threads;
+    for (int64_t warps : blocked.getWarpsPerCTA())
+      tpb *= warps;
+    if (tpb <= 0 || (tpb & (tpb - 1)) != 0) {
+      reject(gather, "rank-1 gather requires a power-of-two thread block");
+      return;
+    }
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(gather.getType());
+    int64_t block = srcTy.getDimSize(0);
+    if (!resTy || block <= 0 || idxTy.getDimSize(0) != block ||
+        resTy.getDimSize(0) != block) {
+      reject(gather, "rank-1 gather source, indices, and result must share one "
+                     "non-empty extent");
+      return;
+    }
+    int64_t bufferLength = std::max(block, tpb);
+    if (bufferLength % tpb != 0) {
+      reject(gather, "rank-1 gather tile must be a multiple of the thread "
+                     "block after sub-thread-block padding");
+      return;
+    }
+    int64_t elementsPerThread = bufferLength / tpb;
+    if (elementsPerThread < 1 || elementsPerThread > 64 ||
+        (elementsPerThread & (elementsPerThread - 1)) != 0)
+      reject(gather,
+             "rank-1 gather requires a power-of-two 1..64 elements per thread");
   });
   // `tt.make_range` is a per-element index, and MakeRangeLowering can only
   // decompose one out of a blocked layout (rank-1), a slice-of-blocked (rank-2)
@@ -24998,9 +25140,41 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
       reject("scan is implemented for f32 and i32 only");
       return;
     }
-    if (!scanCombineKind(op, isI32))
+    if (!scanCombineKind(op, isI32)) {
       reject("scan combine must be add or mul (tl.cumsum / tl.cumprod); other "
              "associative_scan combines are not implemented");
+      return;
+    }
+    auto blocked = mlir::dyn_cast_or_null<
+        mlir::triton::gpu::BlockedEncodingAttr>(rtt.getEncoding());
+    if (!blocked) {
+      reject("rank-1 scan requires a blocked layout");
+      return;
+    }
+    int64_t tpb = 1;
+    for (int64_t threads : blocked.getThreadsPerWarp())
+      tpb *= threads;
+    for (int64_t warps : blocked.getWarpsPerCTA())
+      tpb *= warps;
+    if (tpb <= 0 || (tpb & (tpb - 1)) != 0) {
+      reject("rank-1 scan requires a power-of-two thread block");
+      return;
+    }
+    int64_t block = rtt.getDimSize(0);
+    if (block <= 0) {
+      reject("rank-1 scan requires a non-empty tile");
+      return;
+    }
+    int64_t bufferLength = std::max(block, tpb);
+    if (bufferLength % tpb != 0) {
+      reject("rank-1 scan tile must be a multiple of the thread block after "
+             "sub-thread-block padding");
+      return;
+    }
+    int64_t elementsPerThread = bufferLength / tpb;
+    if (elementsPerThread < 1 || elementsPerThread > 64 ||
+        (elementsPerThread & (elementsPerThread - 1)) != 0)
+      reject("rank-1 scan requires a power-of-two 1..64 elements per thread");
   });
   return mlir::success(valid);
 }
@@ -25995,6 +26169,36 @@ struct ConvertTritonGPUToMetalPass
             << combineName;
         reduceOk = false;
         return;
+      }
+      // A direct rank-2 axis=1 load in a user loop replays its complete
+      // tt.addptr chain during the cooperative row scan. Mirror the pattern's
+      // dry run here, before applyFullConversion mutates the function, so an
+      // adjacent unsupported tensor-offset producer fails deterministically.
+      if (rtt.getRank() == 2 && axes == 1) {
+        mlir::Value src = red.getSrcs().front();
+        if (auto cvt =
+                src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+          src = cvt.getSrc();
+        if (auto load = src.getDefiningOp<mlir::triton::LoadOp>();
+            load && !load.getMask()) {
+          bool loopVaryingAddr = false;
+          for (mlir::Operation *parent = red->getParentOp(); parent;
+               parent = parent->getParentOp()) {
+            if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(parent))
+              loopVaryingAddr |= readsLoopCarriedValue(src, loop);
+          }
+          auto tileLoop = findOutermostScfFor(red);
+          const bool loopCarriesState =
+              tileLoop && tileLoop.getNumRegionIterArgs() > 0;
+          if ((loopVaryingAddr || loopCarriesState) &&
+              !rank2AddPtrChainSupported(load.getPtr(), /*depth=*/0)) {
+            red.emitOpError(
+                "rank-2 axis=1 loop-varying direct-load address has an "
+                "unsupported producer");
+            reduceOk = false;
+            return;
+          }
+        }
       }
       if (rtt.getRank() == 1 && combineName == "arith.mulf") {
         mlir::Value src = red.getSrcs().front();

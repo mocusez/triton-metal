@@ -82,6 +82,102 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_unknown_extern(%out: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tt.extern_elementwise symbol '__metal_missing' has no Metal intrinsic}}
+    %r = tt.extern_elementwise %v {libname = "", libpath = "", pure = true, symbol = "__metal_missing"} : (tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    %range = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #blocked>
+    %base = tt.splat %out : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %range : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %ptr, %r : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_extern_arity(%out: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tt.extern_elementwise symbol '__metal_atan2' expects 2 operands, got 1}}
+    %r = tt.extern_elementwise %v {libname = "", libpath = "", pure = true, symbol = "__metal_atan2"} : (tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    %range = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #blocked>
+    %base = tt.splat %out : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %range : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %ptr, %r : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #parent}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank1_slice_scan(%out: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<32xf32, #slice>
+    // expected-error @+1 {{Metal backend: rank-1 scan requires a blocked layout}}
+    %scan = "tt.scan"(%v) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<32xf32, #slice>) -> tensor<32xf32, #slice>
+    %range = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #slice>
+    %base = tt.splat %out : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #slice>
+    %ptr = tt.addptr %base, %range : tensor<32x!tt.ptr<f32>, #slice>, tensor<32xi32, #slice>
+    tt.store %ptr, %scan : tensor<32x!tt.ptr<f32>, #slice>
+    tt.return
+  }
+}
+
+// -----
+
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #parent}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank1_slice_gather() {
+    %v = arith.constant dense<1.0> : tensor<32xf32, #slice>
+    %i = arith.constant dense<0> : tensor<32xi32, #slice>
+    // expected-error @+1 {{Metal backend: rank-1 gather requires a blocked layout}}
+    %g = tt.gather %v[%i] {axis = 0 : i32} : (tensor<32xf32, #slice>, tensor<32xi32, #slice>) -> tensor<32xf32, #slice>
+    tt.print "g: " {hex = false, isSigned = array<i32: 0>} : %g : tensor<32xf32, #slice>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank1_gather_i64_indices() {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %i = arith.constant dense<0> : tensor<128xi64, #blocked>
+    // expected-error @+1 {{Metal backend: rank-1 gather requires i32 indices}}
+    %g = tt.gather %v[%i] {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xi64, #blocked>) -> tensor<128xf32, #blocked>
+    tt.print "g: " {hex = false, isSigned = array<i32: 0>} : %g : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank1_gather_extent_mismatch() {
+    %v = arith.constant dense<1.0> : tensor<64xf32, #blocked>
+    %i = arith.constant dense<0> : tensor<32xi32, #blocked>
+    // expected-error @+1 {{Metal backend: rank-1 gather source, indices, and result must share one non-empty extent}}
+    %g = tt.gather %v[%i] {axis = 0 : i32} : (tensor<64xf32, #blocked>, tensor<32xi32, #blocked>) -> tensor<32xf32, #blocked>
+    tt.print "g: " {hex = false, isSigned = array<i32: 0>} : %g : tensor<32xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // A `#ttg.linear` `tt.make_range` USED to be refused here, because
 // MakeRangeLowering could only decompose a blocked layout (rank-1), a
 // slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and

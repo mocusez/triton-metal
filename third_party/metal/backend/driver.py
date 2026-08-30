@@ -19,10 +19,9 @@ from triton.backends.driver import DriverBase, decompose_descriptor, expand_sign
 def _use_mps_runtime() -> bool:
     """True when the launch path routes through ``torch.mps.compile_shader``
     for zero-copy dispatch on PyTorch MPS tensors (no host staging, no buffer
-    alloc/free, ordered on the MPS stream). Opt out with
-    ``TRITON_METAL_USE_MPS=0``. Mirror of ``compiler._use_mps_runtime`` — keep
-    the two in lockstep so the compiler's binary_ext and the driver's launch
-    path agree on which runtime is active."""
+    alloc/free, ordered on the MPS stream). ``TRITON_METAL_USE_MPS=0`` disables
+    launching; there is no legacy runtime fallback. The result is cached for
+    the interpreter lifetime because backend/device selection is process-wide."""
     if os.environ.get("TRITON_METAL_USE_MPS", "1") == "0":
         return False
     try:
@@ -185,9 +184,11 @@ def _is_pointer_type(ty: str) -> bool:
 
 
 class MetalUtils:
-    """Driver-level utilities. `load_binary` is the load_binary hook that
-    `CompiledKernel._init_handles` calls; it loads the metallib bytes into
-    `MTLLibrary` + `MTLFunction` + `MTLComputePipelineState` handles.
+    """PyTorch-MPS driver hooks used by `CompiledKernel._init_handles`.
+
+    `load_binary` receives generated MSL text, compiles it with
+    `torch.mps.compile_shader`, and returns the resulting ShaderLibrary and
+    callable kernel. There is no native metallib/PSO runtime in this path.
     """
 
     def load_binary(self, name, kernel_bytes, shared_mem, device):
@@ -507,8 +508,9 @@ class MetalDriver(DriverBase):
 
     def get_active_torch_device(self):
         # MPS path: tensors live on the MPS device so the launcher binds them
-        # zero-copy. Without the MPS runtime, tensors live on CPU and the
-        # legacy launcher stages them through MTLBuffers per launch.
+        # zero-copy. Return CPU only when MPS is unavailable, so backend
+        # discovery remains usable; attempting to launch still raises the
+        # explicit MPS-only error in MetalUtils.load_binary.
         #
         # Return the CONCRETE indexed device ("mps:0", not "mps"): a tensor
         # created with device="mps" reports `.device == mps:0`, so an

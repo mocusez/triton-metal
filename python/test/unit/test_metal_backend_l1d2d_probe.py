@@ -1,4 +1,4 @@
-"""L1d2d — 8-cell tg_load_indexed re-diagnosis probe.
+"""L1d2d — tg_load_indexed lane-aliasing regression matrix.
 
 Per the implementation notes,
 re-diagnose the Apple Metal lane-aliasing miscompile after L1d2c Phase B's
@@ -16,10 +16,10 @@ D0  identity     absent   in-warp     -> PASS
 D1  identity     absent   cross-warp  -> PASS
 D2  identity     present  in-warp     -> PASS
 D3  identity     present  cross-warp  -> PASS
-D4  non-id       absent   in-warp     -> ?
-D5  non-id       absent   cross-warp  -> ?
-D6  non-id       present  in-warp     -> likely FAIL if Apple's race is per-warp-shuffle
-D7  non-id       present  cross-warp  -> EXPECTED FAIL (L1d2 anchor)
+D4  non-id       absent   in-warp     -> PASS
+D5  non-id       absent   cross-warp  -> PASS
+D6  non-id       present  in-warp     -> PASS
+D7  non-id       present  cross-warp  -> PASS
 
 Cells are hand-crafted .mlir files under
 `test/Dialect/Metal/l1d2d_probe/cell_D{0..7}.mlir`. The harness fires each
@@ -52,7 +52,7 @@ BUILD_BIN = REPO_ROOT / "build" / "cmake.macosx-11.0-arm64-cpython-3.12" / "bin"
 METAL_OPT = BUILD_BIN / "triton-metal-opt"
 METAL_TRANSLATE = BUILD_BIN / "triton-metal-translate"
 
-ITERS = 10
+ITERS = 30
 
 # Cell metadata: (cell_id, threadgroup_size, num_threadgroups, expected_outcome_doc).
 # Most cells dispatch as 1 threadgroup. D7mtg dispatches as 2 threadgroups
@@ -62,10 +62,10 @@ CELLS = [
     ("D1", 64, 1, "PASS"),
     ("D2", 16, 1, "PASS"),
     ("D3", 64, 1, "PASS"),
-    ("D4", 16, 1, "?"),
-    ("D5", 64, 1, "?"),
-    ("D6", 16, 1, "likely-FAIL-if-in-warp-race"),
-    ("D7", 64, 1, "EXPECTED-FAIL-L1d2-anchor"),
+    ("D4", 16, 1, "PASS"),
+    ("D5", 64, 1, "PASS"),
+    ("D6", 16, 1, "PASS"),
+    ("D7", 64, 1, "PASS"),
     # Extension probes (added after the cube revealed D7 passes):
     # D7mask = D7 + masked-store wrap downstream of trailing barrier
     #          (tests Phase A's `if(mask){devstore}` shape hypothesis).
@@ -143,8 +143,8 @@ def _dispatch(msl: str, kernel_name: str, threadgroup_size: int,
 
 
 @pytest.mark.parametrize("cell_id,threadgroup_size,num_threadgroups,doc", CELLS)
-def test_l1d2d_cell(cell_id, threadgroup_size, num_threadgroups, doc, request):
-    """Run a single cell 10 times, record pass/fail count."""
+def test_l1d2d_cell(cell_id, threadgroup_size, num_threadgroups, doc):
+    """Run a single cell repeatedly and require bit-exact output."""
     msl = _translate_to_msl(cell_id)
     dump_path = pathlib.Path(f"/tmp/l1d2d_dump/{cell_id}.metal")
     dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,15 +176,6 @@ def test_l1d2d_cell(cell_id, threadgroup_size, num_threadgroups, doc, request):
                     print(f"  distinct failing pattern run #{it}: out={out}")
                     break
 
-    # Cells with known lane-aliasing failures: mark xfail until L1d2e ships.
-    # Spec predicted D6/D7 would fail; the actual cube run shows D5
-    # (cross-warp, non-identity, no-barrier) is the race-prone bare-cube
-    # cell. D7mtg is the L1d2 anchor reproduction.
-    if cell_id in {"D5", "D6", "D7", "D7mask", "D7mtg", "D7scratch"} and fail_runs:
-        pytest.xfail(
-            f"L1d2d {cell_id} reproduces lane-aliasing race "
-            f"({pass_count}/{ITERS} runs PASS); pending L1d2e fix"
-        )
     assert pass_count == ITERS, (
         f"L1d2d {cell_id} unexpected failure: {pass_count}/{ITERS} runs PASS"
     )
