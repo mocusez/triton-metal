@@ -644,8 +644,9 @@ void ModuleTranslation::translate(mlir::triton::metal::ThreadgroupAllocaOp op) {
   // qualifier so all threads in the same threadgroup share the buffer. The
   // surrounding indent/level is established by the caller. See
   // the implementation notes AC.I5.
-  _output << "threadgroup " << stringType << " v" << _varCount << "["
-          << memRef.getSize() << "]";
+  _output << "threadgroup ";
+  _output << stringType << " v" << _varCount << "[" << memRef.getSize()
+          << "]";
   _alloca[op] = _varCount++;
   _output << ";";
 }
@@ -6293,7 +6294,8 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::arith::MulFOp, mlir::arith::DivFOp,
                     mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
                     mlir::arith::AddIOp, mlir::arith::SubIOp,
-                    mlir::arith::MulIOp, mlir::arith::CmpIOp,
+                    mlir::arith::MulIOp, mlir::arith::XOrIOp,
+                    mlir::arith::CmpIOp,
                     mlir::arith::CmpFOp, mlir::arith::SelectOp,
                     mlir::arith::SIToFPOp, mlir::math::ExpOp,
                     mlir::math::FloorOp,

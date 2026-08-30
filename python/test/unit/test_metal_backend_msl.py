@@ -44,8 +44,9 @@ def _load_exact_module(path: Path, name: str):
     return module
 
 
-def _compile_to_msl(fn, signature, constexprs, *, num_warps):
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+def _compile_to_msl(fn, signature, constexprs, *, num_warps, attrs=None):
+    src = ASTSource(
+        fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     target = GPUTarget(backend="metal", arch=9, warp_size=32)
     compiled = triton.compile(src, target=target, options={"num_warps": num_warps})
     assert "metal" in compiled.asm, (
@@ -1015,6 +1016,17 @@ def _gather_computed_source_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr)
     tl.store(out_ptr + offs, tl.gather(v, tl.load(idx_ptr + offs), axis=0))
 
 
+@triton.jit
+def _gather_loop_carried_i32_kernel(x_ptr, idx_ptr, out_ptr, steps,
+                                    BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    acc = tl.load(x_ptr + offs)
+    for step in range(steps):
+        indices = tl.load(idx_ptr + step * BLOCK + offs)
+        acc = tl.gather(acc, indices, axis=0) + 3
+    tl.store(out_ptr + offs, acc)
+
+
 @pytest.mark.parametrize("block", [8, 32, 256, 1024])
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
 def test_gather_f32_permutation(block, num_warps):
@@ -1063,6 +1075,30 @@ def test_gather_computed_source(block):
                                atol=1e-6, rtol=1e-6)
 
 
+def test_gather_rank1_loop_carried_source_i32():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block, steps = 1024, 3
+    x = torch.arange(block, dtype=torch.int32)
+    permutations = torch.stack([
+        torch.randperm(block),
+        torch.arange(block - 1, -1, -1),
+        torch.roll(torch.arange(block), 17),
+    ]).to(torch.int32)
+    out = torch.empty(block, dtype=torch.int32, device="mps")
+
+    _gather_loop_carried_i32_kernel[(1,)](
+        x.to("mps"), permutations.to("mps"), out, steps, BLOCK=block,
+        num_warps=4)
+    torch.mps.synchronize()
+
+    expected = x
+    for permutation in permutations:
+        expected = expected[permutation.long()] + 3
+    assert torch.equal(out.cpu(), expected)
+
+
 # --- rank >= 3: tl.sort / tl.flip and the staged reduce --------------------
 #
 # `tl.sort` reshapes its tile into a `[2] * log2(N)` hypercube and drives it
@@ -1097,6 +1133,411 @@ def _sort_desc_kernel(x_ptr, o_ptr, N: tl.constexpr):
 def _flip_kernel(x_ptr, o_ptr, N: tl.constexpr):
     i = tl.arange(0, N)
     tl.store(o_ptr + i, tl.flip(tl.load(x_ptr + i), 0))
+
+
+@triton.jit
+def _topk_v2_kernel(x_ptr, o_ptr, N: tl.constexpr, K: tl.constexpr,
+                    DESCENDING: tl.constexpr):
+    i = tl.arange(0, N)
+    selected = tl.topk(tl.load(x_ptr + i), K, dim=0,
+                       descending=DESCENDING)
+    tl.store(o_ptr + tl.arange(0, K), selected)
+
+
+@triton.jit
+def _topk_rank2_v2_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
+                          K: tl.constexpr, DESCENDING: tl.constexpr):
+    m = tl.arange(0, M)[:, None]
+    n = tl.arange(0, N)[None, :]
+    values = tl.load(x_ptr + m * N + n)
+    selected = tl.topk(values, K, dim=1, descending=DESCENDING)
+    ko = tl.arange(0, K)[None, :]
+    tl.store(o_ptr + m * K + ko, selected)
+
+
+@triton.jit
+def _topk_rank3_v2_kernel(x_ptr, o_ptr, B: tl.constexpr, M: tl.constexpr,
+                          N: tl.constexpr, K: tl.constexpr,
+                          DESCENDING: tl.constexpr):
+    b = tl.arange(0, B)[:, None, None]
+    m = tl.arange(0, M)[None, :, None]
+    n = tl.arange(0, N)[None, None, :]
+    values = tl.load(x_ptr + b * (M * N) + m * N + n)
+    selected = tl.topk(values, K, dim=2, descending=DESCENDING)
+    ko = tl.arange(0, K)[None, None, :]
+    tl.store(o_ptr + b * (M * K) + m * K + ko, selected)
+
+
+@triton.jit
+def _two_topk_kernel(x_ptr, o0_ptr, o1_ptr, N: tl.constexpr,
+                     K0: tl.constexpr, K1: tl.constexpr):
+    values = tl.load(x_ptr + tl.arange(0, N))
+    first = tl.topk(values, K0, dim=0)
+    second = tl.topk(values, K1, dim=0, descending=False)
+    tl.store(o0_ptr + tl.arange(0, K0), first)
+    tl.store(o1_ptr + tl.arange(0, K1), second)
+
+
+@triton.jit
+def _topk_elementwise_followup_kernel(x_ptr, o_ptr, N: tl.constexpr,
+                                      K: tl.constexpr):
+    values = tl.load(x_ptr + tl.arange(0, N))
+    selected = tl.topk(values, K, dim=0)
+    tl.store(o_ptr + tl.arange(0, K), selected * 2 - 1)
+
+
+@triton.jit
+def _topk_reduce_followup_kernel(x_ptr, sum_ptr, N: tl.constexpr,
+                                 K: tl.constexpr):
+    values = tl.load(x_ptr + tl.arange(0, N))
+    selected = tl.topk(values, K, dim=0)
+    tl.store(sum_ptr, tl.sum(selected, axis=0))
+
+
+@triton.jit
+def _mixed_sort_topk_kernel(x_ptr, sort_ptr, topk_ptr, N: tl.constexpr,
+                            K: tl.constexpr):
+    values = tl.load(x_ptr + tl.arange(0, N))
+    tl.store(sort_ptr + tl.arange(0, N), tl.sort(values))
+    tl.store(topk_ptr + tl.arange(0, K), tl.topk(values, K))
+
+
+@triton.jit
+def _masked_topk_v2_kernel(x_ptr, o_ptr, VALID_N: tl.constexpr,
+                           BLOCK_N: tl.constexpr, K: tl.constexpr,
+                           DESCENDING: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_N)
+    padding = -float("inf") if DESCENDING else float("inf")
+    values = tl.load(x_ptr + offsets, mask=offsets < VALID_N, other=padding)
+    selected = tl.topk(values, K, descending=DESCENDING)
+    tl.store(o_ptr + tl.arange(0, K), selected)
+
+
+@pytest.mark.parametrize("N,K,num_warps,descending,dtype", [
+    (32, 1, 1, True, "bf16"),
+    (32, 4, 1, False, "i32"),
+    (8, 4, 1, False, "fp32"),
+    (16, 8, 1, True, "i32"),
+    (32, 32, 4, False, "fp32"),
+    (128, 8, 4, True, "fp16"),
+    (256, 128, 4, False, "bf16"),
+    (512, 8, 8, True, "fp32"),
+    (1024, 2, 8, False, "i32"),
+])
+def test_topk_compile_matrix(N, K, num_warps, descending, dtype):
+    msl = _compile_to_msl(
+        _topk_v2_kernel,
+        {"x_ptr": f"*{dtype}", "o_ptr": f"*{dtype}", "N": "constexpr",
+         "K": "constexpr", "DESCENDING": "constexpr"},
+        {"N": N, "K": K, "DESCENDING": descending},
+        num_warps=num_warps,
+    )
+    assert "threadgroup" in msl
+    assert "threadgroup_barrier" in msl
+
+
+def test_topk_rank2_rank3_and_two_topk_compile_to_msl():
+    rank2_msl = _compile_to_msl(
+        _topk_rank2_v2_kernel,
+        {"x_ptr": "*fp32", "o_ptr": "*fp32", "M": "constexpr",
+         "N": "constexpr", "K": "constexpr", "DESCENDING": "constexpr"},
+        {"M": 8, "N": 64, "K": 8, "DESCENDING": True},
+        num_warps=8,
+    )
+    rank3_msl = _compile_to_msl(
+        _topk_rank3_v2_kernel,
+        {"x_ptr": "*bf16", "o_ptr": "*bf16", "B": "constexpr",
+         "M": "constexpr", "N": "constexpr", "K": "constexpr",
+         "DESCENDING": "constexpr"},
+        {"B": 2, "M": 4, "N": 64, "K": 8, "DESCENDING": False},
+        num_warps=8,
+    )
+    rank3_multiband_msl = _compile_to_msl(
+        _topk_rank3_v2_kernel,
+        {"x_ptr": "*fp32", "o_ptr": "*fp32", "B": "constexpr",
+         "M": "constexpr", "N": "constexpr", "K": "constexpr",
+         "DESCENDING": "constexpr"},
+        {"B": 4, "M": 2, "N": 128, "K": 8, "DESCENDING": False},
+        num_warps=8,
+        attrs={
+            (0,): [["tt.divisibility", 16]],
+            (1,): [["tt.divisibility", 16]],
+        },
+    )
+    two_msl = _compile_to_msl(
+        _two_topk_kernel,
+        {"x_ptr": "*fp32", "o0_ptr": "*fp32", "o1_ptr": "*fp32",
+         "N": "constexpr", "K0": "constexpr", "K1": "constexpr"},
+        {"N": 128, "K0": 8, "K1": 32},
+        num_warps=4,
+    )
+    elementwise_msl = _compile_to_msl(
+        _topk_elementwise_followup_kernel,
+        {"x_ptr": "*fp32", "o_ptr": "*fp32",
+         "N": "constexpr", "K": "constexpr"},
+        {"N": 128, "K": 8},
+        num_warps=4,
+    )
+    reduce_msl = _compile_to_msl(
+        _topk_reduce_followup_kernel,
+        {"x_ptr": "*fp32", "sum_ptr": "*fp32",
+         "N": "constexpr", "K": "constexpr"},
+        {"N": 128, "K": 8},
+        num_warps=4,
+    )
+    mixed_msl = _compile_to_msl(
+        _mixed_sort_topk_kernel,
+        {"x_ptr": "*fp32", "sort_ptr": "*fp32", "topk_ptr": "*fp32",
+         "N": "constexpr", "K": "constexpr"},
+        {"N": 128, "K": 8},
+        num_warps=4,
+    )
+    assert "threadgroup_barrier" in rank2_msl
+    assert "threadgroup_barrier" in rank3_msl
+    assert rank3_multiband_msl.count("threadgroup_barrier") >= 2
+    assert two_msl.count("threadgroup_barrier") >= 2
+    assert elementwise_msl.count("threadgroup_barrier") >= 2
+    assert reduce_msl.count("threadgroup_barrier") >= 2
+    assert mixed_msl.count("threadgroup_barrier") >= 2
+
+
+@pytest.mark.parametrize("N,K,num_warps,descending", [
+    (8, 4, 1, False),
+    (16, 8, 1, True),
+    (128, 8, 4, False),
+    (512, 8, 8, True),
+])
+def test_topk_exact_permutation(N, K, num_warps, descending):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(N * 97 + K)
+    values = torch.randperm(N).to(torch.float32)
+    out = torch.empty(K, dtype=torch.float32, device="mps")
+    _topk_v2_kernel[(1,)](values.to("mps"), out, N, K, descending,
+                        num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = values.sort(descending=descending).values[:K]
+    assert torch.equal(out.cpu(), expected)
+
+
+_TOPK_SMALL_CASES = [
+    (N, K, num_warps, descending, dtype)
+    for N in (2, 4, 8, 16, 32)
+    for K in (1, 2, 4, 8, 16, 32)
+    if K <= N
+    for num_warps in (1, 4)
+    for descending in (False, True)
+    for dtype in ("i32", "fp32")
+]
+
+
+@pytest.mark.parametrize(
+    "N,K,num_warps,descending,dtype", _TOPK_SMALL_CASES)
+def test_topk_small_exhaustive(N, K, num_warps, descending, dtype):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(N * 4099 + K * 31 + num_warps)
+    values = torch.randperm(N)
+    values = values.to(torch.int32 if dtype == "i32" else torch.float32)
+    values -= N // 2
+    out = torch.empty(K, dtype=values.dtype, device="mps")
+    _topk_v2_kernel[(1,)](values.to("mps"), out, N, K, descending,
+                        num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = values.sort(descending=descending).values[:K]
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("N,K,num_warps,descending,dtype", [
+    (64, 2, 1, True, "fp16"),
+    (128, 8, 4, False, "bf16"),
+    (256, 128, 4, True, "i32"),
+    (512, 8, 8, False, "fp32"),
+    (1024, 2, 8, True, "i32"),
+])
+def test_topk_multiband_dtypes(N, K, num_warps, descending, dtype):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch_dtype = {
+        "i32": torch.int32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[dtype]
+    torch.manual_seed(N * 101 + K)
+    values = torch.randperm(N).to(torch_dtype)
+    if dtype == "i32":
+        values -= N // 2
+    out = torch.empty(K, dtype=torch_dtype, device="mps")
+    _topk_v2_kernel[(1,)](values.to("mps"), out, N, K, descending,
+                        num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = values.sort(descending=descending).values[:K]
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("M,N,K,num_warps,descending", [
+    (2, 64, 8, 4, True),
+    (8, 64, 8, 8, False),
+    (16, 32, 4, 8, True),
+])
+def test_topk_rank2_exact_rows(M, N, K, num_warps, descending):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    values = torch.arange(M * N, dtype=torch.float32).reshape(M, N)
+    values = values.flip(-1) + torch.arange(M).reshape(M, 1) / 1024
+    out = torch.empty(M, K, dtype=torch.float32, device="mps")
+    _topk_rank2_v2_kernel[(1,)](values.to("mps"), out, M, N, K, descending,
+                              num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = values.sort(dim=-1, descending=descending).values[..., :K]
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("B,M,N,K,num_warps,descending", [
+    (2, 4, 64, 8, 8, True),
+    (4, 2, 128, 8, 8, False),
+])
+def test_topk_rank3_exact_rows(B, M, N, K, num_warps, descending):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    values = torch.arange(B * M * N, dtype=torch.float32).reshape(B, M, N)
+    values = values.flip(-1) + torch.arange(B * M).reshape(B, M, 1) / 1024
+    out = torch.empty(B, M, K, dtype=torch.float32, device="mps")
+    _topk_rank3_v2_kernel[(1,)](values.to("mps"), out, B, M, N, K, descending,
+                              num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = values.sort(dim=-1, descending=descending).values[..., :K]
+    assert torch.equal(out.cpu(), expected)
+
+
+def test_two_topk_exact_results():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N, K0, K1 = 128, 8, 32
+    torch.manual_seed(9381)
+    values = torch.randperm(N).to(torch.float32)
+    out0 = torch.empty(K0, dtype=torch.float32, device="mps")
+    out1 = torch.empty(K1, dtype=torch.float32, device="mps")
+    _two_topk_kernel[(1,)](values.to("mps"), out0, out1, N, K0, K1,
+                            num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(out0.cpu(), values.sort(descending=True).values[:K0])
+    assert torch.equal(out1.cpu(), values.sort().values[:K1])
+
+
+def test_topk_followup_elementwise_and_reduce():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N, K = 128, 8
+    values = torch.randperm(N).to(torch.float32) - 64
+    out = torch.empty(K, dtype=torch.float32, device="mps")
+    total = torch.empty(1, dtype=torch.float32, device="mps")
+    device_values = values.to("mps")
+    _topk_elementwise_followup_kernel[(1,)](device_values, out, N, K,
+                                             num_warps=4)
+    _topk_reduce_followup_kernel[(1,)](device_values, total, N, K,
+                                        num_warps=4)
+    torch.mps.synchronize()
+    selected = values.sort(descending=True).values[:K]
+    assert torch.equal(out.cpu(), selected * 2 - 1)
+    assert torch.equal(total.cpu(), selected.sum().reshape(1))
+
+
+def test_mixed_sort_and_topk_results():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    N, K = 128, 8
+    torch.manual_seed(611)
+    values = torch.randperm(N).to(torch.float32)
+    sorted_out = torch.empty(N, dtype=torch.float32, device="mps")
+    topk_out = torch.empty(K, dtype=torch.float32, device="mps")
+    _mixed_sort_topk_kernel[(1,)](values.to("mps"), sorted_out, topk_out,
+                                   N, K, num_warps=4)
+    torch.mps.synchronize()
+    assert torch.equal(sorted_out.cpu(), values.sort().values)
+    assert torch.equal(topk_out.cpu(),
+                       values.sort(descending=True).values[:K])
+
+
+@pytest.mark.parametrize("descending,expected_bits", [
+    (False, [-8388608, -1055916032, -1059061760, -1063256064,
+             -1063256064, -1073741824, -1073741824, -1082130432,
+             -2147483648, -2147483648, 1065353216, 1073741824,
+             1073741824, 1084227584, 1084227584, 2139095040]),
+    (True, [2139095040, 1084227584, 1084227584, 1073741824,
+            1073741824, 1065353216, -2147483648, -2147483648,
+            -1082130432, -1073741824, -1073741824, -1063256064,
+            -1063256064, -1059061760, -1055916032, -8388608]),
+])
+def test_topk_duplicates_infinities_and_signed_zero(descending, expected_bits):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    values = torch.tensor([
+        float("inf"), 5.0, 5.0, 2.0, 2.0, 1.0, 0.0, -0.0,
+        -1.0, -2.0, -2.0, -5.0, -5.0, -7.0, -9.0, -float("inf"),
+    ], dtype=torch.float32)
+    out = torch.empty_like(values, device="mps")
+    _topk_v2_kernel[(1,)](values.to("mps"), out, 16, 16, descending,
+                        num_warps=4)
+    torch.mps.synchronize()
+    # Oracle captured from this same kernel under TRITON_INTERPRET=1. PyTorch's
+    # sort is not a bit-level oracle for signed-zero ties.
+    assert torch.equal(
+        out.cpu().view(torch.int32),
+        torch.tensor(expected_bits, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("descending,expected_bits", [
+    (False, [2143289344] * 8),
+    (True, [2139095040, 0, 0, -8388608,
+            2139095040, 0, 0, -8388608]),
+])
+def test_topk_nan_matches_triton_interpreter(descending, expected_bits):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    # Oracle captured from this same kernel under TRITON_INTERPRET=1. Do not
+    # substitute torch.topk: bitonic compare/XOR intentionally has different
+    # NaN propagation and tie behavior.
+    values = torch.tensor([
+        float("nan"), 4.0, -2.0, float("nan"), float("inf"), -0.0, 0.0,
+        -float("inf"),
+    ], dtype=torch.float32)
+    out = torch.empty_like(values, device="mps")
+    _topk_v2_kernel[(1,)](values.to("mps"), out, 8, 8, descending,
+                        num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(
+        out.cpu().view(torch.int32),
+        torch.tensor(expected_bits, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_topk_masked_padding_sentinel(descending):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    valid_n, block_n, k = 53, 64, 8
+    torch.manual_seed(733)
+    values = torch.randperm(valid_n).to(torch.float32) - 27
+    out = torch.empty(k, dtype=torch.float32, device="mps")
+    _masked_topk_v2_kernel[(1,)](values.to("mps"), out, valid_n, block_n, k,
+                               descending, num_warps=4)
+    torch.mps.synchronize()
+    expected = values.sort(descending=descending).values[:k]
+    assert torch.equal(out.cpu(), expected)
 
 
 @pytest.mark.parametrize("num_warps", [1, 4])
