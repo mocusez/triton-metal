@@ -1,16 +1,17 @@
 name: LLVM Build
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - cmake/llvm-build-info.json
-      - cmake/amd-llvm-build-info.json
-      - third_party/amd/backend/codegen/**
-      - include/triton/Tools/LLVMOptions.h
-      - lib/Tools/LLVMOptions.cpp
+  # TEMP: auto-triggers disabled (keep only macOS/Metal CI). Restore block below to re-enable.
   workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - cmake/llvm-build-info.json
+  #     - cmake/amd-llvm-build-info.json
+  #     - third_party/amd/backend/codegen/**
+  #     - include/triton/Tools/LLVMOptions.h
+  #     - lib/Tools/LLVMOptions.cpp
 
 env:
   SCCACHE_DIR: ${{ github.workspace }}/sccache

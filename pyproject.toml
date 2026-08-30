@@ -38,3 +38,4 @@ ignore = ["E501", "E701", "E731", "E741"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+"python/test/unit/fixtures/metal_leet/*.py" = ["E702", "E703", "F401"]

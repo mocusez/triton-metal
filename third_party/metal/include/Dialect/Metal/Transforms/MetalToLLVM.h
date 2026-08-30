@@ -1,0 +1,30 @@
+//===--- MetalToLLVM.h ------------------------------------------*- C++ -*-===//
+//
+// This source file is part of the metal-dialect open source project
+// See LICENSE.txt for license information
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef METAL_METALTOLLVM_H
+#define METAL_METALTOLLVM_H
+
+#include <memory>
+
+namespace mlir {
+
+class LLVMTypeConverter;
+class MLIRContext;
+class RewritePatternSet;
+class Pass;
+
+namespace triton { namespace metal {
+// `typeConverter` is required so that memref-operand-carrying patterns (e.g.
+// `metal.print`) can deliver an LLVM-struct-shaped operand to their
+// `matchAndRewrite`. Other patterns ignore it.
+void populateMetalToLLVMConversionPatterns(RewritePatternSet &patterns,
+                                           MLIRContext *ctx,
+                                           LLVMTypeConverter &typeConverter);
+} } // end namespace metal, triton
+} // end namespace mlir
+
+#endif // METAL_METALTOLLVM_H
