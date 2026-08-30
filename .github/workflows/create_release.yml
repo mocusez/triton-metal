@@ -1,19 +1,21 @@
 name: Create Release
 
 on:
-  push:
-    branches:
-      - main
-      - release/*
-    tags:
-      # Final Release tags look like: v1.11.0
-      - v[0-9]+.[0-9]+.[0-9]+
-      # Release candidate tags look like: v1.11.0-rc1
-      - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
-  release:
-    types: [published]
-  pull_request:
-    paths: [.github/workflows/create_release.yml]
+  # TEMP: auto-triggers disabled (keep only macOS/Metal CI). Restore block below to re-enable.
+  workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+  #     - release/*
+  #   tags:
+  #     # Final Release tags look like: v1.11.0
+  #     - v[0-9]+.[0-9]+.[0-9]+
+  #     # Release candidate tags look like: v1.11.0-rc1
+  #     - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
+  # release:
+  #   types: [published]
+  # pull_request:
+  #   paths: [.github/workflows/create_release.yml]
 
 jobs:
 

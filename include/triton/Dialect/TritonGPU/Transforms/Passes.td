@@ -266,6 +266,35 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
 }
 
 
+def TritonGPUPropagateCoalescedLayouts : Pass<"tritongpu-propagate-coalesced-layouts", "mlir::ModuleOp"> {
+  let summary = "propagate coalesced layouts into rank-1 reduce operands";
+
+  let description = [{
+    The `tritongpu-coalesce` pass picks a coalesced BlockedEncoding for each
+    memory op and inserts `convert_layout` ops to restore the original
+    (default, sizePerThread = 1) layout for downstream consumers. This is
+    intentionally conservative — Coalesce cannot know whether a downstream
+    op is safe to re-layout. However, when a down-convert immediately feeds
+    a rank-1 `tt.reduce`, the scalar result has no layout encoding, so the
+    reduce can consume the coalesced operand directly. Preserving that layout
+    lets sizePerThread-aware lowerings avoid a tile-loop hoist when
+    `BLOCK > tpb`.
+
+    This pass walks Coalesce-emitted down-converts and, when safe, rewrites
+    rank-1 reduces to consume the coalesced layout directly, then erases the
+    convert. It also promotes eligible sizePerThread=1 rank-1 reduce operands
+    to sizePerThread=BLOCK/tpb. The pass itself is not target-gated; the Metal
+    pipeline controls where it runs by explicitly adding it after Coalesce.
+    See the implementation notes for the full
+    feasibility analysis and the implementation notes
+    for the implementation plan.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+
 def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions", "mlir::ModuleOp"> {
   let summary = "remove superfluous layout conversions";
 

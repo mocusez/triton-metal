@@ -899,11 +899,41 @@ def test_atomic_scalar_masks():
 
 @filecheck_test
 @triton.jit
+def test_atomic_min_float_negative_value():
+    # CHECK-LABEL: test_atomic_min_float_negative_value
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.float32), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), -1.0, tl.float32)
+
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    # CHECK: {{.*}} = tt.atomic_rmw umax, acq_rel, gpu
+    tl.atomic_min(ptrs, val, mask=True)
+
+
+@filecheck_test
+@triton.jit
 def test_atomic_poll():
     # CHECK-LABEL: test_atomic_poll
     ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
     # CHECK: %{{.*}} = tt.atomic_poll relaxed, sys, %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32 -> i1
     tl.atomic_poll(ptr, 1, sem="relaxed", scope="sys")
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_min_float64_negative_value():
+    # CHECK-LABEL: test_atomic_min_float64_negative_value
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.float64), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), -1.0, tl.float64)
+
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    # CHECK: {{.*}} = tt.atomic_rmw umax, acq_rel, gpu
+    tl.atomic_min(ptrs, val, mask=True)
 
 
 @filecheck_test

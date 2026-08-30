@@ -1,16 +1,17 @@
 name: LLVM Build
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - cmake/llvm-build-info.json
-  pull_request:
-    paths:
-      - .github/workflows/llvm-build.yml
-      - cmake/llvm-build-info.json
+  # TEMP: auto-triggers disabled (keep only macOS/Metal CI). Restore block below to re-enable.
   workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - cmake/llvm-build-info.json
+  # pull_request:
+  #   paths:
+  #     - .github/workflows/llvm-build.yml
+  #     - cmake/llvm-build-info.json
 
 env:
   SCCACHE_DIR: ${{ github.workspace }}/sccache

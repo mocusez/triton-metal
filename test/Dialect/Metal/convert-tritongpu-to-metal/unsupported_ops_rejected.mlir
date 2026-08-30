@@ -1,0 +1,96 @@
+// RUN: triton-metal-opt --convert-tritongpu-to-metal --verify-diagnostics --split-input-file %s
+//
+// Triton ops the Metal backend does not implement must be rejected up front by
+// `validateUnsupportedOpsRejected`, BEFORE any conversion runs.
+//
+// This is not cosmetic. Reaching `applyFullConversion` with no pattern printed
+// "failed to legalize operation ..." and then took the PROCESS down in
+// failed-conversion teardown: tt.assert and tt.gather with SIGSEGV (exit 139),
+// tt.join with an abort (exit 134). A crash gives a kernel author no way to
+// tell "this backend can't do that yet" from "the compiler is broken", and it
+// kills the whole pytest process along the way.
+//
+// Each case below therefore pins BOTH that the construct is refused and the
+// wording that tells the author what to do instead. Implementing one of these
+// means deleting its entry in the validator and its case here.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // A pointer loaded out of memory and dereferenced -- `p = tl.load(pp)` then
+  // `tl.load(p.to(tl.pointer_type(tl.float32)) + i)`. This one reached the
+  // conversion because the scalar i64 load it starts with is supported; only
+  // the cast has no pattern.
+  tt.func public @reject_int_to_ptr(%pp: !tt.ptr<i64>) {
+    %p = tt.load %pp : !tt.ptr<i64>
+    // expected-error @+1 {{casting an integer to a pointer is not supported}}
+    %q = tt.int_to_ptr %p : i64 -> !tt.ptr<f32>
+    %v = tt.load %q : !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_ptr_to_int(%x: !tt.ptr<f32>, %o: !tt.ptr<i64>) {
+    // expected-error @+1 {{casting a pointer to an integer is not supported}}
+    %n = tt.ptr_to_int %x : !tt.ptr<f32> -> i64
+    tt.store %o, %n : !tt.ptr<i64>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_join(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tt.join is implemented for a rank-1 pair joined into an [N, 2] tile of at most one element per thread}}
+    %j = tt.join %v, %v : tensor<128xf32, #blocked> -> tensor<128x2xf32, #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_split(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128x2xf32, #blocked>
+    // expected-error @+1 {{tt.split is implemented for an [N, 2] tile of at most one element per thread}}
+    %a, %b = tt.split %v : tensor<128x2xf32, #blocked> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    tt.return
+  }
+}
+
+// -----
+
+// A rank-1 axis-0 gather IS implemented (GatherLowering); a rank-2 one is not,
+// and the message says which part is missing rather than claiming tt.gather as
+// a whole is absent.
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank2_gather(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<8x32xf32, #blocked2>
+    %i = arith.constant dense<0> : tensor<8x32xi32, #blocked2>
+    // expected-error @+1 {{tl.gather is implemented for a rank-1 gather along axis 0 only}}
+    %g = tt.gather %v[%i] {axis = 1 : i32} : (tensor<8x32xf32, #blocked2>, tensor<8x32xi32, #blocked2>) -> tensor<8x32xf32, #blocked2>
+    tt.return
+  }
+}
+
+// -----
+
+// A `#ttg.linear` `tt.make_range` USED to be refused here, because
+// MakeRangeLowering could only decompose a blocked layout (rank-1), a
+// slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and
+// emitting a constant 0 for anything else made every element of `tl.arange(0,2)`
+// reshaped into a rank-3 axis read back as 0 — a silent wrong answer.
+//
+// It is no longer refused: `planLinearRange` evaluates the layout's basis
+// vectors directly, which is what a rank-3 `tl.permute` needs (Triton folds the
+// whole permutation into the load's index layout and leaves the reshape and the
+// transpose as flat identities). Coverage moved to
+// `make_range_linear_layout.mlir`; the rejection above it stays for a layout
+// neither path can decode.

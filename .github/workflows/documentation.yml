@@ -1,8 +1,9 @@
 name: Documentation
 on:
+  # TEMP: auto-triggers disabled (keep only macOS/Metal CI). Restore block below to re-enable.
   workflow_dispatch:
-  schedule:
-    - cron: "0 9 * * *"
+  # schedule:
+  #   - cron: "0 9 * * *"
 
 permissions:
   contents: write

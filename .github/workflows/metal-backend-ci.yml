@@ -1,0 +1,146 @@
+name: Metal Backend CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [metal-develop]
+  pull_request:
+    branches: [metal-develop]
+
+concurrency:
+  group: metal-backend-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/metal-develop' }}
+
+permissions: read-all
+
+jobs:
+  metal-backend:
+    name: Build and test Metal backend (macOS arm64)
+    # Apple Silicon runner is required for the Metal backend.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      TRITON_BUILD_WITH_CLANG_LLD: "TRUE"
+      RUNNER_TYPE: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: "true"
+
+      - name: Install brew dependencies
+        run: |
+          brew update
+          brew install ccache llvm@19 lld coreutils
+
+      - name: Compute cache keys
+        id: cache-key
+        shell: bash
+        run: |
+          llvm_file="cmake/llvm-info.json"
+          nvidia_file="cmake/nvidia-toolchain-version.json"
+          json_file="cmake/json-version.txt"
+
+          if [[ ! -f "$llvm_file" || ! -f "$nvidia_file" || ! -f "$json_file" ]]; then
+            echo "Error: Required dependency files are missing."
+            exit 1
+          fi
+
+          echo "llvm=$(sha256sum $llvm_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+          echo "nvidia=$(sha256sum $nvidia_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+          echo "json=$(cat $json_file)" >> $GITHUB_OUTPUT
+          echo "datetime=$(date -u -Iseconds)" >> $GITHUB_OUTPUT
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.triton/llvm
+            ~/.triton/nvidia
+            ~/.triton/json
+          key: ${{ runner.os }}-${{ runner.arch }}-metal-llvm-${{ steps.cache-key.outputs.llvm }}-nvidia-${{ steps.cache-key.outputs.nvidia }}-json-${{ steps.cache-key.outputs.json }}
+
+      - name: Restore ccache
+        if: github.ref != 'refs/heads/metal-develop'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.ccache
+          restore-keys: |
+            metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-
+            metal-artifacts-${{ runner.os }}-${{ runner.arch }}-
+          key: metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ steps.cache-key.outputs.datetime }}
+
+      - name: Inspect cache directories
+        run: |
+          mkdir -p ~/.triton ~/.ccache
+          du -h -d 1 ~/.triton || true
+          du -h -d 1 ~/.ccache || true
+
+      - name: Update PATH
+        run: |
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
+
+      - name: Create venv
+        run: |
+          python3.12 -m venv ~/.venv
+          source ~/.venv/bin/activate
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest numpy torch
+
+      - name: Build Triton (Metal backend enabled)
+        env:
+          TRITON_BUILD_WITH_O1: "true"
+          MAX_JOBS: 3
+          NINJA_STATUS: "[%f/%t, %es elapsed] "
+        run: |
+          source ~/.venv/bin/activate
+          ccache --zero-stats
+          export PATH="/opt/homebrew/opt/llvm@19/bin:$PATH"
+          export CC="/opt/homebrew/opt/llvm@19/bin/clang"
+          export CXX="/opt/homebrew/opt/llvm@19/bin/clang++"
+          export CXXFLAGS="-stdlib=libc++"
+          export LDFLAGS="-L/opt/homebrew/opt/llvm@19/lib"
+          clang++ --version
+          make dev-install
+
+      - name: CCache stats
+        run: ccache --print-stats
+
+      - name: Verify Metal backend is registered
+        run: |
+          source ~/.venv/bin/activate
+          python3 -c "import triton; from triton.backends import backends; assert 'metal' in backends, f'metal backend missing, have: {list(backends)}'; print('Metal backend OK:', backends['metal'])"
+
+      - name: Run Metal backend unit tests
+        run: |
+          source ~/.venv/bin/activate
+          pytest -s --tb=short \
+            python/test/unit/test_metal_backend_target_apple_family.py \
+            python/test/unit/test_metal_backend_leaky_relu.py \
+            python/test/unit/test_metal_backend_2d_elementwise_add.py \
+            python/test/unit/test_metal_backend_dot_f32_8x8.py \
+            python/test/unit/test_metal_backend_vector_add_matrix.py \
+            python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_exact_kernel_compiles_to_msl \
+            python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_exact_kernels_compile_to_msl \
+            python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_host_contract_rejects_invalid_metadata \
+            python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_host_contract_rejects_invalid_metadata
+
+      - name: Run Metal backend lit tests
+        if: success()
+        run: |
+          source ~/.venv/bin/activate
+          python3 -m pip show lit >/dev/null 2>&1 || python3 -m pip install lit
+          export BUILD_DIR=$(PYTHONPATH=./python python3 -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
+          cd "$BUILD_DIR"
+          ninja triton-metal-opt triton-metal-translate
+          lit -v test/Dialect/Metal/
+
+      - name: Save ccache
+        if: github.ref == 'refs/heads/metal-develop'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.ccache
+          key: metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ steps.cache-key.outputs.datetime }}
