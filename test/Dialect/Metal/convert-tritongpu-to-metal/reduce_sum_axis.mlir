@@ -309,3 +309,112 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, minOp : (f32, f32) -> f32
 // CHECK: metal.return
+
+// -----
+// f32 / arith.addf, shape <64x64xf32>, axis=1. The computed source includes
+// signed and unsigned div/rem integer producers inside an FFT-like phase cone.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_sum_axis1_signed_div_rem_phase(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {
+    %cst_n = arith.constant dense<64> : tensor<64x1xi32, #blocked>
+    %cst_neg4 = arith.constant dense<-4> : tensor<64x1xi32, #blocked>
+    %cst_den = arith.constant dense<5> : tensor<1x64xi32, #blocked>
+    %cst_scale = arith.constant dense<-6.28318548> : tensor<64x64xf32, #blocked>
+    %offs_m = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
+    %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #slice1>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<64xi32, #slice1> -> tensor<64x1xi32, #blocked>
+    %row_scaled = arith.muli %rows_2d, %cst_n : tensor<64x1xi32, #blocked>
+    %signed_num = arith.addi %row_scaled, %cst_neg4 : tensor<64x1xi32, #blocked>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %den = arith.addi %cols_2d, %cst_den : tensor<1x64xi32, #blocked>
+    %num_full = tt.broadcast %signed_num : tensor<64x1xi32, #blocked> -> tensor<64x64xi32, #blocked>
+    %den_full = tt.broadcast %den : tensor<1x64xi32, #blocked> -> tensor<64x64xi32, #blocked>
+    %rem = arith.remsi %num_full, %den_full : tensor<64x64xi32, #blocked>
+    %div = arith.divsi %num_full, %den_full : tensor<64x64xi32, #blocked>
+    %phase_i = arith.addi %rem, %div : tensor<64x64xi32, #blocked>
+    %phase_f = arith.sitofp %phase_i : tensor<64x64xi32, #blocked> to tensor<64x64xf32, #blocked>
+    %phase = arith.mulf %phase_f, %cst_scale : tensor<64x64xf32, #blocked>
+    %c = math.cos %phase : tensor<64x64xf32, #blocked>
+    %s = math.sin %phase : tensor<64x64xf32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<64x64x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %phase_i : tensor<64x64x!tt.ptr<f32>, #blocked>, tensor<64x64xi32, #blocked>
+    %x = tt.load %ap : tensor<64x64x!tt.ptr<f32>, #blocked>
+    %weighted = arith.addf %c, %s : tensor<64x64xf32, #blocked>
+    %source = arith.mulf %x, %weighted : tensor<64x64xf32, #blocked>
+    %sum = "tt.reduce"(%source) ({
+    ^bb0(%a: f32, %b: f32):
+      %add = arith.addf %a, %b : f32
+      tt.reduce.return %add : f32
+    }) {axis = 1 : i32} : (tensor<64x64xf32, #blocked>) -> tensor<64xf32, #slice1>
+    %osp = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked1>
+    %oap = tt.addptr %osp, %offs_m : tensor<64x!tt.ptr<f32>, #blocked1>, tensor<64xi32, #blocked1>
+    %cv = ttg.convert_layout %sum : tensor<64xf32, #slice1> -> tensor<64xf32, #blocked1>
+    tt.store %oap, %cv : tensor<64x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+
+  tt.func public @reduce_sum_axis1_unsigned_div_rem_phase(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {
+    %cst_n = arith.constant dense<64> : tensor<64x1xi32, #blocked>
+    %cst_high = arith.constant dense<-2147483648> : tensor<64x1xi32, #blocked>
+    %cst_den = arith.constant dense<3> : tensor<1x64xi32, #blocked>
+    %cst_scale = arith.constant dense<0.000000000465661287> : tensor<64x64xf32, #blocked>
+    %offs_m = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
+    %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #slice1>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<64xi32, #slice1> -> tensor<64x1xi32, #blocked>
+    %row_scaled = arith.muli %rows_2d, %cst_n : tensor<64x1xi32, #blocked>
+    %unsigned_num = arith.addi %row_scaled, %cst_high : tensor<64x1xi32, #blocked>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %den = arith.addi %cols_2d, %cst_den : tensor<1x64xi32, #blocked>
+    %num_full = tt.broadcast %unsigned_num : tensor<64x1xi32, #blocked> -> tensor<64x64xi32, #blocked>
+    %den_full = tt.broadcast %den : tensor<1x64xi32, #blocked> -> tensor<64x64xi32, #blocked>
+    %rem = arith.remui %num_full, %den_full : tensor<64x64xi32, #blocked>
+    %div = arith.divui %num_full, %den_full : tensor<64x64xi32, #blocked>
+    %phase_i = arith.addi %rem, %div : tensor<64x64xi32, #blocked>
+    %phase_f = arith.uitofp %phase_i : tensor<64x64xi32, #blocked> to tensor<64x64xf32, #blocked>
+    %phase = arith.mulf %phase_f, %cst_scale : tensor<64x64xf32, #blocked>
+    %c = math.cos %phase : tensor<64x64xf32, #blocked>
+    %s = math.sin %phase : tensor<64x64xf32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<64x64x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %rem : tensor<64x64x!tt.ptr<f32>, #blocked>, tensor<64x64xi32, #blocked>
+    %x = tt.load %ap : tensor<64x64x!tt.ptr<f32>, #blocked>
+    %weighted = arith.addf %c, %s : tensor<64x64xf32, #blocked>
+    %source = arith.mulf %x, %weighted : tensor<64x64xf32, #blocked>
+    %sum = "tt.reduce"(%source) ({
+    ^bb0(%a: f32, %b: f32):
+      %add = arith.addf %a, %b : f32
+      tt.reduce.return %add : f32
+    }) {axis = 1 : i32} : (tensor<64x64xf32, #blocked>) -> tensor<64xf32, #slice1>
+    %osp = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked1>
+    %oap = tt.addptr %osp, %offs_m : tensor<64x!tt.ptr<f32>, #blocked1>, tensor<64xi32, #blocked1>
+    %cv = ttg.convert_layout %sum : tensor<64xf32, #slice1> -> tensor<64xf32, #blocked1>
+    tt.store %oap, %cv : tensor<64x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel reduce_sum_axis1_signed_div_rem_phase
+// CHECK: metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: scf.for
+// CHECK: arith.remsi
+// CHECK: arith.divsi
+// CHECK: metal.unary_exp {{.*}}, cosOp
+// CHECK: metal.unary_exp {{.*}}, sinOp
+// CHECK: scf.yield {{.*}} : f32
+// CHECK: metal.barrier
+// CHECK: metal.store
+// CHECK: metal.return
+// CHECK-LABEL: metal.kernel reduce_sum_axis1_unsigned_div_rem_phase
+// CHECK: metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: arith.constant -2147483648 : i32
+// CHECK: scf.for
+// CHECK: arith.remui
+// CHECK: arith.divui
+// CHECK: metal.unary_exp {{.*}}, cosOp
+// CHECK: metal.unary_exp {{.*}}, sinOp
+// CHECK: scf.yield {{.*}} : f32
+// CHECK: metal.barrier
+// CHECK: metal.store
+// CHECK: metal.return

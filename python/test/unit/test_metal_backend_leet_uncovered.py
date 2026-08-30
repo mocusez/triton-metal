@@ -65,6 +65,7 @@ STANDALONE_FIXTURES = {
 
 TARGETED_FIXTURES = {
     "hard-bfs_shortest_path.py",
+    "hard-fast_fourier_transform.py",
     "hard-mult_head_attention.py",
     "hard-sliding_window_self_attention.py",
     "medium-attention_with_linear_biases.py",

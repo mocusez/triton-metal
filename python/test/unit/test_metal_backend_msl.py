@@ -29,6 +29,7 @@ libmetal = pytest.importorskip(
 )
 
 LEET_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "metal_leet"
+HARD_FFT_PATH = LEET_FIXTURES / "hard-fast_fourier_transform.py"
 BFS_PATH = LEET_FIXTURES / "hard-bfs_shortest_path.py"
 FUSED_RMS_NORM_PATH = (
     LEET_FIXTURES / "medium-fused_residual_add_and_rms_norm.py"
@@ -384,6 +385,19 @@ def test_fused_residual_rmsnorm_exact_kernels_compile_to_msl():
     for name, msl in (("single", single_msl), ("loop", loop_msl)):
         assert "kernel void" in msl, f"{name} RMSNorm MSL missing kernel entry.\n--- MSL ---\n{msl}\n"
         assert "sqrt" in msl, f"{name} RMSNorm MSL missing sqrt.\n--- MSL ---\n{msl}\n"
+
+
+def test_hard_fast_fourier_transform_exact_kernel_compiles_to_msl():
+    module = _load_exact_module(HARD_FFT_PATH, "leet_hard_fft_msl")
+    msl = _compile_to_msl(
+        module._dft_naive,
+        {"x_ptr": "*fp32", "y_ptr": "*fp32", "N": "i32"},
+        {"KB": 64, "NB": 64},
+        num_warps=4,
+    )
+
+    for needle in ("kernel void", "cos", "sin"):
+        assert needle in msl, f"hard FFT MSL missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
 
 
 def test_bfs_shortest_path_host_contract_rejects_invalid_metadata():
@@ -1953,3 +1967,23 @@ def test_splat_pointer_store_wide_tile_is_rejected_not_crash(num_warps):
     o = torch.zeros(8, dtype=torch.float32, device="mps")
     with pytest.raises(Exception):
         _splat_store_wide_kernel[(1,)](x, o, BLOCK=8, num_warps=num_warps)
+
+
+@pytest.mark.parametrize("n", [1, 8, 63, 64, 65, 257, 1023, 1024, 1025, 1500])
+def test_hard_fast_fourier_transform_matches_torch(n):
+    """Cover the small DFT, radix-2 FFT, and Bluestein execution paths."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    fft = _load_exact_module(HARD_FFT_PATH, "hard_fast_fourier_transform")
+    torch.manual_seed(n)
+    source = torch.randn(n, dtype=torch.complex64)
+    signal = torch.view_as_real(source).reshape(-1).to("mps")
+    spectrum = torch.empty(2 * n, dtype=torch.float32, device="mps")
+
+    fft.solve(signal, spectrum, n)
+    torch.mps.synchronize()
+
+    actual = torch.view_as_complex(spectrum.cpu().reshape(n, 2))
+    torch.testing.assert_close(actual, torch.fft.fft(source), atol=5e-4,
+                               rtol=5e-4)
