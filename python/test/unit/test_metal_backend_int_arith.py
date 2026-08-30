@@ -12,13 +12,11 @@ succeeds end-to-end without a `RuntimeError`. This proves both:
     `third_party/metal/lib/Target/Metal/ModuleTranslation.cpp`) do not
     `llvm_unreachable` when the op survives into the kernel body.
 
-Bit-exact runtime verification is gated on a deferred uint8/i32 data path
-(Session L2b): the Metal backend's `metal.get_element` op verifier
-accepts `I1, UI8..UI64, SI8..SI64, f16, f32, bf16` only — signless `i32`
-loads/stores fail verification (see
-`third_party/metal/include/Dialect/Metal/IR/MetalOps.td:17`). The IR-level
-correctness of the conversion patterns is independently pinned by the lit
-fixture `test/Dialect/Metal/convert-tritongpu-to-metal/int_arith_broad.mlir`.
+The compile matrix is complemented by runtime canaries for select, u64
+high-product carry handling, and integer-to-float conversion. Integer storage
+is routed through explicit signed/unsigned Metal types; the earlier signless
+i32 verifier gap is closed. IR coverage remains pinned by
+`test/Dialect/Metal/convert-tritongpu-to-metal/int_arith_broad.mlir`.
 
 See the implementation notes.
 """

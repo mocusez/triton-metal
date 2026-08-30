@@ -12,12 +12,13 @@ Two independent Metal-backend fixes are covered here.
    tile per program. Any other base (`pid*K*M*N` below) was read from the wrong
    offset and silently produced wrong numbers — no error, no diagnostic.
 
-   The walker now traverses `tt.broadcast`/`tt.expand_dims`, and when a real
-   scalar term is found it REPLACES the fabricated one rather than adding to it
-   (adding would double-count the per-program offset). When no scalar term
-   exists — the program offset folded into the row tensor, as in
-   `offs_m = pid*BLOCK_M + arange(...)` — the fabricated term is still used, so
-   that shape is unchanged.
+   For non-loop direct loads, the scalar-offset walker traverses
+   `tt.broadcast`/`tt.expand_dims`, and a real scalar term REPLACES the
+   fabricated one rather than being added to it (which would double-count the
+   per-program offset). When no scalar term exists, the established
+   `tgid*tpb*N` fallback remains unchanged. For direct loads inside user loops,
+   the row scan instead replays the complete original `tt.addptr` chain at each
+   logical `(row, col)`, preserving tensor-carried program and trip bases.
 
 2. **Uniform (splat) pointer accesses.** `tt.load` on a bare `tt.splat` of a
    scalar pointer — no `tt.addptr`, every lane reading the SAME address — hit

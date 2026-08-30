@@ -178,36 +178,45 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 
 ## Known limitations
 
-- **No autotuning, no perf work.** Generated MSL is single-threadgroup-per-program and makes no use of SIMD-group reductions, threadgroup memory, or vectorized loads. Throughput will be **far** below what Metal-native kernels achieve.
-- **Op coverage is partial.** Many `tl.*` ops are unimplemented; you will hit `NYI` errors on non-trivial kernels.
-- **No general `tl.dot` / matmul lowering.** Correctness fallbacks cover selected proven f32 GEMM and Gram shapes, but arbitrary dot layouts remain unsupported. Broader SIMD-group-matrix mapping is future work.
+- **Generic tensor codegen is still scalar.** The backend has specialized SIMD-group matrix, reduction, scan, and threadgroup-memory paths, but the general ranked-tensor conversion still lowers one scalar element at a time. Contiguous vector loads/stores and broader aggregate-hoisting remain performance work.
+- **Op coverage is deliberately bounded.** The common elementwise, reduction, scan, gather, atomic, dot, fp8, and control-flow paths have end-to-end coverage, while unsupported shapes fail during preflight with a named diagnostic. Notable remaining envelopes include loop-carried rank-2 reductions, some cross-lane layout changes, broader `tt.dot_scaled`, and multi-result `scf.if`.
+- **`tl.dot` is not layout-general.** Proven scalar and SIMD-group-matrix paths cover the tested f32, fp16/bf16, int8, batched, and scaled-dot envelopes. Masked multi-tile canonical dots, 3-D dots with `K > min(M, N)`, and arbitrary layout combinations remain unsupported.
 - **Launching requires PyTorch MPS.** `torch.mps.compile_shader` compiles the MSL once per process; nothing is cached across processes, and the compiled shader library lives and dies with the interpreter.
 - **The runtime tracks PyTorch's MPS surface.** Capabilities can regress with a torch upgrade: on torch 2.13 `torch.zeros(..., dtype=torch.float8_e4m3fn, device="mps")` fails with `Undefined type Float8_e4m3fn`, so the fp8 paths need torch 2.10-era MPS support even though the backend's own fp8 casts are unchanged.
 - **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`), so a wheel built on macOS 26 will not install on macOS 14/15. Nothing in `libtriton.so` links an Apple framework, so building with `MACOSX_DEPLOYMENT_TARGET` set lower is the fix — untested so far.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
-- **No GPU CI — GitHub Actions cannot run the Metal/MPS tests.** GitHub-hosted macOS
+- **Hosted CI does not validate GPU numerics.** GitHub-hosted macOS
   runners are virtualized and expose no usable Metal device to PyTorch: MPS is either
   reported unavailable, or reported available while every allocation fails, with MPS
   memory capped near 1 GB ([actions/runner-images#9918](https://github.com/actions/runner-images/issues/9918),
   [community#155306](https://github.com/orgs/community/discussions/155306)). What CI can
-  still do is compile: `.github/workflows/metal-backend-ci.yml` builds the backend and
-  runs `lit test/Dialect/Metal/`, and 59 of the 64 `test_metal_backend_*.py` files gate
-  themselves on `torch.backends.mps.is_available()`, so they skip rather than fail on a
-  runner. Read a green CI as "it builds and the MLIR checks hold", never as "the kernels
-  compute the right answer" — end-to-end correctness is verified manually on an Apple
-  Silicon machine.
+  do is build the backend, run compiler/lit checks, and collect Python tests that do not
+  allocate on MPS. GPU-dependent tests skip rather than fail. Read a green hosted job as
+  "it builds and the compiler checks hold", never as "the kernels compute the right
+  answer" — end-to-end correctness remains outside hosted CI and is verified
+  separately on physical Apple Silicon.
 
 ---
 
-## Future work
+## Remaining work
 
-- **Performance pass:** SIMD-group primitives, threadgroup memory, vectorized loads, and a coarser tile-to-threadgroup mapping. The current generator leaves >10× on the table for memory-bound kernels.
-- **`tl.dot` lowering** onto Apple SIMD-group matrix instructions (Apple7+).
-- **Broader op coverage:** atomics, more transcendentals, integer reductions, gather/scatter beyond simple masked load.
-- **Compiled-kernel caching:** persist the compiled shader library across processes instead of re-running `torch.mps.compile_shader` in every interpreter.
-- **Automated correctness suite** covering medium/hard LeetGPU and a subset of upstream Triton tutorials.
-- **Build-system convergence with upstream:** drop pixi, integrate the Metal backend behind the upstream `setup.py` backend-selection flow, and produce a properly-tagged wheel for general distribution.
-- **macOS CI** to gate regressions on Apple Silicon.
+The current dependency-ordered priorities are:
+
+1. Finish the unsupported-op/preflight safety matrix. Axes 1/2
+   `tt.get_num_programs` coverage is in place, and both correctness xfails
+   found by the audit are now ordinary 30-run regressions.
+2. Expand exact dot, scaled-dot, reduce/scan, layout-conversion, atomic CAS,
+   descriptor-reduce, `tt.unsplat`, and `tl.map_elementwise` envelopes one
+   positive/adjacent-negative slice at a time.
+3. Improve generic performance with vectorized contiguous memory access,
+   aggregate/cone reuse, and resource-aware tile selection, backed by fixed
+   MPS benchmarks rather than blanket speedup claims.
+4. Decide and implement a versioned cross-process shader-cache architecture;
+   the current PyTorch MPS API recompiles MSL in each interpreter.
+5. Validate lower deployment-target wheels on clean macOS installations.
+
+PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
+and bf16 atomic add are platform/runtime boundaries, not implementation backlog.
 
 ---
 

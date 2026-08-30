@@ -5,8 +5,8 @@ gap (sizePerThread x mask was tested as independent axes but never crossed). The
 8 1D rows exercise the AC4-v6 fix surface from the prior ralph (BLOCK_SIZE
 auto-selects sizePerThread via the Triton frontend's num_warps split, so the
 1024+mask case is the exact TTGIR shape that triggered the original failure).
-The 2 2D rows lock the AC4-v6 follow-up's 2D MSL-translate ptr-cast bug
-(currently `@pytest.mark.xfail(strict=True)` until that fix lands).
+The 2 2D rows lock the resolved AC4-v6 follow-up's 2D masked-load/store path;
+they are ordinary passing cases and protect the frontend-to-MSL translation.
 
 See the implementation notes AC8.
 """

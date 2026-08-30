@@ -8,8 +8,9 @@ CPU tensors via a copy-back path. See
 the implementation notes.
 
 The launch path routes through `torch.mps.compile_shader` (driver.py
-`MetalUtils.load_binary` + `MetalLauncher`). Set `TRITON_METAL_USE_MPS=0` to
-fall back to the native metallib runtime.
+`MetalUtils.load_binary` + `MetalLauncher`). Setting
+`TRITON_METAL_USE_MPS=0` disables launch; the legacy native metallib runtime
+has been removed.
 """
 
 import pytest

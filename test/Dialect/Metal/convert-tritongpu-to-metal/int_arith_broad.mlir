@@ -3,8 +3,8 @@
 // Session L2 positive fixture: every elementwise integer arith op in the
 // broad set lowers through `convert-tritongpu-to-metal`. Each split section
 // is a minimal kernel that derives two i32 tensor operands from
-// `tt.make_range` + `tt.splat` (the existing i32 sources that don't require
-// an i32-typed load — uint8/i32 data-path is deferred to L2b), applies one
+// `tt.make_range` + `tt.splat` (which keeps each fixture focused on arithmetic
+// rather than memory lowering), applies one
 // target op, then uses the result as the offset for an f32 store. FileCheck
 // verifies that the tensor-form `arith.<op>` is GONE from post-conversion
 // IR and that `metal.kernel` is present.

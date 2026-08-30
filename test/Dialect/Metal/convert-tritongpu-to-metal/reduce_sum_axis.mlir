@@ -66,6 +66,57 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %oap, %cv : tensor<8x!tt.ptr<f32>, #blocked1>
     tt.return
   }
+
+  // A user loop with an iter_arg folds the per-program and per-trip bases into
+  // the load's tensor offset. The cooperative row scan must replay that full
+  // address instead of replacing it with `(row + tgid*tpb) * N`.
+  tt.func public @reduce_sum_axis1_loop_iterarg(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %T: i32, %initial: f32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %tile = arith.constant 128 : i32
+    %half = arith.constant dense<5.000000e-01> : tensor<8xf32, #slice1>
+    %h0 = tt.splat %initial : f32 -> tensor<8xf32, #slice1>
+    %pid = tt.get_program_id x : i32
+    %pid_t = arith.muli %pid, %T : i32
+    %program_base = arith.muli %pid_t, %tile : i32
+    %row_scale = arith.constant dense<16> : tensor<8x1xi32, #blocked>
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #slice1>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #slice1> -> tensor<8x1xi32, #blocked>
+    %row_offsets = arith.muli %rows_2d, %row_scale : tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
+    %cols_full = tt.broadcast %cols_2d : tensor<1x16xi32, #blocked> -> tensor<8x16xi32, #blocked>
+    %x_base = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #blocked>
+    %out_program = arith.muli %pid_t, %c8 : i32
+    %out_base = tt.addptr %out_ptr, %out_program : !tt.ptr<f32>, i32
+    %result = scf.for %t = %c0 to %T step %c1 iter_args(%h = %h0) -> (tensor<8xf32, #slice1>) : i32 {
+      %trip_base = arith.muli %t, %tile : i32
+      %tile_base = arith.addi %program_base, %trip_base : i32
+      %tile_base_2d = tt.splat %tile_base : i32 -> tensor<8x1xi32, #blocked>
+      %row_bases = arith.addi %tile_base_2d, %row_offsets : tensor<8x1xi32, #blocked>
+      %row_bases_full = tt.broadcast %row_bases : tensor<8x1xi32, #blocked> -> tensor<8x16xi32, #blocked>
+      %offsets = arith.addi %row_bases_full, %cols_full : tensor<8x16xi32, #blocked>
+      %x_addr = tt.addptr %x_base, %offsets : tensor<8x16x!tt.ptr<f32>, #blocked>, tensor<8x16xi32, #blocked>
+      %x = tt.load %x_addr : tensor<8x16x!tt.ptr<f32>, #blocked>
+      %sum = "tt.reduce"(%x) ({
+      ^bb0(%a: f32, %b: f32):
+        %add = arith.addf %a, %b : f32
+        tt.reduce.return %add : f32
+      }) {axis = 1 : i32} : (tensor<8x16xf32, #blocked>) -> tensor<8xf32, #slice1>
+      %decayed = arith.mulf %h, %half : tensor<8xf32, #slice1>
+      %next = arith.addf %decayed, %sum : tensor<8xf32, #slice1>
+      %out_trip = arith.muli %t, %c8 : i32
+      %out_trip_base = tt.addptr %out_base, %out_trip : !tt.ptr<f32>, i32
+      %out_splat = tt.splat %out_trip_base : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>, #blocked1>
+      %out_rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #blocked1>
+      %out_addr = tt.addptr %out_splat, %out_rows : tensor<8x!tt.ptr<f32>, #blocked1>, tensor<8xi32, #blocked1>
+      %next_blocked = ttg.convert_layout %next : tensor<8xf32, #slice1> -> tensor<8xf32, #blocked1>
+      tt.store %out_addr, %next_blocked : tensor<8x!tt.ptr<f32>, #blocked1>
+      scf.yield %next : tensor<8xf32, #slice1>
+    }
+    tt.return
+  }
 }
 // CHECK-LABEL: metal.kernel reduce_sum_axis1_f32
 // rowBuf is M (= 8) elements, not M*N.
@@ -90,6 +141,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.threadgroup_alloca : !metal.memref<8 x f32>
 // CHECK: arith.constant 1.000000e+00 : f32
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, mulOp : (f32, f32) -> f32
+// CHECK: metal.return
+// CHECK-LABEL: metal.kernel reduce_sum_axis1_loop_iterarg
+// CHECK: metal.threadgroup_alloca : !metal.memref<8 x f32>
+// CHECK: %[[T_RAW:.*]] = metal.get_element %arg2
+// CHECK-NEXT: %[[T:.*]] = builtin.unrealized_conversion_cast %[[T_RAW]] : ui32 to i32
+// CHECK: scf.for %[[TRIP:.*]] = {{.*}} to %[[T]] {{.*}} iter_args
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: scf.for %[[COL:[^ ]+]] =
+// The row scan address must contain both pid*T*tile and trip*tile.
+// CHECK: %[[PID_T:.*]] = arith.muli {{.*}}, %[[T]] : i32
+// CHECK: %[[PID_BASE:.*]] = arith.muli %[[PID_T]], {{.*}} : i32
+// CHECK: %[[TRIP_BASE:.*]] = arith.muli %[[TRIP]], {{.*}} : i32
+// CHECK: %[[TILE_BASE:.*]] = arith.addi %[[PID_BASE]], %[[TRIP_BASE]] : i32
+// CHECK: %[[ROW_BASE:.*]] = arith.addi %[[TILE_BASE]], {{.*}} : i32
+// CHECK: %[[ADDR:.*]] = arith.addi %[[ROW_BASE]], %[[COL]] : i32
+// CHECK: %[[ADDR_UI32:.*]] = builtin.unrealized_conversion_cast %[[ADDR]] : i32 to ui32
+// CHECK: metal.get_element %arg0[%[[ADDR_UI32]]]
 // CHECK: metal.return
 
 // -----

@@ -29,6 +29,11 @@ which pins the emitted barrier/store order exactly; keep both.
 must keep passing. The determinism check is the sharpest runtime signal — a race
 shows up as bitwise-varying output across identical runs long before the
 numerical error grows large enough to trip a tolerance.
+
+The rank-2 arm also guards address replay. Triton folds
+`pid*T*tile + t*tile` into the load's tensor offset; the reduce's cooperative
+row scan must replay that complete offset on every trip instead of fabricating
+`(row + pid*BLOCK_M)*BLOCK_N` and silently reading the wrong tile.
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ if not torch.backends.mps.is_available():
     )
 
 TRIPS = 64
-REPEATS = 8
+REPEATS = 30
 
 
 @triton.jit
@@ -68,12 +73,13 @@ def _rank1_reduce_in_loop_kernel(x_ptr, out_ptr, T, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _rank2_reduce_in_loop_kernel(x_ptr, out_ptr, T, BLOCK_M: tl.constexpr,
+def _rank2_reduce_in_loop_kernel(x_ptr, out_ptr, T, initial,
+                                 BLOCK_M: tl.constexpr,
                                  BLOCK_N: tl.constexpr):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    h = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    h = tl.zeros((BLOCK_M,), dtype=tl.float32) + initial
     tile = BLOCK_M * BLOCK_N
     for t in range(T):
         addr = (pid * T * tile + t * tile
@@ -118,20 +124,10 @@ def test_rank1_reduce_in_loop_multiwarp_is_deterministic(BLOCK, num_warps, grid)
     assert err <= 2e-5, f"rel_err={err:.3e}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=Exception,
-    reason="Unsupported shape, rejected at compile time (was: silently wrong). "
-    "A rank-2 reduce whose tile address varies with an enclosing loop must be "
-    "re-filled per trip, but when that loop ALSO carries iter_args (the `h` "
-    "accumulator here) the loop is rebuilt by its own conversion pattern and "
-    "the hoisted rowBuf alloca stops dominating the read. The lowering now "
-    "bails with a clear message instead of emitting a hoisted (wrong) reduce. "
-    "The loop-varying address itself is fixed and covered by "
-    "test_rank2_reduce_in_loop_no_iter_args.",
-)
-@pytest.mark.parametrize("BLOCK_M, num_warps", [(32, 1), (64, 2)])
-def test_rank2_reduce_in_loop_multiwarp_is_deterministic(BLOCK_M, num_warps):
+@pytest.mark.parametrize("BLOCK_M, num_warps, initial",
+                         [(32, 1, 0.25), (64, 2, -0.5)])
+def test_rank2_reduce_in_loop_multiwarp_is_deterministic(BLOCK_M, num_warps,
+                                                         initial):
     BLOCK_N = 16
     grid = 256
     torch.manual_seed(BLOCK_M)
@@ -142,15 +138,16 @@ def test_rank2_reduce_in_loop_multiwarp_is_deterministic(BLOCK_M, num_warps):
     for _ in range(REPEATS):
         out = torch.zeros(grid, TRIPS * BLOCK_M, dtype=torch.float32,
                           device="mps")
-        _rank2_reduce_in_loop_kernel[(grid,)](x, out, TRIPS, BLOCK_M=BLOCK_M,
-                                              BLOCK_N=BLOCK_N,
-                                              num_warps=num_warps)
+        _rank2_reduce_in_loop_kernel[(grid,)](
+            x, out, TRIPS, initial, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            num_warps=num_warps,
+        )
         torch.mps.synchronize()
         outs.append(out.cpu())
     _assert_deterministic(outs)
 
     xr = x.cpu().double()
-    h = torch.zeros(grid, BLOCK_M, dtype=torch.float64)
+    h = torch.full((grid, BLOCK_M), initial, dtype=torch.float64)
     ref = torch.zeros(grid, TRIPS, BLOCK_M, dtype=torch.float64)
     for t in range(TRIPS):
         h = h * 0.5 + xr[:, t, :, :].sum(-1)

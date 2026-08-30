@@ -235,6 +235,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+// A direct axis=1 sum inside a state-carrying user loop is supported only when
+// its complete pointer-offset cone can be replayed at logical (row, column).
+// `arith.maxsi` has an ordinary Metal tensor lowering but is deliberately not
+// part of that address evaluator, so this adjacent shape must fail in the
+// preflight instead of declining after full conversion has mutated the module.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_axis1_loop_address_unsupported(%x_ptr: !tt.ptr<f32>, %T: i32, %initial: f32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %tile = arith.constant 512 : i32
+    %h0 = tt.splat %initial : f32 -> tensor<32xf32, #slice1>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #slice1>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32, #slice1> -> tensor<32x1xi32, #blocked>
+    %row_scale = arith.constant dense<16> : tensor<32x1xi32, #blocked>
+    %row_offsets = arith.muli %rows_2d, %row_scale : tensor<32x1xi32, #blocked>
+    %cols = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
+    %cols_full = tt.broadcast %cols_2d : tensor<1x16xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %x_base = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<32x16x!tt.ptr<f32>, #blocked>
+    %result = scf.for %t = %c0 to %T step %c1 iter_args(%h = %h0) -> (tensor<32xf32, #slice1>) : i32 {
+      %trip_base = arith.muli %t, %tile : i32
+      %trip_splat = tt.splat %trip_base : i32 -> tensor<32x1xi32, #blocked>
+      %row_bases = arith.addi %trip_splat, %row_offsets : tensor<32x1xi32, #blocked>
+      %row_bases_full = tt.broadcast %row_bases : tensor<32x1xi32, #blocked> -> tensor<32x16xi32, #blocked>
+      %offsets = arith.addi %row_bases_full, %cols_full : tensor<32x16xi32, #blocked>
+      %zero = arith.constant dense<0> : tensor<32x16xi32, #blocked>
+      %unsupported = arith.maxsi %offsets, %zero : tensor<32x16xi32, #blocked>
+      %x_addr = tt.addptr %x_base, %unsupported : tensor<32x16x!tt.ptr<f32>, #blocked>, tensor<32x16xi32, #blocked>
+      %x = tt.load %x_addr : tensor<32x16x!tt.ptr<f32>, #blocked>
+      // expected-error @+1 {{rank-2 axis=1 loop-varying direct-load address has an unsupported producer}}
+      %sum = "tt.reduce"(%x) ({
+      ^bb0(%a: f32, %b: f32):
+        %add = arith.addf %a, %b : f32
+        tt.reduce.return %add : f32
+      }) {axis = 1 : i32} : (tensor<32x16xf32, #blocked>) -> tensor<32xf32, #slice1>
+      %next = arith.addf %h, %sum : tensor<32xf32, #slice1>
+      scf.yield %next : tensor<32xf32, #slice1>
+    }
+    tt.return
+  }
+}
+
+// -----
 // A masked load remains outside the initial axis=1 f32 product slice.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
