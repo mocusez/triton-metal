@@ -190,6 +190,123 @@ def _gqa_reference(Q, K, V, num_q_heads, num_kv_heads):
     )
 
 
+@triton.jit
+def _packed_qkv_causal_attention_kernel(
+    qkv_ptr, out_ptr, seq_len, qkv_stride, scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
+):
+    """The hard-llama_transformer_block.py packed-QKV address shape."""
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    kv_h = pid_h // 4
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mask_m = offs_m < seq_len
+
+    q_base = qkv_ptr + pid_h * D
+    k_base = qkv_ptr + 512 + kv_h * D
+    v_base = qkv_ptr + 640 + kv_h * D
+    q = tl.load(
+        q_base + offs_m[:, None] * qkv_stride + offs_d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32)
+    acc = tl.zeros((BLOCK_M, D), tl.float32)
+    key_end = pid_m * BLOCK_M + BLOCK_M
+    for start_n in range(0, key_end, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < seq_len
+        k = tl.load(
+            k_base + offs_n[:, None] * qkv_stride + offs_d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        score = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        score = tl.where(
+            (offs_m[:, None] >= offs_n[None, :]) & mask_n[None, :],
+            score,
+            float("-inf"),
+        )
+        m_new = tl.maximum(m_i, tl.max(score, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(score - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            v_base + offs_n[:, None] * qkv_stride + offs_d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        acc = tl.dot(p, v, acc, input_precision="ieee")
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    tl.store(
+        out_ptr + pid_h * D + offs_m[:, None] * 512 + offs_d[None, :],
+        acc,
+        mask=mask_m[:, None],
+    )
+
+
+@pytest.mark.parametrize("seq_len", [1, 65], ids=["specialized-one", "ragged"])
+def test_packed_qkv_causal_gqa_matches_reference(seq_len):
+    """Packed constants must be reproduced, not dropped during FA matching."""
+    num_q_heads, num_kv_heads, head_dim = 8, 2, 64
+    torch.manual_seed(0xA11)
+    packed = torch.randn(
+        seq_len, 768, dtype=torch.float32, device="mps"
+    ).contiguous()
+    output = torch.empty(
+        seq_len, 512, dtype=torch.float32, device="mps"
+    ).contiguous()
+
+    compiled = _packed_qkv_causal_attention_kernel[
+        (triton.cdiv(seq_len, 64), num_q_heads)
+    ](
+        packed,
+        output,
+        seq_len,
+        packed.stride(0),
+        head_dim**-0.5,
+        BLOCK_M=64,
+        BLOCK_N=32,
+        D=head_dim,
+        num_warps=4,
+        num_stages=1,
+    )
+    torch.mps.synchronize()
+
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "metal.fused_attention" in msl
+    for address_literal in (
+        "uint _fa_dh = 64u",
+        "uint _fa_so = 512u",
+        "uint _fa_kbase = 512u",
+        "uint _fa_vbase = 640u",
+        "uint _fa_qhoff = tgid.y * 64u",
+        "uint _fa_khoff = (tgid.y / 4u) * 64u",
+    ):
+        assert address_literal in msl
+    if seq_len == 1:
+        assert "uint _fa_M = 1u" in msl
+        assert "uint _fa_N = 1u" in msl
+
+    packed_cpu = packed.cpu()
+    q = packed_cpu[:, :512].reshape(seq_len, num_q_heads, head_dim)
+    k = packed_cpu[:, 512:640].reshape(seq_len, num_kv_heads, head_dim)
+    v = packed_cpu[:, 640:768].reshape(seq_len, num_kv_heads, head_dim)
+    groups = num_q_heads // num_kv_heads
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.permute(1, 0, 2),
+        k.permute(1, 0, 2).repeat_interleave(groups, dim=0),
+        v.permute(1, 0, 2).repeat_interleave(groups, dim=0),
+        is_causal=True,
+    ).permute(1, 0, 2).reshape(seq_len, 512)
+    torch.testing.assert_close(output.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize(
     "num_q_heads, num_kv_heads, seq_len, head_dim",
     [

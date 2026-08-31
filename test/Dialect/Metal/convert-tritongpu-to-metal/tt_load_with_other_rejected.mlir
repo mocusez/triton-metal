@@ -1,10 +1,11 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal --verify-diagnostics --split-input-file %s
 //
-// Negative fixture: tt.load with an `other` operand feeding a `tt.dot`
-// operand position is rejected by the dot-prepass. Elementwise other-loads
-// are accepted via MaskedLoadLowering (constant or runtime-uniform splat);
-// this fixture validates that the dot-operand-position guardrail remains
-// intact. See the implementation notes
+// Negative fixture: tt.load with a nonzero `other` operand feeding a `tt.dot`
+// operand position is rejected by the dot-prepass. Numeric zero is supported
+// by simdgroup staged loads; elementwise other-loads are accepted via
+// MaskedLoadLowering (constant or runtime-uniform splat). This fixture
+// validates that the nonzero dot-operand guardrail remains intact. See the
+// implementation notes
 // §3.0 ADR.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -25,10 +26,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Mask + splat-constant `other` on the load feeding tt.dot operand 0.
     %true_i1 = arith.constant true
     %mask = tt.splat %true_i1 : i1 -> tensor<8x8xi1, #dotA>
-    %zero_f = arith.constant 0.0 : f32
-    %other = tt.splat %zero_f : f32 -> tensor<8x8xf32, #dotA>
+    %one_f = arith.constant 1.0 : f32
+    %other = tt.splat %one_f : f32 -> tensor<8x8xf32, #dotA>
 
-    // expected-error @+1 {{`other` operand not supported in tt.dot operand position}}
+    // expected-error @+1 {{masked dot load requires numeric zero `other`}}
     %a = tt.load %a_addr, %mask, %other : tensor<8x8x!tt.ptr<f32>, #dotA>
     %b = tt.load %b_addr : tensor<8x8x!tt.ptr<f32>, #dotB>
     %c0 = arith.constant dense<0.000000e+00> : tensor<8x8xf32, #blocked>

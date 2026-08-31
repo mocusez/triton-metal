@@ -395,6 +395,11 @@ void ModuleTranslation::translateKernels() {
     if (auto kernelOp = dyn_cast<mlir::triton::metal::KernelOp>(op)) {
       _varCount = 0;
       _buffers = {};
+      _sharedStageBufferDeclared = false;
+      _sharedStageBufferPerWarp = false;
+      _sgstoreScratchDeclared = false;
+      _sgstoreScratchPerWarp = false;
+      _fstoreScratchDeclared = false;
       translateKernel(kernelOp);
       _output << "\n\n";
     } else if (isa<mlir::triton::metal::ConstantOp, mlir::triton::metal::ModuleEndOp>(op)) {
@@ -1375,6 +1380,8 @@ void ModuleTranslation::translate(
       _output << "_stage_shared[";
       translateVarName(warpIdx[0]);
       _output << "][";
+    } else if (_sharedStageBufferPerWarp) {
+      _output << "_stage_shared[0][";
     } else {
       _output << "_stage_shared[";
     }
@@ -1410,6 +1417,9 @@ void ModuleTranslation::translate(
     _output << "simdgroup_load(v" << id << ", &_stage_shared[";
     translateVarName(warpIdx[0]);
     _output << "][0], " << resTy.getCols() << ")";
+  } else if (_sharedStageBufferPerWarp) {
+    _output << "simdgroup_load(v" << id << ", &_stage_shared[0][0], "
+            << resTy.getCols() << ")";
   } else {
     _output << "simdgroup_load(v" << id << ", &_stage_shared[0], "
             << resTy.getCols() << ")";
@@ -1433,6 +1443,8 @@ void ModuleTranslation::translate(
       _output << "[";
       translateVarName(op.getWarpIndex()[0]);
       _output << "]";
+    } else if (_sharedStageBufferPerWarp) {
+      _output << "[0]";
     }
   };
 
@@ -1608,17 +1620,27 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
     mlir::Value nExtentVal = partialExtents[1];
     auto matTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
         op.getMatrix().getType());
-    unsigned id = _varCount++;
     unsigned elems = matTy.getRows() * matTy.getCols();
+    const bool perWarp = !op.getWarpIndex().empty();
+    auto warpDim = [&]() {
+      if (perWarp) {
+        _output << "[";
+        translateVarName(op.getWarpIndex()[0]);
+        _output << "]";
+      } else if (_sgstoreScratchPerWarp) {
+        _output << "[0]";
+      }
+    };
 
-    _output << "threadgroup " << typeToString(matTy.getElem())
-            << " _scratch_" << id << "[" << elems << "]";
+    _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
     printDelim();
     _output << "\n";
     indent();
     _output << "simdgroup_store(";
     translateVarName(op.getMatrix());
-    _output << ", &_scratch_" << id << "[0], " << matTy.getCols() << ")";
+    _output << ", &_sgstore_shared";
+    warpDim();
+    _output << "[0], " << matTy.getCols() << ")";
     printDelim();
     _output << "\n";
     indent();
@@ -1663,7 +1685,9 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
         translateVarName(op.getMemref());
         _output << "[gi * ";
         translateValue(op.getStride().getDefiningOp());
-        _output << " + gj] = _scratch_" << id << "[c]";
+        _output << " + gj] = _sgstore_shared";
+        warpDim();
+        _output << "[c]";
         printDelim();
       }
       _output << "\n";
@@ -2811,23 +2835,45 @@ void ModuleTranslation::emitFusedAttentionMma_(
   };
   const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
                     V = bufName(op.getV()), O = bufName(op.getOut());
-  const std::string M = bufName(op.getM()) + "[0]";
-  const std::string N = bufName(op.getN()) + "[0]";
-  const std::string DH = bufName(op.getDHead()) + "[0]";
-  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
-  const std::string SK = bufName(op.getStrideK()) + "[0]";
-  const std::string SV = bufName(op.getStrideV()) + "[0]";
-  const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto scalarExpr = [&](mlir::Value value, llvm::StringRef name) {
+    if (mlir::isa<mlir::triton::metal::MetalMemRefType>(value.getType()))
+      return bufName(value) + "[0]";
+    if (auto constant =
+            value.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+        return std::to_string(integer.getValue().getZExtValue()) + "u";
+    op.emitError() << "metal.fused_attention: " << name
+                   << " is neither a kernel scalar buffer nor a ui32 literal";
+    _emitFailed = true;
+    return std::string("0u");
+  };
+  const std::string M = scalarExpr(op.getM(), "m");
+  const std::string N = scalarExpr(op.getN(), "n");
+  const std::string DH = scalarExpr(op.getDHead(), "d_head");
+  const std::string SQ = scalarExpr(op.getStrideQ(), "stride_q");
+  const std::string SK = scalarExpr(op.getStrideK(), "stride_k");
+  const std::string SV = scalarExpr(op.getStrideV(), "stride_v");
+  const std::string SO = scalarExpr(op.getStrideO(), "stride_o");
   auto headParams = op.getHeadParams();
   const bool independentHeads = !headParams.empty();
   std::string SQH, SKH, SVH, SOH, GROUPS;
   if (independentHeads) {
-    SQH = bufName(headParams[0]) + "[0]";
-    SKH = bufName(headParams[1]) + "[0]";
-    SVH = bufName(headParams[2]) + "[0]";
-    SOH = bufName(headParams[3]) + "[0]";
-    GROUPS = bufName(headParams[4]) + "[0]";
+    SQH = scalarExpr(headParams[0], "stride_qh");
+    SKH = scalarExpr(headParams[1], "stride_kh");
+    SVH = scalarExpr(headParams[2], "stride_vh");
+    SOH = scalarExpr(headParams[3], "stride_oh");
+    GROUPS = scalarExpr(headParams[4], "groups");
   }
+  auto baseOffsets = op.getBaseOffsets();
+  const std::string QBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[0], "q base offset");
+  const std::string KBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[1], "k base offset");
+  const std::string VBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[2], "v base offset");
+  const std::string OBASE = baseOffsets.empty()
+                                ? "0u"
+                                : scalarExpr(baseOffsets[3], "out base offset");
   auto S = [](int64_t x) { return std::to_string(x); };
   const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
 
@@ -2862,6 +2908,10 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
   os << "  uint _fa_so = " << SO << ";\n";
+  os << "  uint _fa_qbase = " << QBASE << ";\n";
+  os << "  uint _fa_kbase = " << KBASE << ";\n";
+  os << "  uint _fa_vbase = " << VBASE << ";\n";
+  os << "  uint _fa_obase = " << OBASE << ";\n";
   if (independentHeads) {
     os << "  uint _fa_qhoff = tgid.y * " << SQH << ";\n";
     os << "  uint _fa_khoff = (tgid.y / " << GROUPS << ") * " << SKH
@@ -2887,7 +2937,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
      << "u; uint row = _fa_rowoff + q;\n";
   if (!featureTiled)
     os << "      _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? " << Q
-       << "[" << (independentHeads ? "_fa_qhoff + " : "")
+       << "[_fa_qbase + " << (independentHeads ? "_fa_qhoff + " : "")
        << "row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
@@ -2914,7 +2964,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_out_d) ? " << V
-       << "[kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+       << "[_fa_vbase + kk * _fa_sv + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -2927,14 +2977,14 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "          uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint row = _fa_rowoff + q;\n";
     os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
-       << Q << "[row * _fa_sq + _fa_dc + d] : 0.0f;\n";
+       << Q << "[_fa_qbase + row * _fa_sq + _fa_dc + d] : 0.0f;\n";
     os << "        }\n";
     os << "        for (uint c = _fa_lane; c < " << S(SZ_KTV)
        << "u; c += 32u) {\n";
     os << "          uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
        << "u; uint kk = kb + key;\n";
     os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
-       << K << "[(_fa_dc + d) * _fa_sk + kk] : 0.0f;\n";
+       << K << "[_fa_kbase + (_fa_dc + d) * _fa_sk + kk] : 0.0f;\n";
     os << "        }\n";
     os << "      }\n";
     os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -2969,7 +3019,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
-       << "[" << (independentHeads ? "_fa_khoff + " : "")
+       << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "")
        << "kk * _fa_sk + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
     os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
@@ -2977,7 +3027,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
-       << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
        << "kk * _fa_sv + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
     os << "    }\n";
@@ -3091,7 +3141,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     else
       os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
     os << "        " << O << "["
-       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
        << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d] / denom;\n";
   } else {
@@ -3100,7 +3150,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     else
       os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
     os << "        " << O << "["
-       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
        << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
        << S(BD) << "u + d];\n";
   }
@@ -3192,23 +3242,45 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   };
   const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
                     V = bufName(op.getV()), O = bufName(op.getOut());
-  const std::string M = bufName(op.getM()) + "[0]";
-  const std::string N = bufName(op.getN()) + "[0]";
-  const std::string DH = bufName(op.getDHead()) + "[0]";
-  const std::string SQ = bufName(op.getStrideQ()) + "[0]";
-  const std::string SK = bufName(op.getStrideK()) + "[0]";
-  const std::string SV = bufName(op.getStrideV()) + "[0]";
-  const std::string SO = bufName(op.getStrideO()) + "[0]";
+  auto scalarExpr = [&](mlir::Value value, llvm::StringRef name) {
+    if (mlir::isa<mlir::triton::metal::MetalMemRefType>(value.getType()))
+      return bufName(value) + "[0]";
+    if (auto constant =
+            value.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+        return std::to_string(integer.getValue().getZExtValue()) + "u";
+    op.emitError() << "metal.fused_attention: " << name
+                   << " is neither a kernel scalar buffer nor a ui32 literal";
+    _emitFailed = true;
+    return std::string("0u");
+  };
+  const std::string M = scalarExpr(op.getM(), "m");
+  const std::string N = scalarExpr(op.getN(), "n");
+  const std::string DH = scalarExpr(op.getDHead(), "d_head");
+  const std::string SQ = scalarExpr(op.getStrideQ(), "stride_q");
+  const std::string SK = scalarExpr(op.getStrideK(), "stride_k");
+  const std::string SV = scalarExpr(op.getStrideV(), "stride_v");
+  const std::string SO = scalarExpr(op.getStrideO(), "stride_o");
   auto headParams = op.getHeadParams();
   const bool independentHeads = !headParams.empty();
   std::string SQH, SKH, SVH, SOH, GROUPS;
   if (independentHeads) {
-    SQH = bufName(headParams[0]) + "[0]";
-    SKH = bufName(headParams[1]) + "[0]";
-    SVH = bufName(headParams[2]) + "[0]";
-    SOH = bufName(headParams[3]) + "[0]";
-    GROUPS = bufName(headParams[4]) + "[0]";
+    SQH = scalarExpr(headParams[0], "stride_qh");
+    SKH = scalarExpr(headParams[1], "stride_kh");
+    SVH = scalarExpr(headParams[2], "stride_vh");
+    SOH = scalarExpr(headParams[3], "stride_oh");
+    GROUPS = scalarExpr(headParams[4], "groups");
   }
+  auto baseOffsets = op.getBaseOffsets();
+  const std::string QBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[0], "q base offset");
+  const std::string KBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[1], "k base offset");
+  const std::string VBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[2], "v base offset");
+  const std::string OBASE = baseOffsets.empty()
+                                ? "0u"
+                                : scalarExpr(baseOffsets[3], "out base offset");
   auto S = [](int64_t x) { return std::to_string(x); };
 
   auto &os = _output;
@@ -3237,6 +3309,10 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "  uint _fa_sk = " << SK << ";\n";
   os << "  uint _fa_sv = " << SV << ";\n";
   os << "  uint _fa_so = " << SO << ";\n";
+  os << "  uint _fa_qbase = " << QBASE << ";\n";
+  os << "  uint _fa_kbase = " << KBASE << ";\n";
+  os << "  uint _fa_vbase = " << VBASE << ";\n";
+  os << "  uint _fa_obase = " << OBASE << ";\n";
   if (independentHeads) {
     os << "  uint _fa_qhoff = tgid.y * " << SQH << ";\n";
     os << "  uint _fa_khoff = (tgid.y / " << GROUPS << ") * " << SKH
@@ -3270,7 +3346,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "        uint row = _fa_rowoff + _fa_c0 + qq;\n";
   os << "        _fa_qbuf[c] = (qq + _fa_c0 < " << S(BM)
      << "u && row < _fa_M && d < _fa_out_d) ? " << Q
-     << "[" << (independentHeads ? "_fa_qhoff + " : "")
+     << "[_fa_qbase + " << (independentHeads ? "_fa_qhoff + " : "")
      << "row * _fa_sq + _fa_col + d] : 0.0f;\n";
   os << "        _fa_obuf[c] = 0.0f;\n";
   os << "      }\n";
@@ -3309,11 +3385,12 @@ void ModuleTranslation::emitFusedAttentionScalar_(
   os << "          float _fa_a = 0.0f;\n";
   os << "          for (uint d = 0; d < _fa_dh; ++d)\n";
   if (featureTiled)
-    os << "            _fa_a += " << Q << "[_fa_row * _fa_sq + d] * " << K
-       << "[d * _fa_sk + _fa_key];\n";
+    os << "            _fa_a += " << Q
+       << "[_fa_qbase + _fa_row * _fa_sq + d] * " << K
+       << "[_fa_kbase + d * _fa_sk + _fa_key];\n";
   else
     os << "            _fa_a += _fa_qbuf[_fa_q * " << S(BD) << "u + d] * " << K
-       << "[" << (independentHeads ? "_fa_khoff + " : "")
+       << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "")
        << "_fa_key * _fa_sk + _fa_col + d];\n";
   // ---- the score transform, straight out of the op's region ----
   std::string w = emitScoreRegion_(op, "_fa_a", "(int)_fa_row", "(int)_fa_key",
@@ -3324,7 +3401,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     // source kernel's mask does.
     os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] += " << w << " * "
-       << V << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << V << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
        << "_fa_key * _fa_sv + _fa_col + d];\n";
   } else {
     // norm = online_softmax: the transformed score is a logit. `(m_old ==
@@ -3351,7 +3428,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     os << "          for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "            _fa_obuf[_fa_q * " << S(BD) << "u + d] = _fa_obuf[_fa_q "
           "* " << S(BD) << "u + d] * _fa_sc + _fa_p * " << V
-       << "[" << (independentHeads ? "_fa_vhoff + " : "")
+       << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
        << "_fa_key * _fa_sv + _fa_col + d];\n";
   }
   os << "        }\n";
@@ -3363,13 +3440,13 @@ void ModuleTranslation::emitFusedAttentionScalar_(
       os << "        _fa_den = (_fa_den == 0.0f) ? 1.0f : _fa_den;\n";
     os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "          " << O << "["
-       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
        << "_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d] / _fa_den;\n";
   } else {
     os << "        for (uint d = 0; d < _fa_out_d; ++d)\n";
     os << "          " << O << "["
-       << (independentHeads ? "_fa_ohoff + " : "")
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
        << "_fa_row * _fa_so + _fa_col + d] = "
        << "_fa_obuf[_fa_q * " << S(BD) << "u + d];\n";
   }
@@ -6114,21 +6191,31 @@ void ModuleTranslation::translate(mlir::Region &region) {
     auto kernelOp =
         mlir::dyn_cast<mlir::triton::metal::KernelOp>(region.getParentOp());
     if (kernelOp && !_sharedStageBufferDeclared) {
+      auto scratchNumWarps = [](mlir::Operation *op) {
+        if (auto numWarps = mlir::triton::gpu::maybeLookupNumWarps(op))
+          return *numWarps;
+        return 8;
+      };
       mlir::triton::metal::SimdgroupLoadDeviceStagedOp firstStaged;
+      bool perWarpStage = false;
       kernelOp.walk([&](mlir::triton::metal::SimdgroupLoadDeviceStagedOp op) {
-        firstStaged = op;
-        return mlir::WalkResult::interrupt();
+        if (!firstStaged)
+          firstStaged = op;
+        if (!op.getWarpIndex().empty())
+          perWarpStage = true;
+        return mlir::WalkResult::advance();
       });
       // A kernel may carry only MASKED staged loads (no unmasked); both share
       // the single `_stage_shared` buffer, and either may be per-warp.
       mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp firstMasked;
-      if (!firstStaged) {
-        kernelOp.walk(
-            [&](mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op) {
+      kernelOp.walk(
+          [&](mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op) {
+            if (!firstMasked)
               firstMasked = op;
-              return mlir::WalkResult::interrupt();
-            });
-      }
+            if (!op.getWarpIndex().empty())
+              perWarpStage = true;
+            return mlir::WalkResult::advance();
+          });
       if (firstStaged || firstMasked) {
         auto resTy = firstStaged
                          ? llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
@@ -6136,14 +6223,12 @@ void ModuleTranslation::translate(mlir::Region &region) {
                          : llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
                                firstMasked.getResult().getType());
         unsigned elems = resTy.getRows() * resTy.getCols();
-        bool perWarp = firstStaged ? !firstStaged.getWarpIndex().empty()
-                                   : !firstMasked.getWarpIndex().empty();
         _output << "\n";
         indent();
-        if (perWarp) {
+        if (perWarpStage) {
           int numWarps = firstStaged
-                             ? mlir::triton::gpu::lookupNumWarps(firstStaged)
-                             : mlir::triton::gpu::lookupNumWarps(firstMasked);
+                             ? scratchNumWarps(firstStaged)
+                             : scratchNumWarps(firstMasked);
           _output << "threadgroup " << typeToString(resTy.getElem())
                   << " _stage_shared[" << numWarps << "][" << elems << "]";
         } else {
@@ -6152,6 +6237,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
         }
         printDelim();
         _sharedStageBufferDeclared = true;
+        _sharedStageBufferPerWarp = perWarpStage;
       }
       // Fused-store scratch, shared across all simdgroup_fused_store ops (they
       // run sequentially with barriers) so threadgroup memory does not scale
@@ -6173,11 +6259,43 @@ void ModuleTranslation::translate(mlir::Region &region) {
             indent();
             _output << "threadgroup " << fty << " " << nm;
             if (fpw)
-              _output << "[" << mlir::triton::gpu::lookupNumWarps(firstFused) << "]";
+              _output << "[" << scratchNumWarps(firstFused) << "]";
             _output << "[" << felems << "]";
             printDelim();
           }
           _fstoreScratchDeclared = true;
+        }
+      }
+      // Partial simdgroup_store scratch, shared across all masked-tail stores.
+      // Stores execute sequentially in IR order and each op brackets scratch
+      // reuse with barriers, so threadgroup memory is independent of the
+      // number of output tiles.
+      if (!_sgstoreScratchDeclared) {
+        mlir::triton::metal::SimdgroupStoreOp firstStore;
+        bool spw = false;
+        kernelOp.walk([&](mlir::triton::metal::SimdgroupStoreOp op) {
+          if (op.getPartialExtents().size() != 2)
+            return mlir::WalkResult::advance();
+          if (!firstStore)
+            firstStore = op;
+          if (!op.getWarpIndex().empty())
+            spw = true;
+          return mlir::WalkResult::advance();
+        });
+        if (firstStore) {
+          auto st = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+              firstStore.getMatrix().getType());
+          unsigned selems = st.getRows() * st.getCols();
+          _output << "\n";
+          indent();
+          _output << "threadgroup " << typeToString(st.getElem())
+                  << " _sgstore_shared";
+          if (spw)
+            _output << "[" << scratchNumWarps(firstStore) << "]";
+          _output << "[" << selems << "]";
+          printDelim();
+          _sgstoreScratchDeclared = true;
+          _sgstoreScratchPerWarp = spw;
         }
       }
     }

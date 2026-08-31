@@ -95,6 +95,9 @@ private:
   // buffer can be safely reused. Tracked here so the kernel-body walker
   // emits the declaration exactly once.
   bool _sharedStageBufferDeclared = false;
+  bool _sharedStageBufferPerWarp = false;
+  bool _sgstoreScratchDeclared = false;
+  bool _sgstoreScratchPerWarp = false;
   bool _fstoreScratchDeclared = false;
   // Set by a translator that has emitted an `op.emitError()` and cannot produce
   // correct MSL. `translateModule` turns it into a `failure()` so the compile

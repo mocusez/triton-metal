@@ -269,11 +269,46 @@ llvm::LogicalResult FusedAttentionOp::verify() {
                                      mlir::IntegerType::Signed);
   auto ui32 = mlir::IntegerType::get(getContext(), 32,
                                      mlir::IntegerType::Unsigned);
+
+  auto checkAddressScalar = [&](mlir::Value value,
+                                llvm::StringRef name) -> llvm::LogicalResult {
+    if (auto memRef = llvm::dyn_cast<MetalMemRefType>(value.getType())) {
+      if (memRef.getType() == ui32)
+        return mlir::success();
+      return emitOpError() << name << " must be a !metal.memref<? x ui32> "
+                           << "or a literal ui32";
+    }
+    if (value.getType() == ui32 &&
+        value.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      return mlir::success();
+    return emitOpError() << name << " must be a !metal.memref<? x ui32> "
+                         << "or a metal.constant ui32";
+  };
+  if (mlir::failed(checkAddressScalar(getM(), "m")) ||
+      mlir::failed(checkAddressScalar(getN(), "n")) ||
+      mlir::failed(checkAddressScalar(getDHead(), "d_head")) ||
+      mlir::failed(checkAddressScalar(getStrideQ(), "stride_q")) ||
+      mlir::failed(checkAddressScalar(getStrideK(), "stride_k")) ||
+      mlir::failed(checkAddressScalar(getStrideV(), "stride_v")) ||
+      mlir::failed(checkAddressScalar(getStrideO(), "stride_o")))
+    return mlir::failure();
+
   for (auto [i, p] : llvm::enumerate(headParams)) {
-    auto memRef = llvm::dyn_cast<MetalMemRefType>(p.getType());
-    if (!memRef || memRef.getType() != ui32)
-      return emitOpError() << "head_param " << i
-                           << " must be a !metal.memref<? x ui32>";
+    if (mlir::failed(checkAddressScalar(
+            p, (llvm::Twine("head_param ") + llvm::Twine(i)).str())))
+      return mlir::failure();
+  }
+
+  auto baseOffsets = getBaseOffsets();
+  if (!baseOffsets.empty() && baseOffsets.size() != 4)
+    return emitOpError()
+           << "base_offsets must be empty or contain q, k, v and out element "
+              "offsets (got "
+           << baseOffsets.size() << " operands)";
+  for (auto [i, p] : llvm::enumerate(baseOffsets)) {
+    if (!p.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      return emitOpError() << "base_offset " << i
+                           << " must be a metal.constant ui32";
   }
   auto params = getScoreParams();
 
@@ -1900,6 +1935,16 @@ llvm::LogicalResult SimdgroupLoadDeviceStagedOp::verify() {
 // SimdgroupStoreOp
 //===----------------------------------------------------------------------===//
 
+llvm::LogicalResult SimdgroupLoadDeviceStagedMaskedOp::verify() {
+  auto widx = getWarpIndex();
+  if (widx.size() > 1)
+    return emitOpError()
+           << "warp_index must be empty (single-warp / bit-identical) or "
+              "exactly 1 value (per-warp staged-load); got "
+           << widx.size();
+  return mlir::success();
+}
+
 llvm::LogicalResult SimdgroupStoreOp::verify() {
   auto extents = getPartialExtents();
   if (!extents.empty() && extents.size() != 2)
@@ -1907,6 +1952,15 @@ llvm::LogicalResult SimdgroupStoreOp::verify() {
            << "partial_extents must be empty (full 8x8 store) or exactly 2 "
               "values [m_extent, n_extent]; got "
            << extents.size();
+  auto widx = getWarpIndex();
+  if (widx.size() > 1)
+    return emitOpError()
+           << "warp_index must be empty (single-warp / bit-identical) or "
+              "exactly 1 value (per-warp store); got "
+           << widx.size();
+  if (!widx.empty() && extents.size() != 2)
+    return emitOpError()
+           << "warp_index is only supported for partial stores";
   return mlir::success();
 }
 

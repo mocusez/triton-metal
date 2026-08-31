@@ -167,7 +167,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: uint _fa_col = tgid.y * _fa_dh;
 // The padded feature columns d >= d_head must stage as zero, or the head slice
 // bleeds into its neighbour.
-// CHECK: _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? v0[row * _fa_sq + _fa_col + d] : 0.0f;
+// CHECK: _fa_qbuf[c] = (row < _fa_M && d < _fa_dh) ? v0[_fa_qbase + row * _fa_sq + _fa_col + d] : 0.0f;
 //
 // `softmax_natural_exp` picks base-e. It is not cosmetic: a kernel that folds
 // log2(e) into its scale uses exp2 instead, and the region has already produced
@@ -182,17 +182,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: kernel void feature_tiled_kernel
 // CHECK: uint _fa_col = tgid.y * 64u;
 // CHECK: uint _fa_out_d = (_fa_col < _fa_dh) ? min(64u, _fa_dh - _fa_col) : 0u;
-// CHECK: v2[kk * _fa_sv + _fa_col + d]
+// CHECK: v2[_fa_vbase + kk * _fa_sv + _fa_col + d]
 // CHECK: // ---- feature-tiled QK full-dhead sweep ----
 // CHECK: for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += 64u)
-// CHECK: v0[row * _fa_sq + _fa_dc + d]
-// CHECK: v1[(_fa_dc + d) * _fa_sk + kk]
+// CHECK: v0[_fa_qbase + row * _fa_sq + _fa_dc + d]
+// CHECK: v1[_fa_kbase + (_fa_dc + d) * _fa_sk + kk]
 // CHECK: simdgroup_float8x8 acc(0.0f);
 // CHECK: if (_fa_dc != 0u) simdgroup_load(acc, &_fa_sbuf
 // CHECK: simdgroup_multiply_accumulate(acc, a, b, acc);
 // CHECK: simdgroup_store(acc, &_fa_sbuf
 // CHECK: denom = (denom == 0.0f) ? 1.0f : denom;
-// CHECK: v3[row * _fa_so + _fa_col + d]
+// CHECK: v3[_fa_obase + row * _fa_so + _fa_col + d]
 
 // --- grouped-head kernel: y selects an independently stored query head;
 // K/V share one head per runtime-sized query group. The head offsets are
@@ -203,7 +203,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: uint _fa_khoff = (tgid.y / v15[0]) * v12[0];
 // CHECK: uint _fa_vhoff = (tgid.y / v15[0]) * v13[0];
 // CHECK: uint _fa_ohoff = tgid.y * v14[0];
-// CHECK: v0[_fa_qhoff + row * _fa_sq + _fa_col + d]
-// CHECK: v1[_fa_khoff + kk * _fa_sk + _fa_col + d]
-// CHECK: v2[_fa_vhoff + kk * _fa_sv + _fa_col + d]
-// CHECK: v3[_fa_ohoff + row * _fa_so + _fa_col + d]
+// CHECK: v0[_fa_qbase + _fa_qhoff + row * _fa_sq + _fa_col + d]
+// CHECK: v1[_fa_kbase + _fa_khoff + kk * _fa_sk + _fa_col + d]
+// CHECK: v2[_fa_vbase + _fa_vhoff + kk * _fa_sv + _fa_col + d]
+// CHECK: v3[_fa_obase + _fa_ohoff + row * _fa_so + _fa_col + d]

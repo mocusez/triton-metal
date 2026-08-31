@@ -9,10 +9,10 @@ These files are test inputs, not standalone pytest modules. Assertions and
 parameterization belong in `python/test/unit/test_metal_backend_*.py`; compiler
 IR regressions belong in `test/Dialect/Metal/`.
 
-Run `pixi run leet-all` from the repository root to audit all 80 Python
-fixtures and cover the 78 runnable workloads through their owned execution
-paths. `test_metal_backend_leet_uncovered.py` owns the exhaustive manifest: 23
-standalone scripts, 26 interpreter-backed cases, and 31 targeted backend
+Run `pixi run leet-all` from the repository root to audit all 82 Python
+fixtures and cover the 80 runnable workloads through their owned execution
+paths. `test_metal_backend_leet_uncovered.py` owns the exhaustive manifest: 24
+standalone scripts, 26 interpreter-backed cases, and 32 targeted backend
 regressions. Two interpreter cases are explicit skips because their recovered
 source is invalid on every backend.
 

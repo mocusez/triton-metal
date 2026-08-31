@@ -271,6 +271,186 @@ def test_dot_dynamic_k_transposed_b(M, N, K):
     torch.testing.assert_close(c.cpu(), expected, atol=1e-4, rtol=1e-4)
 
 
+# --- Llama-block canonical masked runtime-K GEMM -----------------------------
+# One program computes a 64x64 output tile, using the canonical pointer-iter_arg
+# K loop from hard-llama_transformer_block.py: masked A/W loads with zero fill,
+# tl.trans(W), and a masked output store. This must be handled by the canonical
+# runtime-K lowering rather than the recompute or fused LoRA special cases.
+@triton.jit
+def masked_multitile_transb_kernel(
+    a_ptr, w_ptr, c_ptr, M, N, K, w_off,
+    stride_am, stride_ak, stride_wn, stride_wk, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = (w_ptr + w_off + offs_n[:, None] * stride_wn
+              + offs_k[None, :] * stride_wk)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = offs_k < K - k0
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        w_mask = (offs_n[:, None] < N) & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        acc = tl.dot(a, tl.trans(w), acc, allow_tf32=False)
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def _run_masked_multitile_transb(
+    M, N, K, *, num_warps, block_m=64, block_n=64, seed=0xA110
+):
+    torch.manual_seed(seed + M * 17 + N * 5 + K)
+    a_cpu = torch.randn((M, K), dtype=torch.float32).contiguous()
+    weight_base_offset = 512
+    w_storage_cpu = torch.randn(
+        (weight_base_offset + N * K,), dtype=torch.float32
+    ).contiguous()
+    w_cpu = w_storage_cpu[weight_base_offset:].view(N, K)
+    a = a_cpu.to("mps")
+    w_storage = w_storage_cpu.to("mps")
+    w = w_storage[weight_base_offset:].view(N, K)
+    sentinel = -4321.0
+    c_guard = torch.full((triton.cdiv(M, block_m) * block_m,
+                          triton.cdiv(N, block_n) * block_n),
+                         sentinel, dtype=torch.float32,
+                         device="mps").contiguous()
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    masked_multitile_transb_kernel[grid](
+        a, w_storage, c_guard, M, N, K, weight_base_offset,
+        a.stride(0), a.stride(1),
+        w.stride(0), w.stride(1),
+        c_guard.stride(0), c_guard.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=32,
+        num_warps=num_warps,
+    )
+    return c_guard, a_cpu, w_cpu, sentinel
+
+
+@pytest.mark.parametrize(
+    "M,N,K", [(1, 768, 512), (4, 768, 512), (16, 768, 512),
+              (30, 768, 512), (64, 768, 512)]
+)
+def test_dot_dynamic_k_masked_multitile_transposed_b_llama_shape(M, N, K):
+    c_guard, a, w, sentinel = _run_masked_multitile_transb(
+        M, N, K, num_warps=4
+    )
+    actual = c_guard[:M, :N].cpu()
+    expected = torch.matmul(a, w.t())
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    assert torch.all(c_guard[M:, :].cpu() == sentinel)
+    assert torch.all(c_guard[:, N:].cpu() == sentinel)
+
+
+@pytest.mark.parametrize(
+    "M,N,K,num_warps,block_m,block_n",
+    [(13, 70, 50, 4, 64, 64), (30, 65, 47, 2, 64, 64),
+     (1, 35, 31, 1, 32, 32)],
+)
+def test_dot_dynamic_k_masked_multitile_transposed_b_ragged(
+    M, N, K, num_warps, block_m, block_n
+):
+    c_guard, a, w, sentinel = _run_masked_multitile_transb(
+        M, N, K, num_warps=num_warps, block_m=block_m, block_n=block_n
+    )
+    actual = c_guard[:M, :N].cpu()
+    expected = torch.matmul(a, w.t())
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    assert torch.all(c_guard[M:, :].cpu() == sentinel)
+    assert torch.all(c_guard[:, N:].cpu() == sentinel)
+
+
+def test_dot_dynamic_k_masked_multitile_multiwarp_repeatability():
+    """Reusable per-warp staging/store scratch stays race-free over launches."""
+    M, N, K = 13, 70, 50
+    for launch in range(30):
+        c_guard, a, w, sentinel = _run_masked_multitile_transb(
+            M, N, K, num_warps=4, seed=0xA130 + launch
+        )
+        torch.testing.assert_close(
+            c_guard[:M, :N].cpu(), a @ w.t(), atol=1e-3, rtol=1e-3
+        )
+        assert torch.all(c_guard[M:, :].cpu() == sentinel)
+        assert torch.all(c_guard[:, N:].cpu() == sentinel)
+
+
+@triton.jit
+def masked_multitile_kernel(
+    a_ptr, b_ptr, c_ptr, M, N, K, b_off,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = (b_ptr + b_off + offs_k[:, None] * stride_bk
+              + offs_n[None, :] * stride_bn)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = offs_k < K - k0
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc = tl.dot(a, b, acc, allow_tf32=False)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@pytest.mark.parametrize(
+    "M,N,K,num_warps,block_m,block_n",
+    [(13, 35, 50, 1, 32, 32), (30, 65, 47, 2, 64, 64),
+     (64, 64, 64, 4, 64, 64)],
+)
+def test_dot_dynamic_k_masked_multitile_normal_b_ragged(
+    M, N, K, num_warps, block_m, block_n
+):
+    torch.manual_seed(0xB110 + M * 17 + N * 5 + K)
+    a_cpu = torch.randn((M, K), dtype=torch.float32).contiguous()
+    b_base_offset = 13
+    b_storage_cpu = torch.randn(
+        (b_base_offset + K * N,), dtype=torch.float32
+    ).contiguous()
+    b_cpu = b_storage_cpu[b_base_offset:].view(K, N)
+    a = a_cpu.to("mps")
+    b_storage = b_storage_cpu.to("mps")
+    b = b_storage[b_base_offset:].view(K, N)
+    sentinel = -4321.0
+    c_guard = torch.full(
+        (triton.cdiv(M, block_m) * block_m,
+         triton.cdiv(N, block_n) * block_n),
+        sentinel,
+        dtype=torch.float32,
+        device="mps",
+    ).contiguous()
+    masked_multitile_kernel[(triton.cdiv(M, block_m),
+                             triton.cdiv(N, block_n))](
+        a, b_storage, c_guard, M, N, K, b_base_offset,
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        c_guard.stride(0), c_guard.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=32,
+        num_warps=num_warps,
+    )
+    actual = c_guard[:M, :N].cpu()
+    torch.testing.assert_close(actual, a_cpu @ b_cpu, atol=1e-3, rtol=1e-3)
+    assert torch.all(c_guard[M:, :].cpu() == sentinel)
+    assert torch.all(c_guard[:, N:].cpu() == sentinel)
+
+
 # --- W2b: recompute-from-IV loop shape (medium-lora_linear.py's inner loop) ---
 # Addresses are rebuilt from the induction variable each iteration
 # (`offs_k = k + tl.arange(...)`), so the loop carries ONLY the accumulator (no
