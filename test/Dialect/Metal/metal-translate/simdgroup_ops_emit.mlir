@@ -25,6 +25,29 @@ module {
       metal.simdgroup_store %c, %c_buf[%row, %col], %stride : !metal.simdgroup_matrix<8 x 8 x f32>, !metal.memref<? x f32>, ui32, ui32, ui32
       metal.return
     }
+
+    metal.kernel simdgroup_partial_warp_store address_space_device [true, true, true] {
+    ^bb0(%c_buf: !metal.memref<? x f32>):
+      %row = metal.constant 0 : ui32
+      %col = metal.constant 0 : ui32
+      %stride = metal.constant 8 : ui32
+      %extent = metal.constant 7 : ui32
+      %warp = metal.simdgroup_index : ui32
+      %c0 = metal.simdgroup_load %c_buf[%row, %col], %stride : (!metal.memref<? x f32>, ui32, ui32, ui32) -> !metal.simdgroup_matrix<8 x 8 x f32>
+      metal.simdgroup_store %c0, %c_buf[%row, %col], %stride partial [%extent, %extent] warp [%warp] : !metal.simdgroup_matrix<8 x 8 x f32>, !metal.memref<? x f32>, ui32, ui32, ui32, ui32, ui32, ui32
+      metal.return
+    }
+
+    metal.kernel simdgroup_partial_store_second_kernel address_space_device [true, true, true] {
+    ^bb0(%c_buf: !metal.memref<? x f32>):
+      %row = metal.constant 0 : ui32
+      %col = metal.constant 0 : ui32
+      %stride = metal.constant 8 : ui32
+      %extent = metal.constant 7 : ui32
+      %c0 = metal.simdgroup_load %c_buf[%row, %col], %stride : (!metal.memref<? x f32>, ui32, ui32, ui32) -> !metal.simdgroup_matrix<8 x 8 x f32>
+      metal.simdgroup_store %c0, %c_buf[%row, %col], %stride partial [%extent, %extent] : !metal.simdgroup_matrix<8 x 8 x f32>, !metal.memref<? x f32>, ui32, ui32, ui32, ui32, ui32
+      metal.return
+    }
   }
 }
 
@@ -43,3 +66,13 @@ module {
 // CHECK: simdgroup_multiply_accumulate(v{{[0-9]+}},
 // CHECK: simdgroup_store(
 // CHECK: return
+// CHECK: kernel void simdgroup_partial_warp_store
+// CHECK: threadgroup float _sgstore_shared
+// CHECK: threadgroup_barrier(mem_flags::mem_threadgroup)
+// CHECK: simdgroup_store(v{{[0-9]+}}, &_sgstore_shared[sgid][0], 8)
+// CHECK: threadgroup_barrier(mem_flags::mem_threadgroup)
+// CHECK: if (gi < {{.*}} && gj < {{.*}}) {
+// CHECK: _sgstore_shared[sgid][c]
+// CHECK: kernel void simdgroup_partial_store_second_kernel
+// CHECK: threadgroup float _sgstore_shared[64]
+// CHECK: simdgroup_store(v{{[0-9]+}}, &_sgstore_shared[0], 8)

@@ -106,7 +106,7 @@ lit -v test/Dialect/Metal
 # these cannot run on GitHub Actions runners, see Known limitations)
 pixi run pytest python/test/unit/test_metal_backend_*.py -s --tb=short
 
-# audit all 80 migrated LeetGPU-style Python fixtures and cover the 78
+# audit all 82 migrated LeetGPU-style Python fixtures and cover the 80
 # runnable workloads through standalone, interpreter, or targeted tests
 pixi run leet-all
 ```
@@ -115,16 +115,16 @@ pixi run leet-all
 
 ## What works today
 
-The 80 Python fixtures under `python/test/unit/fixtures/metal_leet/` have an
+The 82 Python fixtures under `python/test/unit/fixtures/metal_leet/` have an
 exhaustive ownership manifest enforced by
 `test_metal_backend_leet_uncovered.py`. `pixi run leet-all` executes all three
 ownership classes sequentially:
 
 | Ownership | Files | Validation |
 |---|---:|---|
-| Standalone drivers | 23 | Execute the original script and its PyTorch/smoke assertion |
+| Standalone drivers | 24 | Execute the original script and its PyTorch/smoke assertion |
 | Interpreter-backed gaps | 26 | Compare Metal with `TRITON_INTERPRET=1`; 24 run and 2 source-invalid cases skip explicitly |
-| Targeted backend regressions | 31 | Run the owning `test_metal_backend_*.py` modules |
+| Targeted backend regressions | 32 | Run the owning `test_metal_backend_*.py` modules |
 
 Adding a fixture without assigning it to exactly one ownership class fails the
 inventory test. The standalone correctness set includes:

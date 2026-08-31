@@ -44,6 +44,7 @@ STANDALONE_FIXTURES = {
     "easy-interleave_arrays.py",
     "easy-leaky_Relu.py",
     "easy-matrix_transpose.py",
+    "hard-llama_transformer_block.py",
     "medium-2D_subarray_sum.py",
     "medium-2d_convolution.py",
     "medium-2d_fft.py",

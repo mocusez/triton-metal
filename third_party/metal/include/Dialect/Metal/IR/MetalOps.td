@@ -1073,17 +1073,26 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
     and stores it; `online_softmax` treats the transform's output as a logit and
     keeps the running (max, sum) rescale, dividing by the sum on the way out.
 
-    Operands are kernel-argument buffers. Normally `q`/`k`/`v`/`out` are
-    row-major device f32 with per-tensor row strides. `m` is the query row
-    count, `n` the key count, `d_head` the feature width. `h` is OPTIONAL:
-    present when the grid's y dimension selects a head.
+    `q`/`k`/`v`/`out` are kernel-argument buffers. Normally they are row-major
+    device f32 with per-tensor row strides. Scalar address parameters are
+    either kernel-argument ui32 buffers or literal ui32 values when Triton
+    specialized a constexpr away. `m` is the query row count, `n` the key
+    count, `d_head` the feature width. `h` is OPTIONAL: present when the grid's
+    y dimension selects a head.
 
     `head_params` is the independent-head-storage alternative. When present it
-    contains exactly `[stride_qh, stride_kh, stride_vh, stride_oh, groups]`.
+    contains exactly `[stride_qh, stride_kh, stride_vh, stride_oh, groups]`,
+    with each entry following the same buffer-or-literal scalar contract.
     The grid's y dimension selects query head `y`, while K/V use grouped head
     `y / groups`; the four strides address tensors stored as
     `[head, sequence, feature]`. This is deliberately distinct from `h`, whose
     heads occupy feature slices of one `[sequence, d_model]` tensor.
+
+    `base_offsets`, when present, contains exactly four literal element offsets
+    `[q, k, v, out]`. It represents packed storage such as one QKV allocation
+    with K and V beginning at fixed column offsets. Keeping these offsets
+    explicit prevents the address matcher from erasing scalar `tt.addptr`
+    operations that the emitter would otherwise fail to reproduce.
 
     `feature_tiled` is the deliberately narrow alternative used by kernels
     whose y grid tiles the OUTPUT feature dimension rather than selecting a
@@ -1139,11 +1148,11 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
 
   let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$k,
                        Metal_MemRefType:$v, Metal_MemRefType:$out,
-                       Metal_MemRefType:$m, Metal_MemRefType:$n,
-                       Metal_MemRefType:$d_head,
-                       Metal_MemRefType:$stride_q, Metal_MemRefType:$stride_k,
-                       Metal_MemRefType:$stride_v, Metal_MemRefType:$stride_o,
-                       Variadic<Metal_MemRefType>:$head_params,
+                       AnyType:$m, AnyType:$n, AnyType:$d_head,
+                       AnyType:$stride_q, AnyType:$stride_k,
+                       AnyType:$stride_v, AnyType:$stride_o,
+                       Variadic<AnyType>:$head_params,
+                       Variadic<UI32>:$base_offsets,
                        Optional<Metal_MemRefType>:$h,
                        Variadic<Metal_MemRefType>:$score_params,
                        I64Attr:$bm, I64Attr:$bn, I64Attr:$bd,
@@ -1163,6 +1172,7 @@ def FusedAttentionOp : Metal_Op<"fused_attention", [AttrSizedOperandSegments]> {
       "$q `,` $k `,` $v `,` $out `,` $m `,` $n `,` $d_head"
       " `strides` $stride_q `,` $stride_k `,` $stride_v `,` $stride_o"
       " (`head_params` $head_params^)?"
+      " (`base_offsets` `[` $base_offsets^ `]`)?"
       " (`heads` $h^)? (`params` $score_params^)? attr-dict"
       " `:` type(operands) $score `bounds` $key_bounds";
 }
@@ -1573,6 +1583,8 @@ def SimdgroupLoadDeviceStagedMaskedOp
                        " `mask` `[` $row_extent `,` $col_extent `]`"
                        " (`warp` `[` $warp_index^ `]`)?"
                        " attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
 }
 
 def SimdgroupIndexOp : Metal_Op<"simdgroup_index", [Pure]> {
@@ -1629,7 +1641,8 @@ def SimdgroupMultiplyAccumulateOp
                        " `:` functional-type(operands, results)";
 }
 
-def SimdgroupStoreOp : Metal_Op<"simdgroup_store"> {
+def SimdgroupStoreOp
+    : Metal_Op<"simdgroup_store", [AttrSizedOperandSegments]> {
   let summary = "Cooperative SIMD-group store of a matrix tile to device memory";
 
   let description = [{
@@ -1646,10 +1659,12 @@ def SimdgroupStoreOp : Metal_Op<"simdgroup_store"> {
   let arguments = (ins Metal_SimdgroupMatrixType:$matrix,
                        Metal_MemRefType:$memref, UI32:$origin_row,
                        UI32:$origin_col, UI32:$stride,
-                       Variadic<UI32>:$partial_extents);
+                       Variadic<UI32>:$partial_extents,
+                       Variadic<UI32>:$warp_index);
 
   let assemblyFormat = "$matrix `,` $memref `[` $origin_row `,` $origin_col `]`"
                        " `,` $stride (`partial` `[` $partial_extents^ `]`)?"
+                       " (`warp` `[` $warp_index^ `]`)?"
                        " attr-dict `:` type(operands)";
 
   let hasVerifier = 1;
