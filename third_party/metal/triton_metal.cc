@@ -47,11 +47,10 @@ void init_triton_metal(py::module_ &m) {
   // piped into `triton-metal-translate --mlir-to-msl` produces in the
   // lit test harness.
   // Returns (msl, threads_per_group). `threads_per_group` is 0 when the launch
-  // geometry should follow `num_warps` as usual, and 32 when every kernel in
-  // the module is exactly one `metal.fused_attention`: that op's body runs on a
-  // SINGLE warp (`ltid.x < 32`), so a source kernel written with the customary
-  // `num_warps=4` would otherwise launch 128 threads and let 96 of them exit
-  // immediately -- measured at ~12% on this backend, for nothing.
+  // geometry should follow `num_warps` as usual. A kernel consisting of one
+  // scheduled attention op reports the exact geometry chosen by the emitter.
+  // Keeping this decision shared with ModuleTranslation prevents launch
+  // metadata from drifting from the generated MSL.
   m.def("ttgir_to_msl", [](mlir::ModuleOp &mod) -> py::tuple {
     mlir::PassManager pm(mod.getContext());
     pm.addPass(mlir::triton::metal::createConvertTritonGPUToMetalPass());
@@ -60,30 +59,60 @@ void init_triton_metal(py::module_ &m) {
           "Metal backend: convert-tritongpu-to-metal failed");
     }
     // Checked on the Metal IR, not by sniffing the MSL text: "this body is one
-    // op" is a structural fact and should be read structurally.
+    // op" and its schedule are structural facts and should be read
+    // structurally.
     //
-    // The test is that `metal.fused_attention` is the only op in the kernel
-    // that DOES anything -- everything else has to be memory-effect-free. The
-    // body is not literally one op: the matcher leaves behind the casts and
-    // `metal.get_element`s that bridge its operands, and those are pure.
+    // The scheduled attention op must be the only op in the kernel that DOES
+    // anything -- everything else has to be memory-effect-free. The body is
+    // not literally one op: whole-kernel matchers leave behind casts and
+    // `metal.get_element`s that bridge operands, and those are pure.
     int threadsPerGroup = 0;
     {
-      bool anyKernel = false, allSingleWarp = true;
+      bool anyKernel = false, allScheduled = true;
+      int commonThreadsPerGroup = 0;
       mod.walk([&](mlir::triton::metal::KernelOp k) {
         anyKernel = true;
-        int fused = 0, effectful = 0;
+        int scheduled = 0, effectful = 0, kernelThreads = 0;
         for (mlir::Operation &o : k.getBodyRegion().front()) {
-          if (mlir::isa<mlir::triton::metal::FusedAttentionOp>(o))
-            ++fused;
-          else if (!o.hasTrait<mlir::OpTrait::IsTerminator>() &&
+          if (auto attention =
+                  mlir::dyn_cast<mlir::triton::metal::FusedAttentionOp>(o)) {
+            ++scheduled;
+            kernelThreads =
+                mlir::triton::metal::getFusedAttentionSchedule(attention)
+                    .threadsPerGroup;
+          } else if (auto attention = mlir::dyn_cast<
+                         mlir::triton::metal::SoftmaxAttentionBackwardPreOp>(
+                         o)) {
+            ++scheduled;
+            kernelThreads = mlir::triton::metal::
+                getAttentionBackwardThreadsPerGroup(attention);
+          } else if (auto attention = mlir::dyn_cast<
+                         mlir::triton::metal::SoftmaxAttentionBackwardDqOp>(
+                         o)) {
+            ++scheduled;
+            kernelThreads = mlir::triton::metal::
+                getAttentionBackwardThreadsPerGroup(attention);
+          } else if (auto attention = mlir::dyn_cast<
+                         mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp>(
+                         o)) {
+            ++scheduled;
+            kernelThreads = mlir::triton::metal::
+                getAttentionBackwardThreadsPerGroup(attention);
+          } else if (!o.hasTrait<mlir::OpTrait::IsTerminator>() &&
                    !mlir::isMemoryEffectFree(&o))
             ++effectful;
         }
-        if (fused != 1 || effectful != 0)
-          allSingleWarp = false;
+        if (scheduled != 1 || effectful != 0) {
+          allScheduled = false;
+          return;
+        }
+        if (commonThreadsPerGroup == 0)
+          commonThreadsPerGroup = kernelThreads;
+        else if (commonThreadsPerGroup != kernelThreads)
+          allScheduled = false;
       });
-      if (anyKernel && allSingleWarp)
-        threadsPerGroup = 32;
+      if (anyKernel && allScheduled)
+        threadsPerGroup = commonThreadsPerGroup;
     }
 
     // Debug-record message table. `tl.device_print` / `tl.device_assert` write

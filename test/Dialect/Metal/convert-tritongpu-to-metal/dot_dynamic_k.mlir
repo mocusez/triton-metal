@@ -3,6 +3,7 @@
 // RUN: sed -e 's/store_mask = arith.andi %m_ok_bc, %n_ok_bc/store_mask = arith.andi %m_ok_bc, %m_ok_bc/' %s | not triton-metal-opt --convert-tritongpu-to-metal 2>&1 | FileCheck %s --check-prefix=NONRECT
 // RUN: sed -e 's/a_mask = arith.andi %a_m_bc, %k_bc2/a_mask = arith.andi %a_m_bc, %a_m_bc/' %s | not triton-metal-opt --convert-tritongpu-to-metal 2>&1 | FileCheck %s --check-prefix=BADINPUT
 // RUN: sed -e 's/w_mask = arith.andi %w_n_bc, %k_bc2/w_mask = arith.andi %w_n_bc, %w_n_bc/' %s | not triton-metal-opt --convert-tritongpu-to-metal 2>&1 | FileCheck %s --check-prefix=BADINPUT
+// RUN: sed -e 's/%bump = arith.constant dense<32>/%bump = arith.constant dense<64>/' %s | not triton-metal-opt --convert-tritongpu-to-metal 2>&1 | FileCheck %s --check-prefix=BADBUMP
 //
 // W2a fixture (`metal-lora-linear-fix-plan.md`). Canonical 3-iter-arg matmul
 // (same shape as `dot_universal_grid.mlir`) but with a RUNTIME K-loop trip
@@ -111,6 +112,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: metal.kernel dyn_k_masked_multitile_transB
   tt.func public @dyn_k_masked_multitile_transB(%a_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %w_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %c_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %b_off: i32, %M: i32, %N: i32, %K: i32, %stride_am: i32 {tt.divisibility = 16 : i32}, %stride_wn: i32 {tt.divisibility = 16 : i32}, %stride_cm: i32) attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c31_i32 = arith.constant 31 : i32
     %c32_i32 = arith.constant 32 : i32
     %c64_i32 = arith.constant 64 : i32
     %acc = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked64>
@@ -144,8 +147,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %w_base = tt.addptr %w_base_s, %w_row_off : tensor<64x1x!tt.ptr<f32>, #blocked64x32>, tensor<64x1xi32, #blocked64x32>
     %w_base_bc = tt.broadcast %w_base : tensor<64x1x!tt.ptr<f32>, #blocked64x32> -> tensor<64x32x!tt.ptr<f32>, #blocked64x32>
     %w_ptrs = tt.addptr %w_base_bc, %k_bc : tensor<64x32x!tt.ptr<f32>, #blocked64x32>, tensor<64x32xi32, #blocked64x32>
-    %loop:3 = scf.for %k0 = %c0_i32 to %K step %c32_i32 iter_args(%a_p = %a_ptrs, %w_p = %w_ptrs, %acc_iter = %acc) -> (tensor<64x32x!tt.ptr<f32>, #blocked64x32>, tensor<64x32x!tt.ptr<f32>, #blocked64x32>, tensor<64x64xf32, #blocked64>)  : i32 {
-      %k_rem = arith.subi %K, %k0 : i32
+    %K_plus31 = arith.addi %K, %c31_i32 : i32
+    %K_tiles = arith.divsi %K_plus31, %c32_i32 : i32
+    %loop:3 = scf.for %k0 = %c0_i32 to %K_tiles step %c1_i32 iter_args(%a_p = %a_ptrs, %w_p = %w_ptrs, %acc_iter = %acc) -> (tensor<64x32x!tt.ptr<f32>, #blocked64x32>, tensor<64x32x!tt.ptr<f32>, #blocked64x32>, tensor<64x64xf32, #blocked64>)  : i32 {
+      %k0_elem = arith.muli %k0, %c32_i32 : i32
+      %k_rem = arith.subi %K, %k0_elem : i32
       %k_rem_s = tt.splat %k_rem : i32 -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked64x32}>>
       %k_mask = arith.cmpi slt, %rk, %k_rem_s : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked64x32}>>
       %m_s = tt.splat %M : i32 -> tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked64x32}>>
@@ -211,3 +217,4 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // NONZERO: masked dot load requires numeric zero `other`
 // NONRECT: masked multi-tile canonical dot requires a rectangular output mask
 // BADINPUT: rectangular input masks tied to the loaded pointer coordinates
+// BADBUMP: masked runtime-K multi-tile canonical dot requires

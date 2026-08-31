@@ -444,9 +444,9 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   // the implementation notes.
   // metal.fused_attention needs the threadgroup position (program id) AND the
   // LOCAL thread index: the threadgroup position selects the query block and,
-  // with a head split, the head, while the single-warp guard must key off
-  // thread_position_in_threadgroup -- thread_position_in_grid is global and
-  // would mis-identify the 2nd query block's warp (Phase-0 finding).
+  // with a head split, the head, while cooperative staging and row ownership
+  // must key off thread_position_in_threadgroup -- thread_position_in_grid is
+  // global and would mis-identify the 2nd query block's threads.
   bool usesFusedAttention = false;
   op.walk([&](mlir::triton::metal::FusedAttentionOp) {
     usesFusedAttention = true;
@@ -471,8 +471,22 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesLinearAttention = true;
     return mlir::WalkResult::interrupt();
   });
+  bool usesSoftmaxAttentionBackward = false;
+  op.walk([&](mlir::triton::metal::SoftmaxAttentionBackwardPreOp) {
+    usesSoftmaxAttentionBackward = true;
+    return mlir::WalkResult::interrupt();
+  });
+  op.walk([&](mlir::triton::metal::SoftmaxAttentionBackwardDqOp) {
+    usesSoftmaxAttentionBackward = true;
+    return mlir::WalkResult::interrupt();
+  });
+  op.walk([&](mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp) {
+    usesSoftmaxAttentionBackward = true;
+    return mlir::WalkResult::interrupt();
+  });
   bool usesThreadgroupId = usesFusedAttention || usesInt4WeightOnlyMatmul ||
-                           usesInt8QuantizedMatmul || usesLinearAttention;
+                           usesInt8QuantizedMatmul || usesLinearAttention ||
+                           usesSoftmaxAttentionBackward;
   op.walk([&](mlir::triton::metal::ThreadgroupIdOp) {
     usesThreadgroupId = true;
     return mlir::WalkResult::interrupt();
@@ -480,7 +494,8 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
   if (usesThreadgroupId)
     _output << ",\n  uint3 tgid [[threadgroup_position_in_grid]]";
   if (usesFusedAttention || usesInt4WeightOnlyMatmul ||
-      usesInt8QuantizedMatmul || usesLinearAttention)
+      usesInt8QuantizedMatmul || usesLinearAttention ||
+      usesSoftmaxAttentionBackward)
     _output << ",\n  uint3 ltid [[thread_position_in_threadgroup]]";
   // Conditionally add the threadgroups-per-grid parameter only when the
   // kernel body references it (via metal.threadgroups_per_grid). Mirrors the
@@ -504,6 +519,16 @@ void ModuleTranslation::translateKernel(mlir::triton::metal::KernelOp op) {
     usesSimdgroupIndex = true;
     return mlir::WalkResult::interrupt();
   });
+  if (!usesSimdgroupIndex)
+    op.walk([&](mlir::triton::metal::FusedAttentionOp attention) {
+      const FusedAttentionSchedule schedule =
+          getFusedAttentionSchedule(attention);
+      if (schedule.useMma && schedule.numWarps > 1) {
+        usesSimdgroupIndex = true;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    });
   if (usesSimdgroupIndex)
     _output << ",\n  uint sgid [[simdgroup_index_in_threadgroup]]";
   _output << ")\n";
@@ -542,6 +567,9 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::Int8QuantizedMatmulOp,
             mlir::triton::metal::LinearAttentionPreprocessOp,
             mlir::triton::metal::LinearAttentionApplyOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardPreOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardDqOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp,
             mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
@@ -603,6 +631,9 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::Int8QuantizedMatmulOp,
             mlir::triton::metal::LinearAttentionPreprocessOp,
             mlir::triton::metal::LinearAttentionApplyOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardPreOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardDqOp,
+            mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp,
             mlir::triton::metal::ReduceOp,
             mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
             mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
@@ -2732,6 +2763,113 @@ std::string ModuleTranslation::emitScoreRegion_(
   return "v" + std::to_string(outIdx);
 }
 
+std::string ModuleTranslation::emitAttentionBackwardPreScoreRegion_(
+    mlir::triton::metal::SoftmaxAttentionBackwardPreOp op,
+    llvm::StringRef scoreExpr, llvm::StringRef rowExpr,
+    llvm::StringRef keyExpr, llvm::StringRef nTrueExpr,
+    llvm::StringRef scaleExpr, llvm::StringRef ind) {
+  mlir::Block &body = op.getScore().front();
+  auto &os = _output;
+  for (mlir::Operation &nested : body)
+    _letBound.erase(&nested);
+
+  auto bind = [&](mlir::Value arg, llvm::StringRef init) {
+    unsigned idx = _varCount++;
+    os << ind << typeToString(arg.getType()) << " v" << idx << " = " << init
+       << ";\n";
+    _buffers[arg.getAsOpaquePointer()] = idx;
+  };
+  bind(body.getArgument(0), scoreExpr);
+  bind(body.getArgument(1), rowExpr);
+  bind(body.getArgument(2), keyExpr);
+  bind(body.getArgument(3), nTrueExpr);
+  bind(body.getArgument(4), scaleExpr);
+
+  for (mlir::Operation &nested : body) {
+    if (mlir::isa<
+            mlir::triton::metal::AttentionBackwardScoreYieldOp>(nested))
+      continue;
+    if (nested.getNumResults() != 1) {
+      op.emitError() << "metal.attention_backward_pre: score region op '"
+                     << nested.getName()
+                     << "' does not produce exactly one result";
+      _emitFailed = true;
+      return "0.0f";
+    }
+    unsigned idx = _varCount++;
+    os << ind << typeToString(nested.getResult(0).getType()) << " v" << idx
+       << " = ";
+    translateValue(&nested);
+    os << ";\n";
+    _letBound[&nested] = idx;
+  }
+
+  auto yield = mlir::cast<
+      mlir::triton::metal::AttentionBackwardScoreYieldOp>(
+      body.getTerminator());
+  unsigned outIdx = _varCount++;
+  os << ind << "float v" << outIdx << " = ";
+  translateValueOrVarName(yield.getValue());
+  os << ";\n";
+  return "v" + std::to_string(outIdx);
+}
+
+std::pair<std::string, std::string>
+ModuleTranslation::emitAttentionBackwardGradientRegion_(
+    mlir::Operation *op, mlir::Region &region, llvm::StringRef scoreExpr,
+    llvm::StringRef dpExpr, llvm::StringRef mExpr,
+    llvm::StringRef lSafeExpr, llvm::StringRef deltaExpr,
+    llvm::StringRef scaleExpr, llvm::StringRef ind) {
+  mlir::Block &body = region.front();
+  auto &os = _output;
+  for (mlir::Operation &nested : body)
+    _letBound.erase(&nested);
+
+  auto bind = [&](mlir::Value arg, llvm::StringRef init) {
+    unsigned idx = _varCount++;
+    os << ind << typeToString(arg.getType()) << " v" << idx << " = " << init
+       << ";\n";
+    _buffers[arg.getAsOpaquePointer()] = idx;
+  };
+  bind(body.getArgument(0), scoreExpr);
+  bind(body.getArgument(1), dpExpr);
+  bind(body.getArgument(2), mExpr);
+  bind(body.getArgument(3), lSafeExpr);
+  bind(body.getArgument(4), deltaExpr);
+  bind(body.getArgument(5), scaleExpr);
+
+  for (mlir::Operation &nested : body) {
+    if (mlir::isa<
+            mlir::triton::metal::AttentionBackwardGradientYieldOp>(nested))
+      continue;
+    if (nested.getNumResults() != 1) {
+      op->emitError() << "backward gradient region op '" << nested.getName()
+                      << "' does not produce exactly one result";
+      _emitFailed = true;
+      return {"0.0f", "0.0f"};
+    }
+    unsigned idx = _varCount++;
+    os << ind << typeToString(nested.getResult(0).getType()) << " v" << idx
+       << " = ";
+    translateValue(&nested);
+    os << ";\n";
+    _letBound[&nested] = idx;
+  }
+
+  auto yield = mlir::cast<
+      mlir::triton::metal::AttentionBackwardGradientYieldOp>(
+      body.getTerminator());
+  unsigned pIdx = _varCount++;
+  os << ind << "float v" << pIdx << " = ";
+  translateValueOrVarName(yield.getP());
+  os << ";\n";
+  unsigned dsIdx = _varCount++;
+  os << ind << "float v" << dsIdx << " = ";
+  translateValueOrVarName(yield.getDs());
+  os << ";\n";
+  return {"v" + std::to_string(pIdx), "v" + std::to_string(dsIdx)};
+}
+
 std::pair<std::string, std::string> ModuleTranslation::emitKeyBoundsRegion_(
     mlir::triton::metal::FusedAttentionOp op, llvm::StringRef blkExpr,
     llvm::StringRef phaseExpr, llvm::StringRef mExpr, llvm::StringRef nExpr,
@@ -2794,22 +2932,78 @@ std::pair<std::string, std::string> ModuleTranslation::emitKeyBoundsRegion_(
   return {beg, end};
 }
 
+FusedAttentionSchedule
+mlir::triton::metal::getFusedAttentionSchedule(FusedAttentionOp op) {
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const int64_t fullNeed =
+      3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
+      (op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * BM : 0);
+  const bool mmaEnvelope = BM <= 32 && BM % 8 == 0 && BN % 8 == 0 &&
+                           BD % 8 == 0 && op.getNumPhases() == 1 &&
+                           !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR");
+  if (!mmaEnvelope)
+    return {/*useMma=*/false, /*chunked=*/false, /*numWarps=*/1,
+            /*threadsPerGroup=*/32, /*blockK=*/0, /*blockDHead=*/0,
+            /*blockOutD=*/0};
+
+  // Each SIMD-group owns complete 8-row QK/PV tiles.  More SIMD-groups than
+  // row tiles cannot execute additional matrix work, so cap the launch instead
+  // of reproducing the source's otherwise-idle warps.
+  const int sourceWarps = std::max(1, mlir::triton::gpu::lookupNumWarps(op));
+  const int rowTiles = static_cast<int>(BM / 8);
+  const int numWarps = std::max(1, std::min(sourceWarps, rowTiles));
+  if (fullNeed <= 8192)
+    return {/*useMma=*/true, /*chunked=*/false, numWarps, numWarps * 32,
+            static_cast<int>(BN), static_cast<int>(BD), static_cast<int>(BD)};
+
+  const int64_t state = op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * BM : 0;
+  const int initK = static_cast<int>(std::min<int64_t>(BN, 32));
+  const int initD = static_cast<int>(std::min<int64_t>(BD, 32));
+  const int initO = static_cast<int>(std::min<int64_t>(BD, 32));
+  int bestK = 0, bestD = 0, bestO = 0, bestWork = -1;
+  for (int bk = initK; bk >= 8; bk -= 8)
+    for (int dk = initD; dk >= 8; dk -= 8)
+      for (int bo = initO; bo >= 8; bo -= 8) {
+        const int64_t need =
+            BM * BD + BM * dk + dk * bk + bk * bo + BM * bk + state;
+        if (need > 8192)
+          continue;
+        const int work = bk * dk * bo;
+        if (work > bestWork) {
+          bestK = bk;
+          bestD = dk;
+          bestO = bo;
+          bestWork = work;
+        }
+      }
+  if (bestWork < 0)
+    return {/*useMma=*/false, /*chunked=*/false, /*numWarps=*/1,
+            /*threadsPerGroup=*/32, /*blockK=*/0, /*blockDHead=*/0,
+            /*blockOutD=*/0};
+  return {/*useMma=*/true, /*chunked=*/true, numWarps, numWarps * 32, bestK,
+          bestD, bestO};
+}
+
 // Simdgroup body: both matmuls on the matrix unit, with the score transform
 // coming from the op's region instead of the hard-coded scale+mask+softmax that
 // a per-variant emitter would bake in. The staged S tile is exactly where a
 // per-(row, key) transform belongs — the row and key indices are both in hand
 // there — which is what makes one emitter able to serve every variant.
 //
-// Applies only when the working set fits threadgroup memory; `translate` falls
-// back to the scalar body otherwise, so this is a fast path, never a gate.
+// Applies only when the complete working set fits threadgroup memory;
+// `translate` selects the chunked MMA body or the scalar floor otherwise, so
+// this is a fast path, never a gate.
 void ModuleTranslation::emitFusedAttentionMma_(
     mlir::triton::metal::FusedAttentionOp op) {
+  const FusedAttentionSchedule schedule = getFusedAttentionSchedule(op);
   const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
   const bool softmax =
       op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
   const bool featureTiled = op.getFeatureTiled();
   const int64_t SZ_Q = BM * BD, SZ_KTV = BD * BN, SZ_S = BM * BN;
   const int64_t mT = BM / 8, nT = BN / 8, dT = BD / 8;
+  const int numWarps = schedule.numWarps;
+  const int threadsPerGroup = schedule.threadsPerGroup;
 
   auto bufName = [&](mlir::Value m) -> std::string {
     for (;;) {
@@ -2892,8 +3086,12 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
   }
   os << "  {\n";
-  os << "  uint _fa_lane = ltid.x & 31u;\n";
-  os << "  bool _fa_active = ltid.x < 32u;\n";
+  os << "  uint _fa_tid = ltid.x;\n";
+  if (numWarps > 1)
+    os << "  uint _fa_warp = sgid;\n";
+  else
+    os << "  uint _fa_warp = 0u;\n";
+  os << "  bool _fa_active = _fa_tid < " << threadsPerGroup << "u;\n";
   os << "  uint _fa_M = " << M << ";\n";
   os << "  uint _fa_N = " << N << ";\n";
   // `d_head` holds the FULL feature width when a head split is present — a
@@ -2932,7 +3130,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
   // Stage Q and zero the accumulator / running state.
   os << "  if (_fa_active) {\n";
-  os << "    for (uint c = _fa_lane; c < " << S(SZ_Q) << "u; c += 32u) {\n";
+  os << "    for (uint c = _fa_tid; c < " << S(SZ_Q) << "u; c += "
+     << threadsPerGroup << "u) {\n";
   os << "      uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
      << "u; uint row = _fa_rowoff + q;\n";
   if (!featureTiled)
@@ -2942,8 +3141,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   if (softmax)
-    os << "    if (_fa_lane < " << S(BM)
-       << "u) { _fa_rmax[_fa_lane] = -INFINITY; _fa_rsum[_fa_lane] = 0.0f; }\n";
+    os << "    if (_fa_tid < " << S(BM)
+       << "u) { _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f; }\n";
   os << "  }\n";
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   // The key range this program sweeps, computed by the op's key-bounds region.
@@ -2959,8 +3158,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
     // accumulate one BD-wide Q/K chunk at a time so runtime d_head may exceed
     // the statically-sized threadgroup tiles.
     os << "    if (_fa_active) {\n";
-    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
-       << "u; c += 32u) {\n";
+    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+       << "u; c += " << threadsPerGroup << "u) {\n";
     os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_out_d) ? " << V
@@ -2972,15 +3171,15 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(BD)
        << "u) {\n";
     os << "      if (_fa_active) {\n";
-    os << "        for (uint c = _fa_lane; c < " << S(SZ_Q)
-       << "u; c += 32u) {\n";
+    os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
+       << "u; c += " << threadsPerGroup << "u) {\n";
     os << "          uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint row = _fa_rowoff + q;\n";
     os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
        << Q << "[_fa_qbase + row * _fa_sq + _fa_dc + d] : 0.0f;\n";
     os << "        }\n";
-    os << "        for (uint c = _fa_lane; c < " << S(SZ_KTV)
-       << "u; c += 32u) {\n";
+    os << "        for (uint c = _fa_tid; c < " << S(SZ_KTV)
+       << "u; c += " << threadsPerGroup << "u) {\n";
     os << "          uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
        << "u; uint kk = kb + key;\n";
     os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
@@ -2989,7 +3188,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "      }\n";
     os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     os << "      if (_fa_active) {\n";
-    os << "        for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+       << "u; mi += " << numWarps << "u)\n";
     os << "        for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
     // The zero constructor and in-place MAC are both required on Apple family
     // 9. Only later chunks reload the partial score tile.
@@ -3014,16 +3214,16 @@ void ModuleTranslation::emitFusedAttentionMma_(
   } else {
     // Stage K^T and V for this key block.
     os << "    if (_fa_active) {\n";
-    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
-       << "u; c += 32u) {\n";
+    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+       << "u; c += " << threadsPerGroup << "u) {\n";
     os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
        << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "")
        << "kk * _fa_sk + _fa_col + d] : 0.0f;\n";
     os << "      }\n";
-    os << "      for (uint c = _fa_lane; c < " << S(SZ_KTV)
-       << "u; c += 32u) {\n";
+    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+       << "u; c += " << threadsPerGroup << "u) {\n";
     os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
        << "u; uint kk = kb + key;\n";
     os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
@@ -3034,7 +3234,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     // Dot 1: S = Q @ K^T, straight into the staged S tile.
     os << "    if (_fa_active) {\n";
-    os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+    os << "      for (uint mi = _fa_warp; mi < " << S(mT)
+       << "u; mi += " << numWarps << "u)\n";
     os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
     os << "        simdgroup_float8x8 acc(0.0f);\n";
     os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
@@ -3051,11 +3252,12 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   }
-  // The score transform, one query row per lane. Emitted ONCE, writing its
+  // The score transform, one query row per cooperative thread. Emitted ONCE,
+  // writing its
   // result back over the S tile, so the softmax passes below re-read it instead
   // of re-evaluating the region.
   os << "    if (_fa_active) {\n";
-  os << "      uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
   // `q < BM` FIRST: every per-row buffer is sized by BM and `row < M` does not
   // imply it when BM < 32.
   os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
@@ -3109,7 +3311,8 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   // Dot 2: O_tile = P @ V.
   os << "    if (_fa_active) {\n";
-  os << "      for (uint mi = 0; mi < " << S(mT) << "u; ++mi)\n";
+  os << "      for (uint mi = _fa_warp; mi < " << S(mT)
+     << "u; mi += " << numWarps << "u)\n";
   os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
   os << "        simdgroup_float8x8 acc(0.0f);\n";
   os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
@@ -3125,12 +3328,337 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "      }\n";
   os << "    }\n";
   os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "    if (_fa_active) { for (uint c = _fa_lane; c < " << S(SZ_Q)
-     << "u; c += 32u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
+  os << "    if (_fa_active) { for (uint c = _fa_tid; c < " << S(SZ_Q)
+     << "u; c += " << threadsPerGroup
+     << "u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
   os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   os << "  }\n";
   os << "  if (_fa_active) {\n";
-  os << "    uint q = _fa_lane; uint row = _fa_rowoff + q;\n";
+  os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
+  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  if (softmax) {
+    os << "      float denom = _fa_rsum[q];\n";
+    if (op.getSafeDenominatorOne())
+      os << "      denom = (denom == 0.0f) ? 1.0f : denom;\n";
+    if (featureTiled)
+      os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
+    else
+      os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "        " << O << "["
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
+       << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+       << S(BD) << "u + d] / denom;\n";
+  } else {
+    if (featureTiled)
+      os << "      for (uint d = 0; d < _fa_out_d; ++d)\n";
+    else
+      os << "      for (uint d = 0; d < _fa_dh; ++d)\n";
+    os << "        " << O << "["
+       << "_fa_obase + " << (independentHeads ? "_fa_ohoff + " : "")
+       << "row * _fa_so + _fa_col + d] = _fa_obuf[q*"
+       << S(BD) << "u + d];\n";
+  }
+  os << "    }\n";
+  os << "  }\n";
+  os << "  }";
+}
+
+void ModuleTranslation::emitFusedAttentionMmaChunked_(
+    mlir::triton::metal::FusedAttentionOp op) {
+  const FusedAttentionSchedule schedule = getFusedAttentionSchedule(op);
+  const int64_t BM = op.getBm(), BD = op.getBd();
+  const int64_t BK = schedule.blockK, DK = schedule.blockDHead,
+                BO = schedule.blockOutD;
+  const bool softmax =
+      op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+  const bool featureTiled = op.getFeatureTiled();
+  const bool kFeatureMajor = op.getKFeatureMajor();
+  const int64_t SZ_Q = BM * DK, SZ_KT = DK * BK, SZ_V = BK * BO,
+                SZ_S = BM * BK, SZ_O = BM * BD;
+  const int64_t mT = BM / 8, kT = BK / 8, dT = DK / 8, oT = BO / 8;
+  const int numWarps = schedule.numWarps;
+  const int threadsPerGroup = schedule.threadsPerGroup;
+
+  auto bufName = [&](mlir::Value m) -> std::string {
+    for (;;) {
+      while (auto cast = m.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        m = cast.getInputs()[0];
+      }
+      if (auto ge = m.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        m = ge.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(m.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.fused_attention: operand does not resolve to a "
+                        "kernel buffer; refusing to emit";
+      _emitFailed = true;
+      return "<unresolved>";
+    }
+    return "v" + std::to_string(it->second);
+  };
+  const std::string Q = bufName(op.getQ()), K = bufName(op.getK()),
+                    V = bufName(op.getV()), O = bufName(op.getOut());
+  auto scalarExpr = [&](mlir::Value value, llvm::StringRef name) {
+    if (mlir::isa<mlir::triton::metal::MetalMemRefType>(value.getType()))
+      return bufName(value) + "[0]";
+    if (auto constant =
+            value.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+        return std::to_string(integer.getValue().getZExtValue()) + "u";
+    op.emitError() << "metal.fused_attention: " << name
+                   << " is neither a kernel scalar buffer nor a ui32 literal";
+    _emitFailed = true;
+    return std::string("0u");
+  };
+  const std::string M = scalarExpr(op.getM(), "m");
+  const std::string N = scalarExpr(op.getN(), "n");
+  const std::string DH = scalarExpr(op.getDHead(), "d_head");
+  const std::string SQ = scalarExpr(op.getStrideQ(), "stride_q");
+  const std::string SK = scalarExpr(op.getStrideK(), "stride_k");
+  const std::string SV = scalarExpr(op.getStrideV(), "stride_v");
+  const std::string SO = scalarExpr(op.getStrideO(), "stride_o");
+  auto headParams = op.getHeadParams();
+  const bool independentHeads = !headParams.empty();
+  std::string SQH, SKH, SVH, SOH, GROUPS;
+  if (independentHeads) {
+    SQH = scalarExpr(headParams[0], "stride_qh");
+    SKH = scalarExpr(headParams[1], "stride_kh");
+    SVH = scalarExpr(headParams[2], "stride_vh");
+    SOH = scalarExpr(headParams[3], "stride_oh");
+    GROUPS = scalarExpr(headParams[4], "groups");
+  }
+  auto baseOffsets = op.getBaseOffsets();
+  const std::string QBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[0], "q base offset");
+  const std::string KBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[1], "k base offset");
+  const std::string VBASE =
+      baseOffsets.empty() ? "0u" : scalarExpr(baseOffsets[2], "v base offset");
+  const std::string OBASE = baseOffsets.empty()
+                                ? "0u"
+                                : scalarExpr(baseOffsets[3], "out base offset");
+  auto S = [](int64_t x) { return std::to_string(x); };
+  const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
+
+  auto &os = _output;
+  os << "\n  // ---- metal.fused_attention (chunked simdgroup dots, region "
+        "score transform) ----\n";
+  os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
+  os << "  threadgroup float _fa_ktbuf[" << S(SZ_KT) << "];\n";
+  os << "  threadgroup float _fa_vbuf[" << S(SZ_V) << "];\n";
+  os << "  threadgroup float _fa_sbuf[" << S(SZ_S) << "];\n";
+  // Keep the complete output tile private until the final store.  The kernel
+  // may receive aliased Q/K/V/out buffers, and using device out as scratch
+  // would overwrite data that a later QK/PV chunk still has to read.
+  os << "  threadgroup float _fa_obuf[" << S(SZ_O) << "];\n";
+  if (softmax) {
+    os << "  threadgroup float _fa_rmax[" << S(BM) << "];\n";
+    os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
+  }
+  os << "  {\n";
+  os << "  uint _fa_tid = ltid.x;\n";
+  if (numWarps > 1)
+    os << "  uint _fa_warp = sgid;\n";
+  else
+    os << "  uint _fa_warp = 0u;\n";
+  os << "  bool _fa_active = _fa_tid < " << threadsPerGroup << "u;\n";
+  os << "  uint _fa_M = " << M << ";\n";
+  os << "  uint _fa_N = " << N << ";\n";
+  if (op.getH())
+    os << "  uint _fa_dh = " << DH << " / " << bufName(op.getH()) << "[0];\n";
+  else
+    os << "  uint _fa_dh = " << DH << ";\n";
+  os << "  uint _fa_sq = " << SQ << ";\n";
+  os << "  uint _fa_sk = " << SK << ";\n";
+  os << "  uint _fa_sv = " << SV << ";\n";
+  os << "  uint _fa_so = " << SO << ";\n";
+  os << "  uint _fa_qbase = " << QBASE << ";\n";
+  os << "  uint _fa_kbase = " << KBASE << ";\n";
+  os << "  uint _fa_vbase = " << VBASE << ";\n";
+  os << "  uint _fa_obase = " << OBASE << ";\n";
+  if (independentHeads) {
+    os << "  uint _fa_qhoff = tgid.y * " << SQH << ";\n";
+    os << "  uint _fa_khoff = (tgid.y / " << GROUPS << ") * " << SKH
+       << ";\n";
+    os << "  uint _fa_vhoff = (tgid.y / " << GROUPS << ") * " << SVH
+       << ";\n";
+    os << "  uint _fa_ohoff = tgid.y * " << SOH << ";\n";
+  }
+  if (op.getH())
+    os << "  uint _fa_col = tgid.y * _fa_dh;\n";
+  else if (featureTiled)
+    os << "  uint _fa_col = tgid.y * " << S(BD) << "u;\n";
+  else
+    os << "  uint _fa_col = 0u;\n";
+  if (featureTiled)
+    os << "  uint _fa_out_d = (_fa_col < _fa_dh) ? min(" << S(BD)
+       << "u, _fa_dh - _fa_col) : 0u;\n";
+  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  os << "  if (_fa_active) {\n";
+  os << "    for (uint c = _fa_tid; c < " << S(SZ_O) << "u; c += "
+     << threadsPerGroup << "u) _fa_obuf[c] = 0.0f;\n";
+  if (softmax)
+    os << "    if (_fa_tid < " << S(BM)
+       << "u) { _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f; }\n";
+  os << "  }\n";
+  os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+  auto [_fa_kbeg, _fa_kend] =
+      emitKeyBoundsRegion_(op, "(int)tgid.x", "0 /*phase*/", "(int)_fa_M",
+                           "(int)_fa_N", "  ");
+  os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
+     << "; kb += " << S(BK) << "u) {\n";
+  os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(DK)
+     << "u) {\n";
+  os << "      if (_fa_active) {\n";
+  os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
+     << "u; c += " << threadsPerGroup << "u) {\n";
+  os << "          uint q = c / " << S(DK) << "u; uint d = c % " << S(DK)
+     << "u; uint row = _fa_rowoff + q;\n";
+  os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
+     << Q << "[_fa_qbase + " << (independentHeads ? "_fa_qhoff + " : "")
+     << "row * _fa_sq + ";
+  if (featureTiled)
+    os << "_fa_dc + d";
+  else
+    os << "_fa_col + _fa_dc + d";
+  os << "] : 0.0f;\n";
+  os << "        }\n";
+  os << "        for (uint c = _fa_tid; c < " << S(SZ_KT)
+     << "u; c += " << threadsPerGroup << "u) {\n";
+  os << "          uint d = c / " << S(BK) << "u; uint key = c % " << S(BK)
+     << "u; uint kk = kb + key;\n";
+  os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
+     << K << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "");
+  if (kFeatureMajor)
+    os << "(_fa_dc + d) * _fa_sk + kk";
+  else
+    os << "kk * _fa_sk + _fa_col + _fa_dc + d";
+  os << "] : 0.0f;\n";
+  os << "        }\n";
+  os << "      }\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      if (_fa_active) {\n";
+  os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+     << "u; mi += " << numWarps << "u)\n";
+  os << "        for (uint ni = 0; ni < " << S(kT) << "u; ++ni) {\n";
+  os << "          simdgroup_float8x8 acc(0.0f);\n";
+  os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
+        "&_fa_sbuf[(mi*8u)*"
+     << S(BK) << "u + ni*8u], " << S(BK) << ");\n";
+  os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+  os << "            simdgroup_float8x8 a, b;\n";
+  os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(DK)
+     << "u + ki*8u], " << S(DK) << ");\n";
+  os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BK)
+     << "u + ni*8u], " << S(BK) << ");\n";
+  os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "          }\n";
+  os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BK)
+     << "u + ni*8u], " << S(BK) << ");\n";
+  os << "        }\n";
+  os << "      }\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    }\n";
+
+  os << "    if (_fa_active) {\n";
+  os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
+  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+  os << "          uint _fa_key = kb + kk;\n";
+  os << "          if (_fa_key < " << _fa_kend << ") {\n";
+  {
+    std::string sc = "_fa_sbuf[q*" + S(BK) + "u + kk]";
+    std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
+                                     "0 /*phase*/", "            ");
+    os << "            _fa_sbuf[q*" << S(BK) << "u + kk] = " << w << ";\n";
+  }
+  os << "          } else {\n";
+  os << "            _fa_sbuf[q*" << S(BK)
+     << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
+  os << "          }\n";
+  os << "        }\n";
+  if (softmax) {
+    os << "        float m_cur = -INFINITY;\n";
+    os << "        for (uint kk = 0; kk < " << S(BK)
+       << "u; ++kk) m_cur = max(m_cur, _fa_sbuf[q*" << S(BK)
+       << "u + kk]);\n";
+    os << "        float m_old = _fa_rmax[q];\n";
+    os << "        float m_new = max(m_old, m_cur);\n";
+    os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
+       << "(m_old - m_new);\n";
+    os << "        float denom = 0.0f;\n";
+    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+    os << "          float l = _fa_sbuf[q*" << S(BK) << "u + kk];\n";
+    os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
+       << E << "(l - m_new);\n";
+    os << "          _fa_sbuf[q*" << S(BK) << "u + kk] = p; denom += p;\n";
+    os << "        }\n";
+    os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
+    os << "        _fa_rmax[q] = m_new;\n";
+    if (featureTiled)
+      os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
+         << S(BD) << "u + d] *= scaler;\n";
+    else
+      os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
+         << S(BD) << "u + d] *= scaler;\n";
+  }
+  os << "      } else if (q < " << S(BM) << "u) {\n";
+  os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) _fa_sbuf[q*"
+     << S(BK) << "u + kk] = 0.0f;\n";
+  os << "      }\n";
+  os << "    }\n";
+  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+  os << "    for (uint _fa_oc = 0u; _fa_oc < " << S(BD) << "u; _fa_oc += "
+     << S(BO) << "u) {\n";
+  os << "      if (_fa_active) {\n";
+  os << "        for (uint c = _fa_tid; c < " << S(SZ_V)
+     << "u; c += " << threadsPerGroup << "u) {\n";
+  os << "          uint key = c / " << S(BO) << "u; uint d = c % " << S(BO)
+     << "u; uint kk = kb + key; uint od = _fa_oc + d;\n";
+  if (featureTiled)
+    os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_out_d) ? " << V
+       << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
+       << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
+  else
+    os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_dh) ? "
+       << V << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
+       << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
+  os << "        }\n";
+  os << "      }\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "      if (_fa_active) {\n";
+  os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+     << "u; mi += " << numWarps << "u)\n";
+  os << "        for (uint oi = 0; oi < " << S(oT) << "u; ++oi) {\n";
+  os << "          if (_fa_oc + oi*8u < " << S(BD) << "u) {\n";
+  os << "          simdgroup_float8x8 acc;\n";
+  os << "          simdgroup_load(acc, &_fa_obuf[(mi*8u)*" << S(BD)
+     << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
+  os << "          for (uint ki = 0; ki < " << S(kT) << "u; ++ki) {\n";
+  os << "            simdgroup_float8x8 a, b;\n";
+  os << "            simdgroup_load(a, &_fa_sbuf[(mi*8u)*" << S(BK)
+     << "u + ki*8u], " << S(BK) << ");\n";
+  os << "            simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BO)
+     << "u + oi*8u], " << S(BO) << ");\n";
+  os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+  os << "          }\n";
+  os << "          simdgroup_store(acc, &_fa_obuf[(mi*8u)*" << S(BD)
+     << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
+  os << "          }\n";
+  os << "        }\n";
+  os << "      }\n";
+  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+  os << "    }\n";
+  os << "  }\n";
+  os << "  if (_fa_active) {\n";
+  os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
   os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
   if (softmax) {
     os << "      float denom = _fa_rsum[q];\n";
@@ -3160,21 +3688,16 @@ void ModuleTranslation::emitFusedAttentionMma_(
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
-  // Two bodies, same op and same region — the dialect's existing
-  // `MatmulKind::Scalar|Mma` split. The simdgroup body needs
+  // Three schedules, same op and same regions: full-tile MMA, chunked MMA, and
+  // the scalar correctness floor. The full-tile simdgroup body needs
   // `3*bm*bd + 2*bd*bn + 2*bm*bn (+ 2*bm)` floats of threadgroup memory against
   // Apple's 32 KiB; when that does not fit, the scalar body runs instead rather
   // than the op declining. That is the whole point of keeping the scalar tier:
   // a shape the fast path cannot hold still compiles and is still correct.
   //
-  // Lifting the ceiling means blocking bm/bn/bd inside this body, which is
-  // separate follow-up work — today a 64x64x64 tile (28800 floats) takes the
-  // scalar path.
-  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
-  const int64_t need =
-      3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
-      (op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax ? 2 * BM
-                                                                    : 0);
+  // Over-budget MMA-eligible shapes take the chunked simdgroup body below:
+  // it preserves the complete output tile in threadgroup memory for alias
+  // safety, while reusing smaller Q/K/V/score chunks under the 32 KiB cap.
   // 8192 floats == Apple's 32 KiB.
   // Safe to spend in full here because the op replaces the ENTIRE kernel body,
   // so nothing else in the kernel holds threadgroup memory.
@@ -3185,9 +3708,10 @@ void ModuleTranslation::translate(mlir::triton::metal::FusedAttentionOp op) {
   // body walks keys one at a time and simply runs the phases back to back. That
   // is not a regression against the hand-written body this replaces, which was
   // per-key for the same reason.
-  const bool fits = need <= 8192 && BM <= 32 && BM % 8 == 0 && BN % 8 == 0 &&
-                    BD % 8 == 0 && op.getNumPhases() == 1;
-  if (fits && !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR"))
+  const FusedAttentionSchedule schedule = getFusedAttentionSchedule(op);
+  if (schedule.useMma && schedule.chunked)
+    return emitFusedAttentionMmaChunked_(op);
+  if (schedule.useMma)
     return emitFusedAttentionMma_(op);
   return emitFusedAttentionScalar_(op);
 }
@@ -5987,6 +6511,1112 @@ void ModuleTranslation::translate(
   }
   _output << "\n";
   indent();
+  _output << "}";
+}
+
+struct AttentionBackwardPreSchedule {
+  bool useMma;
+  int blockK;
+  int blockDHead;
+  int numWarps;
+  int threadsPerGroup;
+};
+
+static AttentionBackwardPreSchedule getAttentionBackwardPreSchedule(
+    mlir::triton::metal::SoftmaxAttentionBackwardPreOp op) {
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const int numWarps =
+      std::max(1, mlir::triton::gpu::lookupNumWarps(op));
+  const bool envelope = BM > 0 && BM <= 32 && BM % 8 == 0 && BN > 0 &&
+                        BN % 8 == 0 && BD > 0 && BD % 8 == 0 &&
+                        !::getenv("TRITON_METAL_ATTN_BWD_SCALAR");
+  if (!envelope)
+    return {/*useMma=*/false, /*blockK=*/0, /*blockDHead=*/0, numWarps,
+            numWarps * 32};
+
+  const int blockK = static_cast<int>(std::min<int64_t>(BN, 32));
+  for (int blockDHead = static_cast<int>(std::min<int64_t>(BD, 32));
+       blockDHead >= 8; blockDHead -= 8) {
+    // Q/dO and KT/VT are staged together; raw S/DP remain resident until the
+    // row owner has stored both orientations and updated the online state.
+    const int64_t need = 2 * BM * blockDHead + 2 * blockDHead * blockK +
+                         2 * BM * blockK + 3 * BM;
+    if (need <= 8192)
+      return {/*useMma=*/true, blockK, blockDHead, numWarps,
+              numWarps * 32};
+  }
+  return {/*useMma=*/false, /*blockK=*/0, /*blockDHead=*/0, numWarps,
+          numWarps * 32};
+}
+
+int mlir::triton::metal::getAttentionBackwardThreadsPerGroup(
+    SoftmaxAttentionBackwardPreOp op) {
+  return getAttentionBackwardPreSchedule(op).threadsPerGroup;
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SoftmaxAttentionBackwardPreOp op) {
+  auto bufName = [&](mlir::Value value) -> std::string {
+    for (;;) {
+      while (auto cast =
+                 value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1) break;
+        value = cast.getInputs()[0];
+      }
+      if (auto get =
+              value.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        value = get.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(value.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.attention_backward_pre: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+  auto scalar = [&](mlir::Value v) { return bufName(v) + "[0]"; };
+  const std::string Q = bufName(op.getQ()), KT = bufName(op.getKt());
+  const std::string VT = bufName(op.getVt()), DO = bufName(op.getDO());
+  const std::string Sbuf = bufName(op.getS()), ST = bufName(op.getSt());
+  const std::string DP = bufName(op.getDp()), DPT = bufName(op.getDpt());
+  const std::string MP = bufName(op.getMp()), LP = bufName(op.getLp());
+  const std::string DELTA = bufName(op.getDeltap());
+  const AttentionBackwardPreSchedule schedule =
+      getAttentionBackwardPreSchedule(op);
+  if (schedule.useMma) {
+    const int64_t BM = op.getBm(), BD = op.getBd();
+    const int64_t BK = schedule.blockK, DK = schedule.blockDHead;
+    const int64_t SZ_ROW_D = BM * DK, SZ_D_KEY = DK * BK,
+                  SZ_SCORE = BM * BK;
+    const int64_t mT = BM / 8, kT = BK / 8, dT = DK / 8;
+    auto C = [](int64_t value) { return std::to_string(value); };
+
+    _output << "{\n";
+    INDENT();
+    indent();
+    _output << "// ---- metal.attention_backward_pre computed-tile simdgroup MMA ----\n";
+    for (const char *name : {"_ab_q", "_ab_do"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_ROW_D)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_kt", "_ab_vt"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_D_KEY)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_s", "_ab_dp"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_SCORE)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_m", "_ab_l", "_ab_de"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(BM) << "];\n";
+    }
+    indent();
+    _output << "uint _ab_tid = ltid.x, _ab_warp = ltid.x >> 5u;\n";
+    indent();
+    _output << "uint _ab_M = " << scalar(op.getM()) << ", _ab_NT = "
+            << scalar(op.getNTrue()) << ", _ab_D = " << scalar(op.getD())
+            << ";\n";
+    indent();
+    _output << "uint _ab_sqm = " << scalar(op.getStrideQm())
+            << ", _ab_skt = " << scalar(op.getStrideKt())
+            << ", _ab_svt = " << scalar(op.getStrideVt())
+            << ", _ab_sdo = " << scalar(op.getStrideDom()) << ";\n";
+    indent();
+    _output << "uint _ab_ss = " << scalar(op.getStrideSm())
+            << ", _ab_sst = " << scalar(op.getStrideStn())
+            << ", _ab_sdp = " << scalar(op.getStrideDpm())
+            << ", _ab_sdpt = " << scalar(op.getStrideDptn()) << ";\n";
+    indent();
+    _output << "float _ab_scale = " << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "uint _ab_row0 = tgid.x * " << C(BM) << "u;\n";
+    indent();
+    _output << "if (_ab_tid < " << C(BM)
+            << "u) { _ab_m[_ab_tid] = -INFINITY; _ab_l[_ab_tid] = 0.0f; "
+               "_ab_de[_ab_tid] = 0.0f; }\n";
+    indent();
+    _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    indent();
+    _output << "for (uint n0 = 0u; n0 < _ab_ss; n0 += " << C(BK)
+            << "u) {\n";
+    {
+      INDENT();
+      indent();
+      _output << "for (uint dc = 0u; dc < " << C(BD) << "u; dc += " << C(DK)
+              << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "for (uint c = _ab_tid; c < " << C(SZ_ROW_D)
+                << "u; c += " << schedule.threadsPerGroup << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint q = c / " << C(DK) << "u, d = c % " << C(DK)
+                  << "u, m = _ab_row0 + q, od = dc + d;\n";
+          indent();
+          _output << "_ab_q[c] = (m < _ab_M && od < _ab_D) ? " << Q
+                  << "[m*_ab_sqm+od] : 0.0f;\n";
+          indent();
+          _output << "_ab_do[c] = (m < _ab_M && od < _ab_D) ? " << DO
+                  << "[m*_ab_sdo+od] : 0.0f;\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = _ab_tid; c < " << C(SZ_D_KEY)
+                << "u; c += " << schedule.threadsPerGroup << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint d = c / " << C(BK) << "u, r = c % " << C(BK)
+                  << "u, od = dc + d, n = n0 + r;\n";
+          indent();
+          _output << "_ab_kt[c] = (od < _ab_D && n < _ab_ss) ? " << KT
+                  << "[od*_ab_skt+n] : 0.0f;\n";
+          indent();
+          _output << "_ab_vt[c] = (od < _ab_D && n < _ab_ss) ? " << VT
+                  << "[od*_ab_svt+n] : 0.0f;\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint tile = _ab_warp; tile < " << C(mT * kT)
+                << "u; tile += " << schedule.numWarps << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint mi = tile / " << C(kT) << "u, ni = tile % "
+                  << C(kT) << "u;\n";
+          indent();
+          _output << "simdgroup_float8x8 s_acc(0.0f), dp_acc(0.0f);\n";
+          indent();
+          _output << "if (dc != 0u) { simdgroup_load(s_acc, &_ab_s[(mi*8u)*"
+                  << C(BK) << "u + ni*8u], " << C(BK)
+                  << "); simdgroup_load(dp_acc, &_ab_dp[(mi*8u)*" << C(BK)
+                  << "u + ni*8u], " << C(BK) << "); }\n";
+          indent();
+          _output << "for (uint ki = 0u; ki < " << C(dT) << "u; ++ki) {\n";
+          {
+            INDENT();
+            indent();
+            _output << "simdgroup_float8x8 qf, dof, ktf, vtf;\n";
+            indent();
+            _output << "simdgroup_load(qf, &_ab_q[(mi*8u)*" << C(DK)
+                    << "u + ki*8u], " << C(DK) << ");\n";
+            indent();
+            _output << "simdgroup_load(dof, &_ab_do[(mi*8u)*" << C(DK)
+                    << "u + ki*8u], " << C(DK) << ");\n";
+            indent();
+            _output << "simdgroup_load(ktf, &_ab_kt[(ki*8u)*" << C(BK)
+                    << "u + ni*8u], " << C(BK) << ");\n";
+            indent();
+            _output << "simdgroup_load(vtf, &_ab_vt[(ki*8u)*" << C(BK)
+                    << "u + ni*8u], " << C(BK) << ");\n";
+            indent();
+            _output << "simdgroup_multiply_accumulate(s_acc, qf, ktf, s_acc);\n";
+            indent();
+            _output << "simdgroup_multiply_accumulate(dp_acc, dof, vtf, dp_acc);\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "simdgroup_store(s_acc, &_ab_s[(mi*8u)*" << C(BK)
+                  << "u + ni*8u], " << C(BK) << ");\n";
+          indent();
+          _output << "simdgroup_store(dp_acc, &_ab_dp[(mi*8u)*" << C(BK)
+                  << "u + ni*8u], " << C(BK) << ");\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "if (_ab_tid < " << C(BM) << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "uint q = _ab_tid, m = _ab_row0 + q;\n";
+        indent();
+        _output << "if (m < _ab_M) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "float tm = -INFINITY;\n";
+          indent();
+          _output << "for (uint r = 0u; r < " << C(BK) << "u; ++r) {\n";
+          {
+            INDENT();
+            indent();
+            _output << "uint n = n0 + r; float dp = _ab_dp[q*" << C(BK)
+                    << "u+r];\n";
+            std::string s = emitAttentionBackwardPreScoreRegion_(
+                op, "_ab_s[q*" + C(BK) + "u+r]", "(int)m", "(int)n",
+                "_ab_NT", "_ab_scale", std::string(_curIndent * 2, ' '));
+            indent();
+            _output << "float score = " << s << ";\n";
+            indent();
+            _output << "_ab_s[q*" << C(BK) << "u+r] = score;\n";
+            indent();
+            _output << "if (n < _ab_ss) { " << Sbuf
+                    << "[m*_ab_ss+n] = score; " << DP
+                    << "[m*_ab_sdp+n] = dp; " << ST
+                    << "[n*_ab_sst+m] = score; " << DPT
+                    << "[n*_ab_sdpt+m] = dp; }\n";
+            indent();
+            _output << "tm = max(tm, score);\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "float old_m = _ab_m[q], new_m = max(old_m, tm);\n";
+          indent();
+          _output << "float alpha = (old_m == new_m) ? 1.0f : exp(old_m-new_m);\n";
+          indent();
+          _output << "float la = 0.0f, da = 0.0f;\n";
+          indent();
+          _output << "for (uint r = 0u; r < " << C(BK)
+                  << "u; ++r) { float s = _ab_s[q*" << C(BK)
+                  << "u+r]; float p = (s == -INFINITY || new_m == -INFINITY) "
+                     "? 0.0f : exp(s-new_m); la += p; da += p*_ab_dp[q*"
+                  << C(BK) << "u+r]; }\n";
+          indent();
+          _output << "_ab_l[q] = _ab_l[q]*alpha + la; _ab_de[q] = "
+                     "_ab_de[q]*alpha + da; _ab_m[q] = new_m;\n";
+        }
+        indent();
+        _output << "} else { for (uint r = 0u; r < " << C(BK)
+                << "u; ++r) { _ab_s[q*" << C(BK)
+                << "u+r] = -INFINITY; _ab_dp[q*" << C(BK)
+                << "u+r] = 0.0f; } }\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    }
+    indent();
+    _output << "}\n";
+    indent();
+    _output << "if (_ab_tid < " << C(BM)
+            << "u) { uint m = _ab_row0 + _ab_tid; if (m < _ab_M) { float l = "
+               "_ab_l[_ab_tid]; float ls = (l == 0.0f) ? 1.0f : l; "
+            << MP << "[m] = _ab_m[_ab_tid]; " << LP << "[m] = l; " << DELTA
+            << "[m] = _ab_de[_ab_tid] / ls; } }\n";
+    _output << "}";
+    return;
+  }
+
+  _output << "{\n";
+  INDENT();
+  indent();
+  _output << "// ---- metal.attention_backward_pre scalar fallback ----\n";
+  indent();
+  _output << "if (ltid.x == 0u) {\n";
+  {
+    INDENT();
+    indent();
+    _output << "uint BM=" << op.getBm() << "u, BN=" << op.getBn()
+            << "u, M=" << scalar(op.getM()) << ", NT="
+            << scalar(op.getNTrue()) << ", D=" << scalar(op.getD())
+            << ";\n";
+    indent();
+    _output << "uint sqm=" << scalar(op.getStrideQm()) << ", skt="
+            << scalar(op.getStrideKt()) << ", svt="
+            << scalar(op.getStrideVt()) << ", sdo="
+            << scalar(op.getStrideDom()) << ", ss="
+            << scalar(op.getStrideSm()) << ", sst="
+            << scalar(op.getStrideStn()) << ", sdp="
+            << scalar(op.getStrideDpm()) << ", sdpt="
+            << scalar(op.getStrideDptn()) << ";\n";
+    indent();
+    _output << "float scale=" << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "for(uint rm=0u; rm<BM; ++rm){\n";
+    {
+      INDENT();
+      indent();
+      _output << "uint m=tgid.x*BM+rm;\n";
+      indent();
+      _output << "if(m>=M) continue;\n";
+      indent();
+      _output << "float mi=-INFINITY, li=0.0f, de=0.0f;\n";
+      indent();
+      _output << "for(uint n0=0u; n0<ss; n0+=BN){\n";
+      {
+        INDENT();
+        indent();
+        _output << "float tm=-INFINITY;\n";
+        indent();
+        _output << "float sv[64]; float dpv[64];\n";
+        indent();
+        _output << "for(uint rn=0u; rn<BN; ++rn){\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint n=n0+rn; float s=-INFINITY, dpp=0.0f;\n";
+          indent();
+          _output << "if(n<ss){\n";
+          {
+            INDENT();
+            indent();
+            _output << "float sum=0.0f;\n";
+            indent();
+            _output << "for(uint k=0u; k<D; ++k){ sum+=" << Q
+                    << "[m*sqm+k]*" << KT << "[k*skt+n]; dpp+=" << DO
+                    << "[m*sdo+k]*" << VT << "[k*svt+n]; }\n";
+            std::string scored = emitAttentionBackwardPreScoreRegion_(
+                op, "sum", "(int)m", "(int)n", "NT", "scale",
+                std::string(_curIndent * 2, ' '));
+            indent();
+            _output << "s=" << scored << ";\n";
+            indent();
+            _output << Sbuf << "[m*ss+n]=s; " << DP
+                    << "[m*sdp+n]=dpp; " << ST << "[n*sst+m]=s; " << DPT
+                    << "[n*sdpt+m]=dpp;\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "sv[rn]=s; dpv[rn]=dpp; tm=max(tm,s);\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "float mn=max(mi,tm), a=exp(mi-mn), la=0.0f, da=0.0f;\n";
+        indent();
+        _output << "for(uint rn=0u; rn<BN; ++rn){ float p=exp(sv[rn]-mn); "
+                   "la+=p; da+=p*dpv[rn]; }\n";
+        indent();
+        _output << "li=li*a+la; de=de*a+da; mi=mn;\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "float ls=(li==0.0f)?1.0f:li; " << MP << "[m]=mi; " << LP
+              << "[m]=li; " << DELTA << "[m]=de/ls;\n";
+    }
+    indent();
+    _output << "}\n";
+  }
+  indent();
+  _output << "}\n";
+  _output << "}";
+}
+
+struct AttentionBackwardDqSchedule {
+  bool useMma;
+  int blockK;
+  int blockOutD;
+  int numWarps;
+  int threadsPerGroup;
+};
+
+static AttentionBackwardDqSchedule getAttentionBackwardDqSchedule(
+    mlir::triton::metal::SoftmaxAttentionBackwardDqOp op) {
+  const int64_t BM = op.getBm(), BN = op.getBn(), BD = op.getBd();
+  const int numWarps =
+      std::max(1, mlir::triton::gpu::lookupNumWarps(op));
+  const bool envelope = BM > 0 && BM <= 32 && BM % 8 == 0 && BN > 0 &&
+                        BN % 8 == 0 && BD > 0 && BD % 8 == 0 &&
+                        !::getenv("TRITON_METAL_ATTN_BWD_SCALAR");
+  if (!envelope)
+    return {/*useMma=*/false, /*blockK=*/0, /*blockOutD=*/0, numWarps,
+            numWarps * 32};
+
+  const int blockK = static_cast<int>(std::min<int64_t>(BN, 32));
+  for (int blockOutD = static_cast<int>(std::min<int64_t>(BD, 32));
+       blockOutD >= 8; blockOutD -= 8) {
+    // _ab_out is the full [BM, BD] accumulator. Keep every 8x8 SIMD-group
+    // store inside that static allocation instead of emitting a partial final
+    // output tile when BD is not divisible by the preferred block width.
+    if (BD % blockOutD != 0)
+      continue;
+    // Full dQ stays resident until the final store.  The row state is staged
+    // once, while dS and K are reused per key/output chunk.
+    const int64_t need = BM * BD + BM * blockK + blockK * blockOutD + 3 * BM;
+    if (need <= 8192)
+      return {/*useMma=*/true, blockK, blockOutD, numWarps,
+              numWarps * 32};
+  }
+  return {/*useMma=*/false, /*blockK=*/0, /*blockOutD=*/0, numWarps,
+          numWarps * 32};
+}
+
+int mlir::triton::metal::getAttentionBackwardThreadsPerGroup(
+    SoftmaxAttentionBackwardDqOp op) {
+  return getAttentionBackwardDqSchedule(op).threadsPerGroup;
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SoftmaxAttentionBackwardDqOp op) {
+  auto bufName = [&](mlir::Value value) -> std::string {
+    for (;;) {
+      while (auto cast =
+                 value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1) break;
+        value = cast.getInputs()[0];
+      }
+      if (auto get =
+              value.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        value = get.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(value.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.attention_backward_dq: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+  auto scalar = [&](mlir::Value v) { return bufName(v) + "[0]"; };
+  const std::string K = bufName(op.getK()), Sbuf = bufName(op.getS());
+  const std::string DP = bufName(op.getDp()), MP = bufName(op.getMp());
+  const std::string LP = bufName(op.getLp());
+  const std::string DELTA = bufName(op.getDeltap());
+  const std::string DQ = bufName(op.getDq());
+  const AttentionBackwardDqSchedule schedule =
+      getAttentionBackwardDqSchedule(op);
+  if (schedule.useMma) {
+    const int64_t BM = op.getBm(), BD = op.getBd();
+    const int64_t BK = schedule.blockK, BO = schedule.blockOutD;
+    const int64_t SZ_DS = BM * BK, SZ_K = BK * BO, SZ_O = BM * BD;
+    const int64_t mT = BM / 8, kT = BK / 8, oT = BO / 8;
+    auto C = [](int64_t value) { return std::to_string(value); };
+
+    _output << "{\n";
+    INDENT();
+    indent();
+    _output << "// ---- metal.attention_backward_dq computed-tile simdgroup MMA ----\n";
+    indent();
+    _output << "threadgroup float _ab_ds[" << C(SZ_DS) << "];\n";
+    indent();
+    _output << "threadgroup float _ab_k[" << C(SZ_K) << "];\n";
+    indent();
+    _output << "threadgroup float _ab_out[" << C(SZ_O) << "];\n";
+    indent();
+    _output << "threadgroup float _ab_m[" << C(BM) << "];\n";
+    indent();
+    _output << "threadgroup float _ab_ls[" << C(BM) << "];\n";
+    indent();
+    _output << "threadgroup float _ab_delta[" << C(BM) << "];\n";
+    indent();
+    _output << "uint _ab_tid = ltid.x;\n";
+    indent();
+    _output << "uint _ab_warp = ltid.x >> 5u;\n";
+    indent();
+    _output << "uint _ab_M = " << scalar(op.getM()) << ", _ab_D = "
+            << scalar(op.getD()) << ";\n";
+    indent();
+    _output << "uint _ab_skn = " << scalar(op.getStrideKn())
+            << ", _ab_ss = " << scalar(op.getStrideSm())
+            << ", _ab_sdp = " << scalar(op.getStrideDpm())
+            << ", _ab_sdq = " << scalar(op.getStrideDqm()) << ";\n";
+    indent();
+    _output << "float _ab_scale = " << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "uint _ab_row0 = tgid.x * " << C(BM) << "u;\n";
+    indent();
+    _output << "for (uint c = _ab_tid; c < " << C(SZ_O) << "u; c += "
+            << schedule.threadsPerGroup << "u) _ab_out[c] = 0.0f;\n";
+    indent();
+    _output << "if (_ab_tid < " << C(BM) << "u) {\n";
+    {
+      INDENT();
+      indent();
+      _output << "uint m = _ab_row0 + _ab_tid;\n";
+      indent();
+      _output << "if (m < _ab_M) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "float l = " << LP << "[m];\n";
+        indent();
+        _output << "_ab_m[_ab_tid] = " << MP << "[m];\n";
+        indent();
+        _output << "_ab_ls[_ab_tid] = (l == 0.0f) ? 1.0f : l;\n";
+        indent();
+        _output << "_ab_delta[_ab_tid] = " << DELTA << "[m];\n";
+      }
+      indent();
+      _output << "} else { _ab_m[_ab_tid] = 0.0f; "
+                 "_ab_ls[_ab_tid] = 1.0f; _ab_delta[_ab_tid] = 0.0f; }\n";
+    }
+    indent();
+    _output << "}\n";
+    indent();
+    _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    indent();
+    _output << "for (uint n0 = 0u; n0 < _ab_ss; n0 += " << C(BK)
+            << "u) {\n";
+    {
+      INDENT();
+      indent();
+      _output << "for (uint c = _ab_tid; c < " << C(SZ_DS) << "u; c += "
+              << schedule.threadsPerGroup << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "uint q = c / " << C(BK) << "u, r = c % " << C(BK)
+                << "u, m = _ab_row0 + q, n = n0 + r;\n";
+        indent();
+        _output << "float ds = 0.0f;\n";
+        indent();
+        _output << "if (m < _ab_M && n < _ab_ss) {\n";
+        {
+          INDENT();
+          auto gradient = emitAttentionBackwardGradientRegion_(
+              op.getOperation(), op.getGradient(),
+              Sbuf + "[m*_ab_ss+n]", DP + "[m*_ab_sdp+n]", "_ab_m[q]",
+              "_ab_ls[q]", "_ab_delta[q]", "_ab_scale",
+              std::string(_curIndent * 2, ' '));
+          indent();
+          _output << "ds = " << gradient.second << ";\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "_ab_ds[c] = ds;\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint dc = 0u; dc < " << C(BD) << "u; dc += " << C(BO)
+              << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "for (uint c = _ab_tid; c < " << C(SZ_K) << "u; c += "
+                << schedule.threadsPerGroup << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint r = c / " << C(BO) << "u, d = c % " << C(BO)
+                  << "u, n = n0 + r, od = dc + d;\n";
+          indent();
+          _output << "_ab_k[c] = (n < _ab_ss && od < _ab_D) ? " << K
+                  << "[n*_ab_skn+od] : 0.0f;\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint tile = _ab_warp; tile < " << C(mT * oT)
+                << "u; tile += " << schedule.numWarps << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint mi = tile / " << C(oT) << "u, oi = tile % "
+                  << C(oT) << "u;\n";
+          indent();
+          _output << "simdgroup_float8x8 acc;\n";
+          indent();
+          _output << "simdgroup_load(acc, &_ab_out[(mi*8u)*" << C(BD)
+                  << "u + dc + oi*8u], " << C(BD) << ");\n";
+          indent();
+          _output << "for (uint ki = 0u; ki < " << C(kT) << "u; ++ki) {\n";
+          {
+            INDENT();
+            indent();
+            _output << "simdgroup_float8x8 lhs_frag, rhs_frag;\n";
+            indent();
+            _output << "simdgroup_load(lhs_frag, &_ab_ds[(mi*8u)*" << C(BK)
+                    << "u + ki*8u], " << C(BK) << ");\n";
+            indent();
+            _output << "simdgroup_load(rhs_frag, &_ab_k[(ki*8u)*" << C(BO)
+                    << "u + oi*8u], " << C(BO) << ");\n";
+            indent();
+            _output << "simdgroup_multiply_accumulate(acc, lhs_frag, rhs_frag, acc);\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "simdgroup_store(acc, &_ab_out[(mi*8u)*" << C(BD)
+                  << "u + dc + oi*8u], " << C(BD) << ");\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      }
+      indent();
+      _output << "}\n";
+    }
+    indent();
+    _output << "}\n";
+    indent();
+    _output << "for (uint c = _ab_tid; c < " << C(SZ_O) << "u; c += "
+            << schedule.threadsPerGroup << "u) {\n";
+    {
+      INDENT();
+      indent();
+      _output << "uint q = c / " << C(BD) << "u, d = c % " << C(BD)
+              << "u, m = _ab_row0 + q;\n";
+      indent();
+      _output << "if (m < _ab_M && d < _ab_D) " << DQ
+              << "[m*_ab_sdq+d] = _ab_out[c];\n";
+    }
+    indent();
+    _output << "}\n";
+    _output << "}";
+    return;
+  }
+  _output << "{\n";
+  INDENT();
+  indent();
+  _output << "// ---- metal.attention_backward_dq scalar fallback ----\n";
+  indent();
+  _output << "if (ltid.x == 0u) {\n";
+  {
+    INDENT();
+    indent();
+    _output << "uint BM=" << op.getBm() << "u, BN=" << op.getBn()
+            << "u, BD=" << op.getBd() << "u, M=" << scalar(op.getM())
+            << ", D=" << scalar(op.getD()) << ";\n";
+    indent();
+    _output << "uint skn=" << scalar(op.getStrideKn()) << ", ss="
+            << scalar(op.getStrideSm()) << ", sdp="
+            << scalar(op.getStrideDpm()) << ", sdq="
+            << scalar(op.getStrideDqm()) << ";\n";
+    indent();
+    _output << "float scale=" << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "for(uint rm=0u; rm<BM; ++rm){\n";
+    {
+      INDENT();
+      indent();
+      _output << "uint m=tgid.x*BM+rm; if(m>=M) continue; float mi=" << MP
+              << "[m], l=" << LP << "[m], ls=(l==0.0f)?1.0f:l, de="
+              << DELTA << "[m];\n";
+      indent();
+      _output << "for(uint d=0u; d<BD; ++d){\n";
+      {
+        INDENT();
+        indent();
+        _output << "if(d>=D) continue; float acc=0.0f;\n";
+        indent();
+        _output << "for(uint n0=0u; n0<ss; n0+=BN){\n";
+        {
+          INDENT();
+          indent();
+          _output << "for(uint rn=0u; rn<BN; ++rn){\n";
+          {
+            INDENT();
+            indent();
+            _output << "uint n=n0+rn; if(n>=ss) continue;\n";
+            auto gradient = emitAttentionBackwardGradientRegion_(
+                op.getOperation(), op.getGradient(), Sbuf + "[m*ss+n]",
+                DP + "[m*sdp+n]", "mi", "ls", "de", "scale",
+                std::string(_curIndent * 2, ' '));
+            indent();
+            _output << "acc+=" << gradient.second << "*" << K
+                    << "[n*skn+d];\n";
+          }
+          indent();
+          _output << "}\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << DQ << "[m*sdq+d]=acc;\n";
+      }
+      indent();
+      _output << "}\n";
+    }
+    indent();
+    _output << "}\n";
+  }
+  indent();
+  _output << "}\n";
+  _output << "}";
+}
+
+struct AttentionBackwardDkdvSchedule {
+  bool useMma;
+  int blockRows;
+  int blockOutD;
+  int numWarps;
+  int threadsPerGroup;
+};
+
+static AttentionBackwardDkdvSchedule getAttentionBackwardDkdvSchedule(
+    mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp op) {
+  const int64_t BN = op.getBn(), BM = op.getBm(), BD = op.getBd();
+  const int numWarps =
+      std::max(1, mlir::triton::gpu::lookupNumWarps(op));
+  const bool envelope = BN > 0 && BN <= 64 && BN % 8 == 0 && BM > 0 &&
+                        BM % 8 == 0 && BD > 0 && BD % 8 == 0 &&
+                        !::getenv("TRITON_METAL_ATTN_BWD_SCALAR");
+  if (!envelope)
+    return {/*useMma=*/false, /*blockRows=*/0, /*blockOutD=*/0, numWarps,
+            numWarps * 32};
+
+  const int blockRows = static_cast<int>(std::min<int64_t>(BM, 32));
+  for (int blockOutD = static_cast<int>(std::min<int64_t>(BD, 32));
+       blockOutD >= 8; blockOutD -= 8) {
+    // dK/dV are output-feature tiled because keeping both complete BN*BD
+    // accumulators would consume the entire 32 KiB budget at BN=32, BD=128.
+    const int64_t need = 2 * BN * blockOutD + 2 * BN * blockRows +
+                         2 * blockRows * blockOutD + 3 * blockRows;
+    if (need <= 8192)
+      return {/*useMma=*/true, blockRows, blockOutD, numWarps,
+              numWarps * 32};
+  }
+  return {/*useMma=*/false, /*blockRows=*/0, /*blockOutD=*/0, numWarps,
+          numWarps * 32};
+}
+
+int mlir::triton::metal::getAttentionBackwardThreadsPerGroup(
+    SoftmaxAttentionBackwardDkdvOp op) {
+  return getAttentionBackwardDkdvSchedule(op).threadsPerGroup;
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp op) {
+  auto bufName = [&](mlir::Value value) -> std::string {
+    for (;;) {
+      while (auto cast =
+                 value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1) break;
+        value = cast.getInputs()[0];
+      }
+      if (auto get =
+              value.getDefiningOp<mlir::triton::metal::GetElementOp>()) {
+        value = get.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto it = _buffers.find(value.getAsOpaquePointer());
+    if (it == _buffers.end()) {
+      op.emitError() << "metal.attention_backward_dkdv: operand does not "
+                        "resolve to a kernel buffer";
+      _emitFailed = true;
+      return std::string("<unresolved>");
+    }
+    return "v" + std::to_string(it->second);
+  };
+  auto scalar = [&](mlir::Value v) { return bufName(v) + "[0]"; };
+  const std::string Q = bufName(op.getQ()), DO = bufName(op.getDO());
+  const std::string ST = bufName(op.getSt()), DPT = bufName(op.getDpt());
+  const std::string MP = bufName(op.getMp()), LP = bufName(op.getLp());
+  const std::string DELTA = bufName(op.getDeltap());
+  const std::string DK = bufName(op.getDk()), DV = bufName(op.getDv());
+  const AttentionBackwardDkdvSchedule schedule =
+      getAttentionBackwardDkdvSchedule(op);
+  if (schedule.useMma) {
+    const int64_t BN = op.getBn(), BD = op.getBd();
+    const int64_t BR = schedule.blockRows, BO = schedule.blockOutD;
+    const int64_t SZ_OUT = BN * BO, SZ_WEIGHT = BN * BR,
+                  SZ_INPUT = BR * BO;
+    const int64_t nT = BN / 8, rT = BR / 8, oT = BO / 8;
+    auto C = [](int64_t value) { return std::to_string(value); };
+
+    _output << "{\n";
+    INDENT();
+    indent();
+    _output << "// ---- metal.attention_backward_dkdv computed-tile simdgroup MMA ----\n";
+    for (const char *name : {"_ab_ak", "_ab_av"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_OUT)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_ds", "_ab_p"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_WEIGHT)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_q", "_ab_do"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(SZ_INPUT)
+              << "];\n";
+    }
+    for (const char *name : {"_ab_m", "_ab_ls", "_ab_delta"}) {
+      indent();
+      _output << "threadgroup float " << name << "[" << C(BR) << "];\n";
+    }
+    indent();
+    _output << "uint _ab_tid = ltid.x, _ab_warp = ltid.x >> 5u;\n";
+    indent();
+    _output << "uint _ab_M = " << scalar(op.getM()) << ", _ab_N = "
+            << scalar(op.getN()) << ", _ab_D = " << scalar(op.getD())
+            << ";\n";
+    indent();
+    _output << "uint _ab_sqm = " << scalar(op.getStrideQm())
+            << ", _ab_sdo = " << scalar(op.getStrideDom())
+            << ", _ab_sst = " << scalar(op.getStrideStn())
+            << ", _ab_sdpt = " << scalar(op.getStrideDptn()) << ";\n";
+    indent();
+    _output << "uint _ab_sdk = " << scalar(op.getStrideDkn())
+            << ", _ab_sdv = " << scalar(op.getStrideDvn()) << ";\n";
+    indent();
+    _output << "uint _ab_accum = ";
+    if (op.getAccumulateMode() == 1)
+      _output << "1u;\n";
+    else
+      _output << scalar(op.getAccumulate()) << ";\n";
+    indent();
+    _output << "float _ab_scale = " << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "uint _ab_n0 = tgid.x * " << C(BN) << "u;\n";
+    indent();
+    _output << "for (uint dc = 0u; dc < " << C(BD) << "u; dc += " << C(BO)
+            << "u) {\n";
+    {
+      INDENT();
+      indent();
+      _output << "for (uint c = _ab_tid; c < " << C(SZ_OUT) << "u; c += "
+              << schedule.threadsPerGroup
+              << "u) { _ab_ak[c] = 0.0f; _ab_av[c] = 0.0f; }\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      indent();
+      _output << "for (uint m0 = 0u; m0 < _ab_M; m0 += " << C(BR)
+              << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "if (_ab_tid < " << C(BR) << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint m = m0 + _ab_tid;\n";
+          indent();
+          _output << "if (m < _ab_M) { float l = " << LP
+                  << "[m]; _ab_m[_ab_tid] = " << MP
+                  << "[m]; _ab_ls[_ab_tid] = (l == 0.0f) ? 1.0f : l; "
+                  << "_ab_delta[_ab_tid] = " << DELTA << "[m]; } else { "
+                     "_ab_m[_ab_tid] = 0.0f; _ab_ls[_ab_tid] = 1.0f; "
+                     "_ab_delta[_ab_tid] = 0.0f; }\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "for (uint c = _ab_tid; c < " << C(SZ_INPUT)
+                << "u; c += " << schedule.threadsPerGroup << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint r = c / " << C(BO) << "u, d = c % " << C(BO)
+                  << "u, m = m0 + r, od = dc + d;\n";
+          indent();
+          _output << "_ab_q[c] = (m < _ab_M && od < _ab_D) ? " << Q
+                  << "[m*_ab_sqm+od] : 0.0f;\n";
+          indent();
+          _output << "_ab_do[c] = (m < _ab_M && od < _ab_D) ? " << DO
+                  << "[m*_ab_sdo+od] : 0.0f;\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint c = _ab_tid; c < " << C(SZ_WEIGHT)
+                << "u; c += " << schedule.threadsPerGroup << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint nr = c / " << C(BR) << "u, r = c % " << C(BR)
+                  << "u, n = _ab_n0 + nr, m = m0 + r; float p = 0.0f, ds = 0.0f;\n";
+          indent();
+          _output << "if (n < _ab_N && m < _ab_M) {\n";
+          {
+            INDENT();
+            auto gradient = emitAttentionBackwardGradientRegion_(
+                op.getOperation(), op.getGradient(),
+                ST + "[n*_ab_sst+m]", DPT + "[n*_ab_sdpt+m]",
+                "_ab_m[r]", "_ab_ls[r]", "_ab_delta[r]", "_ab_scale",
+                std::string(_curIndent * 2, ' '));
+            indent();
+            _output << "p = " << gradient.first << "; ds = "
+                    << gradient.second << ";\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "_ab_p[c] = p; _ab_ds[c] = ds;\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+        indent();
+        _output << "for (uint tile = _ab_warp; tile < " << C(nT * oT)
+                << "u; tile += " << schedule.numWarps << "u) {\n";
+        {
+          INDENT();
+          indent();
+          _output << "uint ni = tile / " << C(oT) << "u, oi = tile % "
+                  << C(oT) << "u;\n";
+          indent();
+          _output << "simdgroup_float8x8 ak, av;\n";
+          indent();
+          _output << "simdgroup_load(ak, &_ab_ak[(ni*8u)*" << C(BO)
+                  << "u + oi*8u], " << C(BO) << ");\n";
+          indent();
+          _output << "simdgroup_load(av, &_ab_av[(ni*8u)*" << C(BO)
+                  << "u + oi*8u], " << C(BO) << ");\n";
+          indent();
+          _output << "for (uint ri = 0u; ri < " << C(rT) << "u; ++ri) {\n";
+          {
+            INDENT();
+            indent();
+            _output << "simdgroup_float8x8 dsf, pf, qf, dof;\n";
+            indent();
+            _output << "simdgroup_load(dsf, &_ab_ds[(ni*8u)*" << C(BR)
+                    << "u + ri*8u], " << C(BR) << ");\n";
+            indent();
+            _output << "simdgroup_load(pf, &_ab_p[(ni*8u)*" << C(BR)
+                    << "u + ri*8u], " << C(BR) << ");\n";
+            indent();
+            _output << "simdgroup_load(qf, &_ab_q[(ri*8u)*" << C(BO)
+                    << "u + oi*8u], " << C(BO) << ");\n";
+            indent();
+            _output << "simdgroup_load(dof, &_ab_do[(ri*8u)*" << C(BO)
+                    << "u + oi*8u], " << C(BO) << ");\n";
+            indent();
+            _output << "simdgroup_multiply_accumulate(ak, dsf, qf, ak);\n";
+            indent();
+            _output << "simdgroup_multiply_accumulate(av, pf, dof, av);\n";
+          }
+          indent();
+          _output << "}\n";
+          indent();
+          _output << "simdgroup_store(ak, &_ab_ak[(ni*8u)*" << C(BO)
+                  << "u + oi*8u], " << C(BO) << ");\n";
+          indent();
+          _output << "simdgroup_store(av, &_ab_av[(ni*8u)*" << C(BO)
+                  << "u + oi*8u], " << C(BO) << ");\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "for (uint c = _ab_tid; c < " << C(SZ_OUT) << "u; c += "
+              << schedule.threadsPerGroup << "u) {\n";
+      {
+        INDENT();
+        indent();
+        _output << "uint nr = c / " << C(BO) << "u, d = c % " << C(BO)
+                << "u, n = _ab_n0 + nr, od = dc + d;\n";
+        indent();
+        _output << "if (n < _ab_N && od < _ab_D) { uint ok = n*_ab_sdk+od, "
+                   "ov = n*_ab_sdv+od; float ak = _ab_ak[c], av = _ab_av[c]; "
+                   "if (_ab_accum != 0u) { ak += "
+                << DK << "[ok]; av += " << DV << "[ov]; } " << DK
+                << "[ok] = ak; " << DV << "[ov] = av; }\n";
+      }
+      indent();
+      _output << "}\n";
+      indent();
+      _output << "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    }
+    indent();
+    _output << "}\n";
+    _output << "}";
+    return;
+  }
+  _output << "{\n";
+  INDENT();
+  indent();
+  _output << "// ---- metal.attention_backward_dkdv scalar fallback ----\n";
+  indent();
+  _output << "if (ltid.x == 0u) {\n";
+  {
+    INDENT();
+    indent();
+    _output << "uint BN=" << op.getBn() << "u, BM=" << op.getBm()
+            << "u, BD=" << op.getBd() << "u, M=" << scalar(op.getM())
+            << ", N=" << scalar(op.getN()) << ", D=" << scalar(op.getD())
+            << ";\n";
+    indent();
+    _output << "uint sqm=" << scalar(op.getStrideQm()) << ", sdo="
+            << scalar(op.getStrideDom()) << ", sst="
+            << scalar(op.getStrideStn()) << ", sdpt="
+            << scalar(op.getStrideDptn()) << ", sdk="
+            << scalar(op.getStrideDkn()) << ", sdv="
+            << scalar(op.getStrideDvn()) << ", accum=";
+    if (op.getAccumulateMode() == 1)
+      _output << "1u;\n";
+    else
+      _output << scalar(op.getAccumulate()) << ";\n";
+    indent();
+    _output << "float scale=" << scalar(op.getSmScale()) << ";\n";
+    indent();
+    _output << "for(uint rn=0u; rn<BN; ++rn){\n";
+    {
+      INDENT();
+      indent();
+      _output << "uint n=tgid.x*BN+rn; if(n>=N) continue;\n";
+      indent();
+      _output << "for(uint d=0u; d<BD; ++d){\n";
+      {
+        INDENT();
+        indent();
+        _output << "if(d>=D) continue; float ak=0.0f, av=0.0f;\n";
+        indent();
+        _output << "for(uint m0=0u; m0<M; m0+=BM){\n";
+        {
+          INDENT();
+          indent();
+          _output << "for(uint rm=0u; rm<BM; ++rm){\n";
+          {
+            INDENT();
+            indent();
+            _output << "uint m=m0+rm; if(m>=M) continue; float l=" << LP
+                    << "[m]; float ls=(l==0.0f)?1.0f:l;\n";
+            auto gradient = emitAttentionBackwardGradientRegion_(
+                op.getOperation(), op.getGradient(), ST + "[n*sst+m]",
+                DPT + "[n*sdpt+m]", MP + "[m]", "ls", DELTA + "[m]",
+                "scale", std::string(_curIndent * 2, ' '));
+            indent();
+            _output << "av+=" << gradient.first << "*" << DO
+                    << "[m*sdo+d]; ak+=" << gradient.second << "*" << Q
+                    << "[m*sqm+d];\n";
+          }
+          indent();
+          _output << "}\n";
+        }
+        indent();
+        _output << "}\n";
+        indent();
+        _output << "uint ok=n*sdk+d; if(accum!=0u) ak+=" << DK << "[ok]; "
+                << DK << "[ok]=ak; uint ov=n*sdv+d; if(accum!=0u) av+="
+                << DV << "[ov]; " << DV << "[ov]=av;\n";
+      }
+      indent();
+      _output << "}\n";
+    }
+    indent();
+    _output << "}\n";
+  }
+  indent();
+  _output << "}\n";
   _output << "}";
 }
 

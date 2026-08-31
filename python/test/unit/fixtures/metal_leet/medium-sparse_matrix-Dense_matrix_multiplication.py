@@ -43,19 +43,24 @@ def dense_matrix_multiplication_kernel(
     offs_bk = (pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-    for n in range(0, N, BLOCK_SIZE_N):
-        offs_n = n + tl.arange(0, BLOCK_SIZE_N)
-        a_block = a + (
-            offs_am[:, None] * stride_am + offs_n[None, :] * stride_an
-        )
-        b_block = b + (
-            offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
-        )
-        a_val = tl.load(a_block, mask=offs_n[None, :] < N, other=0.0)
-        b_val = tl.load(b_block, mask=offs_n[:, None] < N, other=0.0)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    a_block = a + (
+        offs_am[:, None] * stride_am + offs_n[None, :] * stride_an
+    )
+    b_block = b + (
+        offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk
+    )
+    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+        remaining = N - n * BLOCK_SIZE_N
+        a_val = tl.load(a_block, mask=offs_n[None, :] < remaining,
+                        other=0.0)
+        b_val = tl.load(b_block, mask=offs_n[:, None] < remaining,
+                        other=0.0)
         accumulator = tl.dot(
             a_val, b_val, acc=accumulator, allow_tf32=False
         )
+        a_block += BLOCK_SIZE_N * stride_an
+        b_block += BLOCK_SIZE_N * stride_bn
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_ck = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)

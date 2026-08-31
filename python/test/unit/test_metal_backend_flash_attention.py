@@ -314,6 +314,7 @@ def test_packed_qkv_causal_gqa_matches_reference(seq_len):
         pytest.param(4, 2, 33, 16, id="ragged-sequence"),
         pytest.param(4, 2, 64, 12, id="padded-head-dim"),
         pytest.param(8, 2, 129, 32, id="multiple-key-blocks"),
+        pytest.param(8, 2, 65, 128, id="chunked-mma-wide-head"),
     ],
 )
 def test_leet_grouped_query_attention_matches_reference(
@@ -346,6 +347,20 @@ def test_leet_grouped_query_attention_matches_reference(
             "_fa_qhoff", "_fa_khoff", "_fa_vhoff", "_fa_ohoff"
         ):
             assert head_offset in msl
+    if head_dim == 128:
+        # BM=BN=32, BD=128 cannot hold the full attention working set.  This
+        # pins the independent-head address mode on the chunked body, including
+        # its selected BO=24 output tile (which does not divide BD).
+        assert getattr(compiled.metadata, "threads_per_group", None) == 128
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "chunked simdgroup dots" in msl
+        assert "_fa_oc += 24u" in msl
+        for head_offset in (
+            "_fa_qhoff", "_fa_khoff", "_fa_vhoff", "_fa_ohoff"
+        ):
+            assert head_offset in msl
 
     actual = out.cpu()
     assert actual.isfinite().all()
@@ -370,6 +385,7 @@ def test_leet_grouped_query_attention_matches_reference(
         (64, 64, 8),    # d_head=8 < BD=16 -> padded-column masking
         (64, 64, 2),    # d_head=32 == BD=32 (no padding)
         (96, 96, 3),    # d_head=32, ragged N
+        (65, 256, 2),   # d_head=128 -> chunked head-split MMA, ragged N
     ],
 )
 def test_flash_attention_online_softmax(N, d_model, h):
@@ -382,7 +398,16 @@ def test_flash_attention_online_softmax(N, d_model, h):
     BLOCKSIZE_N = 32
     BLOCKSIZE_d = max(16, d_model // h)
     grid = (triton.cdiv(N, BLOCKSIZE_N), h)
-    mha_kernel[grid](Q, K, V, out, N, d_model, h, BLOCKSIZE_N, BLOCKSIZE_d, num_warps=4)
+    compiled = mha_kernel[grid](
+        Q, K, V, out, N, d_model, h, BLOCKSIZE_N, BLOCKSIZE_d, num_warps=4)
+
+    if d_model // h == 128:
+        assert getattr(compiled.metadata, "threads_per_group", None) == 128
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "chunked simdgroup dots" in msl
+        assert "uint _fa_col = tgid.y * _fa_dh" in msl
 
     expected = _reference(Q, K, V, N, d_model, h)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
@@ -400,12 +425,12 @@ def test_flash_attention_online_softmax(N, d_model, h):
 def test_flash_attention_block16_lane_guard(N, d_model, h):
     """BLOCKSIZE_N == 16, i.e. bm < 32 — the FA emitter's per-row buffers.
 
-    The emitter runs the online-softmax stage on one warp with `q = _fa_lane`
-    ranging over all 32 lanes, but `_fa_rmax`/`_fa_rsum` hold bm floats,
-    `_fa_pbuf` bm*bn and `_fa_obuf` bm*bd. At bm == 32 that is exactly in
-    bounds, which is why the bm == 32 cases above never caught it; at bm == 16
-    lanes 16..31 write past the end of every one of them (both the `row < N`
-    arm and its pbuf-zeroing else arm). Measured before the `q < bm` guard:
+    The online-softmax stage maps rows with the cooperative thread id, while
+    `_fa_rmax`/`_fa_rsum` hold bm floats and `_fa_pbuf`/`_fa_obuf` are likewise
+    bm-sized. At bm == 32 that is exactly in bounds, which is why the bm == 32
+    cases above never caught the old missing row-owner guard; at bm == 16
+    threads 16..31 wrote past the end of every buffer. Measured before the
+    `q < bm` guard:
     maxerr 1.7e+04 on (64, 64, 4). See metal-sliding-window-attention-plan.md
     §1c — the sliding-window driver uses BLOCK_M = 16, so this had to be fixed
     before that kernel could work regardless of the matcher gates.
@@ -530,11 +555,11 @@ def _alibi_reference(Q, K, V, M, N, d, alpha):
     return torch.softmax(scores, dim=1) @ Vc
 
 
-def _launch_alibi_attention(alibi, Q, K, V, out, M, N, d, alpha):
+def _launch_alibi_attention(alibi, Q, K, V, out, M, N, d, alpha,
+                            block_d=64):
     K_t = K.T.contiguous()
     block_m = 16
     block_n = 16
-    block_d = 64
     grid = (triton.cdiv(M, block_m), triton.cdiv(d, block_d))
     return alibi.alibi_attention_fwd[grid](
         Q, K_t, V, out,
@@ -589,18 +614,43 @@ def test_leet_alibi_attention_matches_reference(M, N, d, alpha):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-def test_flash_attention_launches_one_warp():
-    """A fused-attention kernel must launch 32 threads, whatever num_warps says.
+def test_leet_alibi_attention_chunked_mma_feature_tile():
+    """An over-budget feature-tiled ALiBi kernel keeps its generic score region."""
+    M, N, d, alpha = 31, 33, 96, -0.0625
+    torch.manual_seed(0xC4A)
+    Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
 
-    The op's body runs entirely under `ltid.x < 32`, so a source kernel written
-    with the customary `num_warps=4` would launch 128 threads and have 96 of
-    them exit immediately — measured at ~11% on this backend, for nothing.
-    The compiler therefore reports `threads_per_group` and the driver prefers
-    it over `num_warps * 32`.
+    alibi = _load_alibi_attention()
+    compiled = _launch_alibi_attention(
+        alibi, Q, K, V, out, M, N, d, alpha, block_d=128)
+    torch.mps.synchronize()
+
+    assert getattr(compiled.metadata, "threads_per_group", None) == 64
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "simdgroup_index_in_threadgroup" in msl
+    assert "uint _fa_warp = sgid" in msl
+    assert msl.count("simdgroup_multiply_accumulate") >= 2
+    expected = _alibi_reference(Q, K, V, M, N, d, alpha)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("block_n", [16, 32])
+def test_flash_attention_uses_multiwarp_schedule(block_n):
+    """The fused MMA body launches one SIMD-group per useful 8-row tile.
+
+    BM=16/32 have two/four row tiles. Requests for fewer warps are honoured;
+    larger requests are capped at the row-tile count so no SIMD-group is
+    launched without a QK/PV tile. The compiler reports the exact schedule
+    through `threads_per_group`, which the driver prefers over the source
+    `num_warps * 32`.
 
     Asserted on the MECHANISM rather than on a timing: a perf regression here
     is silent and a wall-clock assertion in a test suite is a flake generator.
-    The numbers are in the commit that added it.
     """
     N, d_model, h = 128, 64, 4
     torch.manual_seed(0xF1)
@@ -610,12 +660,21 @@ def test_flash_attention_launches_one_warp():
     out = torch.zeros(N, d_model, dtype=torch.float32, device="mps").contiguous()
 
     for num_warps in (1, 2, 4, 8):
-        compiled = mha_kernel[(triton.cdiv(N, 32), h)](
-            Q, K, V, out, N, d_model, h, 32, max(16, d_model // h),
+        compiled = mha_kernel[(triton.cdiv(N, block_n), h)](
+            Q, K, V, out, N, d_model, h, block_n, max(16, d_model // h),
             num_warps=num_warps)
-        assert getattr(compiled.metadata, "threads_per_group", None) == 32, (
-            f"num_warps={num_warps} did not report a single-warp launch")
-        # The override must not change what the kernel computes.
+        expected_warps = min(num_warps, block_n // 8)
+        assert getattr(compiled.metadata, "threads_per_group", None) == expected_warps * 32
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        if expected_warps > 1:
+            assert "simdgroup_index_in_threadgroup" in msl
+            assert "uint _fa_warp = sgid" in msl
+        else:
+            assert "uint _fa_warp = 0u" in msl
+        assert f"mi += {expected_warps}u" in msl
+        # The schedule must not change what the kernel computes.
         torch.mps.synchronize()
         torch.testing.assert_close(out.cpu(), _reference(Q, K, V, N, d_model, h),
                                    atol=1e-3, rtol=1e-3)
@@ -705,17 +764,763 @@ def _load_softmax_attention_backward():
     return module
 
 
+def _metal_text(compiled):
+    msl = compiled.asm["metal"]
+    return msl.decode() if isinstance(msl, bytes) else msl
+
+
+def _compile_softmax_attention_backward(monkeypatch, stage=None, kernel=None):
+    monkeypatch.delenv("TRITON_METAL_ATTN_BWD_SCALAR", raising=False)
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    torch.manual_seed(0xBADC0DE)
+    M, N, d = 16, 32, 32
+    Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
+    dO = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    dQ = torch.empty_like(Q)
+    dK = torch.empty_like(K)
+    dV = torch.empty_like(V)
+
+    backward = _load_softmax_attention_backward()
+    if stage is not None:
+        setattr(backward, f"_attn_bwd_{stage}", kernel)
+    compiled_pre, compiled_dq, compiled_dkdv = backward.solve(
+        Q, K, V, dO, dQ, dK, dV, M, N, d)
+    torch.mps.synchronize()
+    return {
+        "pre": _metal_text(compiled_pre),
+        "dq": _metal_text(compiled_dq),
+        "dkdv": _metal_text(compiled_dkdv),
+        "inputs": (Q.cpu(), K.cpu(), V.cpu(), dO.cpu()),
+        "outputs": (dQ.cpu(), dK.cpu(), dV.cpu()),
+    }
+
+
+def _assert_backward_variant_matches_reference(result, keep):
+    q, k, v, do = result["inputs"]
+    q = q.detach().requires_grad_(True)
+    k = k.detach().requires_grad_(True)
+    v = v.detach().requires_grad_(True)
+    scores = q @ k.T * (q.shape[1] ** -0.5)
+    scores = scores.masked_fill(~keep, float("-inf"))
+    (torch.softmax(scores, dim=1) @ v).backward(do)
+    for actual, expected in zip(result["outputs"], (q.grad, k.grad, v.grad)):
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def _causal_backward_pre_kernel():
+    @triton.jit(do_not_specialize=["N_true"])
+    def _attn_bwd_pre(
+        Q, KT, VT, dO,
+        S, ST, DP, DPT,
+        Mp, Lp, Deltap,
+        stride_qm, stride_kt, stride_vt, stride_dom,
+        stride_sm, stride_stn, stride_dpm, stride_dptn,
+        M, N_true, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+        mask_md = mask_m[:, None] & mask_d[None, :]
+
+        q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :], mask=mask_md, other=0.0)
+        do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :], mask=mask_md, other=0.0)
+
+        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        delta = tl.zeros([BLOCK_M], tl.float32)
+
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_dn = mask_d[:, None] & mask_n[None, :]
+            kt = tl.load(KT + offs_d[:, None] * stride_kt + offs_n[None, :], mask=mask_dn, other=0.0)
+            vt = tl.load(VT + offs_d[:, None] * stride_vt + offs_n[None, :], mask=mask_dn, other=0.0)
+
+            s = tl.dot(q, kt, input_precision="ieee") * sm_scale
+            valid = offs_n[None, :] < N_true
+            causal = offs_n[None, :] <= offs_m[:, None]
+            s = tl.where(valid & causal, s, float("-inf"))
+            dp = tl.dot(do, vt, input_precision="ieee")
+
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            delta = delta * alpha + tl.sum(p * dp, 1)
+            m_i = m_new
+
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            tl.store(S + offs_m[:, None] * stride_sm + offs_n[None, :], s, mask=mask_mn)
+            tl.store(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], dp, mask=mask_mn)
+            st = tl.trans(s)
+            dpt = tl.trans(dp)
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            tl.store(ST + offs_n[:, None] * stride_stn + offs_m[None, :], st, mask=mask_nm)
+            tl.store(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], dpt, mask=mask_nm)
+
+        # Exercise the predicate-normalized spelling in the pre-stage stored
+        # delta as well as in the DQ/DKDV probability formulas below.
+        l_safe = tl.where(l_i != 0.0, l_i, 1.0)
+        tl.store(Mp + offs_m, m_i, mask=mask_m)
+        tl.store(Lp + offs_m, l_i, mask=mask_m)
+        tl.store(Deltap + offs_m, delta / l_safe, mask=mask_m)
+
+    return _attn_bwd_pre
+
+
+def _shifted_score_backward_pre_kernel():
+    @triton.jit(do_not_specialize=["N_true"])
+    def _attn_bwd_pre(
+        Q, KT, VT, dO,
+        S, ST, DP, DPT,
+        Mp, Lp, Deltap,
+        stride_qm, stride_kt, stride_vt, stride_dom,
+        stride_sm, stride_stn, stride_dpm, stride_dptn,
+        M, N_true, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+        mask_md = mask_m[:, None] & mask_d[None, :]
+
+        q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :], mask=mask_md, other=0.0)
+        do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :], mask=mask_md, other=0.0)
+
+        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        delta = tl.zeros([BLOCK_M], tl.float32)
+
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_dn = mask_d[:, None] & mask_n[None, :]
+            kt = tl.load(KT + offs_d[:, None] * stride_kt + offs_n[None, :], mask=mask_dn, other=0.0)
+            vt = tl.load(VT + offs_d[:, None] * stride_vt + offs_n[None, :], mask=mask_dn, other=0.0)
+
+            s = tl.dot(q, kt, input_precision="ieee") * sm_scale
+            s = tl.where((offs_n[None, :] + 1) < N_true, s, float("-inf"))
+            dp = tl.dot(do, vt, input_precision="ieee")
+
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            delta = delta * alpha + tl.sum(p * dp, 1)
+            m_i = m_new
+
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            tl.store(S + offs_m[:, None] * stride_sm + offs_n[None, :], s, mask=mask_mn)
+            tl.store(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], dp, mask=mask_mn)
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            tl.store(ST + offs_n[:, None] * stride_stn + offs_m[None, :], tl.trans(s), mask=mask_nm)
+            tl.store(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], tl.trans(dp), mask=mask_nm)
+
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+        tl.store(Mp + offs_m, m_i, mask=mask_m)
+        tl.store(Lp + offs_m, l_i, mask=mask_m)
+        tl.store(Deltap + offs_m, delta / l_safe, mask=mask_m)
+
+    return _attn_bwd_pre
+
+
+def _wrong_recurrence_backward_pre_kernel():
+    @triton.jit(do_not_specialize=["N_true"])
+    def _attn_bwd_pre(
+        Q, KT, VT, dO,
+        S, ST, DP, DPT,
+        Mp, Lp, Deltap,
+        stride_qm, stride_kt, stride_vt, stride_dom,
+        stride_sm, stride_stn, stride_dpm, stride_dptn,
+        M, N_true, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+        mask_md = mask_m[:, None] & mask_d[None, :]
+
+        q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :], mask=mask_md, other=0.0)
+        do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :], mask=mask_md, other=0.0)
+
+        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        delta = tl.zeros([BLOCK_M], tl.float32)
+
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_dn = mask_d[:, None] & mask_n[None, :]
+            kt = tl.load(KT + offs_d[:, None] * stride_kt + offs_n[None, :], mask=mask_dn, other=0.0)
+            vt = tl.load(VT + offs_d[:, None] * stride_vt + offs_n[None, :], mask=mask_dn, other=0.0)
+
+            s = tl.dot(q, kt, input_precision="ieee") * sm_scale
+            s = tl.where(offs_n[None, :] < N_true, s, float("-inf"))
+            dp = tl.dot(do, vt, input_precision="ieee")
+
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            delta = delta * alpha + tl.sum(p * (dp + 1.0), 1)
+            m_i = m_new
+
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            tl.store(S + offs_m[:, None] * stride_sm + offs_n[None, :], s, mask=mask_mn)
+            tl.store(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], dp, mask=mask_mn)
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            tl.store(ST + offs_n[:, None] * stride_stn + offs_m[None, :], tl.trans(s), mask=mask_nm)
+            tl.store(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], tl.trans(dp), mask=mask_nm)
+
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+        tl.store(Mp + offs_m, m_i, mask=mask_m)
+        tl.store(Lp + offs_m, l_i, mask=mask_m)
+        tl.store(Deltap + offs_m, delta / l_safe, mask=mask_m)
+
+    return _attn_bwd_pre
+
+
+def _wrong_delta_sign_backward_dq_kernel():
+    @triton.jit
+    def _attn_bwd_dq(
+        K, S, DP, Mp, Lp, Deltap, DQ,
+        stride_kn, stride_sm, stride_dpm, stride_dqm,
+        M, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+
+        m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+        l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+        delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            s = tl.load(S + offs_m[:, None] * stride_sm + offs_n[None, :], mask=mask_mn,
+                        other=float("-inf"))
+            dp = tl.load(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], mask=mask_mn,
+                         other=0.0)
+            k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :],
+                        mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            p = tl.exp(s - m_i[:, None]) / l_safe[:, None]
+            ds = p * (dp + delta[:, None]) * sm_scale
+            acc = tl.dot(ds, k, acc, input_precision="ieee")
+
+        tl.store(DQ + offs_m[:, None] * stride_dqm + offs_d[None, :], acc,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+    return _attn_bwd_dq
+
+
+def _wrong_delta_coefficient_backward_dq_kernel():
+    @triton.jit
+    def _attn_bwd_dq(
+        K, S, DP, Mp, Lp, Deltap, DQ,
+        stride_kn, stride_sm, stride_dpm, stride_dqm,
+        M, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+
+        m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+        l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+        delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            s = tl.load(S + offs_m[:, None] * stride_sm + offs_n[None, :], mask=mask_mn,
+                        other=float("-inf"))
+            dp = tl.load(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], mask=mask_mn,
+                         other=0.0)
+            k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :],
+                        mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            p = tl.exp(s - m_i[:, None]) / l_safe[:, None]
+            ds = p * ((dp - delta[:, None]) - delta[:, None]) * sm_scale
+            acc = tl.dot(ds, k, acc, input_precision="ieee")
+
+        tl.store(DQ + offs_m[:, None] * stride_dqm + offs_d[None, :], acc,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+    return _attn_bwd_dq
+
+
+def _shifted_s_address_backward_dq_kernel():
+    @triton.jit
+    def _attn_bwd_dq(
+        K, S, DP, Mp, Lp, Deltap, DQ,
+        stride_kn, stride_sm, stride_dpm, stride_dqm,
+        M, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+
+        m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+        l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+        delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            s = tl.load(S + offs_m[:, None] * stride_sm + offs_n[None, :] + 1,
+                        mask=mask_mn, other=float("-inf"))
+            dp = tl.load(DP + offs_m[:, None] * stride_dpm + offs_n[None, :],
+                         mask=mask_mn, other=0.0)
+            k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :],
+                        mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            p = tl.exp(s - m_i[:, None]) / l_safe[:, None]
+            ds = p * (dp - delta[:, None]) * sm_scale
+            acc = tl.dot(ds, k, acc, input_precision="ieee")
+
+        tl.store(DQ + offs_m[:, None] * stride_dqm + offs_d[None, :], acc,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+    return _attn_bwd_dq
+
+
+def _reassociated_backward_dq_kernel():
+    @triton.jit
+    def _attn_bwd_dq(
+        K, S, DP, Mp, Lp, Deltap, DQ,
+        stride_kn, stride_sm, stride_dpm, stride_dqm,
+        M, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+
+        m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+        l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+        delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+        # Same safe denominator as where(l == 0, 1, l), with the predicate
+        # inverted and the select arms swapped. Upstream canonicalization is
+        # allowed to choose either spelling.
+        l_safe = tl.where(l_i != 0.0, l_i, 1.0)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            s = tl.load(S + offs_m[:, None] * stride_sm + offs_n[None, :], mask=mask_mn,
+                        other=float("-inf"))
+            dp = tl.load(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], mask=mask_mn,
+                         other=0.0)
+            k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :],
+                        mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            p = tl.exp((-m_i[:, None]) + s) * (1.0 / l_safe[:, None])
+            ds = p * (((-delta[:, None]) + dp) * sm_scale)
+            acc = tl.dot(ds, k, acc, input_precision="ieee")
+
+        tl.store(DQ + offs_m[:, None] * stride_dqm + offs_d[None, :], acc,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+    return _attn_bwd_dq
+
+
+def _add_negated_terms_backward_dq_kernel():
+    @triton.jit
+    def _attn_bwd_dq(
+        K, S, DP, Mp, Lp, Deltap, DQ,
+        stride_kn, stride_sm, stride_dpm, stride_dqm,
+        M, D, sm_scale,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_m = offs_m < M
+        mask_d = offs_d < D
+
+        m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+        l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+        delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+        for start_n in range(0, stride_sm, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < stride_sm
+            mask_mn = mask_m[:, None] & mask_n[None, :]
+            s = tl.load(S + offs_m[:, None] * stride_sm + offs_n[None, :], mask=mask_mn,
+                        other=float("-inf"))
+            dp = tl.load(DP + offs_m[:, None] * stride_dpm + offs_n[None, :], mask=mask_mn,
+                         other=0.0)
+            k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :],
+                        mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            p = tl.exp(s + (0.0 - m_i[:, None])) / l_safe[:, None]
+            ds = p * (dp + (0.0 - delta[:, None])) * sm_scale
+            acc = tl.dot(ds, k, acc, input_precision="ieee")
+
+        tl.store(DQ + offs_m[:, None] * stride_dqm + offs_d[None, :], acc,
+                 mask=mask_m[:, None] & mask_d[None, :])
+
+    return _attn_bwd_dq
+
+
+def _wrong_delta_sign_backward_dkdv_kernel():
+    @triton.jit
+    def _attn_bwd_dkdv(
+        Q, dO, ST, DPT, Mp, Lp, Deltap, DK, DV,
+        stride_qm, stride_dom, stride_stn, stride_dptn,
+        stride_dkn, stride_dvn,
+        M, N, D, sm_scale, accumulate,
+        BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_n = offs_n < N
+        mask_d = offs_d < D
+
+        acc_dk = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        acc_dv = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        for start_m in range(0, M, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            st = tl.load(ST + offs_n[:, None] * stride_stn + offs_m[None, :], mask=mask_nm,
+                         other=float("-inf"))
+            dpt = tl.load(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], mask=mask_nm,
+                          other=0.0)
+            m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+            l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+            delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+            l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+            q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :],
+                        mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :],
+                         mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+            p = tl.exp(st - m_i[None, :]) / l_safe[None, :]
+            ds = p * (dpt + delta[None, :]) * sm_scale
+            acc_dv = tl.dot(p, do, acc_dv, input_precision="ieee")
+            acc_dk = tl.dot(ds, q, acc_dk, input_precision="ieee")
+
+        mask_nd = mask_n[:, None] & mask_d[None, :]
+        if accumulate != 0:
+            prev_k = tl.load(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            prev_v = tl.load(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            acc_dk += prev_k
+            acc_dv += prev_v
+        tl.store(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], acc_dk, mask=mask_nd)
+        tl.store(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], acc_dv, mask=mask_nd)
+
+    return _attn_bwd_dkdv
+
+
+def _reassociated_backward_dkdv_kernel():
+    @triton.jit
+    def _attn_bwd_dkdv(
+        Q, dO, ST, DPT, Mp, Lp, Deltap, DK, DV,
+        stride_qm, stride_dom, stride_stn, stride_dptn,
+        stride_dkn, stride_dvn,
+        M, N, D, sm_scale, accumulate,
+        BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_n = offs_n < N
+        mask_d = offs_d < D
+
+        acc_dk = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        acc_dv = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        for start_m in range(0, M, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            st = tl.load(ST + offs_n[:, None] * stride_stn + offs_m[None, :], mask=mask_nm,
+                         other=float("-inf"))
+            dpt = tl.load(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], mask=mask_nm,
+                          other=0.0)
+            m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+            l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+            delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+            # Same safe denominator as where(l == 0, 1, l), with the
+            # predicate inverted and the select arms swapped.
+            l_safe = tl.where(l_i != 0.0, l_i, 1.0)
+            q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :],
+                        mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :],
+                         mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+            p = tl.exp((-m_i[None, :]) + st) * (1.0 / l_safe[None, :])
+            ds = (p * sm_scale) * ((-delta[None, :]) + dpt)
+            acc_dv = tl.dot(p, do, acc_dv, input_precision="ieee")
+            acc_dk = tl.dot(ds, q, acc_dk, input_precision="ieee")
+
+        mask_nd = mask_n[:, None] & mask_d[None, :]
+        if accumulate != 0:
+            prev_k = tl.load(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            prev_v = tl.load(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            acc_dk += prev_k
+            acc_dv += prev_v
+        tl.store(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], acc_dk, mask=mask_nd)
+        tl.store(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], acc_dv, mask=mask_nd)
+
+    return _attn_bwd_dkdv
+
+
+def _add_negated_terms_backward_dkdv_kernel():
+    @triton.jit
+    def _attn_bwd_dkdv(
+        Q, dO, ST, DPT, Mp, Lp, Deltap, DK, DV,
+        stride_qm, stride_dom, stride_stn, stride_dptn,
+        stride_dkn, stride_dvn,
+        M, N, D, sm_scale, accumulate,
+        BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_n = offs_n < N
+        mask_d = offs_d < D
+
+        acc_dk = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        acc_dv = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        for start_m in range(0, M, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            st = tl.load(ST + offs_n[:, None] * stride_stn + offs_m[None, :], mask=mask_nm,
+                         other=float("-inf"))
+            dpt = tl.load(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], mask=mask_nm,
+                          other=0.0)
+            m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+            l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+            delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+            l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+            q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :],
+                        mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :],
+                         mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+            p = tl.exp(st + (0.0 - m_i[None, :])) / l_safe[None, :]
+            ds = p * (dpt + (0.0 - delta[None, :])) * sm_scale
+            acc_dv = tl.dot(p, do, acc_dv, input_precision="ieee")
+            acc_dk = tl.dot(ds, q, acc_dk, input_precision="ieee")
+
+        mask_nd = mask_n[:, None] & mask_d[None, :]
+        if accumulate != 0:
+            prev_k = tl.load(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            prev_v = tl.load(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            acc_dk += prev_k
+            acc_dv += prev_v
+        tl.store(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], acc_dk, mask=mask_nd)
+        tl.store(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], acc_dv, mask=mask_nd)
+
+    return _attn_bwd_dkdv
+
+
+def _wrong_accumulate_condition_backward_dkdv_kernel():
+    @triton.jit
+    def _attn_bwd_dkdv(
+        Q, dO, ST, DPT, Mp, Lp, Deltap, DK, DV,
+        stride_qm, stride_dom, stride_stn, stride_dptn,
+        stride_dkn, stride_dvn,
+        M, N, D, sm_scale, accumulate,
+        BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_n = offs_n < N
+        mask_d = offs_d < D
+
+        acc_dk = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        acc_dv = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        for start_m in range(0, M, BLOCK_M):
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
+            mask_nm = mask_n[:, None] & mask_m[None, :]
+            st = tl.load(ST + offs_n[:, None] * stride_stn + offs_m[None, :], mask=mask_nm,
+                         other=float("-inf"))
+            dpt = tl.load(DPT + offs_n[:, None] * stride_dptn + offs_m[None, :], mask=mask_nm,
+                          other=0.0)
+            m_i = tl.load(Mp + offs_m, mask=mask_m, other=0.0)
+            l_i = tl.load(Lp + offs_m, mask=mask_m, other=1.0)
+            delta = tl.load(Deltap + offs_m, mask=mask_m, other=0.0)
+            l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+            q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :],
+                        mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            do = tl.load(dO + offs_m[:, None] * stride_dom + offs_d[None, :],
+                         mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+            p = tl.exp(st - m_i[None, :]) / l_safe[None, :]
+            ds = p * (dpt - delta[None, :]) * sm_scale
+            acc_dv = tl.dot(p, do, acc_dv, input_precision="ieee")
+            acc_dk = tl.dot(ds, q, acc_dk, input_precision="ieee")
+
+        mask_nd = mask_n[:, None] & mask_d[None, :]
+        if accumulate == 0:
+            prev_k = tl.load(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            prev_v = tl.load(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], mask=mask_nd,
+                             other=0.0)
+            acc_dk += prev_k
+            acc_dv += prev_v
+        tl.store(DK + offs_n[:, None] * stride_dkn + offs_d[None, :], acc_dk, mask=mask_nd)
+        tl.store(DV + offs_n[:, None] * stride_dvn + offs_d[None, :], acc_dv, mask=mask_nd)
+
+    return _attn_bwd_dkdv
+
+
+def test_backward_pre_matcher_claims_causal_mask_and_inverted_safe_denominator(
+        monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "pre", _causal_backward_pre_kernel())
+    assert "metal.attention_backward_pre computed-tile simdgroup MMA" in result["pre"]
+    q, k, _, _ = result["inputs"]
+    row = torch.arange(q.shape[0])[:, None]
+    key = torch.arange(k.shape[0])[None, :]
+    _assert_backward_variant_matches_reference(result, key <= row)
+
+
+def test_backward_pre_region_preserves_shifted_score_index(monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "pre", _shifted_score_backward_pre_kernel())
+    assert "metal.attention_backward_pre computed-tile simdgroup MMA" in result["pre"]
+    _, k, _, _ = result["inputs"]
+    key = torch.arange(k.shape[0])[None, :]
+    _assert_backward_variant_matches_reference(result, key + 1 < k.shape[0])
+
+
+def test_backward_pre_matcher_does_not_claim_wrong_recurrence(monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "pre", _wrong_recurrence_backward_pre_kernel())
+
+
+def test_backward_dq_region_accepts_reassociated_formula_and_inverted_safe_denominator(
+        monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "dq", _reassociated_backward_dq_kernel())
+    assert "metal.attention_backward_dq computed-tile simdgroup MMA" in result["dq"]
+    q, k, _, _ = result["inputs"]
+    keep = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool)
+    _assert_backward_variant_matches_reference(result, keep)
+
+
+def test_backward_dq_region_accepts_add_of_negated_terms(monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "dq", _add_negated_terms_backward_dq_kernel())
+    assert "metal.attention_backward_dq computed-tile simdgroup MMA" in result["dq"]
+    q, k, _, _ = result["inputs"]
+    keep = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool)
+    _assert_backward_variant_matches_reference(result, keep)
+
+
+def test_backward_dq_matcher_does_not_claim_wrong_delta_sign(monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "dq", _wrong_delta_sign_backward_dq_kernel())
+
+
+def test_backward_dq_matcher_does_not_claim_wrong_delta_coefficient(
+        monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "dq", _wrong_delta_coefficient_backward_dq_kernel())
+
+
+def test_backward_dq_matcher_does_not_claim_shifted_s_address(monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "dq", _shifted_s_address_backward_dq_kernel())
+
+
+def test_backward_dkdv_region_accepts_reassociated_formula_and_inverted_safe_denominator(
+        monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "dkdv", _reassociated_backward_dkdv_kernel())
+    assert "metal.attention_backward_dkdv computed-tile simdgroup MMA" in result["dkdv"]
+    q, k, _, _ = result["inputs"]
+    keep = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool)
+    _assert_backward_variant_matches_reference(result, keep)
+
+
+def test_backward_dkdv_region_accepts_add_of_negated_terms(monkeypatch):
+    result = _compile_softmax_attention_backward(
+        monkeypatch, "dkdv", _add_negated_terms_backward_dkdv_kernel())
+    assert "metal.attention_backward_dkdv computed-tile simdgroup MMA" in result["dkdv"]
+    q, k, _, _ = result["inputs"]
+    keep = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool)
+    _assert_backward_variant_matches_reference(result, keep)
+
+
+def test_backward_dkdv_matcher_does_not_claim_wrong_delta_sign(monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "dkdv", _wrong_delta_sign_backward_dkdv_kernel())
+
+
+def test_backward_dkdv_matcher_does_not_claim_wrong_accumulate_condition(
+        monkeypatch):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_softmax_attention_backward(
+            monkeypatch, "dkdv",
+            _wrong_accumulate_condition_backward_dkdv_kernel())
+
+
 @pytest.mark.parametrize(
-    "M, N, d, force_chunk_rows",
+    "M, N, d, force_chunk_rows, force_scalar",
     [
-        (16, 16, 16, None),
-        (17, 19, 20, None),
-        (32, 48, 32, 16),
-        (64, 256, 128, None),
+        (16, 16, 16, None, False),
+        (17, 19, 20, None, False),
+        (32, 48, 32, 16, False),
+        (64, 256, 128, None, False),
+        (16, 32, 256, None, False),
+        (16, 16, 16, None, True),
     ],
 )
-def test_softmax_attention_backward(M, N, d, force_chunk_rows):
+def test_softmax_attention_backward(M, N, d, force_chunk_rows, force_scalar,
+                                    monkeypatch):
     """The leet-triton backward kernel compiles and matches CPU autograd."""
+    monkeypatch.delenv("TRITON_METAL_ATTN_BWD_SCALAR", raising=False)
+    if force_scalar:
+        monkeypatch.setenv("TRITON_METAL_ATTN_BWD_SCALAR", "1")
+        monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     torch.manual_seed(0xBADC0DE + M + N + d)
     q_cpu = torch.randn(M, d, dtype=torch.float32, requires_grad=True)
     k_cpu = torch.randn(N, d, dtype=torch.float32, requires_grad=True)
@@ -737,8 +1542,35 @@ def test_softmax_attention_backward(M, N, d, force_chunk_rows):
     backward = _load_softmax_attention_backward()
     if force_chunk_rows is not None:
         backward._SCRATCH_ELEMS = force_chunk_rows * backward._pad16(N)
-    backward.solve(Q, K, V, dO, dQ, dK, dV, M, N, d)
+    compiled_pre, compiled_dq, compiled_dkdv = backward.solve(
+        Q, K, V, dO, dQ, dK, dV, M, N, d)
     torch.mps.synchronize()
+
+    for compiled in (compiled_pre, compiled_dq, compiled_dkdv):
+        assert getattr(compiled.metadata, "threads_per_group", None) == 256
+
+    generated_msl = []
+    for compiled in (compiled_pre, compiled_dq, compiled_dkdv):
+        generated_msl.append(_metal_text(compiled))
+    pre_msl, dq_msl, dkdv_msl = generated_msl
+    if force_scalar:
+        for stage, msl in zip(("pre", "dq", "dkdv"), generated_msl):
+            assert f"metal.attention_backward_{stage} scalar fallback" in msl
+            assert "simdgroup_multiply_accumulate" not in msl
+    if d == 128:
+        assert "metal.attention_backward_pre computed-tile simdgroup MMA" in pre_msl
+        assert pre_msl.count("simdgroup_multiply_accumulate") >= 2
+        assert "metal.attention_backward_pre scalar fallback" not in pre_msl
+        assert "metal.attention_backward_dq computed-tile simdgroup MMA" in dq_msl
+        assert "uint _ab_warp = ltid.x >> 5u" in dq_msl
+        assert "simdgroup_multiply_accumulate" in dq_msl
+        assert "metal.attention_backward_dq scalar fallback" not in dq_msl
+        assert "metal.attention_backward_dkdv computed-tile simdgroup MMA" in dkdv_msl
+        assert dkdv_msl.count("simdgroup_multiply_accumulate") >= 2
+        assert "metal.attention_backward_dkdv scalar fallback" not in dkdv_msl
+    if d == 256:
+        assert "metal.attention_backward_dq scalar fallback" in dq_msl
+        assert "simdgroup_multiply_accumulate" not in dq_msl
 
     torch.testing.assert_close(dQ.cpu(), q_cpu.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(dK.cpu(), k_cpu.grad, atol=1e-5, rtol=1e-5)

@@ -80,11 +80,15 @@ def _visit_neighbor(
     claimed = candidate & (old_value == 0)
     claimed_int = claimed.to(tl.int32)
 
-    output_pos = tl.atomic_add(
-        counters_ptr + tl.zeros_like(claimed_int),
-        claimed_int,
-        mask=claimed,
+    claimed_count = tl.sum(claimed_int, axis=0)
+
+    base_pos = tl.atomic_add(
+        counters_ptr,
+        claimed_count,
     )
+
+    exclusive_prefix = tl.cumsum(claimed_int, axis=0) - claimed_int
+    output_pos = base_pos + exclusive_prefix
 
     tl.store(
         next_frontier_ptr + output_pos,
@@ -93,11 +97,12 @@ def _visit_neighbor(
     )
 
     found = claimed & (neighbor == end_idx)
+    found_count = tl.sum(found.to(tl.int32), axis=0)
+    found_flag = (found_count > 0).to(tl.int32)
 
     tl.atomic_or(
-        counters_ptr + 1 + tl.zeros_like(claimed_int),
-        found.to(tl.int32),
-        mask=found,
+        counters_ptr + 1,
+        found_flag,
     )
 
 

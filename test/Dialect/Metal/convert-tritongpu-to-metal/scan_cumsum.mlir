@@ -93,6 +93,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %o_0, %cs : tensor<1024x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // BFS frontier compaction shape: the scan input is computed from the OLD
+  // value returned by a tensor atomic exchange. Replaying that cone would emit
+  // a second atomic exchange; BLOCK==tpb lets the lowering use the already
+  // converted per-lane scalar instead.
+  tt.func public @k_atomic_old_value_i32_cumsum(%visited: !tt.ptr<i32>, %out: !tt.ptr<i32>, %n: i32) attributes {noinline = false} {
+    %off = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %one = arith.constant dense<1> : tensor<128xi32, #blocked>
+    %zero = arith.constant dense<0> : tensor<128xi32, #blocked>
+    %n_s = tt.splat %n : i32 -> tensor<128xi32, #blocked>
+    %mask = arith.cmpi slt, %off, %n_s : tensor<128xi32, #blocked>
+    %base = tt.splat %visited : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %addr = tt.addptr %base, %off : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    %old = tt.atomic_rmw exch, acq_rel, gpu, %addr, %one, %mask : (tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>, tensor<128xi1, #blocked>) -> tensor<128xi32, #blocked>
+    %claimed = arith.cmpi eq, %old, %zero : tensor<128xi32, #blocked>
+    %claimed_i32 = arith.extui %claimed : tensor<128xi1, #blocked> to tensor<128xi32, #blocked>
+    %cs = "tt.scan"(%claimed_i32) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: i32, %b: i32):
+      %s = arith.addi %a, %b : i32
+      tt.scan.return %s : i32
+    }) : (tensor<128xi32, #blocked>) -> tensor<128xi32, #blocked>
+    %dst = tt.splat %out : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %dst_addr = tt.addptr %dst, %off : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %dst_addr, %cs, %mask : tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
 } loc(#loc)
 #loc1 = loc("/tmp/dump_scan_ttgir.py":10:9)
 #loc2 = loc("/tmp/dump_scan_ttgir.py":7:9)
@@ -139,6 +165,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // CHECK-LABEL: metal.kernel k_reverse
 // CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 1024 : i64, reverse, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel k_atomic_old_value_i32_cumsum
+// CHECK-COUNT-1: metal.atomic_rmw Xchg
+// CHECK: metal.threadgroup_alloca : !metal.memref<128 x ui32>
+// CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 128 : i64, tpb = 128 : i64}
 // CHECK-NOT: tt.scan
 
 // -----

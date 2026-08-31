@@ -615,6 +615,25 @@ findRank2Axis1ReduceOutTile(mlir::triton::ReduceOp op) {
       consider(store.getValue().getType());
       continue;
     }
+    // A reduce feeding a loop-carried accumulator commonly reaches the final
+    // store through `arith.addf -> scf.yield -> scf.for result` (raw 1D conv).
+    // `scf.yield` has no results of its own, so the generic result walk below
+    // would stop before seeing the blocked rank-1 output tile. Bridge the
+    // yielded operand position to the parent loop result explicitly.
+    if (auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(u)) {
+      auto parentFor = mlir::dyn_cast_or_null<mlir::scf::ForOp>(
+          yield->getParentOp());
+      if (!parentFor)
+        continue;
+      for (auto [idx, operand] : llvm::enumerate(yield.getOperands())) {
+        if (idx >= parentFor.getNumResults())
+          break;
+        consider(parentFor.getResult(idx).getType());
+        for (auto *next : parentFor.getResult(idx).getUsers())
+          worklist.push_back(next);
+      }
+      continue;
+    }
     for (auto res : u->getResults()) {
       consider(res.getType());
       for (auto *next : res.getUsers())
@@ -7289,6 +7308,9 @@ static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
     }
   }
   if (!mlir::isa<mlir::RankedTensorType>(v.getType())) {
+    if (!v.getDefiningOp())
+      if (mlir::Value remapped = rewriter.getRemappedValue(v))
+        return remapped;
     // Most scalar leaves (kernel arguments and already-lowered values) can be
     // reused directly. Scalar arithmetic from the original
     // tensor cone is different: the rank-2 fill may be hoisted ahead of the
@@ -8167,6 +8189,7 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
                                      mlir::Value rowBase, mlir::Value nVal,
                                      mlir::ConversionPatternRewriter &rewriter,
                                      mlir::Location loc, int depth);
+static bool rank2AddPtrChainSupported(mlir::Value ptrVal, int depth);
 static bool rank2ConeSupported(mlir::Value v, int depth);
 
 //===----------------------------------------------------------------------===//
@@ -8729,6 +8752,35 @@ static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
     return load;
   for (mlir::Value operand : def->getOperands())
     if (auto l = findFirstLoadInCone(operand, depth + 1))
+      return l;
+  return nullptr;
+}
+
+// Same traversal as `findFirstLoadInCone`, but prefer the load that actually
+// has the rank-2 geometry of the reduce tile.  Raw conv's source cone is
+// `broadcast(expand_dims(rank1_kernel_load)) * rank2_input_load`; choosing the
+// rank-1 kernel load as the representative makes the outer rank-2 address
+// validation reject a cone that the evaluator can otherwise handle correctly.
+static mlir::triton::LoadOp findFirstRank2LoadInCone(mlir::Value v,
+                                                     int depth) {
+  if (depth > 24)
+    return nullptr;
+  if (g_stagedLeaves && g_stagedLeaves->count(v))
+    return nullptr;
+  if (g_tileBuffers && g_tileBuffers->count(v))
+    return nullptr;
+  if (g_reduceRowBufs && g_reduceRowBufs->count(v))
+    return nullptr;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return nullptr;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
+    if (ty && ty.getRank() == 2)
+      return load;
+  }
+  for (mlir::Value operand : def->getOperands())
+    if (auto l = findFirstRank2LoadInCone(operand, depth + 1))
       return l;
   return nullptr;
 }
@@ -9925,7 +9977,7 @@ struct ScanLowering
   const ScanBufPool *bufPool;
 
   mlir::LogicalResult
-  matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor /*adaptor*/,
+  matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     if (isCanonicalSegmentedSumScan(op))
@@ -9994,7 +10046,13 @@ struct ScanLowering
     // elements across threads. So spt=1 and spt>1 (e.g. V=1024 → spt=4) both work.
 
     mlir::Value scanInput = op.getSrcs().front();
-    if (!rank1ConeSupported(scanInput, 0))
+    mlir::Value directScalarInput = adaptor.getSrcs().front();
+    const bool canUseDirectScalarInput =
+        BLOCK == tpb &&
+        directScalarInput &&
+        !mlir::isa<mlir::RankedTensorType>(directScalarInput.getType()) &&
+        !underDivergentControlFlow(op);
+    if (!canUseDirectScalarInput && !rank1ConeSupported(scanInput, 0))
       return rewriter.notifyMatchFailure(op, "scan: input cone unsupported");
 
     auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
@@ -10096,9 +10154,12 @@ struct ScanLowering
                                                 cZeroI.getResult())
                       .getResult();
       }
-      mlir::Value val = evalRank1ValueAt(scanInput, evalPos, rewriter, loc, 0);
-      if (!val)
-        return rewriter.notifyMatchFailure(op, "scan: input eval failed");
+      mlir::Value val = directScalarInput;
+      if (!canUseDirectScalarInput) {
+        val = evalRank1ValueAt(scanInput, evalPos, rewriter, loc, 0);
+        if (!val)
+          return rewriter.notifyMatchFailure(op, "scan: input eval failed");
+      }
       if (padded) {
         // Identity of THIS scan's monoid, in the cone's own type; `val` is
         // still signless here (the bridge to the ui32 staging type happens just
@@ -12391,7 +12452,9 @@ struct ReduceLowering
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed-cone src has an unsupported producer "
                 "(Wall 17 Increment 1: load/arith/math/splat only)");
-      reprLoad = findFirstLoadInCone(reduceSrc, 0);
+      reprLoad = findFirstRank2LoadInCone(reduceSrc, 0);
+      if (!reprLoad)
+        reprLoad = findFirstLoadInCone(reduceSrc, 0);
       if (!reprLoad)
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed src has no device load");
@@ -12498,8 +12561,14 @@ struct ReduceLowering
     // it to the replacement loop. Treat any loop with scalar/tensor state as
     // iteration-varying conservatively. Recomputing a loop-invariant tile is
     // still correct; hoisting a genuinely varying tile is not.
+    bool enclosedByStateLoop = false;
+    for (mlir::Operation *parent = op->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(parent))
+        enclosedByStateLoop |= loop.getNumRegionIterArgs() > 0;
     const bool loopCarriesState =
-        tileLoop && tileLoop.getNumRegionIterArgs() > 0;
+        (tileLoop && tileLoop.getNumRegionIterArgs() > 0) ||
+        enclosedByStateLoop;
     // Structural SCF conversion can fold a loop-varying scalar base into the
     // load's tensor offset. In that form the scalar-offset walker below sees
     // nothing and its historical `tgid*tpb*N` fallback drops both the trip and
@@ -17787,7 +17856,8 @@ static bool valueConeContains(mlir::Value root, mlir::Value needle,
 }
 
 static MaskExtents extractMaskExtents(mlir::Value mask,
-                                      bool allowDenseSplatBounds = false) {
+                                      bool allowDenseSplatBounds = false,
+                                      bool requireBothMatrixAxes = true) {
   MaskExtents empty;
   if (!mask) return empty;
   // Collect every comparison leaf through broadcast/expand/conjunction
@@ -17813,6 +17883,10 @@ static MaskExtents extractMaskExtents(mlir::Value mask,
     }
     if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
       collectComparisons(ed.getSrc(), depth + 1);
+      return;
+    }
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def)) {
+      collectComparisons(cvt.getSrc(), depth + 1);
       return;
     }
     if (auto splat = mlir::dyn_cast<mlir::triton::SplatOp>(def)) {
@@ -17864,6 +17938,10 @@ static MaskExtents extractMaskExtents(mlir::Value mask,
         v = bc.getSrc();
         continue;
       }
+      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def)) {
+        v = cvt.getSrc();
+        continue;
+      }
       if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp>(def)) {
         // Walk into either operand. Triton emits `addi(splat(pid_m*8),
         // make_range)`; prefer the operand that reaches an expand_dims.
@@ -17871,7 +17949,8 @@ static MaskExtents extractMaskExtents(mlir::Value mask,
           v = operand;
           auto inner = v.getDefiningOp();
           if (inner && mlir::isa<mlir::triton::ExpandDimsOp,
-                                  mlir::triton::BroadcastOp>(inner))
+                                  mlir::triton::BroadcastOp,
+                                  mlir::triton::gpu::ConvertLayoutOp>(inner))
             break;
         }
         continue;
@@ -17888,6 +17967,11 @@ static MaskExtents extractMaskExtents(mlir::Value mask,
       }
       if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
         v = ed.getSrc();
+        continue;
+      }
+      if (auto cvt =
+              v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+        v = cvt.getSrc();
         continue;
       }
       break;
@@ -17922,7 +18006,9 @@ static MaskExtents extractMaskExtents(mlir::Value mask,
       r.nIndex = index;
     }
   }
-  return (r.mExtent && r.nExtent) ? r : empty;
+  if (requireBothMatrixAxes)
+    return (r.mExtent && r.nExtent) ? r : empty;
+  return (r.mExtent || r.nExtent || r.batchExtent) ? r : empty;
 }
 
 // Helper: walk addptr/splat/broadcast/expand_dims back to the kernel-arg ptr.
@@ -18073,7 +18159,10 @@ factorWarps(int numWarps, int mTiles, int nTiles) {
 
 static bool isNumericZero(mlir::Value value);
 static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
-                                              mlir::scf::ForOp loop);
+                                              mlir::scf::ForOp loop,
+                                              int64_t bk = -1);
+static mlir::Value normalizeRuntimeKLoopUpper(mlir::scf::ForOp loop,
+                                               int64_t bk);
 static mlir::Value emitStagedLoad(mlir::OpBuilder &b, mlir::Location loc,
                                   MetalSimdgroupMatrixType matTy,
                                   mlir::Value buf, mlir::Value originRow,
@@ -18646,19 +18735,123 @@ static bool isNumericZero(mlir::Value value) {
   return false;
 }
 
+static std::optional<int64_t> getScalarIntegerConstant(mlir::Value value) {
+  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+    return integer.getInt();
+  return std::nullopt;
+}
+
+static mlir::Value matchCeilDivByConstant(mlir::Value value,
+                                           int64_t divisor) {
+  if (divisor <= 0)
+    return {};
+  auto div = value.getDefiningOp<mlir::arith::DivSIOp>();
+  if (!div)
+    return {};
+  auto rhs = getScalarIntegerConstant(div.getRhs());
+  if (!rhs || *rhs != divisor)
+    return {};
+  auto add = div.getLhs().getDefiningOp<mlir::arith::AddIOp>();
+  if (!add)
+    return {};
+  auto lhsCst = getScalarIntegerConstant(add.getLhs());
+  if (lhsCst && *lhsCst == divisor - 1)
+    return add.getRhs();
+  auto rhsCst = getScalarIntegerConstant(add.getRhs());
+  if (rhsCst && *rhsCst == divisor - 1)
+    return add.getLhs();
+  return {};
+}
+
+static bool isValueTimesConstant(mlir::Value value, mlir::Value factor,
+                                 int64_t constant) {
+  if (constant == 1)
+    return value == factor;
+  auto mul = value.getDefiningOp<mlir::arith::MulIOp>();
+  if (!mul)
+    return false;
+  auto lhsCst = getScalarIntegerConstant(mul.getLhs());
+  if (lhsCst && *lhsCst == constant && mul.getRhs() == factor)
+    return true;
+  auto rhsCst = getScalarIntegerConstant(mul.getRhs());
+  return rhsCst && *rhsCst == constant && mul.getLhs() == factor;
+}
+
+static mlir::Value findAxisStride(mlir::Value ptr, int axis);
+
+static std::optional<int64_t>
+extractConstantAddPtrBump(mlir::triton::AddPtrOp addptr) {
+  auto offset = addptr.getOffset();
+  if (auto cst = offset.getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto dense =
+            mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue()))
+      if (dense.isSplat())
+        return dense.getSplatValue<mlir::APInt>().getSExtValue();
+  if (auto splat = offset.getDefiningOp<mlir::triton::SplatOp>())
+    if (auto cst = splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+        return ia.getInt();
+  return std::nullopt;
+}
+
+// Prove that a loop-carried pointer advances exactly one K tile. Unit-stride
+// operands use a dense/splat BK constant; strided operands use
+// `splat(BK * physical_k_stride)`. Reject every other symbolic expression so
+// erasing the source loop cannot silently change which B tile is loaded.
+static bool addPtrBumpMatchesKTile(mlir::triton::AddPtrOp addptr,
+                                   mlir::Value initPtr, int kAxis,
+                                   int64_t bk) {
+  if (auto constant = extractConstantAddPtrBump(addptr))
+    return *constant == bk;
+  mlir::Value offset = addptr.getOffset();
+  if (auto splat = offset.getDefiningOp<mlir::triton::SplatOp>())
+    offset = splat.getSrc();
+  mlir::Value stride = findAxisStride(initPtr, kAxis);
+  return stride && isValueTimesConstant(offset, stride, bk);
+}
+
+static mlir::Value normalizeRuntimeKLoopUpper(mlir::scf::ForOp loop,
+                                               int64_t bk) {
+  if (bk <= 0)
+    return {};
+  auto lower = getScalarIntegerConstant(loop.getLowerBound());
+  auto step = getScalarIntegerConstant(loop.getStep());
+  if (!lower || *lower != 0 || !step || *step <= 0)
+    return {};
+  if (*step == bk)
+    return loop.getUpperBound();
+  if (*step == 1)
+    return matchCeilDivByConstant(loop.getUpperBound(), bk);
+  return {};
+}
+
 // The pointer-advance canonical loop expresses its K-tail predicate in local
 // tile coordinates: `rk < K - old_iv`.  The replacement loop uses the fresh
 // induction variable as the staged-load origin, so its extent must be the
 // global K bound.  Accept only the exact canonical forms; widening equivalent
 // arithmetic here would make the zero-fill proof depend on cross-op algebra.
 static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
-                                               mlir::scf::ForOp loop) {
-  if (extent == loop.getUpperBound())
+                                               mlir::scf::ForOp loop,
+                                               int64_t bk) {
+  if (!extent)
+    return {};
+  mlir::Value elementUpper =
+      bk > 0 ? normalizeRuntimeKLoopUpper(loop, bk) : loop.getUpperBound();
+  if (!elementUpper)
+    return {};
+  if (extent == elementUpper)
     return extent;
   auto sub = extent.getDefiningOp<mlir::arith::SubIOp>();
-  if (sub && sub.getLhs() == loop.getUpperBound() &&
-      sub.getRhs() == loop.getInductionVar())
-    return loop.getUpperBound();
+  if (sub && sub.getLhs() == elementUpper) {
+    if (sub.getRhs() == loop.getInductionVar())
+      return elementUpper;
+    if (bk > 0 && isValueTimesConstant(sub.getRhs(), loop.getInductionVar(),
+                                       bk))
+      return elementUpper;
+  }
   return {};
 }
 
@@ -18706,30 +18899,14 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
   } else if (dot.getB() != loadB.getResult()) {
     return mlir::failure();
   }
-  auto analyzeLoadMask =
-      [&](mlir::triton::LoadOp load, bool kAxisIsRow)
-          -> std::optional<MaskExtents> {
-    MaskExtents ext;
-    if (!load.getMask())
-      return ext;
-    if (!load.getOther() || !isNumericZero(load.getOther()))
-      return std::nullopt;
-    ext = extractMaskExtents(load.getMask(), /*allowDenseSplatBounds=*/true);
-    if (!ext.mExtent || !ext.nExtent)
-      return std::nullopt;
-    mlir::Value &kExtent = kAxisIsRow ? ext.mExtent : ext.nExtent;
-    kExtent = normalizeCanonicalKExtent(kExtent, forOp);
-    if (!kExtent)
-      return std::nullopt;
-    return ext;
-  };
-  auto aLoadExtOpt = analyzeLoadMask(loadA, /*kAxisIsRow=*/false);
-  auto bLoadExtOpt = analyzeLoadMask(loadB, /*kAxisIsRow=*/!bTransposed);
-  if (!aLoadExtOpt || !bLoadExtOpt)
-    return mlir::failure();
-  MaskExtents aLoadExt = *aLoadExtOpt;
-  MaskExtents bLoadExt = *bLoadExtOpt;
 
+  auto bkOpt = extractConstantAddPtrBump(addptrA);
+  if (!bkOpt || *bkOpt % 8 != 0)
+    return mlir::failure();
+  int64_t BK = *bkOpt;
+  mlir::Value loopElementUpper = normalizeRuntimeKLoopUpper(forOp, BK);
+  if (!loopElementUpper)
+    return mlir::failure();
   auto iterArgs = forOp.getRegionIterArgs();
   int accIdx = -1, aIdx = -1, bIdx = -1;
   for (int i = 0; i < 3; ++i) {
@@ -18744,6 +18921,9 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
   if (yieldOp.getOperand(bIdx) != addptrB.getResult()) return mlir::failure();
   if (addptrA.getPtr() != iterArgs[aIdx]) return mlir::failure();
   if (addptrB.getPtr() != iterArgs[bIdx]) return mlir::failure();
+  if (!addPtrBumpMatchesKTile(addptrB, forOp.getInits()[bIdx],
+                              /*kAxis=*/bTransposed ? 1 : 0, BK))
+    return mlir::failure();
 
   auto getConstInt = [](mlir::Value v) -> std::optional<int64_t> {
     auto c = v.getDefiningOp<mlir::arith::ConstantOp>();
@@ -18758,23 +18938,6 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
   auto st = getConstInt(forOp.getStep());
   if (!lo || *lo != 0 || !st || *st <= 0) return mlir::failure();
   if (getConstInt(forOp.getUpperBound())) return mlir::failure();  // static → other path
-
-  // Require the element-offset loop form (step == BK), so the runtime upper
-  // bound is the total K in elements and the fresh step-8 loop iterates [0,K).
-  auto extractBK = [](mlir::triton::AddPtrOp ap) -> std::optional<int64_t> {
-    auto offset = ap.getOffset();
-    if (auto cst = offset.getDefiningOp<mlir::arith::ConstantOp>())
-      if (auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue()))
-        if (dense.isSplat())
-          return dense.getSplatValue<mlir::APInt>().getSExtValue();
-    if (auto splat = offset.getDefiningOp<mlir::triton::SplatOp>())
-      if (auto cst = splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>())
-        if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
-          return ia.getInt();
-    return std::nullopt;
-  };
-  auto bkOpt = extractBK(addptrA);
-  if (!bkOpt || *bkOpt != *st || *bkOpt % 8 != 0) return mlir::failure();
 
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   if (!resTy) return mlir::failure();
@@ -18814,6 +18977,35 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
       return mlir::failure();
   }
 
+  auto analyzeLoadMask =
+      [&](mlir::triton::LoadOp load, bool kAxisIsRow)
+          -> std::optional<MaskExtents> {
+    MaskExtents ext;
+    if (!load.getMask())
+      return ext;
+    if (!load.getOther() || !isNumericZero(load.getOther()))
+      return std::nullopt;
+    ext = extractMaskExtents(load.getMask(), /*allowDenseSplatBounds=*/true,
+                             /*requireBothMatrixAxes=*/false);
+    mlir::Value &kExtent = kAxisIsRow ? ext.mExtent : ext.nExtent;
+    kExtent = normalizeCanonicalKExtent(kExtent, forOp, BK);
+    if (!kExtent)
+      return std::nullopt;
+    if (!ext.mExtent)
+      ext.mExtent = maskExtents.mExtent;
+    if (!ext.nExtent)
+      ext.nExtent = maskExtents.nExtent;
+    if (!ext.mExtent || !ext.nExtent)
+      return std::nullopt;
+    return ext;
+  };
+  auto aLoadExtOpt = analyzeLoadMask(loadA, /*kAxisIsRow=*/false);
+  auto bLoadExtOpt = analyzeLoadMask(loadB, /*kAxisIsRow=*/!bTransposed);
+  if (!aLoadExtOpt || !bLoadExtOpt)
+    return mlir::failure();
+  MaskExtents aLoadExt = *aLoadExtOpt;
+  MaskExtents bLoadExt = *bLoadExtOpt;
+
   mlir::Value aPtrsInit = forOp.getInits()[aIdx];
   mlir::Value bPtrsInit = forOp.getInits()[bIdx];
   if (!aPtrsInit.getDefiningOp<mlir::triton::AddPtrOp>() ||
@@ -18822,10 +19014,20 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
   auto maskMatchesInit = [](mlir::triton::LoadOp load,
                             const MaskExtents &extents,
                             mlir::Value init) {
-    return !load.getMask() ||
-           (extents.mIndex && extents.nIndex &&
-            valueConeContains(init, extents.mIndex) &&
-            valueConeContains(init, extents.nIndex));
+    if (!load.getMask())
+      return true;
+    bool checkedAnyAxis = false;
+    if (extents.mIndex) {
+      if (!valueConeContains(init, extents.mIndex))
+        return false;
+      checkedAnyAxis = true;
+    }
+    if (extents.nIndex) {
+      if (!valueConeContains(init, extents.nIndex))
+        return false;
+      checkedAnyAxis = true;
+    }
+    return checkedAnyAxis;
   };
   if (!maskMatchesInit(loadA, aLoadExt, aPtrsInit) ||
       !maskMatchesInit(loadB, bLoadExt, bPtrsInit))
@@ -18857,6 +19059,10 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
   mlir::Value bBaseCol =
       findOriginScalarInPtrChain(bPtrsInit, /*targetAxis=*/bTransposed ? 0 : 1);
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
+  if (!aBaseRow && !aLoadExt.mIndex)
+    aBaseRow = cOrig.row;
+  if (!bBaseCol && !bTransposed && !bLoadExt.nIndex)
+    bBaseCol = cOrig.col;
 
   bool mExtentIsLocal = false;
   bool nExtentIsLocal = false;
@@ -18995,7 +19201,7 @@ static mlir::LogicalResult tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) 
                                             builder.getI32IntegerAttr(0));
   auto c8 = mlir::arith::ConstantOp::create(builder, loc,
                                             builder.getI32IntegerAttr(8));
-  mlir::Value ub = forOp.getUpperBound();  // runtime total K (i32)
+  mlir::Value ub = loopElementUpper;  // runtime total K (i32)
 
   auto loop = mlir::scf::ForOp::create(
       builder, loc, c0.getResult(), ub, c8.getResult(),
@@ -20341,14 +20547,67 @@ struct SdPtrParts {
   mlir::Value rowContrib;
   mlir::Value colContrib;
   mlir::Value rootArg;
+  int64_t literalBaseOffset = 0;
   llvm::SmallVector<mlir::Value, 2> baseOffsets;
 };
+
+static std::optional<int64_t> sdDenseSplatIntConstant(mlir::Value v) {
+  auto c = v ? v.getDefiningOp<mlir::arith::ConstantOp>()
+             : mlir::arith::ConstantOp();
+  if (!c)
+    return std::nullopt;
+  if (auto d = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue()))
+    if (d.isSplat())
+      return d.getSplatValue<mlir::APInt>().getSExtValue();
+  if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()))
+    return i.getValue().getSExtValue();
+  return std::nullopt;
+}
+
+static mlir::Value sdResolveLoopCarriedPtrInit(mlir::Value ptr) {
+  auto blockArg = mlir::dyn_cast_if_present<mlir::BlockArgument>(ptr);
+  if (!blockArg || blockArg.getArgNumber() == 0)
+    return ptr;
+  auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(
+      blockArg.getOwner()->getParentOp());
+  if (!forOp)
+    return ptr;
+  unsigned iterArgIndex = blockArg.getArgNumber() - 1;
+  if (iterArgIndex >= forOp.getInitArgs().size())
+    return ptr;
+  mlir::Value init = forOp.getInitArgs()[iterArgIndex];
+  if (init.getType() != ptr.getType())
+    return ptr;
+  return init;
+}
+
 static SdPtrParts sdSplitPtr(mlir::Value ptr) {
   SdPtrParts p;
   std::function<void(mlir::Value, int)> collectContrib =
       [&](mlir::Value off, int depth) {
     if (!off || depth > 8)
       return;
+    if (sdDenseSplatIntConstant(off))
+      return;
+    if (auto muli = off.getDefiningOp<mlir::arith::MulIOp>()) {
+      mlir::Value scaled;
+      if (sdDenseSplatIntConstant(muli.getLhs()))
+        scaled = muli.getRhs();
+      else if (sdDenseSplatIntConstant(muli.getRhs()))
+        scaled = muli.getLhs();
+      bool mixedScaled = false;
+      if (auto scaledAdd = scaled ? scaled.getDefiningOp<mlir::arith::AddIOp>()
+                                  : mlir::arith::AddIOp()) {
+        auto lhsAxis = sdBatchedMatrixAxis(scaledAdd.getLhs());
+        auto rhsAxis = sdBatchedMatrixAxis(scaledAdd.getRhs());
+        mixedScaled = (lhsAxis && rhsAxis && *lhsAxis != *rhsAxis) ||
+                      !sdBatchedMatrixAxis(scaled);
+      }
+      if (scaled && mixedScaled) {
+        collectContrib(scaled, depth + 1);
+        return;
+      }
+    }
     auto ax = sdBatchedMatrixAxis(off);
     auto addi = off.getDefiningOp<mlir::arith::AddIOp>();
     if (addi) {
@@ -20395,7 +20654,10 @@ static SdPtrParts sdSplitPtr(mlir::Value ptr) {
   };
   for (int depth = 0; depth < 16 && ptr; ++depth) {
     if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
-      collectContrib(addptr.getOffset(), 0);
+      if (auto literal = sdDenseSplatIntConstant(addptr.getOffset()))
+        p.literalBaseOffset += *literal;
+      else
+        collectContrib(addptr.getOffset(), 0);
       ptr = addptr.getPtr();
       continue;
     }
@@ -20414,6 +20676,11 @@ static SdPtrParts sdSplitPtr(mlir::Value ptr) {
         auto addptr = root.getDefiningOp<mlir::triton::AddPtrOp>();
         if (!addptr || mlir::isa<mlir::ShapedType>(addptr.getOffset().getType()))
           break;
+        if (auto literal = sdDenseSplatIntConstant(addptr.getOffset())) {
+          p.literalBaseOffset += *literal;
+          root = addptr.getPtr();
+          continue;
+        }
         p.baseOffsets.push_back(addptr.getOffset());
         root = addptr.getPtr();
       }
@@ -20423,6 +20690,105 @@ static SdPtrParts sdSplitPtr(mlir::Value ptr) {
     break;
   }
   return p;
+}
+
+struct SdAxisStride {
+  mlir::Value dynamic;
+  std::optional<int64_t> constant;
+  int64_t multiplier = 1;
+};
+
+static mlir::Value sdSplatScalarSource(mlir::Value v) {
+  for (int depth = 0; depth < 8 && v; ++depth) {
+    if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
+      return splat.getSrc();
+    if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      v = bc.getSrc();
+      continue;
+    }
+    if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      v = ed.getSrc();
+      continue;
+    }
+    if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      v = cvt.getSrc();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+static std::optional<SdAxisStride>
+sdFindPhysicalAxisStrideInOffset(mlir::Value off, BatchedMatrixAxis target,
+                                 int64_t multiplier = 1, int depth = 0) {
+  if (!off || depth > 10)
+    return std::nullopt;
+  if (auto addi = off.getDefiningOp<mlir::arith::AddIOp>()) {
+    if (auto s = sdFindPhysicalAxisStrideInOffset(addi.getLhs(), target,
+                                                  multiplier, depth + 1))
+      return s;
+    if (auto s = sdFindPhysicalAxisStrideInOffset(addi.getRhs(), target,
+                                                  multiplier, depth + 1))
+      return s;
+    if (sdBatchedMatrixAxis(off) == target)
+      return SdAxisStride{{}, multiplier, 1};
+    return std::nullopt;
+  }
+  if (auto muli = off.getDefiningOp<mlir::arith::MulIOp>()) {
+    if (auto c = sdDenseSplatIntConstant(muli.getLhs()))
+      if (auto s = sdFindPhysicalAxisStrideInOffset(
+              muli.getRhs(), target, multiplier * *c, depth + 1))
+        return s;
+    if (auto c = sdDenseSplatIntConstant(muli.getRhs()))
+      if (auto s = sdFindPhysicalAxisStrideInOffset(
+              muli.getLhs(), target, multiplier * *c, depth + 1))
+        return s;
+    if (sdBatchedMatrixAxis(off) == target) {
+      if (auto dyn = sdSplatScalarSource(muli.getLhs()))
+        return SdAxisStride{dyn, std::nullopt, multiplier};
+      if (auto dyn = sdSplatScalarSource(muli.getRhs()))
+        return SdAxisStride{dyn, std::nullopt, multiplier};
+      if (auto c = sdConstStride(off))
+        return SdAxisStride{{}, *c * multiplier, 1};
+    }
+    return std::nullopt;
+  }
+  if (auto bc = off.getDefiningOp<mlir::triton::BroadcastOp>())
+    return sdFindPhysicalAxisStrideInOffset(bc.getSrc(), target, multiplier,
+                                            depth + 1);
+  if (auto ed = off.getDefiningOp<mlir::triton::ExpandDimsOp>())
+    return sdFindPhysicalAxisStrideInOffset(ed.getSrc(), target, multiplier,
+                                            depth + 1);
+  if (auto cvt = off.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    return sdFindPhysicalAxisStrideInOffset(cvt.getSrc(), target, multiplier,
+                                            depth + 1);
+  if (sdBatchedMatrixAxis(off) == target)
+    return SdAxisStride{{}, multiplier, 1};
+  return std::nullopt;
+}
+
+static std::optional<SdAxisStride>
+sdFindPhysicalAxisStride(mlir::Value ptr, BatchedMatrixAxis target) {
+  ptr = sdResolveLoopCarriedPtrInit(ptr);
+  for (int depth = 0; depth < 16 && ptr; ++depth) {
+    if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (auto s = sdFindPhysicalAxisStrideInOffset(addptr.getOffset(), target))
+        return s;
+      ptr = sdResolveLoopCarriedPtrInit(addptr.getPtr());
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      ptr = bc.getSrc();
+      continue;
+    }
+    if (auto sp = ptr.getDefiningOp<mlir::triton::SplatOp>()) {
+      ptr = sp.getSrc();
+      continue;
+    }
+    break;
+  }
+  return std::nullopt;
 }
 
 // Forward BFS from `v` to the first `tt.store` reachable through the epilogue
@@ -20619,12 +20985,13 @@ sdMakeAvailableBefore(mlir::Value v, mlir::Operation *insertBefore,
   return clone->getResult(mlir::cast<mlir::OpResult>(v).getResultNumber());
 }
 
-static ScalarDotOp sdEmitScalarDot(
+static ScalarDotOp sdCreateScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
     mlir::Value reductionExtent = {}, bool transposeA = false,
-    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false) {
+    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false,
+    bool inferPhysicalStrides = false) {
   // Strides: A/B leading-dim (row) multiplier. For ordinary contiguous
   // row-major inputs the A row stride equals the (masked) K extent, so it is
   // also the default reduction trip count. The weighted-Gram path supplies a
@@ -20632,8 +20999,14 @@ static ScalarDotOp sdEmitScalarDot(
   // n_features while it reduces over n_samples. Accept both constexpr strides
   // (dense constants) and runtime i32 kernel arguments; LeetGPU-style kernels
   // commonly keep M/N/K dynamic even with a constexpr tile size.
-  SdPtrParts aParts = sdSplitPtr(aLoad.getPtr());
-  SdPtrParts bParts = sdSplitPtr(bLoad.getPtr());
+  mlir::Value aPtr = inferPhysicalStrides
+                         ? sdResolveLoopCarriedPtrInit(aLoad.getPtr())
+                         : aLoad.getPtr();
+  mlir::Value bPtr = inferPhysicalStrides
+                         ? sdResolveLoopCarriedPtrInit(bLoad.getPtr())
+                         : bLoad.getPtr();
+  SdPtrParts aParts = sdSplitPtr(aPtr);
+  SdPtrParts bParts = sdSplitPtr(bPtr);
   int64_t batchTile = resultTensorTy.getRank() == 3
                           ? resultTensorTy.getDimSize(0)
                           : 1;
@@ -20643,13 +21016,13 @@ static ScalarDotOp sdEmitScalarDot(
   if (batchTile > 1 && (!aParts.batchContrib || !bParts.batchContrib))
     return {};
   mlir::Value strideADynamic =
-      findAxisStride(aLoad.getPtr(), /*axis=*/transposeA ? 1 : 0);
+      findAxisStride(aPtr, /*axis=*/transposeA ? 1 : 0);
   // `stride_b` is the multiplier of B's SLOW axis in the load's own pointer
   // arithmetic, i.e. axis 0, transposed or not. What the transpose changes is
   // which logical index that axis carries — N instead of K — and therefore only
   // which side of the multiply it lands on in the emitter, not where the stride
   // is read from.
-  mlir::Value strideBDynamic = findAxisStride(bLoad.getPtr(), /*axis=*/0);
+  mlir::Value strideBDynamic = findAxisStride(bPtr, /*axis=*/0);
   auto strideAOpt = sdConstStride(aParts.rowContrib);
   auto strideBOpt = sdConstStride(bParts.rowContrib);
   // B can be transposed WITHOUT a `tt.trans`, purely in the address: `b + n*K +
@@ -20664,7 +21037,7 @@ static ScalarDotOp sdEmitScalarDot(
   // index once `stride_b` comes from the column side.
   if (!transposeB) {
     mlir::Value strideBColDynamic =
-        findAxisStride(bLoad.getPtr(), /*axis=*/1);
+        findAxisStride(bPtr, /*axis=*/1);
     auto strideBColOpt = sdConstStride(bParts.colContrib);
     // A bare `k[:, None]` row index has no multiply at all, so sdConstStride
     // reports nullopt rather than 1. That is only readable as stride 1 when the
@@ -20681,8 +21054,9 @@ static ScalarDotOp sdEmitScalarDot(
       strideBOpt = strideBColOpt;
     }
   }
-  if ((!strideADynamic && (!strideAOpt || *strideAOpt <= 0)) ||
-      (!strideBDynamic && (!strideBOpt || *strideBOpt <= 0)))
+  if (!inferPhysicalStrides &&
+      ((!strideADynamic && (!strideAOpt || *strideAOpt <= 0)) ||
+       (!strideBDynamic && (!strideBOpt || *strideBOpt <= 0))))
     return {};
   auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(aLoad.getType());
   auto bTy = mlir::dyn_cast<mlir::RankedTensorType>(bLoad.getType());
@@ -20727,11 +21101,23 @@ static ScalarDotOp sdEmitScalarDot(
         .getResult(0);
   };
   auto emitBaseOffset = [&](const SdPtrParts &parts) -> mlir::Value {
-    if (parts.baseOffsets.empty()) return emitConstUi32(0);
-    mlir::Value total = parts.baseOffsets.front();
-    for (mlir::Value offset : llvm::drop_begin(parts.baseOffsets))
+    mlir::Value total;
+    if (parts.literalBaseOffset != 0)
+      total = mlir::arith::ConstantOp::create(
+                  builder, loc,
+                  builder.getI32IntegerAttr(
+                      static_cast<int32_t>(parts.literalBaseOffset)))
+                  .getResult();
+    for (mlir::Value offset : parts.baseOffsets) {
+      if (!total) {
+        total = offset;
+        continue;
+      }
       total = mlir::arith::AddIOp::create(builder, loc, total, offset)
                   .getResult();
+    }
+    if (!total)
+      return emitConstUi32(0);
     return toUi32(total);
   };
   bool bytePayloads = scaleInfo && scaleInfo->payloadKind !=
@@ -20776,8 +21162,60 @@ static ScalarDotOp sdEmitScalarDot(
     }
     return emitConstUi32(*constant);
   };
-  mlir::Value strideA = emitStride(strideADynamic, strideAOpt);
-  mlir::Value strideB = emitStride(strideBDynamic, strideBOpt);
+  auto emitAxisStride = [&](std::optional<SdAxisStride> physical,
+                            mlir::Value dynamic,
+                            std::optional<int64_t> constant,
+                            int64_t defaultConstant) -> mlir::Value {
+    if (physical) {
+      dynamic = physical->dynamic;
+      constant = physical->constant;
+      if (dynamic && physical->multiplier != 1) {
+        auto scale = mlir::arith::ConstantOp::create(
+            builder, loc,
+            builder.getIntegerAttr(dynamic.getType(), physical->multiplier));
+        dynamic = mlir::arith::MulIOp::create(builder, loc, dynamic,
+                                             scale.getResult())
+                      .getResult();
+      }
+    }
+    if (!dynamic && !constant)
+      constant = defaultConstant;
+    return emitStride(dynamic, constant);
+  };
+  std::optional<SdAxisStride> aPhysicalRowStride;
+  std::optional<SdAxisStride> aPhysicalColStride;
+  std::optional<SdAxisStride> bPhysicalRowStride;
+  std::optional<SdAxisStride> bPhysicalColStride;
+  if (inferPhysicalStrides) {
+    aPhysicalRowStride = sdFindPhysicalAxisStride(
+        aPtr, transposeA ? BatchedMatrixAxis::Col : BatchedMatrixAxis::Row);
+    aPhysicalColStride = sdFindPhysicalAxisStride(
+        aPtr, transposeA ? BatchedMatrixAxis::Row : BatchedMatrixAxis::Col);
+    bPhysicalRowStride = sdFindPhysicalAxisStride(
+        bPtr, transposeB ? BatchedMatrixAxis::Col : BatchedMatrixAxis::Row);
+    bPhysicalColStride = sdFindPhysicalAxisStride(
+        bPtr, transposeB ? BatchedMatrixAxis::Row : BatchedMatrixAxis::Col);
+  }
+  auto isUnitPhysicalStride =
+      [](const std::optional<SdAxisStride> &stride) -> bool {
+    return !stride || (!stride->dynamic && stride->constant &&
+                       *stride->constant == 1);
+  };
+  const bool unitInnerStrides =
+      isUnitPhysicalStride(aPhysicalColStride) &&
+      isUnitPhysicalStride(bPhysicalColStride);
+  mlir::Value strideA =
+      emitAxisStride(aPhysicalRowStride, strideADynamic, strideAOpt,
+                     /*defaultConstant=*/1);
+  mlir::Value strideB =
+      emitAxisStride(bPhysicalRowStride, strideBDynamic, strideBOpt,
+                     /*defaultConstant=*/1);
+  mlir::Value innerStrideA =
+      emitAxisStride(aPhysicalColStride, {}, std::nullopt,
+                     /*defaultConstant=*/1);
+  mlir::Value innerStrideB =
+      emitAxisStride(bPhysicalColStride, {}, std::nullopt,
+                     /*defaultConstant=*/1);
   mlir::Value reductionExtentUi32 =
       reductionExtent ? toUi32(reductionExtent) : strideA;
   llvm::SmallVector<mlir::Value, 3> outputIndices;
@@ -20786,7 +21224,11 @@ static ScalarDotOp sdEmitScalarDot(
     mlir::Value outputStrideDynamic =
         findAxisStride(store.getPtr(), /*axis=*/0);
     auto outputStrideOpt = sdConstStride(cParts.rowContrib);
-    if (outputStrideDynamic || (outputStrideOpt && *outputStrideOpt > 0)) {
+    auto outputStridePhysical =
+        sdFindPhysicalAxisStrideInOffset(cParts.rowContrib,
+                                         BatchedMatrixAxis::Row);
+    if (outputStrideDynamic || (outputStrideOpt && *outputStrideOpt > 0) ||
+        outputStridePhysical) {
       // The store's row/col arithmetic may live after `insertBefore` (dot
       // inside an accumulation loop, store after it) — replay it here so the
       // operands dominate. See sdMakeAvailableBefore.
@@ -20798,7 +21240,8 @@ static ScalarDotOp sdEmitScalarDot(
       mlir::Value colContrib =
           sdMakeAvailableBefore(cParts.colContrib, insertBefore, dom, memo);
       mlir::Value outputStride =
-          emitStride(outputStrideDynamic, outputStrideOpt);
+          emitAxisStride(outputStridePhysical, outputStrideDynamic,
+                         outputStrideOpt, /*defaultConstant=*/1);
       mlir::Value availStride =
           sdMakeAvailableBefore(outputStride, insertBefore, dom, memo);
       if (rowContrib && colContrib && availStride)
@@ -20882,8 +21325,8 @@ static ScalarDotOp sdEmitScalarDot(
   auto scalarDot = ScalarDotOp::create(
       builder, loc, resultTensorTy, aBuf, bBuf, aBaseOffset, bBaseOffset,
       aBatchOffset, bBatchOffset, batchOrigin, rowOrigin, colOrigin, strideA,
-      strideB, reductionExtentUi32, cInit, outputIndices, weightBuf,
-      partialExtents, scaleBufs, scaleParams);
+      strideB, innerStrideA, innerStrideB, reductionExtentUi32, cInit,
+      outputIndices, weightBuf, partialExtents, scaleBufs, scaleParams);
   if (scaleInfo) {
     if (scaleInfo->aScaleLoad)
       scalarDot->setAttr("metal.a_scaled", builder.getUnitAttr());
@@ -20944,8 +21387,24 @@ static ScalarDotOp sdEmitScalarDot(
   // the store mask when present, else the full tile bounds). The warp count is
   // recovered in the pattern from the tile's threadsPerBlock.
   if (batchTile == 1 && sdIsZeroInit(cInit) && !weightLoad && !transposeA &&
-      !transposeB && !scaleInfo)
+      !transposeB && !scaleInfo && unitInnerStrides)
     scalarDot->setAttr("metal.simdgroup", builder.getUnitAttr());
+  return scalarDot;
+}
+
+static ScalarDotOp sdEmitScalarDot(
+    mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
+    mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
+    mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
+    mlir::Value reductionExtent = {}, bool transposeA = false,
+    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false) {
+  auto scalarDot =
+      sdCreateScalarDot(insertBefore, aLoad, bLoad, cInit, replaceTarget,
+                        resultTensorTy, weightLoad, reductionExtent,
+                        transposeA, scaleInfo, transposeB,
+                        /*inferPhysicalStrides=*/false);
+  if (!scalarDot)
+    return {};
   replaceTarget.replaceAllUsesWith(scalarDot.getResult());
   return scalarDot;
 }
@@ -21348,6 +21807,215 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
   return mlir::success();
 }
 
+struct SdLinearDotTerms {
+  bool sawAccumulator = false;
+  llvm::DenseMap<mlir::Operation *, int> dotSigns;
+};
+
+static bool sdCollectLinearDotTerms(mlir::Value v, mlir::Value accumulator,
+                                    SdLinearDotTerms &terms, int sign = 1,
+                                    int depth = 0) {
+  if (!v || depth > 8)
+    return false;
+  if (v == accumulator) {
+    terms.sawAccumulator = true;
+    return true;
+  }
+  if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    return sdCollectLinearDotTerms(cvt.getSrc(), accumulator, terms, sign,
+                                   depth + 1);
+  if (auto dot = v.getDefiningOp<mlir::triton::DotOp>()) {
+    terms.dotSigns[dot.getOperation()] += sign;
+    if (!sdIsZeroInit(dot.getC()))
+      return sdCollectLinearDotTerms(dot.getC(), accumulator, terms, sign,
+                                     depth + 1);
+    return true;
+  }
+  if (auto add = v.getDefiningOp<mlir::arith::AddFOp>())
+    return sdCollectLinearDotTerms(add.getLhs(), accumulator, terms, sign,
+                                   depth + 1) &&
+           sdCollectLinearDotTerms(add.getRhs(), accumulator, terms, sign,
+                                   depth + 1);
+  if (auto sub = v.getDefiningOp<mlir::arith::SubFOp>())
+    return sdCollectLinearDotTerms(sub.getLhs(), accumulator, terms, sign,
+                                   depth + 1) &&
+           sdCollectLinearDotTerms(sub.getRhs(), accumulator, terms, -sign,
+                                   depth + 1);
+  return false;
+}
+
+static mlir::LogicalResult
+tryComplexFourDotLoopFallback(mlir::scf::ForOp forOp) {
+  if (forOp.getNumRegionIterArgs() < 2 ||
+      forOp.getNumRegionIterArgs() != forOp.getNumResults())
+    return mlir::failure();
+  llvm::SmallVector<unsigned, 2> accIndices;
+  for (auto [idx, result] : llvm::enumerate(forOp.getResults())) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
+    if (ty && ty.getRank() == 2 && ty.getElementType().isF32())
+      accIndices.push_back(idx);
+  }
+  if (accIndices.size() != 2)
+    return mlir::failure();
+  unsigned realIdx = accIndices[0];
+  unsigned imagIdx = accIndices[1];
+  if (!sdIsZeroInit(forOp.getInitArgs()[realIdx]) ||
+      !sdIsZeroInit(forOp.getInitArgs()[imagIdx]))
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::triton::DotOp, 4> dots;
+  forOp.getBodyRegion().walk([&](mlir::triton::DotOp dot) {
+    dots.push_back(dot);
+  });
+  if (dots.size() != 4)
+    return mlir::failure();
+
+  auto resultTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(forOp.getResult(realIdx).getType());
+  if (!resultTy || resultTy != forOp.getResult(imagIdx).getType() ||
+      !resultTy.getElementType().isF32())
+    return mlir::failure();
+  int64_t matrixM = 0, matrixN = 0;
+  if (!sdGetMatrixShape(resultTy, matrixM, matrixN) || matrixM % 8 != 0 ||
+      matrixN % 8 != 0)
+    return mlir::failure();
+
+  llvm::DenseSet<mlir::Operation *> dotOps;
+  for (auto dot : dots)
+    dotOps.insert(dot.getOperation());
+  for (auto dot : dots) {
+    auto dotTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+    auto cDot = dot.getC().getDefiningOp<mlir::triton::DotOp>();
+    if (dotTy != resultTy ||
+        (!sdIsZeroInit(dot.getC()) &&
+         (!cDot || !dotOps.contains(cDot.getOperation()))))
+      return mlir::failure();
+  }
+
+  auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(
+      forOp.getBody()->getTerminator());
+  if (!yield || yield.getNumOperands() != forOp.getNumResults())
+    return mlir::failure();
+
+  SdLinearDotTerms realTerms, imagTerms;
+  if (!sdCollectLinearDotTerms(yield.getOperand(realIdx),
+                               forOp.getRegionIterArg(realIdx), realTerms) ||
+      !sdCollectLinearDotTerms(yield.getOperand(imagIdx),
+                               forOp.getRegionIterArg(imagIdx), imagTerms) ||
+      !realTerms.sawAccumulator || !imagTerms.sawAccumulator ||
+      realTerms.dotSigns.size() != 2 || imagTerms.dotSigns.size() != 2)
+    return mlir::failure();
+
+  mlir::triton::DotOp rrDot, iiDot;
+  for (auto dot : dots) {
+    auto it = realTerms.dotSigns.find(dot.getOperation());
+    if (it == realTerms.dotSigns.end())
+      continue;
+    if (it->second == 1)
+      rrDot = dot;
+    else if (it->second == -1)
+      iiDot = dot;
+    else
+      return mlir::failure();
+  }
+  if (!rrDot || !iiDot)
+    return mlir::failure();
+
+  auto rrA = sdPeelToLoad(rrDot.getA());
+  auto rrB = sdPeelToLoad(rrDot.getB());
+  auto iiA = sdPeelToLoad(iiDot.getA());
+  auto iiB = sdPeelToLoad(iiDot.getB());
+  if (!rrA || !rrB || !iiA || !iiB || rrA == iiA || rrB == iiB)
+    return mlir::failure();
+
+  mlir::triton::DotOp riDot, irDot;
+  for (auto dot : dots) {
+    auto it = imagTerms.dotSigns.find(dot.getOperation());
+    if (it == imagTerms.dotSigns.end())
+      continue;
+    if (it->second != 1)
+      return mlir::failure();
+    auto aLoad = sdPeelToLoad(dot.getA());
+    auto bLoad = sdPeelToLoad(dot.getB());
+    if (aLoad == rrA && bLoad == iiB)
+      riDot = dot;
+    else if (aLoad == iiA && bLoad == rrB)
+      irDot = dot;
+    else
+      return mlir::failure();
+  }
+  if (!riDot || !irDot)
+    return mlir::failure();
+
+  auto realStore = sdFindStore(forOp.getResult(realIdx));
+  auto imagStore = sdFindStore(forOp.getResult(imagIdx));
+  if (!realStore || !imagStore || realStore == imagStore)
+    return mlir::failure();
+
+  auto ptrIsLoopCarried = [&](mlir::Value ptr) {
+    auto blockArg = mlir::dyn_cast_if_present<mlir::BlockArgument>(ptr);
+    return blockArg && blockArg.getOwner() == forOp.getBody() &&
+           blockArg.getArgNumber() > 0;
+  };
+  const bool hasLoopCarriedPtrs =
+      ptrIsLoopCarried(rrA.getPtr()) || ptrIsLoopCarried(rrB.getPtr()) ||
+      ptrIsLoopCarried(iiA.getPtr()) || ptrIsLoopCarried(iiB.getPtr());
+  mlir::Value reductionExtent;
+  if (!hasLoopCarriedPtrs) {
+    auto lowerCst =
+        forOp.getLowerBound().getDefiningOp<mlir::arith::ConstantOp>();
+    auto lowerAttr =
+        lowerCst ? mlir::dyn_cast<mlir::IntegerAttr>(lowerCst.getValue())
+                 : mlir::IntegerAttr();
+    if (!lowerAttr || !lowerAttr.getValue().isZero())
+      return mlir::failure();
+    reductionExtent = forOp.getUpperBound();
+  }
+  auto rr =
+      sdCreateScalarDot(forOp, rrA, rrB, forOp.getInitArgs()[realIdx],
+                        forOp.getResult(realIdx), resultTy, {},
+                        reductionExtent,
+                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
+                        sdConeCrossesTranspose(rrDot.getB()),
+                        /*inferPhysicalStrides=*/true);
+  auto ii =
+      sdCreateScalarDot(forOp, iiA, iiB, forOp.getInitArgs()[realIdx],
+                        forOp.getResult(realIdx), resultTy, {},
+                        reductionExtent,
+                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
+                        sdConeCrossesTranspose(iiDot.getB()),
+                        /*inferPhysicalStrides=*/true);
+  auto ri =
+      sdCreateScalarDot(forOp, rrA, iiB, forOp.getInitArgs()[imagIdx],
+                        forOp.getResult(imagIdx), resultTy, {},
+                        reductionExtent,
+                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
+                        sdConeCrossesTranspose(riDot.getB()),
+                        /*inferPhysicalStrides=*/true);
+  auto ir =
+      sdCreateScalarDot(forOp, iiA, rrB, forOp.getInitArgs()[imagIdx],
+                        forOp.getResult(imagIdx), resultTy, {},
+                        reductionExtent,
+                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
+                        sdConeCrossesTranspose(irDot.getB()),
+                        /*inferPhysicalStrides=*/true);
+  if (!rr || !ii || !ri || !ir)
+    return mlir::failure();
+
+  mlir::OpBuilder builder(forOp);
+  auto loc = forOp.getLoc();
+  auto real =
+      mlir::arith::SubFOp::create(builder, loc, rr.getResult(), ii.getResult())
+          .getResult();
+  auto imag =
+      mlir::arith::AddFOp::create(builder, loc, ri.getResult(), ir.getResult())
+          .getResult();
+  forOp.getResult(realIdx).replaceAllUsesWith(real);
+  forOp.getResult(imagIdx).replaceAllUsesWith(imag);
+  forOp.erase();
+  return mlir::success();
+}
+
 // Loop variant: a single-dot recompute K-loop (K > TILE, iters > 1) whose
 // accumulator result feeds either a `cvt -> alpha/beta epilogue` or (when
 // `allowStoreConsumer`) a bare `tt.store`. The whole reduction (all iters *
@@ -21596,7 +22264,11 @@ static void preprocessScalarDots(mlir::ModuleOp moduleOp) {
 
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
-  for (auto f : loops) (void)tryScalarDotLoopFallback(f);
+  for (auto f : loops) {
+    if (mlir::succeeded(tryComplexFourDotLoopFallback(f)))
+      continue;
+    (void)tryScalarDotLoopFallback(f);
+  }
 }
 
 // Total correctness fallback (Tier 2), run AFTER the fast SIMD-group matchers
@@ -21946,6 +22618,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
             .getResult();
     mlir::Value strideAI32 = toI32(adaptor.getStrideA());
     mlir::Value strideBI32 = toI32(adaptor.getStrideB());
+    mlir::Value innerStrideAI32 = toI32(adaptor.getAInnerStride());
+    mlir::Value innerStrideBI32 = toI32(adaptor.getBInnerStride());
     mlir::Value reductionExtentI32 =
         toI32(adaptor.getReductionExtent());
     mlir::Value aBaseI32 = toI32(adaptor.getABaseOffset());
@@ -22326,7 +23000,9 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                   b, loc,
                   mlir::arith::MulIOp::create(b, loc, aPhysicalK, strideAI32)
                       .getResult(),
-                  aPhysicalRow)
+                  mlir::arith::MulIOp::create(b, loc, aPhysicalRow,
+                                              innerStrideAI32)
+                      .getResult())
                   .getResult();
         } else {
           aLogicalIdx =
@@ -22334,7 +23010,9 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                   b, loc,
                   mlir::arith::MulIOp::create(b, loc, aPhysicalRow, strideAI32)
                       .getResult(),
-                  aPhysicalK)
+                  mlir::arith::MulIOp::create(b, loc, aPhysicalK,
+                                              innerStrideAI32)
+                      .getResult())
                   .getResult();
         }
         mlir::Value aIdx =
@@ -22354,7 +23032,9 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                   b, loc,
                   mlir::arith::MulIOp::create(b, loc, bPhysicalCol, strideBI32)
                       .getResult(),
-                  bPhysicalK)
+                  mlir::arith::MulIOp::create(b, loc, bPhysicalK,
+                                              innerStrideBI32)
+                      .getResult())
                   .getResult();
         } else {
           bLogicalIdx =
@@ -22362,7 +23042,9 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                   b, loc,
                   mlir::arith::MulIOp::create(b, loc, bPhysicalK, strideBI32)
                       .getResult(),
-                  bPhysicalCol)
+                  mlir::arith::MulIOp::create(b, loc, bPhysicalCol,
+                                              innerStrideBI32)
+                      .getResult())
                   .getResult();
         }
         mlir::Value bIdx =
@@ -24155,6 +24837,143 @@ static mlir::Value cloneConeInto(mlir::Value v, mlir::IRMapping &map,
   return map.lookup(v);
 }
 
+static bool olsMixedLoopBodyOpSupported(mlir::Operation &op) {
+  if (op.hasTrait<mlir::OpTrait::IsTerminator>())
+    return true;
+  if (mlir::isa<mlir::triton::StoreOp, mlir::triton::AtomicRMWOp,
+                mlir::triton::AtomicCASOp>(op))
+    return false;
+  if (mlir::isa<mlir::triton::LoadOp, mlir::triton::DotOp,
+                mlir::triton::ReduceOp>(op))
+    return true;
+  if (op.getNumRegions() != 0)
+    return false;
+  return mlir::isPure(&op);
+}
+
+static bool coneContainsOp(mlir::Value v, mlir::Block *body,
+                           llvm::StringRef opName,
+                           llvm::DenseSet<void *> &seen) {
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || def->getBlock() != body)
+    return false;
+  if (!seen.insert(v.getAsOpaquePointer()).second)
+    return false;
+  if (def->getName().getStringRef() == opName)
+    return true;
+  for (mlir::Value operand : def->getOperands())
+    if (coneContainsOp(operand, body, opName, seen))
+      return true;
+  return false;
+}
+
+static bool coneOnlyUsesAllowedBodyArgs(mlir::Value v, mlir::Block *body,
+                                        mlir::Value iv,
+                                        mlir::Value ownIterArg,
+                                        llvm::DenseSet<void *> &seen) {
+  if (!seen.insert(v.getAsOpaquePointer()).second)
+    return true;
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v))
+    if (arg.getOwner() == body)
+      return v == iv || v == ownIterArg;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || def->getBlock() != body)
+    return true;
+  for (mlir::Value operand : def->getOperands())
+    if (!coneOnlyUsesAllowedBodyArgs(operand, body, iv, ownIterArg, seen))
+      return false;
+  return true;
+}
+
+// OLS' raw Gram kernel carries two independent accumulators in one sample loop:
+//   acc_xtx = dot(transpose_view(X), X)
+//   acc_xty = reduce(transpose_view(X) * y[:, None], axis=1)
+// Split only that side-effect-free mixed loop into two single-result loops.
+// The later Gram fallback can then consume the dot loop, while the reduce loop
+// stays in the ordinary rank-2 reduce envelope.  This is deliberately a
+// preprocessing analysis/rewrite, keeping the individual lowerings local to
+// the op they lower.
+static mlir::LogicalResult
+preprocessIndependentMixedAccumulatorLoops(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  moduleOp.walk([&](mlir::scf::ForOp loop) { loops.push_back(loop); });
+  for (auto forOp : loops) {
+    bool hasDot = false;
+    bool hasReduce = false;
+    forOp.getBodyRegion().walk([&](mlir::Operation *op) {
+      hasDot |= mlir::isa<mlir::triton::DotOp>(op);
+      hasReduce |= mlir::isa<mlir::triton::ReduceOp>(op);
+    });
+    if (!hasDot || !hasReduce)
+      continue;
+
+    auto fail = [&](llvm::StringRef msg) {
+      forOp.emitOpError()
+          << "Metal backend: mixed dot/reduce accumulator loop " << msg;
+      return mlir::failure();
+    };
+
+    if (forOp.getNumResults() != 2)
+      continue;
+    auto yieldOp =
+        mlir::dyn_cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (!yieldOp || yieldOp.getNumOperands() != 2)
+      continue;
+
+    for (mlir::Operation &op : forOp.getBody()->getOperations())
+      if (!olsMixedLoopBodyOpSupported(op))
+        return fail("body must contain only pure ops, tt.load, tt.dot and "
+                    "tt.reduce");
+
+    llvm::SmallVector<bool, 2> resultHasDot(2, false);
+    llvm::SmallVector<bool, 2> resultHasReduce(2, false);
+    for (unsigned i = 0; i < 2; ++i) {
+      llvm::DenseSet<void *> seenArgs;
+      if (!coneOnlyUsesAllowedBodyArgs(yieldOp.getOperand(i), forOp.getBody(),
+                                       forOp.getInductionVar(),
+                                       forOp.getRegionIterArg(i), seenArgs))
+        return fail("yield slice depends on another accumulator");
+      llvm::DenseSet<void *> seenDot;
+      llvm::DenseSet<void *> seenReduce;
+      resultHasDot[i] =
+          coneContainsOp(yieldOp.getOperand(i), forOp.getBody(),
+                         mlir::triton::DotOp::getOperationName(), seenDot);
+      resultHasReduce[i] =
+          coneContainsOp(yieldOp.getOperand(i), forOp.getBody(),
+                         mlir::triton::ReduceOp::getOperationName(),
+                         seenReduce);
+      if (resultHasDot[i] == resultHasReduce[i])
+        return fail("requires one dot accumulator and one reduce accumulator");
+    }
+    if (resultHasDot[0] == resultHasDot[1])
+      return fail("requires independent dot and reduce yield slices");
+
+    mlir::OpBuilder b(forOp);
+    auto loc = forOp.getLoc();
+    llvm::SmallVector<mlir::Value, 2> replacements;
+    for (unsigned i = 0; i < 2; ++i) {
+      auto newFor = mlir::scf::ForOp::create(
+          b, loc, forOp.getLowerBound(), forOp.getUpperBound(),
+          forOp.getStep(), mlir::ValueRange{forOp.getInitArgs()[i]},
+          [&](mlir::OpBuilder &bb, mlir::Location ll, mlir::Value iv,
+              mlir::ValueRange args) {
+            mlir::IRMapping map;
+            map.map(forOp.getInductionVar(), iv);
+            map.map(forOp.getRegionIterArg(i), args[0]);
+            mlir::Value next =
+                cloneConeInto(yieldOp.getOperand(i), map, bb, forOp.getBody());
+            mlir::scf::YieldOp::create(bb, ll, next);
+          });
+      replacements.push_back(newFor.getResult(0));
+    }
+
+    forOp.getResult(0).replaceAllUsesWith(replacements[0]);
+    forOp.getResult(1).replaceAllUsesWith(replacements[1]);
+    forOp.erase();
+  }
+  return mlir::success();
+}
+
 // W: reduce over a LOOP-CARRIED sum accumulator. `sum(scf.for(acc += delta))`
 // (delta independent of acc) is reassociated to a SCALAR-accumulating loop
 // `scf.for(s += sum(delta))` because addf is associative/commutative. This
@@ -25136,6 +25955,8 @@ emitConeScalar(mlir::OpBuilder &b, mlir::Location loc, mlir::Value v,
     out = bin(BOP::addOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::SubFOp>(def)) {
     out = bin(BOP::subOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::NegFOp>(def)) {
+    out = un(UOP::minusOp, rec(op.getOperand()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::DivFOp>(def)) {
     out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def)) {
@@ -26480,8 +27301,11 @@ static mlir::LogicalResult tryFusedAttention(mlir::triton::FuncOp funcOp) {
           // That is how a causal `min((pid+1)*bm, n)` becomes a key range
           // instead of an attribute -- and it is why the bound is never
           // replaced by `n` on the argument that the tail is masked anyway.
-          // (The emitter clamps the range to `[0, n]`, which is what turns a
-          // `cdiv(n, bn)*bn` sweep back into `[0, n)`.)
+          // The emitter only floors a negative start at zero; it deliberately
+          // does not add a generic upper clamp.  An explicit per-phase
+          // `keyBound` below supplies a proven upper min, while the generated
+          // load guards and score-region masks preserve source tail semantics
+          // for a `cdiv(n, bn)*bn` sweep.
           ph.keyEnd = ub;
           ph.keyEndMul = blockCounted ? ph.BN : 1;
         }
@@ -26803,6 +27627,1482 @@ static void runLinearAttentionMatcher(mlir::ModuleOp moduleOp) {
   }
 }
 
+static int64_t tensorDim(mlir::Value v, unsigned dim) {
+  auto ty = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!ty || dim >= static_cast<unsigned>(ty.getRank()))
+    return -1;
+  return ty.getDimSize(dim);
+}
+
+static bool isF32PtrArg(mlir::Value v) {
+  auto ptr = mlir::dyn_cast<mlir::triton::PointerType>(v.getType());
+  return ptr && ptr.getPointeeType().isF32();
+}
+
+static bool attentionBackwardWarpEnvelope(mlir::triton::FuncOp funcOp) {
+  auto module = funcOp->getParentOfType<mlir::ModuleOp>();
+  auto warps = module ? module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps")
+                      : nullptr;
+  auto tpw = module ? module->getAttrOfType<mlir::IntegerAttr>(
+                          "ttg.threads-per-warp")
+                    : nullptr;
+  return warps && tpw && warps.getInt() == 8 && tpw.getInt() == 32;
+}
+
+static bool isRawAttentionBackwardKernel(mlir::triton::FuncOp funcOp,
+                                         llvm::StringRef suffix) {
+  return funcOp.getSymName() == suffix;
+}
+
+static bool dotMentions(mlir::triton::DotOp dot, mlir::Value lhsRoot,
+                        mlir::Value rhsRoot) {
+  return coneMentionsValue(dot.getA(), lhsRoot) &&
+         coneMentionsValue(dot.getB(), rhsRoot);
+}
+
+static bool hasStoreTo(llvm::ArrayRef<mlir::triton::StoreOp> stores,
+                       mlir::Value ptrRoot) {
+  return llvm::any_of(stores, [&](mlir::triton::StoreOp store) {
+    return store.getMask() && coneMentionsValue(store.getPtr(), ptrRoot);
+  });
+}
+
+// The backward ops erase an entire source kernel and re-emit a fixed formula.
+// `coneMentionsValue` is therefore not a sufficient proof: `p * (dp + delta)`
+// and `p * (dp - delta)` mention the same roots but are not interchangeable.
+// Peel only per-element identity plumbing and compare the remaining pure cone
+// structurally, ignoring layout-only differences on splat constants.
+static mlir::Value peelAttentionBackwardShape(mlir::Value value) {
+  while (mlir::Operation *def = value.getDefiningOp()) {
+    if (!mlir::isa<mlir::triton::gpu::ConvertLayoutOp,
+                   mlir::triton::BroadcastOp, mlir::triton::ExpandDimsOp>(def))
+      break;
+    value = def->getOperand(0);
+  }
+  return value;
+}
+
+static bool sameAttentionBackwardCone(mlir::Value lhs, mlir::Value rhs,
+                                      int depth = 0) {
+  if (depth > 24)
+    return false;
+  lhs = peelAttentionBackwardShape(lhs);
+  rhs = peelAttentionBackwardShape(rhs);
+  if (lhs == rhs)
+    return true;
+  mlir::Operation *lhsDef = lhs.getDefiningOp();
+  mlir::Operation *rhsDef = rhs.getDefiningOp();
+  if (!lhsDef || !rhsDef || lhsDef->getName() != rhsDef->getName() ||
+      lhsDef->getNumOperands() != rhsDef->getNumOperands() ||
+      lhsDef->getNumRegions() || rhsDef->getNumRegions())
+    return false;
+  if (auto lhsConst = mlir::dyn_cast<mlir::arith::ConstantOp>(lhsDef)) {
+    auto rhsConst = mlir::cast<mlir::arith::ConstantOp>(rhsDef);
+    auto lhsDense =
+        mlir::dyn_cast<mlir::DenseElementsAttr>(lhsConst.getValue());
+    auto rhsDense =
+        mlir::dyn_cast<mlir::DenseElementsAttr>(rhsConst.getValue());
+    if (lhsDense && rhsDense)
+      return lhsDense.isSplat() && rhsDense.isSplat() &&
+             lhsDense.getSplatValue<mlir::Attribute>() ==
+                 rhsDense.getSplatValue<mlir::Attribute>();
+    return lhsConst.getValue() == rhsConst.getValue();
+  }
+  if (lhsDef->getAttrDictionary() != rhsDef->getAttrDictionary())
+    return false;
+  for (auto [lhsOperand, rhsOperand] :
+       llvm::zip(lhsDef->getOperands(), rhsDef->getOperands()))
+    if (!sameAttentionBackwardCone(lhsOperand, rhsOperand, depth + 1))
+      return false;
+  return true;
+}
+
+static bool attentionBackwardSplatOf(mlir::Value value, mlir::Value scalar) {
+  value = peelAttentionBackwardShape(value);
+  auto splat = value.getDefiningOp<mlir::triton::SplatOp>();
+  return splat && splat.getSrc() == scalar;
+}
+
+static mlir::triton::LoadOp
+attentionBackwardLoadFrom(mlir::Value value, mlir::Value ptrRoot) {
+  value = peelAttentionBackwardShape(value);
+  auto load = value.getDefiningOp<mlir::triton::LoadOp>();
+  if (!load || !coneMentionsValue(load.getPtr(), ptrRoot))
+    return nullptr;
+  return load;
+}
+
+static bool attentionBackwardIsZero(mlir::Value value) {
+  return isSplatFloatConst(peelAttentionBackwardShape(value), 0.0);
+}
+
+static bool attentionBackwardIsOne(mlir::Value value) {
+  return isSplatFloatConst(peelAttentionBackwardShape(value), 1.0);
+}
+
+enum class AttentionBackwardIndex { Row, Key, Feature };
+
+struct AttentionBackwardIndexContext {
+  mlir::scf::ForOp loop;
+  int64_t blockM;
+  int64_t blockN;
+  int64_t blockD;
+  AttentionBackwardIndex loopIndex;
+  AttentionBackwardIndex programIndex;
+
+  int64_t extent(AttentionBackwardIndex index) const {
+    switch (index) {
+    case AttentionBackwardIndex::Row:
+      return blockM;
+    case AttentionBackwardIndex::Key:
+      return blockN;
+    case AttentionBackwardIndex::Feature:
+      return blockD;
+    }
+    llvm_unreachable("unknown attention backward index");
+  }
+};
+
+struct AttentionBackwardAccessDimension {
+  AttentionBackwardIndex index;
+  mlir::Value bound;
+  mlir::Value stride;
+};
+
+static bool attentionBackwardIsIntConst(mlir::Value value, int64_t expected) {
+  value = peelAttentionBackwardShape(value);
+  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!constant)
+    return false;
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  return integer && integer.getInt() == expected;
+}
+
+// Recognize the three logical coordinates used by the fixed backward ops.
+// This deliberately accepts only the canonical leet kernel spelling: a
+// program tile is `pid0 * BLOCK + arange`, a streaming tile is
+// `loop_iv + arange`, and the feature coordinate is a bare arange. In
+// particular, shifted/scaled coordinates are not equivalent and must not be
+// swallowed by whole-kernel replacement.
+static std::optional<AttentionBackwardIndex>
+classifyAttentionBackwardIndex(mlir::Value value,
+                               const AttentionBackwardIndexContext &context) {
+  value = peelAttentionBackwardShape(value);
+  if (auto range = value.getDefiningOp<mlir::triton::MakeRangeOp>()) {
+    if (range.getStart() == 0 &&
+        static_cast<int64_t>(range.getEnd()) == context.blockD)
+      return AttentionBackwardIndex::Feature;
+    return std::nullopt;
+  }
+  auto add = value.getDefiningOp<mlir::arith::AddIOp>();
+  if (!add)
+    return std::nullopt;
+  mlir::Value rangeValue;
+  mlir::Value baseValue;
+  for (unsigned i = 0; i < 2; ++i) {
+    mlir::Value candidate = peelAttentionBackwardShape(add->getOperand(i));
+    if (candidate.getDefiningOp<mlir::triton::MakeRangeOp>()) {
+      rangeValue = candidate;
+      baseValue = add->getOperand(1 - i);
+      break;
+    }
+  }
+  auto range =
+      rangeValue ? rangeValue.getDefiningOp<mlir::triton::MakeRangeOp>()
+                 : nullptr;
+  if (!range || range.getStart() != 0)
+    return std::nullopt;
+  const int64_t length = static_cast<int64_t>(range.getEnd());
+  baseValue = peelAttentionBackwardShape(baseValue);
+  auto baseSplat = baseValue.getDefiningOp<mlir::triton::SplatOp>();
+  if (!baseSplat)
+    return std::nullopt;
+  mlir::Value baseScalar = baseSplat.getSrc();
+  if (length == context.extent(context.loopIndex) &&
+      baseScalar == context.loop->getRegion(0).front().getArgument(0))
+    return context.loopIndex;
+  auto mul = baseScalar.getDefiningOp<mlir::arith::MulIOp>();
+  if (!mul || length != context.extent(context.programIndex))
+    return std::nullopt;
+  for (unsigned i = 0; i < 2; ++i) {
+    auto pid = mul->getOperand(i)
+                   .getDefiningOp<mlir::triton::GetProgramIdOp>();
+    if (pid && pid.getAxisAsInt() == 0 &&
+        attentionBackwardIsIntConst(mul->getOperand(1 - i), length))
+      return context.programIndex;
+  }
+  return std::nullopt;
+}
+
+static bool collectAttentionBackwardMaskBounds(
+    mlir::Value value, const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> expected,
+    llvm::SmallVectorImpl<bool> &matched, int depth = 0) {
+  if (!value || depth > 16)
+    return false;
+  value = peelAttentionBackwardShape(value);
+  if (auto andOp = value.getDefiningOp<mlir::arith::AndIOp>())
+    return collectAttentionBackwardMaskBounds(andOp.getLhs(), context,
+                                              expected, matched, depth + 1) &&
+           collectAttentionBackwardMaskBounds(andOp.getRhs(), context,
+                                              expected, matched, depth + 1);
+  auto cmp = value.getDefiningOp<mlir::arith::CmpIOp>();
+  if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+    return false;
+  auto index = classifyAttentionBackwardIndex(cmp.getLhs(), context);
+  if (!index)
+    return false;
+  for (unsigned i = 0; i < expected.size(); ++i) {
+    if (!matched[i] && *index == expected[i].index &&
+        attentionBackwardSplatOf(cmp.getRhs(), expected[i].bound)) {
+      matched[i] = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool attentionBackwardMaskMatches(
+    mlir::Value mask, const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> expected) {
+  llvm::SmallVector<bool, 2> matched(expected.size(), false);
+  if (!collectAttentionBackwardMaskBounds(mask, context, expected, matched))
+    return false;
+  return llvm::all_of(matched, [](bool value) { return value; });
+}
+
+static bool collectAttentionBackwardAddressTerms(
+    mlir::Value value, const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> expected,
+    llvm::SmallVectorImpl<bool> &matched, int depth = 0) {
+  if (!value || depth > 16)
+    return false;
+  value = peelAttentionBackwardShape(value);
+  if (auto index = classifyAttentionBackwardIndex(value, context)) {
+    for (unsigned i = 0; i < expected.size(); ++i) {
+      if (!matched[i] && *index == expected[i].index &&
+          !expected[i].stride) {
+        matched[i] = true;
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto mul = value.getDefiningOp<mlir::arith::MulIOp>()) {
+    for (unsigned operand = 0; operand < 2; ++operand) {
+      auto index =
+          classifyAttentionBackwardIndex(mul->getOperand(operand), context);
+      if (!index)
+        continue;
+      for (unsigned i = 0; i < expected.size(); ++i) {
+        if (!matched[i] && *index == expected[i].index &&
+            expected[i].stride &&
+            attentionBackwardSplatOf(mul->getOperand(1 - operand),
+                                     expected[i].stride)) {
+          matched[i] = true;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (auto add = value.getDefiningOp<mlir::arith::AddIOp>())
+    return collectAttentionBackwardAddressTerms(add.getLhs(), context,
+                                                expected, matched, depth + 1) &&
+           collectAttentionBackwardAddressTerms(add.getRhs(), context,
+                                                expected, matched, depth + 1);
+  return false;
+}
+
+static bool matchAttentionBackwardAddress(
+    mlir::Value pointer, mlir::Value ptrRoot,
+    const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> expected) {
+  llvm::SmallVector<bool, 2> matched(expected.size(), false);
+  while (pointer) {
+    pointer = peelAttentionBackwardShape(pointer);
+    if (pointer == ptrRoot)
+      break;
+    if (auto splat = pointer.getDefiningOp<mlir::triton::SplatOp>()) {
+      if (splat.getSrc() != ptrRoot)
+        return false;
+      break;
+    }
+    auto addPtr = pointer.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!addPtr ||
+        !collectAttentionBackwardAddressTerms(addPtr.getOffset(), context,
+                                              expected, matched))
+      return false;
+    pointer = addPtr.getPtr();
+  }
+  return pointer &&
+         llvm::all_of(matched, [](bool value) { return value; });
+}
+
+enum class AttentionBackwardLoadOther { Zero, One, NegativeInfinity };
+
+static bool matchAttentionBackwardLoadContract(
+    llvm::ArrayRef<mlir::triton::LoadOp> loads, mlir::Value ptrRoot,
+    const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> access,
+    AttentionBackwardLoadOther expectedOther) {
+  mlir::triton::LoadOp found;
+  for (auto load : loads) {
+    if (!coneMentionsValue(load.getPtr(), ptrRoot))
+      continue;
+    if (found)
+      return false;
+    found = load;
+  }
+  if (!found || !matchAttentionBackwardAddress(found.getPtr(), ptrRoot,
+                                                context, access) ||
+      !attentionBackwardMaskMatches(found.getMask(), context, access))
+    return false;
+  switch (expectedOther) {
+  case AttentionBackwardLoadOther::Zero:
+    return attentionBackwardIsZero(found.getOther());
+  case AttentionBackwardLoadOther::One:
+    return attentionBackwardIsOne(found.getOther());
+  case AttentionBackwardLoadOther::NegativeInfinity:
+    return isSplatNegativeInfinity(
+        peelAttentionBackwardShape(found.getOther()));
+  }
+  llvm_unreachable("unknown attention backward load fill");
+}
+
+static bool matchAttentionBackwardStoreContract(
+    llvm::ArrayRef<mlir::triton::StoreOp> stores, mlir::Value ptrRoot,
+    const AttentionBackwardIndexContext &context,
+    llvm::ArrayRef<AttentionBackwardAccessDimension> access) {
+  mlir::triton::StoreOp found;
+  for (auto store : stores) {
+    if (!coneMentionsValue(store.getPtr(), ptrRoot))
+      continue;
+    if (found)
+      return false;
+    found = store;
+  }
+  return found && matchAttentionBackwardAddress(found.getPtr(), ptrRoot,
+                                                 context, access) &&
+         attentionBackwardMaskMatches(found.getMask(), context, access);
+}
+
+// Match the two predicate-normalized spellings of the same safe denominator:
+// `select(l == 0, 1, l)` and `select(l != 0, l, 1)`.  The second form must use
+// unordered-not-equal: for NaN it selects `l`, just as ordered-equal's false
+// arm does.  Accepting ordered-not-equal would silently turn NaN into 1 after
+// the source body is erased.
+static bool matchAttentionBackwardSafeDenominator(mlir::Value value,
+                                                  mlir::Value lPtr) {
+  value = peelAttentionBackwardShape(value);
+  auto select = value.getDefiningOp<mlir::arith::SelectOp>();
+  if (!select)
+    return false;
+  mlir::Value condition = peelAttentionBackwardShape(select.getCondition());
+  auto cmp = condition.getDefiningOp<mlir::arith::CmpFOp>();
+  if (!cmp)
+    return false;
+  mlir::triton::LoadOp lLoad;
+  if (cmp.getPredicate() == mlir::arith::CmpFPredicate::OEQ &&
+      attentionBackwardIsOne(select.getTrueValue()))
+    lLoad = attentionBackwardLoadFrom(select.getFalseValue(), lPtr);
+  else if (cmp.getPredicate() == mlir::arith::CmpFPredicate::UNE &&
+           attentionBackwardIsOne(select.getFalseValue()))
+    lLoad = attentionBackwardLoadFrom(select.getTrueValue(), lPtr);
+  if (!lLoad)
+    return false;
+  return (sameAttentionBackwardCone(cmp.getLhs(), lLoad.getResult()) &&
+          attentionBackwardIsZero(cmp.getRhs())) ||
+         (sameAttentionBackwardCone(cmp.getRhs(), lLoad.getResult()) &&
+          attentionBackwardIsZero(cmp.getLhs()));
+}
+
+struct AttentionBackwardSignedTerm {
+  mlir::Value value;
+  int sign;
+};
+
+// Flatten a bounded floating-point sum into signed leaves. Zero constants are
+// identities; all other operations stay atomic so the semantic matcher cannot
+// cancel unfamiliar terms or infer coefficients it has not explicitly
+// proved. The source expression itself is replayed by the gradient region.
+static bool collectAttentionBackwardSignedTerms(
+    mlir::Value value, int sign,
+    llvm::SmallVectorImpl<AttentionBackwardSignedTerm> &terms,
+    int depth = 0) {
+  if (depth > 32)
+    return false;
+  value = peelAttentionBackwardShape(value);
+  if (attentionBackwardIsZero(value))
+    return true;
+  if (auto add = value.getDefiningOp<mlir::arith::AddFOp>())
+    return collectAttentionBackwardSignedTerms(add.getLhs(), sign, terms,
+                                               depth + 1) &&
+           collectAttentionBackwardSignedTerms(add.getRhs(), sign, terms,
+                                               depth + 1);
+  if (auto sub = value.getDefiningOp<mlir::arith::SubFOp>())
+    return collectAttentionBackwardSignedTerms(sub.getLhs(), sign, terms,
+                                               depth + 1) &&
+           collectAttentionBackwardSignedTerms(sub.getRhs(), -sign, terms,
+                                               depth + 1);
+  if (auto neg = value.getDefiningOp<mlir::arith::NegFOp>())
+    return collectAttentionBackwardSignedTerms(neg.getOperand(), -sign, terms,
+                                               depth + 1);
+  terms.push_back({value, sign});
+  return true;
+}
+
+// Prove an additive spelling of `positive - negative`. Reassociation,
+// commutation, explicit zero, and unary negation are accepted, but each load
+// must occur exactly once with the required sign and no other term may remain.
+static bool matchAttentionBackwardDifference(mlir::Value value,
+                                             mlir::Value positivePtr,
+                                             mlir::Value negativePtr) {
+  llvm::SmallVector<AttentionBackwardSignedTerm, 4> terms;
+  if (!collectAttentionBackwardSignedTerms(value, 1, terms) ||
+      terms.size() != 2)
+    return false;
+  bool sawPositive = false;
+  bool sawNegative = false;
+  for (const AttentionBackwardSignedTerm &term : terms) {
+    if (term.sign == 1 && !sawPositive &&
+        attentionBackwardLoadFrom(term.value, positivePtr)) {
+      sawPositive = true;
+      continue;
+    }
+    if (term.sign == -1 && !sawNegative &&
+        attentionBackwardLoadFrom(term.value, negativePtr)) {
+      sawNegative = true;
+      continue;
+    }
+    return false;
+  }
+  return sawPositive && sawNegative;
+}
+
+static bool matchAttentionBackwardExpScoreDifference(mlir::Value value,
+                                                     mlir::Value scorePtr,
+                                                     mlir::Value mPtr) {
+  value = peelAttentionBackwardShape(value);
+  auto exp = value.getDefiningOp<mlir::math::ExpOp>();
+  return exp &&
+         matchAttentionBackwardDifference(exp.getOperand(), scorePtr, mPtr);
+}
+
+// Prove `p = exp(score - m) / l_safe`. Besides the canonical division, accept
+// multiplication by an explicit reciprocal so the region can preserve source
+// reassociation without weakening the probability semantics.
+static bool matchAttentionBackwardProbability(mlir::Value value,
+                                              mlir::Value scorePtr,
+                                              mlir::Value mPtr,
+                                              mlir::Value lPtr,
+                                              mlir::Value *safeDenominator =
+                                                  nullptr) {
+  value = peelAttentionBackwardShape(value);
+  if (auto div = value.getDefiningOp<mlir::arith::DivFOp>()) {
+    if (!matchAttentionBackwardExpScoreDifference(div.getLhs(), scorePtr,
+                                                  mPtr) ||
+        !matchAttentionBackwardSafeDenominator(div.getRhs(), lPtr))
+      return false;
+    if (safeDenominator)
+      *safeDenominator = peelAttentionBackwardShape(div.getRhs());
+    return true;
+  }
+  auto mul = value.getDefiningOp<mlir::arith::MulFOp>();
+  if (!mul)
+    return false;
+  for (unsigned expIndex = 0; expIndex < 2; ++expIndex) {
+    mlir::Value expValue = mul->getOperand(expIndex);
+    mlir::Value reciprocalValue =
+        peelAttentionBackwardShape(mul->getOperand(1 - expIndex));
+    auto reciprocal = reciprocalValue.getDefiningOp<mlir::arith::DivFOp>();
+    if (!reciprocal || !attentionBackwardIsOne(reciprocal.getLhs()) ||
+        !matchAttentionBackwardExpScoreDifference(expValue, scorePtr, mPtr) ||
+        !matchAttentionBackwardSafeDenominator(reciprocal.getRhs(), lPtr))
+      continue;
+    if (safeDenominator)
+      *safeDenominator = peelAttentionBackwardShape(reciprocal.getRhs());
+    return true;
+  }
+  return false;
+}
+
+static bool findAttentionBackwardProbability(
+    mlir::Value value, mlir::Value scorePtr, mlir::Value mPtr,
+    mlir::Value lPtr, mlir::Value &probability, mlir::Value &safeDenominator,
+    llvm::DenseSet<void *> &seen, int depth = 0) {
+  if (depth > 32)
+    return false;
+  value = peelAttentionBackwardShape(value);
+  if (!seen.insert(value.getAsOpaquePointer()).second)
+    return false;
+  if (matchAttentionBackwardProbability(value, scorePtr, mPtr, lPtr,
+                                        &safeDenominator)) {
+    probability = value;
+    return true;
+  }
+  auto mul = value.getDefiningOp<mlir::arith::MulFOp>();
+  if (!mul)
+    return false;
+  return findAttentionBackwardProbability(
+             mul.getLhs(), scorePtr, mPtr, lPtr, probability,
+             safeDenominator, seen, depth + 1) ||
+         findAttentionBackwardProbability(
+             mul.getRhs(), scorePtr, mPtr, lPtr, probability,
+             safeDenominator, seen, depth + 1);
+}
+
+static bool collectAttentionBackwardProductFactors(
+    mlir::Value value, mlir::Value probability,
+    llvm::SmallVectorImpl<mlir::Value> &factors, int depth = 0) {
+  if (depth > 32)
+    return false;
+  value = peelAttentionBackwardShape(value);
+  if (sameAttentionBackwardCone(value, probability)) {
+    factors.push_back(value);
+    return true;
+  }
+  if (auto mul = value.getDefiningOp<mlir::arith::MulFOp>())
+    return collectAttentionBackwardProductFactors(
+               mul.getLhs(), probability, factors, depth + 1) &&
+           collectAttentionBackwardProductFactors(
+               mul.getRhs(), probability, factors, depth + 1);
+  factors.push_back(value);
+  return true;
+}
+
+// Prove `ds = p * (dp - delta) * sm_scale`. Flatten only the outer product,
+// keeping the already-proven probability as an atomic factor. This admits
+// commutation and reassociation but continues to reject `dp + delta`.
+static bool matchAttentionBackwardDs(mlir::Value value, mlir::Value p,
+                                     mlir::Value dpPtr,
+                                     mlir::Value deltaPtr,
+                                     mlir::Value scale) {
+  llvm::SmallVector<mlir::Value> factors;
+  if (!collectAttentionBackwardProductFactors(value, p, factors) ||
+      factors.size() != 3)
+    return false;
+  bool sawProbability = false;
+  bool sawScale = false;
+  bool sawDifference = false;
+  for (mlir::Value factor : factors) {
+    factor = peelAttentionBackwardShape(factor);
+    if (!sawProbability && sameAttentionBackwardCone(factor, p)) {
+      sawProbability = true;
+      continue;
+    }
+    if (!sawScale && attentionBackwardSplatOf(factor, scale)) {
+      sawScale = true;
+      continue;
+    }
+    if (!sawDifference &&
+        matchAttentionBackwardDifference(factor, dpPtr, deltaPtr)) {
+      sawDifference = true;
+      continue;
+    }
+    return false;
+  }
+  return sawProbability && sawScale && sawDifference;
+}
+
+static bool matchAttentionBackwardDqFormula(mlir::Value ds,
+                                            mlir::Value scorePtr,
+                                            mlir::Value dpPtr,
+                                            mlir::Value mPtr,
+                                            mlir::Value lPtr,
+                                            mlir::Value deltaPtr,
+                                            mlir::Value scale,
+                                            mlir::Value &probability,
+                                            mlir::Value &safeDenominator) {
+  llvm::DenseSet<void *> seen;
+  return findAttentionBackwardProbability(
+             ds, scorePtr, mPtr, lPtr, probability, safeDenominator, seen) &&
+         matchAttentionBackwardDs(ds, probability, dpPtr, deltaPtr, scale);
+}
+
+template <typename CombineOp>
+static bool matchAttentionBackwardReduce(mlir::Value value,
+                                         mlir::Value source, unsigned axis) {
+  value = peelAttentionBackwardShape(value);
+  auto reduce = value.getDefiningOp<mlir::triton::ReduceOp>();
+  if (!reduce || reduce.getAxis() != axis || reduce.getSrcs().size() != 1 ||
+      !sameAttentionBackwardCone(reduce.getSrcs().front(), source))
+    return false;
+  mlir::Block &combine = reduce.getCombineOp().front();
+  auto body = combine.without_terminator();
+  return std::distance(body.begin(), body.end()) == 1 &&
+         mlir::isa<CombineOp>(&*body.begin());
+}
+
+static bool splitAttentionBackwardScaledCarry(mlir::Value value,
+                                              mlir::Value carry,
+                                              mlir::Value &scale) {
+  value = peelAttentionBackwardShape(value);
+  auto mul = value.getDefiningOp<mlir::arith::MulFOp>();
+  if (!mul)
+    return false;
+  if (sameAttentionBackwardCone(mul.getLhs(), carry)) {
+    scale = mul.getRhs();
+    return true;
+  }
+  if (sameAttentionBackwardCone(mul.getRhs(), carry)) {
+    scale = mul.getLhs();
+    return true;
+  }
+  return false;
+}
+
+static bool matchAttentionBackwardExpDifference(mlir::Value value,
+                                                mlir::Value lhs,
+                                                mlir::Value rhs) {
+  value = peelAttentionBackwardShape(value);
+  auto exp = value.getDefiningOp<mlir::math::ExpOp>();
+  if (!exp)
+    return false;
+  auto sub = peelAttentionBackwardShape(exp.getOperand())
+                 .getDefiningOp<mlir::arith::SubFOp>();
+  return sub && sameAttentionBackwardCone(sub.getLhs(), lhs) &&
+         sameAttentionBackwardCone(sub.getRhs(), rhs);
+}
+
+// Prove the online-softmax state transition before erasing the source loop:
+//   m'     = max(m, reduce_max(score))
+//   alpha  = exp(m - m')
+//   p      = exp(score - m')
+//   l'     = l * alpha + reduce_sum(p)
+//   delta' = delta * alpha + reduce_sum(p * dp)
+static bool matchAttentionBackwardPreRecurrence(mlir::scf::ForOp loop,
+                                                mlir::Value score,
+                                                mlir::Value dp) {
+  if (loop.getNumResults() != 3 || loop.getInitArgs().size() != 3 ||
+      !isSplatNegativeInfinity(
+          peelAttentionBackwardShape(loop.getInitArgs()[0])) ||
+      !attentionBackwardIsZero(loop.getInitArgs()[1]) ||
+      !attentionBackwardIsZero(loop.getInitArgs()[2]))
+    return false;
+  auto yield =
+      llvm::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!yield || yield.getNumOperands() != 3)
+    return false;
+
+  mlir::Value mNew = peelAttentionBackwardShape(yield.getOperand(0));
+  auto max = mNew.getDefiningOp<mlir::arith::MaxNumFOp>();
+  if (!max)
+    return false;
+  mlir::Value rowMax;
+  if (sameAttentionBackwardCone(max.getLhs(), loop.getRegionIterArg(0)))
+    rowMax = max.getRhs();
+  else if (sameAttentionBackwardCone(max.getRhs(),
+                                    loop.getRegionIterArg(0)))
+    rowMax = max.getLhs();
+  else
+    return false;
+  if (!matchAttentionBackwardReduce<mlir::arith::MaxNumFOp>(rowMax, score, 1))
+    return false;
+
+  mlir::Value lNext = peelAttentionBackwardShape(yield.getOperand(1));
+  auto lAdd = lNext.getDefiningOp<mlir::arith::AddFOp>();
+  if (!lAdd)
+    return false;
+  mlir::Value alpha;
+  mlir::Value pReduce;
+  if (splitAttentionBackwardScaledCarry(lAdd.getLhs(),
+                                        loop.getRegionIterArg(1), alpha))
+    pReduce = lAdd.getRhs();
+  else if (splitAttentionBackwardScaledCarry(lAdd.getRhs(),
+                                             loop.getRegionIterArg(1), alpha))
+    pReduce = lAdd.getLhs();
+  else
+    return false;
+  if (!matchAttentionBackwardExpDifference(
+          alpha, loop.getRegionIterArg(0), mNew))
+    return false;
+  pReduce = peelAttentionBackwardShape(pReduce);
+  auto pReduction = pReduce.getDefiningOp<mlir::triton::ReduceOp>();
+  if (!pReduction ||
+      !matchAttentionBackwardReduce<mlir::arith::AddFOp>(pReduce,
+                                                        pReduction.getSrcs()[0],
+                                                        1))
+    return false;
+  mlir::Value p = pReduction.getSrcs()[0];
+  if (!matchAttentionBackwardExpDifference(p, score, mNew))
+    return false;
+
+  mlir::Value deltaNext = peelAttentionBackwardShape(yield.getOperand(2));
+  auto deltaAdd = deltaNext.getDefiningOp<mlir::arith::AddFOp>();
+  if (!deltaAdd)
+    return false;
+  mlir::Value deltaAlpha;
+  mlir::Value pdpReduce;
+  if (splitAttentionBackwardScaledCarry(deltaAdd.getLhs(),
+                                        loop.getRegionIterArg(2), deltaAlpha))
+    pdpReduce = deltaAdd.getRhs();
+  else if (splitAttentionBackwardScaledCarry(
+               deltaAdd.getRhs(), loop.getRegionIterArg(2), deltaAlpha))
+    pdpReduce = deltaAdd.getLhs();
+  else
+    return false;
+  if (!sameAttentionBackwardCone(deltaAlpha, alpha))
+    return false;
+  pdpReduce = peelAttentionBackwardShape(pdpReduce);
+  auto pdpReduction = pdpReduce.getDefiningOp<mlir::triton::ReduceOp>();
+  if (!pdpReduction ||
+      !matchAttentionBackwardReduce<mlir::arith::AddFOp>(
+          pdpReduce, pdpReduction.getSrcs()[0], 1))
+    return false;
+  mlir::Value pdp = peelAttentionBackwardShape(pdpReduction.getSrcs()[0]);
+  auto product = pdp.getDefiningOp<mlir::arith::MulFOp>();
+  return product &&
+         ((sameAttentionBackwardCone(product.getLhs(), p) &&
+           sameAttentionBackwardCone(product.getRhs(), dp)) ||
+          (sameAttentionBackwardCone(product.getRhs(), p) &&
+           sameAttentionBackwardCone(product.getLhs(), dp)));
+}
+
+static mlir::triton::StoreOp findAttentionBackwardStore(
+    llvm::ArrayRef<mlir::triton::StoreOp> stores, mlir::Value ptrRoot) {
+  mlir::triton::StoreOp found;
+  for (auto store : stores) {
+    if (!coneMentionsValue(store.getPtr(), ptrRoot))
+      continue;
+    if (found)
+      return nullptr;
+    found = store;
+  }
+  return found;
+}
+
+static mlir::triton::LoadOp findAttentionBackwardLoad(
+    llvm::ArrayRef<mlir::triton::LoadOp> loads, mlir::Value ptrRoot) {
+  mlir::triton::LoadOp found;
+  for (auto load : loads) {
+    if (!coneMentionsValue(load.getPtr(), ptrRoot))
+      continue;
+    if (found)
+      return nullptr;
+    found = load;
+  }
+  return found;
+}
+
+static bool matchAttentionBackwardAdd(mlir::Value value, mlir::Value lhs,
+                                      mlir::Value rhs) {
+  value = peelAttentionBackwardShape(value);
+  auto add = value.getDefiningOp<mlir::arith::AddFOp>();
+  return add &&
+         ((sameAttentionBackwardCone(add.getLhs(), lhs) &&
+           sameAttentionBackwardCone(add.getRhs(), rhs)) ||
+          (sameAttentionBackwardCone(add.getRhs(), lhs) &&
+           sameAttentionBackwardCone(add.getLhs(), rhs)));
+}
+
+static bool matchAttentionBackwardSafeDenominatorValue(mlir::Value value,
+                                                       mlir::Value lValue) {
+  value = peelAttentionBackwardShape(value);
+  auto select = value.getDefiningOp<mlir::arith::SelectOp>();
+  if (!select)
+    return false;
+  auto cmp = peelAttentionBackwardShape(select.getCondition())
+                 .getDefiningOp<mlir::arith::CmpFOp>();
+  if (!cmp)
+    return false;
+  const bool canonical =
+      cmp.getPredicate() == mlir::arith::CmpFPredicate::OEQ &&
+      attentionBackwardIsOne(select.getTrueValue()) &&
+      sameAttentionBackwardCone(select.getFalseValue(), lValue);
+  const bool inverted =
+      cmp.getPredicate() == mlir::arith::CmpFPredicate::UNE &&
+      sameAttentionBackwardCone(select.getTrueValue(), lValue) &&
+      attentionBackwardIsOne(select.getFalseValue());
+  if (!canonical && !inverted)
+    return false;
+  return (sameAttentionBackwardCone(cmp.getLhs(), lValue) &&
+          attentionBackwardIsZero(cmp.getRhs())) ||
+         (sameAttentionBackwardCone(cmp.getRhs(), lValue) &&
+          attentionBackwardIsZero(cmp.getLhs()));
+}
+
+static bool matchAttentionBackwardPreStoredValues(
+    llvm::ArrayRef<mlir::triton::StoreOp> stores,
+    llvm::ArrayRef<mlir::Value> ptrs, mlir::scf::ForOp loop,
+    mlir::Value score, mlir::Value dp) {
+  if (ptrs.size() != 7)
+    return false;
+  auto sStore = findAttentionBackwardStore(stores, ptrs[0]);
+  auto stStore = findAttentionBackwardStore(stores, ptrs[1]);
+  auto dpStore = findAttentionBackwardStore(stores, ptrs[2]);
+  auto dptStore = findAttentionBackwardStore(stores, ptrs[3]);
+  auto mStore = findAttentionBackwardStore(stores, ptrs[4]);
+  auto lStore = findAttentionBackwardStore(stores, ptrs[5]);
+  auto deltaStore = findAttentionBackwardStore(stores, ptrs[6]);
+  if (!sStore || !stStore || !dpStore || !dptStore || !mStore || !lStore ||
+      !deltaStore ||
+      !sameAttentionBackwardCone(sStore.getValue(), score) ||
+      !sameAttentionBackwardCone(dpStore.getValue(), dp) ||
+      !sameAttentionBackwardCone(mStore.getValue(), loop.getResult(0)) ||
+      !sameAttentionBackwardCone(lStore.getValue(), loop.getResult(1)))
+    return false;
+  auto st = peelAttentionBackwardShape(stStore.getValue())
+                .getDefiningOp<mlir::triton::TransOp>();
+  auto dpt = peelAttentionBackwardShape(dptStore.getValue())
+                 .getDefiningOp<mlir::triton::TransOp>();
+  if (!st || !dpt || !sameAttentionBackwardCone(st.getSrc(), score) ||
+      !sameAttentionBackwardCone(dpt.getSrc(), dp))
+    return false;
+  auto deltaDiv = peelAttentionBackwardShape(deltaStore.getValue())
+                      .getDefiningOp<mlir::arith::DivFOp>();
+  return deltaDiv &&
+         sameAttentionBackwardCone(deltaDiv.getLhs(), loop.getResult(2)) &&
+         matchAttentionBackwardSafeDenominatorValue(deltaDiv.getRhs(),
+                                                    loop.getResult(1));
+}
+
+static bool matchAttentionBackwardDkdvStoredValues(
+    llvm::ArrayRef<mlir::triton::StoreOp> stores,
+    llvm::ArrayRef<mlir::triton::LoadOp> loads, mlir::Value dkPtr,
+    mlir::Value dvPtr, mlir::scf::ForOp loop, mlir::Value accumulate) {
+  auto dkStore = findAttentionBackwardStore(stores, dkPtr);
+  auto dvStore = findAttentionBackwardStore(stores, dvPtr);
+  auto dkLoad = findAttentionBackwardLoad(loads, dkPtr);
+  auto dvLoad = findAttentionBackwardLoad(loads, dvPtr);
+  if (!dkStore || !dvStore || !dkLoad || !dvLoad)
+    return false;
+  if (!accumulate)
+    return matchAttentionBackwardAdd(dkStore.getValue(), loop.getResult(0),
+                                     dkLoad.getResult()) &&
+           matchAttentionBackwardAdd(dvStore.getValue(), loop.getResult(1),
+                                     dvLoad.getResult());
+
+  mlir::Value dkValue = peelAttentionBackwardShape(dkStore.getValue());
+  mlir::Value dvValue = peelAttentionBackwardShape(dvStore.getValue());
+  auto dkResult = mlir::dyn_cast<mlir::OpResult>(dkValue);
+  auto dvResult = mlir::dyn_cast<mlir::OpResult>(dvValue);
+  if (!dkResult || !dvResult || dkResult.getResultNumber() != 0 ||
+      dvResult.getResultNumber() != 1 ||
+      dkResult.getOwner() != dvResult.getOwner())
+    return false;
+  auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(dkResult.getOwner());
+  if (!ifOp || ifOp.getNumResults() != 2 || ifOp.getElseRegion().empty())
+    return false;
+  auto condition = peelAttentionBackwardShape(ifOp.getCondition())
+                       .getDefiningOp<mlir::arith::CmpIOp>();
+  if (!condition ||
+      condition.getPredicate() != mlir::arith::CmpIPredicate::ne ||
+      !((condition.getLhs() == accumulate &&
+         attentionBackwardIsIntConst(condition.getRhs(), 0)) ||
+        (condition.getRhs() == accumulate &&
+         attentionBackwardIsIntConst(condition.getLhs(), 0))))
+    return false;
+  auto thenYield = llvm::dyn_cast<mlir::scf::YieldOp>(
+      ifOp.getThenRegion().front().getTerminator());
+  auto elseYield = llvm::dyn_cast<mlir::scf::YieldOp>(
+      ifOp.getElseRegion().front().getTerminator());
+  return thenYield && elseYield && thenYield.getNumOperands() == 2 &&
+         elseYield.getNumOperands() == 2 &&
+         matchAttentionBackwardAdd(thenYield.getOperand(0), loop.getResult(0),
+                                   dkLoad.getResult()) &&
+         matchAttentionBackwardAdd(thenYield.getOperand(1), loop.getResult(1),
+                                   dvLoad.getResult()) &&
+         sameAttentionBackwardCone(elseYield.getOperand(0),
+                                   loop.getResult(0)) &&
+         sameAttentionBackwardCone(elseYield.getOperand(1),
+                                   loop.getResult(1));
+}
+
+// Bind every canonical row/key value in the score cone to the corresponding
+// scalar region argument.  Non-canonical expressions are deliberately not
+// classified as leaves: `key + 1`, for example, is replayed as scalar addi over
+// the canonical key leaf, preserving the source expression rather than
+// teaching the matcher a new formula.
+static void bindAttentionBackwardScoreIndexLeaves(
+    mlir::Value value, mlir::Value rawScore,
+    const AttentionBackwardIndexContext &indexContext, mlir::Value rowArg,
+    mlir::Value keyArg, llvm::DenseMap<void *, mlir::Value> &leaf,
+    llvm::DenseSet<void *> &seen, int depth = 0) {
+  if (depth > 32)
+    return;
+  value = peelAttentionBackwardShape(value);
+  void *key = value.getAsOpaquePointer();
+  if (!seen.insert(key).second || value == rawScore)
+    return;
+  if (auto index = classifyAttentionBackwardIndex(value, indexContext)) {
+    if (*index == AttentionBackwardIndex::Row)
+      leaf[key] = rowArg;
+    else if (*index == AttentionBackwardIndex::Key)
+      leaf[key] = keyArg;
+    return;
+  }
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return;
+  for (mlir::Value operand : def->getOperands())
+    bindAttentionBackwardScoreIndexLeaves(
+        operand, rawScore, indexContext, rowArg, keyArg, leaf, seen,
+        depth + 1);
+}
+
+// Translate the complete pure score cone into a detached region.  Translation
+// is the acceptance test: an unbound leaf, memory read, reduction, or scalar op
+// outside `emitConeScalar`'s supported table declines the whole-kernel match.
+// Building detached keeps a failed attempt from leaving bridge ops or a
+// half-formed Metal op in the generic conversion path.
+static bool buildAttentionBackwardScoreRegion(
+    mlir::Region &region, mlir::Location loc, mlir::Value score,
+    mlir::triton::DotOp qkDot, mlir::Value nTrue, mlir::Value scale,
+    const AttentionBackwardIndexContext &indexContext) {
+  mlir::OpBuilder builder(qkDot.getContext());
+  mlir::Block *body = &region.emplaceBlock();
+  auto f32 = builder.getF32Type();
+  auto si32 = mlir::IntegerType::get(builder.getContext(), 32,
+                                     mlir::IntegerType::Signed);
+  auto ui32 = mlir::IntegerType::get(builder.getContext(), 32,
+                                     mlir::IntegerType::Unsigned);
+  body->addArguments({f32, si32, si32, ui32, f32},
+                     {loc, loc, loc, loc, loc});
+  builder.setInsertionPointToEnd(body);
+
+  mlir::Value rawScore = peelAttentionBackwardShape(qkDot.getResult());
+  llvm::DenseMap<void *, mlir::Value> leaf, memo;
+  leaf[rawScore.getAsOpaquePointer()] = body->getArgument(0);
+  leaf[nTrue.getAsOpaquePointer()] = body->getArgument(3);
+  leaf[scale.getAsOpaquePointer()] = body->getArgument(4);
+  llvm::DenseSet<void *> seen;
+  bindAttentionBackwardScoreIndexLeaves(
+      score, rawScore, indexContext, body->getArgument(1),
+      body->getArgument(2), leaf, seen);
+  mlir::Value scalarScore = emitConeScalar(builder, loc, score, leaf, memo);
+  if (!scalarScore)
+    return false;
+  mlir::triton::metal::AttentionBackwardScoreYieldOp::create(
+      builder, loc, scalarScore);
+  return true;
+}
+
+// Preserve the accepted source spelling of the backward probability and score
+// gradient while keeping its semantic proof in the matcher. The six leaves
+// are scalar values already available to both the MMA and scalar emitters.
+static bool buildAttentionBackwardGradientRegion(
+    mlir::Region &region, mlir::Location loc, mlir::Value probability,
+    mlir::Value ds, mlir::triton::LoadOp scoreLoad,
+    mlir::triton::LoadOp dpLoad, mlir::triton::LoadOp mLoad,
+    mlir::Value safeDenominator, mlir::triton::LoadOp deltaLoad,
+    mlir::Value scale) {
+  if (!scoreLoad || !dpLoad || !mLoad || !safeDenominator || !deltaLoad)
+    return false;
+  mlir::OpBuilder builder(probability.getContext());
+  mlir::Block *body = &region.emplaceBlock();
+  auto f32 = builder.getF32Type();
+  body->addArguments({f32, f32, f32, f32, f32, f32},
+                     {loc, loc, loc, loc, loc, loc});
+  builder.setInsertionPointToEnd(body);
+
+  llvm::DenseMap<void *, mlir::Value> leaf, memo;
+  leaf[scoreLoad.getResult().getAsOpaquePointer()] = body->getArgument(0);
+  leaf[dpLoad.getResult().getAsOpaquePointer()] = body->getArgument(1);
+  leaf[mLoad.getResult().getAsOpaquePointer()] = body->getArgument(2);
+  leaf[peelAttentionBackwardShape(safeDenominator).getAsOpaquePointer()] =
+      body->getArgument(3);
+  leaf[deltaLoad.getResult().getAsOpaquePointer()] = body->getArgument(4);
+  leaf[scale.getAsOpaquePointer()] = body->getArgument(5);
+  mlir::Value scalarProbability =
+      emitConeScalar(builder, loc, probability, leaf, memo);
+  mlir::Value scalarDs = emitConeScalar(builder, loc, ds, leaf, memo);
+  if (!scalarProbability || !scalarDs)
+    return false;
+  mlir::triton::metal::AttentionBackwardGradientYieldOp::create(
+      builder, loc, scalarProbability, scalarDs);
+  return true;
+}
+
+static void eraseMatchedAttentionBackwardBody(
+    mlir::Operation *replacement, mlir::Block &entry) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (mlir::Operation &op :
+         llvm::make_early_inc_range(llvm::reverse(entry))) {
+      if (&op == replacement || op.hasTrait<mlir::OpTrait::IsTerminator>() ||
+          !op.use_empty())
+        continue;
+      op.erase();
+      changed = true;
+    }
+  }
+}
+
+// Whole-kernel replacement may remove arbitrary operations, so operation
+// counts are not enough: an otherwise matching kernel with an extra atomic or
+// other observable effect must be declined. Loads/stores are checked
+// separately for exact count, address, mask, fill, and stored value.
+static bool attentionBackwardEffectsAreCovered(mlir::triton::FuncOp funcOp) {
+  bool covered = true;
+  funcOp.walk([&](mlir::Operation *op) {
+    if (!covered || op == funcOp.getOperation() ||
+        op->hasTrait<mlir::OpTrait::IsTerminator>() ||
+        mlir::isa<mlir::scf::ForOp, mlir::scf::IfOp,
+                  mlir::triton::LoadOp, mlir::triton::StoreOp>(op))
+      return;
+    if (!mlir::isMemoryEffectFree(op))
+      covered = false;
+  });
+  return covered;
+}
+
+static mlir::LogicalResult
+trySoftmaxAttentionBackwardPre(mlir::triton::FuncOp funcOp) {
+  if (funcOp.getBody().empty() ||
+      !isRawAttentionBackwardKernel(funcOp, "_attn_bwd_pre") ||
+      !attentionBackwardWarpEnvelope(funcOp))
+    return mlir::failure();
+  mlir::Block &entry = funcOp.getBody().front();
+  if (entry.getNumArguments() != 23)
+    return mlir::failure();
+  auto arg = [&](unsigned i) { return entry.getArgument(i); };
+  for (unsigned i = 0; i < 11; ++i)
+    if (!isF32PtrArg(arg(i)))
+      return mlir::failure();
+  for (unsigned i = 11; i < 22; ++i)
+    if (!arg(i).getType().isInteger(32))
+      return mlir::failure();
+  if (!arg(22).getType().isF32())
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  llvm::SmallVector<mlir::triton::DotOp> dots;
+  llvm::SmallVector<mlir::triton::ReduceOp> reduces;
+  llvm::SmallVector<mlir::triton::StoreOp> stores;
+  llvm::SmallVector<mlir::triton::LoadOp> loads;
+  funcOp.walk([&](mlir::scf::ForOp op) { loops.push_back(op); });
+  funcOp.walk([&](mlir::triton::DotOp op) { dots.push_back(op); });
+  funcOp.walk([&](mlir::triton::ReduceOp op) { reduces.push_back(op); });
+  funcOp.walk([&](mlir::triton::StoreOp op) { stores.push_back(op); });
+  funcOp.walk([&](mlir::triton::LoadOp op) { loads.push_back(op); });
+  if (loops.size() != 1 || dots.size() != 2 || reduces.size() != 3 ||
+      stores.size() != 7 || loads.size() != 4 ||
+      loops[0].getNumResults() != 3 ||
+      !attentionBackwardEffectsAreCovered(funcOp))
+    return mlir::failure();
+  auto loop = loops[0];
+  for (auto dot : dots)
+    if (dot->getBlock() != loop.getBody())
+      return mlir::failure();
+  int64_t bm = tensorDim(dots[0].getResult(), 0);
+  int64_t bn = tensorDim(dots[0].getResult(), 1);
+  int64_t bd = tensorDim(dots[0].getA(), 1);
+  if (bm <= 0 || bn <= 0 || bd <= 0 || bn > 64)
+    return mlir::failure();
+  mlir::triton::DotOp qkDot;
+  mlir::triton::DotOp dpDot;
+  if (dotMentions(dots[0], arg(0), arg(1)) &&
+      dotMentions(dots[1], arg(3), arg(2))) {
+    qkDot = dots[0];
+    dpDot = dots[1];
+  } else if (dotMentions(dots[1], arg(0), arg(1)) &&
+             dotMentions(dots[0], arg(3), arg(2))) {
+    qkDot = dots[1];
+    dpDot = dots[0];
+  } else {
+    return mlir::failure();
+  }
+  auto scoreStore = findAttentionBackwardStore(stores, arg(4));
+  if (!scoreStore || !attentionBackwardIsZero(qkDot.getC()) ||
+      !attentionBackwardIsZero(dpDot.getC()))
+    return mlir::failure();
+  mlir::Value score = scoreStore.getValue();
+  if (!coneMentionsValue(score, qkDot.getResult()) ||
+      !matchAttentionBackwardPreRecurrence(loop, score, dpDot.getResult()))
+    return mlir::failure();
+  using LoadOther = AttentionBackwardLoadOther;
+  using Index = AttentionBackwardIndex;
+  AttentionBackwardIndexContext indexContext{loop, bm, bn, bd, Index::Key,
+                                             Index::Row};
+  if (!matchAttentionBackwardLoadContract(
+          loads, arg(0), indexContext,
+          {{Index::Row, arg(19), arg(11)},
+           {Index::Feature, arg(21), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(3), indexContext,
+          {{Index::Row, arg(19), arg(14)},
+           {Index::Feature, arg(21), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(1), indexContext,
+          {{Index::Feature, arg(21), arg(12)},
+           {Index::Key, arg(15), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(2), indexContext,
+          {{Index::Feature, arg(21), arg(13)},
+           {Index::Key, arg(15), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(4), indexContext,
+          {{Index::Row, arg(19), arg(15)},
+           {Index::Key, arg(15), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(5), indexContext,
+          {{Index::Key, arg(15), arg(16)},
+           {Index::Row, arg(19), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(6), indexContext,
+          {{Index::Row, arg(19), arg(17)},
+           {Index::Key, arg(15), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(7), indexContext,
+          {{Index::Key, arg(15), arg(18)},
+           {Index::Row, arg(19), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(8), indexContext,
+          {{Index::Row, arg(19), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(9), indexContext,
+          {{Index::Row, arg(19), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(10), indexContext,
+          {{Index::Row, arg(19), {}}}))
+    return mlir::failure();
+  if (!matchAttentionBackwardPreStoredValues(
+          stores,
+          {arg(4), arg(5), arg(6), arg(7), arg(8), arg(9), arg(10)}, loop,
+          score, dpDot.getResult()))
+    return mlir::failure();
+
+  auto loc = loop.getLoc();
+  mlir::Region scoreRegion;
+  if (!buildAttentionBackwardScoreRegion(scoreRegion, loc, score, qkDot,
+                                         arg(20), arg(22), indexContext))
+    return mlir::failure();
+
+  mlir::OpBuilder builder(loop);
+  auto f32 = builder.getF32Type();
+  auto u32 = wrapperElementType(arg(11).getType());
+  auto bridge = [&](mlir::Value v, mlir::Type e) {
+    return bridgePtrToMemref(builder, loc, v, e);
+  };
+  auto repl = mlir::triton::metal::SoftmaxAttentionBackwardPreOp::create(
+      builder, loc, bridge(arg(0), f32), bridge(arg(1), f32),
+      bridge(arg(2), f32), bridge(arg(3), f32), bridge(arg(4), f32),
+      bridge(arg(5), f32), bridge(arg(6), f32), bridge(arg(7), f32),
+      bridge(arg(8), f32), bridge(arg(9), f32), bridge(arg(10), f32),
+      bridge(arg(11), u32), bridge(arg(12), u32), bridge(arg(13), u32),
+      bridge(arg(14), u32), bridge(arg(15), u32), bridge(arg(16), u32),
+      bridge(arg(17), u32), bridge(arg(18), u32), bridge(arg(19), u32),
+      bridge(arg(20), u32), bridge(arg(21), u32), bridge(arg(22), f32),
+      bm, bn, bd);
+  repl.getScore().takeBody(scoreRegion);
+  eraseMatchedAttentionBackwardBody(repl.getOperation(), entry);
+  return mlir::success();
+}
+
+static mlir::LogicalResult
+trySoftmaxAttentionBackwardDq(mlir::triton::FuncOp funcOp) {
+  if (funcOp.getBody().empty() ||
+      !isRawAttentionBackwardKernel(funcOp, "_attn_bwd_dq") ||
+      !attentionBackwardWarpEnvelope(funcOp))
+    return mlir::failure();
+  mlir::Block &entry = funcOp.getBody().front();
+  if (entry.getNumArguments() != 14)
+    return mlir::failure();
+  auto arg = [&](unsigned i) { return entry.getArgument(i); };
+  for (unsigned i = 0; i < 7; ++i)
+    if (!isF32PtrArg(arg(i)))
+      return mlir::failure();
+  for (unsigned i = 7; i < 13; ++i)
+    if (!arg(i).getType().isInteger(32))
+      return mlir::failure();
+  if (!arg(13).getType().isF32())
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  llvm::SmallVector<mlir::triton::DotOp> dots;
+  llvm::SmallVector<mlir::triton::StoreOp> stores;
+  llvm::SmallVector<mlir::triton::LoadOp> loads;
+  funcOp.walk([&](mlir::scf::ForOp op) { loops.push_back(op); });
+  funcOp.walk([&](mlir::triton::DotOp op) { dots.push_back(op); });
+  funcOp.walk([&](mlir::triton::StoreOp op) { stores.push_back(op); });
+  funcOp.walk([&](mlir::triton::LoadOp op) { loads.push_back(op); });
+  if (loops.size() != 1 || dots.size() != 1 || stores.size() != 1 ||
+      loads.size() != 6 || loops[0].getNumResults() != 1 ||
+      !attentionBackwardEffectsAreCovered(funcOp))
+    return mlir::failure();
+  int64_t bm = tensorDim(dots[0].getResult(), 0);
+  int64_t bd = tensorDim(dots[0].getResult(), 1);
+  int64_t bn = tensorDim(dots[0].getA(), 1);
+  if (bm <= 0 || bn <= 0 || bd <= 0 || bn > 64)
+    return mlir::failure();
+  auto loop = loops[0];
+  mlir::Value probability;
+  mlir::Value safeDenominator;
+  if (dots[0]->getBlock() != loop.getBody() ||
+      !attentionBackwardLoadFrom(dots[0].getB(), arg(0)) ||
+      !matchAttentionBackwardDqFormula(
+          dots[0].getA(), arg(1), arg(2), arg(3), arg(4), arg(5),
+          arg(13), probability, safeDenominator) ||
+      !sameAttentionBackwardCone(dots[0].getC(),
+                                 loop.getRegionIterArg(0)))
+    return mlir::failure();
+  using LoadOther = AttentionBackwardLoadOther;
+  using Index = AttentionBackwardIndex;
+  AttentionBackwardIndexContext indexContext{loop, bm, bn, bd, Index::Key,
+                                             Index::Row};
+  if (!matchAttentionBackwardLoadContract(
+          loads, arg(0), indexContext,
+          {{Index::Key, arg(8), arg(7)},
+           {Index::Feature, arg(12), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(1), indexContext,
+          {{Index::Row, arg(11), arg(8)},
+           {Index::Key, arg(8), {}}},
+                                          LoadOther::NegativeInfinity) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(2), indexContext,
+          {{Index::Row, arg(11), arg(9)},
+           {Index::Key, arg(8), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(3), indexContext, {{Index::Row, arg(11), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(4), indexContext, {{Index::Row, arg(11), {}}},
+                                          LoadOther::One) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(5), indexContext, {{Index::Row, arg(11), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(6), indexContext,
+          {{Index::Row, arg(11), arg(10)},
+           {Index::Feature, arg(12), {}}}))
+    return mlir::failure();
+  auto yield = llvm::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!yield || yield.getNumOperands() != 1 ||
+      !sameAttentionBackwardCone(yield.getOperand(0), dots[0].getResult()) ||
+      !llvm::any_of(stores, [&](mlir::triton::StoreOp store) {
+        return store.getMask() && coneMentionsValue(store.getPtr(), arg(6)) &&
+               sameAttentionBackwardCone(store.getValue(), loop.getResult(0));
+      }))
+    return mlir::failure();
+  mlir::Region gradientRegion;
+  if (!buildAttentionBackwardGradientRegion(
+          gradientRegion, loop.getLoc(), probability, dots[0].getA(),
+          findAttentionBackwardLoad(loads, arg(1)),
+          findAttentionBackwardLoad(loads, arg(2)),
+          findAttentionBackwardLoad(loads, arg(3)), safeDenominator,
+          findAttentionBackwardLoad(loads, arg(5)), arg(13)))
+    return mlir::failure();
+  mlir::OpBuilder builder(loops[0]);
+  auto loc = loops[0].getLoc();
+  auto f32 = builder.getF32Type();
+  auto u32 = wrapperElementType(arg(7).getType());
+  auto bridge = [&](mlir::Value v, mlir::Type e) {
+    return bridgePtrToMemref(builder, loc, v, e);
+  };
+  auto repl = mlir::triton::metal::SoftmaxAttentionBackwardDqOp::create(
+      builder, loc, bridge(arg(0), f32), bridge(arg(1), f32),
+      bridge(arg(2), f32), bridge(arg(3), f32), bridge(arg(4), f32),
+      bridge(arg(5), f32), bridge(arg(6), f32), bridge(arg(7), u32),
+      bridge(arg(8), u32), bridge(arg(9), u32), bridge(arg(10), u32),
+      bridge(arg(11), u32), bridge(arg(12), u32), bridge(arg(13), f32),
+      bm, bn, bd);
+  repl.getGradient().takeBody(gradientRegion);
+  eraseMatchedAttentionBackwardBody(repl.getOperation(), entry);
+  return mlir::success();
+}
+
+static mlir::LogicalResult
+trySoftmaxAttentionBackwardDkdv(mlir::triton::FuncOp funcOp) {
+  auto decline = [&](llvm::StringRef why) {
+    if (::getenv("TRITON_METAL_FA_DEBUG"))
+      llvm::errs() << "[metal-attn-bwd-dkdv] rejected "
+                   << funcOp.getSymName() << ": " << why << "\n";
+    return mlir::failure();
+  };
+  if (funcOp.getBody().empty() ||
+      !isRawAttentionBackwardKernel(funcOp, "_attn_bwd_dkdv") ||
+      !attentionBackwardWarpEnvelope(funcOp))
+    return decline("symbol/body/warp envelope");
+  mlir::Block &entry = funcOp.getBody().front();
+  const unsigned numArgs = entry.getNumArguments();
+  if (numArgs != 19 && numArgs != 20)
+    return decline("argument count");
+  auto arg = [&](unsigned i) { return entry.getArgument(i); };
+  for (unsigned i = 0; i < 9; ++i)
+    if (!isF32PtrArg(arg(i)))
+      return decline("f32 pointer arguments");
+  for (unsigned i = 9; i < 18; ++i)
+    if (!arg(i).getType().isInteger(32))
+      return decline("i32 extent/stride arguments");
+  if (!arg(18).getType().isF32() ||
+      (numArgs == 20 && !arg(19).getType().isInteger(32)))
+    return decline("scale/accumulate arguments");
+
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  llvm::SmallVector<mlir::triton::DotOp> dots;
+  llvm::SmallVector<mlir::triton::StoreOp> stores;
+  llvm::SmallVector<mlir::triton::LoadOp> loads;
+  funcOp.walk([&](mlir::scf::ForOp op) { loops.push_back(op); });
+  funcOp.walk([&](mlir::triton::DotOp op) { dots.push_back(op); });
+  funcOp.walk([&](mlir::triton::StoreOp op) { stores.push_back(op); });
+  funcOp.walk([&](mlir::triton::LoadOp op) { loads.push_back(op); });
+  if (loops.size() != 1 || loops[0].getNumResults() != 2 ||
+      dots.size() != 2 || stores.size() != 2 || loads.size() != 9 ||
+      !attentionBackwardEffectsAreCovered(funcOp))
+    return decline("operation counts");
+  mlir::scf::ForOp loop = loops[0];
+  int64_t bn = tensorDim(dots[0].getResult(), 0);
+  int64_t bd = tensorDim(dots[0].getResult(), 1);
+  int64_t bm = tensorDim(dots[0].getA(), 1);
+  if (bm <= 0 || bn <= 0 || bd <= 0 || bm > 64)
+    return decline("dot tile shape");
+  unsigned loopDots = 0;
+  for (auto dot : dots)
+    if (dot->getBlock() == loop.getBody())
+      ++loopDots;
+  if (loopDots != 2)
+    return decline("dot outside streaming loop");
+  auto dotOperandConeMentions = [&](mlir::Value root) {
+    return llvm::any_of(dots, [&](mlir::triton::DotOp dot) {
+      return coneMentionsValue(dot.getA(), root) ||
+             coneMentionsValue(dot.getB(), root);
+    });
+  };
+  auto yield = llvm::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!dotOperandConeMentions(arg(0)) || !dotOperandConeMentions(arg(1)) ||
+      !dotOperandConeMentions(arg(2)) || !dotOperandConeMentions(arg(3)) ||
+      !yield || yield.getNumOperands() != 2)
+    return decline("key dataflow/store/yield shape");
+  for (auto dot : dots)
+    if (!coneMentionsValue(yield.getOperand(0), dot.getResult()) &&
+        !coneMentionsValue(yield.getOperand(1), dot.getResult()))
+      return decline("loop yield does not carry both dot results");
+  if (!hasStoreTo(stores, arg(7)) || !hasStoreTo(stores, arg(8)))
+    return decline("output stores do not target dK and dV");
+  mlir::triton::DotOp dkDot, dvDot;
+  for (auto dot : dots) {
+    if (attentionBackwardLoadFrom(dot.getB(), arg(0)))
+      dkDot = dot;
+    if (attentionBackwardLoadFrom(dot.getB(), arg(1)))
+      dvDot = dot;
+  }
+  if (!dkDot || !dvDot || dkDot == dvDot)
+    return decline("could not map dots to dK and dV operands");
+  mlir::Value safeDenominator;
+  if (!matchAttentionBackwardProbability(dvDot.getA(), arg(2), arg(4),
+                                         arg(5), &safeDenominator) ||
+      !matchAttentionBackwardDs(dkDot.getA(), dvDot.getA(), arg(3), arg(6),
+                                arg(18)))
+    return decline("probability/ds formula is not canonical");
+  using LoadOther = AttentionBackwardLoadOther;
+  using Index = AttentionBackwardIndex;
+  AttentionBackwardIndexContext indexContext{loop, bm, bn, bd, Index::Row,
+                                             Index::Key};
+  if (!matchAttentionBackwardLoadContract(
+          loads, arg(0), indexContext,
+          {{Index::Row, arg(15), arg(9)},
+           {Index::Feature, arg(17), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(1), indexContext,
+          {{Index::Row, arg(15), arg(10)},
+           {Index::Feature, arg(17), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(2), indexContext,
+          {{Index::Key, arg(16), arg(11)},
+           {Index::Row, arg(15), {}}},
+                                          LoadOther::NegativeInfinity) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(3), indexContext,
+          {{Index::Key, arg(16), arg(12)},
+           {Index::Row, arg(15), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(4), indexContext, {{Index::Row, arg(15), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(5), indexContext, {{Index::Row, arg(15), {}}},
+                                          LoadOther::One) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(6), indexContext, {{Index::Row, arg(15), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(7), indexContext,
+          {{Index::Key, arg(16), arg(13)},
+           {Index::Feature, arg(17), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardLoadContract(
+          loads, arg(8), indexContext,
+          {{Index::Key, arg(16), arg(14)},
+           {Index::Feature, arg(17), {}}},
+                                          LoadOther::Zero) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(7), indexContext,
+          {{Index::Key, arg(16), arg(13)},
+           {Index::Feature, arg(17), {}}}) ||
+      !matchAttentionBackwardStoreContract(
+          stores, arg(8), indexContext,
+          {{Index::Key, arg(16), arg(14)},
+           {Index::Feature, arg(17), {}}}))
+    return decline("load/store mask or fill contract is not canonical");
+  if (!matchAttentionBackwardDkdvStoredValues(
+          stores, loads, arg(7), arg(8), loop,
+          numArgs == 20 ? arg(19) : mlir::Value{}))
+    return decline("dK/dV accumulation and stored values are not canonical");
+  if (!sameAttentionBackwardCone(dkDot.getC(), loop.getRegionIterArg(0)) ||
+      !sameAttentionBackwardCone(dvDot.getC(), loop.getRegionIterArg(1)) ||
+      !sameAttentionBackwardCone(yield.getOperand(0), dkDot.getResult()) ||
+      !sameAttentionBackwardCone(yield.getOperand(1), dvDot.getResult()))
+    return decline("dot accumulators do not map exactly to dK/dV loop state");
+  mlir::Region gradientRegion;
+  if (!buildAttentionBackwardGradientRegion(
+          gradientRegion, loop.getLoc(), dvDot.getA(), dkDot.getA(),
+          findAttentionBackwardLoad(loads, arg(2)),
+          findAttentionBackwardLoad(loads, arg(3)),
+          findAttentionBackwardLoad(loads, arg(4)), safeDenominator,
+          findAttentionBackwardLoad(loads, arg(6)), arg(18)))
+    return decline("probability/ds cone cannot be regionized");
+  mlir::OpBuilder builder(loop);
+  auto loc = loop.getLoc();
+  auto f32 = builder.getF32Type();
+  auto u32 = wrapperElementType(arg(9).getType());
+  auto bridge = [&](mlir::Value v, mlir::Type e) {
+    return bridgePtrToMemref(builder, loc, v, e);
+  };
+  // Triton's equal-to-one scalar specialization removes `accumulate` from
+  // the function ABI for the later chunks. Keep one op shape for both JIT
+  // variants: -1 reads the real runtime operand, while +1 ignores the typed
+  // placeholder and materializes the specialized value in translation.
+  const bool accumulateIsSpecializedOne = numArgs == 19;
+  mlir::Value accumulateTransport =
+      accumulateIsSpecializedOne ? arg(17) : arg(19);
+  auto repl = mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp::create(
+      builder, loc, bridge(arg(0), f32), bridge(arg(1), f32),
+      bridge(arg(2), f32), bridge(arg(3), f32), bridge(arg(4), f32),
+      bridge(arg(5), f32), bridge(arg(6), f32), bridge(arg(7), f32),
+      bridge(arg(8), f32), bridge(arg(9), u32), bridge(arg(10), u32),
+      bridge(arg(11), u32), bridge(arg(12), u32), bridge(arg(13), u32),
+      bridge(arg(14), u32), bridge(arg(15), u32), bridge(arg(16), u32),
+      bridge(arg(17), u32), bridge(arg(18), f32),
+      bridge(accumulateTransport, u32),
+      accumulateIsSpecializedOne ? 1 : -1, bn, bm, bd);
+  repl.getGradient().takeBody(gradientRegion);
+  eraseMatchedAttentionBackwardBody(repl.getOperation(), entry);
+  return mlir::success();
+}
+
+static void runSoftmaxAttentionBackwardMatcher(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::FuncOp> funcs;
+  moduleOp.walk([&](mlir::triton::FuncOp f) { funcs.push_back(f); });
+  for (auto f : funcs) {
+    if (mlir::succeeded(trySoftmaxAttentionBackwardPre(f)))
+      continue;
+    if (mlir::succeeded(trySoftmaxAttentionBackwardDq(f)))
+      continue;
+    (void)trySoftmaxAttentionBackwardDkdv(f);
+  }
+}
+
 static mlir::Type getAtomicScalarType(mlir::Type type) {
   if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
     return tensor.getElementType();
@@ -27094,7 +29394,34 @@ static bool supportsCanonicalRuntimeMaskedMultiTilePreflight(
   auto stepAttr = step ? mlir::dyn_cast<mlir::IntegerAttr>(step.getValue())
                        : mlir::IntegerAttr();
   if (!lowerAttr || lowerAttr.getInt() != 0 || !stepAttr ||
-      stepAttr.getInt() <= 0 || stepAttr.getInt() % 8 != 0)
+      stepAttr.getInt() <= 0)
+    return false;
+
+  llvm::SmallVector<mlir::triton::AddPtrOp, 2> addPtrs;
+  for (mlir::Operation &bodyOp : loop.getBody()->getOperations())
+    if (auto addPtr = mlir::dyn_cast<mlir::triton::AddPtrOp>(bodyOp))
+      addPtrs.push_back(addPtr);
+  if (addPtrs.size() != 2)
+    return false;
+  auto bkOpt = extractConstantAddPtrBump(addPtrs[0]);
+  if (!bkOpt || *bkOpt % 8 != 0 ||
+      !normalizeRuntimeKLoopUpper(loop, *bkOpt))
+    return false;
+  auto bRegionArg = mlir::dyn_cast<mlir::BlockArgument>(addPtrs[1].getPtr());
+  if (!bRegionArg || bRegionArg.getOwner() != loop.getBody() ||
+      bRegionArg.getArgNumber() == 0)
+    return false;
+  unsigned bIdx = bRegionArg.getArgNumber() - 1;
+  if (bIdx >= loop.getNumRegionIterArgs())
+    return false;
+  mlir::Value dotB = dot.getB();
+  if (auto cvt =
+          dotB.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    dotB = cvt.getSrc();
+  const bool bTransposed =
+      static_cast<bool>(dotB.getDefiningOp<mlir::triton::TransOp>());
+  if (!addPtrBumpMatchesKTile(addPtrs[1], loop.getInits()[bIdx],
+                              /*kAxis=*/bTransposed ? 1 : 0, *bkOpt))
     return false;
 
   auto resultTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
@@ -27147,11 +29474,13 @@ static bool supportsCanonicalRuntimeMaskedMultiTilePreflight(
     if (!load.getOther() || !isNumericZero(load.getOther()))
       return false;
     MaskExtents extents =
-        extractMaskExtents(load.getMask(), /*allowDenseSplatBounds=*/true);
-    if (!extents.mExtent || !extents.nExtent)
-      return false;
-    if (!normalizeCanonicalKExtent(extents.mExtent, loop) &&
-        !normalizeCanonicalKExtent(extents.nExtent, loop))
+        extractMaskExtents(load.getMask(), /*allowDenseSplatBounds=*/true,
+                           /*requireBothMatrixAxes=*/false);
+    mlir::Value normalizedM =
+        normalizeCanonicalKExtent(extents.mExtent, loop, *bkOpt);
+    mlir::Value normalizedN =
+        normalizeCanonicalKExtent(extents.nExtent, loop, *bkOpt);
+    if (!normalizedM && !normalizedN)
       return false;
     mlir::Value init;
     for (auto [idx, iterArg] : llvm::enumerate(loop.getRegionIterArgs())) {
@@ -27160,9 +29489,20 @@ static bool supportsCanonicalRuntimeMaskedMultiTilePreflight(
         break;
       }
     }
-    if (!init || !extents.mIndex || !extents.nIndex ||
-        !valueConeContains(init, extents.mIndex) ||
-        !valueConeContains(init, extents.nIndex))
+    if (!init)
+      return false;
+    bool checkedAnyAxis = false;
+    if (extents.mIndex) {
+      if (!valueConeContains(init, extents.mIndex))
+        return false;
+      checkedAnyAxis = true;
+    }
+    if (extents.nIndex) {
+      if (!valueConeContains(init, extents.nIndex))
+        return false;
+      checkedAnyAxis = true;
+    }
+    if (!checkedAnyAxis)
       return false;
   }
   return true;
@@ -28230,6 +30570,12 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    // Softmax attention backward's raw leet kernels intentionally feed dots
+    // from computed softmax tiles and `other=-inf` masked loads. Claim those
+    // exact structural whole-kernel shapes before the generic dot-load zero
+    // sentinel sees the intermediate loads.
+    runSoftmaxAttentionBackwardMatcher(moduleOp);
+
     // Reject tt.load with an `other` operand only when it feeds a `tt.dot`
     // operand position. The matmul track does not (yet) honour Triton `other`
     // semantics under the simdgroup rewrite. Elementwise other-loads are
@@ -28335,6 +30681,14 @@ struct ConvertTritonGPUToMetalPass
     // staged-transpose envelope. Run before the generic dot/cvt preprocessors;
     // a successful match replaces the whole loop/store with one legal Metal op.
     runInt4WeightOnlyMatmulMatcher(moduleOp);
+
+    // Raw OLS keeps Gram and X^T y in one loop. Split only the proven
+    // independent dot/reduce accumulator pair so the existing single-result
+    // Gram fallback and rank-2 reduce paths can each lower their own loop.
+    if (mlir::failed(preprocessIndependentMixedAccumulatorLoops(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
 
     // Ordinary and weighted Gram matrices both use a physically transposed X
     // view and reduce over n_samples rather than the physical row stride.
@@ -29408,15 +31762,7 @@ struct ConvertTritonGPUToMetalPass
 
       bool candidate = isCanonicalRank2Axis1ArgminReduce(red);
       if (!candidate && srcs.size() == 1 && rtt.getElementType().isF32()) {
-        mlir::Operation *combine = nullptr;
-        if (red->getNumRegions() > 0 && !red->getRegion(0).empty()) {
-          for (mlir::Operation &nested : red->getRegion(0).front()) {
-            if (!mlir::isa<mlir::triton::ReduceReturnOp>(nested)) {
-              combine = &nested;
-              break;
-            }
-          }
-        }
+        mlir::Operation *combine = reduceCombineBinaryOp(red);
         candidate =
             combine && mlir::isa<mlir::arith::MinimumFOp,
                                   mlir::arith::MinNumFOp>(combine);

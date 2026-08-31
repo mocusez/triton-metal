@@ -112,7 +112,8 @@ def _solve(Q, K, V, output, M, d, window_size):
     BLOCK_N = 16
     BLOCK_D = max(16, triton.next_power_of_2(d))
     grid = (triton.cdiv(M, BLOCK_M), )
-    attention[grid](Q, K, V, output, M, M, d, window_size, BLOCK_M, BLOCK_N, BLOCK_D)
+    return attention[grid](Q, K, V, output, M, M, d, window_size,
+                           BLOCK_M, BLOCK_N, BLOCK_D)
 
 
 def _reference(Q, K, V, M, d, window_size):
@@ -169,19 +170,18 @@ def test_sliding_window_attention(M, d, window_size):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-def test_sliding_window_attention_over_budget_is_correct_not_rejected():
+def test_sliding_window_attention_over_budget_uses_chunked_mma():
     """d = 128 -> BLOCK_D = 128 -> 10784 threadgroup floats > the 8192 budget.
 
-    This used to be a HARD REJECT, and pinned as one: the simdgroup body needs
-    the whole working set in threadgroup memory, so an over-budget tile had
-    nowhere to go and the compile failed. `metal.fused_attention` carries a
-    scalar per-key body as its correctness floor and picks between the two by
-    threadgroup budget, so an over-budget shape now falls back and computes the
-    right answer instead of failing.
+    The original full-tile simdgroup body cannot allocate Q/K/V/S/P/O/Ot for
+    this shape at once. The chunked body keeps the complete O accumulator (so
+    output/input aliasing remains safe) while staging Q/K/V/S in smaller feature
+    chunks. This test pins that the former scalar fallback now reaches MMA.
 
-    The assertion is NUMERIC on purpose. The thing that could go wrong with the
-    fallback is a wrong answer, not a crash, so a bare "it compiles now" check
-    would pass just as happily on a body that silently drops the band mask.
+    The primary assertion is NUMERIC on purpose. The thing that could go wrong
+    with chunking is a wrong answer, not a crash, so a bare "it compiles now"
+    check would pass just as happily on a body that silently drops the band
+    mask. The structural assertions separately pin the multi-SIMD-group path.
     """
     M, d, window_size = 64, 128, 16
     torch.manual_seed(0xB0D)
@@ -190,8 +190,54 @@ def test_sliding_window_attention_over_budget_is_correct_not_rejected():
     V = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
     out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
 
-    _solve(Q, K, V, out, M, d, window_size)
+    compiled = _solve(Q, K, V, out, M, d, window_size)
 
+    # BM=16 has two useful 8-row tiles, so the source's four-warp request is
+    # capped at two SIMD-groups by the shared emitter/launcher schedule.
+    assert getattr(compiled.metadata, "threads_per_group", None) == 64
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "simdgroup_index_in_threadgroup" in msl
+    assert "uint _fa_warp = sgid" in msl
+    assert "mi += 2u" in msl
+    assert msl.count("simdgroup_multiply_accumulate") >= 2
+
+    expected = _reference(Q, K, V, M, d, window_size)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+def test_sliding_window_attention_chunked_mma_preserves_q_out_alias():
+    """Chunking must not use the output buffer as inter-chunk scratch storage."""
+    M, d, window_size = 64, 128, 16
+    torch.manual_seed(0xA11A5)
+    Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    expected = _reference(Q.clone(), K, V, M, d, window_size)
+
+    _solve(Q, K, V, Q, M, d, window_size)
+
+    torch.testing.assert_close(Q.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+def test_sliding_window_attention_too_wide_keeps_scalar_floor():
+    """A full BM*BD output accumulator that cannot fit still falls back."""
+    M, d, window_size = 16, 512, 4
+    torch.manual_seed(0xFA11)
+    Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    K = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    V = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
+
+    compiled = _solve(Q, K, V, out, M, d, window_size)
+
+    assert getattr(compiled.metadata, "threads_per_group", None) == 32
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "metal.fused_attention (per-key, region score transform)" in msl
+    assert "simdgroup_index_in_threadgroup" not in msl
     expected = _reference(Q, K, V, M, d, window_size)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 

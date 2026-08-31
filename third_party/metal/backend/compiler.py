@@ -322,12 +322,11 @@ class MetalBackend(BaseBackend):
         # with, and a non-empty list is also how the launcher knows the kernel
         # has that extra parameter at all.
         metadata["debug_messages"] = list(debug_messages)
-        # A kernel that IS one `metal.fused_attention` runs on a single warp,
-        # so the launch needs 32 threads whatever `num_warps` the source asked
-        # for. Recorded separately rather than by overwriting `num_warps`: that
-        # field drove codegen and is part of the cache key, and a value that no
-        # longer matches the IR it produced would be a lie to every later
-        # reader.
+        # A kernel that IS one scheduled attention op reports the exact
+        # threadgroup size selected by its scalar or multi-SIMD-group schedule.
+        # Record it separately rather than overwriting `num_warps`: that field
+        # drove TTGIR codegen and remains part of the cache key, while the fused
+        # op is free to cap otherwise-idle SIMD-groups to its 8-row tile count.
         if threads_per_group:
             metadata["threads_per_group"] = threads_per_group
         # CompiledKernel.__init__ requires metadata["name"]; mirror how
