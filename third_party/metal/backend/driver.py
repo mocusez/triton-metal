@@ -374,10 +374,9 @@ class MetalLauncher:
         if self._has_tensordesc:
             self._arg_types = expand_signature(self._arg_types, None, "")
         # num_warps × warp_size = threadgroup x-dim. Default to 4×32=128.
-        # `threads_per_group`, when the compiler set it, overrides that: a
-        # kernel that lowers to a single `metal.fused_attention` runs its whole
-        # body on one warp, so honouring a source `num_warps=4` there would
-        # launch 128 threads and have 96 of them exit immediately (~12%).
+        # `threads_per_group`, when the compiler set it, overrides that.
+        # Scheduled attention kernels use this so dispatch cannot drift from
+        # the threadgroup geometry selected by their MSL emitter.
         nw = getattr(metadata, "num_warps", 4)
         ws = 32
         tpg = getattr(metadata, "threads_per_group", None)

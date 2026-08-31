@@ -22,6 +22,30 @@ class Operation;
 namespace triton { namespace metal {
 class KernelOp;
 
+struct FusedAttentionSchedule {
+  bool useMma;
+  bool chunked;
+  int numWarps;
+  int threadsPerGroup;
+  int blockK;
+  int blockDHead;
+  int blockOutD;
+};
+
+// One source of truth for the fused-attention body and launch geometry.  The
+// MMA body assigns one or more 8-row tiles to each SIMD-group; the scalar floor
+// remains single-SIMD-group.  The launcher queries the same schedule so it
+// cannot dispatch a threadgroup shape that disagrees with the emitted MSL.
+FusedAttentionSchedule getFusedAttentionSchedule(FusedAttentionOp op);
+
+// Backward attention currently keeps the source 8-warp geometry, but expose
+// that decision through the same metadata path as forward fused attention.
+// This makes the launch contract explicit and prevents a future schedule
+// change from drifting away from the driver dispatch size.
+int getAttentionBackwardThreadsPerGroup(SoftmaxAttentionBackwardPreOp op);
+int getAttentionBackwardThreadsPerGroup(SoftmaxAttentionBackwardDqOp op);
+int getAttentionBackwardThreadsPerGroup(SoftmaxAttentionBackwardDkdvOp op);
+
 class ModuleTranslation {
 public:
   static llvm::LogicalResult translateModule(mlir::ModuleOp m,
@@ -142,6 +166,19 @@ private:
   void translate(mlir::triton::metal::Int8QuantizedMatmulOp op);
   void translate(mlir::triton::metal::LinearAttentionPreprocessOp op);
   void translate(mlir::triton::metal::LinearAttentionApplyOp op);
+  void translate(mlir::triton::metal::SoftmaxAttentionBackwardPreOp op);
+  std::string emitAttentionBackwardPreScoreRegion_(
+      mlir::triton::metal::SoftmaxAttentionBackwardPreOp op,
+      llvm::StringRef rawScoreExpr, llvm::StringRef rowExpr,
+      llvm::StringRef keyExpr, llvm::StringRef nTrueExpr,
+      llvm::StringRef scaleExpr, llvm::StringRef ind);
+  std::pair<std::string, std::string> emitAttentionBackwardGradientRegion_(
+      mlir::Operation *op, mlir::Region &region, llvm::StringRef scoreExpr,
+      llvm::StringRef dpExpr, llvm::StringRef mExpr,
+      llvm::StringRef lSafeExpr, llvm::StringRef deltaExpr,
+      llvm::StringRef scaleExpr, llvm::StringRef ind);
+  void translate(mlir::triton::metal::SoftmaxAttentionBackwardDqOp op);
+  void translate(mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp op);
   void translate(mlir::triton::metal::ReduceOp op);
   void translate(mlir::triton::metal::ArgmaxOp op);
   void translate(mlir::triton::metal::SoftmaxOp op);
@@ -154,6 +191,8 @@ private:
   // correctness floor and always applies. `translate` picks between them.
   void emitFusedAttentionScalar_(mlir::triton::metal::FusedAttentionOp op);
   void emitFusedAttentionMma_(mlir::triton::metal::FusedAttentionOp op);
+  void emitFusedAttentionMmaChunked_(
+      mlir::triton::metal::FusedAttentionOp op);
   // Binds a fused-attention region's block args to MSL temps: the pinned
   // prefix from `fixedInits`, then one per `score_params` buffer. Both regions
   // take the same params in the same order and the verifier pins their types,

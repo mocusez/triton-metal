@@ -39,6 +39,11 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_HIP_USE_COEXEC_SCHEDULER",
     "TRITON_HIP_USE_EXPERT_SCHEDULING",
     "TRITON_HIP_USE_IN_THREAD_TRANSPOSE",
+    // These switches select different emitted MSL bodies. Keep them in the
+    // compiler cache key so a diagnostic scalar compile cannot be reused as
+    // the normal SIMD-group attention kernel (or vice versa).
+    "TRITON_METAL_ATTN_BWD_SCALAR",
+    "TRITON_METAL_FUSED_ATTN_SCALAR",
     "TRITON_LLVM_DEBUG_ONLY",
     "TRITON_ENABLE_ASAN",
     "TRITON_OVERRIDE_ARCH",

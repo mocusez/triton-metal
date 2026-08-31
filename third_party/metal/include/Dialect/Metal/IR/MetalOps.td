@@ -865,6 +865,145 @@ def LinearAttentionApplyOp : Metal_Op<"linear_attention_apply"> {
 }
 
 //===----------------------------------------------------------------------===//
+// SoftmaxAttentionBackward*Op
+//===----------------------------------------------------------------------===//
+
+def AttentionBackwardScoreYieldOp : Metal_Op<
+    "attention_backward_score_yield",
+    [Pure, Terminator, HasParent<"SoftmaxAttentionBackwardPreOp">]> {
+  let summary = "Terminator of a backward-pre score-transform region";
+  let description = [{
+    Yields the stored logit for one (query row, key) pair. The parent binds the
+    region arguments to the raw Q@K value, global row/key indices, N_true, and
+    sm_scale. Keeping this scalar transform in IR lets one MMA schedule preserve
+    pure score variants without enumerating them in the emitter.
+  }];
+
+  let arguments = (ins F32:$value);
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+def SoftmaxAttentionBackwardPreOp : Metal_Op<"attention_backward_pre"> {
+  let summary = "Regionized softmax attention backward prepass";
+  let description = [{
+    Computes Q@K and dO@V with the source tile geometry, then runs `score` once
+    per logical (row, key) element before the fixed online-softmax recurrence.
+    The score region has the signature
+
+        (raw_score: f32, row: si32, key: si32,
+         n_true: ui32, sm_scale: f32) -> f32
+
+    and must end in `metal.attention_backward_score_yield`. The recurrence,
+    scratch addresses, and final state stores remain part of the op contract;
+    only the pure elementwise score transform is data-driven.
+  }];
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$kt,
+                       Metal_MemRefType:$vt, Metal_MemRefType:$dO,
+                       Metal_MemRefType:$s, Metal_MemRefType:$st,
+                       Metal_MemRefType:$dp, Metal_MemRefType:$dpt,
+                       Metal_MemRefType:$mp, Metal_MemRefType:$lp,
+                       Metal_MemRefType:$deltap,
+                       Metal_MemRefType:$stride_qm,
+                       Metal_MemRefType:$stride_kt,
+                       Metal_MemRefType:$stride_vt,
+                       Metal_MemRefType:$stride_dom,
+                       Metal_MemRefType:$stride_sm,
+                       Metal_MemRefType:$stride_stn,
+                       Metal_MemRefType:$stride_dpm,
+                       Metal_MemRefType:$stride_dptn,
+                       Metal_MemRefType:$m, Metal_MemRefType:$n_true,
+                       Metal_MemRefType:$d, Metal_MemRefType:$sm_scale,
+                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd);
+  let regions = (region SizedRegion<1>:$score);
+  let hasVerifier = 1;
+  let assemblyFormat = "$q `,` $kt `,` $vt `,` $dO `,` $s `,` $st `,` "
+                       "$dp `,` $dpt `,` $mp `,` $lp `,` $deltap `,` "
+                       "$stride_qm `,` $stride_kt `,` $stride_vt `,` "
+                       "$stride_dom `,` $stride_sm `,` $stride_stn `,` "
+                       "$stride_dpm `,` $stride_dptn `,` $m `,` "
+                       "$n_true `,` $d `,` $sm_scale attr-dict `:` "
+                       "type(operands) $score";
+}
+
+def AttentionBackwardGradientYieldOp : Metal_Op<
+    "attention_backward_gradient_yield", [Pure, Terminator]> {
+  let summary = "Terminator of a backward probability/gradient region";
+  let description = [{
+    Yields the scalar softmax probability and score gradient for one logical
+    attention element. The parent DQ or DKDV op binds the region arguments to
+    score, dp, m, l_safe, delta, and sm_scale respectively. Parent verifiers
+    restrict this terminator to those two operations.
+  }];
+
+  let arguments = (ins F32:$p, F32:$ds);
+  let hasVerifier = 1;
+  let assemblyFormat = "$p `,` $ds attr-dict `:` type($p) `,` type($ds)";
+}
+
+def SoftmaxAttentionBackwardDqOp : Metal_Op<"attention_backward_dq"> {
+  let summary = "Regionized softmax attention backward dQ";
+  let description = [{
+    Computes dQ using the source tile geometry. The `gradient` region has the
+    signature
+
+        (score: f32, dp: f32, m: f32, l_safe: f32,
+         delta: f32, sm_scale: f32) -> (p: f32, ds: f32)
+
+    and must end in `metal.attention_backward_gradient_yield`. The converter
+    admits only proven rearrangements of the canonical probability and score
+    gradient formulas; address, dot, and accumulator contracts remain fixed.
+  }];
+  let arguments = (ins Metal_MemRefType:$k, Metal_MemRefType:$s,
+                       Metal_MemRefType:$dp, Metal_MemRefType:$mp,
+                       Metal_MemRefType:$lp, Metal_MemRefType:$deltap,
+                       Metal_MemRefType:$dq, Metal_MemRefType:$stride_kn,
+                       Metal_MemRefType:$stride_sm,
+                       Metal_MemRefType:$stride_dpm,
+                       Metal_MemRefType:$stride_dqm, Metal_MemRefType:$m,
+                       Metal_MemRefType:$d, Metal_MemRefType:$sm_scale,
+                       I64Attr:$bm, I64Attr:$bn, I64Attr:$bd);
+  let regions = (region SizedRegion<1>:$gradient);
+  let hasVerifier = 1;
+  let assemblyFormat = "$k `,` $s `,` $dp `,` $mp `,` $lp `,` $deltap "
+                       "`,` $dq `,` $stride_kn `,` $stride_sm `,` "
+                       "$stride_dpm `,` $stride_dqm `,` $m `,` $d `,` "
+                       "$sm_scale attr-dict `:` type(operands) $gradient";
+}
+
+def SoftmaxAttentionBackwardDkdvOp : Metal_Op<"attention_backward_dkdv"> {
+  let summary = "Regionized softmax attention backward dK/dV";
+  let description = [{
+    Computes dK and dV using the source tile geometry and a shared `gradient`
+    region with the same ABI as `metal.attention_backward_dq`. The yielded p
+    feeds dV while ds feeds dK. Source load/store addresses, dot roles, and the
+    output accumulation condition remain part of the fixed op contract.
+  }];
+  let arguments = (ins Metal_MemRefType:$q, Metal_MemRefType:$dO,
+                       Metal_MemRefType:$st, Metal_MemRefType:$dpt,
+                       Metal_MemRefType:$mp, Metal_MemRefType:$lp,
+                       Metal_MemRefType:$deltap, Metal_MemRefType:$dk,
+                       Metal_MemRefType:$dv, Metal_MemRefType:$stride_qm,
+                       Metal_MemRefType:$stride_dom,
+                       Metal_MemRefType:$stride_stn,
+                       Metal_MemRefType:$stride_dptn,
+                       Metal_MemRefType:$stride_dkn,
+                       Metal_MemRefType:$stride_dvn, Metal_MemRefType:$m,
+                       Metal_MemRefType:$n, Metal_MemRefType:$d,
+                       Metal_MemRefType:$sm_scale,
+                       Metal_MemRefType:$accumulate,
+                       I64Attr:$accumulate_mode, I64Attr:$bn,
+                       I64Attr:$bm, I64Attr:$bd);
+  let regions = (region SizedRegion<1>:$gradient);
+  let hasVerifier = 1;
+  let assemblyFormat = "$q `,` $dO `,` $st `,` $dpt `,` $mp `,` $lp "
+                       "`,` $deltap `,` $dk `,` $dv `,` $stride_qm "
+                       "`,` $stride_dom `,` $stride_stn `,` $stride_dptn "
+                       "`,` $stride_dkn `,` $stride_dvn `,` $m `,` $n "
+                       "`,` $d `,` $sm_scale `,` $accumulate attr-dict "
+                       "`:` type(operands) $gradient";
+}
+
+//===----------------------------------------------------------------------===//
 // ReduceOp
 //===----------------------------------------------------------------------===//
 
@@ -1716,8 +1855,10 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
 
       acc = c_init;
       for (k = 0; k < reduction_extent; ++k)
-        acc += a_buf[a_base_offset + a_batch_offset + gRow*stride_a + k]
-             * b_buf[b_base_offset + b_batch_offset + k*stride_b + gCol];
+        acc += a_buf[a_base_offset + a_batch_offset +
+                     gRow*stride_a + k*a_inner_stride]
+             * b_buf[b_base_offset + b_batch_offset +
+                     k*stride_b + gCol*b_inner_stride];
 
     where `(localBatch, linRow, linCol)` are recovered from the blocked tile
     geometry and `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)`.
@@ -1730,11 +1871,12 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     contributions for the current batch lane. The geometry is pinned to the
     function-wide tile loop so it remains aligned with the store when a folded
     result layout conversion uses a different blocked encoding. The reduction
-    trip count is `reduction_extent` (normally equal to `stride_a`).  A
+    trip count is `reduction_extent` (normally equal to logical K).  A
     `transpose_a` unit attribute changes A's physical index to
-    `k*stride_a + gRow`; a `transpose_b` unit attribute likewise changes B's to
-    `gCol*stride_b + k`, which is what `tl.dot(a, tl.trans(b))` means when b is
-    stored `[N, K]` (an `nn.Linear` weight, among others). Without it the
+    `k*stride_a + gRow*a_inner_stride`; a `transpose_b` unit attribute likewise
+    changes B's to `gCol*stride_b + k*b_inner_stride`, which is what
+    `tl.dot(a, tl.trans(b))` means when b is stored `[N, K]` (an `nn.Linear`
+    weight, among others). Without it the
     matcher's peel through `tt.trans` silently dropped the transpose and indexed
     B as if it were `[K, N]`; an optional `weight_buf` multiplies each product by
     `weight_buf[k]`.  Together these two narrow extensions represent the
@@ -1772,6 +1914,7 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        AnyType:$a_batch_offset, AnyType:$b_batch_offset,
                        UI32:$batch_origin, UI32:$row_origin, UI32:$col_origin,
                        UI32:$stride_a, UI32:$stride_b,
+                       UI32:$a_inner_stride, UI32:$b_inner_stride,
                        UI32:$reduction_extent,
                        AnyType:$c_init,
                        Variadic<AnyType>:$output_indices,
@@ -1786,7 +1929,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        "$b_base_offset `]` `batch_offset` `[` $a_batch_offset"
                        " `,` $b_batch_offset `]` `origin` `[` $batch_origin"
                        " `,` $row_origin `,` $col_origin `]`"
-                       " `,` $stride_a `,` $stride_b `,` $reduction_extent"
+                       " `,` $stride_a `,` $stride_b `,` $a_inner_stride"
+                       " `,` $b_inner_stride `,` $reduction_extent"
                        " `,` $c_init"
                        " (`output` `[` $output_indices^ `]`)?"
                        " (`weight` $weight_buf^)?"

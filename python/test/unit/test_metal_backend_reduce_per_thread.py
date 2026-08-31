@@ -47,6 +47,35 @@ def reduce_per_thread_kernel(
     tl.store(out_ptr + offs_m, s)
 
 
+@triton.jit
+def conv1d_runtime_reduce_kernel(
+    input_ptr,
+    kernel_ptr,
+    output_ptr,
+    input_size,
+    kernel_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    p0 = tl.program_id(0)
+    offs_out = p0 * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for k in range(0, kernel_size, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < kernel_size
+        kernel = tl.load(kernel_ptr + offs_k, mask_k)
+
+        offs_i = offs_out[:, None] + offs_k[None, :]
+        mask_i = offs_i < input_size
+        values = tl.load(input_ptr + offs_i, mask_i)
+
+        acc += tl.sum(kernel[None, :] * values, axis=1)
+
+    mask_out = offs_out < (input_size - kernel_size + 1)
+    tl.store(output_ptr + offs_out, acc, mask_out)
+
+
 @pytest.mark.parametrize(
     "M, N",
     [
@@ -62,3 +91,36 @@ def test_reduce_per_thread_owned_f32(M, N):
     reduce_per_thread_kernel[(1, 1, 1)](x, out, BLOCK_M=M, BLOCK_N=N)
     expected = torch.sum(x.cpu(), dim=1)
     torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "input_size, kernel_size",
+    [
+        (1024, 7),
+        (2053, 73),
+        (4096, 129),
+    ],
+)
+def test_conv1d_runtime_loop_masked_product_reduce(input_size, kernel_size):
+    torch.manual_seed(input_size * 13 + kernel_size)
+    x = torch.randn((input_size,), dtype=torch.float32, device="mps")
+    kernel = torch.randn((kernel_size,), dtype=torch.float32, device="mps")
+    out_size = input_size - kernel_size + 1
+    out = torch.zeros((out_size,), dtype=torch.float32, device="mps")
+
+    conv1d_runtime_reduce_kernel[(triton.cdiv(out_size, 1024),)](
+        x,
+        kernel,
+        out,
+        input_size,
+        kernel_size,
+        BLOCK_SIZE=1024,
+        BLOCK_K=64,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+
+    expected = torch.nn.functional.conv1d(
+        x.cpu().view(1, 1, -1), kernel.cpu().view(1, 1, -1)
+    ).flatten()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)

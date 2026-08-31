@@ -34,6 +34,9 @@ BFS_PATH = LEET_FIXTURES / "hard-bfs_shortest_path.py"
 FUSED_RMS_NORM_PATH = (
     LEET_FIXTURES / "medium-fused_residual_add_and_rms_norm.py"
 )
+FLASH_ATTENTION_TEST_PATH = Path(__file__).resolve().parent / (
+    "test_metal_backend_flash_attention.py"
+)
 
 
 def _load_exact_module(path: Path, name: str):
@@ -42,6 +45,13 @@ def _load_exact_module(path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_flash_attention_test_module_for_compile_only(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    return _load_exact_module(
+        FLASH_ATTENTION_TEST_PATH, "metal_flash_attention_compile_only")
 
 
 def _compile_to_msl(fn, signature, constexprs, *, num_warps, attrs=None):
@@ -58,6 +68,24 @@ def _compile_to_msl(fn, signature, constexprs, *, num_warps, attrs=None):
     return msl
 
 
+def _compile_backward_pre_to_msl(fn):
+    return _compile_to_msl(
+        fn,
+        {
+            "Q": "*fp32", "KT": "*fp32", "VT": "*fp32", "dO": "*fp32",
+            "S": "*fp32", "ST": "*fp32", "DP": "*fp32", "DPT": "*fp32",
+            "Mp": "*fp32", "Lp": "*fp32", "Deltap": "*fp32",
+            "stride_qm": "i32", "stride_kt": "i32", "stride_vt": "i32",
+            "stride_dom": "i32", "stride_sm": "i32", "stride_stn": "i32",
+            "stride_dpm": "i32", "stride_dptn": "i32", "M": "i32",
+            "N_true": "i32", "D": "i32", "sm_scale": "fp32",
+        },
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_D": 32},
+        num_warps=8,
+        attrs={"N_true": {"do_not_specialize": True}},
+    )
+
+
 @triton.jit
 def add_kernel_unmasked(
     x_ptr,
@@ -71,6 +99,48 @@ def add_kernel_unmasked(
     x = tl.load(x_ptr + offsets)
     y = tl.load(y_ptr + offsets)
     tl.store(output_ptr + offsets, x + y)
+
+
+def test_backward_pre_causal_mask_compiles_to_msl(monkeypatch):
+    flash_attention = _load_flash_attention_test_module_for_compile_only(
+        monkeypatch)
+    msl = _compile_backward_pre_to_msl(
+        flash_attention._causal_backward_pre_kernel())
+    assert "metal.attention_backward_pre computed-tile simdgroup MMA" in msl
+    assert "float score =" in msl
+    assert "-INFINITY" in msl
+    assert "<=" in msl
+    assert "&&" in msl
+
+
+def test_backward_pre_shifted_score_region_compiles_to_msl(monkeypatch):
+    flash_attention = _load_flash_attention_test_module_for_compile_only(
+        monkeypatch)
+    msl = _compile_backward_pre_to_msl(
+        flash_attention._shifted_score_backward_pre_kernel())
+    assert "metal.attention_backward_pre computed-tile simdgroup MMA" in msl
+    assert "float score =" in msl
+    assert "-INFINITY" in msl
+    assert re.search(
+        r"int32_t v\d+ = \(v\d+\) \+ \(v\d+\);\n"
+        r"\s*int32_t v\d+ = int32_t\(v\d+\);\n"
+        r"\s*bool v\d+ = \(v\d+\) < \(v\d+\);",
+        msl,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    [
+        "_wrong_recurrence_backward_pre_kernel",
+    ],
+)
+def test_backward_pre_near_misses_still_reject_compile_only(
+        monkeypatch, factory_name):
+    flash_attention = _load_flash_attention_test_module_for_compile_only(
+        monkeypatch)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_backward_pre_to_msl(getattr(flash_attention, factory_name)())
 
 
 @triton.jit
@@ -353,8 +423,11 @@ def test_bfs_shortest_path_exact_kernel_compiles_to_msl():
         "atomic_fetch_or_explicit",
     ):
         assert needle in msl, f"BFS MSL missing required substring {needle!r}.\n--- MSL ---\n{msl}\n"
-    assert "cumsum" not in msl.lower()
-    assert "scan" not in msl.lower()
+    assert msl.count("atomic_exchange_explicit") == 4, (
+        "BFS cumsum lowering must consume the old-value scalar returned by each "
+        "atomic exchange, not replay the exchange while filling the scan buffer."
+    )
+    assert "tt.scan" not in msl
 
 
 def test_fused_residual_rmsnorm_exact_kernels_compile_to_msl():

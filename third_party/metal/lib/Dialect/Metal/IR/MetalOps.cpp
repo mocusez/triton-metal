@@ -12,6 +12,7 @@
 #include "Dialect/Metal/IR/MetalTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir::triton::metal;
 
@@ -531,6 +532,170 @@ llvm::LogicalResult LinearAttentionPreprocessOp::verify() {
 llvm::LogicalResult LinearAttentionApplyOp::verify() {
   return verifyLinearAttentionBuffers(
       getOperation(), {getQ(), getKv(), getKsum(), getOut()}, {getM(), getD()});
+}
+
+static llvm::LogicalResult verifySoftmaxAttentionBackwardBuffers(
+    mlir::Operation *op, mlir::ValueRange floatBuffers,
+    mlir::ValueRange extentBuffers, mlir::ValueRange scaleBuffers) {
+  auto checkMemref = [&](mlir::Value value, mlir::Type elem,
+                         llvm::StringRef name) -> llvm::LogicalResult {
+    auto memref = llvm::dyn_cast<MetalMemRefType>(value.getType());
+    if (!memref)
+      return op->emitOpError() << name << " must be a !metal.memref";
+    if (memref.getType() != elem)
+      return op->emitOpError() << name << " element type must be " << elem
+                               << ", got " << memref.getType();
+    return mlir::success();
+  };
+
+  auto *ctx = op->getContext();
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto ui32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Unsigned);
+  for (auto [index, value] : llvm::enumerate(floatBuffers))
+    if (failed(checkMemref(value, f32,
+                           ("float operand " + llvm::Twine(index)).str())))
+      return mlir::failure();
+  for (auto [index, value] : llvm::enumerate(extentBuffers))
+    if (failed(checkMemref(value, ui32,
+                           ("extent operand " + llvm::Twine(index)).str())))
+      return mlir::failure();
+  for (auto [index, value] : llvm::enumerate(scaleBuffers))
+    if (failed(checkMemref(value, f32,
+                           ("scale operand " + llvm::Twine(index)).str())))
+      return mlir::failure();
+  return mlir::success();
+}
+
+llvm::LogicalResult SoftmaxAttentionBackwardPreOp::verify() {
+  if (failed(verifySoftmaxAttentionBackwardBuffers(
+      getOperation(),
+      {getQ(), getKt(), getVt(), getDO(), getS(), getSt(), getDp(), getDpt(),
+       getMp(), getLp(), getDeltap()},
+      {getStrideQm(), getStrideKt(), getStrideVt(), getStrideDom(),
+       getStrideSm(), getStrideStn(), getStrideDpm(), getStrideDptn(), getM(),
+       getNTrue(), getD()},
+      {getSmScale()})))
+    return mlir::failure();
+
+  if (getScore().empty())
+    return emitOpError() << "score region must contain one block";
+  mlir::Block &body = getScore().front();
+  if (body.getNumArguments() != 5)
+    return emitOpError()
+           << "score region must take raw_score, row, key, n_true and "
+              "sm_scale (got "
+           << body.getNumArguments() << " arguments)";
+  auto f32 = mlir::Float32Type::get(getContext());
+  auto si32 = mlir::IntegerType::get(getContext(), 32,
+                                     mlir::IntegerType::Signed);
+  auto ui32 = mlir::IntegerType::get(getContext(), 32,
+                                     mlir::IntegerType::Unsigned);
+  llvm::SmallVector<mlir::Type> expected = {f32, si32, si32, ui32, f32};
+  for (auto [index, type] : llvm::enumerate(expected))
+    if (body.getArgument(index).getType() != type)
+      return emitOpError() << "score region arg " << index << " must be "
+                           << type << ", got "
+                           << body.getArgument(index).getType();
+  if (body.empty())
+    return emitOpError() << "score region must end in "
+                            "metal.attention_backward_score_yield";
+  for (mlir::Operation &nested : body.without_terminator()) {
+    if (!mlir::isMemoryEffectFree(&nested))
+      return emitOpError() << "score region op '" << nested.getName()
+                           << "' must be memory-effect free";
+    if (nested.getNumResults() != 1)
+      return emitOpError() << "score region op '" << nested.getName()
+                           << "' must produce exactly one result";
+  }
+  auto yield =
+      llvm::dyn_cast<AttentionBackwardScoreYieldOp>(body.getTerminator());
+  if (!yield)
+    return emitOpError()
+           << "score region must end in "
+              "metal.attention_backward_score_yield";
+  if (yield.getValue().getType() != f32)
+    return emitOpError() << "metal.attention_backward_score_yield must yield "
+                            "f32, got "
+                         << yield.getValue().getType();
+  return mlir::success();
+}
+
+llvm::LogicalResult AttentionBackwardGradientYieldOp::verify() {
+  if (!llvm::isa<SoftmaxAttentionBackwardDqOp,
+                 SoftmaxAttentionBackwardDkdvOp>((*this)->getParentOp()))
+    return emitOpError()
+           << "must terminate metal.attention_backward_dq or "
+              "metal.attention_backward_dkdv";
+  return mlir::success();
+}
+
+static llvm::LogicalResult verifyAttentionBackwardGradientRegion(
+    mlir::Operation *op, mlir::Region &region) {
+  if (region.empty())
+    return op->emitOpError() << "gradient region must contain one block";
+  mlir::Block &body = region.front();
+  if (body.getNumArguments() != 6)
+    return op->emitOpError()
+           << "gradient region must take score, dp, m, l_safe, delta and "
+              "sm_scale (got "
+           << body.getNumArguments() << " arguments)";
+  auto f32 = mlir::Float32Type::get(op->getContext());
+  for (auto [index, argument] : llvm::enumerate(body.getArguments()))
+    if (argument.getType() != f32)
+      return op->emitOpError() << "gradient region arg " << index
+                               << " must be f32, got "
+                               << argument.getType();
+  if (body.empty())
+    return op->emitOpError()
+           << "gradient region must end in "
+              "metal.attention_backward_gradient_yield";
+  for (mlir::Operation &nested : body.without_terminator()) {
+    if (!mlir::isMemoryEffectFree(&nested))
+      return op->emitOpError() << "gradient region op '" << nested.getName()
+                               << "' must be memory-effect free";
+    if (nested.getNumResults() != 1)
+      return op->emitOpError() << "gradient region op '" << nested.getName()
+                               << "' must produce exactly one result";
+  }
+  auto yield = llvm::dyn_cast<AttentionBackwardGradientYieldOp>(
+      body.getTerminator());
+  if (!yield)
+    return op->emitOpError()
+           << "gradient region must end in "
+              "metal.attention_backward_gradient_yield";
+  if (yield.getP().getType() != f32 || yield.getDs().getType() != f32)
+    return op->emitOpError()
+           << "metal.attention_backward_gradient_yield must yield two f32 "
+              "values";
+  return mlir::success();
+}
+
+llvm::LogicalResult SoftmaxAttentionBackwardDqOp::verify() {
+  if (failed(verifySoftmaxAttentionBackwardBuffers(
+      getOperation(), {getK(), getS(), getDp(), getMp(), getLp(), getDeltap(),
+                       getDq()},
+      {getStrideKn(), getStrideSm(), getStrideDpm(), getStrideDqm(), getM(),
+       getD()},
+      {getSmScale()})))
+    return mlir::failure();
+  return verifyAttentionBackwardGradientRegion(getOperation(), getGradient());
+}
+
+llvm::LogicalResult SoftmaxAttentionBackwardDkdvOp::verify() {
+  if (getAccumulateMode() != -1 && getAccumulateMode() != 1)
+    return emitOpError()
+           << "accumulate_mode must be -1 (runtime operand) or 1 "
+              "(Triton equal-to-one specialization)";
+  if (failed(verifySoftmaxAttentionBackwardBuffers(
+      getOperation(),
+      {getQ(), getDO(), getSt(), getDpt(), getMp(), getLp(), getDeltap(),
+       getDk(), getDv()},
+      {getStrideQm(), getStrideDom(), getStrideStn(), getStrideDptn(),
+       getStrideDkn(), getStrideDvn(), getM(), getN(), getD(),
+       getAccumulate()},
+      {getSmScale()})))
+    return mlir::failure();
+  return verifyAttentionBackwardGradientRegion(getOperation(), getGradient());
 }
 
 //===----------------------------------------------------------------------===//

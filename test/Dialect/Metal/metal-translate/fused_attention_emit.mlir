@@ -104,6 +104,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    // A direct emitter regression for a non-power-of-two static dQ tile. The
+    // preferred BO=32 does not divide BD=48, so the scheduler must select
+    // BO=24 and keep every simdgroup store inside the [BM, BD] accumulator.
+    metal.kernel backward_dq_bd48_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%k: !metal.memref<? x f32>, %s: !metal.memref<? x f32>, %dp: !metal.memref<? x f32>, %mp: !metal.memref<? x f32>, %lp: !metal.memref<? x f32>, %delta: !metal.memref<? x f32>, %dq: !metal.memref<? x f32>, %skn: !metal.memref<? x ui32>, %ssm: !metal.memref<? x ui32>, %sdpm: !metal.memref<? x ui32>, %sdqm: !metal.memref<? x ui32>, %m: !metal.memref<? x ui32>, %d: !metal.memref<? x ui32>, %scale: !metal.memref<? x f32>):
+      metal.attention_backward_dq %k, %s, %dp, %mp, %lp, %delta, %dq, %skn, %ssm, %sdpm, %sdqm, %m, %d, %scale {bm = 16 : i64, bn = 32 : i64, bd = 48 : i64} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x f32> {
+      ^bb0(%score: f32, %dpv: f32, %mv: f32, %ls: f32, %de: f32, %sc: f32):
+        %centered_score = metal.binary_exp %score, %mv, subOp : (f32, f32) -> f32
+        %numerator = metal.unary_exp %centered_score, expOp : (f32) -> f32
+        %p = metal.binary_exp %numerator, %ls, divOp : (f32, f32) -> f32
+        %centered_dp = metal.binary_exp %dpv, %de, subOp : (f32, f32) -> f32
+        %weighted = metal.binary_exp %p, %centered_dp, mulOp : (f32, f32) -> f32
+        %ds = metal.binary_exp %weighted, %sc, mulOp : (f32, f32) -> f32
+        metal.attention_backward_gradient_yield %p, %ds : f32, f32
+      }
+      metal.return
+    }
   }
 }
 
@@ -141,16 +158,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // region is evaluated over the staged S tile — which is the whole point: one
 // emitter, two bodies, no per-variant code.
 // CHECK-LABEL: kernel void softmax_kernel
+// CHECK: uint sgid {{\[\[}}simdgroup_index_in_threadgroup]]
 // CHECK: threadgroup float _fa_sbuf[1024]
 // CHECK: threadgroup float _fa_pbuf[1024]
 // CHECK: threadgroup float _fa_rmax[32]
+// CHECK: uint _fa_tid = ltid.x;
+// CHECK: uint _fa_warp = sgid;
+// CHECK: bool _fa_active = _fa_tid < 128u;
+// CHECK: for (uint c = _fa_tid; c < 512u; c += 128u)
+// CHECK: for (uint mi = _fa_warp; mi < 4u; mi += 4u)
 // CHECK: simdgroup_multiply_accumulate
 // the region, inlined over the staged score tile
+// CHECK: uint q = _fa_tid; uint row = _fa_rowoff + q;
 // CHECK: = _fa_sbuf[q*32u + kk];
 // CHECK: _fa_pbuf[q*32u + kk] =
 // running state + rescale + epilogue divide
 // CHECK: float m_new = max(m_old, m_cur)
 // CHECK: _fa_rsum[q] = _fa_rsum[q]*scaler + denom
+// CHECK: for (uint mi = _fa_warp; mi < 4u; mi += 4u)
 // CHECK: simdgroup_multiply_accumulate
 // CHECK: / denom
 
@@ -207,3 +232,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: v1[_fa_kbase + _fa_khoff + kk * _fa_sk + _fa_col + d]
 // CHECK: v2[_fa_vbase + _fa_vhoff + kk * _fa_sv + _fa_col + d]
 // CHECK: v3[_fa_obase + _fa_ohoff + row * _fa_so + _fa_col + d]
+
+// --- backward dQ non-divisible output tile: BO=32 would overrun the final
+// [BM, BD] accumulator chunk, so the schedule must choose the largest divisor,
+// BO=24, while preserving the MMA path.
+// CHECK-LABEL: kernel void backward_dq_bd48_kernel
+// CHECK: metal.attention_backward_dq computed-tile simdgroup MMA
+// CHECK: for (uint dc = 0u; dc < 48u; dc += 24u)
+// CHECK: simdgroup_multiply_accumulate
+// CHECK-NOT: metal.attention_backward_dq scalar fallback

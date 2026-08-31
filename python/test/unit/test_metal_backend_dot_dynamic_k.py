@@ -182,10 +182,10 @@ def test_leet_sparse_dense_matmul_coalesces_duplicate_coordinates():
     torch.testing.assert_close(c_prepacked.cpu(), expected)
 
 
-def test_leet_sparse_dense_matmul_dense_input_compatibility():
+@pytest.mark.parametrize("M,N,K", [(8, 8, 8), (64, 64, 64), (70, 66, 96)])
+def test_leet_sparse_dense_matmul_dense_input_compatibility(M, N, K):
     module = _load_sparse_dense_matmul_module()
-    torch.manual_seed(0x5B5B)
-    M, N, K = 8, 8, 8
+    torch.manual_seed(0x5B5B + M * 17 + N * 3 + K)
     a_cpu = torch.randn((M, N), dtype=torch.float32)
     b_cpu = torch.randn((N, K), dtype=torch.float32)
     c = torch.empty((M, K), dtype=torch.float32, device="mps")
@@ -203,18 +203,19 @@ def test_leet_sparse_dense_matmul_dense_input_compatibility():
 
     torch.testing.assert_close(c.cpu(), a_cpu @ b_cpu, atol=1e-3, rtol=1e-3)
 
-    a_noncontiguous = a_cpu.to("mps").T
-    assert not a_noncontiguous.is_contiguous()
-    with pytest.raises(ValueError, match="contiguous"):
-        module.solve(
-            a_noncontiguous,
-            b_cpu.to("mps"),
-            c,
-            M,
-            N,
-            K,
-            M * N,
-        )
+    if (M, N, K) == (8, 8, 8):
+        a_noncontiguous = a_cpu.to("mps").T
+        assert not a_noncontiguous.is_contiguous()
+        with pytest.raises(ValueError, match="contiguous"):
+            module.solve(
+                a_noncontiguous,
+                b_cpu.to("mps"),
+                c,
+                M,
+                N,
+                K,
+                M * N,
+            )
 
 
 # --- W1: transposed B operand, tl.dot(a, tl.trans(w)) -------------------------
@@ -860,10 +861,76 @@ def test_dot_logistic_hessian_weighted_gram(n_samples, n_features):
     torch.testing.assert_close(hessian, ref, atol=2e-3, rtol=2e-3)
 
 
-# --- Ordinary least squares: unweighted Gram plus sample-tiled X^T y.
-#     The Gram loop exercises the transpose-A scalar-dot fallback; X^T y uses
-#     one program per (feature, sample block) and atomically combines the
-#     partials, avoiding an unsupported rank-2 reduce inside a stateful loop.
+# --- Ordinary least squares: raw single-loop Gram plus X^T y.
+#     The raw LeetGPU kernel carries acc_xtx and acc_xty in the same sample
+#     loop; Metal splits those independent accumulator slices before the Gram
+#     scalar-dot fallback runs. The raw source only writes the diagonal XtX
+#     feature block for n_features > BLOCK_N, so the raw-equivalent test below
+#     intentionally stays at n_features <= 32.
+@triton.jit
+def ordinary_least_squares_raw_kernel(
+    X, y, XtX, Xty, n_samples, n_features, stride_x_0, stride_x_1,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = pid_row
+    offset_row = pid_row * BLOCK_N + tl.arange(0, BLOCK_N)
+    offset_col = pid_col * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_row = offset_row < n_features
+    mask_col = offset_col < n_features
+
+    acc_xtx = tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32)
+    acc_xty = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for step in range(0, n_samples, BLOCK_M):
+        offset_m = step + tl.arange(0, BLOCK_M)
+        mask_m = offset_m < n_samples
+        x_mn = tl.load(
+            X + offset_m[:, None] * stride_x_0
+            + offset_col[None, :] * stride_x_1,
+            mask=mask_m[:, None] & mask_col[None, :],
+            other=0.0,
+        )
+        x_nm = tl.load(
+            X + offset_row[:, None] * stride_x_1
+            + offset_m[None, :] * stride_x_0,
+            mask=mask_row[:, None] & mask_m[None, :],
+            other=0.0,
+        )
+        acc_xtx += tl.dot(x_nm, x_mn)
+        y_m = tl.load(y + offset_m, mask=mask_m, other=0.0)
+        acc_xty += tl.sum(x_nm * y_m, axis=1)
+
+    tl.store(
+        XtX + offset_row[:, None] * n_features + offset_col[None, :],
+        acc_xtx,
+        mask=mask_row[:, None] & mask_col[None, :],
+    )
+    tl.store(Xty + offset_row, acc_xty, mask=mask_row)
+
+
+@pytest.mark.parametrize("n_samples,n_features", [(32, 8), (45, 16), (64, 32)])
+def test_dot_ordinary_least_squares_raw_mixed_loop(n_samples, n_features):
+    torch.manual_seed(0xC0FFEE)
+    x = torch.randn((n_samples, n_features), dtype=torch.float32).contiguous()
+    y = torch.randn((n_samples,), dtype=torch.float32).contiguous()
+    xtx = torch.full((n_features, n_features), torch.nan, dtype=torch.float32)
+    xty = torch.full((n_features,), torch.nan, dtype=torch.float32)
+
+    ordinary_least_squares_raw_kernel[(triton.cdiv(n_features, 32),)](
+        x, y, xtx, xty,
+        n_samples, n_features,
+        x.stride(0), x.stride(1),
+        BLOCK_M=32, BLOCK_N=32,
+    )
+
+    torch.testing.assert_close(xtx, x.t() @ x, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(xty, x.t() @ y, atol=2e-3, rtol=2e-3)
+
+
+# Corrected OLS canary for n_features > BLOCK_N. The raw LeetGPU kernel uses a
+# one-dimensional program grid and leaves off-diagonal XtX blocks unwritten, so
+# this separate path keeps the fixture's intended two-dimensional coverage.
 @triton.jit
 def ordinary_least_squares_gram_kernel(
     X, XtX, n_samples, n_features, stride_x_0, stride_x_1,
@@ -917,8 +984,8 @@ def ordinary_least_squares_xty_kernel(
     tl.atomic_add(Xty + pid_n, tl.sum(x_m * y_m))
 
 
-@pytest.mark.parametrize("n_samples,n_features", [(32, 8), (45, 37), (64, 32)])
-def test_dot_ordinary_least_squares_gram_and_xty(n_samples, n_features):
+@pytest.mark.parametrize("n_samples,n_features", [(45, 37)])
+def test_dot_ordinary_least_squares_corrected_large_feature_canary(n_samples, n_features):
     torch.manual_seed(0xC0FFEE)
     x = torch.randn((n_samples, n_features), dtype=torch.float32).contiguous()
     y = torch.randn((n_samples,), dtype=torch.float32).contiguous()
