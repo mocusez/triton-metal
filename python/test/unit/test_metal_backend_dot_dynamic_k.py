@@ -17,6 +17,7 @@ an 8x8 program grid. See `metal-lora-linear-fix-plan.md` (W2a).
 from __future__ import annotations
 
 import importlib.util
+import types
 from pathlib import Path
 
 import pytest
@@ -1111,21 +1112,68 @@ def _linear_phi(x):
     return torch.where(x > 0, x + 1, torch.exp(x))
 
 
-def _run_linear_attention(q, k, v, out):
+def _clone_jit(fn, name):
+    raw = fn.fn
+    cloned = types.FunctionType(
+        raw.__code__, raw.__globals__, name, raw.__defaults__, raw.__closure__
+    )
+    cloned.__annotations__ = dict(getattr(raw, "__annotations__", {}))
+    cloned.__kwdefaults__ = getattr(raw, "__kwdefaults__", None)
+    cloned.__module__ = raw.__module__
+    return triton.jit(cloned)
+
+
+renamed_matmulKV_kernel = _clone_jit(matmulKV_kernel, "renamed_matmulKV")
+renamed_linear_attn_kernel = _clone_jit(linear_attn_kernel, "renamed_linear_attn")
+
+
+def _run_linear_attention(q, k, v, out, *, preprocess=matmulKV_kernel,
+                          apply=linear_attn_kernel):
     M, D = q.shape
     block_d = max(16, triton.next_power_of_2(D))
     kt = k.T.contiguous()
     kv = torch.zeros((D, D), dtype=torch.float32, device=q.device)
     ksum = torch.zeros((D,), dtype=torch.float32, device=q.device)
-    matmulKV_kernel[(triton.cdiv(M, 256),)](
+    preprocess[(triton.cdiv(M, 256),)](
         kt, v, kv, ksum, M, D,
         BLOCK_M=64, NUM_ITER=4, BLOCK_D=block_d, num_warps=16,
     )
-    linear_attn_kernel[(triton.cdiv(D, 64), triton.cdiv(M, 64))](
+    apply[(triton.cdiv(D, 64), triton.cdiv(M, 64))](
         q, kv, ksum, out, M, D,
         BLOCK_M=32, NUM_ITER=2, BLOCK_D=block_d, BLOCK_d=64, num_warps=8,
     )
     return kv, ksum
+
+
+def _metal_text(compiled):
+    metal = compiled.asm["metal"]
+    return metal.decode() if isinstance(metal, bytes) else metal
+
+
+def _compile_linear_attention_preprocess(kernel, num_warps):
+    M, D = 64, 32
+    kt = torch.empty((D, M), dtype=torch.float32, device="mps")
+    v = torch.empty((M, D), dtype=torch.float32, device="mps")
+    kv = torch.empty((D, D), dtype=torch.float32, device="mps")
+    ksum = torch.empty((D,), dtype=torch.float32, device="mps")
+    return _metal_text(kernel.warmup(
+        kt, v, kv, ksum, M, D,
+        BLOCK_M=64, NUM_ITER=4, BLOCK_D=32,
+        grid=(1,), num_warps=num_warps,
+    ))
+
+
+def _compile_linear_attention_apply(kernel, num_warps):
+    M, D = 64, 32
+    q = torch.empty((M, D), dtype=torch.float32, device="mps")
+    kv = torch.empty((D, D), dtype=torch.float32, device="mps")
+    ksum = torch.empty((D,), dtype=torch.float32, device="mps")
+    out = torch.empty((M, D), dtype=torch.float32, device="mps")
+    return _metal_text(kernel.warmup(
+        q, kv, ksum, out, M, D,
+        BLOCK_M=32, NUM_ITER=2, BLOCK_D=32, BLOCK_d=64,
+        grid=(1, 1), num_warps=num_warps,
+    ))
 
 
 @pytest.mark.parametrize("M,D", [(256, 16), (300, 32)])
@@ -1168,3 +1216,63 @@ def test_linear_attention_solve_matches_reference(M, D):
     assert actual.isfinite().all()
     assert not torch.any(actual == float(sentinel))
     torch.testing.assert_close(actual, expected, atol=3e-3, rtol=3e-3)
+
+
+def test_linear_attention_renamed_kernels_match_reference():
+    M, D = 128, 32
+    torch.manual_seed(0x1A771A)
+    q = torch.randn((M, D), dtype=torch.float32, device="mps").contiguous()
+    k = torch.randn((M, D), dtype=torch.float32, device="mps").contiguous()
+    v = torch.randn((M, D), dtype=torch.float32, device="mps").contiguous()
+    out = torch.empty((M, D), dtype=torch.float32, device="mps")
+
+    _run_linear_attention(
+        q,
+        k,
+        v,
+        out,
+        preprocess=renamed_matmulKV_kernel,
+        apply=renamed_linear_attn_kernel,
+    )
+    torch.mps.synchronize()
+
+    qf = _linear_phi(q.cpu())
+    kf = _linear_phi(k.cpu())
+    vf = v.cpu()
+    expected = (qf @ (kf.T @ vf)) / (
+        (qf * kf.sum(0)).sum(1, keepdim=True) + 1e-5
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=3e-3, rtol=3e-3)
+    assert (
+        "metal.linear_attention_preprocess scalar fallback"
+        in _compile_linear_attention_preprocess(renamed_matmulKV_kernel, 16)
+    )
+    assert (
+        "metal.linear_attention_apply scalar fallback"
+        in _compile_linear_attention_apply(renamed_linear_attn_kernel, 8)
+    )
+
+
+@pytest.mark.parametrize(
+    "compile_kernel,marker",
+    [
+        pytest.param(
+            lambda: _compile_linear_attention_preprocess(matmulKV_kernel, 8),
+            "metal.linear_attention_preprocess scalar fallback",
+            id="preprocess_wrong_warps",
+        ),
+        pytest.param(
+            lambda: _compile_linear_attention_apply(linear_attn_kernel, 16),
+            "metal.linear_attention_apply scalar fallback",
+            id="apply_wrong_warps",
+        ),
+    ],
+)
+def test_linear_attention_matcher_rejects_adjacent_warp_shape(
+        compile_kernel, marker):
+    try:
+        metal = compile_kernel()
+    except RuntimeError as error:
+        assert "convert-tritongpu-to-metal failed" in str(error)
+    else:
+        assert marker not in metal

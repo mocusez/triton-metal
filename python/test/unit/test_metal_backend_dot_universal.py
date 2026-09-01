@@ -19,6 +19,7 @@ Shape conventions:
 - The kernel is a single canonical 3-iter-arg matmul; correctness of each
   axis (M-tile, N-tile, K-tile) is verified against `torch.matmul`.
 """
+
 from __future__ import annotations
 
 import os
@@ -42,9 +43,18 @@ if not torch.backends.mps.is_available():
 
 @triton.jit
 def dot_universal_kernel(
-    a_ptr, b_ptr, c_ptr,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     K_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -93,6 +103,270 @@ def dot_scaled_e4m3_u8_kernel(
         fast_math=False,
     )
     tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e4m3_masked_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    OTHER: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+    b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+    a = tl.load(
+        a_ptr + offs_m[:, None] * K + offs_k[None, :],
+        mask=a_mask,
+        other=OTHER,
+    )
+    b = tl.load(
+        b_ptr + offs_k[:, None] * N + offs_n[None, :],
+        mask=b_mask,
+        other=OTHER,
+    )
+    a_scale = tl.load(a_scale_ptr + offs_m[:, None])
+    b_scale = tl.load(b_scale_ptr + offs_n[:, None])
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(
+        c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :],
+        result,
+        mask=c_mask,
+    )
+
+
+@triton.jit
+def dot_scaled_e4m3_batched_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    BATCH: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    PER_BATCH_SCALES: tl.constexpr,
+    A_SCALE_BATCH_STRIDE: tl.constexpr,
+    B_SCALE_BATCH_STRIDE: tl.constexpr,
+):
+    offs_b = tl.arange(0, BATCH)
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, K)
+    offs_scale_k = tl.arange(0, K // 32)
+    a = tl.load(a_ptr + offs_b[:, None, None] * M * K + offs_m[None, :, None] * K + offs_k[None, None, :])
+    b = tl.load(b_ptr + offs_b[:, None, None] * K * N + offs_k[None, :, None] * N + offs_n[None, None, :])
+    if PER_BATCH_SCALES:
+        a_scale = tl.load(
+            a_scale_ptr
+            + offs_b[:, None, None] * A_SCALE_BATCH_STRIDE
+            + offs_m[None, :, None] * (K // 32)
+            + offs_scale_k[None, None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr
+            + offs_b[:, None, None] * B_SCALE_BATCH_STRIDE
+            + offs_n[None, :, None] * (K // 32)
+            + offs_scale_k[None, None, :]
+        )
+    else:
+        a_scale = tl.load(
+            a_scale_ptr + offs_b[:, None, None] * 0 + offs_m[None, :, None] * (K // 32) + offs_scale_k[None, None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr + offs_b[:, None, None] * 0 + offs_n[None, :, None] * (K // 32) + offs_scale_k[None, None, :]
+        )
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    tl.store(
+        c_ptr + offs_b[:, None, None] * M * N + offs_m[None, :, None] * N + offs_n[None, None, :],
+        result,
+    )
+
+
+@triton.jit
+def dot_scaled_e4m3_batched_masked_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    actual_batch,
+    M,
+    N,
+    K,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MASK_BATCH: tl.constexpr,
+    BATCH_BOUND_BIAS: tl.constexpr,
+):
+    offs_b = tl.arange(0, BLOCK_BATCH)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_mask = (offs_m[None, :, None] < M) & (offs_k[None, None, :] < K)
+    b_mask = (offs_k[None, :, None] < K) & (offs_n[None, None, :] < N)
+    c_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N)
+    if MASK_BATCH:
+        batch_mask = offs_b[:, None, None] < actual_batch
+        b_batch_mask = batch_mask
+        if BATCH_BOUND_BIAS:
+            b_batch_mask = offs_b[:, None, None] < actual_batch + BATCH_BOUND_BIAS
+        a_mask &= batch_mask
+        b_mask &= b_batch_mask
+        c_mask &= batch_mask
+    a = tl.load(
+        a_ptr + offs_b[:, None, None] * BLOCK_M * BLOCK_K + offs_m[None, :, None] * BLOCK_K + offs_k[None, None, :],
+        mask=a_mask,
+        other=0,
+    )
+    b = tl.load(
+        b_ptr + offs_b[:, None, None] * BLOCK_K * BLOCK_N + offs_k[None, :, None] * BLOCK_N + offs_n[None, None, :],
+        mask=b_mask,
+        other=0,
+    )
+    a_scale = tl.load(a_scale_ptr + offs_b[:, None, None] * 0 + offs_m[None, :, None] * (BLOCK_K // 32))
+    b_scale = tl.load(b_scale_ptr + offs_b[:, None, None] * 0 + offs_n[None, :, None] * (BLOCK_K // 32))
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    tl.store(
+        c_ptr + offs_b[:, None, None] * BLOCK_M * BLOCK_N + offs_m[None, :, None] * BLOCK_N + offs_n[None, None, :],
+        result,
+        mask=c_mask,
+    )
+
+
+@triton.jit
+def dot_scaled_loop_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_FACTOR: tl.constexpr,
+    LOOP_START: tl.constexpr,
+    ELEM_TYPE: tl.constexpr,
+):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(
+            a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            ELEM_TYPE,
+            b,
+            b_scale,
+            ELEM_TYPE,
+            acc,
+            fast_math=False,
+        )
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+@triton.jit
+def dot_scaled_loop_e2m1_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    LOOP_START: tl.constexpr,
+    LHS_K_PACK: tl.constexpr,
+    RHS_K_PACK: tl.constexpr,
+    PACKED_K_DIVISOR: tl.constexpr,
+):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // 32)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        if LHS_K_PACK:
+            lhs_packed_k: tl.constexpr = BLOCK_K // 2
+            offs_lhs_packed_k = tl.arange(0, lhs_packed_k)
+            a = tl.load(a_ptr + offs_m[:, None] * (K // 2) + (k_start // PACKED_K_DIVISOR + offs_lhs_packed_k[None, :]))
+        else:
+            packed_m: tl.constexpr = M // 2
+            offs_packed_m = tl.arange(0, packed_m)
+            a = tl.load(a_ptr + offs_packed_m[:, None] * K + (k_start + offs_k[None, :]))
+        if RHS_K_PACK:
+            rhs_packed_k: tl.constexpr = BLOCK_K // 2
+            offs_rhs_packed_k = tl.arange(0, rhs_packed_k)
+            b = tl.load(b_ptr + (k_start // PACKED_K_DIVISOR + offs_rhs_packed_k[:, None]) * N + offs_n[None, :])
+        else:
+            packed_n: tl.constexpr = N // 2
+            offs_packed_n = tl.arange(0, packed_n)
+            b = tl.load(b_ptr + (k_start + offs_k[:, None]) * packed_n + offs_packed_n[None, :])
+        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // 32) + k_start // 32 + offs_scale_k[None, :])
+        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // 32) + k_start // 32 + offs_scale_k[None, :])
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            "e2m1",
+            b,
+            b_scale,
+            "e2m1",
+            acc,
+            fast_math=False,
+            lhs_k_pack=LHS_K_PACK,
+            rhs_k_pack=RHS_K_PACK,
+        )
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
 
 
 @triton.jit
@@ -196,6 +470,498 @@ def _run_dot_scaled_e4m3_u8(a, *, a_scale_raw=127):
     )
     torch.mps.synchronize()
     return output.cpu()
+
+
+def test_dot_scaled_e4m3_masked_ragged_mnk():
+    M, N, K = 13, 11, 27
+    block_m, block_n, block_k = 16, 16, 32
+    one = 0x38
+    a = torch.full((M, K), one, dtype=torch.uint8, device="mps")
+    b = torch.full((K, N), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((block_m, 1), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((block_n, 1), 127, dtype=torch.uint8, device="mps")
+    sentinel = -4321.0
+    output = torch.full((block_m, block_n), sentinel, dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_masked_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        OTHER=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    actual = output.cpu()
+    assert torch.equal(actual[:M, :N], torch.full((M, N), float(K)))
+    assert torch.all(actual[M:, :] == sentinel)
+    assert torch.all(actual[:, N:] == sentinel)
+
+
+def test_dot_scaled_masked_nonzero_other_is_named(capfd):
+    M = N = 8
+    K = 16
+    a = torch.zeros((M, K), dtype=torch.uint8, device="mps")
+    b = torch.zeros((K, N), dtype=torch.uint8, device="mps")
+    a_scale = torch.full((16, 1), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((16, 1), 127, dtype=torch.uint8, device="mps")
+    output = torch.empty((16, 16), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_e4m3_masked_u8_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            M,
+            N,
+            K,
+            BLOCK_M=16,
+            BLOCK_N=16,
+            BLOCK_K=32,
+            OTHER=0x38,
+            num_warps=4,
+        )
+    assert "zero-filled rectangular A/B loads" in capfd.readouterr().err
+
+
+def test_dot_scaled_e4m3_batched_shared_scales():
+    batch, M, N, K = 2, 16, 16, 64
+    one = 0x38
+    two = 0x40
+    a = torch.stack(
+        [
+            torch.full((M, K), one, dtype=torch.uint8),
+            torch.full((M, K), two, dtype=torch.uint8),
+        ]
+    ).to("mps")
+    b = torch.stack(
+        [
+            torch.full((K, N), one, dtype=torch.uint8),
+            torch.full((K, N), two, dtype=torch.uint8),
+        ]
+    ).to("mps")
+    a_scale = torch.full((M, K // 32), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((N, K // 32), 127, dtype=torch.uint8, device="mps")
+    output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_batched_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        batch,
+        M,
+        N,
+        K,
+        PER_BATCH_SCALES=False,
+        A_SCALE_BATCH_STRIDE=0,
+        B_SCALE_BATCH_STRIDE=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.stack([torch.full((M, N), float(K)), torch.full((M, N), float(4 * K))])
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_dot_scaled_e4m3_batched_per_batch_scales():
+    batch, M, N, K = 2, 16, 16, 64
+    one = 0x38
+    a = torch.full((batch, M, K), one, dtype=torch.uint8, device="mps")
+    b = torch.full((batch, K, N), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((batch, M, K // 32), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((batch, N, K // 32), 127, dtype=torch.uint8, device="mps")
+    a_scale[1] = 128
+    b_scale[1] = 129
+    output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_batched_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        batch,
+        M,
+        N,
+        K,
+        PER_BATCH_SCALES=True,
+        A_SCALE_BATCH_STRIDE=M * (K // 32),
+        B_SCALE_BATCH_STRIDE=N * (K // 32),
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.stack([torch.full((M, N), float(K)), torch.full((M, N), float(8 * K))])
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_dot_scaled_batched_noncontiguous_scale_batch_stride_is_named(capfd):
+    batch, M, N, K = 2, 16, 16, 32
+    a = torch.zeros((batch, M, K), dtype=torch.uint8, device="mps")
+    b = torch.zeros((batch, K, N), dtype=torch.uint8, device="mps")
+    a_scale = torch.full((batch * (M + 1), K // 32), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((batch, N, K // 32), 127, dtype=torch.uint8, device="mps")
+    output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_e4m3_batched_u8_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            batch,
+            M,
+            N,
+            K,
+            PER_BATCH_SCALES=True,
+            A_SCALE_BATCH_STRIDE=M * (K // 32) + 1,
+            B_SCALE_BATCH_STRIDE=N * (K // 32),
+            num_warps=4,
+        )
+    assert "contiguous per-batch scale matrices" in capfd.readouterr().err
+
+
+def test_dot_scaled_e4m3_batched_masked_ragged_mnk():
+    block_batch, block_m, block_n, block_k = 2, 16, 16, 32
+    M, N, K = 13, 11, 27
+    one = 0x38
+    a = torch.full((block_batch, block_m, block_k), one, dtype=torch.uint8, device="mps")
+    b = torch.full((block_batch, block_k, block_n), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((block_m, 1), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((block_n, 1), 127, dtype=torch.uint8, device="mps")
+    sentinel = -4321.0
+    output = torch.full(
+        (block_batch, block_m, block_n),
+        sentinel,
+        dtype=torch.float32,
+        device="mps",
+    )
+
+    dot_scaled_e4m3_batched_masked_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        block_batch,
+        M,
+        N,
+        K,
+        BLOCK_BATCH=block_batch,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        MASK_BATCH=False,
+        BATCH_BOUND_BIAS=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    actual = output.cpu()
+    assert torch.equal(actual[:, :M, :N], torch.full((block_batch, M, N), float(K)))
+    assert torch.all(actual[:, M:, :] == sentinel)
+    assert torch.all(actual[:, :, N:] == sentinel)
+
+
+def test_dot_scaled_e4m3_batched_masked_batch_tail():
+    block_batch, block_m, block_n, block_k = 2, 16, 16, 32
+    actual_batch, M, N, K = 1, 13, 11, 27
+    one = 0x38
+    a = torch.full((block_batch, block_m, block_k), one, dtype=torch.uint8, device="mps")
+    b = torch.full((block_batch, block_k, block_n), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((block_m, 1), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((block_n, 1), 127, dtype=torch.uint8, device="mps")
+    sentinel = -4321.0
+    output = torch.full(
+        (block_batch, block_m, block_n),
+        sentinel,
+        dtype=torch.float32,
+        device="mps",
+    )
+
+    dot_scaled_e4m3_batched_masked_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        actual_batch,
+        M,
+        N,
+        K,
+        BLOCK_BATCH=block_batch,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        MASK_BATCH=True,
+        BATCH_BOUND_BIAS=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    actual = output.cpu()
+    assert torch.equal(actual[0, :M, :N], torch.full((M, N), float(K)))
+    assert torch.all(actual[0, M:, :] == sentinel)
+    assert torch.all(actual[0, :, N:] == sentinel)
+    assert torch.all(actual[1] == sentinel)
+
+
+def test_dot_scaled_batched_mismatched_batch_tail_is_named(capfd):
+    block_batch, block_m, block_n, block_k = 2, 16, 16, 32
+    one = 0x38
+    a = torch.full((block_batch, block_m, block_k), one, dtype=torch.uint8, device="mps")
+    b = torch.full((block_batch, block_k, block_n), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((block_m, 1), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((block_n, 1), 127, dtype=torch.uint8, device="mps")
+    output = torch.empty((block_batch, block_m, block_n), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_e4m3_batched_masked_u8_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            1,
+            block_m,
+            block_n,
+            block_k,
+            BLOCK_BATCH=block_batch,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            MASK_BATCH=True,
+            BATCH_BOUND_BIAS=1,
+            num_warps=4,
+        )
+    assert "matching batch-tail bounds" in capfd.readouterr().err
+
+
+def _loop_scaled_inputs(*, M, N, K, one, two, dtype, scale_factor):
+    a = torch.full((M, K), one, dtype=dtype)
+    a[:, K // 2 :] = two
+    b = torch.full((K, N), one, dtype=dtype)
+    a_scale = torch.full((M, K // scale_factor), 127, dtype=torch.uint8)
+    a_scale[:, K // (2 * scale_factor) :] = 128
+    b_scale = torch.full((N, K // scale_factor), 127, dtype=torch.uint8)
+    return tuple(tensor.to("mps") for tensor in (a, b, a_scale, b_scale))
+
+
+@pytest.mark.parametrize(
+    ("elem_type", "one", "two", "dtype", "scale_factor"),
+    [
+        pytest.param("e4m3", 0x38, 0x40, torch.uint8, 32, id="e4m3-sf32"),
+        pytest.param("e5m2", 0x3C, 0x40, torch.uint8, 32, id="e5m2-sf32"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 16, id="fp16-sf16"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 32, id="fp16-sf32"),
+        pytest.param("bf16", 1.0, 2.0, torch.bfloat16, 16, id="bf16-sf16"),
+        pytest.param("bf16", 1.0, 2.0, torch.bfloat16, 32, id="bf16-sf32"),
+    ],
+)
+def test_dot_scaled_loop_accumulates_payload_and_scale_groups(elem_type, one, two, dtype, scale_factor):
+    M = N = 16
+    K = 64
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=one, two=two, dtype=dtype, scale_factor=scale_factor
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_loop_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        BLOCK_K=scale_factor,
+        SCALE_FACTOR=scale_factor,
+        LOOP_START=0,
+        ELEM_TYPE=elem_type,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(output.cpu(), torch.full((M, N), 160.0))
+
+
+@pytest.mark.parametrize(
+    ("elem_type", "one", "two", "dtype", "scale_factor"),
+    [
+        pytest.param("e4m3", 0x38, 0x40, torch.uint8, 32, id="e4m3-sf32"),
+        pytest.param("e5m2", 0x3C, 0x40, torch.uint8, 32, id="e5m2-sf32"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 16, id="fp16-sf16"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 32, id="fp16-sf32"),
+        pytest.param("bf16", 1.0, 2.0, torch.bfloat16, 16, id="bf16-sf16"),
+        pytest.param("bf16", 1.0, 2.0, torch.bfloat16, 32, id="bf16-sf32"),
+    ],
+)
+def test_dot_scaled_loop_nonzero_start_is_named(capfd, elem_type, one, two, dtype, scale_factor):
+    M = N = 16
+    K = 4 * scale_factor
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=one, two=two, dtype=dtype, scale_factor=scale_factor
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            M,
+            N,
+            K,
+            BLOCK_K=scale_factor,
+            SCALE_FACTOR=scale_factor,
+            LOOP_START=scale_factor,
+            ELEM_TYPE=elem_type,
+            num_warps=4,
+        )
+    assert "zero-based full-K loop" in capfd.readouterr().err
+
+
+def _loop_e2m1_inputs(*, M, N, K, lhs_k_pack, rhs_k_pack):
+    a_shape = (M, K // 2) if lhs_k_pack else (M // 2, K)
+    b_shape = (K // 2, N) if rhs_k_pack else (K, N // 2)
+    a = torch.full(a_shape, 0x22, dtype=torch.uint8)
+    a[:, a.shape[1] // 2 :] = 0x44
+    b = torch.full(b_shape, 0x22, dtype=torch.uint8)
+    a_scale = torch.full((M, K // 32), 127, dtype=torch.uint8)
+    a_scale[:, K // 64 :] = 128
+    b_scale = torch.full((N, K // 32), 127, dtype=torch.uint8)
+    return tuple(tensor.to("mps") for tensor in (a, b, a_scale, b_scale))
+
+
+@pytest.mark.parametrize(
+    ("lhs_k_pack", "rhs_k_pack"),
+    [
+        pytest.param(True, True, id="kk"),
+        pytest.param(True, False, id="ko"),
+        pytest.param(False, True, id="ok"),
+        pytest.param(False, False, id="oo"),
+    ],
+)
+def test_dot_scaled_loop_e2m1_accumulates_packed_payload_and_scale_groups(lhs_k_pack, rhs_k_pack):
+    M = N = 16
+    K = 64
+    a, b, a_scale, b_scale = _loop_e2m1_inputs(
+        M=M,
+        N=N,
+        K=K,
+        lhs_k_pack=lhs_k_pack,
+        rhs_k_pack=rhs_k_pack,
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_loop_e2m1_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        BLOCK_K=32,
+        LOOP_START=0,
+        LHS_K_PACK=lhs_k_pack,
+        RHS_K_PACK=rhs_k_pack,
+        PACKED_K_DIVISOR=2,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(output.cpu(), torch.full((M, N), 160.0))
+
+
+@pytest.mark.parametrize(
+    ("lhs_k_pack", "rhs_k_pack"),
+    [
+        pytest.param(True, True, id="kk"),
+        pytest.param(True, False, id="ko"),
+        pytest.param(False, True, id="ok"),
+        pytest.param(False, False, id="oo"),
+    ],
+)
+def test_dot_scaled_loop_e2m1_nonzero_start_is_named(capfd, lhs_k_pack, rhs_k_pack):
+    M = N = 16
+    K = 96
+    a, b, a_scale, b_scale = _loop_e2m1_inputs(
+        M=M,
+        N=N,
+        K=K,
+        lhs_k_pack=lhs_k_pack,
+        rhs_k_pack=rhs_k_pack,
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_loop_e2m1_u8_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            M,
+            N,
+            K,
+            BLOCK_K=32,
+            LOOP_START=32,
+            LHS_K_PACK=lhs_k_pack,
+            RHS_K_PACK=rhs_k_pack,
+            PACKED_K_DIVISOR=2,
+            num_warps=4,
+        )
+    assert "zero-based full-K loop" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("lhs_k_pack", "rhs_k_pack"),
+    [
+        pytest.param(True, False, id="lhs"),
+        pytest.param(False, True, id="rhs"),
+    ],
+)
+def test_dot_scaled_loop_e2m1_wrong_packed_k_divisor_is_named(capfd, lhs_k_pack, rhs_k_pack):
+    M = N = 16
+    K = 64
+    a, b, a_scale, b_scale = _loop_e2m1_inputs(
+        M=M,
+        N=N,
+        K=K,
+        lhs_k_pack=lhs_k_pack,
+        rhs_k_pack=rhs_k_pack,
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_loop_e2m1_u8_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            M,
+            N,
+            K,
+            BLOCK_K=32,
+            LOOP_START=0,
+            LHS_K_PACK=lhs_k_pack,
+            RHS_K_PACK=rhs_k_pack,
+            PACKED_K_DIVISOR=4,
+            num_warps=4,
+        )
+    assert "canonical contiguous full-K A and B pointer arithmetic" in capfd.readouterr().err
 
 
 def _run_dot_scaled_e5m2_u8(a):
@@ -456,11 +1222,19 @@ def _run(M, N, K, dtype_in=torch.float32, *, seed=0xC0FFEE):
     c = torch.zeros((M, N), dtype=torch.float32).contiguous()
     K_TILES = K // 8
     dot_universal_kernel[(triton.cdiv(M, 8), triton.cdiv(N, 8))](
-        a, b, c,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=8, BLOCK_N=8, BLOCK_K=8, K_TILES=K_TILES,
+        a,
+        b,
+        c,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=8,
+        BLOCK_N=8,
+        BLOCK_K=8,
+        K_TILES=K_TILES,
     )
     ref = a.float() @ b.float()
     return c, ref
@@ -479,9 +1253,7 @@ def _run(M, N, K, dtype_in=torch.float32, *, seed=0xC0FFEE):
     ],
 )
 def test_dot_f32_nonsquare(M, N, K):
-    os.environ.setdefault(
-        "TRITON_REPRODUCER_PATH", f"/tmp/dot-universal-{M}x{N}x{K}.mlir"
-    )
+    os.environ.setdefault("TRITON_REPRODUCER_PATH", f"/tmp/dot-universal-{M}x{N}x{K}.mlir")
     c, ref = _run(M, N, K, torch.float32)
     torch.testing.assert_close(c, ref, atol=1e-4, rtol=1e-4)
 
@@ -494,10 +1266,20 @@ def test_dot_f32_nonsquare(M, N, K):
 # in-bounds (the masked store discards the out-of-bounds rows/cols of acc).
 @triton.jit
 def dot_universal_masked_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     K_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -532,12 +1314,21 @@ def _run_padded(M, N, K, *, seed=0xC0FFEE):
     c_pad = torch.zeros((Mp, Np), dtype=torch.float32)
     K_TILES = K // 8
     dot_universal_masked_kernel[(Mp // 8, Np // 8)](
-        a_pad, b_pad, c_pad,
-        M, N,
-        a_pad.stride(0), a_pad.stride(1),
-        b_pad.stride(0), b_pad.stride(1),
-        c_pad.stride(0), c_pad.stride(1),
-        BLOCK_M=8, BLOCK_N=8, BLOCK_K=8, K_TILES=K_TILES,
+        a_pad,
+        b_pad,
+        c_pad,
+        M,
+        N,
+        a_pad.stride(0),
+        a_pad.stride(1),
+        b_pad.stride(0),
+        b_pad.stride(1),
+        c_pad.stride(0),
+        c_pad.stride(1),
+        BLOCK_M=8,
+        BLOCK_N=8,
+        BLOCK_K=8,
+        K_TILES=K_TILES,
     )
     ref = a_pad[:M, :].float() @ b_pad[:, :N].float()
     return c_pad[:M, :N].contiguous(), ref
@@ -546,8 +1337,8 @@ def _run_padded(M, N, K, *, seed=0xC0FFEE):
 @pytest.mark.parametrize(
     "M,N,K",
     [
-        pytest.param(33,  8,  8, id="m_tail_only"),
-        pytest.param( 8, 17,  8, id="n_tail_only"),
+        pytest.param(33, 8, 8, id="m_tail_only"),
+        pytest.param(8, 17, 8, id="n_tail_only"),
         pytest.param(33, 17, 16, id="both_tails_kloop_2"),
     ],
 )
@@ -572,14 +1363,14 @@ def test_dot_fp16():
     M = N = K = 32
     c, ref = _run(M, N, K, torch.float16)
     # K * 2^-10 = K * 9.77e-4
-    tol = K * (2.0 ** -10)
+    tol = K * (2.0**-10)
     torch.testing.assert_close(c, ref, atol=tol, rtol=tol)
 
 
 def test_dot_bf16_singletile():
     M = N = K = 8
     c, ref = _run(M, N, K, torch.bfloat16)
-    tol = K * (2.0 ** -7)
+    tol = K * (2.0**-7)
     torch.testing.assert_close(c, ref, atol=tol, rtol=tol)
 
 
@@ -589,7 +1380,14 @@ def test_dot_bf16_singletile():
 # from fp16 to fp32 before Triton inserts the blocked -> dot-operand relayout.
 @triton.jit
 def batched_fp16_dot_kernel(
-    a_ptr, b_ptr, c_ptr, BATCH, M, N, K, BLOCK_SIZE: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    BATCH,
+    M,
+    N,
+    K,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -627,7 +1425,7 @@ def test_batched_fp16_dot_explicit_fp32_operands(batch, M, N, K):
     grid = (batch, triton.cdiv(M, 64), triton.cdiv(N, 64))
     batched_fp16_dot_kernel[grid](a, b, c, batch, M, N, K, BLOCK_SIZE=64)
     ref = torch.bmm(a.float(), b.float()).half()
-    tol = K * (2.0 ** -9)
+    tol = K * (2.0**-9)
     torch.testing.assert_close(c.float(), ref.float(), atol=tol, rtol=tol)
 
 
@@ -636,9 +1434,17 @@ def test_batched_fp16_dot_explicit_fp32_operands(batch, M, N, K):
 # multi-element batch tiles.
 @triton.jit
 def batched_f32_rank3_dot_kernel(
-    a, b, c, BATCH, M, N, K,
+    a,
+    b,
+    c,
+    BATCH,
+    M,
+    N,
+    K,
     BLOCK_BATCH: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     COMBINE_OFFSETS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -674,11 +1480,7 @@ def batched_f32_rank3_dot_kernel(
             a_ptrs = a + (a_batch_offset + a_row_offset + a_k_offset)
         else:
             a_ptrs = a + a_batch_offset + a_row_offset + a_k_offset
-        a_mask = (
-            mask_b[:, None, None]
-            & mask_m[None, :, None]
-            & mask_k[None, None, :]
-        )
+        a_mask = mask_b[:, None, None] & mask_m[None, :, None] & mask_k[None, None, :]
         tile_a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
         b_batch_offset = offs_b64[:, None, None] * (K64 * N64)
@@ -688,11 +1490,7 @@ def batched_f32_rank3_dot_kernel(
             b_ptrs = b + (b_batch_offset + b_k_offset + b_col_offset)
         else:
             b_ptrs = b + b_batch_offset + b_k_offset + b_col_offset
-        b_mask = (
-            mask_b[:, None, None]
-            & mask_k[None, :, None]
-            & mask_n[None, None, :]
-        )
+        b_mask = mask_b[:, None, None] & mask_k[None, :, None] & mask_n[None, None, :]
         tile_b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         acc = tl.dot(tile_a, tile_b, acc=acc, input_precision="ieee")
 
@@ -703,11 +1501,7 @@ def batched_f32_rank3_dot_kernel(
         c_ptrs = c + (c_batch_offset + c_row_offset + c_col_offset)
     else:
         c_ptrs = c + c_batch_offset + c_row_offset + c_col_offset
-    c_mask = (
-        mask_b[:, None, None]
-        & mask_m[None, :, None]
-        & mask_n[None, None, :]
-    )
+    c_mask = mask_b[:, None, None] & mask_m[None, :, None] & mask_n[None, None, :]
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
@@ -725,7 +1519,12 @@ def batched_f32_rank3_dot_kernel(
     ],
 )
 def test_batched_f32_rank3_dot_batch_tile(
-    batch, M, N, K, block_batch, combine_offsets,
+    batch,
+    M,
+    N,
+    K,
+    block_batch,
+    combine_offsets,
 ):
     torch.manual_seed(0xC0FFEE)
     a = torch.randn((batch, M, K), dtype=torch.float32).contiguous()
@@ -737,8 +1536,17 @@ def test_batched_f32_rank3_dot_batch_tile(
         triton.cdiv(batch, block_batch),
     )
     batched_f32_rank3_dot_kernel[grid](
-        a, b, c, batch, M, N, K,
-        BLOCK_BATCH=block_batch, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64,
+        a,
+        b,
+        c,
+        batch,
+        M,
+        N,
+        K,
+        BLOCK_BATCH=block_batch,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=64,
         COMBINE_OFFSETS=combine_offsets,
     )
     ref = torch.bmm(a, b)
@@ -832,21 +1640,17 @@ def int4_weight_only_dot_kernel(
         pytest.param(70, 66, 128, 64, id="mn_tail_kloop_group64"),
     ],
 )
-def test_int4_weight_only_dot_runs_computed_dequant_operand(
-    M, N, K, group_size
-):
+def test_int4_weight_only_dot_runs_computed_dequant_operand(M, N, K, group_size):
     torch.manual_seed(0x1A4)
     x = torch.randn((M, K), dtype=torch.float16).contiguous()
     w_int = torch.randint(-8, 8, (N, K), dtype=torch.int16)
-    hi = ((w_int[:, 0::2] + 8).to(torch.uint8) << 4)
+    hi = (w_int[:, 0::2] + 8).to(torch.uint8) << 4
     lo = (w_int[:, 1::2] + 8).to(torch.uint8)
     wq = (hi | lo).contiguous()
     scales = torch.rand((N, K // group_size), dtype=torch.float32).contiguous()
     y = torch.empty((M, N), dtype=torch.float16).contiguous()
 
-    int4_weight_only_dot_kernel[
-        (triton.cdiv(M, 64), triton.cdiv(N, 64))
-    ](
+    int4_weight_only_dot_kernel[(triton.cdiv(M, 64), triton.cdiv(N, 64))](
         x,
         wq,
         scales,
@@ -871,7 +1675,7 @@ def test_int4_weight_only_dot_runs_computed_dequant_operand(
     scale_expanded = scales.float().repeat_interleave(group_size, dim=1)
     w_dequant = w_int.float() * scale_expanded
     ref = (x.float() @ w_dequant.t()).half()
-    tol = K * (2.0 ** -9)
+    tol = K * (2.0**-9)
     torch.testing.assert_close(y.float(), ref.float(), atol=tol, rtol=tol)
 
 
@@ -893,9 +1697,18 @@ def test_dot_kloop_tiled(K_TILES):
 # ----------------------------------------------------------------------------
 @triton.jit
 def dot_multiwarp_kernel(
-    a_ptr, b_ptr, c_ptr,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     K_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -922,11 +1735,19 @@ def _run_multiwarp(num_warps, M=64, N=64, K=32, seed=0xAC4):
     b = torch.randn((K, N), dtype=torch.float32).contiguous()
     c = torch.zeros((M, N), dtype=torch.float32).contiguous()
     dot_multiwarp_kernel[(1, 1)](
-        a, b, c,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=M, BLOCK_N=N, BLOCK_K=8, K_TILES=K // 8,
+        a,
+        b,
+        c,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=M,
+        BLOCK_N=N,
+        BLOCK_K=8,
+        K_TILES=K // 8,
         num_warps=num_warps,
     )
     ref = a.float() @ b.float()
@@ -953,16 +1774,25 @@ def _capture_msl(num_warps):
     `num_warps` is the only candidate, so this works even when multiple
     parametrize iterations co-exist in `~/.triton/cache`."""
     import json
+
     M, N, K = 64, 64, 32
     a = torch.zeros((M, K), dtype=torch.float32).contiguous()
     b = torch.zeros((K, N), dtype=torch.float32).contiguous()
     c = torch.zeros((M, N), dtype=torch.float32).contiguous()
     dot_multiwarp_kernel[(1, 1)](
-        a, b, c,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=M, BLOCK_N=N, BLOCK_K=8, K_TILES=K // 8,
+        a,
+        b,
+        c,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=M,
+        BLOCK_N=N,
+        BLOCK_K=8,
+        K_TILES=K // 8,
         num_warps=num_warps,
     )
     for root, _dirs, files in os.walk(os.path.expanduser("~/.triton/cache")):
@@ -989,19 +1819,16 @@ def test_dot_multiwarp_msl_predicates(num_warps):
     assert msl, "no MSL captured (cache miss)"
     expected_mma = 256 // num_warps
     mma_count = msl.count("simdgroup_multiply_accumulate(")
-    assert mma_count == expected_mma, (
-        f"num_warps={num_warps}: mma count {mma_count} != expected {expected_mma}"
-    )
+    assert mma_count == expected_mma, f"num_warps={num_warps}: mma count {mma_count} != expected {expected_mma}"
     if num_warps > 1:
         assert "simdgroup_index_in_threadgroup" in msl, (
-            "multi-warp MSL missing simdgroup_index_in_threadgroup parameter")
-        assert "_stage_shared[sgid]" in msl, (
-            "multi-warp MSL missing per-warp stage buffer slice _stage_shared[sgid]")
+            "multi-warp MSL missing simdgroup_index_in_threadgroup parameter"
+        )
+        assert "_stage_shared[sgid]" in msl, "multi-warp MSL missing per-warp stage buffer slice _stage_shared[sgid]"
     else:
         assert "_stage_shared[" in msl
         # Single-warp Branch A: shared buffer is [elems], not [num_warps][elems].
-        assert "_stage_shared[sgid]" not in msl, (
-            "single-warp MSL should not slice _stage_shared by sgid")
+        assert "_stage_shared[sgid]" not in msl, "single-warp MSL should not slice _stage_shared by sgid"
 
 
 # --- transposed B ---------------------------------------------------------
@@ -1022,39 +1849,31 @@ def test_dot_multiwarp_msl_predicates(num_warps):
 
 
 @triton.jit
-def _transb_trans_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
-                         BN: tl.constexpr, BK: tl.constexpr):
+def _transb_trans_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """b is [N, K]; the transpose is a real tt.trans."""
     om = tl.arange(0, BM)
     on = tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :],
-                      mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :], mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
         acc = tl.dot(av, tl.trans(bnk), acc)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
 @triton.jit
-def _transb_address_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
-                           BN: tl.constexpr, BK: tl.constexpr):
+def _transb_address_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """b is [N, K] and the transpose lives only in the address arithmetic."""
     om = tl.arange(0, BM)
     on = tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bv = tl.load(b_ptr + on[None, :] * K + ok[:, None],
-                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * K + ok[:, None], mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
         acc += tl.dot(av, bv)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
 @pytest.mark.parametrize("kernel", [_transb_trans_kernel, _transb_address_kernel])
@@ -1065,28 +1884,22 @@ def test_dot_transposed_b(kernel, size, bk):
     a = torch.rand(m, k, dtype=torch.float32)
     b = torch.rand(k, n, dtype=torch.float32)
     c = torch.zeros(m, n, dtype=torch.float32, device="mps")
-    kernel[(1, 1)](a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k,
-                   BM=m, BN=n, BK=bk, num_warps=1)
+    kernel[(1, 1)](a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k, BM=m, BN=n, BK=bk, num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
 
 
 @triton.jit
-def _dot_runtime_extent_one_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
-                                   BM: tl.constexpr, BN: tl.constexpr,
-                                   BK: tl.constexpr):
+def _dot_runtime_extent_one_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     om = tl.arange(0, BM)
     on = tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
-                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :], mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
         acc += tl.dot(av, bv)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
 def test_unclaimed_dot_is_rejected_not_crashed(capfd):
@@ -1102,9 +1915,7 @@ def test_unclaimed_dot_is_rejected_not_crashed(capfd):
     b = torch.rand(16, 1, dtype=torch.float32, device="mps")
     c = torch.zeros(16, 1, dtype=torch.float32, device="mps")
     with pytest.raises(Exception):
-        _dot_runtime_extent_one_kernel[(1, 1)](a, b, c, 16, 1, 16,
-                                               BM=16, BN=16, BK=16,
-                                               num_warps=1)
+        _dot_runtime_extent_one_kernel[(1, 1)](a, b, c, 16, 1, 16, BM=16, BN=16, BK=16, num_warps=1)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
 
     # The process must still be able to compile: a rejection that poisons the
@@ -1112,11 +1923,9 @@ def test_unclaimed_dot_is_rejected_not_crashed(capfd):
     a2 = torch.rand(16, 16, dtype=torch.float32, device="mps")
     b2 = torch.rand(16, 16, dtype=torch.float32, device="mps")
     c2 = torch.zeros(16, 16, dtype=torch.float32, device="mps")
-    _dot_runtime_extent_one_kernel[(1, 1)](a2, b2, c2, 16, 16, 16,
-                                           BM=16, BN=16, BK=16, num_warps=1)
+    _dot_runtime_extent_one_kernel[(1, 1)](a2, b2, c2, 16, 16, 16, BM=16, BN=16, BK=16, num_warps=1)
     torch.mps.synchronize()
-    torch.testing.assert_close(c2.cpu(), a2.cpu() @ b2.cpu(),
-                               atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(c2.cpu(), a2.cpu() @ b2.cpu(), atol=2e-4, rtol=2e-4)
 
 
 # --- BK > BN must not let the A tile define the output's geometry -----------
@@ -1134,8 +1943,7 @@ def test_unclaimed_dot_is_rejected_not_crashed(capfd):
 
 
 @triton.jit
-def _bk_gt_bn_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
-                            BN: tl.constexpr, BK: tl.constexpr):
+def _bk_gt_bn_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     om = pm * BM + tl.arange(0, BM)
@@ -1143,17 +1951,13 @@ def _bk_gt_bn_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr,
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
-                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :], mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
         acc += tl.dot(av, bv)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
-@pytest.mark.parametrize("bm,bn,bk", [(8, 8, 16), (8, 8, 64), (16, 8, 32),
-                                      (32, 8, 64), (16, 16, 32), (32, 16, 64)])
+@pytest.mark.parametrize("bm,bn,bk", [(8, 8, 16), (8, 8, 64), (16, 8, 32), (32, 8, 64), (16, 16, 32), (32, 16, 64)])
 @pytest.mark.parametrize("ragged", [False, True])
 def test_matmul_block_k_larger_than_block_n(bm, bn, bk, ragged):
     m, n, k = (bm - 1, bn - 1, bk - 1) if ragged else (bm, bn, bk)
@@ -1162,32 +1966,26 @@ def test_matmul_block_k_larger_than_block_n(bm, bn, bk, ragged):
     b = torch.randn(k, n, dtype=torch.float32)
     c = torch.zeros(m, n, dtype=torch.float32, device="mps")
     _bk_gt_bn_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
-        a.to("mps"), b.to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk,
-        num_warps=1)
+        a.to("mps"), b.to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=1
+    )
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
 
 
 @triton.jit
-def _transb_single_column_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
-                                 BM: tl.constexpr, BN: tl.constexpr,
-                                 BK: tl.constexpr):
+def _transb_single_column_kernel(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     om = tl.arange(0, BM)
     on = tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :],
-                      mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bnk = tl.load(b_ptr + on[:, None] * K + ok[None, :], mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
         acc = tl.dot(av, tl.trans(bnk), acc)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
-@pytest.mark.parametrize("bm,bn,bk", [(32, 16, 16), (32, 16, 64), (64, 32, 32),
-                                      (16, 16, 16), (8, 8, 8)])
+@pytest.mark.parametrize("bm,bn,bk", [(32, 16, 16), (32, 16, 64), (64, 32, 32), (16, 16, 16), (8, 8, 8)])
 def test_transb_single_runtime_column(bm, bn, bk):
     """N == 1 flips the tile to column-major (Triton specializes the argument
     to a constant), and ScalarDotLowering decomposed the flat position
@@ -1200,16 +1998,16 @@ def test_transb_single_runtime_column(bm, bn, bk):
     b = torch.randn(k, n, dtype=torch.float32)
     c = torch.zeros(m, n, dtype=torch.float32, device="mps")
     _transb_single_column_kernel[(1, 1)](
-        a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k,
-        BM=bm, BN=bn, BK=bk, num_warps=1)
+        a.to("mps"), b.t().contiguous().to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=1
+    )
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), a @ b, atol=2e-4, rtol=2e-4)
 
 
 @triton.jit
-def _multiwarp_multitile_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
-                                       BM: tl.constexpr, BN: tl.constexpr,
-                                       BK: tl.constexpr):
+def _multiwarp_multitile_matmul_kernel(
+    a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     om = pm * BM + tl.arange(0, BM)
@@ -1217,13 +2015,10 @@ def _multiwarp_multitile_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         ok = k + tl.arange(0, BK)
-        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
-                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
-        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :],
-                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :], mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + ok[:, None] * N + on[None, :], mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
         acc += tl.dot(av, bv)
-    tl.store(c_ptr + om[:, None] * N + on[None, :], acc,
-             mask=(om[:, None] < M) & (on[None, :] < N))
+    tl.store(c_ptr + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
@@ -1248,7 +2043,8 @@ def test_multiwarp_multitile_matmul_is_deterministic(num_warps):
     for _ in range(8):
         c = torch.zeros(m, n, dtype=torch.float32, device="mps")
         _multiwarp_multitile_matmul_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
-            a_mps, b_mps, c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=num_warps)
+            a_mps, b_mps, c, m, n, k, BM=bm, BN=bn, BK=bk, num_warps=num_warps
+        )
         torch.mps.synchronize()
         torch.testing.assert_close(c.cpu(), ref, atol=2e-4, rtol=2e-4)
 
@@ -1273,32 +2069,26 @@ def _int8_dot_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr)
 
 
 @pytest.mark.parametrize("num_warps", [1, 4])
-@pytest.mark.parametrize("M, N, K", [(16, 16, 16), (32, 32, 32), (16, 32, 64),
-                                     (64, 16, 16), (32, 16, 8)])
+@pytest.mark.parametrize("M, N, K", [(16, 16, 16), (32, 32, 32), (16, 32, 64), (64, 16, 16), (32, 16, 8)])
 def test_int8_dot_matches_torch_exactly(M, N, K, num_warps):
     torch.manual_seed(M * N + K)
     a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
     b = torch.randint(-8, 8, (K, N), dtype=torch.int8)
     c = torch.zeros(M, N, dtype=torch.int32, device="mps")
-    _int8_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, M, N, K,
-                           num_warps=num_warps)
+    _int8_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, M, N, K, num_warps=num_warps)
     torch.mps.synchronize()
     assert torch.equal(c.cpu(), a.to(torch.int32) @ b.to(torch.int32))
 
 
 # --- 3-D batched dot ---------------------------------------------------------
 #
-# A batched `tl.dot` works when K <= min(M, N) and is a named rejection above
-# it. The scalar-dot path takes its geometry from the kernel's largest tile,
-# which is the result only up to that point: A is B*M*K and B is B*K*N, so a
-# bigger K makes an operand win the tiebreak and nothing claims the dot. What
-# the author used to see was a `ttg.convert_layout` diagnostic about the
-# operands' dot_op layouts — true, and three steps removed from the real limit.
+# A batched `tl.dot` uses the BxMxN result tile as both the function-loop and
+# scalar-dot geometry. This remains true when K is the largest dimension and
+# either BxMxK or BxKxN would otherwise win a largest-tensor heuristic.
 
 
 @triton.jit
-def _batched_dot_kernel(A, B, C, BATCH: tl.constexpr, M: tl.constexpr,
-                        N: tl.constexpr, K: tl.constexpr):
+def _batched_dot_kernel(A, B, C, BATCH: tl.constexpr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
     b = tl.arange(0, BATCH)[:, None, None]
     am = b * (M * K) + tl.arange(0, M)[None, :, None] * K + tl.arange(0, K)[None, None, :]
     bm = b * (K * N) + tl.arange(0, K)[None, :, None] * N + tl.arange(0, N)[None, None, :]
@@ -1306,9 +2096,18 @@ def _batched_dot_kernel(A, B, C, BATCH: tl.constexpr, M: tl.constexpr,
     tl.store(C + cm, tl.dot(tl.load(A + am), tl.load(B + bm)))
 
 
-@pytest.mark.parametrize("BATCH, M, N, K", [(2, 16, 16, 16), (2, 32, 32, 32),
-                                            (4, 32, 32, 32), (2, 64, 16, 16),
-                                            (8, 16, 16, 16)])
+@pytest.mark.parametrize(
+    "BATCH, M, N, K",
+    [
+        (2, 16, 16, 16),
+        (2, 32, 32, 32),
+        (4, 32, 32, 32),
+        (2, 64, 16, 16),
+        (8, 16, 16, 16),
+        (2, 32, 16, 64),
+        (2, 16, 32, 64),
+    ],
+)
 def test_batched_dot_matches_torch(BATCH, M, N, K):
     torch.manual_seed(BATCH * 100 + M + K)
     a = torch.rand(BATCH, M, K, dtype=torch.float32)
@@ -1317,16 +2116,3 @@ def test_batched_dot_matches_torch(BATCH, M, N, K):
     _batched_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, BATCH, M, N, K)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), torch.bmm(a, b), atol=1e-4, rtol=1e-4)
-
-
-def test_batched_dot_beyond_the_envelope_is_named(capfd):
-    """K above min(M, N) has to say what the limit is, not report a layout
-    conversion three steps downstream of it."""
-    BATCH, M, N, K = 2, 32, 32, 64
-    a = torch.rand(BATCH, M, K, dtype=torch.float32, device="mps")
-    b = torch.rand(BATCH, K, N, dtype=torch.float32, device="mps")
-    c = torch.zeros(BATCH, M, N, dtype=torch.float32, device="mps")
-    with pytest.raises(Exception):
-        _batched_dot_kernel[(1,)](a, b, c, BATCH, M, N, K)
-    assert "3-D batched tl.dot is implemented for K <= min(M, N)" in \
-        capfd.readouterr().err

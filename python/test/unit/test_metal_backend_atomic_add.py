@@ -451,6 +451,59 @@ def test_atomic_ulong_compile_error_has_capability_context(monkeypatch):
     assert error.value.__cause__ is compiler_error
 
 
+def test_atomic_ulong_capability_surface_matches_backend_gate():
+    header = "#include <metal_stdlib>\nusing namespace metal;\n"
+
+    def source(name, statement):
+        return (
+            header
+            + f"kernel void {name}(device ulong* out [[buffer(0)]]) {{ "
+            + statement
+            + " }"
+        )
+
+    # Apple8+ exposes the void u64 min/max surface used by the backend.
+    torch.mps.compile_shader(
+        source(
+            "u64_min_control",
+            "atomic_min_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);",
+        )
+    )
+
+    unsupported = {
+        "u64_fetch_add": (
+            "atomic_fetch_add_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);"
+        ),
+        "u64_fetch_and": (
+            "atomic_fetch_and_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);"
+        ),
+        "u64_fetch_or": (
+            "atomic_fetch_or_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);"
+        ),
+        "u64_fetch_xor": (
+            "atomic_fetch_xor_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);"
+        ),
+        "u64_exchange": (
+            "atomic_exchange_explicit((device atomic_ulong*)&out[0], "
+            "(ulong)1, memory_order_relaxed);"
+        ),
+        "u64_cas": (
+            "ulong expected = 0; "
+            "atomic_compare_exchange_weak_explicit("
+            "(device atomic_ulong*)&out[0], &expected, (ulong)1, "
+            "memory_order_relaxed, memory_order_relaxed);"
+        ),
+    }
+    for name, statement in unsupported.items():
+        with pytest.raises((RuntimeError, SyntaxError), match="no matching function"):
+            torch.mps.compile_shader(source(name, statement))
+
+
 @triton.jit
 def _max_subarray_sum_kernel(
     input, output, N, windows_size, length, BLOCK_SIZE: tl.constexpr
@@ -856,6 +909,109 @@ def test_atomic_add_scalar_old_value_reaches_every_lane():
     # ...and one distinct ticket per program. Which program drew which is up to
     # the hardware's serialization and is not part of the contract.
     assert sorted(tickets[:, 0].tolist()) == list(range(G))
+
+
+# --- f32 atomic compare-and-swap -------------------------------------------
+
+
+@triton.jit
+def _atomic_cas_f32_tensor(Target, Expected, Desired, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    old = tl.atomic_cas(
+        Target + offsets,
+        tl.load(Expected + offsets),
+        tl.load(Desired + offsets),
+    )
+    tl.store(Old + offsets, old)
+
+
+def test_atomic_cas_f32_uses_bitwise_compare_and_returns_old_value():
+    # Include the two IEEE-754 cases that a numeric `==` retry test gets wrong:
+    # signed zero compares unequal for CAS, while equal NaN payloads compare
+    # equal because compare-exchange operates on the object representation.
+    target_bits = torch.tensor(
+        [
+            0,
+            -0x80000000,
+            0x7FC00001,
+            0x7FC00001,
+            0x3FC00000,
+            0x40000000,
+            0x40800000,
+            0x40A00000,
+        ],
+        dtype=torch.int32,
+    )
+    expected_bits = torch.tensor(
+        [
+            0,
+            0,
+            0x7FC00001,
+            0x7FC00002,
+            0x3FC00000,
+            0x40400000,
+            0x40800000,
+            0x40C00000,
+        ],
+        dtype=torch.int32,
+    )
+    desired_bits = torch.tensor(
+        [
+            0x41200000,
+            0x41300000,
+            0x41400000,
+            0x41500000,
+            0x41600000,
+            0x41700000,
+            0x41800000,
+            0x41900000,
+        ],
+        dtype=torch.int32,
+    )
+    target = target_bits.view(torch.float32).to("mps")
+    expected = expected_bits.view(torch.float32).to("mps")
+    desired = desired_bits.view(torch.float32).to("mps")
+    old = torch.empty_like(target)
+
+    _atomic_cas_f32_tensor[(1,)](
+        target, expected, desired, old, BLOCK=target_bits.numel()
+    )
+    torch.mps.synchronize()
+
+    final_bits = torch.where(target_bits == expected_bits, desired_bits, target_bits)
+    assert torch.equal(old.cpu().view(torch.int32), target_bits)
+    assert torch.equal(target.cpu().view(torch.int32), final_bits)
+
+
+@triton.jit
+def _atomic_cas_f32_scalar_contended(Target, Seen, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    desired = (pid + 1).to(tl.float32)
+    old = tl.atomic_cas(Target, 0.0, desired)
+    tl.store(Seen + pid * BLOCK + tl.arange(0, BLOCK), old)
+
+
+def test_atomic_cas_f32_scalar_contention_and_old_value_broadcast():
+    programs = 4
+    block = 32
+    target = torch.zeros(1, dtype=torch.float32, device="mps")
+    seen = torch.full(
+        (programs * block,), -1.0, dtype=torch.float32, device="mps"
+    )
+
+    _atomic_cas_f32_scalar_contended[(programs,)](
+        target, seen, BLOCK=block, num_warps=2
+    )
+    torch.mps.synchronize()
+
+    final = target.cpu().item()
+    assert final in {1.0, 2.0, 3.0, 4.0}
+    rows = seen.cpu().reshape(programs, block)
+    for row in rows:
+        assert torch.equal(row, torch.full_like(row, row[0]))
+    tickets = rows[:, 0]
+    assert torch.count_nonzero(tickets == 0.0).item() == 1
+    assert torch.all((tickets == 0.0) | (tickets == final))
 
 
 # --- f16 atomic add ---------------------------------------------------------

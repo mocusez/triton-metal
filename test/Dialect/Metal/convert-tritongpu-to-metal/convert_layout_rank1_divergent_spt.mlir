@@ -112,6 +112,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %store_addresses, %store_values, %valid1 : tensor<1024x!tt.ptr<i32>, #blocked1>
     tt.return
   }
+
+  // The raw reverse workload has two stores of values loaded in #blocked.
+  // Triton gives the second store a #blocked1 address/mask and bridges only
+  // its value.  Rewriting the shared producer cone made the first store use
+  // strided addresses with contiguous reverse-loaded values.  Store-side
+  // normalization instead moves the second address/mask to #blocked, so every
+  // load and store uses one contiguous ownership mapping.
+  tt.func public @reverse_shared_index_cones(%x_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32) {
+    %c1024 = arith.constant 1024 : i32
+    %minus_one = arith.constant -1 : i32
+    %two = arith.constant 2 : i32
+    %zero = arith.constant dense<0> : tensor<1024xi32, #blocked>
+    %zero1 = arith.constant dense<0> : tensor<1024xi32, #blocked1>
+    %pid = tt.get_program_id x : i32
+    %base = arith.muli %pid, %c1024 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %range1 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked1>
+    %base_splat = tt.splat %base : i32 -> tensor<1024xi32, #blocked>
+    %base_splat1 = tt.splat %base : i32 -> tensor<1024xi32, #blocked1>
+    %offsets = arith.addi %base_splat, %range : tensor<1024xi32, #blocked>
+    %offsets1 = arith.addi %base_splat1, %range1 : tensor<1024xi32, #blocked1>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %left_ptr = tt.addptr %x_splat, %offsets : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %end_ptr = tt.addptr %x_ptr, %n : !tt.ptr<f32>, i32
+    %last_ptr = tt.addptr %end_ptr, %minus_one : !tt.ptr<f32>, i32
+    %last_splat = tt.splat %last_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %last_splat1 = tt.splat %last_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked1>
+    %negative = arith.subi %zero1, %offsets1 : tensor<1024xi32, #blocked1>
+    %right_ptr1 = tt.addptr %last_splat1, %negative : tensor<1024x!tt.ptr<f32>, #blocked1>, tensor<1024xi32, #blocked1>
+    %half = arith.divsi %n, %two : i32
+    %half_splat = tt.splat %half : i32 -> tensor<1024xi32, #blocked>
+    %half_splat1 = tt.splat %half : i32 -> tensor<1024xi32, #blocked1>
+    %mask = arith.cmpi slt, %offsets, %half_splat : tensor<1024xi32, #blocked>
+    %mask1 = arith.cmpi slt, %offsets1, %half_splat1 : tensor<1024xi32, #blocked1>
+    %left = tt.load %left_ptr, %mask : tensor<1024x!tt.ptr<f32>, #blocked>
+    %negative_src = arith.subi %zero, %offsets : tensor<1024xi32, #blocked>
+    %right_ptr = tt.addptr %last_splat, %negative_src : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %right = tt.load %right_ptr, %mask : tensor<1024x!tt.ptr<f32>, #blocked>
+    tt.store %left_ptr, %right, %mask : tensor<1024x!tt.ptr<f32>, #blocked>
+    %left1 = ttg.convert_layout %left : tensor<1024xf32, #blocked> -> tensor<1024xf32, #blocked1>
+    tt.store %right_ptr1, %left1, %mask1 : tensor<1024x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
 }
 
 // The pass must succeed (previously a hard error) and emit a Metal kernel; no
@@ -128,4 +171,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: metal.kernel scan_scatter_paired_relabels
 // CHECK: metal.threadgroup_prefix_sum
 // CHECK-NOT: ttg.convert_layout
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel reverse_shared_index_cones
+// CHECK-NOT: ttg.convert_layout
+// CHECK: scf.for %[[IV:[^ ]+]] =
+// CHECK-NOT: arith.muli %[[IV]],
 // CHECK: metal.return

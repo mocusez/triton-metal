@@ -7,12 +7,12 @@ import triton.language as tl
 def matrix_transpose_kernel(
     input,
     output,
-    rows: tl.constexpr,
-    cols: tl.constexpr,
-    stride_ir: tl.constexpr,
-    stride_ic: tl.constexpr,
-    stride_or: tl.constexpr,
-    stride_oc: tl.constexpr,
+    rows,
+    cols,
+    stride_ir,
+    stride_ic,
+    stride_or,
+    stride_oc,
     BLOCK_N: tl.constexpr,
 ):
     pid_x = tl.program_id(0)
@@ -42,7 +42,6 @@ def solve(input: torch.Tensor, output: torch.Tensor, rows: int, cols: int):
     matrix_transpose_kernel[grid](
         input, output, rows, cols, stride_ir, stride_ic, stride_or, stride_oc,
         BLOCK_N,
-        num_warps=8,
     )
 
 

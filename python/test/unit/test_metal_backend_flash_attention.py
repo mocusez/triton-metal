@@ -24,6 +24,7 @@ BD is the unpadded path. N covers block-aligned, masked-tail, and ragged cases.
 from __future__ import annotations
 
 import importlib.util
+import types
 from pathlib import Path
 
 import pytest
@@ -769,11 +770,28 @@ def _metal_text(compiled):
     return msl.decode() if isinstance(msl, bytes) else msl
 
 
-def _compile_softmax_attention_backward(monkeypatch, stage=None, kernel=None):
+def _clone_jit(fn, name):
+    raw = fn.fn
+    cloned = types.FunctionType(
+        raw.__code__, raw.__globals__, name, raw.__defaults__, raw.__closure__
+    )
+    cloned.__annotations__ = dict(getattr(raw, "__annotations__", {}))
+    cloned.__kwdefaults__ = getattr(raw, "__kwdefaults__", None)
+    cloned.__module__ = raw.__module__
+    return triton.jit(cloned)
+
+
+def _compile_softmax_attention_backward(
+    monkeypatch,
+    stage=None,
+    kernel=None,
+    force_chunk_rows=None,
+    shape=(16, 32, 32),
+):
     monkeypatch.delenv("TRITON_METAL_ATTN_BWD_SCALAR", raising=False)
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     torch.manual_seed(0xBADC0DE)
-    M, N, d = 16, 32, 32
+    M, N, d = shape
     Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
     K = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
     V = torch.randn(N, d, dtype=torch.float32, device="mps").contiguous()
@@ -783,6 +801,8 @@ def _compile_softmax_attention_backward(monkeypatch, stage=None, kernel=None):
     dV = torch.empty_like(V)
 
     backward = _load_softmax_attention_backward()
+    if force_chunk_rows is not None:
+        backward._SCRATCH_ELEMS = force_chunk_rows * backward._pad16(N)
     if stage is not None:
         setattr(backward, f"_attn_bwd_{stage}", kernel)
     compiled_pre, compiled_dq, compiled_dkdv = backward.solve(
@@ -1501,6 +1521,29 @@ def test_backward_dkdv_matcher_does_not_claim_wrong_accumulate_condition(
         _compile_softmax_attention_backward(
             monkeypatch, "dkdv",
             _wrong_accumulate_condition_backward_dkdv_kernel())
+
+
+@pytest.mark.parametrize("stage", ["pre", "dq", "dkdv"])
+def test_backward_matcher_accepts_renamed_stage_kernel(monkeypatch, stage):
+    backward = _load_softmax_attention_backward()
+    renamed = _clone_jit(
+        getattr(backward, f"_attn_bwd_{stage}"),
+        f"renamed_softmax_attention_backward_{stage}",
+    )
+    result = _compile_softmax_attention_backward(
+        monkeypatch,
+        stage,
+        renamed,
+        force_chunk_rows=16 if stage == "dkdv" else None,
+        shape=(32, 32, 32) if stage == "dkdv" else (16, 32, 32),
+    )
+    assert (
+        f"metal.attention_backward_{stage} computed-tile simdgroup MMA"
+        in result[stage]
+    )
+    q, k, _, _ = result["inputs"]
+    keep = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool)
+    _assert_backward_variant_matches_reference(result, keep)
 
 
 @pytest.mark.parametrize(

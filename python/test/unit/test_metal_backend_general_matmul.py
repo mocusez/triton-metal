@@ -12,6 +12,7 @@ correctness fallback and bridged into the ordinary tile-loop epilogue. See
 from __future__ import annotations
 
 import importlib.util
+import types
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,33 @@ def _solve_int8_quantized(a, b, c, M, N, K, scale_A, scale_B, scale_C,
     )
 
 
+def _clone_jit(fn, name):
+    raw = fn.fn
+    cloned = types.FunctionType(
+        raw.__code__, raw.__globals__, name, raw.__defaults__, raw.__closure__
+    )
+    cloned.__annotations__ = dict(getattr(raw, "__annotations__", {}))
+    cloned.__kwdefaults__ = getattr(raw, "__kwdefaults__", None)
+    cloned.__module__ = raw.__module__
+    return triton.jit(cloned)
+
+
+renamed_int8_quant_matmul = _clone_jit(
+    int8_quant_matmul_kernel, "renamed_int8_quant_matmul"
+)
+
+
+def _solve_renamed_int8_quantized(a, b, c, M, N, K, scale_A, scale_B, scale_C,
+                                  zero_point_A, zero_point_B, zero_point_C):
+    block = 64
+    grid = (triton.cdiv(M, block), triton.cdiv(N, block))
+    renamed_int8_quant_matmul[grid](
+        a, b, c, M, N, K, scale_A, scale_B, scale_C,
+        zero_point_A, zero_point_B, zero_point_C,
+        block, block, block, 8,
+    )
+
+
 def _int8_quantized_reference(a, b, scale_A, scale_B, scale_C,
                               zero_point_A, zero_point_B, zero_point_C):
     a_i32 = a.to(torch.int32)
@@ -199,6 +227,19 @@ def _int8_quantized_reference(a, b, scale_A, scale_B, scale_C,
         corrected.float() * (scale_A * scale_B / scale_C) + 0.5
     ) + zero_point_C
     return result.clamp(-128, 127).to(torch.int8)
+
+
+def _compile_int8_quantized_metal(kernel, *, block_k=64):
+    M = N = K = 64
+    a = torch.empty((M, K), dtype=torch.int8, device="mps")
+    b = torch.empty((K, N), dtype=torch.int8, device="mps")
+    c = torch.empty((M, N), dtype=torch.int8, device="mps")
+    compiled = kernel.warmup(
+        a, b, c, M, N, K, 0.03125, 0.0625, 0.015625, -3, 5, -7,
+        64, 64, block_k, 8, grid=(1, 1), num_warps=4,
+    )
+    metal = compiled.asm["metal"]
+    return metal.decode() if isinstance(metal, bytes) else metal
 
 
 @pytest.mark.parametrize(
@@ -229,6 +270,47 @@ def test_metal_int8_quantized_matmul(M, N, K):
         zero_point_A, zero_point_B, zero_point_C,
     )
     torch.testing.assert_close(c.cpu(), ref, atol=0, rtol=0)
+
+
+def test_metal_int8_quantized_matmul_renamed_kernel():
+    M, N, K = 64, 64, 64
+    scale_A, scale_B, scale_C = 0.03125, 0.0625, 0.015625
+    zero_point_A, zero_point_B, zero_point_C = -3, 5, -7
+    torch.manual_seed(0x1818)
+    a_cpu = torch.randint(-16, 17, (M, K), dtype=torch.int8)
+    b_cpu = torch.randint(-16, 17, (K, N), dtype=torch.int8)
+    a = a_cpu.to("mps")
+    b = b_cpu.to("mps")
+    c = torch.empty((M, N), dtype=torch.int8, device="mps")
+
+    _solve_renamed_int8_quantized(
+        a, b, c, M, N, K, scale_A, scale_B, scale_C,
+        zero_point_A, zero_point_B, zero_point_C,
+    )
+    torch.mps.synchronize()
+
+    ref = _int8_quantized_reference(
+        a_cpu, b_cpu, scale_A, scale_B, scale_C,
+        zero_point_A, zero_point_B, zero_point_C,
+    )
+    torch.testing.assert_close(c.cpu(), ref, atol=0, rtol=0)
+
+
+def test_metal_int8_quantized_matmul_matcher_accepts_renamed_kernel():
+    metal = _compile_int8_quantized_metal(renamed_int8_quant_matmul)
+    assert "metal.int8_quantized_matmul scalar fallback" in metal
+
+
+def test_metal_int8_quantized_matmul_matcher_rejects_adjacent_shape():
+    marker = "metal.int8_quantized_matmul scalar fallback"
+    try:
+        metal = _compile_int8_quantized_metal(
+            int8_quant_matmul_kernel, block_k=32
+        )
+    except RuntimeError as error:
+        assert "convert-tritongpu-to-metal failed" in str(error)
+    else:
+        assert marker not in metal
 
 
 def _load_leet_2d_fft():

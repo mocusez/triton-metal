@@ -7,6 +7,7 @@
 // the implementation notes.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @expand_dims_kernel(%x_ptr: !tt.ptr<f32>) {
     %r = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
@@ -18,8 +19,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %x_addr, %x_val : tensor<8x1x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  tt.func public @unsplat_kernel(%x_ptr: !tt.ptr<i32>, %out_ptr: !tt.ptr<i32>) {
+    %ptrs = tt.splat %x_ptr : !tt.ptr<i32> -> tensor<1x!tt.ptr<i32>, #blocked1>
+    %value = tt.load %ptrs : tensor<1x!tt.ptr<i32>, #blocked1>
+    %scalar = tt.unsplat %value : tensor<1xi32, #blocked1>
+    tt.store %out_ptr, %scalar : !tt.ptr<i32>
+    tt.return
+  }
 }
 
 // CHECK: metal.module
 // CHECK: metal.kernel expand_dims_kernel
+// CHECK: metal.kernel unsplat_kernel
 // CHECK: metal.return

@@ -29,6 +29,8 @@ pytorch = "*"
 # import.
 matplotlib = "*"
 pandas = "*"
+# Keep native-source formatting reproducible inside the project environment.
+clang-format = ">=23.1.0,<24"
 
 [tasks]
 # Build Triton (editable) against the pixi-managed Python; uses Triton's own
@@ -74,6 +76,6 @@ leet-vector-add-smoke = "python python/test/unit/fixtures/metal_leet/test-1.py"
 leet-tutorial-vector-add = "python python/test/unit/fixtures/metal_leet/tutorials_python/01-vector-add.py"
 leet-tutorial-fused-softmax = "python python/test/unit/fixtures/metal_leet/tutorials_python/02-fused-softmax.py"
 
-# Audit all 80 Metal Leet Python fixtures and cover every runnable workload
+# Audit all 90 Metal Leet Python fixtures and cover every runnable workload
 # through its owned pytest or standalone path.
 leet-all = "python python/test/unit/test_metal_backend_leet_uncovered.py --all"

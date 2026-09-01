@@ -821,10 +821,10 @@ llvm::LogicalResult AtomicCasOp::verify() {
 
   auto cmpInt = llvm::dyn_cast<mlir::IntegerType>(cmpType);
   auto memInt = llvm::dyn_cast<mlir::IntegerType>(memType);
-  if (!cmpInt || cmpInt.getWidth() != 32 || !memInt ||
-      memInt.getWidth() != 32)
-    return emitOpError(
-        "requires 32-bit integer cmp/value/result and storage");
+  bool validStorage = (memInt && memInt.getWidth() == 32) || memType.isF32();
+  if (!cmpInt || cmpInt.getWidth() != 32 || !validStorage)
+    return emitOpError("requires 32-bit integer bit-pattern operands and "
+                       "i32/u32 or f32 storage");
   return checkIndex(*this, memRef, getIndex());
 }
 

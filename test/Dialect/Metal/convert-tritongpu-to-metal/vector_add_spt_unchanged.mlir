@@ -55,9 +55,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-NOT: metal.tg_load_indexed
 //
 // I5: tile loop with trip count 8 (1024 / 128 threads).
-// CHECK: arith.constant 0 : i32
-// CHECK: arith.constant 8 : i32
-// CHECK: arith.constant 1 : i32
+// CHECK-DAG: arith.constant 0 : i32
+// CHECK-DAG: arith.constant 8 : i32
+// CHECK-DAG: arith.constant 1 : i32
 // CHECK: scf.for
 //
 // I4 + I6: exactly one get_element per operand, then addOp — NOT a reduce op.

@@ -57,10 +57,10 @@ private:
   mlir::triton::metal::ModuleOp _metalModule;
   std::map<mlir::Operation *, unsigned> _alloca;
   std::map<void *, size_t> _buffers;
-  // Maps an `scf.if` op (with a single result) to the index of the temp
-  // variable holding its result. The result is pre-declared before the `if`
-  // and assigned inside the then/else regions by `scf.yield`.
-  std::map<mlir::Operation *, unsigned> _scfIfTemp;
+  // Maps an `scf.if` op to one temp per result, in result order. The temps are
+  // pre-declared before the `if`; each `scf.yield` assigns its operands to the
+  // corresponding temps, and every SSA result resolves through `_buffers`.
+  std::map<mlir::Operation *, llvm::SmallVector<unsigned, 4>> _scfIfTemps;
   // Maps an `scf.for` op to the temp index of its induction variable.
   // The induction var BlockArgument is registered in `_buffers` so
   // `translateVarName(iv)` prints `v<idx>`.

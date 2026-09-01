@@ -34,6 +34,27 @@ module {
       }
       metal.return
     }
+
+    // A result-bearing scf.if needs one persistent MSL temp per result. Keep
+    // unlike result types here so accidentally mapping both yields to the last
+    // declared temp is rejected by both FileCheck and the Metal compiler.
+    metal.kernel multi_result_scf_if address_space_device [true, true] {
+    ^bb0(%out_f: !metal.memref<? x f32>, %out_i: !metal.memref<? x ui32>):
+      %idx = metal.constant 0 : ui32
+      %cond = metal.constant true
+      %then_f = metal.constant 0x3F800000 : f32
+      %else_f = metal.constant 0x40000000 : f32
+      %then_i = metal.constant 7 : ui32
+      %else_i = metal.constant 9 : ui32
+      %pair:2 = scf.if %cond -> (f32, ui32) {
+        scf.yield %then_f, %then_i : f32, ui32
+      } else {
+        scf.yield %else_f, %else_i : f32, ui32
+      }
+      metal.store %pair#0, %out_f[%idx] : f32, !metal.memref<? x f32>, ui32
+      metal.store %pair#1, %out_i[%idx] : ui32, !metal.memref<? x ui32>, ui32
+      metal.return
+    }
     metal.module_end
   }
 }
@@ -49,3 +70,15 @@ module {
 // CHECK-NEXT: if (
 // CHECK: v{{[0-9]+}}[{{[^]]+}}] = v[[#LET]];
 // CHECK: return;
+
+// CHECK-LABEL: kernel void multi_result_scf_if
+// CHECK: float v[[#F:]];
+// CHECK-NEXT: uint32_t v[[#I:]];
+// CHECK: if (true) {
+// CHECK: v[[#F]] = 1.000000e+00;
+// CHECK: v[[#I]] = 7;
+// CHECK: } else {
+// CHECK: v[[#F]] = 2.000000e+00;
+// CHECK: v[[#I]] = 9;
+// CHECK: v{{[0-9]+}}[0] = v[[#F]];
+// CHECK: v{{[0-9]+}}[0] = v[[#I]];

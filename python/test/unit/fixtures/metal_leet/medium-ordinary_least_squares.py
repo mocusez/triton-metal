@@ -6,9 +6,7 @@ import triton.language as tl
 @triton.jit
 def gram_kernel(
     X,
-    y,
     XtX,
-    Xty,
     n_samples,
     n_features,
     stride_x_0,
@@ -24,7 +22,6 @@ def gram_kernel(
     mask_col = offset_col < n_features
 
     acc_xtx = tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32)
-    acc_xty = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     for step in range(0, n_samples, BLOCK_M):
         offset_m = step + tl.arange(0, BLOCK_M)
@@ -44,15 +41,45 @@ def gram_kernel(
         )
 
         acc_xtx += tl.dot(x_nm, x_mn)
-        y_m = tl.load(y + offset_m, mask=mask_m, other=0.0)
-        acc_xty += tl.sum(x_nm * y_m, axis=1)
 
     tl.store(
         XtX + offset_row[:, None] * n_features + offset_col[None, :],
         acc_xtx,
         mask=mask_row[:, None] & mask_col[None, :],
     )
-    tl.store(Xty + offset_row, acc_xty, mask=mask_row)
+
+
+@triton.jit
+def xty_kernel(
+    X,
+    y,
+    Xty,
+    n_samples,
+    n_features,
+    stride_x_0,
+    stride_x_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offset_n < n_features
+
+    acc_xty = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for step in range(0, n_samples, BLOCK_M):
+        offset_m = step + tl.arange(0, BLOCK_M)
+        mask_m = offset_m < n_samples
+        x_nm = tl.load(
+            X + offset_n[:, None] * stride_x_1
+            + offset_m[None, :] * stride_x_0,
+            mask=mask_n[:, None] & mask_m[None, :],
+            other=0.0,
+        )
+        y_m = tl.load(y + offset_m, mask=mask_m, other=0.0)
+        acc_xty += tl.sum(x_nm * y_m, axis=1)
+
+    tl.store(Xty + offset_n, acc_xty, mask=mask_n)
 
 
 # X, y, beta are tensors on the GPU
@@ -73,16 +100,22 @@ def solve(
     XtX = torch.empty(
         (n_features, n_features), device=X.device, dtype=torch.float32
     )
-    Xty = torch.zeros(n_features, device=X.device, dtype=torch.float32)
+    Xty = torch.empty(n_features, device=X.device, dtype=torch.float32)
 
-    # This intentionally preserves the raw LeetGPU kernel shape: one program
-    # dimension writes the matching feature block of XtX and Xty. The raw source
-    # only fills all XtX entries when n_features <= BLOCK_N; larger feature
-    # counts are covered by the corrected two-dimensional canary in pytest.
-    gram_kernel[(triton.cdiv(n_features, BLOCK_N),)](
+    feature_blocks = triton.cdiv(n_features, BLOCK_N)
+    gram_kernel[(feature_blocks, feature_blocks)](
+        X,
+        XtX,
+        n_samples,
+        n_features,
+        X.stride(0),
+        X.stride(1),
+        BLOCK_M,
+        BLOCK_N,
+    )
+    xty_kernel[(feature_blocks,)](
         X,
         y,
-        XtX,
         Xty,
         n_samples,
         n_features,
@@ -105,7 +138,7 @@ if __name__ == "__main__":
         sys.exit("No GPU device (MPS or CUDA) available")
 
     torch.manual_seed(0xC0FFEE)
-    cases = ((64, 8), (96, 32))
+    cases = ((64, 8), (96, 32), (96, 48))
     for n_samples, n_features in cases:
         X = torch.randn(
             (n_samples, n_features), dtype=torch.float32, device=device

@@ -1900,15 +1900,19 @@ void ModuleTranslation::translate(ReturnOp op) { _output << "return;"; }
 
 void ModuleTranslation::translate(mlir::scf::IfOp op) {
   // Pre-declare a temp var per result so the assignment inside then/else
-  // (emitted by translate(scf.yield)) has somewhere to land. Single-result
-  // scf.if is supported; multi-result would need a tuple of temps — left to
-  // future work since the masked vector_add path only uses the 1-result form.
+  // (emitted by translate(scf.yield)) has somewhere to land. Register every
+  // SSA result separately: translating the defining op cannot identify which
+  // result a later consumer selected, while `_buffers` is value-specific.
+  llvm::SmallVector<unsigned, 4> resultTemps;
   for (auto res : op.getResults()) {
     auto idx = _varCount++;
-    _scfIfTemp[op.getOperation()] = idx;
+    resultTemps.push_back(idx);
+    _buffers[res.getAsOpaquePointer()] = idx;
     _output << typeToString(res.getType()) << " v" << idx << ";\n";
     indent();
   }
+  if (!resultTemps.empty())
+    _scfIfTemps[op.getOperation()] = std::move(resultTemps);
   _output << "if (";
   // The condition may be a block arg (e.g. an i1 scf.for iter_arg like
   // speculative decoding's `accepted_all`), so resolve by name when it has no
@@ -2155,17 +2159,26 @@ void ModuleTranslation::translate(mlir::scf::YieldOp op) {
     }
     return;
   }
-  // scf::IfOp parent: existing single-result assignment path.
+  // scf::IfOp parent: assign each yielded value to its matching result temp.
+  // The assignments occur in result order and each RHS is evaluated from the
+  // branch's original SSA value, preserving scf.yield's simultaneous tuple
+  // semantics without requiring an MSL tuple type.
   if (auto parentIf =
           llvm::dyn_cast_or_null<mlir::scf::IfOp>(op->getParentOp())) {
     if (parentIf.getNumResults() == 0)
       return; // no-op for void scf.if
-    auto it = _scfIfTemp.find(parentIf.getOperation());
-    assert(it != _scfIfTemp.end() &&
-           "scf.yield: parent scf.if has no temp var pre-declared");
-    _output << "v" << it->second << " = ";
-    translateValueOrVarName(op.getOperand(0));
-    _output << ";";
+    auto it = _scfIfTemps.find(parentIf.getOperation());
+    assert(it != _scfIfTemps.end() &&
+           "scf.yield: parent scf.if has no result temps pre-declared");
+    assert(it->second.size() == op.getNumOperands() &&
+           "scf.yield: operand/result temp count mismatch");
+    for (auto [i, yielded] : llvm::enumerate(op.getOperands())) {
+      if (i)
+        _output << "\n", indent();
+      _output << "v" << it->second[i] << " = ";
+      translateValueOrVarName(yielded);
+      _output << ";";
+    }
     return;
   }
   // Wall 15: scf::ForOp parent with one f32 iter_arg — assign the yielded
@@ -8151,8 +8164,7 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             mlir::triton::metal::UnaryExpOp, mlir::triton::metal::BinaryExpOp,
             mlir::triton::metal::FmaOp, mlir::triton::metal::ClampFOp,
             mlir::triton::metal::MathIntrinsicOp,
-            mlir::triton::metal::Fp8ConvertOp,
-            mlir::triton::metal::MulHiUIOp,
+            mlir::triton::metal::Fp8ConvertOp, mlir::triton::metal::MulHiUIOp,
             mlir::triton::metal::YieldWhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::arith::CmpIOp>([&](mlir::arith::CmpIOp op) {
         // Emit `(lhs <pred> rhs)` matching arith.cmpi semantics. Only the
@@ -8165,16 +8177,40 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         // `signednessCast`. eq/ne compare bit patterns and need neither.
         bool wantSigned = true;
         switch (op.getPredicate()) {
-        case P::eq:  opStr = " == "; break;
-        case P::ne:  opStr = " != "; break;
-        case P::slt: opStr = " < ";  break;
-        case P::sle: opStr = " <= "; break;
-        case P::sgt: opStr = " > ";  break;
-        case P::sge: opStr = " >= "; break;
-        case P::ult: opStr = " < ";  wantSigned = false; break;
-        case P::ule: opStr = " <= "; wantSigned = false; break;
-        case P::ugt: opStr = " > ";  wantSigned = false; break;
-        case P::uge: opStr = " >= "; wantSigned = false; break;
+        case P::eq:
+          opStr = " == ";
+          break;
+        case P::ne:
+          opStr = " != ";
+          break;
+        case P::slt:
+          opStr = " < ";
+          break;
+        case P::sle:
+          opStr = " <= ";
+          break;
+        case P::sgt:
+          opStr = " > ";
+          break;
+        case P::sge:
+          opStr = " >= ";
+          break;
+        case P::ult:
+          opStr = " < ";
+          wantSigned = false;
+          break;
+        case P::ule:
+          opStr = " <= ";
+          wantSigned = false;
+          break;
+        case P::ugt:
+          opStr = " > ";
+          wantSigned = false;
+          break;
+        case P::uge:
+          opStr = " >= ";
+          wantSigned = false;
+          break;
         }
         // Operands may be block arguments (e.g. an scf.for induction var fed
         // straight into a comparison by the computed-cone reduce evaluator),
@@ -8218,11 +8254,21 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         };
 
         switch (op.getPredicate()) {
-        case P::OEQ: emitRelation(" == "); break;
-        case P::OGT: emitRelation(" > "); break;
-        case P::OGE: emitRelation(" >= "); break;
-        case P::OLT: emitRelation(" < "); break;
-        case P::OLE: emitRelation(" <= "); break;
+        case P::OEQ:
+          emitRelation(" == ");
+          break;
+        case P::OGT:
+          emitRelation(" > ");
+          break;
+        case P::OGE:
+          emitRelation(" >= ");
+          break;
+        case P::OLT:
+          emitRelation(" < ");
+          break;
+        case P::OLE:
+          emitRelation(" <= ");
+          break;
         case P::ONE:
           _output << "(";
           emitIsNan(op.getLhs(), true);
@@ -8234,13 +8280,25 @@ void ModuleTranslation::translateValue(Operation *opInst) {
           translateValueOrVarName(op.getRhs());
           _output << ")";
           break;
-        case P::UEQ: emitUnorderedRelation(" == "); break;
-        case P::UGT: emitUnorderedRelation(" > "); break;
-        case P::UGE: emitUnorderedRelation(" >= "); break;
-        case P::ULT: emitUnorderedRelation(" < "); break;
-        case P::ULE: emitUnorderedRelation(" <= "); break;
+        case P::UEQ:
+          emitUnorderedRelation(" == ");
+          break;
+        case P::UGT:
+          emitUnorderedRelation(" > ");
+          break;
+        case P::UGE:
+          emitUnorderedRelation(" >= ");
+          break;
+        case P::ULT:
+          emitUnorderedRelation(" < ");
+          break;
+        case P::ULE:
+          emitUnorderedRelation(" <= ");
+          break;
         // MSL `!=` is true if either operand is NaN, exactly matching UNE.
-        case P::UNE: emitRelation(" != "); break;
+        case P::UNE:
+          emitRelation(" != ");
+          break;
         case P::ORD:
           _output << "(";
           emitIsNan(op.getLhs(), true);
@@ -8255,8 +8313,12 @@ void ModuleTranslation::translateValue(Operation *opInst) {
           emitIsNan(op.getRhs(), false);
           _output << ")";
           break;
-        case P::AlwaysTrue: _output << "true"; break;
-        case P::AlwaysFalse: _output << "false"; break;
+        case P::AlwaysTrue:
+          _output << "true";
+          break;
+        case P::AlwaysFalse:
+          _output << "false";
+          break;
         }
       })
       .Case<mlir::arith::ConstantOp>([&](mlir::arith::ConstantOp op) {
@@ -8618,45 +8680,47 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         emitAs(op.getRhs(), /*wantSigned=*/false);
         _output << ")";
       })
-      .Case<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
-            mlir::arith::FPToSIOp, mlir::arith::FPToUIOp, mlir::arith::ExtFOp,
-            mlir::arith::TruncFOp, mlir::arith::ExtSIOp, mlir::arith::ExtUIOp,
-            mlir::arith::TruncIOp>([&](auto op) {
-        // Scalar numeric conversion surviving to translation, e.g.
-        // `idx.to(tl.float32)` -> arith.sitofp (tensor conversions are folded
-        // into metal ops by the conversion pass; only scalar ones reach here).
-        // MSL spells every numeric conversion as a constructor cast `T(x)`,
-        // mirroring metal.cast's emission. float->int uses C truncation toward
-        // zero, matching arith.fptosi/fptoui; int->float and width changes are
-        // exact for the value ranges Triton emits here. The generic lambda is
-        // instantiated per op type, so .getIn()/.getType() resolve concretely.
-        // C-style cast `(T)(x)`, NOT functional `T(x)`: the latter is a variable
-        // DECLARATION when x is a bare identifier (C++ most-vexing-parse), so a
-        // dead conversion emitted as a statement (e.g. a reduce that re-derives
-        // its cone leaves the original `x.to(f32)` extf use-empty) would become
-        // `float(v3);` == `float v3;` — a redefinition. The C-style form is a
-        // valid no-op as a statement and identical as an expression.
-        //
-        // The result cast alone is not enough: for sitofp/uitofp the INPUT's
-        // signedness decides which number the integer bits denote, and for
-        // extsi/extui it decides sign- vs zero-extension. A signless device
-        // buffer is declared `uint32_t`, so an uncast input made
-        // `x.to(tl.float32)` on a negative i32 produce 2^32 instead of -1.
-        // The float-input conversions (fptosi/fptoui/extf/truncf) and trunci
-        // (which only keeps low bits) are unaffected.
-        mlir::Operation *conv = op.getOperation();
-        bool wantSigned =
-            mlir::isa<mlir::arith::SIToFPOp, mlir::arith::ExtSIOp>(conv);
-        bool inputSignednessMatters =
-            wantSigned ||
-            mlir::isa<mlir::arith::UIToFPOp, mlir::arith::ExtUIOp>(conv);
-        _output << "(" << typeToString(op.getType()) << ")(";
-        if (inputSignednessMatters)
-          emitAs(op.getIn(), wantSigned);
-        else
-          translateValueOrVarName(op.getIn());
-        _output << ")";
-      })
+      .Case<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp, mlir::arith::FPToSIOp,
+            mlir::arith::FPToUIOp, mlir::arith::ExtFOp, mlir::arith::TruncFOp,
+            mlir::arith::ExtSIOp, mlir::arith::ExtUIOp, mlir::arith::TruncIOp>(
+          [&](auto op) {
+            // Scalar numeric conversion surviving to translation, e.g.
+            // `idx.to(tl.float32)` -> arith.sitofp (tensor conversions are
+            // folded into metal ops by the conversion pass; only scalar ones
+            // reach here). MSL spells every numeric conversion as a constructor
+            // cast `T(x)`, mirroring metal.cast's emission. float->int uses C
+            // truncation toward zero, matching arith.fptosi/fptoui; int->float
+            // and width changes are exact for the value ranges Triton emits
+            // here. The generic lambda is instantiated per op type, so
+            // .getIn()/.getType() resolve concretely. C-style cast `(T)(x)`,
+            // NOT functional `T(x)`: the latter is a variable DECLARATION when
+            // x is a bare identifier (C++ most-vexing-parse), so a dead
+            // conversion emitted as a statement (e.g. a reduce that re-derives
+            // its cone leaves the original `x.to(f32)` extf use-empty) would
+            // become `float(v3);` == `float v3;` — a redefinition. The C-style
+            // form is a valid no-op as a statement and identical as an
+            // expression.
+            //
+            // The result cast alone is not enough: for sitofp/uitofp the
+            // INPUT's signedness decides which number the integer bits denote,
+            // and for extsi/extui it decides sign- vs zero-extension. A
+            // signless device buffer is declared `uint32_t`, so an uncast input
+            // made `x.to(tl.float32)` on a negative i32 produce 2^32 instead of
+            // -1. The float-input conversions (fptosi/fptoui/extf/truncf) and
+            // trunci (which only keeps low bits) are unaffected.
+            mlir::Operation *conv = op.getOperation();
+            bool wantSigned =
+                mlir::isa<mlir::arith::SIToFPOp, mlir::arith::ExtSIOp>(conv);
+            bool inputSignednessMatters =
+                wantSigned ||
+                mlir::isa<mlir::arith::UIToFPOp, mlir::arith::ExtUIOp>(conv);
+            _output << "(" << typeToString(op.getType()) << ")(";
+            if (inputSignednessMatters)
+              emitAs(op.getIn(), wantSigned);
+            else
+              translateValueOrVarName(op.getIn());
+            _output << ")";
+          })
       .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
         auto emit = [&](mlir::Value v) {
           // Route through translateValueOrVarName so a specific result of a
@@ -8674,10 +8738,16 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << ")";
       })
       .Case<mlir::scf::IfOp>([&](mlir::scf::IfOp op) {
-        auto it = _scfIfTemp.find(op.getOperation());
-        assert(it != _scfIfTemp.end() &&
+        auto it = _scfIfTemps.find(op.getOperation());
+        assert(it != _scfIfTemps.end() &&
                "scf.if result referenced before pre-declaration");
-        _output << "v" << it->second;
+        // A direct defining-op translation has no result-number context.
+        // Multi-result consumers must take the value-specific `_buffers` path
+        // in translateValueOrVarName; retain this fallback for single-result
+        // call sites only.
+        assert(it->second.size() == 1 &&
+               "multi-result scf.if must resolve through its SSA result");
+        _output << "v" << it->second.front();
       })
       .Case<mlir::triton::metal::SimdgroupIndexOp>(
           [&](mlir::triton::metal::SimdgroupIndexOp op) {

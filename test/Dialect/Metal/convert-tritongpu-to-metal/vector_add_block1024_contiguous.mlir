@@ -34,9 +34,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // METAL: metal.module
 // METAL: metal.kernel add_kernel_contiguous
-// METAL: arith.constant 0 : i32
-// METAL: arith.constant 8 : i32
-// METAL: arith.constant 1 : i32
+// METAL-DAG: arith.constant 0 : i32
+// METAL-DAG: arith.constant 8 : i32
+// METAL-DAG: arith.constant 1 : i32
 // METAL: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}}
 // METAL: metal.thread_id "x"
 // METAL: arith.constant 8 : i32
