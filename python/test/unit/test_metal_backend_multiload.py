@@ -113,6 +113,36 @@ def test_pattern_A_multi_program(BLOCK, N_PROGS):
     )
 
 
+# Pattern A2: same logical rank-1 range feeds two stores with a value relabel.
+# The raw leet reverse kernel exposed a split where the first address cone used
+# `tid + iv*tpb` while the relabelled store's mirror address and mask used
+# `tid*E + iv`, producing silent wrong answers at BLOCK=1024, num_warps=4.
+@triton.jit
+def _reverse_inplace(input_ptr, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    i = pid * BLOCK + tl.arange(0, BLOCK)
+    addr = input_ptr + i
+    mirror = input_ptr + N - 1 - i
+    mask = i < N // 2
+    tmp = tl.load(addr, mask=mask)
+    tmp_mirror = tl.load(mirror, mask=mask)
+    tl.store(addr, tmp_mirror, mask=mask)
+    tl.store(mirror, tmp, mask=mask)
+
+
+@pytest.mark.parametrize("N", [127, 128, 2053])
+def test_pattern_A2_inplace_reverse_relabelled_store(N):
+    x = torch.arange(N, dtype=torch.float32, device="mps")
+
+    _reverse_inplace[(triton.cdiv(N // 2, 1024),)](
+        x, N, BLOCK=1024, num_warps=4
+    )
+    torch.mps.synchronize()
+
+    expected = torch.arange(N, dtype=torch.float32).flip(0)
+    torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # Pattern B: different bases, same derived offsets via `>> 1` (vec_add
 # shape with derived offsets).

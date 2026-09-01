@@ -16,6 +16,55 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_map_elementwise_pack2() {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tl.map_elementwise is implemented for pack=1 only}}
+    %r = "tt.map_elementwise"(%v, %v) <{pack = 2 : i32}> ({
+    ^bb0(%a0: f32, %a1: f32, %b0: f32, %b1: f32):
+      %x = arith.addf %a0, %b0 : f32
+      %y = arith.addf %a1, %b1 : f32
+      tt.map_elementwise.return %x, %y : f32, f32
+    }) : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    tt.print "r: " {hex = false, isSigned = array<i32: 0>} : %r : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_map_elementwise_multiblock() {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{tl.map_elementwise requires a single-block scalar region}}
+    %r = "tt.map_elementwise"(%v, %v) <{pack = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %take_a = arith.cmpf ogt, %a, %b : f32
+      cf.cond_br %take_a, ^bb1(%a : f32), ^bb1(%b : f32)
+    ^bb1(%selected: f32):
+      tt.map_elementwise.return %selected : f32
+    }) : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    tt.print "r: " {hex = false, isSigned = array<i32: 0>} : %r : tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_raw_descriptor_reduce(%desc: !tt.tensordesc<16xi32>, %src: tensor<16xi32, #blocked>) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{tt.descriptor_reduce must be eliminated by triton-rewrite-tensor-descriptor-to-pointer before Metal conversion}}
+    tt.descriptor_reduce add, %desc[%c0], %src : !tt.tensordesc<16xi32>, tensor<16xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   // A pointer loaded out of memory and dereferenced -- `p = tl.load(pp)` then
   // `tl.load(p.to(tl.pointer_type(tl.float32)) + i)`. This one reached the
   // conversion because the scalar i64 load it starts with is supported; only

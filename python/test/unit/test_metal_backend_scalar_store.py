@@ -97,3 +97,45 @@ def test_scalar_i32_load_store_guarded(B: int, S: int) -> None:
     torch.testing.assert_close(out[:B].cpu(), (inp + 1).cpu(), atol=0, rtol=0)
     # Guarded rows: untouched sentinel (cf.cond_br early-return fired).
     assert (out[B:].cpu() == SENT).all(), "early-return guard did not fire"
+
+
+@triton.jit
+def _scalar_multi_result_if_kernel(
+    cond_ptr,
+    true_f_ptr,
+    false_f_ptr,
+    true_i_ptr,
+    false_i_ptr,
+    out_f_ptr,
+    out_i_ptr,
+):
+    """Keep two unlike scalar results on one dynamic `scf.if` tuple."""
+    cond = tl.load(cond_ptr)
+    if cond:
+        selected_f = tl.load(true_f_ptr)
+        selected_i = tl.load(true_i_ptr)
+    else:
+        selected_f = tl.load(false_f_ptr)
+        selected_i = tl.load(false_i_ptr)
+    tl.store(out_f_ptr, selected_f)
+    tl.store(out_i_ptr, selected_i)
+
+
+@pytest.mark.parametrize("take_true", [False, True])
+def test_scalar_multi_result_if_preserves_each_result(take_true: bool) -> None:
+    cond = torch.tensor([take_true], dtype=torch.int32, device="mps")
+    true_f = torch.tensor([1.25], dtype=torch.float32, device="mps")
+    false_f = torch.tensor([-3.5], dtype=torch.float32, device="mps")
+    true_i = torch.tensor([17], dtype=torch.int32, device="mps")
+    false_i = torch.tensor([-9], dtype=torch.int32, device="mps")
+    out_f = torch.full((1,), float("nan"), dtype=torch.float32, device="mps")
+    out_i = torch.full((1,), 123456, dtype=torch.int32, device="mps")
+
+    _scalar_multi_result_if_kernel[(1,)](
+        cond, true_f, false_f, true_i, false_i, out_f, out_i
+    )
+
+    expected_f = true_f if take_true else false_f
+    expected_i = true_i if take_true else false_i
+    torch.testing.assert_close(out_f.cpu(), expected_f.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(out_i.cpu(), expected_i.cpu(), atol=0, rtol=0)

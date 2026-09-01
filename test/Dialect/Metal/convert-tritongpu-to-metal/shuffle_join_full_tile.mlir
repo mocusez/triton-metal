@@ -27,7 +27,8 @@
 // CHECK: metal.barrier
 // CHECK: metal.store
 // CHECK: metal.barrier
-// CHECK: metal.get_element
+// The post-barrier read uses the explicit threadgroup-memory operation.
+// CHECK: metal.tg_load_indexed
 // MSL-LABEL: kernel void join_full_tile
 // MSL: threadgroup float v[[BUF:[0-9]+]][64];
 // Both operands are published, the second in the band at slot tpb.

@@ -1,7 +1,7 @@
 """The Metal Leet fixture inventory and interpreter-backed gap coverage.
 
-Twenty-six of the corpus files have no standalone driver or narrower backend
-test. Twenty-four of them run against an interpreter oracle; two are retained
+Thirty-four of the corpus files have no standalone driver or narrower backend
+test. Thirty-two of them run against an interpreter oracle; two are retained
 as explicit skips because the source itself is invalid on every backend.
 
 The remaining fixtures are inventoried as standalone or targeted tests. The
@@ -167,6 +167,55 @@ def _case(name):
 
 def _rnd(*shape):
     return torch.randn(*shape, dtype=torch.float32)
+
+
+@_case("easy-relu")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), torch.zeros(N, device=dev), N), [1]
+
+
+@_case("easy-reverse_array")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), N), [0]
+
+
+@_case("easy-rgb_to_grayscale")
+def _(dev):
+    width, height = 37, 29
+    return (_rnd(width * height * 3).to(dev),
+            torch.zeros(width * height, device=dev), width, height), [1]
+
+
+@_case("easy-sigmod_linear_layout")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), torch.zeros(N, device=dev), N), [1]
+
+
+@_case("easy-softmax_activation")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), torch.zeros(N, device=dev), N), [1]
+
+
+@_case("easy-swish-gated_linear_unit")
+def _(dev):
+    N = 2050
+    return (_rnd(N).to(dev), torch.zeros(N // 2, device=dev), N), [1]
+
+
+@_case("easy-value_clipping")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), torch.zeros(N, device=dev), -0.25, 0.5, N), [1]
+
+
+@_case("easy-vector_addition")
+def _(dev):
+    N = 2053
+    return (_rnd(N).to(dev), _rnd(N).to(dev), torch.zeros(N, device=dev), N), [2]
 
 
 @_case("easy-matrix-addition")
@@ -467,6 +516,7 @@ def _run_all():
         "-m",
         "pytest",
         str(Path(__file__).resolve()),
+        str(test_root / "test_metal_leet_source_fidelity.py"),
         *(str(test_root / name) for name in TARGETED_TEST_MODULES),
         "-s",
         "--tb=short",

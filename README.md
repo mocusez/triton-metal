@@ -55,14 +55,14 @@ curl -fsSL https://pixi.sh/install.sh | bash
 
 # from repo root
 pixi install
-pixi run install   # builds Triton + Metal backend in editable mode
+pixi run --frozen install   # builds Triton + Metal backend in editable mode
 ```
 
 ### Build a release wheel
 
 ```bash
 TRITON_WHEEL_BACKENDS=metal TRITON_BUILD_PROTON=0 TRITON_STABLE_ABI=1 \
-    pixi run python setup.py bdist_wheel
+    pixi run --frozen python setup.py bdist_wheel
 # → dist/triton-3.8.0+git<sha>-cp312-abi3-macosx_26_0_arm64.whl  (~59 MB)
 ```
 
@@ -98,32 +98,44 @@ of the build directory, which no wheel carries.
 
 ```bash
 # lit-based MLIR tests (no GPU required — CPU-only compiler checks)
-cd $(pixi run python -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
+cd $(pixi run --frozen python -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
 ninja triton-opt
 lit -v test/Dialect/Metal
 
 # pytest GPU smoke tests (Metal/MPS required — a real Apple Silicon machine;
 # these cannot run on GitHub Actions runners, see Known limitations)
-pixi run pytest python/test/unit/test_metal_backend_*.py -s --tb=short
+pixi run --frozen pytest python/test/unit/test_metal_backend_*.py -s --tb=short
 
-# audit all 82 migrated LeetGPU-style Python fixtures and cover the 80
+# audit all 90 migrated LeetGPU-style Python fixtures and cover the 88
 # runnable workloads through standalone, interpreter, or targeted tests
-pixi run leet-all
+pixi run --frozen leet-all
 ```
+
+> **Sandboxed macOS processes can report a false-negative MPS status.** On a
+> physical Apple Silicon Mac, a process constrained by a Seatbelt-style agent
+> sandbox may return `False` from `torch.backends.mps.is_available()` and raise
+> PyTorch's generic "MPS backend is supported on macOS 14.0+" error even though
+> the host OS, GPU, and Pixi environment are valid. Re-running the same
+> `pixi run --frozen ...` command outside that sandbox exposes the MPS device
+> normally. `--clean-env` does not grant the missing service access. Local GPU
+> validation and performance reports must therefore record that they used the
+> project Pixi environment **and** an unsandboxed process; do not treat a
+> sandbox-only `is_available() == False` result as evidence that the Mac lacks
+> MPS support.
 
 ---
 
 ## What works today
 
-The 82 Python fixtures under `python/test/unit/fixtures/metal_leet/` have an
+The 90 Python fixtures under `python/test/unit/fixtures/metal_leet/` have an
 exhaustive ownership manifest enforced by
-`test_metal_backend_leet_uncovered.py`. `pixi run leet-all` executes all three
+`test_metal_backend_leet_uncovered.py`. `pixi run --frozen leet-all` executes all three
 ownership classes sequentially:
 
 | Ownership | Files | Validation |
 |---|---:|---|
 | Standalone drivers | 24 | Execute the original script and its PyTorch/smoke assertion |
-| Interpreter-backed gaps | 26 | Compare Metal with `TRITON_INTERPRET=1`; 24 run and 2 source-invalid cases skip explicitly |
+| Interpreter-backed gaps | 34 | Compare Metal with `TRITON_INTERPRET=1`; 32 run and 2 source-invalid cases skip explicitly |
 | Targeted backend regressions | 32 | Run the owning `test_metal_backend_*.py` modules |
 
 Adding a fixture without assigning it to exactly one ownership class fails the
@@ -149,13 +161,13 @@ inventory test. The standalone correctness set includes:
 These cover element-wise ops, masked load/store, reductions, scans, stable compaction, atomic accumulation, broadcast, 2D dispatch, convolution, COO sparse matvec/matmul, a correctness-first direct 2D DFT built from supported `tl.dot` tiles, and an ordinary least-squares solve backed by `tl.dot` Gram tiles.
 
 The following examples show the narrower commands for two fixtures owned by
-targeted pytest coverage; the full `pixi run leet-all` gate includes them:
+targeted pytest coverage; the full `pixi run --frozen leet-all` gate includes them:
 
 | Task | Reproduce |
 |---|---|
-| `hard-bfs_shortest_path.py` | `pixi run pytest python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_exact_kernel_compiles_to_msl python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_host_contract_rejects_invalid_metadata python/test/unit/test_metal_backend_atomic_add.py::test_bfs_shortest_path_original_solve_matches_cpu -s --tb=short` |
-| `hard-fast_fourier_transform.py` | `pixi run pytest python/test/unit/test_metal_backend_msl.py::test_hard_fast_fourier_transform_exact_kernel_compiles_to_msl python/test/unit/test_metal_backend_msl.py::test_hard_fast_fourier_transform_matches_torch -s --tb=short` |
-| `medium-fused_residual_add_and_rms_norm.py` | `pixi run pytest python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_exact_kernels_compile_to_msl python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_host_contract_rejects_invalid_metadata python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_original_solve_matches_torch python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_dynamic_fallback_large_width python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_accepts_noncontiguous_readonly_inputs python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_accepts_stride_zero_weight python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_stable_for_extreme_scales -s --tb=short` |
+| `hard-bfs_shortest_path.py` | `pixi run --frozen pytest python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_exact_kernel_compiles_to_msl python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_host_contract_rejects_invalid_metadata python/test/unit/test_metal_backend_atomic_add.py::test_bfs_shortest_path_original_solve_matches_cpu -s --tb=short` |
+| `hard-fast_fourier_transform.py` | `pixi run --frozen pytest python/test/unit/test_metal_backend_msl.py::test_hard_fast_fourier_transform_exact_kernel_compiles_to_msl python/test/unit/test_metal_backend_msl.py::test_hard_fast_fourier_transform_matches_torch -s --tb=short` |
+| `medium-fused_residual_add_and_rms_norm.py` | `pixi run --frozen pytest python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_exact_kernels_compile_to_msl python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_host_contract_rejects_invalid_metadata python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_original_solve_matches_torch python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_dynamic_fallback_large_width python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_accepts_noncontiguous_readonly_inputs python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_accepts_stride_zero_weight python/test/unit/test_metal_backend_layer_norm.py::test_fused_residual_add_rms_norm_stable_for_extreme_scales -s --tb=short` |
 
 `hard-bfs_shortest_path.py` uses a correctness-first host-controlled BFS: each
 frontier depth performs one kernel launch plus one host counter synchronization.
@@ -184,14 +196,81 @@ budget. The shared Triton frontend rules still apply (`k > 0`, power-of-two
 whose required phase scratch exceeds that budget are not part of this support
 contract.
 
+`tt.unsplat` is supported for its verifier-valid source shape: a tensor with
+exactly one logical element. The Metal type conversion maps that tensor to its
+scalar element type, so the lowering is an exact passthrough rather than a
+lane-exchange operation.
+
+`tl.map_elementwise` is supported with `pack=1` when its scalar callback is a
+single block ending in `tt.map_elementwise.return`. Both one and multiple
+result tensors are supported. `pack>1` and callbacks with multi-block control
+flow remain fail-closed with named diagnostics because they require adjacent
+logical elements or control-flow restructuring beyond the scalar inliner.
+
+Dynamic `scf.if` control flow supports one or more scalar results, including
+mixed scalar types. The MSL emitter preserves result order with one temporary
+per SSA result and assigns every branch yield to its corresponding temporary.
+
+Tensor-descriptor reducing stores use Triton's standard
+`triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
+The audited Metal envelope includes `i32` add/min/max/and/or/xor and `f32` add;
+the rewrite preserves descriptor-view bounds with an explicit atomic mask and
+supports contended updates. A raw `tt.descriptor_reduce` reaching the Metal
+conversion pass is rejected as a pipeline-order violation rather than reported
+as an unsupported frontend operation.
+
+`tl.atomic_cas` supports scalar and blocked rank-1/rank-2 `i32`, `u32`, and
+`f32` storage. The floating-point form compares and exchanges the exact IEEE-754
+object representation through a `ui32` atomic view, so signed zero and NaN
+payloads follow compare-exchange bit semantics rather than floating `==`.
+Old-value results and contended multi-program scalar CAS are covered on physical
+MPS. `f16`, `bf16`, and 64-bit CAS remain fail-closed with a named diagnostic.
+On the audited Apple M4 toolchain, `atomic_ulong` supports the existing void
+u64 min/max path but rejects fetch-add, bitwise, exchange, and compare-exchange
+overloads; those operations therefore remain platform boundaries rather than
+being approximated with a racy load/modify/store sequence.
+
 ---
 
 ## Known limitations
 
 - **Generic tensor codegen is still scalar.** The backend has specialized SIMD-group matrix, reduction, scan, and threadgroup-memory paths, but the general ranked-tensor conversion still lowers one scalar element at a time. Contiguous vector loads/stores and broader aggregate-hoisting remain performance work.
-- **Op coverage is deliberately bounded.** The common elementwise, reduction, scan, gather, atomic, dot, fp8, and control-flow paths have end-to-end coverage, while unsupported shapes fail during preflight with a named diagnostic. Notable remaining envelopes include loop-carried rank-2 reductions, some cross-lane layout changes, broader `tt.dot_scaled`, and multi-result `scf.if`.
-- **`tl.dot` is not layout-general.** Proven scalar and SIMD-group-matrix paths cover the tested f32, fp16/bf16, int8, batched, and scaled-dot envelopes. Masked multi-tile canonical dots, 3-D dots with `K > min(M, N)`, and arbitrary layout combinations remain unsupported.
-- **Launching requires PyTorch MPS.** `torch.mps.compile_shader` compiles the MSL once per process; nothing is cached across processes, and the compiled shader library lives and dies with the interpreter.
+- **Op coverage is deliberately bounded.** The common elementwise, reduction, scan, gather, atomic, dot, fp8, and control-flow paths have end-to-end coverage, while unsupported shapes fail during preflight with a named diagnostic. Notable remaining envelopes include loop-carried rank-2 reductions, some cross-lane layout changes, and broader `tt.dot_scaled`.
+- **`tl.dot` is not layout-general.** Proven scalar and SIMD-group-matrix paths
+  cover the tested f32, fp16/bf16, int8, batched, and scaled-dot envelopes.
+  Canonical masked multi-tile dots and direct rank-3 batched dots with
+  `K > min(M, N)` are covered. Rank-2 `tt.dot_scaled` additionally accepts
+  matched zero-filled rectangular A/B loads and a matching masked output
+  store. A static rank-2 loop slice is covered for matching fp16/bf16 payloads
+  with 16- or 32-element E8M0 groups and matching E2M1/E4M3/E5M2 payloads with
+  32-element groups. E2M1 may pack either operand along K or its outer M/N
+  dimension. The loop must walk the whole K range from zero, carry one
+  accumulator, and advance both scale matrices by exactly one group per
+  iteration. Direct rank-3 `tt.dot_scaled` is covered for unmasked canonical
+  matrix I/O with batch-shared or statically proven contiguous per-batch E8M0
+  scale matrices.
+  Its matched zero-filled rectangular mask also covers simultaneous rank-3
+  batch/M/N/K tails when A/B/output carry the same canonical batch bound and
+  zero-based batch coordinate. The store-owned batch coordinate is preserved
+  through `metal.scalar_dot`, so the tail guard remains aligned across a folded
+  result layout conversion; mismatched A/B/output batch bounds fail closed.
+  Mixed-format loop payloads, dynamic or masked loops, non-contiguous/dynamic
+  scale batch strides, and arbitrary layout combinations remain unsupported.
+- **Launching requires PyTorch MPS.** Triton's normal on-disk cache stores the
+  terminal MSL text, while `torch.mps.compile_shader` returns only an in-process
+  shader library/callable and exposes no public `.metallib` or PSO handle. The
+  host stack nevertheless has an effective source-specific cross-process cache:
+  on the audited Apple M4/PyTorch 2.10 environment, fresh-process compilation of
+  a repeated source had a `3.189 ms` median versus `29.318 ms` for unique
+  sources (`0.109x`). Keep this behavior under the
+  `metal_shader_compile_cache.py` benchmark rather than adding a competing,
+  non-serializable backend cache.
+- **Agent sandboxes can hide an otherwise working MPS device.** In particular,
+  a Seatbelt-constrained Codex command may make PyTorch report zero MPS devices
+  and emit its generic minimum-macOS error. The same project Pixi interpreter
+  can allocate an MPS tensor when invoked outside the sandbox. Run GPU tests
+  and benchmarks with `pixi run --frozen` in an unsandboxed process, and include
+  that execution context in reported evidence.
 - **The runtime tracks PyTorch's MPS surface.** Capabilities can regress with a torch upgrade: on torch 2.13 `torch.zeros(..., dtype=torch.float8_e4m3fn, device="mps")` fails with `Undefined type Float8_e4m3fn`, so the fp8 paths need torch 2.10-era MPS support even though the backend's own fp8 casts are unchanged.
 - **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`), so a wheel built on macOS 26 will not install on macOS 14/15. Nothing in `libtriton.so` links an Apple framework, so building with `MACOSX_DEPLOYMENT_TARGET` set lower is the fix — untested so far.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
@@ -215,15 +294,16 @@ The current dependency-ordered priorities are:
 1. Finish the unsupported-op/preflight safety matrix. Axes 1/2
    `tt.get_num_programs` coverage is in place, and both correctness xfails
    found by the audit are now ordinary 30-run regressions.
-2. Expand exact dot, scaled-dot, reduce/scan, layout-conversion, atomic CAS,
-   descriptor-reduce, `tt.unsplat`, and `tl.map_elementwise` envelopes one
+2. Expand scaled-dot beyond the static rank-2 same-type fp16/bf16/FP8 loop
+   slice and add the remaining mixed-format/dynamic/masked loop forms and
+   non-canonical scale-address forms, reduce/scan,
+   layout-conversion, broader descriptor-reduce type/rank envelopes, and
+   broader `tl.map_elementwise` pack/control-flow envelopes one
    positive/adjacent-negative slice at a time.
 3. Improve generic performance with vectorized contiguous memory access,
    aggregate/cone reuse, and resource-aware tile selection, backed by fixed
    MPS benchmarks rather than blanket speedup claims.
-4. Decide and implement a versioned cross-process shader-cache architecture;
-   the current PyTorch MPS API recompiles MSL in each interpreter.
-5. Validate lower deployment-target wheels on clean macOS installations.
+4. Validate lower deployment-target wheels on clean macOS installations.
 
 PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
 and bf16 atomic add are platform/runtime boundaries, not implementation backlog.

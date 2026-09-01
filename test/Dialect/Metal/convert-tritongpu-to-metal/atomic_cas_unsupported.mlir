@@ -5,7 +5,7 @@
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_cas_scalar_i64(%out_ptr: !tt.ptr<i64>, %cmp: i64, %value: i64) {
-    // expected-error @+1 {{Metal backend: atomic_cas requires 32-bit integer compare, value, and storage}}
+    // expected-error @+1 {{Metal backend: 64-bit atomic_cas is unsupported because MSL has no atomic_ulong compare-exchange}}
     %old = tt.atomic_cas acq_rel, gpu, %out_ptr, %cmp, %value : (!tt.ptr<i64>, i64, i64) -> i64
     tt.return
   }
@@ -14,9 +14,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @atomic_cas_scalar_f32(%out_ptr: !tt.ptr<f32>, %cmp: f32, %value: f32) {
-    // expected-error @+1 {{Metal backend: atomic_cas requires 32-bit integer compare, value, and storage}}
-    %old = tt.atomic_cas acq_rel, gpu, %out_ptr, %cmp, %value : (!tt.ptr<f32>, f32, f32) -> f32
+  tt.func public @atomic_cas_scalar_f16(%out_ptr: !tt.ptr<f16>, %cmp: f16, %value: f16) {
+    // expected-error @+1 {{Metal backend: atomic_cas requires matching i32/u32 or f32 compare, value, and storage}}
+    %old = tt.atomic_cas acq_rel, gpu, %out_ptr, %cmp, %value : (!tt.ptr<f16>, f16, f16) -> f16
     tt.return
   }
 }
@@ -31,7 +31,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %addr = tt.addptr %out, %r : tensor<16x!tt.ptr<i64>, #blocked>, tensor<16xi32, #blocked>
     %cmps = tt.splat %cmp : i64 -> tensor<16xi64, #blocked>
     %values = tt.splat %value : i64 -> tensor<16xi64, #blocked>
-    // expected-error @+1 {{Metal backend: atomic_cas requires 32-bit integer compare, value, and storage}}
+    // expected-error @+1 {{Metal backend: 64-bit atomic_cas is unsupported because MSL has no atomic_ulong compare-exchange}}
     %old = tt.atomic_cas acq_rel, gpu, %addr, %cmps, %values : (tensor<16x!tt.ptr<i64>, #blocked>, tensor<16xi64, #blocked>, tensor<16xi64, #blocked>) -> tensor<16xi64, #blocked>
     %old_out = tt.splat %old_ptr : !tt.ptr<i64> -> tensor<16x!tt.ptr<i64>, #blocked>
     %old_addr = tt.addptr %old_out, %r : tensor<16x!tt.ptr<i64>, #blocked>, tensor<16xi32, #blocked>

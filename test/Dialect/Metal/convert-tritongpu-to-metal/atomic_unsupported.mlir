@@ -16,8 +16,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_add_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
-    // expected-error @+1 {{Metal backend: 64-bit integer atomic add is unsupported}}
+    // expected-error @+1 {{Metal backend: 64-bit integer atomic add is unsupported because MSL has no atomic_ulong fetch-add}}
     %old = tt.atomic_rmw add, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_and_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
+    // expected-error @+1 {{Metal backend: bitwise atomic and/or/xor require a 32-bit integer payload; MSL has no 64-bit bitwise atomic}}
+    %old = tt.atomic_rmw and, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_xchg_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
+    // expected-error @+1 {{Metal backend: 64-bit atomic exchange is unsupported because MSL has no atomic_ulong exchange}}
+    %old = tt.atomic_rmw exch, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
     tt.return
   }
 }

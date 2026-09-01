@@ -67,6 +67,15 @@ def _parse_args():
         help="Call the JIT kernel directly with this num_warps value.",
     )
     parser.add_argument(
+        "--raw-fused",
+        action="store_true",
+        help=(
+            "Benchmark the original single-kernel GroupNorm path directly. "
+            "Defaults to the fixture's Metal raw-fused num_warps unless "
+            "--num-warps is provided."
+        ),
+    )
+    parser.add_argument(
         "--assert-max-ratio",
         type=float,
         help="Fail if any round has Triton/PyTorch median above this ratio.",
@@ -89,7 +98,14 @@ def main():
     beta = torch.randn(c, dtype=torch.float32, device="mps")
     triton_out = torch.empty_like(x)
 
-    if args.num_warps is None:
+    raw_fused = args.raw_fused or args.num_warps is not None
+    raw_num_warps = (
+        args.num_warps
+        if args.num_warps is not None
+        else module.METAL_RAW_FUSED_NUM_WARPS
+    )
+
+    if not raw_fused:
 
         def triton_group_norm():
             module.solve(
@@ -111,7 +127,7 @@ def main():
                 HW=h * w,
                 BLOCK=4096,
                 BLOCK_CH=4096,
-                num_warps=args.num_warps,
+                num_warps=raw_num_warps,
             )
             return triton_out
 
@@ -161,7 +177,8 @@ def main():
         "shape": SHAPE,
         "groups": GROUPS,
         "dtype": "float32",
-        "num_warps": args.num_warps,
+        "path": "raw_fused" if raw_fused else "split",
+        "num_warps": raw_num_warps if raw_fused else None,
         "max_abs": max_abs,
         "warmup": args.warmup,
         "iterations": args.iterations,

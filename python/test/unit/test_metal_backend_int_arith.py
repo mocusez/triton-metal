@@ -154,6 +154,32 @@ def _umulhi_u64_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, high, mask=mask)
 
 
+@triton.jit
+def _map_linear(a, b):
+    return a * 3 + b
+
+
+@triton.jit
+def _map_pair(a, b):
+    return a + b, a - b
+
+
+@triton.jit
+def _map_elementwise_pack1_kernel(
+    a_ptr, b_ptr, out0_ptr, out1_ptr, MULTI: tl.constexpr, BLOCK: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    if MULTI:
+        out0, out1 = tl.map_elementwise(_map_pair, a, b)
+        tl.store(out0_ptr + offsets, out0)
+        tl.store(out1_ptr + offsets, out1)
+    else:
+        out0 = tl.map_elementwise(_map_linear, a, b)
+        tl.store(out0_ptr + offsets, out0)
+
+
 _SIGNATURE_1ARG = {"out_ptr": "*fp32", "BLOCK": "constexpr"}
 _SIGNATURE_SELECT = {
     "x_ptr": "*fp32",
@@ -315,3 +341,25 @@ def test_scalar_int_to_float_runtime_bit_exact():
     # Each program g writes its pid (as f32) into out[g*BLOCK : (g+1)*BLOCK].
     expected = torch.arange(G, dtype=torch.float32).repeat_interleave(BLOCK)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+@pytest.mark.parametrize("multi", [False, True])
+def test_map_elementwise_pack1_runtime(multi: bool):
+    block = 128
+    a = torch.arange(-64, 64, dtype=torch.int32, device="mps")
+    b = torch.arange(127, -1, -1, dtype=torch.int32, device="mps")
+    out0 = torch.empty(block, dtype=torch.int32, device="mps")
+    out1 = torch.empty(block, dtype=torch.int32, device="mps")
+
+    _map_elementwise_pack1_kernel[(1,)](
+        a, b, out0, out1, MULTI=multi, BLOCK=block
+    )
+
+    if multi:
+        torch.testing.assert_close(out0.cpu(), (a + b).cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(out1.cpu(), (a - b).cpu(), atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(out0.cpu(), (a * 3 + b).cpu(), atol=0, rtol=0)

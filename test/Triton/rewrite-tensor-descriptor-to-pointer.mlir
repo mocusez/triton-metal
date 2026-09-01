@@ -211,3 +211,23 @@ module {
 
 // CHECK-LABEL: @arg_attr
 // CHECK-SAME: %arg7: i32 {tt.divisibility = 16 : i32} loc({{.*}})) {
+
+// -----
+
+module {
+  tt.func public @reduce_add_i32(%base: !tt.ptr<i32>, %offset: i32, %src: tensor<16xi32>) {
+    %c18_i32 = arith.constant 18 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %desc = tt.make_tensor_descriptor %base, [%c18_i32], [%c1_i64] : <i32>, <16xi32>
+    tt.descriptor_reduce add, %desc[%offset], %src : !tt.tensordesc<16xi32>, tensor<16xi32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: @reduce_add_i32
+// CHECK-SAME: %[[BASE:[^:]*]]
+// CHECK-SAME: %[[OFFSET:[^:]*]]
+// CHECK-SAME: %[[SRC:[^:]*]]
+// CHECK: %[[MASK:.*]] = arith.andi
+// CHECK: tt.atomic_rmw add, release, gpu,
+// CHECK-SAME: %[[SRC]], %[[MASK]]

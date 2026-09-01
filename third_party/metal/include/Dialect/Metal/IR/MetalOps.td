@@ -339,10 +339,12 @@ def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
 def AtomicCasOp : Metal_Op<"atomic_cas"> {
   let summary = "Atomic compare-and-swap on a 32-bit device-memory element.";
   let description = [{
-    Atomically compares `memref[index]` against `cmp` and stores `value` when
-    equal, yielding the old value observed at the memory location. NOT `Pure`:
-    it has a device-memory side effect and must be emitted even when its result
-    is unused.
+    Atomically compares the 32-bit object representation at `memref[index]`
+    against `cmp` and stores `value` when equal, yielding the old bits observed
+    at the memory location. Integer storage uses its native representation;
+    f32 storage is accessed through a ui32 atomic view. NOT `Pure`: it has a
+    device-memory side effect and must be emitted even when its result is
+    unused.
   }];
 
   let arguments = (ins Metal_Type:$cmp, Metal_Type:$value,
@@ -1864,9 +1866,11 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     geometry and `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)`.
     When `output_indices` is present, its scalarized row contribution, column
     contribution, and row stride instead recover the exact rank-2 output
-    coordinates owned by the current store lane.  This keeps scalar-dot
-    evaluation aligned with a folded result layout conversion whose blocked
-    distribution differs from the function-wide tile loop.
+    coordinates owned by the current store lane. Rank-3 batch tails prepend
+    the batch mask coordinate to the same triple. This keeps scalar-dot
+    evaluation and its tail guard aligned with a folded result layout
+    conversion whose blocked distribution differs from the function-wide tile
+    loop.
     `a_batch_offset`/`b_batch_offset` are scalarized shaped pointer
     contributions for the current batch lane. The geometry is pinned to the
     function-wide tile loop so it remains aligned with the store when a folded
@@ -1895,13 +1899,16 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     unused matrix buffer as the placeholder for an unscaled side) and five
     ui32 parameters: A/B scale base offsets, A/B scale row strides, and the
     shared 16- or 32-element scale factor.  Unit attributes identify which
-    sides are scaled and whether scale-NaN masking may be skipped.  The
-    lowering decodes each E8M0 byte into the operand compute type; optional
-    markers identify E2M1 (packed along K or the outer matrix dimension) or
-    byte-backed E4M3FN/E5M2 payloads.  Every
-    finite payload is widened exactly to bf16 before scaling; NaN class is
-    preserved without promising payload bits.  The scaled operand is rounded
-    at that compute type and only then extended for f32 accumulation.  Exact
+    sides are scaled and whether scale-NaN masking may be skipped. Optional
+    `metal.a_scale_batch_stride`/`metal.b_scale_batch_stride` integer
+    attributes add the logical batch coordinate times a proven static
+    contiguous scale-matrix stride; absent attributes retain batch-shared
+    scales. The lowering decodes each E8M0 byte into the operand compute type;
+    optional markers identify E2M1 (packed along K or the outer matrix
+    dimension) or byte-backed E4M3FN/E5M2 payloads. Every finite payload is
+    widened exactly to bf16 before scaling; NaN class is preserved without
+    promising payload bits. The scaled operand is rounded at that compute type
+    and only then extended for f32 accumulation. Exact
     cross-backend numerical parity excludes denormal products or accumulation
     results on targets whose native floating-point arithmetic flushes them.
     NOTE: this is O(M*N*K) scalar work with no matrix-unit reuse — a correctness

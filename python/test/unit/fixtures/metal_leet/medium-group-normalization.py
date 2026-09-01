@@ -24,6 +24,9 @@ import triton
 import triton.language as tl
 
 
+METAL_RAW_FUSED_NUM_WARPS = 32
+
+
 @triton.jit
 def _group_norm_fwd_kernel(
     X, GAMMA, BETA, Y,
@@ -192,9 +195,10 @@ def solve(
     NG = N * G
     grid = (NG,)
     if X.device.type == "mps":
-        # The current Metal lowering replays reductions inside the output tile
-        # loop of a fused kernel. Splitting only the Metal path avoids that
-        # compiler limitation while retaining the T4-tuned fused CUDA path.
+        # The compiler now hoists the fused kernel's block-uniform statistics
+        # recurrence out of its output tile loop. Keep the two-kernel Metal
+        # specialization because it is still the faster tuned path on Apple M4,
+        # not because the fused source requires a correctness workaround.
         stats = torch.empty((2 * NG,), device=X.device, dtype=torch.float32)
         _group_norm_stats_kernel[grid](
             X, stats,
