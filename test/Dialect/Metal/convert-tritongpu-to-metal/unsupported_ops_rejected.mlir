@@ -1,7 +1,7 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal --verify-diagnostics --split-input-file %s
 //
-// Triton ops the Metal backend does not implement must be rejected up front by
-// `validateUnsupportedOpsRejected`, BEFORE any conversion runs.
+// Source operations the Metal backend cannot lower must be rejected up front
+// by their preflight validators, BEFORE any conversion runs.
 //
 // This is not cosmetic. Reaching `applyFullConversion` with no pattern printed
 // "failed to legalize operation ..." and then took the PROCESS down in
@@ -12,7 +12,7 @@
 //
 // Each case below therefore pins BOTH that the construct is refused and the
 // wording that tells the author what to do instead. Implementing one of these
-// means deleting its entry in the validator and its case here.
+// means updating its validator and deleting the corresponding case here.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
@@ -281,6 +281,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @reject_scalar_fp8_cast(%v: f32) {
     // expected-error @+1 {{fp8 conversion is implemented for tensor casts only}}
     %r = tt.fp_to_fp %v, rounding = rtne : f32 -> f8E4M3FN
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_non_splat_tensor_constant(%out: !tt.ptr<i32>) {
+    // expected-error @+1 {{tensor arith.constant requires a splat value}}
+    %v = arith.constant dense<[0, 1, 2, 3]> : tensor<4xi32, #blocked>
+    %range = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32, #blocked>
+    %base = tt.splat %out : !tt.ptr<i32> -> tensor<4x!tt.ptr<i32>, #blocked>
+    %ptr = tt.addptr %base, %range : tensor<4x!tt.ptr<i32>, #blocked>, tensor<4xi32, #blocked>
+    tt.store %ptr, %v : tensor<4x!tt.ptr<i32>, #blocked>
     tt.return
   }
 }

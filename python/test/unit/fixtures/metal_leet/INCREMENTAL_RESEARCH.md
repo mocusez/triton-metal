@@ -934,6 +934,17 @@ are still whole-kernel replacements rather than layout-general lowering.
     file and all 125 Metal conversion lit tests pass. P0 remains open only for
     the separate audit of lowering patterns whose matchers can still decline.
 
+33. **P0 moves non-splat tensor constants ahead of full conversion.** A live
+    `arith.constant dense<[...]>` reached `ArithConstantDenseLowering`, whose
+    scalar model can represent only a splat. The resulting match failure first
+    printed a generic legalization error and then crashed split-input test
+    processing in `Region::dropAllReferences` with SIGSEGV. A shared
+    `tensorConstantSplatValue` predicate now drives both the lowering and an
+    early validator, which names the unsupported per-element constant while
+    the source module is intact. The reproducer now exits through the expected
+    diagnostic, the existing splat fixture still lowers, the Pixi native build
+    succeeds, and all 125 Metal conversion lit tests pass.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

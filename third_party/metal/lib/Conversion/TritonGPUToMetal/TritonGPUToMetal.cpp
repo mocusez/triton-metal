@@ -3722,6 +3722,13 @@ struct ConvertLayoutLowering
 // See the implementation notes.
 //===----------------------------------------------------------------------===//
 
+static mlir::SplatElementsAttr
+tensorConstantSplatValue(mlir::arith::ConstantOp op) {
+  if (!mlir::isa<mlir::RankedTensorType>(op.getType()))
+    return {};
+  return mlir::dyn_cast<mlir::SplatElementsAttr>(op.getValue());
+}
+
 struct ArithConstantDenseLowering
     : public mlir::OpConversionPattern<mlir::arith::ConstantOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3732,7 +3739,7 @@ struct ArithConstantDenseLowering
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(resTy);
     if (!rtt)
       return mlir::failure(); // scalar arith.constant: leave alone
-    auto denseAttr = mlir::dyn_cast<mlir::SplatElementsAttr>(op.getValue());
+    auto denseAttr = tensorConstantSplatValue(op);
     if (!denseAttr)
       return rewriter.notifyMatchFailure(
           op, "arith.constant: non-splat dense not supported");
@@ -31696,6 +31703,26 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// A tensor arith.constant reaches full conversion through
+// ArithConstantDenseLowering, which can scalarize a splat but cannot choose a
+// different literal for every logical element. Its in-conversion decline has
+// the same unsafe teardown behavior as an unsupported Triton op, so mirror the
+// lowering's exact predicate here while the source module is still intact.
+static mlir::LogicalResult
+validateTensorConstantSupport(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::arith::ConstantOp op) {
+    if (!mlir::isa<mlir::RankedTensorType>(op.getType()) ||
+        tensorConstantSplatValue(op))
+      return;
+    op.emitOpError(
+        "Metal backend: tensor arith.constant requires a splat value; "
+        "per-element tensor constants are not implemented");
+    valid = false;
+  });
+  return mlir::success(valid);
+}
+
 // `tt.scan` shapes ScanLowering cannot lower.
 //
 // It declines by `notifyMatchFailure`, which in this backend is a process kill
@@ -32614,6 +32641,7 @@ struct ConvertTritonGPUToMetalPass
     g_broadcastExchange.clear();
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
+        mlir::failed(validateTensorConstantSupport(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateUnitAxisReduce(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
