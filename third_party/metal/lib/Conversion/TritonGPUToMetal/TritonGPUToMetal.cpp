@@ -16333,6 +16333,220 @@ static std::optional<int64_t> getScalarIntConstant(mlir::Value v) {
   return attr.getInt();
 }
 
+// P4.1: collapse the exact aligned, contiguous, rank-1 masked vector-add
+// envelope before the tensor-to-scalar conversion. The ordinary load/store
+// patterns deliberately inspect one operation at a time; vectorizing across
+// two loads, one add, and one store therefore belongs in this separate
+// whole-function transformation.
+//
+// The matcher is intentionally coverage-complete rather than name-based. It
+// accepts only:
+//   out[pid * BLOCK + arange] = x[...] + y[...]
+//   under one shared `(pid * BLOCK + arange) < n` mask,
+// with a rank-1 blocked layout whose per-thread mapping is contiguous and all
+// three base pointer arguments carrying `tt.divisibility >= 16`. Anything
+// else, including an `other`, an extra side effect, an unaligned pointer, a
+// strided layout, or a different mask, stays on the scalar fallback.
+static mlir::LogicalResult
+tryRewriteContiguousVectorAdd(mlir::triton::FuncOp funcOp) {
+  if (!funcOp.getBody().hasOneBlock())
+    return mlir::failure();
+  mlir::Block &entry = funcOp.getBody().front();
+  llvm::SmallPtrSet<mlir::Operation *, 32> claimed;
+  auto claim = [&](mlir::Operation *op) {
+    if (op)
+      claimed.insert(op);
+  };
+
+  mlir::triton::StoreOp store;
+  for (mlir::Operation &op : entry) {
+    auto candidate = mlir::dyn_cast<mlir::triton::StoreOp>(&op);
+    if (!candidate)
+      continue;
+    if (store)
+      return mlir::failure();
+    store = candidate;
+  }
+  if (!store || !store.getMask())
+    return mlir::failure();
+  claim(store);
+
+  auto add = store.getValue().getDefiningOp<mlir::arith::AddFOp>();
+  if (!add)
+    return mlir::failure();
+  claim(add);
+  auto xLoad = add.getLhs().getDefiningOp<mlir::triton::LoadOp>();
+  auto yLoad = add.getRhs().getDefiningOp<mlir::triton::LoadOp>();
+  if (!xLoad || !yLoad || xLoad == yLoad || !xLoad.getMask() ||
+      !yLoad.getMask() || xLoad.getOther() || yLoad.getOther() ||
+      xLoad.getMask() != store.getMask() ||
+      yLoad.getMask() != store.getMask())
+    return mlir::failure();
+  claim(xLoad);
+  claim(yLoad);
+
+  mlir::Value offsets;
+  mlir::Value xBase, yBase, outBase;
+  auto matchAddress = [&](mlir::Value ptr, mlir::Value expectedOffsets,
+                          mlir::Value &base) {
+    auto addPtr = ptr.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!addPtr || (expectedOffsets && addPtr.getOffset() != expectedOffsets))
+      return false;
+    auto splat = addPtr.getPtr().getDefiningOp<mlir::triton::SplatOp>();
+    if (!splat)
+      return false;
+    offsets = addPtr.getOffset();
+    base = splat.getSrc();
+    claim(addPtr);
+    claim(splat);
+    return true;
+  };
+  if (!matchAddress(store.getPtr(), {}, outBase))
+    return mlir::failure();
+  mlir::Value commonOffsets = offsets;
+  if (!matchAddress(xLoad.getPtr(), commonOffsets, xBase) ||
+      !matchAddress(yLoad.getPtr(), commonOffsets, yBase))
+    return mlir::failure();
+
+  auto mask = store.getMask().getDefiningOp<mlir::arith::CmpIOp>();
+  if (!mask || mask.getPredicate() != mlir::arith::CmpIPredicate::slt ||
+      mask.getLhs() != commonOffsets)
+    return mlir::failure();
+  auto nSplat = mask.getRhs().getDefiningOp<mlir::triton::SplatOp>();
+  if (!nSplat)
+    return mlir::failure();
+  auto nArg = mlir::dyn_cast<mlir::BlockArgument>(nSplat.getSrc());
+  if (!nArg || nArg.getOwner() != &entry || !nArg.getType().isInteger(32))
+    return mlir::failure();
+  claim(mask);
+  claim(nSplat);
+
+  auto offsetAdd = commonOffsets.getDefiningOp<mlir::arith::AddIOp>();
+  if (!offsetAdd)
+    return mlir::failure();
+  mlir::triton::MakeRangeOp range;
+  mlir::triton::SplatOp blockStartSplat;
+  auto classifyOffsetOperand = [&](mlir::Value value) {
+    if (auto candidate =
+            value.getDefiningOp<mlir::triton::MakeRangeOp>()) {
+      if (range)
+        return false;
+      range = candidate;
+      return true;
+    }
+    if (auto candidate = value.getDefiningOp<mlir::triton::SplatOp>()) {
+      if (blockStartSplat)
+        return false;
+      blockStartSplat = candidate;
+      return true;
+    }
+    return false;
+  };
+  if (!classifyOffsetOperand(offsetAdd.getLhs()) ||
+      !classifyOffsetOperand(offsetAdd.getRhs()) || !range ||
+      !blockStartSplat || range.getStart() != 0)
+    return mlir::failure();
+  claim(offsetAdd);
+  claim(range);
+  claim(blockStartSplat);
+
+  auto blockMul =
+      blockStartSplat.getSrc().getDefiningOp<mlir::arith::MulIOp>();
+  if (!blockMul)
+    return mlir::failure();
+  mlir::triton::GetProgramIdOp programId;
+  mlir::arith::ConstantOp blockConstant;
+  auto classifyBlockOperand = [&](mlir::Value value) {
+    if (auto candidate =
+            value.getDefiningOp<mlir::triton::GetProgramIdOp>()) {
+      if (programId)
+        return false;
+      programId = candidate;
+      return true;
+    }
+    if (auto candidate = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+      if (blockConstant)
+        return false;
+      blockConstant = candidate;
+      return true;
+    }
+    return false;
+  };
+  if (!classifyBlockOperand(blockMul.getLhs()) ||
+      !classifyBlockOperand(blockMul.getRhs()) || !programId ||
+      programId.getAxisAsInt() != 0 || !blockConstant)
+    return mlir::failure();
+  auto blockAttr =
+      mlir::dyn_cast<mlir::IntegerAttr>(blockConstant.getValue());
+  if (!blockAttr || blockAttr.getInt() <= 0 ||
+      range.getEnd() != blockAttr.getInt())
+    return mlir::failure();
+  claim(blockMul);
+  claim(programId);
+  claim(blockConstant);
+
+  auto valueTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(add.getResult().getType());
+  if (!valueTy || valueTy.getRank() != 1 ||
+      !valueTy.getElementType().isF32() ||
+      valueTy.getDimSize(0) != blockAttr.getInt())
+    return mlir::failure();
+  auto tile = tileFromTensor(valueTy);
+  constexpr int64_t vectorWidth = 4;
+  if (!tile || tile->rank != 1 || !tile->contiguous ||
+      tile->order.size() != 1 || tile->order[0] != 0 ||
+      tile->elemPerThread < vectorWidth ||
+      tile->elemPerThread % vectorWidth != 0 ||
+      tile->elemPerThread * tile->threadsPerBlock != valueTy.getNumElements())
+    return mlir::failure();
+
+  auto alignedF32PointerArg = [&](mlir::Value value) {
+    auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+    if (!arg || arg.getOwner() != &entry)
+      return false;
+    auto ptrTy = mlir::dyn_cast<mlir::triton::PointerType>(arg.getType());
+    if (!ptrTy || !ptrTy.getPointeeType().isF32())
+      return false;
+    auto divisibility = funcOp.getArgAttrOfType<mlir::IntegerAttr>(
+        arg.getArgNumber(), "tt.divisibility");
+    return divisibility && divisibility.getInt() >= 16;
+  };
+  if (!alignedF32PointerArg(xBase) || !alignedF32PointerArg(yBase) ||
+      !alignedF32PointerArg(outBase))
+    return mlir::failure();
+
+  // Coverage is the final over-match guard. Every non-terminator operation in
+  // the function must be one of the nodes proven above; otherwise the
+  // replacement could drop a computation or side effect.
+  for (mlir::Operation &op : entry)
+    if (!op.hasTrait<mlir::OpTrait::IsTerminator>() && !claimed.contains(&op))
+      return mlir::failure();
+
+  mlir::OpBuilder builder(store);
+  auto loc = store.getLoc();
+  ContiguousVectorAddOp::create(
+      builder, loc,
+      bridgePtrToMemref(builder, loc, xBase, builder.getF32Type()),
+      bridgePtrToMemref(builder, loc, yBase, builder.getF32Type()),
+      bridgePtrToMemref(builder, loc, outBase, builder.getF32Type()), nArg,
+      tile->elemPerThread, vectorWidth);
+
+  llvm::SmallVector<mlir::Operation *, 32> erase;
+  for (mlir::Operation &op : entry)
+    if (claimed.contains(&op))
+      erase.push_back(&op);
+  for (mlir::Operation *op : llvm::reverse(erase))
+    op->erase();
+  return mlir::success();
+}
+
+static void preprocessContiguousVectorAdds(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::FuncOp> funcs;
+  moduleOp.walk([&](mlir::triton::FuncOp funcOp) { funcs.push_back(funcOp); });
+  for (mlir::triton::FuncOp funcOp : funcs)
+    (void)tryRewriteContiguousVectorAdd(funcOp);
+}
+
 static bool isTritonPtrToInt(mlir::Type ty, unsigned width) {
   auto ptr = llvm::dyn_cast<mlir::triton::PointerType>(ty);
   if (!ptr)
@@ -32000,6 +32214,12 @@ struct ConvertTritonGPUToMetalPass
     // no pattern for, and every structural matcher below is happier not seeing
     // them. No-op for kernels without `tl.assume`.
     eraseAssumeHints(moduleOp);
+
+    // P4.1 aligned contiguous vectorization. This whole-function rewrite runs
+    // while tensor layouts, shared mask identity, and argument divisibility
+    // proofs are still available. A miss is deliberately a no-op: the normal
+    // scalar load/add/store conversion remains the correctness floor.
+    preprocessContiguousVectorAdds(moduleOp);
 
     // Structure top-level early-exit guards (`if cond: return`) into scf.if
     // BEFORE any other handling — the MSL emitter is structured-only and has no

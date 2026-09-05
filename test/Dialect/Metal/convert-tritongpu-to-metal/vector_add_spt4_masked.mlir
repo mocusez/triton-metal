@@ -53,6 +53,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // tile (E = 1024 / 128 threads = 8); the masked load and store both fire
 // inside the per-iter guard.
 // MSL: kernel void add_kernel_spt4_masked(
+// MSL-NOT: float4
 // MSL: for (int v{{[0-9]+}} = 0; v{{[0-9]+}} < 8; v{{[0-9]+}} += 1)
 // MSL: if (
 // MSL: return;

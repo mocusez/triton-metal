@@ -2,14 +2,15 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
 // BLOCK_SIZE=1024 vector_add with contiguous per-thread layout
-// (sizePerThread=[8]). 128 threads each process 8 contiguous elements
-// with idx = tid * 8 + iv. Tile loop wraps load/compute/store; per-iter
-// mask check guards each iteration.
+// (sizePerThread=[8]). 128 threads each process 8 contiguous elements.
+// The three buffers are proven 16-byte aligned, so the exact canonical
+// masked-add envelope may use two float4 transactions per thread. The emitted
+// op retains a scalar tail for the last partial program.
 // See the implementation notes.
 
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @add_kernel_contiguous(%x_ptr: !tt.ptr<f32>, %y_ptr: !tt.ptr<f32>, %output_ptr: !tt.ptr<f32>, %n_elements: i32) {
+  tt.func public @add_kernel_contiguous(%x_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %y_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %output_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n_elements: i32) {
     %c1024_i32 = arith.constant 1024 : i32
     %pid = tt.get_program_id x : i32
     %block_start = arith.muli %pid, %c1024_i32 : i32
@@ -33,40 +34,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // METAL: metal.module
-// METAL: metal.kernel add_kernel_contiguous
-// METAL-DAG: arith.constant 0 : i32
-// METAL-DAG: arith.constant 8 : i32
-// METAL-DAG: arith.constant 1 : i32
-// METAL: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}}
-// METAL: metal.thread_id "x"
-// METAL: arith.constant 8 : i32
-// METAL: arith.muli
-// METAL: arith.addi
-// METAL: arith.cmpi slt
-// METAL: scf.if {{.*}} -> (f32)
+// METAL-LABEL: metal.kernel add_kernel_contiguous
 // METAL: metal.get_element
+// METAL: metal.contiguous_vector_add
+// METAL-SAME: elements_per_thread = 8
+// METAL-SAME: vector_width = 4
+// METAL-NOT: scf.for
 // METAL: metal.return
 
-// Wall 13 fix (the implementation notes AC8):
-// MakeRange now emits `localTid*E + iv` for BOTH the load index and the
-// mask predicate (was global `id.x * E + iv` pre-fix). For vector_add, the
-// load index combines this with `pid*BLOCK` via AddPtr chained accumulation.
-// The mask predicate becomes `(localTid*E + iv) < n_elements`, which for
-// n_elements > BLOCK is functionally equivalent to the old global form but
-// uses the local-thread-relative shape consistently with the softmax fix.
+// The full-vector arm performs two aligned float4 loads from each input and
+// two aligned float4 stores. The fallback loop preserves the original mask for
+// a partial final program and therefore never touches out-of-range elements.
 // MSL: kernel void add_kernel_contiguous(
 // MSL: device float *v{{[0-9]+}}
 // MSL: device float *v{{[0-9]+}}
 // MSL: device float *v{{[0-9]+}}
 // MSL: device uint32_t *v{{[0-9]+}}
 // MSL: thread_position_in_grid
-// MSL: threadgroup_position_in_grid
-// MSL: for (int v{{[0-9]+}} = 0; v{{[0-9]+}} < 8; v{{[0-9]+}} += 1)
-// Mask now reads the FULL index cone `pid*1024 + localtid*8 + iv < N` (the
-// address value v6), not the old local-only `localtid*8 + iv` — which was itself
-// wrong for grid>1 (missing the pid*BLOCK program offset).
-// MSL: int v{{[0-9]+}} = ((tgid.x * 1024) + (((id.x - (tgid.x * 128)) * 8) + v{{[0-9]+}}));
-// MSL: bool v{{[0-9]+}} = ((int32_t)(v{{[0-9]+}}) < (int32_t)(v{{[0-9]+}}[0]));
-// MSL: if (v{{[0-9]+}})
-// MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
+// MSL: uint base = id.x * 8u;
+// MSL: int n =
+// MSL: float4
+// MSL: (device float4*)
+// MSL: (device float4*)
+// MSL: for (uint lane = 0u; lane < 8u; ++lane)
+// MSL: if (idx < uint(n))
 // MSL: return;
