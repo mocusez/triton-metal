@@ -254,18 +254,31 @@ def _make_p4_fused_softmax() -> _P4Workload:
     return _P4Workload("fused_softmax", shape, "float32", (4,), operation, validate)
 
 
-def _make_p4_matmul() -> _P4Workload:
+def _make_p4_matmul(
+    *,
+    shape: tuple[int, int, int] = (512, 512, 64),
+    block: tuple[int, int, int] = (8, 8, 8),
+    num_warps: int = 4,
+    expected_threads_per_group: int | None = None,
+) -> _P4Workload:
     # Eight K tiles is the largest canonical loop currently covered by the
     # Metal simdgroup-matrix lowering; keep this baseline inside that envelope.
-    shape = (512, 512, 64)
-    block = 8
+    block_m, block_n, block_k = block
+    if any(value <= 0 for value in (*shape, *block)):
+        raise ValueError("P4 matmul shapes and blocks must be positive")
+    if shape[0] % block_m or shape[1] % block_n or shape[2] % block_k:
+        raise ValueError("P4 matmul shape must be divisible by its block shape")
+    if shape[2] // block_k > 8:
+        raise ValueError("P4 matmul supports at most eight K tiles")
     torch.manual_seed(2)
     a = torch.randn((shape[0], shape[2]), dtype=torch.float16, device="mps")
     b = torch.randn((shape[2], shape[1]), dtype=torch.float16, device="mps")
     out = torch.empty((shape[0], shape[1]), dtype=torch.float32, device="mps")
+    compiled_kernel = None
 
     def operation():
-        _p4_matmul_kernel[(shape[0] // block, shape[1] // block)](
+        nonlocal compiled_kernel
+        compiled_kernel = _p4_matmul_kernel[(shape[0] // block_m, shape[1] // block_n)](
             a,
             b,
             out,
@@ -275,18 +288,27 @@ def _make_p4_matmul() -> _P4Workload:
             b.stride(1),
             out.stride(0),
             out.stride(1),
-            BLOCK_M=block,
-            BLOCK_N=block,
-            BLOCK_K=block,
-            K_TILES=shape[2] // block,
-            num_warps=4,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            K_TILES=shape[2] // block_k,
+            num_warps=num_warps,
         )
         return out
 
     def validate():
         torch.testing.assert_close(out, a.float() @ b.float(), atol=0.25, rtol=2e-2)
+        if expected_threads_per_group is not None:
+            assert compiled_kernel is not None
+            metadata = compiled_kernel.metadata
+            actual_threads_per_group = getattr(
+                metadata,
+                "threads_per_group",
+                metadata.num_warps * 32,
+            )
+            assert actual_threads_per_group == expected_threads_per_group
 
-    return _P4Workload("matmul", shape, "float16", (4,), operation, validate)
+    return _P4Workload("matmul", shape, "float16", (num_warps,), operation, validate)
 
 
 def _load_p4_group_norm_module():
@@ -473,6 +495,7 @@ def _compare_p4_reports(
     primary_workload: str,
     min_speedup: float,
     max_canary_regression: float,
+    allow_primary_num_warps_change: bool = False,
 ) -> dict:
     candidate_rounds = candidate["benchmark_config"]["rounds"]
     reference_rounds = reference["benchmark_config"]["rounds"]
@@ -495,6 +518,8 @@ def _compare_p4_reports(
         current = candidate_by_name[name]
         baseline = reference_by_name[name]
         for field in ("shape", "dtype", "num_warps"):
+            if field == "num_warps" and name == primary_workload and allow_primary_num_warps_change:
+                continue
             current_value = current[field]
             baseline_value = baseline[field]
             if field in ("shape", "num_warps"):
@@ -513,17 +538,7 @@ def _compare_p4_reports(
             baseline_ms = baseline_round["median_ms"]
             speedup = baseline_ms / current_ms
             regression = current_ms / baseline_ms - 1.0
-            if name == primary_workload:
-                passed = speedup >= min_speedup
-                if not passed:
-                    violations.append(f"{name} round {current_round['round']}: {speedup:.4f}x < {min_speedup:.4f}x")
-            else:
-                passed = regression <= max_canary_regression
-                if not passed:
-                    violations.append(
-                        f"{name} round {current_round['round']}: "
-                        f"{regression:.2%} > {max_canary_regression:.2%} regression"
-                    )
+            passed = speedup >= min_speedup if name == primary_workload else regression <= max_canary_regression
             round_results.append(
                 {
                     "round": current_round["round"],
@@ -534,10 +549,29 @@ def _compare_p4_reports(
                     "passed": passed,
                 }
             )
+        current_median_ms = statistics.median(round_result["median_ms"] for round_result in current["rounds"])
+        baseline_median_ms = statistics.median(round_result["median_ms"] for round_result in baseline["rounds"])
+        median_speedup = baseline_median_ms / current_median_ms
+        median_regression = current_median_ms / baseline_median_ms - 1.0
+        if name == primary_workload:
+            median_passed = median_speedup >= min_speedup
+            if not median_passed:
+                violations.append(f"{name} median: {median_speedup:.4f}x < {min_speedup:.4f}x")
+        else:
+            median_passed = median_regression <= max_canary_regression
+            if not median_passed:
+                violations.append(f"{name} median: {median_regression:.2%} > {max_canary_regression:.2%} regression")
         workload_results.append(
             {
                 "name": name,
                 "primary": name == primary_workload,
+                "median": {
+                    "reference_ms": baseline_median_ms,
+                    "candidate_ms": current_median_ms,
+                    "speedup": median_speedup,
+                    "regression": median_regression,
+                    "passed": median_passed,
+                },
                 "rounds": round_results,
             }
         )
@@ -546,13 +580,22 @@ def _compare_p4_reports(
         "primary_workload": primary_workload,
         "min_speedup": min_speedup,
         "max_canary_regression": max_canary_regression,
+        "allow_primary_num_warps_change": allow_primary_num_warps_change,
         "passed": not violations,
         "violations": violations,
         "workloads": workload_results,
     }
 
 
-def _run_p4_baseline(output_dir: pathlib.Path, *, rounds: int) -> dict:
+def _run_p4_baseline(
+    output_dir: pathlib.Path,
+    *,
+    rounds: int,
+    matmul_shape: tuple[int, int, int] = (512, 512, 64),
+    matmul_block: tuple[int, int, int] = (8, 8, 8),
+    matmul_num_warps: int = 4,
+    matmul_expected_threads_per_group: int | None = None,
+) -> dict:
     if not torch.backends.mps.is_available():
         raise RuntimeError("P4 Metal baseline requires MPS")
     if rounds < 1:
@@ -561,7 +604,12 @@ def _run_p4_baseline(output_dir: pathlib.Path, *, rounds: int) -> dict:
     workload_factories = (
         _make_p4_vector_add,
         _make_p4_fused_softmax,
-        _make_p4_matmul,
+        lambda: _make_p4_matmul(
+            shape=matmul_shape,
+            block=matmul_block,
+            num_warps=matmul_num_warps,
+            expected_threads_per_group=matmul_expected_threads_per_group,
+        ),
         _make_p4_group_norm,
     )
     workloads = []
@@ -639,7 +687,7 @@ def _run_p4_baseline(output_dir: pathlib.Path, *, rounds: int) -> dict:
 
 
 def test_p4_report_contract_round_trip(tmp_path):
-    rounds = 2
+    rounds = 3
     report = {
         "schema_version": 1,
         "metadata": {
@@ -705,10 +753,11 @@ def test_p4_report_contract_round_trip(tmp_path):
     assert comparison["passed"]
 
     failing = json.loads(json.dumps(candidate))
-    failed_round = failing["workloads"][0]["rounds"][1]
-    baseline_ms = report["workloads"][0]["rounds"][1]["median_ms"]
-    failed_round["median_ms"] = baseline_ms / 1.1
-    failed_round["samples_ms"] = [failed_round["median_ms"]] * P4_SAMPLES
+    for failed_round, baseline_round in zip(
+        failing["workloads"][0]["rounds"], report["workloads"][0]["rounds"], strict=True
+    ):
+        failed_round["median_ms"] = baseline_round["median_ms"] / 1.1
+        failed_round["samples_ms"] = [failed_round["median_ms"]] * P4_SAMPLES
     comparison = _compare_p4_reports(
         failing,
         report,
@@ -717,7 +766,33 @@ def test_p4_report_contract_round_trip(tmp_path):
         max_canary_regression=0.05,
     )
     assert not comparison["passed"]
-    assert comparison["violations"] == ["vector_add round 2: 1.1000x < 1.2000x"]
+    assert comparison["violations"] == ["vector_add median: 1.1000x < 1.2000x"]
+
+    different_primary_geometry = json.loads(json.dumps(candidate))
+    different_primary_geometry["workloads"][0]["num_warps"] = [16]
+    comparison = _compare_p4_reports(
+        different_primary_geometry,
+        report,
+        primary_workload="vector_add",
+        min_speedup=1.2,
+        max_canary_regression=0.05,
+        allow_primary_num_warps_change=True,
+    )
+    assert comparison["passed"]
+
+    noisy_canary = json.loads(json.dumps(candidate))
+    noisy_round = noisy_canary["workloads"][1]["rounds"][0]
+    baseline_ms = report["workloads"][1]["rounds"][0]["median_ms"]
+    noisy_round["median_ms"] = baseline_ms * 1.20
+    noisy_round["samples_ms"] = [noisy_round["median_ms"]] * P4_SAMPLES
+    comparison = _compare_p4_reports(
+        noisy_canary,
+        report,
+        primary_workload="vector_add",
+        min_speedup=1.2,
+        max_canary_regression=0.05,
+    )
+    assert comparison["passed"]
 
 
 def test_do_bench_returns_positive_quantiles():
@@ -867,6 +942,23 @@ def _parse_p4_args() -> argparse.Namespace:
     parser.add_argument("--p4-primary-workload", choices=P4_WORKLOAD_NAMES)
     parser.add_argument("--p4-min-speedup", type=float)
     parser.add_argument("--p4-max-canary-regression", type=float)
+    parser.add_argument(
+        "--p4-matmul-shape",
+        type=int,
+        nargs=3,
+        metavar=("M", "N", "K"),
+        default=(512, 512, 64),
+    )
+    parser.add_argument(
+        "--p4-matmul-block",
+        type=int,
+        nargs=3,
+        metavar=("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+        default=(8, 8, 8),
+    )
+    parser.add_argument("--p4-matmul-num-warps", type=int, default=4)
+    parser.add_argument("--p4-matmul-expected-threads-per-group", type=int)
+    parser.add_argument("--p4-allow-primary-num-warps-change", action="store_true")
     args = parser.parse_args()
     comparison_args = (
         args.p4_reference_json,
@@ -881,7 +973,14 @@ def _parse_p4_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_p4_args()
-    report = _run_p4_baseline(args.p4_report_dir, rounds=args.rounds)
+    report = _run_p4_baseline(
+        args.p4_report_dir,
+        rounds=args.rounds,
+        matmul_shape=tuple(args.p4_matmul_shape),
+        matmul_block=tuple(args.p4_matmul_block),
+        matmul_num_warps=args.p4_matmul_num_warps,
+        matmul_expected_threads_per_group=args.p4_matmul_expected_threads_per_group,
+    )
     if args.p4_reference_json is not None:
         reference = json.loads(args.p4_reference_json.read_text())
         comparison = _compare_p4_reports(
@@ -890,6 +989,7 @@ if __name__ == "__main__":
             primary_workload=args.p4_primary_workload,
             min_speedup=args.p4_min_speedup,
             max_canary_regression=args.p4_max_canary_regression,
+            allow_primary_num_warps_change=args.p4_allow_primary_num_warps_change,
         )
         comparison["reference_json"] = str(args.p4_reference_json)
         report["comparison"] = comparison

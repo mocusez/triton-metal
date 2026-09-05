@@ -289,6 +289,11 @@ being approximated with a racy load/modify/store sequence.
 
 ## Remaining work
 
+The fixed-benchmark generic-performance line is complete: aligned contiguous
+vector transactions, effect-bounded aggregate/cone reuse, and resource-aware
+canonical matrix launch selection now have deterministic IR/MSL coverage and
+physical Apple Silicon MPS evidence.
+
 The current dependency-ordered priorities are:
 
 1. Finish the unsupported-op/preflight safety matrix. Axes 1/2
@@ -300,10 +305,7 @@ The current dependency-ordered priorities are:
    layout-conversion, broader descriptor-reduce type/rank envelopes, and
    broader `tl.map_elementwise` pack/control-flow envelopes one
    positive/adjacent-negative slice at a time.
-3. Improve generic performance with vectorized contiguous memory access,
-   aggregate/cone reuse, and resource-aware tile selection, backed by fixed
-   MPS benchmarks rather than blanket speedup claims.
-4. Validate lower deployment-target wheels on clean macOS installations.
+3. Validate lower deployment-target wheels on clean macOS installations.
 
 PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
 and bf16 atomic add are platform/runtime boundaries, not implementation backlog.

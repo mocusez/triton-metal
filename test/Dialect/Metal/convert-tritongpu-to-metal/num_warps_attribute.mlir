@@ -1,25 +1,27 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s --check-prefix=MSL
 //
-// AC4-S6c: lit-level assertion that `triton::gpu::lookupNumWarps` reads
-// the `ttg.num-warps = N : i32` attribute set on the module. When N>1
-// AND the dot's static shape is multi-tile, the matcher emits the AC4
-// multi-warp partitioning ops; when N=1 it does not (validated alongside
-// in dot_single_warp_regression.mlir).
+// P4.3: a 64x64 canonical tile requests 16 SIMD-groups, but the resource
+// selector caps the matrix launch at 256 threads. The resulting 8-group
+// schedule owns eight 8x8 accumulator tiles per group, well below the
+// 32-matrix register ceiling, and needs eight 64-element staging slices.
 //
-// This fixture pins the contract that the conversion pass honors the
-// upstream `ttg.num-warps` attribute, so a future change that strips
-// the attribute (or fails to set it) breaks here loudly.
+// The single-dot/single-function envelope is what makes the physical launch
+// override safe; other kernels keep their source geometry.
 
-#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
-#blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
-#blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
-// A genuinely multi-SIMD-group kernel must retain the requested launch size.
-// CHECK-NOT: metal.threads_per_group
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [2, 16], warpsPerCTA = [16, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 2], warpsPerCTA = [16, 1], order = [1, 0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [16, 1], order = [1, 0]}>
+// CHECK: module attributes {{.*}}metal.threads_per_group = 256 : i32
+// CHECK-NOT: metal.matrix_active_warps
+// CHECK-NOT: metal.resource_scheduled
 // CHECK-LABEL: metal.kernel k
 // CHECK: metal.simdgroup_index
 // CHECK: arith.divui {{.*}}, {{.*}} : i32
 // CHECK: arith.remui {{.*}}, {{.*}} : i32
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-COUNT-32: metal.simdgroup_multiply_accumulate
+// MSL: threadgroup float _stage_shared[8][64]
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 16 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @k(%a_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %b_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %c_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %stride_am: i32 {tt.divisibility = 16 : i32}, %stride_bk: i32 {tt.divisibility = 16 : i32}, %stride_cm: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %acc = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked>
     %c1_i32 = arith.constant 1 : i32
