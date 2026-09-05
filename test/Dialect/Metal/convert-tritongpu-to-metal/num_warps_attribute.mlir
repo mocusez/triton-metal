@@ -13,6 +13,8 @@
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+// A genuinely multi-SIMD-group kernel must retain the requested launch size.
+// CHECK-NOT: metal.threads_per_group
 // CHECK-LABEL: metal.kernel k
 // CHECK: metal.simdgroup_index
 // CHECK: arith.divui {{.*}}, {{.*}} : i32

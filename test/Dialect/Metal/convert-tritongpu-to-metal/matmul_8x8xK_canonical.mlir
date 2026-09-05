@@ -82,6 +82,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // IR-level: scf.for erased; dense<0.0> C-init → simdgroup_matrix_zero;
 // 2×(A,B) loads = 4 simdgroup_load_device_staged; 2 MA ops; 1 store.
+// The resulting straight-line kernel has no thread- or simdgroup-indexed work,
+// so launching the otherwise-requested four warps would duplicate the same
+// 8×8 tile four times. Pin the compiler-to-launcher 32-thread override.
+// PASS: module attributes {{.*}}metal.threads_per_group = 32 : i32
 // PASS: metal.module
 // PASS: metal.kernel matmul_canonical
 // PASS-NOT: scf.for
