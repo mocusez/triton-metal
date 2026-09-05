@@ -921,6 +921,19 @@ are still whole-kernel replacements rather than layout-general lowering.
     macOS 15 clean install/compile smoke; the hosted runner cannot supply the
     remaining physical macOS 15 MPS numerical evidence.
 
+32. **P0 directly locks every op category in the unsupported-op preflight.**
+    The existing CPU-only split-input lit already exercised join, split,
+    map-elementwise, descriptor-reduce, extern-elementwise, integer-to-pointer,
+    and pointer-to-integer rejection. Five adjacent fixtures now cover the
+    remaining `validateUnsupportedOpsRejected` TypeSwitch categories: tensor
+    `device_print` with a non-Blocked/Slice layout, PTX inline asm,
+    `atomic_poll`, a call to a multi-block callee that preprocessing cannot
+    inline, and scalar fp8 conversion. Each fixture pins the named diagnostic
+    emitted before dialect conversion, so these platform/runtime boundaries
+    fail normally instead of reaching failed-conversion teardown. The focused
+    file and all 125 Metal conversion lit tests pass. P0 remains open only for
+    the separate audit of lowering patterns whose matchers can still decline.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

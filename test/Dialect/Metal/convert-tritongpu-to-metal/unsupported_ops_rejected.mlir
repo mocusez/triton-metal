@@ -227,6 +227,66 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#linear = #ttg.linear<{register = [], lane = [[0], [0], [0], [0], [1]], warp = [[2], [4]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_device_print_linear_layout() {
+    %v = arith.constant dense<1.0> : tensor<8xf32, #linear>
+    // expected-error @+1 {{tl.device_print needs a blocked or slice layout for each tensor argument}}
+    tt.print "v: " {hex = false, isSigned = array<i32: 0>} : %v : tensor<8xf32, #linear>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_elementwise_inline_asm(%v: i32) {
+    // expected-error @+1 {{tl.inline_asm_elementwise is not implemented (its payload is PTX, which Metal cannot consume)}}
+    %r = tt.elementwise_inline_asm "shl.b32 $0, $0, 3;" {constraints = "=r,r", packed_element = 1 : i32, pure = true} %v : i32 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_atomic_poll(%ptr: !tt.ptr<i32>, %expected: i32) {
+    // expected-error @+1 {{tl.atomic_poll is not implemented (Metal has no equivalent of the poll-until-condition primitive)}}
+    %matched = tt.atomic_poll acquire, sys, %ptr, %expected : !tt.ptr<i32>, i32 -> i1
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @multi_block_callee(%take_first: i1) {
+    cf.cond_br %take_first, ^first, ^second
+  ^first:
+    tt.return
+  ^second:
+    tt.return
+  }
+
+  tt.func public @reject_non_inlined_call(%take_first: i1) {
+    // expected-error @+1 {{calls to non-inlined functions are implemented by inlining the callee, which needs a single-block body}}
+    tt.call @multi_block_callee(%take_first) : (i1) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_scalar_fp8_cast(%v: f32) {
+    // expected-error @+1 {{fp8 conversion is implemented for tensor casts only}}
+    %r = tt.fp_to_fp %v, rounding = rtne : f32 -> f8E4M3FN
+    tt.return
+  }
+}
+
+// -----
+
 // A `#ttg.linear` `tt.make_range` USED to be refused here, because
 // MakeRangeLowering could only decompose a blocked layout (rank-1), a
 // slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and
