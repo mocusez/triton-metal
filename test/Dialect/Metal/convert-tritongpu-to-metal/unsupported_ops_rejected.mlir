@@ -302,6 +302,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_precise_sqrt_f16(%x: f16, %out: !tt.ptr<f16>) {
+    // expected-error @+1 {{tt.precise_sqrt requires f32 operands and result}}
+    %r = tt.precise_sqrt %x : f16
+    tt.store %out, %r : !tt.ptr<f16>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_precise_divf_f16(%x: f16, %y: f16, %out: !tt.ptr<f16>) {
+    // expected-error @+1 {{tt.precise_divf requires f32 operands and result}}
+    %r = tt.precise_divf %x, %y : f16
+    tt.store %out, %r : !tt.ptr<f16>
+    tt.return
+  }
+}
+
+// -----
+
 // A `#ttg.linear` `tt.make_range` USED to be refused here, because
 // MakeRangeLowering could only decompose a blocked layout (rank-1), a
 // slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and

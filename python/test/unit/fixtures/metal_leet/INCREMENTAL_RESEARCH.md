@@ -945,6 +945,16 @@ are still whole-kernel replacements rather than layout-general lowering.
     diagnostic, the existing splat fixture still lowers, the Pixi native build
     succeeds, and all 125 Metal conversion lit tests pass.
 
+34. **P0 preflights the f32 envelope of Triton's precise math ops.** TTIR
+    permits `tt.precise_sqrt` and `tt.precise_divf` on adjacent float widths,
+    while the Metal expression lowerings currently accept only f32. A live f16
+    result therefore produced a generic legalization error followed by the
+    same `Region::dropAllReferences` SIGSEGV. Both lowerings and the new early
+    validator now use one `hasF32ElementType` predicate. Direct f16 sqrt/div
+    fixtures pin their named diagnostics, the existing f32 tensor fixtures
+    still lower to Metal expression ops, the Pixi native build succeeds, and
+    all 125 Metal conversion lit tests pass.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
