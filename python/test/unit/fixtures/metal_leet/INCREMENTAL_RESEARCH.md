@@ -874,6 +874,31 @@ are still whole-kernel replacements rather than layout-general lowering.
     evaluator, and the two-round performance gate. Durable reports are under
     `.omx/goals/performance/metal-p42-aggregate-hoist/`.
 
+30. **P4.3 selects a bounded physical SIMD-group schedule for canonical
+    matrix tiles.** A single-function, single-dot canonical kernel now chooses
+    the largest exact tile partition within a preferred 256-thread matrix
+    group, while also enforcing the backend's 1024-thread and 32 KiB
+    threadgroup limits and the existing 32-accumulator-matrix ceiling. The
+    source geometry remains the fallback when no lower legal schedule satisfies
+    those constraints, and source requests above the physical threadgroup limit
+    retain their named rejection instead of being hidden by downselection.
+    Post-conversion proof rejects unrelated thread-indexed work before updating
+    `ttg.num-warps` and `metal.threads_per_group`; temporary scheduling markers
+    do not survive in the final Metal IR.
+
+    The deterministic 64x64 fixture requests 16 SIMD-groups and lowers to an
+    8-group/256-thread launch. Each group owns eight 8x8 accumulator tiles, the
+    static body contains 32 MMA operations across four K tiles, and generated
+    MSL allocates exactly eight 64-element staging slices. On the fixed
+    `(2048,2048,64)` fp16 matmul with a `64x64x8` program tile, the three-round
+    median was 0.982496 ms against the separately captured 1.350519 ms
+    single-group reference, a 1.3746x speedup. Median canary changes were
+    -1.11% for vector add, -0.12% for fused softmax, and -0.11% for GroupNorm.
+    Numeric validation, launch metadata, JSON/CSV reporting, the full 125-test
+    Metal conversion directory, the evaluator contract test, and Ruff all
+    passed. Durable reports are under
+    `.omx/goals/performance/metal-p43-resource-aware-matrix-schedule/`.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
@@ -934,6 +959,14 @@ pixi run --frozen python python/test/microbenchmark/metal_shader_compile_cache.p
 pixi run --frozen python python/test/unit/test_metal_perf_report.py \
   --p4-report-dir .omx/goals/performance/metal-p4-baseline-contract/baseline \
   --rounds 2
+pixi run --frozen python python/test/unit/test_metal_perf_report.py \
+  --p4-report-dir .omx/goals/performance/metal-p43-resource-aware-matrix-schedule/candidate \
+  --rounds 3 --p4-matmul-shape 2048 2048 64 \
+  --p4-matmul-block 64 64 8 --p4-matmul-num-warps 16 \
+  --p4-matmul-expected-threads-per-group 256 \
+  --p4-reference-json .omx/goals/performance/metal-p43-resource-aware-matrix-schedule/reference/metal-p4-baseline.json \
+  --p4-primary-workload matmul --p4-min-speedup 1.20 \
+  --p4-max-canary-regression 0.05 --p4-allow-primary-num-warps-change
 ```
 
 ## Remaining unknowns

@@ -18834,6 +18834,109 @@ static std::optional<std::pair<int, int>> factorWarps(int numWarps, int mTiles,
   return best;
 }
 
+// P4.3: canonical matrix kernels may request more SIMD-groups than are useful
+// for one program tile.  Select the largest exact tile partition that stays
+// inside the backend's portable resource envelope and preferred 256-thread
+// matrix launch.  The accumulator estimate follows the existing lowering
+// contract: one 8x8 f32 simdgroup matrix occupies roughly two registers per
+// lane, so 32 matrices is the established hard per-group ceiling.  Each
+// staged matrix load reserves 64 values in a per-group threadgroup slice; use
+// four bytes/value as the conservative element width.
+struct MatrixWarpSchedule {
+  int activeWarps;
+  int warpsM;
+  int warpsN;
+  int accumulatorTilesPerWarp;
+};
+
+static constexpr llvm::StringLiteral kMatrixActiveWarpsAttr =
+    "metal.matrix_active_warps";
+static constexpr llvm::StringLiteral kResourceScheduledIndexAttr =
+    "metal.resource_scheduled";
+
+static std::optional<MatrixWarpSchedule>
+selectMatrixWarpSchedule(int requestedWarps, int mTiles, int nTiles,
+                         bool allowDownselection) {
+  if (requestedWarps < 1 || mTiles < 1 || nTiles < 1)
+    return std::nullopt;
+
+  auto makeSchedule = [&](int activeWarps)
+      -> std::optional<MatrixWarpSchedule> {
+    auto factors = factorWarps(activeWarps, mTiles, nTiles);
+    if (!factors)
+      return std::nullopt;
+    return MatrixWarpSchedule{activeWarps, factors->first, factors->second,
+                              (mTiles / factors->first) *
+                                  (nTiles / factors->second)};
+  };
+
+  auto requested = makeSchedule(requestedWarps);
+  if (!allowDownselection || requestedWarps == 1)
+    return requested;
+
+  constexpr int simdgroupWidth = 32;
+  constexpr int preferredThreadsPerGroup = 256;
+  constexpr int maxThreadsPerGroup = 1024;
+  constexpr int stagedElementsPerWarp = 64;
+  constexpr int conservativeElementBytes = 4;
+  constexpr int maxThreadgroupBytes = 32 * 1024;
+  constexpr int maxAccumulatorTilesPerWarp = 32;
+  if (static_cast<int64_t>(requestedWarps) * simdgroupWidth >
+      maxThreadsPerGroup)
+    return requested;
+  int preferredWarps = preferredThreadsPerGroup / simdgroupWidth;
+  int upperWarps = std::min(requestedWarps, preferredWarps);
+
+  for (int activeWarps = upperWarps; activeWarps >= 1; --activeWarps) {
+    if (requestedWarps % activeWarps != 0)
+      continue;
+    auto candidate = makeSchedule(activeWarps);
+    if (!candidate)
+      continue;
+    int64_t threadsPerGroup =
+        static_cast<int64_t>(activeWarps) * simdgroupWidth;
+    int64_t stagedBytes = static_cast<int64_t>(activeWarps) *
+                          stagedElementsPerWarp * conservativeElementBytes;
+    if (threadsPerGroup > maxThreadsPerGroup ||
+        stagedBytes > maxThreadgroupBytes ||
+        candidate->accumulatorTilesPerWarp > maxAccumulatorTilesPerWarp)
+      continue;
+    return candidate;
+  }
+
+  // A lower launch is an optimization, not a new legality requirement.  If
+  // no lower schedule satisfies the resource model, retain the exact source
+  // partition when it was already legal.
+  return requested;
+}
+
+// Changing the physical launch is safe only for the whole-kernel canonical
+// rewrite.  Restrict this first resource-aware path to the normal Triton
+// compilation unit: one function containing one dot.  More complex modules
+// preserve their source geometry until launch requirements can be reconciled
+// across every kernel and matrix region.
+static bool canDownselectMatrixWarps(mlir::triton::DotOp dot) {
+  auto moduleOp = dot->getParentOfType<mlir::ModuleOp>();
+  if (!moduleOp)
+    return false;
+  unsigned functionCount = 0;
+  unsigned dotCount = 0;
+  moduleOp.walk([&](mlir::triton::FuncOp) { ++functionCount; });
+  moduleOp.walk([&](mlir::triton::DotOp) { ++dotCount; });
+  return functionCount == 1 && dotCount == 1;
+}
+
+static void recordMatrixWarpDownselection(mlir::triton::DotOp dot,
+                                          int requestedWarps,
+                                          int activeWarps) {
+  if (activeWarps >= requestedWarps)
+    return;
+  auto moduleOp = dot->getParentOfType<mlir::ModuleOp>();
+  auto i32 = mlir::IntegerType::get(moduleOp.getContext(), 32);
+  moduleOp->setAttr(kMatrixActiveWarpsAttr,
+                    mlir::IntegerAttr::get(i32, activeWarps));
+}
+
 static bool isNumericZero(mlir::Value value);
 static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
                                              mlir::scf::ForOp loop,
@@ -19143,18 +19246,21 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   // an unsupported launch abort the compiler instead of falling through to a
   // clean illegal-tt.dot diagnostic.
   const bool multiTile = (mTiles > 1) || (nTiles > 1);
-  const int64_t numWarps = mlir::triton::gpu::lookupNumWarps(dot);
-  const bool multiWarp = numWarps > 1;
+  const int requestedWarps =
+      static_cast<int>(mlir::triton::gpu::lookupNumWarps(dot));
+  int activeWarps = requestedWarps;
   int warpsM = 1, warpsN = 1;
-  if (multiTile && multiWarp) {
-    auto warpFactors =
-        factorWarps(static_cast<int>(numWarps), static_cast<int>(mTiles),
-                    static_cast<int>(nTiles));
-    if (!warpFactors)
+  if (multiTile && requestedWarps > 1) {
+    auto schedule = selectMatrixWarpSchedule(
+        requestedWarps, static_cast<int>(mTiles), static_cast<int>(nTiles),
+        canDownselectMatrixWarps(dot));
+    if (!schedule)
       return mlir::failure();
-    warpsM = warpFactors->first;
-    warpsN = warpFactors->second;
+    activeWarps = schedule->activeWarps;
+    warpsM = schedule->warpsM;
+    warpsN = schedule->warpsN;
   }
+  const bool multiWarp = activeWarps > 1;
 
   // Emit IR before the scf.for.
   mlir::OpBuilder builder(forOp);
@@ -19294,8 +19400,10 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     }
     mlir::Value widxI32, warpMI32, warpNI32, widxUi32Hoisted;
     if (multiWarp) {
-      widxUi32Hoisted =
-          SimdgroupIndexOp::create(builder, loc, ui32).getResult();
+      auto widxOp = SimdgroupIndexOp::create(builder, loc, ui32);
+      if (activeWarps < requestedWarps)
+        widxOp->setAttr(kResourceScheduledIndexAttr, builder.getUnitAttr());
+      widxUi32Hoisted = widxOp.getResult();
       widxI32 = toI32(widxUi32Hoisted);
       auto warpsNCst = mlir::arith::ConstantOp::create(
           builder, loc, builder.getI32IntegerAttr(warpsN));
@@ -19405,6 +19513,7 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   }
 
   // Erase originals.
+  recordMatrixWarpDownselection(dot, requestedWarps, activeWarps);
   store.erase();
   forOp.erase();
   return mlir::success();
@@ -19680,16 +19789,20 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
     return mlir::failure();
   const int mTiles = static_cast<int>(shape[0] / 8);
   const int nTiles = static_cast<int>(shape[1] / 8);
-  const int numWarps = static_cast<int>(mlir::triton::gpu::lookupNumWarps(dot));
-  if (numWarps < 1)
+  const int requestedWarps =
+      static_cast<int>(mlir::triton::gpu::lookupNumWarps(dot));
+  if (requestedWarps < 1)
     return mlir::failure();
+  int activeWarps = requestedWarps;
   int warpsM = 1, warpsN = 1;
-  if (numWarps > 1) {
-    auto factors = factorWarps(numWarps, mTiles, nTiles);
-    if (!factors)
+  if (requestedWarps > 1) {
+    auto schedule = selectMatrixWarpSchedule(
+        requestedWarps, mTiles, nTiles, canDownselectMatrixWarps(dot));
+    if (!schedule)
       return mlir::failure();
-    warpsM = factors->first;
-    warpsN = factors->second;
+    activeWarps = schedule->activeWarps;
+    warpsM = schedule->warpsM;
+    warpsN = schedule->warpsN;
   }
   const int mPerWarp = mTiles / warpsM;
   const int nPerWarp = nTiles / warpsN;
@@ -19866,9 +19979,12 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   mlir::Value widx;
   mlir::Value warpMI32;
   mlir::Value warpNI32;
-  if (numWarps > 1) {
+  if (activeWarps > 1) {
     auto i32 = builder.getIntegerType(32);
-    widx = SimdgroupIndexOp::create(builder, loc, ui32).getResult();
+    auto widxOp = SimdgroupIndexOp::create(builder, loc, ui32);
+    if (activeWarps < requestedWarps)
+      widxOp->setAttr(kResourceScheduledIndexAttr, builder.getUnitAttr());
+    widx = widxOp.getResult();
     mlir::Value widxI32 =
         mlir::UnrealizedConversionCastOp::create(
             builder, loc, mlir::TypeRange{i32}, mlir::ValueRange{widx})
@@ -19999,11 +20115,13 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
       SimdgroupStoreOp::create(
           builder, loc, loop.getResult(idx), cBuf, cRowTiles[mi], cColTiles[ni],
           strideCVal, partialExtents,
-          (numWarps > 1 && !partialExtents.empty()) ? mlir::ValueRange{widx}
-                                                    : mlir::ValueRange{});
+          (activeWarps > 1 && !partialExtents.empty())
+              ? mlir::ValueRange{widx}
+              : mlir::ValueRange{});
     }
   }
 
+  recordMatrixWarpDownselection(dot, requestedWarps, activeWarps);
   store.erase();
   forOp.erase();
   return mlir::success();
@@ -31090,15 +31208,10 @@ static bool supportsCanonicalRuntimeMaskedMultiTilePreflight(
   int mTiles = static_cast<int>(shape[0] / 8);
   int nTiles = static_cast<int>(shape[1] / 8);
   int numWarps = mlir::triton::gpu::lookupNumWarps(dot);
-  int warpsM = 1, warpsN = 1;
-  if (numWarps > 1) {
-    auto factors = factorWarps(numWarps, mTiles, nTiles);
-    if (!factors)
-      return false;
-    warpsM = factors->first;
-    warpsN = factors->second;
-  }
-  if ((mTiles / warpsM) * (nTiles / warpsN) > 32)
+  auto schedule = selectMatrixWarpSchedule(
+      numWarps, mTiles, nTiles,
+      numWarps > 1 && canDownselectMatrixWarps(dot));
+  if (!schedule || schedule->accumulatorTilesPerWarp > 32)
     return false;
 
   if (accIdx < 0 || accIdx >= static_cast<int>(loop.getNumRegionIterArgs()) ||
@@ -31229,7 +31342,9 @@ validateCanonicalMultiTileDotSupport(mlir::ModuleOp moduleOp) {
       return;
 
     int numWarps = static_cast<int>(mlir::triton::gpu::lookupNumWarps(dot));
-    if (numWarps > 1 && !factorWarps(numWarps, mTiles, nTiles)) {
+    if (numWarps > 1 &&
+        !selectMatrixWarpSchedule(numWarps, mTiles, nTiles,
+                                  canDownselectMatrixWarps(dot))) {
       dot.emitOpError(
           "Metal backend: canonical multi-tile dot has no valid warp "
           "partition");
@@ -32397,14 +32512,62 @@ static bool isStraightLineSingleSimdgroupKernel(KernelOp kernel) {
          matrixStores == 1;
 }
 
-static void annotateSingleSimdgroupLaunch(mlir::ModuleOp moduleOp) {
+static mlir::LogicalResult
+annotateResourceAwareMatrixLaunch(mlir::ModuleOp moduleOp) {
   static constexpr llvm::StringLiteral attrName =
       "metal.threads_per_group";
   moduleOp->removeAttr(attrName);
   auto requestedWarps =
       moduleOp->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
   if (!requestedWarps || requestedWarps.getInt() <= 1)
-    return;
+    return mlir::success();
+
+  if (auto activeWarps =
+          moduleOp->getAttrOfType<mlir::IntegerAttr>(kMatrixActiveWarpsAttr)) {
+    int64_t active = activeWarps.getInt();
+    bool safe = active >= 1 && active < requestedWarps.getInt();
+    unsigned kernelCount = 0;
+    unsigned matrixOps = 0;
+    unsigned scheduledIndexes = 0;
+    moduleOp.walk([&](KernelOp kernel) {
+      ++kernelCount;
+      kernel.getBodyRegion().walk([&](mlir::Operation *op) {
+        if (mlir::isa<ThreadIdOp, TgLoadIndexedOp>(op)) {
+          safe = false;
+          return;
+        }
+        if (auto index = mlir::dyn_cast<SimdgroupIndexOp>(op)) {
+          if (!index->hasAttr(kResourceScheduledIndexAttr))
+            safe = false;
+          else
+            ++scheduledIndexes;
+        }
+        if (mlir::isa<SimdgroupMultiplyAccumulateOp>(op))
+          ++matrixOps;
+      });
+    });
+    safe = safe && kernelCount == 1 && matrixOps > 0;
+    safe = safe &&
+           (active == 1 ? scheduledIndexes == 0 : scheduledIndexes > 0);
+    if (!safe) {
+      moduleOp.emitError(
+          "Metal backend: resource-aware matrix launch could not prove a "
+          "single-kernel SIMD-group schedule");
+      return mlir::failure();
+    }
+
+    moduleOp.walk([&](SimdgroupIndexOp index) {
+      index->removeAttr(kResourceScheduledIndexAttr);
+    });
+    moduleOp->setAttr("ttg.num-warps",
+                      mlir::IntegerAttr::get(requestedWarps.getType(), active));
+    moduleOp->setAttr(
+        attrName,
+        mlir::IntegerAttr::get(
+            mlir::IntegerType::get(moduleOp.getContext(), 32), active * 32));
+    moduleOp->removeAttr(kMatrixActiveWarpsAttr);
+    return mlir::success();
+  }
 
   bool anyKernel = false;
   bool allSingleSimdgroup = true;
@@ -32417,6 +32580,7 @@ static void annotateSingleSimdgroupLaunch(mlir::ModuleOp moduleOp) {
                       mlir::IntegerAttr::get(mlir::IntegerType::get(
                                                  moduleOp.getContext(), 32),
                                              32));
+  return mlir::success();
 }
 
 struct ConvertTritonGPUToMetalPass
@@ -34046,7 +34210,10 @@ struct ConvertTritonGPUToMetalPass
       });
     });
 
-    annotateSingleSimdgroupLaunch(moduleOp);
+    if (mlir::failed(annotateResourceAwareMatrixLaunch(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
   }
 };
 
