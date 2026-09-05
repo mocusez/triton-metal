@@ -324,6 +324,81 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#hist_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#hist_dst = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_rank2_histogram() {
+    %src = arith.constant dense<0> : tensor<4x32xi32, #hist_src>
+    // expected-error @+1 {{Metal backend: tt.histogram is implemented for rank-1 source and result tensors only}}
+    %hist = tt.histogram %src : tensor<4x32xi32, #hist_src> -> tensor<16xi32, #hist_dst>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #hist_dst>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_i16_histogram() {
+    %src = arith.constant dense<0> : tensor<128xi16, #blocked>
+    // expected-error @+1 {{Metal backend: tt.histogram supports i32 source and result elements only}}
+    %hist = tt.histogram %src : tensor<128xi16, #blocked> -> tensor<16xi16, #blocked>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#hist_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #parent}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_slice_histogram_result() {
+    %src = arith.constant dense<0> : tensor<128xi32, #hist_src>
+    // expected-error @+1 {{Metal backend: tt.histogram requires a blocked result layout}}
+    %hist = tt.histogram %src : tensor<128xi32, #hist_src> -> tensor<16xi32, #slice>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #slice>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_histogram_source_cone() {
+    %src = arith.constant dense<1> : tensor<128xi32, #blocked>
+    %clz = tt.extern_elementwise %src {libname = "", libpath = "", pure = true, symbol = "__metal_clz"} : (tensor<128xi32, #blocked>) -> tensor<128xi32, #blocked>
+    // expected-error @+1 {{Metal backend: tt.histogram source cone is not rank-1 evaluable}}
+    %hist = tt.histogram %clz : tensor<128xi32, #blocked> -> tensor<16xi32, #blocked>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_histogram_mask_cone() {
+    %src = arith.constant dense<1> : tensor<128xi32, #blocked>
+    %mask = "tt.map_elementwise"(%src) <{pack = 1 : i32}> ({
+    ^bb0(%value: i32):
+      %zero = arith.constant 0 : i32
+      %keep = arith.cmpi ne, %value, %zero : i32
+      tt.map_elementwise.return %keep : i1
+    }) : (tensor<128xi32, #blocked>) -> tensor<128xi1, #blocked>
+    // expected-error @+1 {{Metal backend: tt.histogram mask cone is not rank-1 i1 evaluable}}
+    %hist = tt.histogram %src, %mask : tensor<128xi32, #blocked> -> tensor<16xi32, #blocked>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // A `#ttg.linear` `tt.make_range` USED to be refused here, because
 // MakeRangeLowering could only decompose a blocked layout (rank-1), a
 // slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and
