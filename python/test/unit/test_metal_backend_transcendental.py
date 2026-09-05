@@ -41,6 +41,88 @@ def sqrt_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.jit
+def _fma_f32_kernel(X, Y, Z, O, N: tl.constexpr, BLOCK: tl.constexpr):
+    if N == 1:
+        x = tl.load(X).to(tl.float32)
+        y = tl.load(Y).to(tl.float32)
+        z = tl.load(Z).to(tl.float32)
+        tl.store(O, tl.fma(x, y, z))
+    else:
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        x = tl.load(X + offset, offset < N, other=0).to(tl.float32)
+        y = tl.load(Y + offset, offset < N, other=0).to(tl.float32)
+        z = tl.load(Z + offset, offset < N, other=0).to(tl.float32)
+        tl.store(O + offset, tl.fma(x, y, z), offset < N)
+
+
+@pytest.mark.parametrize("n", [1, 259])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fma_f32_preserves_fusion_and_explicit_promotion(n, num_warps, dtype):
+    # The first f32 triple yields -2**-46 when fused, but zero after a
+    # separately rounded multiply. All triples have exact f64 intermediates.
+    x = torch.tensor([1 + 2**-23, -2, 0.5, 4], dtype=dtype).repeat(n)[:n]
+    y = torch.tensor([1 - 2**-23, 3, -4, 0.25], dtype=dtype).repeat(n)[:n]
+    z = torch.tensor([-1, 1, 3, -2], dtype=dtype).repeat(n)[:n]
+    expected = (x.double() * y.double() + z.double()).float()
+    output = torch.full((n + 3,), 12345.0, device="mps")
+    compiled = _fma_f32_kernel[(triton.cdiv(n, 256),)](
+        x.to("mps"), y.to("mps"), z.to("mps"), output,
+        N=n, BLOCK=256, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(output[:n].cpu(), expected, rtol=0, atol=0)
+    assert torch.all(output[n:].cpu() == 12345.0)
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode("utf-8")
+    assert "metal::precise::fma" in msl
+
+
+@triton.jit
+def _unary_f32_kernel(X, O, N: tl.constexpr, OP: tl.constexpr, BLOCK: tl.constexpr):
+    if N == 1:
+        offset = 0
+    else:
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + offset, offset < N, other=1.0)
+    if OP == "sqrt":
+        y = tl.sqrt(x)
+    elif OP == "erf":
+        y = tl.erf(x)
+    elif OP == "exp":
+        y = tl.exp(x)
+    elif OP == "exp2":
+        y = tl.exp2(x)
+    elif OP == "log":
+        y = tl.log(x)
+    elif OP == "log2":
+        y = tl.log2(x)
+    elif OP == "rsqrt":
+        y = tl.rsqrt(x)
+    elif OP == "sin":
+        y = tl.sin(x)
+    elif OP == "cos":
+        y = tl.cos(x)
+    tl.store(O + offset, y, offset < N)
+
+
+@pytest.mark.parametrize("op", ["sqrt", "erf", "exp", "exp2", "log", "log2", "rsqrt", "sin", "cos"])
+@pytest.mark.parametrize("n", [1, 259])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_unary_math_f32_preserves_scalar_and_tensor_support(op, n, num_warps):
+    x = torch.linspace(0.125, 4.0, n, dtype=torch.float32)
+    expected = getattr(torch, op)(x)
+    output = torch.full((n + 3,), 12345.0, device="mps")
+    _unary_f32_kernel[(triton.cdiv(n, 256),)](
+        x.to("mps"), output, N=n, OP=op, BLOCK=256, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(output[:n].cpu(), expected, rtol=1e-5, atol=1e-6)
+    assert torch.all(output[n:].cpu() == 12345.0)
+
+
+@triton.jit
 def erf_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE

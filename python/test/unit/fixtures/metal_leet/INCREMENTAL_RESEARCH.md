@@ -967,7 +967,351 @@ are still whole-kernel replacements rather than layout-general lowering.
     masked i32 histogram still lowers, the Pixi native build succeeds, and all
     125 Metal conversion lit tests pass.
 
-The latest post-P3-slice acceptance run collected 1,525 tests and completed with
+36. **P0 rejects pointer selection before buffer resolution declines.** A
+    scalar `arith.select` between two bound buffer pointers followed by
+    `tt.load` reproduced a legalization failure and SIGSEGV in
+    `Region::dropAllReferences` (lit exit -11). Buffer resolution cannot trace
+    a selected pointer to one bound argument. The unsupported-op validator now
+    diagnoses scalar and tensor pointer-valued selects before conversion.
+    Three negative fixtures cover scalar loads, scalar stores, and tensor
+    pointer loads; an adjacent positive fixture checks that selecting integer
+    offsets still feeds the load index. Existing value-select tests also pass.
+    `pixi run --frozen make` succeeded, and all 157 tests under the build
+    directory's `test/Dialect/Metal` passed. No MPS numerical suite was rerun
+    for this source-rejection change. The remaining decline audit stays open.
+
+37. **P0 also preflights pointer-valued `scf.if` results.** Selecting a
+    buffer through structured control flow bypassed the `arith.select` guard:
+    a following scalar load still failed legalization and crashed in
+    `Region::dropAllReferences` (lit exit -11). The validator now checks every
+    if result for scalar or tensor pointers and emits one named diagnostic.
+    Negative fixtures cover scalar loads and a tensor store whose pointer is
+    the second result. A positive multi-result if keeps loads inside the
+    branches and yields f32 data plus an i32 output offset. Both focused lit
+    files and all 157 Metal lit tests passed after `pixi run --frozen make`;
+    `git diff --check` passed. No MPS numerical suite was rerun for this
+    source-rejection change. Other lowering declines remain under audit.
+
+38. **P0 preflights pointer-carrying `scf.while`.** A loop returning an
+    advanced scalar pointer to a following load reproduced a legalization
+    failure and SIGSEGV in `Region::dropAllReferences` (exit 139). The validator
+    now checks both initial operand and result types, including tensor pointer
+    elements: `scf.condition` can forward different types to the after region.
+    Four negative fixtures cover scalar result loads, tensor stores in the
+    loop body, pointer-only operands, and pointer-only results. An adjacent
+    positive fixture carries i32 offsets and f32 data while accessing bound
+    buffers in both loop regions. After `pixi run --frozen make`, both focused
+    lit files and all 157 Metal lit tests passed; the additional result-only
+    case passed a focused rerun. The original reproducer now exits normally
+    with the named diagnostic (exit 1). The existing while-loop MSL compile
+    test and all eight physical-MPS while numerical cases passed, including
+    zero-trip and masked multi-block loops. `git diff --check` passed. This
+    closes the while-pointer slice; other lowering declines remain under audit.
+
+39. **P0 preflights generic pointer-carrying `scf.for`.** The check runs
+    after recognized pointer-advance matmuls have been replaced and before
+    partial/full conversion rewrites the function. Scalar pointer results and
+    tensor pointer loop-body stores have negative coverage; integer-offset
+    and data-carrying loops retain positive coverage. This completes the
+    previously unrecorded for-loop slice alongside the select/if/while checks.
+
+40. **Elementwise unsigned min/max and f32 remainder are implemented.**
+    Tensor u32/u64 min/max reuse the signedness-preserving scalar arithmetic
+    emitter, with high-bit, mixed-sign-bit, and masked-tail numerical coverage.
+    Scalar and tensor `arith.remf` use `metal::precise::fmod`; tests distinguish
+    truncating remainder from floor/IEEE remainder, including signed zero,
+    large quotients, infinities, NaNs and zero divisors. Non-f32 remainder
+    remains preflighted. The fresh-cache integer/MSL suite passed all 453
+    cases on physical MPS before the abs extension below.
+
+41. **f16/bf16 absolute value preserves every magnitude bit.** The original
+    minimal `tl.abs(tl.load(fp16_ptr))` frontend program aborted in MSL
+    emission with `translateValue: unexpected op math.absf` (exit 134).
+    The new scalar/tensor path bitcasts to ui16, clears bit 15, and bitcasts
+    back, preserving subnormals, signed-zero semantics, and every NaN payload.
+    Conversion now requires these abs operations to lower; f64/fp8 retain
+    named preflight rejection. Four IR cases and two neighboring type
+    rejections extend existing lit files. Runtime tests use integer storage
+    around floating bitcasts to preserve signaling/quiet NaN representations,
+    exhaust all 65,536 bit patterns for each format, add a 37-element masked
+    tail, and cover scalar/multi-program execution with one and four warps.
+
+Fresh 2026-09-05 verification after all three follow-up slices above used
+macOS 26.4 / PyTorch 2.10.0 on the physical Apple M4. Native rebuild passed
+(`CCACHE_DIR=/tmp/triton-metal-followup-ccache pixi run --frozen make`), all 157
+Metal lit tests passed, and the full `test_metal_backend_*.py` suite completed
+with **2,146 passes, three skips, and no failures** in 152.39 seconds. GPU tests
+ran outside Seatbelt with a fresh `TRITON_CACHE_DIR`; the original f16 frontend
+reproducer now exits successfully. Ruff, Python syntax compilation, and
+`git diff --check` passed. Independent review of the abs implementation and
+regressions found no actionable issues. The two warnings came from the existing dropout
+fixture's deprecated non-boolean `tl.where` condition. This is a compiler
+correctness/coverage run, not a new performance benchmark or macOS 15 device
+validation.
+
+42. **Scalar masked loads compose pointer, mask and fallback support.**
+    The i16 frontend form `tl.load(ptr + pid, pid < N, other=-7)` previously
+    failed the uniform-other preflight, and the scalar load pattern itself
+    declined all masks. The shared predicate now recognizes integer/float
+    scalars as block-uniform. `ScalarLoadLowering` retains the original buffer
+    and complete scalar offset chain, reads memory only inside the true
+    `scf.if` region, and yields the supplied scalar other in the false region.
+    Both branches use the logical result type, with the existing storage-type
+    bridge applied to the loaded value. The tensor masked pattern explicitly
+    defers scalar pointers; its non-uniform tensor-other rejection is retained.
+
+    Targeted physical MPS verification passed all 115 scalar-load tests. New
+    coverage spans i8/i16/i32/i64/f16/bf16/f32, constant and runtime fallback,
+    fallback from a scalar load, omitted other, zero/partial/full active
+    programs, loop-varying masks and offset chains, and exact floating bits
+    including negative zero, subnormals, infinities and NaNs at one/four warps.
+    Tests do not assert a masked-off value when no other was specified.
+    Twelve CPU-only frontend compile cases pin the input read inside the
+    emitted MSL true branch. Three adjacent lit files verify guarded reads,
+    negative integer fallback typing, bf16 default handling, and unchanged
+    tensor positives/negatives. Independent read-only review found no emitter
+    constraint requiring additional storage-type conversions around the if.
+
+    Final native rebuild and all 157 Metal lit tests passed. A fresh-cache full
+    `test_metal_backend_*.py` run on physical MPS completed with **2,254 passes,
+    three skips, and no failures** in 151.78 seconds. The two warnings remain
+    the existing dropout fixture's deprecated non-boolean `tl.where` condition.
+    The original i16 frontend reproducer now compiles successfully. Ruff,
+    Python syntax compilation, and `git diff --check` passed. Environment:
+    Apple M4, macOS 26.4, PyTorch 2.10.0; GPU commands used `pixi run --frozen`
+    outside Seatbelt with `TRITON_CACHE_DIR=/tmp/triton-metal-scalar-mask-full`.
+
+43. **Staged multidimensional i32 XOR scans reuse the existing fold.**
+    A frontend `tl.associative_scan` using `a ^ b` on a 4x8 i32 tile previously
+    failed the staged-scan preflight. The exact single-op combine matcher now
+    accepts XOR only when called by the rank >= 2 staged plan. The rank-1
+    distributed template retains its add/mul restriction. Existing blocked
+    layout, at-most-one-element-per-thread, axis extent 2..64, and control-flow
+    checks are unchanged. The existing publication barriers, ui32 staging,
+    zero identity, and generic binary fold require no new lowering path.
+
+    All 24 new physical MPS cases passed bit-exact CPU differential checks:
+    rank-2 both axes, rank-3 all axes, forward/reverse, one/four warps, extent
+    64, three independent programs, random full-range i32 values and explicit
+    zero/all-ones/sign-bit/max-positive inputs. Three frontend negative cases
+    retain named rejection for rank-1 XOR, an overfull tile, and extent 128.
+    Lit pins publication/read ordering, zero identity, ui32 storage, swapped
+    combine arguments, and rejects compound XOR, wrong return, and i64 XOR.
+    Independent architecture review found no blocking issues.
+
+    Native rebuild, all 157 Metal lit tests, Ruff, Python syntax compilation,
+    and whitespace checks passed. The first fresh-cache full GPU run had
+    **2,280 passes, three skips, and one failure**: the existing raw Metal D5
+    probe matched 29/30 dispatches. Its hand-written IR intentionally omits
+    the barrier before a cross-warp transposed shared-memory read
+    (`test/Dialect/Metal/l1d2d_probe/cell_D5.mlir`); it does not invoke the
+    TritonGPU-to-Metal scan conversion. Isolated recheck matched 30/30. This
+    remains a limitation of the historical probe's unconditional PASS
+    expectation; a passing retry does not establish that it is race-free.
+
+    The second fresh-cache full GPU run completed with **2,281 passes, three
+    skips, and no failures** in 148.77 seconds; the two warnings remain the
+    existing dropout fixture's deprecated non-boolean `tl.where` condition.
+    Environment: Apple M4, macOS 26.4, PyTorch 2.10.0, frozen Pixi; GPU runs
+    outside Seatbelt. Logs: `/tmp/triton-metal-xor-full.log` (first run) and
+    `/tmp/triton-metal-xor-full-repeat.log` (second run), with the latter using
+    `TRITON_CACHE_DIR=/tmp/triton-metal-xor-full-repeat`.
+
+44. **Numerical probe expectations now require defined memory reads.**
+    The D5 failure recorded above came from a hand-written Metal probe that
+    intentionally omitted the publication barrier before a transposed
+    cross-warp shared-memory read. D4 has the same missing synchronization
+    within one SIMD group; SIMD execution alone does not justify its previous
+    unconditional PASS expectation. The neighboring D7scratch probe also
+    loads scratch before initialization, even though its always-true mask
+    selects the other value. Their original IR remains available as historical
+    diagnostics, but none of these three shaders is dispatched by the routine
+    GPU correctness matrix.
+
+    Three CPU-only tests preserve the diagnostic translation evidence: paired
+    D4/D6 and D5/D7 checks pin the store/barrier/read ordering and the trailing
+    barrier, while a D7scratch check preserves the original read-before-store
+    form. The eight defined-memory GPU probes retain all 30 bit-exact dispatch
+    checks, including synchronized in-warp/cross-warp transpose, masked output,
+    and multi-threadgroup coverage. No dynamic xfail or success-on-mismatch
+    behavior was introduced. MPS availability now gates only GPU tests, so the
+    CPU translation checks also run inside Seatbelt.
+
+    Targeted verification passed three CPU checks (eight GPU skips inside
+    Seatbelt), followed by **136 passes** for physical MPS probes plus the
+    existing valid Triton transpose suite. This is a Python test/documentation
+    change; no native rebuild was needed.
+
+    Final full-suite verification passed **2,281 tests with three skips and
+    no failures** in 149.03 seconds, using the physical Apple M4, macOS 26.4,
+    PyTorch 2.10.0 and frozen Pixi outside Seatbelt with
+    `TRITON_CACHE_DIR=/tmp/triton-metal-probe-safety-full`. The total is
+    unchanged because three CPU checks replace three invalid GPU cases.
+    All 157 Metal lit tests, Ruff, Python syntax compilation and
+    `git diff --check` passed. In-memory removal of the D6/D7 publication
+    barriers made both new structural assertions fail as intended.
+    Independent read-only review agreed with the split; old plan language
+    and diagnostic-source comments were corrected without changing their IR
+    operations. The two warnings remain the existing dropout fixture's
+    deprecated non-boolean `tl.where`. Full log:
+    `/tmp/triton-metal-probe-safety-full.log`.
+
+45. **Reject unsupported FMA widths before MSL emission.**
+    The valid frontend `tl.fma` on f16 loads aborted with SIGABRT in
+    `ModuleTranslation::translateValue` (`unexpected op math.fma`). The
+    scalar/tensor cases at one/four warps all reproduced the failure in
+    CPU-only subprocesses. Non-f32 math was legal during conversion, while
+    `MathFmaLowering` only supported f32, so the unsupported operation survived
+    into the emitter.
+
+    Preflight now shares `hasF32ElementType` with the FMA lowering and reports
+    `math.fma requires f32 operands and result`. The compiler does not silently
+    promote half FMA or change its rounding contract. Explicit operand casts
+    to f32 use the existing fused operation. Lit rejects f16/bf16/f64 scalar
+    FMA and multi-band f16 tensor FMA, while retaining scalar and tensor f32
+    positive cases. Four frontend subprocess regressions changed from signal
+    termination to ordinary exit 1 with the named diagnostic. Eight physical
+    MPS cases cover scalar/tensor, one/four warps, f16 explicit promotion,
+    f32 fused cancellation (`-2**-46` rather than a separately rounded zero),
+    multiple programs, masked tails, and untouched output sentinels.
+
+    Native rebuild passed with a writable temporary ccache. All 157 Metal
+    lit tests, four CPU rejection cases, and eight targeted MPS cases passed.
+    The initial lit invocation failed tool discovery with exit 127; after
+    checking the rebuilt executable, the complete rerun passed. The first
+    MPS run passed numerical checks but exposed a bytes/string mismatch in
+    the new MSL assertion; decoding the artifact fixed the test, and all
+    eight cases passed with another fresh cache. Ruff, Python syntax checks,
+    and `git diff --check` passed.
+
+    Fresh-cache full backend acceptance outside Seatbelt completed with
+    **2,293 passed, three skipped, zero failed** in 189.01 seconds:
+    `TRITON_CACHE_DIR=/tmp/triton-metal-p0-fma-full-cache pixi run --frozen pytest
+    python/test/unit/test_metal_backend_*.py -s --tb=short`.
+    The two warnings remain the existing dropout fixture's non-boolean
+    `tl.where` deprecation. Independent read-only review returned GO with no
+    correctness, block-model, or test defects. Full-suite log:
+    `/tmp/triton-metal-p0-fma-full.log`; lit log:
+    `/tmp/triton-metal-p0-fma-lit.log`. This is correctness/safety evidence,
+    not a new performance measurement or physical macOS 15 validation.
+
+    README and the current remaining-work plan were reconciled first: P3/P4
+    planned scopes are complete, P5.2 awaits only physical macOS 15 numerical
+    validation, and the three undefined numerical probes remain CPU checks.
+    P0's remaining safety audit and P2.1/P2.2 breadth remain open.
+
+46. **Complete the f32-only unary math preflight family.**
+    `sqrt`, `erf`, `exp`, `exp2`, `log`, `log2`, `rsqrt`, `sin`, and `cos`
+    shared the same unsupported-width escape as FMA: non-f32 operations stayed
+    legal in conversion and aborted in the MSL emitter. Eighteen valid
+    frontend programs (nine operations, scalar/tensor) load f32 buffers,
+    explicitly compute in f64, and store f32 results; every pre-fix subprocess
+    exited on SIGABRT. All now exit normally with a named compile error.
+    Preflight and each lowering use the same f32 element-type predicate.
+    Direct lit covers all nine operations on f16/bf16 scalars and f64 tensors.
+
+47. **Support block-uniform scalar masked stores.**
+    The new f32 unary positive matrix exposed another existing failure:
+    even a constant-true scalar store mask was sent through the tensor-only
+    masked-store path, producing a failed conversion and sometimes SIGABRT.
+    `MaskedStoreLowering` now recognizes scalar pointers (including converted
+    kernel memrefs), creates an `scf.if` from its adapted mask, clones its own
+    store without that mask into the true region, and lets `StoreLowering`
+    perform its existing address and storage conversion. The rewrite preserves
+    store attributes and introduces no producer inspection or new address
+    analysis. False masks perform no destination access.
+
+    Forty-two new physical MPS cases cover i8/i16/i32/i64/f16/bf16/f32,
+    one/four warps, four programs, loop-varying scalar offset chains, and
+    all-disabled/partial/all-enabled masks; inactive elements and row padding
+    remain sentinels. Direct f32 and offset i16 lit cases pin the only device
+    store inside the conditional. The nine-op f32 scalar/tensor matrix adds
+    36 cases with masked tails and multiple programs. Together with the
+    existing scalar-store module, the targeted MPS run passed **87/87**.
+    The scalar-store test module's obsolete f32-only scope note was corrected.
+
+    Native rebuild, all **157 Metal lit** cases, **18 CPU subprocess** cases,
+    Ruff, syntax checks, and diff checks passed. The first expanded lit run
+    caught an incorrect type-spelling assertion in the new test; matching the
+    actual `metal.store` syntax fixed it without changing the implementation.
+    Logs: `/tmp/triton-metal-p0-unary-red-pytest.log`,
+    `/tmp/triton-metal-p0-unary-green-pytest.log`,
+    `/tmp/triton-metal-p0-unary-store-mps.log`, and
+    `/tmp/triton-metal-p0-unary-store-lit-final.log`.
+
+    Final fresh-cache full backend validation passed **2,389 tests**, with
+    **3 skips, 0 failures**, and the two existing integer-condition `tl.where`
+    deprecation warnings in **169.03s**. Command:
+    `TRITON_CACHE_DIR=/tmp/triton-metal-p0-unary-store-full-cache pixi run --frozen pytest python/test/unit/test_metal_backend_*.py -s --tb=short`.
+    Full log: `/tmp/triton-metal-p0-unary-store-full.log`.
+    Independent read-only reviews returned GO for both the unary preflight
+    and scalar masked-store changes, including conversion remapping,
+    block-uniform semantics, and regression coverage. The reviewer flagged
+    the stale scalar-store scope note; it was corrected before finalization.
+    These close two bounded P0 slices; the remaining P0 audit and P2.1/P2.2
+    extensions remain open.
+
+48. **Diagnose f64 numeric casts and preserve float-to-integer signedness.**
+    The remaining P0 type audit reached `arith.extf`, `arith.truncf`,
+    `arith.sitofp`, `arith.uitofp`, `arith.fptosi`, and `arith.fptoui`.
+    Twelve valid frontend scalar/tensor cases showed six widening SIGABRTs
+    and six source-f64 conversion failures without a useful type diagnostic.
+    Widening cases retain their f64 intermediate through an integer consumer;
+    source-f64 cases compile without allocating an MPS f64 buffer. An earlier
+    bitcast-based probe failed verification before reaching the emitter, so
+    it was replaced with these direct numeric cases. Preflight now checks the
+    input and result element types of each of the six operations and names
+    f64 as unsupported. It does not reject the supported float/integer widths.
+
+    Adjacent physical MPS tests exposed a separate numerical defect:
+    converting f32 `-1.75` to i64 returned `0` instead of `-1`. The emitter
+    used the unsigned storage spelling of signless i64 for a signed numeric
+    conversion. It now reuses `signednessCast` to select the result cast from
+    `fptosi`/`fptoui` semantics. This also handles signless i16 and direct
+    scalar unsigned conversion consistently, without adding conversion-graph
+    inspection or changing buffer representations.
+
+    Sixty-four new MPS cases cover f16/bf16/f32 casts, i32/u32/i64/u64 inputs,
+    signed and unsigned 8/16/32/64-bit results, high-bit unsigned values,
+    negative fractional inputs, signed zeros, scalar/tensor forms, one/four
+    warps, multiple programs, and masked-tail sentinels. All float-to-integer
+    inputs are in range. PyTorch cannot fill a uint64 MPS tensor directly;
+    the test initializes its sentinel on CPU and transfers the buffer.
+    The full float-cast module passed **85/85** cases. The new twelve CPU
+    rejection cases plus the existing unary rejection family passed **30/30**.
+    Two direct rejection modules pin all six operations, while the MSL lit
+    fixture checks all eight signed/unsigned integer result spellings.
+    Native rebuild, all **157 Metal lit** cases, Ruff, syntax checks, and
+    diff checks passed.
+
+    Evidence: `/tmp/triton-metal-p0-cast-red-direct.log`,
+    `/tmp/triton-metal-p0-cast-green.log`,
+    `/tmp/triton-metal-p0-cast-mps.log` (pre-fix numerical failure),
+    `/tmp/triton-metal-p0-cast-signed-mps.log`, and
+    `/tmp/triton-metal-p0-cast-signed-lit.log`. Validation uses the dirty
+    checkout based on `bb4b5978a1`, macOS 26.4, and the pinned Pixi environment.
+
+    Final fresh-cache full backend validation passed **2,465 tests**, with
+    **3 skips, 0 failures**, and the two existing integer-condition `tl.where`
+    deprecation warnings in **185.46s**. Command:
+    `TRITON_CACHE_DIR=/tmp/triton-metal-p0-cast-full-cache pixi run --frozen pytest python/test/unit/test_metal_backend_*.py -s --tb=short`.
+    Full log: `/tmp/triton-metal-p0-cast-full.log`.
+    Independent read-only review of the final source and tests returned GO
+    with no blocking findings. The review confirmed both preflight directions,
+    the signedness fix, and coverage of supported adjacent types.
+
+    **New open correctness finding:** floating `tl.minimum`/`tl.maximum`
+    with `propagate_nan=tl.PropagateNan.ALL` return `[2, 1]` for inputs
+    `[NaN, 1]` and `[2, NaN]`, rather than `[NaN, NaN]`. Independent MPS
+    reproduction is saved at `/tmp/triton_metal_minmax_repro.py`.
+    `ArithMinMaxFLowering`, scalar `ModuleTranslation` cases, and the
+    reduction/cone evaluators currently merge NaN-propagating and
+    number-preferring operations. A future fix must preserve both policies
+    across all three paths and test NaNs in either/both operands, finite
+    values, signed zeros, and reduction consumers. This is recorded in the
+    current plan and README as unfinished; the cast fixes do not address it.
+
+The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
 exhaustive inventory reported 90 owned fixtures and 88 runnable workloads, and
@@ -1046,8 +1390,10 @@ pixi run --frozen python python/test/unit/test_metal_perf_report.py \
   forward. Once the compiler changed, the full suite was rerun: the compiler
   build, 157-test Metal lit directory, 425-test MSL suite, 54 focused tests,
   reverse stability probes, and GroupNorm measurements are fresh post-fix
-  evidence. After the P1/P2 fixture and matcher work, the latest integrated
-  suite is 1,503-pass/3-skip with all 24 standalone scripts passing.
+  evidence. After the P1/P2 fixture and matcher work, that integrated
+  suite recorded 1,503 passes/3 skips with all 24 standalone scripts passing.
+  Later per-slice acceptance records above supersede those counts for their
+  respective suites; backend pytest and `leet-all` are distinct test scopes.
 - The current raw source corpus has not been repaired and replayed wholesale;
   the suite result applies to fixtures, while raw probes deliberately targeted
   the missing and changed high-information workloads.

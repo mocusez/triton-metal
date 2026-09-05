@@ -221,6 +221,92 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @int_minui_i32_kernel(%out_ptr: !tt.ptr<i32>, %k: i32) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %ksp = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %r = arith.minui %offs, %ksp : tensor<128xi32, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %r : tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel int_minui_i32_kernel
+// CHECK-NOT:   arith.minsi
+// CHECK:       arith.minui {{.*}} : i32
+// CHECK-NOT:   arith.minui {{.*}} tensor
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @int_maxui_i32_kernel(%out_ptr: !tt.ptr<i32>, %k: i32) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %ksp = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %r = arith.maxui %offs, %ksp : tensor<128xi32, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %r : tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel int_maxui_i32_kernel
+// CHECK-NOT:   arith.maxsi
+// CHECK:       arith.maxui {{.*}} : i32
+// CHECK-NOT:   arith.maxui {{.*}} tensor
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @int_minui_i64_kernel(%x_ptr: !tt.ptr<i64>, %y_ptr: !tt.ptr<i64>, %out_ptr: !tt.ptr<i64>) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %xs = tt.splat %x_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %xa = tt.addptr %xs, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %xa : tensor<128x!tt.ptr<i64>, #blocked>
+    %ys = tt.splat %y_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %ya = tt.addptr %ys, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    %y = tt.load %ya : tensor<128x!tt.ptr<i64>, #blocked>
+    %r = arith.minui %x, %y : tensor<128xi64, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %r : tensor<128x!tt.ptr<i64>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel int_minui_i64_kernel
+// CHECK-NOT:   arith.minsi
+// CHECK:       arith.minui {{.*}} : i64
+// CHECK-NOT:   arith.minui {{.*}} tensor
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @int_maxui_i64_kernel(%x_ptr: !tt.ptr<i64>, %y_ptr: !tt.ptr<i64>, %out_ptr: !tt.ptr<i64>) {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %xs = tt.splat %x_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %xa = tt.addptr %xs, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %xa : tensor<128x!tt.ptr<i64>, #blocked>
+    %ys = tt.splat %y_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %ya = tt.addptr %ys, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    %y = tt.load %ya : tensor<128x!tt.ptr<i64>, #blocked>
+    %r = arith.maxui %x, %y : tensor<128xi64, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<i64> -> tensor<128x!tt.ptr<i64>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<128x!tt.ptr<i64>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %r : tensor<128x!tt.ptr<i64>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel int_maxui_i64_kernel
+// CHECK-NOT:   arith.maxsi
+// CHECK:       arith.maxui {{.*}} : i64
+// CHECK-NOT:   arith.maxui {{.*}} tensor
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @int_select_kernel(%x_ptr: !tt.ptr<f32>, %y_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {
     %c64_i32 = arith.constant 64 : i32
     %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>

@@ -958,6 +958,43 @@ _UNSUPPORTED_SNIPPETS = {
 _UNSUPPORTED_NUM_WARPS = {"join_out_of_envelope": 1}
 
 
+@pytest.mark.parametrize("tensor", [False, True], ids=["scalar", "tensor"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_fma_f16_fails_without_crashing(tensor, num_warps, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    # Compile without an MPS device. A subprocess contains the historical
+    # llvm_unreachable in MSL emission and lets us distinguish it from rejection.
+    script = tmp_path / "unsupported_fma.py"
+    offset = "tl.arange(0, 256)" if tensor else "0"
+    script.write_text(
+        "import triton\n"
+        "import triton.language as tl\n"
+        "from triton.compiler import ASTSource\n"
+        "from triton.backends.compiler import GPUTarget\n"
+        "@triton.jit\n"
+        "def kernel(X, Y, Z, O):\n"
+        f"    offset = {offset}\n"
+        "    x = tl.load(X + offset)\n"
+        "    y = tl.load(Y + offset)\n"
+        "    z = tl.load(Z + offset)\n"
+        "    tl.store(O + offset, tl.fma(x, y, z))\n"
+        "source = ASTSource(kernel, signature={k: '*fp16' for k in 'XYZO'})\n"
+        "triton.compile(source, target=GPUTarget('metal', 9, 32), "
+        f"options={{'num_warps': {num_warps}}})\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True,
+        timeout=120,
+        env={**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "cache")},
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "Metal backend: math.fma requires f32 operands and result" in proc.stderr
+    assert "UNREACHABLE" not in proc.stderr
+
+
 @pytest.mark.parametrize("name", sorted(_UNSUPPORTED_SNIPPETS))
 def test_unsupported_construct_fails_without_crashing(name, tmp_path):
     torch = pytest.importorskip("torch")
@@ -987,6 +1024,83 @@ def test_unsupported_construct_fails_without_crashing(name, tmp_path):
         f"{proc.stderr[-2000:]}")
     assert "Metal backend:" in proc.stderr, (
         f"{name}: no backend diagnostic in stderr:\n{proc.stderr[-2000:]}")
+
+
+@pytest.mark.parametrize("op", ["sqrt", "erf", "exp", "exp2", "log", "log2", "rsqrt", "sin", "cos"])
+@pytest.mark.parametrize("tensor", [False, True], ids=["scalar", "tensor"])
+def test_unary_math_f64_fails_without_crashing(op, tensor, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    # f32 buffers keep the unsupported math width independent of the buffer
+    # storage contract. The explicit f64 intermediate is valid Triton input.
+    script = tmp_path / "unsupported_unary_math.py"
+    offset = "tl.arange(0, 256)" if tensor else "0"
+    script.write_text(
+        "import triton\n"
+        "import triton.language as tl\n"
+        "from triton.compiler import ASTSource\n"
+        "from triton.backends.compiler import GPUTarget\n"
+        "@triton.jit\n"
+        "def kernel(X, O):\n"
+        f"    offset = {offset}\n"
+        "    x = tl.load(X + offset).to(tl.float64)\n"
+        f"    y = tl.{op}(x).to(tl.float32)\n"
+        "    tl.store(O + offset, y)\n"
+        "source = ASTSource(kernel, signature={'X': '*fp32', 'O': '*fp32'})\n"
+        "triton.compile(source, target=GPUTarget('metal', 9, 32), "
+        "options={'num_warps': 4})\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+        env={**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "cache")},
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert f"Metal backend: math.{op} requires f32 operands and result" in proc.stderr
+    assert "UNREACHABLE" not in proc.stderr
+
+
+@pytest.mark.parametrize("op,input_type,output_type,expression", [
+    ("extf", "fp32", "i64", "x.to(tl.float64).to(tl.int64)"),
+    ("truncf", "fp64", "fp32", "x.to(tl.float32)"),
+    ("sitofp", "i32", "i64", "x.to(tl.float64).to(tl.int64)"),
+    ("uitofp", "u32", "i64", "x.to(tl.float64).to(tl.int64)"),
+    ("fptosi", "fp64", "i32", "x.to(tl.int32)"),
+    ("fptoui", "fp64", "u32", "x.to(tl.uint32)"),
+])
+@pytest.mark.parametrize("tensor", [False, True], ids=["scalar", "tensor"])
+def test_numeric_cast_f64_fails_without_crashing(op, input_type, output_type, expression, tensor, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    # Preserve widening with an integer consumer. The source-f64 cases are
+    # compile-only: they require no allocation of an unsupported MPS dtype.
+    script = tmp_path / "unsupported_numeric_cast.py"
+    offset = "tl.arange(0, 256)" if tensor else "0"
+    script.write_text(
+        "import triton\n"
+        "import triton.language as tl\n"
+        "from triton.compiler import ASTSource\n"
+        "from triton.backends.compiler import GPUTarget\n"
+        "@triton.jit\n"
+        "def kernel(X, O):\n"
+        f"    offset = {offset}\n"
+        "    x = tl.load(X + offset)\n"
+        f"    y = {expression}\n"
+        "    tl.store(O + offset, y)\n"
+        f"source = ASTSource(kernel, signature={{'X': '*{input_type}', 'O': '*{output_type}'}})\n"
+        "triton.compile(source, target=GPUTarget('metal', 9, 32), "
+        "options={'num_warps': 4})\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+        env={**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "cache")},
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert f"Metal backend: arith.{op} does not support f64" in proc.stderr
+    assert "UNREACHABLE" not in proc.stderr
 
 
 # --- tt.make_range must never fall back to a constant ---------------------
@@ -2108,6 +2222,65 @@ def test_cumsum_rank2_i32_bridges_through_storage_type():
     assert torch.equal(out.cpu(), x.cumsum(1, dtype=torch.int32))
 
 
+@triton.jit
+def _xor_scan_combine(a, b):
+    return a ^ b
+
+
+@triton.jit
+def _xor_scan_tile_kernel(x_ptr, out_ptr, SHAPE: tl.constexpr,
+                          BLOCK: tl.constexpr, AXIS: tl.constexpr,
+                          REVERSE: tl.constexpr):
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK).reshape(SHAPE)
+    x = tl.load(x_ptr + off)
+    result = tl.associative_scan(x, AXIS, _xor_scan_combine, reverse=REVERSE)
+    tl.store(out_ptr + off, result)
+
+
+@pytest.mark.parametrize("shape,axis,num_warps", [
+    ((4, 8), axis, nw) for axis in (0, 1) for nw in (1, 4)
+] + [
+    ((2, 4, 4), axis, nw) for axis in (0, 1, 2) for nw in (1, 4)
+] + [((2, 64), 1, 4), ((64, 2), 0, 4)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_xor_scan_staged_axes_are_bit_exact(shape, axis, num_warps, reverse):
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = math.prod(shape)
+    generator = torch.Generator().manual_seed(block + axis)
+    x = torch.randint(-(2**31), 2**31, (3, *shape), dtype=torch.int32,
+                      generator=generator)
+    x.flatten()[:4] = torch.tensor([0, -1, -(2**31), 2**31 - 1])
+    expected = x.clone()
+    slices = expected.unbind(axis + 1)
+    indices = range(len(slices) - 2, -1, -1) if reverse else range(1, len(slices))
+    for i in indices:
+        slices[i].bitwise_xor_(slices[i + 1 if reverse else i - 1])
+    out = torch.empty_like(x, device="mps")
+    _xor_scan_tile_kernel[(3,)](x.to("mps"), out, shape, block, axis, reverse,
+                                num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("shape,block,axis,diagnostic", [
+    ((32,), 32, 0, "scan combine must be add or mul"),
+    ((8, 8), 64, 1, "rank >= 2 scan is implemented"),
+    ((1, 128), 128, 1, "rank >= 2 scan is implemented"),
+])
+def test_xor_scan_outside_staged_envelope_is_rejected(
+        shape, block, axis, diagnostic, capfd):
+    with pytest.raises(Exception):
+        _compile_to_msl(
+            _xor_scan_tile_kernel, {"x_ptr": "*i32", "out_ptr": "*i32"},
+            {"SHAPE": shape, "BLOCK": block, "AXIS": axis, "REVERSE": False},
+            num_warps=1)
+    assert diagnostic in capfd.readouterr().err
+
+
 # --- tl.join / tl.split / tl.cat / tl.interleave ---------------------------
 #
 # Triton keeps these per-thread by choosing a layout where one thread owns both
@@ -2501,3 +2674,136 @@ def test_hard_fast_fourier_transform_matches_torch(n):
     actual = torch.view_as_complex(spectrum.cpu().reshape(n, 2))
     torch.testing.assert_close(actual, torch.fft.fft(source), atol=5e-4,
                                rtol=5e-4)
+
+
+@triton.jit
+def _floating_remainder_kernel(x_ptr, y_ptr, out_ptr, N, SCALAR: tl.constexpr, BLOCK: tl.constexpr):
+    if SCALAR:
+        x = tl.load(x_ptr)
+        y = tl.load(y_ptr)
+        tl.store(out_ptr, x % y)
+    else:
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y = tl.load(y_ptr + offsets, mask=mask, other=1.0)
+        tl.store(out_ptr + offsets, x % y, mask=mask)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_floating_remainder_compiles_to_msl(scalar):
+    src = ASTSource(
+        fn=_floating_remainder_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32", "N": "i32",
+                   "SCALAR": "constexpr", "BLOCK": "constexpr"},
+        constexprs={"SCALAR": scalar, "BLOCK": 128},
+    )
+    compiled = triton.compile(src, target=GPUTarget("metal", 80, 32), options={"num_warps": 4})
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    assert "metal::precise::fmod(" in msl
+
+
+@pytest.mark.parametrize("scalar,n", [(True, 1), (False, 63), (False, 128), (False, 1025)])
+def test_floating_remainder_matches_torch(scalar, n):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    # Dividend sign, negative divisors, exact multiples, large quotients and
+    # special values distinguish truncating remainder from floor/IEEE remainder.
+    pairs = [
+        (-0.0, 3.0), (0.0, -3.0), (-4.0, 2.0), (4.0, -2.0),
+        (-5.5, 2.0), (5.5, -2.0), (-5.5, -2.0), (5.5, 2.0),
+        (3.4028234663852886e38, 1.25), (-1073741824.0, 3.0),
+        (1.0, float("inf")), (-1.0, -float("inf")),
+        (float("inf"), 2.0), (-float("inf"), -2.0),
+        (float("nan"), 2.0), (2.0, float("nan")), (2.0, 0.0),
+    ]
+    inputs = torch.tensor((pairs * triton.cdiv(n, len(pairs)))[:n], dtype=torch.float32)
+    x, y = inputs[:, 0].contiguous(), inputs[:, 1].contiguous()
+    out = torch.empty(n, dtype=torch.float32, device="mps")
+    _floating_remainder_kernel[(triton.cdiv(n, 128),)](
+        x.to("mps"), y.to("mps"), out, n, SCALAR=scalar, BLOCK=128,
+    )
+    torch.mps.synchronize()
+    actual = out.cpu()
+    expected = torch.fmod(x, y)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    zero = expected == 0
+    assert torch.equal(torch.signbit(actual[zero]), torch.signbit(expected[zero]))
+
+
+@triton.jit
+def _abs_16bit_kernel(x_ptr, out_ptr, N, DTYPE: tl.constexpr, SCALAR: tl.constexpr, BLOCK: tl.constexpr):
+    if SCALAR:
+        offsets = tl.program_id(0)
+        bits = tl.load(x_ptr + offsets)
+    else:
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        bits = tl.load(x_ptr + offsets, offsets < N, other=0)
+    value = bits.to(DTYPE, bitcast=True)
+    magnitude = tl.abs(value)
+    if SCALAR:
+        tl.store(out_ptr + offsets, magnitude.to(tl.int16, bitcast=True))
+    else:
+        tl.store(out_ptr + offsets, magnitude.to(tl.int16, bitcast=True), offsets < N)
+
+
+@pytest.mark.parametrize("dtype", [tl.float16, tl.bfloat16])
+@pytest.mark.parametrize("scalar", [False, True])
+def test_abs_16bit_compiles_to_msl(dtype, scalar):
+    src = ASTSource(
+        fn=_abs_16bit_kernel,
+        signature={"x_ptr": "*i16", "out_ptr": "*i16", "N": "i32",
+                   "DTYPE": "constexpr", "SCALAR": "constexpr", "BLOCK": "constexpr"},
+        constexprs={"DTYPE": dtype, "SCALAR": scalar, "BLOCK": 256},
+    )
+    compiled = triton.compile(src, target=GPUTarget("metal", 80, 32), options={"num_warps": 4})
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    assert "as_type<uint16_t>" in msl
+    assert "32767" in msl and " & " in msl
+    spelling = "half" if dtype == tl.float16 else "bfloat"
+    assert f"as_type<{spelling}>" in msl
+
+
+@pytest.mark.parametrize("dtype", [tl.float16, tl.bfloat16])
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_abs_16bit_runtime_preserves_magnitude_bits(dtype, scalar, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    # Tensor mode exhausts both signs of every normal, subnormal, zero, infinity
+    # and NaN payload. Integer I/O prevents host/device float conversions from
+    # hiding a changed NaN payload. The extra 37 values exercise a masked tail.
+    if scalar:
+        bits = torch.tensor([0, 0x8000, 1, 0x8001, 0x3c00, 0xbc00, 0x7c00, 0xfc00,
+                             0x7c01, 0xfc01, 0x7f80, 0xff80, 0x7f81, 0xff81,
+                             0x7fff, 0xffff], dtype=torch.int32).to(torch.int16)
+    else:
+        bits = torch.arange(65536 + 37, dtype=torch.int32).to(torch.int16)
+    n = bits.numel()
+    out = torch.empty_like(bits, device="mps")
+    _abs_16bit_kernel[(n if scalar else triton.cdiv(n, 256),)](
+        bits.to("mps"), out, n, DTYPE=dtype, SCALAR=scalar, BLOCK=256, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), bits & 0x7fff)
+
+
+@pytest.mark.parametrize("dtype", ["i16", "fp32", "bf16"])
+@pytest.mark.parametrize("mode", ["constant", "runtime", "loaded", "none"])
+def test_masked_scalar_load_compiles_with_guarded_memory_read(dtype, mode):
+    from test_metal_backend_scalar_load import _masked_scalar_load_kernel
+
+    msl = _compile_to_msl(
+        _masked_scalar_load_kernel,
+        {"x_ptr": f"*{dtype}", "fallback_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
+         "N": "i32", "fallback": "i32", "MODE": "constexpr"},
+        {"MODE": mode}, num_warps=4,
+    )
+    # Buffer 0 is the masked input. Its one memory read must occur inside the
+    # true branch; generating a select around an unconditional read is invalid.
+    assert msl.count("v0[") == 1
+    assert msl.index("if (") < msl.index("v0[") < msl.index("} else {")

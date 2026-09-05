@@ -4801,11 +4801,10 @@ struct ArithMinMaxFLowering : public mlir::OpConversionPattern<OpTy> {
   }
 };
 
-// Elementwise i32 `arith.maxsi` / `arith.minsi` (`tl.maximum` / `tl.minimum`
-// on int32) → the same SCALAR op on the per-thread operands. metal.binary_exp
-// rejects signless i32, but ModuleTranslation emits scalar maxsi/minsi as MSL
-// `max((int)a,(int)b)` (signed). Enables loop-carried i32 column-min/max after
-// reassociateLoopCarriedAxis0Reduce.
+// Elementwise integer min/max → the same scalar op on per-thread operands.
+// Keeping the arith op preserves its signedness and width for ModuleTranslation
+// to select the matching MSL min/max overload. Also used by loop-carried i32
+// column-min/max after reassociateLoopCarriedAxis0Reduce.
 template <typename OpTy>
 struct ArithIntMinMaxLowering : public mlir::OpConversionPattern<OpTy> {
   using mlir::OpConversionPattern<OpTy>::OpConversionPattern;
@@ -5058,6 +5057,25 @@ static bool hasF32ElementType(mlir::Type type) {
     type = ranked.getElementType();
   return type.isF32();
 }
+
+// arith.remf uses truncating remainder, matching fmod rather than the IEEE
+// remainder function. Select the precise namespace explicitly: the default
+// MSL fmod variant has undefined accuracy when fast math is enabled.
+struct ArithRemFLowering
+    : public mlir::OpConversionPattern<mlir::arith::RemFOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(mlir::arith::RemFOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy || !hasF32ElementType(resultTy))
+      return rewriter.notifyMatchFailure(op, "floating remainder requires f32");
+    rewriter.replaceOpWithNewOp<MathIntrinsicOp>(
+        op, resultTy, rewriter.getStringAttr("metal::precise::fmod"),
+        mlir::ValueRange{adaptor.getLhs(), adaptor.getRhs()});
+    return mlir::success();
+  }
+};
 
 struct TritonPreciseSqrtLowering
     : public mlir::OpConversionPattern<mlir::triton::PreciseSqrtOp> {
@@ -5336,7 +5354,7 @@ struct MathSqrtLowering : public mlir::OpConversionPattern<mlir::math::SqrtOp> {
   matchAndRewrite(mlir::math::SqrtOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::sqrtOp);
@@ -5352,7 +5370,7 @@ struct MathErfLowering : public mlir::OpConversionPattern<mlir::math::ErfOp> {
   matchAndRewrite(mlir::math::ErfOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::erfOp);
@@ -5379,7 +5397,7 @@ struct MathExpLowering : public mlir::OpConversionPattern<mlir::math::ExpOp> {
   matchAndRewrite(mlir::math::ExpOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::expOp);
@@ -5398,7 +5416,7 @@ struct MathExp2Lowering : public mlir::OpConversionPattern<mlir::math::Exp2Op> {
   matchAndRewrite(mlir::math::Exp2Op op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return rewriter.notifyMatchFailure(op, "exp2 requires f32");
     auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::exp2Op);
@@ -5416,7 +5434,7 @@ struct MathSinLowering : public mlir::OpConversionPattern<mlir::math::SinOp> {
   matchAndRewrite(mlir::math::SinOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::sinOp);
@@ -5432,7 +5450,7 @@ struct MathCosLowering : public mlir::OpConversionPattern<mlir::math::CosOp> {
   matchAndRewrite(mlir::math::CosOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::cosOp);
@@ -5448,7 +5466,7 @@ struct MathLogLowering : public mlir::OpConversionPattern<mlir::math::LogOp> {
   matchAndRewrite(mlir::math::LogOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::logOp);
@@ -5464,7 +5482,7 @@ struct MathLog2Lowering : public mlir::OpConversionPattern<mlir::math::Log2Op> {
   matchAndRewrite(mlir::math::Log2Op op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return rewriter.notifyMatchFailure(op, "log2 requires f32");
     auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::log2Op);
@@ -5480,8 +5498,23 @@ struct MathAbsFLowering : public mlir::OpConversionPattern<mlir::math::AbsFOp> {
   matchAndRewrite(mlir::math::AbsFOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (resultTy && (resultTy.isF16() || resultTy.isBF16())) {
+      // Both 16-bit formats store the sign in bit 15. Clearing that bit
+      // implements abs exactly, including signed zero and NaN payloads,
+      // without a floating conversion that could quiet or canonicalize NaNs.
+      auto ui16 = rewriter.getIntegerType(16, /*isSigned=*/false);
+      auto bits = BitcastOp::create(rewriter, op.getLoc(), ui16,
+                                    adaptor.getOperand());
+      auto mask = ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getIntegerAttr(ui16, 0x7fff));
+      auto magnitude = BinaryExpOp::create(rewriter, op.getLoc(),
+                                           BinaryExpOperator::bitAndOp, bits,
+                                           mask);
+      rewriter.replaceOpWithNewOp<BitcastOp>(op, resultTy, magnitude);
+      return mlir::success();
+    }
     if (!resultTy || !resultTy.isF32())
-      return rewriter.notifyMatchFailure(op, "absf requires f32");
+      return rewriter.notifyMatchFailure(op, "absf requires f16, bf16 or f32");
     auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::absOp);
     rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, kind,
@@ -5495,8 +5528,7 @@ struct MathFmaLowering : public mlir::OpConversionPattern<mlir::math::FmaOp> {
   mlir::LogicalResult
   matchAndRewrite(mlir::math::FmaOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!hasF32ElementType(op.getType()))
       return rewriter.notifyMatchFailure(op, "fma requires f32");
     rewriter.replaceOpWithNewOp<mlir::triton::metal::FmaOp>(
         op, adaptor.getA(), adaptor.getB(), adaptor.getC());
@@ -5511,7 +5543,7 @@ struct MathRsqrtLowering
   matchAndRewrite(mlir::math::RsqrtOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return mlir::failure();
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::rsqrtOp);
@@ -10188,17 +10220,19 @@ lowerCanonicalAffineScan(mlir::triton::ScanOp op,
 }
 
 // The monoid of a SINGLE-operand `tt.scan`, or `nullopt` when the combine
-// region is not one of the two `metal.threadgroup_prefix_sum` implements.
+// region is not supported by the selected scan path. The distributed rank-1
+// template implements add/mul; the staged path also implements i32 XOR.
 //
 // The match is STRUCTURAL, not "what is the first op in the region": the region
 // must hold exactly one arithmetic op, it must combine the two block arguments
 // themselves, and its result must be what `tt.scan.return` yields. A first-op
 // sniff would accept `combine(l, r) = (l + r) * 2` as a cumsum and
 // `combine(l, r) = l * 2 + r` as a cumprod — both silently wrong answers, with
-// no diagnostic anywhere. Add and mul are the only cases; both are commutative,
+// no diagnostic anywhere. All supported combines are commutative,
 // so the two operand orders are equivalent.
 static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
-                                                        bool isI32) {
+                                                      bool isI32,
+                                                      bool allowXor = false) {
   if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
     return std::nullopt;
   mlir::Block &body = op->getRegion(0).front();
@@ -10210,7 +10244,7 @@ static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
     if (mlir::isa<mlir::triton::ScanReturnOp>(nested))
       continue;
     if (combine)
-      return std::nullopt; // more than one op: not a bare add/mul
+      return std::nullopt; // more than one op: not a bare supported combine
     combine = &nested;
   }
   auto ret = mlir::dyn_cast<mlir::triton::ScanReturnOp>(body.back());
@@ -10231,6 +10265,8 @@ static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
   if (isI32 ? mlir::isa<mlir::arith::MulIOp>(combine)
             : mlir::isa<mlir::arith::MulFOp>(combine))
     return BinaryExpOperator::mulOp;
+  if (allowXor && isI32 && mlir::isa<mlir::arith::XOrIOp>(combine))
+    return BinaryExpOperator::bitXorOp;
   return std::nullopt;
 }
 
@@ -10252,7 +10288,7 @@ static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
 // multiple of tpb with E = BLOCK/tpb in [1,64] pow2 (mirrors the rank-1 reduce
 // spt-fold envelope). The scan INPUT cone must be `rank1ConeSupported`.
 //===----------------------------------------------------------------------===//
-// rank >= 2 `tt.scan` — `tl.cumsum` / `tl.cumprod` along either axis of a tile.
+// rank >= 2 `tt.scan` — add/mul or i32 XOR along any axis of a tile.
 //
 // Scan was rank-1 axis-0 only: the distributed prefix-sum template below builds
 // one threadgroup buffer per BLOCK-long run, which has no meaning once the tile
@@ -10307,7 +10343,8 @@ static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
   const bool isI32 = elemTy.isInteger(32);
   if (!isI32 && !elemTy.isF32() && !elemTy.isF16() && !elemTy.isBF16())
     return std::nullopt;
-  std::optional<BinaryExpOperator> kind = scanCombineKind(op, isI32);
+  std::optional<BinaryExpOperator> kind =
+      scanCombineKind(op, isI32, /*allowXor=*/true);
   if (!kind)
     return std::nullopt;
 
@@ -13961,7 +13998,7 @@ struct LoadLowering : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
 //===----------------------------------------------------------------------===//
 // Scalar tt.load → metal.get_element (L3a-tileloop-compiler-A).
 //
-// Matches an unmasked `tt.load` whose ptr is a bare `!tt.ptr<f32>` (NOT a
+// Matches a scalar `tt.load` whose ptr is a bare `!tt.ptr<f32>` (NOT a
 // `tensor<Nx!tt.ptr<f32>>`) and whose result is bare `f32`. Two shapes are
 // supported:
 //   * `tt.load %scalar_ptr : !tt.ptr<f32>` (offset 0; no addptr — Triton
@@ -13973,7 +14010,8 @@ struct LoadLowering : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
 // emitted by the Triton frontend BEFORE the arith op — splat lowering is
 // already in place, so no broadcast work is needed here.
 //
-// Envelope: unmasked only; load only; any dtype the memref can store. See
+// Envelope: scalar pointer and optional scalar mask/other; any dtype the
+// memref can store. Masked-off accesses yield other without reading memory. See
 // the implementation notes.
 //===----------------------------------------------------------------------===//
 struct ScalarLoadLowering
@@ -13982,8 +14020,6 @@ struct ScalarLoadLowering
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::LoadOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    if (op.getMask())
-      return mlir::failure(); // masked scalar load deferred
     // Must be SCALAR ptr — not a tensor of pointers. The ptr operand may
     // appear as either `!tt.ptr<f32>` (intermediate `tt.addptr` operand) or
     // `!metal.memref<? x f32>` (kernel-arg block argument rewritten by
@@ -14033,14 +14069,38 @@ struct ScalarLoadLowering
     auto memrefTy = mlir::cast<MetalMemRefType>(memref.getType());
     mlir::Type storageTy = memrefTy.getType();
     mlir::Type wantTy = op.getType();
-    mlir::Value el =
-        GetElementOp::create(rewriter, loc, storageTy, memref, idxUi32)
-            .getResult();
-    if (storageTy != wantTy)
-      el = mlir::UnrealizedConversionCastOp::create(
-               rewriter, loc, mlir::TypeRange{wantTy}, mlir::ValueRange{el})
-               .getResult(0);
-    rewriter.replaceOp(op, el);
+    auto emitLoad = [&]() -> mlir::Value {
+      mlir::Value el =
+          GetElementOp::create(rewriter, loc, storageTy, memref, idxUi32);
+      if (storageTy != wantTy)
+        el = mlir::UnrealizedConversionCastOp::create(
+                 rewriter, loc, mlir::TypeRange{wantTy}, mlir::ValueRange{el})
+                 .getResult(0);
+      return el;
+    };
+    if (!op.getMask()) {
+      rewriter.replaceOp(op, emitLoad());
+      return mlir::success();
+    }
+
+    // A scalar mask is uniform within the logical block. Keep the memory
+    // read inside the true region: the pointer need not be in bounds when
+    // the mask is false. Address arithmetic alone may stay outside it.
+    auto branch = mlir::scf::IfOp::create(
+        rewriter, loc, mlir::TypeRange{wantTy}, adaptor.getMask(),
+        /*addThenBlock=*/true, /*addElseBlock=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&branch.getThenRegion().front());
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{emitLoad()});
+      rewriter.setInsertionPointToStart(&branch.getElseRegion().front());
+      mlir::Value other = adaptor.getOther();
+      if (!other)
+        other = mlir::arith::ConstantOp::create(rewriter, loc,
+                                               rewriter.getZeroAttr(wantTy));
+      mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{other});
+    }
+    rewriter.replaceOp(op, branch.getResult(0));
     return mlir::success();
   }
 };
@@ -14225,7 +14285,7 @@ static mlir::Value emitTileAwareMask(llvm::ArrayRef<MaskComponent> shapes,
 // branch).
 //
 // Restricted to (addr, mask[, other]) shape. The `other` operand may be either
-// a splat-constant (`tt.splat(arith.constant scalar)` / dense splat) or a
+// a scalar, a splat-constant (`tt.splat(arith.constant scalar)` / dense splat), or a
 // runtime-uniform `tt.splat` of a scalar expression. The latter is the shape
 // emitted for `tl.load(..., other=K - 1)`: the tensor-to-scalar TypeConverter
 // makes the adaptor operand a scalar, which the else branch can yield after a
@@ -14278,6 +14338,10 @@ extractSplatConstantAttr(mlir::Value other) {
 static bool maskedLoadOtherIsUniform(mlir::Value other) {
   if (!other)
     return true; // no `other` at all — the masked-off branch yields zero
+  // Source-level scalars are block-uniform, including constants, loaded
+  // values, and loop-varying expressions. They need no tensor splat proof.
+  if (mlir::isa<mlir::IntegerType, mlir::FloatType>(other.getType()))
+    return true;
   if (extractSplatConstantAttr(other))
     return true; // splat constant
   if (other.getDefiningOp<mlir::triton::SplatOp>())
@@ -14306,9 +14370,12 @@ struct MaskedLoadLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     if (!op.getMask())
       return mlir::failure(); // handled by LoadLowering
+    if (!mlir::isa<mlir::RankedTensorType>(op.getPtr().getType()))
+      return mlir::failure(); // handled by ScalarLoadLowering
     // `other` operand: constants keep their literal materialization path;
-    // dynamic values must be a direct tt.splat of a runtime-uniform scalar.
-    // The dot prepass separately keeps every `other` out of tt.dot operands.
+    // tensor dynamic values must be a uniform splat or a scalar-condition
+    // select of uniform values. Scalar loads are handled separately above.
+    // The dot prepass separately requires numeric zero for dot operands.
     std::optional<mlir::TypedAttr> otherSplatAttr;
     mlir::Value dynamicOther;
     if (op.getOther()) {
@@ -15586,6 +15653,22 @@ struct MaskedStoreLowering
     if (!op.getMask())
       return mlir::failure(); // handled by StoreLowering
     auto loc = op.getLoc();
+    if (mlir::isa<mlir::triton::PointerType, MetalMemRefType>(
+            op.getPtr().getType())) {
+      // Scalar masks are block-uniform. Keep the store inside the true
+      // region, then let StoreLowering handle the unmasked scalar operation
+      // with its existing address and storage-type handling.
+      auto branch = mlir::scf::IfOp::create(rewriter, loc, adaptor.getMask(),
+                                           /*withElseRegion=*/false);
+      {
+        mlir::OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(branch.thenBlock());
+        auto store = mlir::cast<mlir::triton::StoreOp>(rewriter.clone(*op));
+        rewriter.modifyOpInPlace(store, [&] { store.getMaskMutable().clear(); });
+      }
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
     auto isScanBackedValue = [](mlir::Value value) {
       while (auto cvt =
                  value.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
@@ -31429,8 +31512,8 @@ validateCanonicalMultiTileDotSupport(mlir::ModuleOp moduleOp) {
 // Rejecting here, before any conversion runs, turns each into an ordinary
 // compile error naming the construct and what to use instead.
 //
-// Kept deliberately in sync with what IS implemented: an op listed here must
-// have no lowering pattern, and adding a pattern means deleting its entry.
+// Keep each rejection in sync with its lowering's supported envelope. A new
+// lowering removes its rejection only for the forms it actually implements.
 static mlir::LogicalResult
 validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   bool valid = true;
@@ -31440,6 +31523,86 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
   };
   moduleOp.walk([&](mlir::Operation *op) {
     llvm::TypeSwitch<mlir::Operation *, void>(op)
+        .Case<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
+              mlir::arith::FPToSIOp, mlir::arith::FPToUIOp,
+              mlir::arith::ExtFOp, mlir::arith::TruncFOp>([&](auto o) {
+          // Scalarizing a numeric cast does not make f64 representable in
+          // MSL. Reject both directions before conversion or emission fails.
+          auto isF64 = [](mlir::Type type) {
+            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+              type = tensor.getElementType();
+            return type.isF64();
+          };
+          if (isF64(o.getIn().getType()) || isF64(o.getType()))
+            reject(o, o->getName().getStringRef().str() +
+                          " does not support f64 operands or results; "
+                          "use f32 for Metal numeric conversions");
+        })
+        .Case<mlir::math::SqrtOp, mlir::math::ErfOp, mlir::math::ExpOp,
+              mlir::math::Exp2Op, mlir::math::LogOp, mlir::math::Log2Op,
+              mlir::math::RsqrtOp, mlir::math::SinOp, mlir::math::CosOp>(
+            [&](auto o) {
+              // These patterns only emit f32 Metal expressions. Other
+              // widths remain legal in conversion but have no MSL emitter.
+              if (!hasF32ElementType(o.getType()))
+                reject(o, o->getName().getStringRef().str() +
+                              " requires f32 operands and result; "
+                              "convert the operand to f32 before this operation");
+            })
+        .Case<mlir::math::FmaOp>([&](auto o) {
+          // Non-f32 math is otherwise legal during conversion and reaches
+          // MSL emission without a translator. Share the lowering envelope
+          // instead of letting a valid half-precision tl.fma abort there.
+          if (!hasF32ElementType(o.getType()))
+            reject(o, "math.fma requires f32 operands and result; "
+                      "convert operands to f32 before tl.fma");
+        })
+        .Case<mlir::math::AbsFOp>([&](auto o) {
+          mlir::Type type = o.getType();
+          if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+            type = tensor.getElementType();
+          if (!type.isF16() && !type.isBF16() && !type.isF32())
+            reject(o, "math.absf requires f16, bf16 or f32 operands and result");
+        })
+        // Buffer resolution follows address arithmetic back to a bound
+        // argument; it cannot represent a selection between pointer values.
+        // Reject the source select before a consuming load/store declines in
+        // conversion and tears down a partially rewritten function.
+        .Case<mlir::arith::SelectOp>([&](auto o) {
+          mlir::Type type = o.getType();
+          if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+            type = tensor.getElementType();
+          if (mlir::isa<mlir::triton::PointerType>(type))
+            reject(o, "selecting pointer values is not implemented; select "
+                      "loaded values or integer offsets instead");
+        })
+        .Case<mlir::scf::IfOp>([&](auto o) {
+          for (mlir::Type type : o.getResultTypes()) {
+            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+              type = tensor.getElementType();
+            if (mlir::isa<mlir::triton::PointerType>(type)) {
+              reject(o, "scf.if pointer results are not implemented; keep "
+                        "memory accesses inside the branches or yield integer "
+                        "offsets instead");
+              break;
+            }
+          }
+        })
+        .Case<mlir::scf::WhileOp>([&](auto o) {
+          // Unlike scf.for, no whole-kernel matcher consumes pointer-carrying
+          // while loops. Check both sides: scf.condition may forward types
+          // different from the initial operands to the results/after region.
+          auto isPointer = [](mlir::Type type) {
+            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+              type = tensor.getElementType();
+            return mlir::isa<mlir::triton::PointerType>(type);
+          };
+          if (llvm::any_of(o->getOperandTypes(), isPointer) ||
+              llvm::any_of(o->getResultTypes(), isPointer))
+            reject(o, "scf.while pointer operands or results are not "
+                      "implemented; carry integer offsets and access bound "
+                      "buffers inside the loop instead");
+        })
         // join/split/cat are implemented as threadgroup shuffles, but only for
         // the shape where each source element has a lane of its own — see
         // JoinLowering. Outside it the pattern would decline, and a declined
@@ -31750,6 +31913,14 @@ static mlir::LogicalResult validatePreciseMathSupport(mlir::ModuleOp moduleOp) {
         "Metal backend: tt.precise_divf requires f32 operands and result");
     valid = false;
   });
+  moduleOp.walk([&](mlir::arith::RemFOp op) {
+    if (hasF32ElementType(op.getType()))
+      return;
+    op.emitOpError(
+        "Metal backend: arith.remf requires f32 operands and result; "
+        "convert to f32 before taking a floating remainder");
+    valid = false;
+  });
   return mlir::success(valid);
 }
 
@@ -31843,7 +32014,7 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
       reject("rank >= 2 scan is implemented for a blocked tile of at most one "
              "element per thread, along an axis of extent 2..64, with an "
              "add or mul combine (tl.cumsum / tl.cumprod) on f32, f16, bf16 or "
-             "i32, outside divergent control flow");
+             "i32, or an xor combine on i32, outside divergent control flow");
       return;
     }
     if (op.getAxis() != 0) {
@@ -32752,7 +32923,7 @@ struct ConvertTritonGPUToMetalPass
         return;
       load.emitOpError(
           "Metal backend: a masked tt.load's `other` must be uniform across "
-          "lanes — a splat constant, a tt.splat of a scalar, or a select "
+          "lanes — a scalar, a splat constant, a tt.splat of a scalar, or a select "
           "between those on a scalar condition; a per-lane `other` tensor "
           "needs a per-lane blend the masked-load path does not emit");
       otherUniformOk = false;
@@ -33813,6 +33984,34 @@ struct ConvertTritonGPUToMetalPass
       }
     }
 
+    // Canonical pointer-advance matmul loops have now been replaced. Generic
+    // pointer-carrying for loops cannot preserve a bound buffer plus offset:
+    // their consuming accesses may decline during conversion, before the
+    // post-conversion accumulator-type guard can report the unsupported carry.
+    // Keep this after the matmul matchers, but before even partial conversion
+    // rewrites the function shell.
+    {
+      bool loopsOk = true;
+      moduleOp.walk([&](mlir::scf::ForOp loop) {
+        for (mlir::Type type : loop.getResultTypes()) {
+          if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+            type = tensor.getElementType();
+          if (!mlir::isa<mlir::triton::PointerType>(type))
+            continue;
+          loop.emitOpError(
+              "Metal backend: scf.for pointer iter_args are not implemented "
+              "outside matched matmul loops; carry integer offsets and access "
+              "bound buffers inside the loop instead");
+          loopsOk = false;
+          break;
+        }
+      });
+      if (!loopsOk) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     // Scalar CAS/RMW old-value broadcast scratch. This must be hoisted before
     // the function shell is converted so it dominates the lane-zero atomic and
     // the post-barrier load in AtomicCasLowering / AtomicRmwLowering.
@@ -34082,6 +34281,10 @@ struct ConvertTritonGPUToMetalPass
     // legal so a later validation/emission stage can diagnose them explicitly.
     target.addDynamicallyLegalDialect<
         mlir::math::MathDialect>([&](mlir::Operation *op) {
+      // All admitted abs widths have an explicit lowering, including the
+      // bit-preserving f16/bf16 path. Do not leave those ops for MSL emission.
+      if (mlir::isa<mlir::math::AbsFOp>(op))
+        return false;
       if (!mlir::isa<mlir::math::SqrtOp, mlir::math::ErfOp, mlir::math::ExpOp,
                      mlir::math::Exp2Op, mlir::math::LogOp, mlir::math::Log2Op,
                      mlir::math::AbsFOp, mlir::math::FmaOp, mlir::math::RsqrtOp,
@@ -34105,6 +34308,9 @@ struct ConvertTritonGPUToMetalPass
     // tensor<->scalar`, and the MSL emitter hits `llvm_unreachable` (see
     // ModuleTranslation::translateValue Default).
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // Scalar remainder needs the same explicit precise fmod spelling as a
+    // tensor remainder; do not let scalar arith legality bypass the pattern.
+    target.addIllegalOp<mlir::arith::RemFOp>();
     // `metal.scalar_dot` (the GEMM correctness fallback) is a transient op that
     // MUST be lowered to a per-thread scalar reduction; mark it illegal so
     // `ScalarDotLowering` fires despite the Metal dialect being legal above.
@@ -34122,7 +34328,7 @@ struct ConvertTritonGPUToMetalPass
         MaskedLoadLowering, StoreLowering, HistogramLowering, ArithMuliLowering,
         ArithAddILowering, ArithAddFLowering, ArithCmpILowering,
         ArithCmpFLowering, ArithAndILowering, ArithSubILowering,
-        ArithSubFLowering, ArithDivSILowering, ArithDivFLowering,
+        ArithSubFLowering, ArithDivSILowering, ArithDivFLowering, ArithRemFLowering,
         ArithRemSILowering, ArithShRSILowering, ArithShLILowering,
         ArithOrILowering, ArithXOrILowering, ArithDivUILowering,
         ArithRemUILowering, ArithShRUILowering, ArithSelectLowering,
@@ -34133,7 +34339,9 @@ struct ConvertTritonGPUToMetalPass
         ArithMinMaxFLowering<mlir::arith::MinNumFOp, BinaryExpOperator::minOp>,
         ArithMinMaxFLowering<mlir::arith::MinimumFOp, BinaryExpOperator::minOp>,
         ArithIntMinMaxLowering<mlir::arith::MaxSIOp>,
-        ArithIntMinMaxLowering<mlir::arith::MinSIOp>, ArithExtFLowering,
+        ArithIntMinMaxLowering<mlir::arith::MinSIOp>,
+        ArithIntMinMaxLowering<mlir::arith::MaxUIOp>,
+        ArithIntMinMaxLowering<mlir::arith::MinUIOp>, ArithExtFLowering,
         ArithTruncFLowering, ArithIntCastLowering<mlir::arith::ExtUIOp>,
         ArithIntCastLowering<mlir::arith::ExtSIOp>,
         ArithIntCastLowering<mlir::arith::TruncIOp>, ScalarDotLowering,

@@ -1,4 +1,4 @@
-// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal --split-input-file %s | FileCheck %s
 //
 // Wall 12 lit fixture: rank-1 arith.divf lowering via ArithDivFLowering.
 // Mirror of arith_subf_rank1.mlir with arith.divf in place of arith.subf.
@@ -32,3 +32,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, divOp
 // CHECK: metal.store
 // CHECK: metal.return
+
+// -----
+
+// Float remainder uses the explicit precise intrinsic; the default fmod
+// variant has undefined accuracy under fast math.
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @remf_kernel(%x_ptr: !tt.ptr<f32>, %y_ptr: !tt.ptr<f32>, %output_ptr: !tt.ptr<f32>) {
+    %offsets = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %x_val = tt.load %x_addr : tensor<1024x!tt.ptr<f32>, #blocked>
+    %y_splat = tt.splat %y_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %y_addr = tt.addptr %y_splat, %offsets : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    %y_val = tt.load %y_addr : tensor<1024x!tt.ptr<f32>, #blocked>
+    %quot = arith.remf %x_val, %y_val : tensor<1024xf32, #blocked>
+    %o_splat = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %o_addr = tt.addptr %o_splat, %offsets : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %o_addr, %quot : tensor<1024x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+
+// CHECK-LABEL: metal.kernel remf_kernel
+// CHECK: metal.math_intrinsic "metal::precise::fmod"({{.*}}, {{.*}}) : (f32, f32) -> f32
+// CHECK: metal.store
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @remf_scalar(%x: !tt.ptr<f32>, %y: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+    %a = tt.load %x : !tt.ptr<f32>
+    %b = tt.load %y : !tt.ptr<f32>
+    %result = arith.remf %a, %b : f32
+    tt.store %out, %result : !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel remf_scalar
+// CHECK: metal.math_intrinsic "metal::precise::fmod"({{.*}}, {{.*}}) : (f32, f32) -> f32
+// CHECK: metal.store

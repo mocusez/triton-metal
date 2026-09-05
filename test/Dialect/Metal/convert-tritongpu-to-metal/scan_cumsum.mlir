@@ -321,3 +321,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: metal.kernel k_affine_reverse
 // CHECK: metal.threadgroup_affine_prefix_scan {{.*}} {block = 256 : i64, reverse, tpb = 128 : i64}
 // CHECK-NOT: tt.scan
+
+// -----
+
+// Staged XOR uses the same publication barrier as add/mul, a zero identity,
+// and ui32 storage. Swapped combine operands are equivalent for this monoid.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#row = #ttg.slice<{dim = 1, parent = #blocked}>
+#col = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @staged_xor_reverse(%out: !tt.ptr<i32>, %x: i32) {
+    %v = tt.splat %x : i32 -> tensor<4x8xi32, #blocked>
+    %scan = "tt.scan"(%v) <{axis = 0 : i32, reverse = true}> ({
+    ^bb0(%lhs: i32, %rhs: i32):
+      %r = arith.xori %rhs, %lhs : i32
+      tt.scan.return %r : i32
+    }) : (tensor<4x8xi32, #blocked>) -> tensor<4x8xi32, #blocked>
+    %row = tt.make_range {start = 0 : i32, end = 4 : i32} : tensor<4xi32, #row>
+    %col = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #col>
+    %eight = arith.constant dense<8> : tensor<4xi32, #row>
+    %rowOff = arith.muli %row, %eight : tensor<4xi32, #row>
+    %r = tt.expand_dims %rowOff {axis = 1 : i32} : tensor<4xi32, #row> -> tensor<4x1xi32, #blocked>
+    %c = tt.expand_dims %col {axis = 0 : i32} : tensor<8xi32, #col> -> tensor<1x8xi32, #blocked>
+    %rr = tt.broadcast %r : tensor<4x1xi32, #blocked> -> tensor<4x8xi32, #blocked>
+    %cc = tt.broadcast %c : tensor<1x8xi32, #blocked> -> tensor<4x8xi32, #blocked>
+    %off = arith.addi %rr, %cc : tensor<4x8xi32, #blocked>
+    %base = tt.splat %out : !tt.ptr<i32> -> tensor<4x8x!tt.ptr<i32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<4x8x!tt.ptr<i32>, #blocked>, tensor<4x8xi32, #blocked>
+    tt.store %ptr, %scan : tensor<4x8x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel staged_xor_reverse
+// CHECK: %[[BUF:.*]] = metal.threadgroup_alloca : !metal.memref<32 x ui32>
+// CHECK: metal.barrier
+// CHECK: metal.store {{.*}}, %[[BUF]][
+// CHECK: metal.barrier
+// CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
+// CHECK: metal.tg_load_indexed %[[BUF]][
+// CHECK: arith.cmpi sge
+// CHECK: arith.select {{.*}}, %[[ZERO]] : i32
+// CHECK: bitXorOp
+// CHECK-NOT: tt.scan

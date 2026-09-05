@@ -1,4 +1,20 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal --split-input-file %s | FileCheck %s
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @math_fma_scalar(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+    %x = tt.load %a : !tt.ptr<f32>
+    %y = tt.load %b : !tt.ptr<f32>
+    %z = tt.load %c : !tt.ptr<f32>
+    %r = math.fma %x, %y, %z : f32
+    tt.store %out, %r : !tt.ptr<f32>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel math_fma_scalar
+// CHECK: metal.fma
+// CHECK: metal.store
+
+// -----
 //
 // Session L4 positive fixture: fp32 `math.sqrt` and `math.erf` lower through
 // `convert-tritongpu-to-metal` to `metal.unary_exp` with the correct
@@ -276,3 +292,83 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: metal.kernel clampf_all_kernel
 // CHECK-NOT:   tt.clampf
 // CHECK:       metal.clampf {{.*}}, propagate_nan = true
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @abs_f16_scalar(%input: !tt.ptr<f16>, %output: !tt.ptr<f16>) {
+    %value = tt.load %input : !tt.ptr<f16>
+    %result = math.absf %value : f16
+    tt.store %output, %result : !tt.ptr<f16>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel abs_f16_scalar
+// CHECK: %[[BITS:.*]] = metal.bitcast {{.*}} : (f16) -> ui16
+// CHECK: %[[MASK:.*]] = metal.constant 32767 : ui16
+// CHECK: %[[MAG:.*]] = metal.binary_exp %[[BITS]], %[[MASK]], bitAndOp : (ui16, ui16) -> ui16
+// CHECK: metal.bitcast %[[MAG]] : (ui16) -> f16
+// CHECK: metal.store
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @abs_f16_tensor(%input: !tt.ptr<f16>, %output: !tt.ptr<f16>) {
+    %offset = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %base = tt.splat %input : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offset : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi32, #blocked>
+    %value = tt.load %ptr : tensor<256x!tt.ptr<f16>, #blocked>
+    %result = math.absf %value : tensor<256xf16, #blocked>
+    %out_base = tt.splat %output : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
+    %out_ptr = tt.addptr %out_base, %offset : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %out_ptr, %result : tensor<256x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel abs_f16_tensor
+// CHECK: %[[BITS:.*]] = metal.bitcast {{.*}} : (f16) -> ui16
+// CHECK: %[[MASK:.*]] = metal.constant 32767 : ui16
+// CHECK: %[[MAG:.*]] = metal.binary_exp %[[BITS]], %[[MASK]], bitAndOp : (ui16, ui16) -> ui16
+// CHECK: metal.bitcast %[[MAG]] : (ui16) -> f16
+// CHECK: metal.store
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @abs_bf16_scalar(%input: !tt.ptr<bf16>, %output: !tt.ptr<bf16>) {
+    %value = tt.load %input : !tt.ptr<bf16>
+    %result = math.absf %value : bf16
+    tt.store %output, %result : !tt.ptr<bf16>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel abs_bf16_scalar
+// CHECK: %[[BITS:.*]] = metal.bitcast {{.*}} : (bf16) -> ui16
+// CHECK: %[[MASK:.*]] = metal.constant 32767 : ui16
+// CHECK: %[[MAG:.*]] = metal.binary_exp %[[BITS]], %[[MASK]], bitAndOp : (ui16, ui16) -> ui16
+// CHECK: metal.bitcast %[[MAG]] : (ui16) -> bf16
+// CHECK: metal.store
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @abs_bf16_tensor(%input: !tt.ptr<bf16>, %output: !tt.ptr<bf16>) {
+    %offset = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %base = tt.splat %input : !tt.ptr<bf16> -> tensor<256x!tt.ptr<bf16>, #blocked>
+    %ptr = tt.addptr %base, %offset : tensor<256x!tt.ptr<bf16>, #blocked>, tensor<256xi32, #blocked>
+    %value = tt.load %ptr : tensor<256x!tt.ptr<bf16>, #blocked>
+    %result = math.absf %value : tensor<256xbf16, #blocked>
+    %out_base = tt.splat %output : !tt.ptr<bf16> -> tensor<256x!tt.ptr<bf16>, #blocked>
+    %out_ptr = tt.addptr %out_base, %offset : tensor<256x!tt.ptr<bf16>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %out_ptr, %result : tensor<256x!tt.ptr<bf16>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel abs_bf16_tensor
+// CHECK: %[[BITS:.*]] = metal.bitcast {{.*}} : (bf16) -> ui16
+// CHECK: %[[MASK:.*]] = metal.constant 32767 : ui16
+// CHECK: %[[MAG:.*]] = metal.binary_exp %[[BITS]], %[[MASK]], bitAndOp : (ui16, ui16) -> ui16
+// CHECK: metal.bitcast %[[MAG]] : (ui16) -> bf16
+// CHECK: metal.store

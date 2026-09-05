@@ -16,21 +16,25 @@ D0  identity     absent   in-warp     -> PASS
 D1  identity     absent   cross-warp  -> PASS
 D2  identity     present  in-warp     -> PASS
 D3  identity     present  cross-warp  -> PASS
-D4  non-id       absent   in-warp     -> PASS
-D5  non-id       absent   cross-warp  -> PASS
+D4  non-id       absent   in-warp     -> translation only (unsynchronized)
+D5  non-id       absent   cross-warp  -> translation only (unsynchronized)
 D6  non-id       present  in-warp     -> PASS
 D7  non-id       present  cross-warp  -> PASS
 
 Cells are hand-crafted .mlir files under
 `test/Dialect/Metal/l1d2d_probe/cell_D{0..7}.mlir`. The harness fires each
 through `triton-metal-opt | triton-metal-translate --mlir-to-msl`,
-compiles it via `torch.mps.compile_shader`, and dispatches on MPS tensors
-with deterministic `arange(N)` input. Each cell runs ITERS times (>= 10) to
-surface nondeterministic races.
+compiles defined-memory cells via `torch.mps.compile_shader`, and dispatches
+on MPS tensors with deterministic `arange(N)` input. Each GPU cell runs ITERS
+times. D4/D5 remain historical translation fixtures: being in one SIMD group
+does not supply the missing memory synchronization. D7scratch also remains
+translation-only because its scratch read precedes initialization. Passing
+dispatches of these historical probes cannot establish numerical correctness.
 """
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 
 import pytest
@@ -40,11 +44,6 @@ pytest.importorskip(
     "triton._C.libtriton.metal",
     reason="Metal backend pybind module not built into libtriton",
 )
-if not torch.backends.mps.is_available():
-    pytest.skip(
-        "Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
-        allow_module_level=True,
-    )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 PROBE_DIR = REPO_ROOT / "test" / "Dialect" / "Metal" / "l1d2d_probe"
@@ -54,7 +53,9 @@ METAL_TRANSLATE = BUILD_BIN / "triton-metal-translate"
 
 ITERS = 30
 
-# Cell metadata: (cell_id, threadgroup_size, num_threadgroups, expected_outcome_doc).
+# GPU cell metadata: (cell_id, threadgroup_size, num_threadgroups, description).
+# D4/D5 have unsynchronized cross-lane reads; D7scratch reads uninitialized
+# scratch. Keep their original IR in the translation-only tests below.
 # Most cells dispatch as 1 threadgroup. D7mtg dispatches as 2 threadgroups
 # (multi-tg grid matching L1d2c Phase A C6's exact MSL shape).
 CELLS = [
@@ -62,8 +63,6 @@ CELLS = [
     ("D1", 64, 1, "PASS"),
     ("D2", 16, 1, "PASS"),
     ("D3", 64, 1, "PASS"),
-    ("D4", 16, 1, "PASS"),
-    ("D5", 64, 1, "PASS"),
     ("D6", 16, 1, "PASS"),
     ("D7", 64, 1, "PASS"),
     # Extension probes (added after the cube revealed D7 passes):
@@ -73,13 +72,12 @@ CELLS = [
     #          (full L1d2c Phase A C6 MSL shape reproduction).
     ("D7mask", 64, 1, "EXT: tests if(mask){devstore} wrap shape"),
     ("D7mtg",  64, 2, "EXT: D7mask + multi-tg + lid=id.x-tgid.x*64"),
-    ("D7scratch", 64, 2, "EXT: D7mtg + Phase-B scratch RMW select-on-value (full current C6 MSL shape)"),
 ]
 
 
 def _is_non_identity(cell_id: str) -> bool:
-    """Cells D4-D7* use a non-identity (transpose) index expression."""
-    return cell_id in {"D4", "D5", "D6", "D7", "D7mask", "D7mtg", "D7scratch"}
+    """Numerically tested cells with a transpose index expression."""
+    return cell_id in {"D6", "D7", "D7mask", "D7mtg"}
 
 
 def _block_n(threadgroup_size: int) -> int:
@@ -142,6 +140,39 @@ def _dispatch(msl: str, kernel_name: str, threadgroup_size: int,
     return out_t.cpu().tolist()
 
 
+@pytest.mark.parametrize("diagnostic,synchronized", [("D4", "D6"), ("D5", "D7")])
+def test_l1d2d_transpose_barrier_precedes_shared_read(diagnostic, synchronized):
+    """Retain the historical contrast without dispatching a racy shader."""
+    for cell_id in (diagnostic, synchronized):
+        msl = _translate_to_msl(cell_id)
+        buffer = re.search(r"threadgroup float (\w+)\[\d+\];", msl)
+        assert buffer, msl
+        name = buffer.group(1)
+        store = re.search(rf"{name}\[[^\n]+\] = [^\n]+;", msl)
+        load = re.search(rf"float \w+ = {name}\[[^\n]+\];", msl)
+        assert store and load, msl
+        assert store.end() < load.start(), msl
+        barriers = msl[store.end():load.start()].count(
+            "threadgroup_barrier(mem_flags::mem_threadgroup)")
+        assert barriers == (1 if cell_id == synchronized else 0), msl
+        # A trailing barrier cannot order the preceding cross-lane read.
+        assert "threadgroup_barrier(mem_flags::mem_threadgroup)" in msl[load.end():]
+
+
+def test_l1d2d_uninitialized_scratch_fixture_translates_without_dispatch():
+    """Preserve the original reproduction, including its undefined read."""
+    msl = _translate_to_msl("D7scratch")
+    buffers = re.findall(r"threadgroup float (\w+)\[64\];", msl)
+    assert len(buffers) == 2, msl
+    scratch = buffers[0]
+    load = re.search(rf"float \w+ = {scratch}\[[^\n]+\];", msl)
+    store = re.search(rf"{scratch}\[[^\n]+\] = [^\n]+;", msl)
+    assert load and store, msl
+    assert load.end() < store.start(), msl
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(),
+                    reason="Metal backend requires an MPS-enabled PyTorch")
 @pytest.mark.parametrize("cell_id,threadgroup_size,num_threadgroups,doc", CELLS)
 def test_l1d2d_cell(cell_id, threadgroup_size, num_threadgroups, doc):
     """Run a single cell repeatedly and require bit-exact output."""

@@ -7,11 +7,10 @@ fires when `tt.store` consumes a bare `!tt.ptr<T>` (no `tt.addptr`, no tensor
 layout) — the same IR shape that rank-1 reduce result stores produce when
 Triton folds `tl.store(out_ptr + 0, s)` to `tt.store %out_ptr, %s : !tt.ptr<f32>`.
 
-Scope: f32 only. The scalar-ptr branch emits `metal.store` with the raw
-adaptor value; it does NOT bridge a signless i32 through ui32 (`metal.store`
-expects Metal_Type — the bridging the rank-1 reduce path performs at
-`:1825` is absent from the scalar-ptr branch). i32 coverage requires that
-bridging or a dialect tweak and is deferred.
+Scalar stores bridge values to the buffer's storage type. Coverage includes
+integer and floating-point payloads, accumulated offsets, user-loop state,
+and block-uniform masks. Masked stores execute only in the mask's true region
+and reuse the unmasked scalar address/storage lowering.
 
 See the implementation notes Step 5 / AC2.
 """
@@ -80,6 +79,32 @@ def _scalar_i32_copy_guarded_kernel(in_ptr, out_ptr, B, S):
     for j in range(S):
         v = tl.load(in_ptr + pid * S + j)
         tl.store(out_ptr + pid * S + j, v + 1)
+
+
+@triton.jit
+def _scalar_masked_copy_kernel(X, O, ACTIVE, LIMIT, S: tl.constexpr):
+    pid = tl.program_id(0)
+    for j in range(S):
+        value = tl.load(X + pid * S + j)
+        tl.store(O + pid * (S + 2) + j + 1, value,
+                 mask=(pid < ACTIVE) & (j < LIMIT))
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64,
+                                  torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("active,limit", [(0, 0), (2, 3), (4, 5)])
+def test_scalar_masked_store_preserves_offsets_and_inactive_elements(dtype, num_warps, active, limit):
+    programs, width = 4, 5
+    source = (torch.arange(programs * width) - 10).to(dtype).reshape(programs, width)
+    output = torch.full((programs, width + 2), -73, dtype=dtype, device="mps")
+    expected = output.cpu()
+    expected[:active, 1:1 + limit] = source[:active, :limit]
+    _scalar_masked_copy_kernel[(programs,)](
+        source.to("mps"), output, active, limit, S=width, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("B, S", [(1, 4), (3, 5), (8, 1)])

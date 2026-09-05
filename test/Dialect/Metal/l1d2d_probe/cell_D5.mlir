@@ -1,6 +1,7 @@
 // L1d2d cell D5: B1=non-identity, B2=barrier-absent, B3=cross-warp (64 threads).
 // 8x8 transpose: idx = (lid%8)*8 + lid/8.
-// Expected: ? (axis disambiguation).
+// Historical translation-only diagnostic: the cross-lane read is unsynchronized.
+// Do not use numerical dispatches as a correctness oracle; D7 is synchronized.
 
 module {
   metal.module {
@@ -13,7 +14,7 @@ module {
       %v = metal.get_element %in[%lid] : (!metal.memref<? x f32>, ui32) -> f32
       metal.tg_store_indexed %buf[%lid], %v : !metal.memref<64 x f32>, ui32, f32
 
-      // B2 = absent (race-inducing — but in-warp execution is implicitly synced for first 32 lanes)
+      // B2 = absent: SIMD execution does not supply shared-memory synchronization.
 
       // B1 = non-identity: idx = (lid % 8) * 8 + (lid / 8)
       %col = metal.binary_exp %lid, %c8, remOp : (ui32, ui32) -> ui32

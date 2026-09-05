@@ -153,6 +153,61 @@ def test_fptoui_runtime_truncates_toward_zero(N):
     assert out.cpu().tolist() == expected.tolist()
 
 
+@triton.jit
+def _numeric_cast_kernel(X, O, N: tl.constexpr, DT: tl.constexpr, BLOCK: tl.constexpr):
+    if N == 1:
+        offset = 0
+    else:
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(X + offset, mask=offset < N, other=0)
+    tl.store(O + offset, value.to(DT), mask=offset < N)
+
+
+@pytest.mark.parametrize("src,dst", [
+    ("float16", "float32"), ("bfloat16", "float32"),
+    ("float32", "float16"), ("float32", "bfloat16"),
+    ("int32", "float32"), ("int64", "float32"),
+    ("uint32", "float32"), ("uint64", "float32"),
+    ("float32", "int8"), ("float32", "int16"),
+    ("float32", "int32"), ("float32", "int64"),
+    ("float32", "uint8"), ("float32", "uint16"),
+    ("float32", "uint32"), ("float32", "uint64"),
+])
+@pytest.mark.parametrize("n", [1, 259], ids=["scalar", "tensor_tail"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_numeric_cast_supported_widths_preserve_values(src, dst, n, num_warps):
+    if src.startswith("uint"):
+        width = int(src[4:])
+        values = [2**(width - 1), 0, 1, 2**(width - 1) - 1, 2**width - 1]
+    elif src.startswith("int"):
+        width = int(src[3:])
+        values = [-2**(width - 1), -1, 0, 1, 2**(width - 1) - 1]
+    elif dst.startswith("uint"):
+        width = int(dst[4:])
+        step = max(1, 2**(width - 24))
+        values = [1.75, 0.0, 127.5, float(2**(width - 1)), float(2**width - step)]
+    elif dst.startswith("int"):
+        values = [-1.75, 0.0, -0.0, 1.75, -127.5, 127.5]
+    else:
+        values = [-1.75, 0.0, -0.0, 1.75, -127.5, 256.0]
+    x = torch.tensor(values, dtype=getattr(torch, src))
+    x = x.repeat(triton.cdiv(n, x.numel()))[:n]
+    expected = x.to(getattr(torch, dst))
+    # MPS can bind uint64 buffers, but PyTorch's MPS fill kernel cannot
+    # initialize them. Construct the sentinel on CPU before transferring it.
+    output = torch.full((n + 3,), 37, dtype=getattr(torch, dst)).to("mps")
+    _numeric_cast_kernel[(triton.cdiv(n, 256),)](
+        x.to("mps"), output, N=n, DT=getattr(tl, dst), BLOCK=256, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    actual = output.cpu()
+    assert actual[:n].tolist() == expected.tolist()
+    assert actual[n:].tolist() == [37, 37, 37]
+    if expected.is_floating_point():
+        zeros = expected == 0
+        assert torch.equal(torch.signbit(actual[:n][zeros]), torch.signbit(expected[zeros]))
+
+
 # --- fp8: e4m3fn and e5m2 ----------------------------------------------------
 #
 # MSL has no 8-bit float type, so these casts run in software and the payload

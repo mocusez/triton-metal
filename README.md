@@ -1,6 +1,6 @@
 # Triton-Metal (Proof of Concept)
 
-> **Status: Proof of Concept.** This fork lowers a subset of Triton kernels onto Apple Silicon GPUs via Metal. It is **not** a drop-in replacement for upstream Triton on CUDA/ROCm. Many ops are unsupported, the compiler pipeline is rough around the edges, and **performance is not yet tuned**. Expect to read source code when something breaks.
+> **Status: Proof of Concept.** This fork lowers a subset of Triton kernels onto Apple Silicon GPUs via Metal. It is **not** a drop-in replacement for upstream Triton on CUDA/ROCm. Many ops are unsupported, the compiler pipeline is rough around the edges, and performance work has only closed the fixed benchmark line described below. Expect to read source code when something breaks.
 
 This is a research-grade experiment exploring whether the Triton compiler stack can target Apple Metal. If you are looking for production-ready Triton, use the upstream project at [triton-lang/triton](https://github.com/triton-lang/triton).
 
@@ -98,6 +98,10 @@ print(sorted(backends), MetalDriver().get_current_target())
 Note that `python/test/unit/test_metal_backend_l1d2d_probe.py` cannot be part of a
 wheel check: it drives the `triton-metal-opt` / `triton-metal-translate` binaries out
 of the build directory, which no wheel carries.
+Its D4/D5 probes omit synchronization before cross-lane reads, and D7scratch
+reads scratch before initialization. These historical fixtures receive
+CPU-only translation checks; numerical GPU checks cover the eight remaining
+probes, including the synchronized transpose counterparts.
 
 ### Run the tests
 
@@ -216,6 +220,32 @@ Dynamic `scf.if` control flow supports one or more scalar results, including
 mixed scalar types. The MSL emitter preserves result order with one temporary
 per SSA result and assigns every branch yield to its corresponding temporary.
 
+Elementwise unsigned integer min/max supports 32- and 64-bit values, including
+high-bit inputs. Floating remainder supports f32 scalar and tensor values using
+precise truncating remainder. `tl.fma` supports f32 scalar and tensor values;
+non-f32 operands fail in preflight with a named diagnostic instead of reaching
+MSL emission. `tl.abs` supports f16, bf16, and f32; the 16-bit paths clear the
+sign bit directly, preserving subnormals and NaN payloads.
+
+`tl.sqrt`, `tl.erf`, `tl.exp`, `tl.exp2`, `tl.log`, `tl.log2`, `tl.rsqrt`,
+`tl.sin`, and `tl.cos` require f32 operands on Metal. Unsupported math widths
+receive a named compile diagnostic before MSL emission.
+
+Numeric casts involving f64 fail in preflight with a diagnostic naming the
+conversion. Float-to-integer casts preserve the operation's signedness for
+8-, 16-, 32-, and 64-bit results, including negative signed results.
+
+Scalar `tl.load` supports an optional block-uniform mask and scalar `other`,
+including runtime expressions and loaded values. A false mask prevents the
+input memory access; loop-varying masks and address offsets are preserved.
+Scalar `tl.store` also supports a block-uniform mask: false masks leave the
+destination untouched, including inside loops with changing address offsets.
+
+Multidimensional inclusive scans support an exact i32 XOR combine, forward or
+reverse, on blocked tiles with at most one element per thread and scan-axis
+extent 2–64. This uses the existing staged scan path; rank-1 XOR, wider integer
+types, and compound XOR combine regions retain named preflight rejection.
+
 Tensor-descriptor reducing stores use Triton's standard
 `triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
 The audited Metal envelope includes `i32` add/min/max/and/or/xor and `f32` add;
@@ -239,7 +269,7 @@ being approximated with a racy load/modify/store sequence.
 
 ## Known limitations
 
-- **Generic tensor codegen is still scalar.** The backend has specialized SIMD-group matrix, reduction, scan, and threadgroup-memory paths, but the general ranked-tensor conversion still lowers one scalar element at a time. Contiguous vector loads/stores and broader aggregate-hoisting remain performance work.
+- **Generic tensor codegen is still mostly scalar.** The backend has specialized SIMD-group matrix, reduction, scan, threadgroup-memory, contiguous vector-add, and aggregate-hoist/cone-reuse paths, but the general ranked-tensor conversion still lowers one scalar element at a time outside those proven envelopes.
 - **Op coverage is deliberately bounded.** The common elementwise, reduction, scan, gather, atomic, dot, fp8, and control-flow paths have end-to-end coverage, while unsupported shapes fail during preflight with a named diagnostic. Notable remaining envelopes include loop-carried rank-2 reductions, some cross-lane layout changes, and broader `tt.dot_scaled`.
 - **`tl.dot` is not layout-general.** Proven scalar and SIMD-group-matrix paths
   cover the tested f32, fp16/bf16, int8, batched, and scaled-dot envelopes.
@@ -305,18 +335,34 @@ physical Apple Silicon MPS evidence.
 The current dependency-ordered priorities are:
 
 1. Finish the remaining lowering-decline portion of the preflight safety
-   matrix. All 12 op categories in `validateUnsupportedOpsRejected` now have
+   matrix. The audited op categories in `validateUnsupportedOpsRejected` have
    direct CPU-only lit coverage, axes 1/2 `tt.get_num_programs` coverage is in
    place, and live non-splat tensor constants, non-f32 precise math, plus
-   unsupported histogram ranks/types/layouts/producer cones now fail in
-   preflight instead of conversion teardown. Both correctness xfails found by
-   the audit are now ordinary 30-run regressions.
-2. Expand scaled-dot beyond the static rank-2 same-type fp16/bf16/FP8 loop
-   slice and add the remaining mixed-format/dynamic/masked loop forms and
-   non-canonical scale-address forms, reduce/scan,
-   layout-conversion, broader descriptor-reduce type/rank envelopes, and
-   broader `tl.map_elementwise` pack/control-flow envelopes one
-   positive/adjacent-negative slice at a time.
+   unsupported histogram ranks/types/layouts/producer cones and pointer-valued
+   `arith.select`/`scf.if` and pointer-carrying `scf.while`/generic `scf.for` now fail in preflight
+   instead of conversion teardown.
+   Select loaded values or integer offsets instead of buffer pointers, or keep
+   memory accesses inside the branches. Carry integer offsets through while
+   and for loops and access the bound buffers inside their regions. Recognized
+   pointer-advance matmul loops retain their specialized lowering.
+   Non-f32 FMA and the f32-only unary math operations also fail in preflight
+   with type diagnostics; explicitly convert operands to f32 to use them.
+   Numeric casts with f64 operands or results also have named diagnostics.
+   The earlier probe correctness work is complete: defined GPU probes use ordinary
+   30-run regressions; the three probes without defined numerical behavior
+   remain CPU translation checks.
+   A newly reproduced correctness issue remains: floating `tl.minimum` and
+   `tl.maximum` with `propagate_nan=tl.PropagateNan.ALL` can return a number
+   when an input is NaN. Fixing it requires consistent elementwise, scalar,
+   and reduction-cone handling.
+2. Expand layout conversion and reduce/scan support, including cross-lane
+   transpose, general tuple combines, and axis-0 reductions with multiple
+   output elements per thread. Broader descriptor-reduce type/rank and
+   `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
+   The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
+   canonical dynamic/masked loops, and masked rank-3 batch tails; more general
+   combinations and non-canonical scale addresses remain outside that scope.
+   Each extension needs a positive case and an adjacent rejection regression.
 3. Run the MPS numerical wheel smoke on a physical macOS 15 machine. CI now
    builds/audits on macOS 26, then installs and compile-smokes the
    `macosx_15_0_arm64` artifact on the hosted macOS 15 runner, while physical
