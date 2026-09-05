@@ -692,6 +692,187 @@ are still whole-kernel replacements rather than layout-general lowering.
     cases with three skips, and all 24 standalone scripts; the LLaMA smoke
     anchor was `52.19 ms / iter`. Mixed-format and dynamic/masked loops plus
     non-canonical scale batch strides remain future slices.
+22. **Advanced P3 — add mixed E4M3/E5M2 payloads to the exact scaled-dot
+    envelope.** The matcher now accepts both E4M3/E5M2 operand orientations at
+    the FP8-mandated 32-element E8M0 scale factor. `metal.scalar_dot` records
+    each operand's payload kind independently and applies the corresponding
+    decoder before bf16 scaling, while retaining the legacy shared markers for
+    same-format IR. The `K=64` loop-carried MPS cases change both payloads and
+    both scale groups and obtain 320 in either orientation. Direct structural
+    IR checks pin the E5M2 decoder on A and E4M3 decoder on B; adjacent E2M1/FP8
+    source mixtures remain rejected. Malformed internal scalar-dot IR is also
+    rejected when payload markers conflict or identify only one raw-i8
+    operand, rather than silently selecting a decoder. Fresh verification
+    passed the Pixi build, all 157 Metal lit tests, the 14 focused mixed,
+    same-format, and nonzero-start MPS tests, the 275-test dot/general-matmul/
+    attention gate, all 425 MSL tests, and the complete Metal backend suite
+    with 2,094 passes and three skips. Dynamic/masked loops and non-canonical
+    scale batch strides remain future slices; aligned nonzero starts are
+    addressed by item 23 below. The `leet-all`
+    pytest phase separately reached 1,523 passes and three skips, but its sole
+    source-fidelity check failed on a pre-existing byte mismatch: the pinned
+    checkout's `easy-swish-gated_linear_unit.py` contains one trailing space
+    that the clean, nominally verbatim fixture does not. Because both files
+    match their respective HEADs, this slice leaves that unrelated fidelity
+    policy/data issue explicit instead of adding trailing whitespace; the gate
+    stopped before its standalone phase.
+
+23. **Scale-group-aligned nonzero loop starts are represented explicitly.**
+    The exact static rank-2 loop-carried `tt.dot_scaled` envelope now accepts a
+    nonnegative lower bound aligned to the 16- or 32-element scale factor while
+    still requiring the upper bound to prove the physical full-K row stride.
+    `metal.scalar_dot` carries separate `reduction_start` and
+    `reduction_extent` operands; its scalar and SIMD-group lowerings form
+    `logical_k = reduction_start + local_k`, so native FP16/BF16, byte-backed
+    E4M3/E5M2, E8M0 scale groups, and E2M1 byte/nibble coordinates all retain
+    the source suffix origin. Physical MPS tests cover every same-type format,
+    both mixed E4M3/E5M2 orientations, and all four E2M1 packing combinations.
+    Misaligned and negative starts fail with a named diagnostic, closing the
+    unsigned-wrap/OOB edge. Fresh validation passed the Pixi rebuild, 28 focused
+    loop tests, all 425 MSL tests, the full build-tree lit suite with 454 passes
+    and two unsupported tests (including Metal 157/157), and the complete Metal
+    backend suite with 2,098 passes and three skips. Masked and dynamic-upper
+    loop-carried forms remain separate future envelopes.
+
+24. **Zero-based static-upper loops now preserve matched M/N/K tails.** The
+    exact rank-2 loop-carried `tt.dot_scaled` envelope accepts matched
+    zero-filled rectangular A/B masks plus the corresponding rectangular output
+    store mask. Its runtime K extent is clamped to `[0, static_upper]` before it
+    becomes the folded `metal.scalar_dot` reduction extent, so an oversized or
+    negative runtime bound cannot expose memory outside the static payload.
+    Physical MPS tests cover E4M3/SF32 and FP16/SF16 at static
+    `(BM,BN,BK)=(16,16,64)` with runtime `(M,N)=(13,11)` and K values `-1`, 48,
+    and 80: they respectively produce 0, 96, and 160 inside the valid rectangle,
+    proving both clamp boundaries, and retain the output sentinel on M/N tails.
+    Nonzero load fills, mismatched A/B K bounds, and masked loops with a nonzero
+    lower bound fail with named diagnostics. Fresh validation passed all 28
+    focused loop tests, all 425 MSL tests, the full build-tree lit suite with 454
+    passes and two unsupported tests (including Metal 157/157), and the complete
+    Metal backend suite with 2,107 passes and three skips. Dynamic-upper loops
+    and non-canonical scale batch strides remain future envelopes.
+
+25. **Canonical clamped dynamic-upper loops now preserve the same masked
+    tails.** The exact rank-2 loop-carried `tt.dot_scaled` envelope accepts a
+    runtime upper bound only when it has the structural form
+    `min(max(runtime_k, 0), static_full_k)`. The physical A row stride proves
+    `static_full_k`, and both scale row strides must equal
+    `static_full_k / scale_factor`; matched zero-filled rectangular A/B loads
+    plus the corresponding output mask prove the runtime M/N/K extent. This
+    keeps the folded reduction inside both payload and scale capacity without
+    cross-operation inference. Physical MPS tests cover E4M3/SF32 and
+    FP16/SF16 at static `(BM,BN,BK)=(16,16,64)` with runtime
+    `(M,N)=(13,11)` and K values `-1`, 0, 27, 48, 64, and 80. They respectively
+    produce 0, 0, 27, 96, 160, and 160 inside the valid rectangle while keeping
+    the M/N sentinel tails unchanged. Unmasked dynamic loops, a biased
+    non-canonical upper bound, and a padded scale row fail with named
+    diagnostics. Fresh validation passed the Pixi rebuild, all 43 focused
+    static/dynamic loop tests, the complete 153-test dot-universal file, all
+    425 MSL tests, the full build-tree lit suite with 454 passes and two
+    unsupported tests (including Metal 157/157), and the complete Metal backend
+    suite with 2,122 passes and three skips. Non-contiguous or dynamic scale
+    batch strides remain the next P3 envelope.
+
+26. **Exact static-padded and runtime scale batch strides close P3.** Rank-3
+    `tt.dot_scaled` now carries both A/B scale batch strides as `ui32`
+    `metal.scalar_dot` operands instead of static contiguous-stride
+    attributes. A zero operand retains batch-shared scales; an exact static or
+    runtime operand preserves padding when the source address is structurally
+    `zero_based_batch_index * stride`. The matrix row/group proof remains
+    unchanged, and an added batch origin or slice stays outside the envelope
+    because scalar-dot has no operand that could preserve it. Physical MPS
+    tests use E4M3 payloads with `K=64`, one padding row filled with `0xff`
+    between batches, and distinct batch-1 A/B scales of 2 and 4. Both constexpr
+    and runtime strides produce 64 for batch 0 and 512 for batch 1 without
+    reading the padding sentinel; a runtime `(batch + 1) * stride` neighbor
+    fails with the `canonical zero-based per-batch scale stride` diagnostic.
+    Fresh validation passed the Pixi rebuild, all eight rank-3 scaled-dot
+    tests, the complete 155-test dot-universal file, all 425 MSL tests, the
+    full build-tree lit suite with 454 passes and two unsupported tests
+    (including Metal 157/157), and the complete Metal backend suite with 2,124
+    passes and three skips. The planned P3 correctness/capability envelopes are
+    now closed.
+
+27. **The report-only P4 performance contract now has durable evidence.**
+    `test_metal_perf_report.py` exposes a CLI that validates and times fixed
+    vector-add `(4194304,)`, fused-softmax `(4096,1024)`, fp16 matmul
+    `(512,512,64)`, and split GroupNorm `(8,512,64,64)` workloads. Every run
+    uses five warmups, seven samples, and 20 launches per sample with explicit
+    MPS synchronization around each sample; compile-plus-first-launch time is
+    kept outside the steady-state samples. The report records commit/dirty
+    state, Apple GPU family, macOS, PyTorch, Triton target, dtype, shape, and
+    `num_warps`, then writes both JSON and CSV. On Apple M4/macOS 26.4/PyTorch
+    2.10.0 at commit `4817e44e72c7985a8b88db5f97afe289040c49ab`
+    (dirty worktree), the independent round medians were 0.742675/0.722198 ms
+    for add, 0.757033/0.739096 ms for softmax, 0.267775/0.323517 ms for matmul,
+    and 7.869725/8.163690 ms for GroupNorm. A proposed `512x512x512` matmul was
+    correctly rejected because its 64 K tiles exceed the canonical Metal dot
+    loop envelope; the accepted K=64 shape exercises the documented eight-tile
+    maximum. Fresh validation passed the evaluator and all 10 tests in the
+    performance-report file. These numbers are report-only; P4.1 and later
+    optimization slices must independently apply the 1.20x target and 5%
+    non-target canary limits.
+
+28. **P4.1 vectorizes only the fully proven contiguous masked-add envelope.**
+    A pre-conversion whole-function matcher retains tensor layout and pointer
+    facts long enough to recognize exactly one rank-1 f32 store of two masked
+    loads added together. It requires a shared canonical
+    `pid * BLOCK + arange` address, the same signed `offsets < n` mask, a
+    contiguous blocked tile with a per-thread extent divisible by four, and
+    `tt.divisibility >= 16` on all three entry pointers. Extra operations,
+    load `other` values, strided layouts, noncanonical masks, and missing
+    alignment proofs stay on the existing scalar path. The matched cone becomes
+    `metal.contiguous_vector_add`; its MSL full-range arm issues two `float4`
+    loads from each input before two `float4` stores, while a guarded scalar
+    loop preserves the partial final program and negative/zero `n` behavior.
+    Deterministic tests pin `elements_per_thread = 8`, `vector_width = 4`, the
+    vector transactions, and the scalar tail, with explicit no-`float4`
+    neighbors for strided and unproven-alignment cases.
+
+    The fresh pre-change P4.1 reference measured vector add at
+    0.978915/1.013733 ms. Two independent post-change runs, each using a
+    different empty Triton cache and forced recompilation, measured
+    0.599396/0.598627 ms (1.633x/1.693x) and 0.595846/0.628479 ms
+    (1.643x/1.613x). Fused softmax, matmul, and GroupNorm stayed below the 5%
+    regression limit in every round. The isolated-cache requirement is
+    material: an exploratory run through the old disk cache reused scalar MSL
+    because native translator changes are not represented in that kernel cache
+    key, so it is not accepted as evidence. Fresh validation passed the Pixi
+    native build, all ten vector-add lit tests, two compiler/report contract
+    tests, all 11 MPS zero-copy tests, all 13 vector-add matrix/tile GPU tests,
+    and a read-only correctness review. Durable reports are under
+    `.omx/goals/performance/metal-p4-vector-load-store/`.
+
+29. **P4.2 materializes provably tile-invariant rank-1 aggregates before the
+    synthetic output loop.** The selector accepts only straight-line,
+    top-level, static rank-1 f32 axis-0 add/max reductions whose device-rooted
+    replay cone reaches an output. Dependencies are cloned in source order, so
+    softmax's sum consumes the already-materialized max, and replay memoization
+    reuses shared cone values for each logical index. Observable stores,
+    unrelated device reads, barriers, user loops, and region-bearing control
+    flow close the hoistable prefix; dedicated lit neighbors pin every one of
+    those boundaries. The final aggregate scratch read is named before the
+    elementwise output loop, so generated MSL contains no aggregate scratch or
+    threadgroup barrier in that loop.
+
+    A fresh two-round evaluator run measured fused softmax at
+    0.433792/0.436871 ms against the pre-change 0.784415/0.720817 ms reference,
+    for 1.808x/1.650x speedups. Vector add measured 0.610971/0.612685 ms and
+    GroupNorm 7.436592/7.403694 ms, both below their reference medians. The
+    first candidate runs also exposed a phase-order-sensitive matmul canary:
+    its MSL was byte-identical to the reference, but a structurally
+    single-SIMD-group 8x8 kernel still launched four warps and repeated the
+    same matrix pipeline four times. Post-conversion analysis now emits a
+    32-thread launch override only for straight-line kernels with no thread or
+    SIMD-group index, at least two unpartitioned staged loads, one or more MMA
+    operations, and exactly one unpartitioned matrix store. The evaluator's
+    matmul then measured 0.106965/0.082910 ms; genuine multi-warp kernels retain
+    their source geometry.
+
+    Fresh validation passed the Pixi native build, all 125 Metal conversion
+    lit tests, 12 single-/multi-SIMD-group matmul GPU cases, five multi-warp
+    loop-reduction determinism cases, numerical checks embedded in the P4
+    evaluator, and the two-round performance gate. Durable reports are under
+    `.omx/goals/performance/metal-p42-aggregate-hoist/`.
 
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
@@ -750,6 +931,9 @@ pixi run --frozen pytest \
   -s --tb=short
 pixi run --frozen python python/test/microbenchmark/metal_shader_compile_cache.py \
   --repeats 5 --assert-max-warm-ratio 0.5
+pixi run --frozen python python/test/unit/test_metal_perf_report.py \
+  --p4-report-dir .omx/goals/performance/metal-p4-baseline-contract/baseline \
+  --rounds 2
 ```
 
 ## Remaining unknowns
