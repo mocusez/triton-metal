@@ -15,13 +15,13 @@ permissions: read-all
 
 jobs:
   metal-backend:
-    name: Build and test Metal backend (macOS arm64)
+    name: Build and test Metal backend (macOS 26 arm64)
     # Apple Silicon runner is required for the Metal backend.
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 90
     env:
       TRITON_BUILD_WITH_CLANG_LLD: "TRUE"
-      RUNNER_TYPE: macos-latest
+      RUNNER_TYPE: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -137,6 +137,29 @@ jobs:
           ninja triton-metal-opt triton-metal-translate
           lit -v test/Dialect/Metal/
 
+      - name: Build and inspect macOS 15 Metal wheel
+        env:
+          TRITON_BUILD_DIR: ${{ runner.temp }}/triton-metal-wheel-build
+          TRITON_WHEEL_BACKENDS: metal
+          TRITON_BUILD_PROTON: "0"
+          TRITON_STABLE_ABI: "1"
+          TRITON_BUILD_WITH_O1: "1"
+          MAX_JOBS: "3"
+        run: |
+          source ~/.venv/bin/activate
+          python3 setup.py bdist_wheel --dist-dir wheelhouse
+          wheels=(wheelhouse/*.whl)
+          test "${#wheels[@]}" -eq 1
+          TRITON_TEST_METAL_WHEEL="${wheels[0]}" \
+            pytest -s --tb=short python/test/unit/test_metal_wheel.py
+
+      - name: Upload Metal wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-metal-macos15-arm64
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
       - name: Save ccache
         if: github.ref == 'refs/heads/metal-develop'
         uses: actions/cache/save@v4
@@ -144,3 +167,32 @@ jobs:
           path: |
             ~/.ccache
           key: metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ steps.cache-key.outputs.datetime }}
+
+  metal-wheel-install:
+    name: Install Metal wheel (macOS 15 arm64)
+    needs: metal-backend
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout smoke test
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download Metal wheel
+        uses: actions/download-artifact@v5
+        with:
+          name: triton-metal-macos15-arm64
+          path: wheelhouse
+
+      - name: Install and compile smoke test
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/triton-wheel-smoke"
+          "${RUNNER_TEMP}/triton-wheel-smoke/bin/pip" install torch==2.10.0
+          "${RUNNER_TEMP}/triton-wheel-smoke/bin/pip" install --no-deps wheelhouse/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/triton-wheel-smoke/bin/python" \
+            "${GITHUB_WORKSPACE}/python/test/packaging/metal_wheel_smoke.py"
