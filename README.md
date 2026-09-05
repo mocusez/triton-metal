@@ -307,8 +307,9 @@ The current dependency-ordered priorities are:
 1. Finish the remaining lowering-decline portion of the preflight safety
    matrix. All 12 op categories in `validateUnsupportedOpsRejected` now have
    direct CPU-only lit coverage, axes 1/2 `tt.get_num_programs` coverage is in
-   place, and both correctness xfails found by the audit are now ordinary
-   30-run regressions.
+   place, and live non-splat tensor constants now fail in preflight instead of
+   conversion teardown. Both correctness xfails found by the audit are now
+   ordinary 30-run regressions.
 2. Expand scaled-dot beyond the static rank-2 same-type fp16/bf16/FP8 loop
    slice and add the remaining mixed-format/dynamic/masked loop forms and
    non-canonical scale-address forms, reduce/scan,
