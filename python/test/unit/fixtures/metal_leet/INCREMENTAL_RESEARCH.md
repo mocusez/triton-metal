@@ -899,6 +899,28 @@ are still whole-kernel replacements rather than layout-general lowering.
     passed. Durable reports are under
     `.omx/goals/performance/metal-p43-resource-aware-matrix-schedule/`.
 
+31. **P5.2 now publishes an honest macOS 15 Metal wheel contract.** An initial
+    macOS 14 target produced a superficially correct wheel tag, but the linker
+    warned that objects in the pinned LLVM/MLIR archives were built for macOS
+    15. That candidate was rejected: forcing only the final link target would
+    advertise compatibility the dependency graph does not provide. Metal-only
+    builds now default both setuptools and CMake to 15.0, reject lower targets,
+    preserve explicit higher targets, and fail packaging if the final arm64
+    platform tag does not match.
+
+    The replacement build on macOS 26 produced the 61 MB
+    `cp312-abi3-macosx_15_0_arm64` wheel with SHA256
+    `e4d17623beb4a5a2ad5aef01bf4937a279156002a7b82958bb32bdced0c1f17c`.
+    Ten artifact/policy tests verified every bundled Mach-O file has `minos=15.0`,
+    only the Metal backend and entry point are present, and NVIDIA/profiler
+    payloads are absent. Pip also accepted the artifact for an explicit
+    macOS 15 arm64 / CPython 3.12 / abi3 target. A clean Python 3.12 environment
+    with PyTorch 2.10 installed the wheel, compiled through the installed Metal
+    backend, and ran the vector-add numerical smoke successfully on the physical
+    Apple M4/MPS host. CI now separates macOS 26 build/audit from a hosted
+    macOS 15 clean install/compile smoke; the hosted runner cannot supply the
+    remaining physical macOS 15 MPS numerical evidence.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

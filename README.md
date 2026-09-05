@@ -37,7 +37,8 @@ The backend's own pipeline stops at MSL text. Launching goes through PyTorch's M
 To **run** a released wheel:
 
 - Apple Silicon Mac (M1 or newer)
-- macOS 26+ for the published wheel — it is tagged `macosx_26_0_arm64` after the build machine's SDK, see Known limitations
+- macOS 15+ for the published wheel — Metal-only builds pin and verify the
+  `macosx_15_0_arm64` compatibility floor
 - Python 3.12+ and an MPS-enabled PyTorch (`torch.backends.mps.is_available()`, and `torch.mps.compile_shader`, added in PyTorch 2.7). No Xcode or Metal toolchain is needed at run time — PyTorch compiles the shader.
 
 To **build from source**, additionally:
@@ -63,7 +64,7 @@ pixi run --frozen install   # builds Triton + Metal backend in editable mode
 ```bash
 TRITON_WHEEL_BACKENDS=metal TRITON_BUILD_PROTON=0 TRITON_STABLE_ABI=1 \
     pixi run --frozen python setup.py bdist_wheel
-# → dist/triton-3.8.0+git<sha>-cp312-abi3-macosx_26_0_arm64.whl  (~59 MB)
+# → dist/triton-3.8.0+git<sha>-cp312-abi3-macosx_15_0_arm64.whl  (~61 MB)
 ```
 
 - `TRITON_WHEEL_BACKENDS=metal` ships only the Metal Python backend. All three
@@ -75,6 +76,10 @@ TRITON_WHEEL_BACKENDS=metal TRITON_BUILD_PROTON=0 TRITON_STABLE_ABI=1 \
 - `TRITON_STABLE_ABI=1` tags the wheel `cp312-abi3`, so one artifact covers Python
   3.12+ instead of a wheel per interpreter.
 - `TRITON_BUILD_PROTON=0` drops the CUDA/ROCm profiler.
+- A Metal-only build defaults `MACOSX_DEPLOYMENT_TARGET` to `15.0` and passes
+  the same value to CMake. Lower values are rejected because the pinned
+  LLVM/MLIR archives were built for macOS 15; an explicitly higher target is
+  preserved.
 
 Install into a throwaway venv to verify it is self-contained:
 
@@ -272,7 +277,10 @@ being approximated with a racy load/modify/store sequence.
   and benchmarks with `pixi run --frozen` in an unsandboxed process, and include
   that execution context in reported evidence.
 - **The runtime tracks PyTorch's MPS surface.** Capabilities can regress with a torch upgrade: on torch 2.13 `torch.zeros(..., dtype=torch.float8_e4m3fn, device="mps")` fails with `Undefined type Float8_e4m3fn`, so the fp8 paths need torch 2.10-era MPS support even though the backend's own fp8 casts are unchanged.
-- **Wheel platform tag** reflects the build machine's macOS SDK (e.g. `macosx_26_0_arm64`), so a wheel built on macOS 26 will not install on macOS 14/15. Nothing in `libtriton.so` links an Apple framework, so building with `MACOSX_DEPLOYMENT_TARGET` set lower is the fix — untested so far.
+- **The Metal wheel floor is macOS 15.0.** [PyTorch MPS](https://docs.pytorch.org/docs/stable/notes/mps.html)
+  itself supports macOS 14+, but the pinned LLVM/MLIR archives contain Mach-O objects built for
+  macOS 15. Metal-only packaging therefore pins both CMake and setuptools to
+  15.0 and rejects a lower target instead of publishing a misleading tag.
 - **Only `osx-arm64`** is supported. Intel Macs and `universal2` are out of scope.
 - **Hosted CI does not validate GPU numerics.** GitHub-hosted macOS
   runners are virtualized and expose no usable Metal device to PyTorch: MPS is either
@@ -305,7 +313,10 @@ The current dependency-ordered priorities are:
    layout-conversion, broader descriptor-reduce type/rank envelopes, and
    broader `tl.map_elementwise` pack/control-flow envelopes one
    positive/adjacent-negative slice at a time.
-3. Validate lower deployment-target wheels on clean macOS installations.
+3. Run the MPS numerical wheel smoke on a physical macOS 15 machine. CI now
+   builds/audits on macOS 26, then installs and compile-smokes the
+   `macosx_15_0_arm64` artifact on the hosted macOS 15 runner, while physical
+   Apple Silicon remains necessary for GPU numerical validation.
 
 PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
 and bf16 atomic add are platform/runtime boundaries, not implementation backlog.

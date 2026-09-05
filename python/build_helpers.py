@@ -21,6 +21,60 @@ from pathlib import Path
 from typing import Optional
 
 
+# PyTorch's current MPS runtime requires macOS 14.0, but Triton's pinned
+# prebuilt LLVM/MLIR archives are themselves built for macOS 15.0. The wheel's
+# honest floor is therefore the stricter dependency floor until those archives
+# are rebuilt for an older target.
+MIN_METAL_MACOS_DEPLOYMENT_TARGET = (15, 0)
+
+
+def _parse_macos_deployment_target(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)(?:\.(\d+))?", value)
+    if match is None:
+        raise RuntimeError(f"invalid MACOSX_DEPLOYMENT_TARGET {value!r}; expected MAJOR or MAJOR.MINOR")
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def resolve_macos_deployment_target(
+    wheel_backends: list[str],
+    requested_target: Optional[str] = None,
+    system: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the native deployment target for a Metal-only wheel build.
+
+    PyTorch's current MPS runtime requires macOS 14.0 or newer, while Triton's
+    pinned LLVM/MLIR distribution requires macOS 15.0. Metal-only wheels
+    therefore default to the stricter dependency floor instead of inheriting
+    the build host's SDK version. A caller may request a newer target, but
+    advertising a lower one would let pip install a wheel whose dependencies
+    cannot run. Other platforms and multi-backend builds retain their existing
+    behavior.
+    """
+    if (system or platform.system()) != "Darwin" or wheel_backends != ["metal"]:
+        return requested_target
+
+    target = requested_target or ".".join(map(str, MIN_METAL_MACOS_DEPLOYMENT_TARGET))
+    if _parse_macos_deployment_target(target) < MIN_METAL_MACOS_DEPLOYMENT_TARGET:
+        raise RuntimeError(
+            "Metal-only wheels require macOS 15.0 or newer because Triton's "
+            "pinned LLVM/MLIR archives were built for macOS 15.0 "
+            f"(requested MACOSX_DEPLOYMENT_TARGET={target})"
+        )
+    return target
+
+
+def validate_metal_wheel_platform_tag(platform_tag: str, deployment_target: str) -> None:
+    """Reject a Metal wheel if its tag does not reflect the requested floor."""
+    major, minor = _parse_macos_deployment_target(deployment_target)
+    expected = f"macosx_{major}_{minor}_arm64"
+    if platform_tag != expected:
+        raise RuntimeError(
+            "Metal wheel binary compatibility does not match the requested "
+            f"deployment target: expected {expected}, got {platform_tag}. "
+            "Check every bundled Mach-O dependency and CMake deployment flag."
+        )
+
+
 def get_base_dir():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 

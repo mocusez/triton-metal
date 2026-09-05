@@ -37,7 +37,14 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from python.build_helpers import check_env_flag, find_therock_rocm_include_dir, get_base_dir, get_cmake_dir
+from python.build_helpers import (
+    check_env_flag,
+    find_therock_rocm_include_dir,
+    get_base_dir,
+    get_cmake_dir,
+    resolve_macos_deployment_target,
+    validate_metal_wheel_platform_tag,
+)
 
 
 def is_git_repo() -> bool:
@@ -309,6 +316,8 @@ class CMakeBuild(build_ext):
         build_args = ["--config", cfg]
 
         cmake_args += [f"-DCMAKE_BUILD_TYPE={cfg}"]
+        if macos_deployment_target is not None:
+            cmake_args += [f"-DCMAKE_OSX_DEPLOYMENT_TARGET={macos_deployment_target}"]
         if platform.system() == "Windows":
             cmake_args += [f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_{cfg.upper()}={extdir}"]
         # This tests for "--jobserver-auth=fifo:" rather than "--jobserver-auth" because ninja
@@ -414,10 +423,21 @@ def get_wheel_backends():
     does not carry the NVIDIA Linux toolchain payload that can never run there.
     """
     names = os.environ.get("TRITON_WHEEL_BACKENDS", ";".join(CODEGEN_BACKENDS))
-    return [name for name in re.split(r"[;,]", names) if name.strip()]
+    return [name.strip() for name in re.split(r"[;,]", names) if name.strip()]
 
 
-backends = [*BackendInstaller.copy(get_wheel_backends()), *BackendInstaller.copy_externals()]
+wheel_backend_names = get_wheel_backends()
+macos_deployment_target = resolve_macos_deployment_target(
+    wheel_backend_names,
+    requested_target=os.environ.get("MACOSX_DEPLOYMENT_TARGET"),
+)
+if macos_deployment_target is not None:
+    # setuptools derives the wheel tag from the staged Mach-O files, while
+    # CMake owns the actual minimum OS load command. Keep both tools on the
+    # same explicit value, including when reusing an existing CMake cache.
+    os.environ["MACOSX_DEPLOYMENT_TARGET"] = macos_deployment_target
+
+backends = [*BackendInstaller.copy(wheel_backend_names), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -553,9 +573,12 @@ def add_links(external_only):
 class plugin_bdist_wheel(bdist_wheel):
 
     def get_tag(self):
+        tag = super().get_tag()
+        if wheel_backend_names == ["metal"] and platform.system() == "Darwin":
+            validate_metal_wheel_platform_tag(tag[2], macos_deployment_target)
         if check_env_flag("TRITON_STABLE_ABI"):
-            return "cp312", "abi3", super().get_tag()[2]
-        return super().get_tag()
+            return "cp312", "abi3", tag[2]
+        return tag
 
     def run(self):
         # install_lib copies the entire build_lib tree into the wheel, so stale
