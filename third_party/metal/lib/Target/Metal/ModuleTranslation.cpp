@@ -555,7 +555,9 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicCasOp,
+            mlir::triton::metal::StoreOp,
+            mlir::triton::metal::ContiguousVectorAddOp,
+            mlir::triton::metal::AtomicCasOp,
             mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
@@ -619,7 +621,9 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
             mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp, mlir::triton::metal::AtomicCasOp,
+            mlir::triton::metal::StoreOp,
+            mlir::triton::metal::ContiguousVectorAddOp,
+            mlir::triton::metal::AtomicCasOp,
             mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
@@ -724,6 +728,93 @@ void ModuleTranslation::translate(mlir::triton::metal::StoreOp op) {
   // translating the defining scf.for as a value cannot select a result.
   translateValueOrVarName(op.getValue());
   printDelim();
+}
+
+void ModuleTranslation::translate(
+    mlir::triton::metal::ContiguousVectorAddOp op) {
+  const int64_t elementsPerThread = op.getElementsPerThread();
+  const int64_t vectorWidth = op.getVectorWidth();
+  const int64_t vectorsPerThread = elementsPerThread / vectorWidth;
+
+  _output << "{";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    _output << "uint base = id.x * " << elementsPerThread << "u;\n";
+    indent();
+    _output << "int n = ";
+    translateValueOrVarName(op.getN());
+    _output << ";\n";
+    indent();
+    _output << "if ((n >= " << elementsPerThread
+            << ") && (base <= uint(n - " << elementsPerThread << "))) {";
+    {
+      INDENT();
+      for (int64_t chunk = 0; chunk < vectorsPerThread; ++chunk) {
+        const int64_t offset = chunk * vectorWidth;
+        _output << "\n";
+        indent();
+        _output << "float4 x" << chunk << " = *((device float4*)(";
+        translateVarName(op.getX());
+        _output << " + base + " << offset << "u));\n";
+        indent();
+        _output << "float4 y" << chunk << " = *((device float4*)(";
+        translateVarName(op.getY());
+        _output << " + base + " << offset << "u));";
+      }
+      for (int64_t chunk = 0; chunk < vectorsPerThread; ++chunk) {
+        const int64_t offset = chunk * vectorWidth;
+        _output << "\n";
+        indent();
+        _output << "*((device float4*)(";
+        translateVarName(op.getOut());
+        _output << " + base + " << offset << "u)) = x" << chunk << " + y"
+                << chunk << ";";
+      }
+    }
+    _output << "\n";
+    indent();
+    _output << "} else if (n > 0) {";
+    {
+      INDENT();
+      _output << "\n";
+      indent();
+      _output << "for (uint lane = 0u; lane < " << elementsPerThread
+              << "u; ++lane) {";
+      {
+        INDENT();
+        _output << "\n";
+        indent();
+        _output << "uint idx = base + lane;\n";
+        indent();
+        _output << "if (idx < uint(n)) {";
+        {
+          INDENT();
+          _output << "\n";
+          indent();
+          translateVarName(op.getOut());
+          _output << "[idx] = ";
+          translateVarName(op.getX());
+          _output << "[idx] + ";
+          translateVarName(op.getY());
+          _output << "[idx];";
+        }
+        _output << "\n";
+        indent();
+        _output << "}";
+      }
+      _output << "\n";
+      indent();
+      _output << "}";
+    }
+    _output << "\n";
+    indent();
+    _output << "}";
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::AtomicCasOp op) {

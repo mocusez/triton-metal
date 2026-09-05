@@ -307,6 +307,35 @@ def GetElementOp : Metal_Op<"get_element", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// ContiguousVectorAddOp
+//===----------------------------------------------------------------------===//
+
+def ContiguousVectorAddOp : Metal_Op<"contiguous_vector_add"> {
+  let summary = "Aligned contiguous rank-1 vector addition with a scalar tail";
+  let description = [{
+    Computes `out[i] = x[i] + y[i]` for the canonical rank-1 masked Triton
+    vector-add envelope. Each hardware thread owns `elements_per_thread`
+    adjacent f32 elements. Full groups use aligned MSL vector transactions;
+    the final partial group falls back to scalar guarded accesses, preserving
+    the source `i < n` mask without reading or writing outside the buffers.
+
+    This op is introduced only by a whole-function structural prepass that
+    proves common contiguous indices, a shared canonical mask, and 16-byte
+    alignment for all three buffer arguments. Kernels outside that exact
+    envelope retain the ordinary scalar load/store lowering.
+  }];
+
+  let arguments = (ins Metal_MemRefType:$x, Metal_MemRefType:$y,
+                       Metal_MemRefType:$out, I32:$n,
+                       I64Attr:$elements_per_thread,
+                       I64Attr:$vector_width);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$x `,` $y `,` $out `,` $n attr-dict `:` type(operands)";
+}
+
+//===----------------------------------------------------------------------===//
 // AtomicRmwOp
 //===----------------------------------------------------------------------===//
 

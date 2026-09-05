@@ -852,6 +852,28 @@ llvm::LogicalResult GetElementOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ContiguousVectorAddOp
+//===----------------------------------------------------------------------===//
+
+llvm::LogicalResult ContiguousVectorAddOp::verify() {
+  auto xTy = mlir::cast<MetalMemRefType>(getX().getType()).getType();
+  auto yTy = mlir::cast<MetalMemRefType>(getY().getType()).getType();
+  auto outTy = mlir::cast<MetalMemRefType>(getOut().getType()).getType();
+  if (!xTy.isF32() || yTy != xTy || outTy != xTy)
+    return emitOpError("requires f32 x, y, and out buffers");
+  if (!getN().getType().isInteger(32))
+    return emitOpError("requires a signless i32 element count");
+  if (getElementsPerThread() <= 0)
+    return emitOpError("elements_per_thread must be positive");
+  if (getVectorWidth() != 4)
+    return emitOpError("currently supports vector_width = 4 only");
+  if (getElementsPerThread() % getVectorWidth() != 0)
+    return emitOpError(
+        "elements_per_thread must be divisible by vector_width");
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // ThreadIdOp
 //===----------------------------------------------------------------------===//
 
