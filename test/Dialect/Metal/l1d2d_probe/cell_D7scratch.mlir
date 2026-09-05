@@ -1,4 +1,6 @@
 // L1d2d cell D7+scratch: D7 + L1d2c Phase B scratch-RMW + masked devstore.
+// Historical translation-only diagnostic: scratch is read before initialization.
+// Preserve this IR for translation checks, not numerical GPU assertions.
 // Reproduces the actual current L1d2c Phase A C6 MSL shape (post-Phase-B
 // scratch-sentinel + select-on-value regression-guard rewrite):
 //   tg_store; barrier; let v9 = tg_load[transpose]; barrier;

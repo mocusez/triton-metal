@@ -43,7 +43,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK:       metal.store
 
 // MSL-LABEL: kernel void fptosi_rank1_f32_i32
-// MSL:       (int)(
+// MSL:       (int32_t)(
 
 // FPToUI must stay unsigned through MSL emission; `(int32_t)` would corrupt
 // the upper half of the u32 range before the bit-preserving store.

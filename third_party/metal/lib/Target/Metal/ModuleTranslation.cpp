@@ -8805,7 +8805,19 @@ void ModuleTranslation::translateValue(Operation *opInst) {
             bool inputSignednessMatters =
                 wantSigned ||
                 mlir::isa<mlir::arith::UIToFPOp, mlir::arith::ExtUIOp>(conv);
-            _output << "(" << typeToString(op.getType()) << ")(";
+            // For float-to-integer casts, the operation also determines the
+            // RESULT's signedness. Signless i16/i64 storage is unsigned in
+            // MSL; using that spelling for fptosi clamps negative inputs to
+            // zero instead of truncating them toward zero as signed values.
+            auto resultCast =
+                mlir::isa<mlir::arith::FPToSIOp, mlir::arith::FPToUIOp>(conv)
+                    ? signednessCast(op.getType(),
+                                     mlir::isa<mlir::arith::FPToSIOp>(conv))
+                    : llvm::StringRef();
+            if (!resultCast.empty())
+              _output << resultCast << "(";
+            else
+              _output << "(" << typeToString(op.getType()) << ")(";
             if (inputSignednessMatters)
               emitAs(op.getIn(), wantSigned);
             else

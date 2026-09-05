@@ -1,6 +1,7 @@
 // L1d2d cell D4: B1=non-identity, B2=barrier-absent, B3=in-warp (16 threads).
 // 4x4 transpose: idx = (lid%4)*4 + lid/4.
-// Expected: ? (axis disambiguation).
+// Historical translation-only diagnostic: the cross-lane read is unsynchronized.
+// Do not use numerical dispatches as a correctness oracle; D6 is synchronized.
 
 module {
   metal.module {

@@ -168,3 +168,98 @@ def test_scalar_load_negative_int(dtype_name: str) -> None:
     _scalar_load_negative_kernel[(1,)](s, out)
     torch.mps.synchronize()
     assert out.cpu().item() == -7.0
+
+
+@triton.jit
+def _masked_scalar_load_kernel(x_ptr, fallback_ptr, out_ptr, N, fallback, MODE: tl.constexpr):
+    pid = tl.program_id(0)
+    if MODE == "constant":
+        value = tl.load(x_ptr + pid, pid < N, other=-7)
+    elif MODE == "runtime":
+        value = tl.load(x_ptr + pid, pid < N, other=fallback + pid)
+    elif MODE == "loaded":
+        other = tl.load(fallback_ptr + pid)
+        value = tl.load(x_ptr + pid, pid < N, other=other)
+    else:
+        value = tl.load(x_ptr + pid, pid < N)
+    tl.store(out_ptr + pid, value)
+
+
+@pytest.mark.parametrize("dtype_name,value", _SCALAR_DTYPES)
+@pytest.mark.parametrize("mode", ["constant", "runtime", "loaded", "none"])
+@pytest.mark.parametrize("n", [0, 5, 17])
+def test_masked_scalar_load_dtype_and_other(dtype_name, value, mode, n):
+    dtype = getattr(torch, dtype_name)
+    programs = 17
+    # The masked-off program IDs are outside the input's logical extent.
+    source = (torch.arange(max(n, 1)) + value).to(dtype)
+    fallback = (-torch.arange(programs) - 11).to(dtype)
+    out = torch.empty(programs, dtype=dtype, device="mps")
+    _masked_scalar_load_kernel[(programs,)](
+        source.to("mps"), fallback.to("mps"), out, n, -29, MODE=mode,
+    )
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[:n], source[:n], atol=0, rtol=0)
+    if mode == "constant":
+        expected = torch.full((programs,), -7, dtype=dtype)
+    elif mode == "runtime":
+        expected = (-29 + torch.arange(programs)).to(dtype)
+    elif mode == "loaded":
+        expected = fallback
+    else:
+        # Triton leaves the masked-off result undefined without `other`.
+        return
+    torch.testing.assert_close(actual[n:], expected[n:], atol=0, rtol=0)
+
+
+@triton.jit
+def _masked_scalar_load_loop_kernel(x_ptr, out_ptr, N, TRIPS, STRIDE: tl.constexpr):
+    pid = tl.program_id(0)
+    for trip in range(TRIPS):
+        ptr = x_ptr + trip * STRIDE + pid
+        value = tl.load(ptr, pid < N - trip, other=trip - 9)
+        tl.store(out_ptr + trip * STRIDE + pid, value)
+
+
+@pytest.mark.parametrize("dtype_name", ["int16", "float32"])
+@pytest.mark.parametrize("trips", [0, 1, 3])
+def test_masked_scalar_load_loop_preserves_iteration_offsets(dtype_name, trips):
+    dtype = getattr(torch, dtype_name)
+    stride, n = 8, 5
+    source = torch.arange(3 * stride).to(dtype)
+    out = torch.full((3 * stride,), -99, dtype=dtype, device="mps")
+    _masked_scalar_load_loop_kernel[(stride,)](source.to("mps"), out, n, trips, STRIDE=stride)
+    torch.mps.synchronize()
+    expected = torch.full_like(source, -99)
+    for trip in range(trips):
+        start = trip * stride
+        expected[start:start + stride] = trip - 9
+        expected[start:start + n - trip] = source[start:start + n - trip]
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16", "float32"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_masked_scalar_load_preserves_float_bits(dtype_name, num_warps):
+    dtype = getattr(torch, dtype_name)
+    int_dtype = torch.int32 if dtype_name == "float32" else torch.int16
+    if dtype_name == "float32":
+        patterns = [0x80000000, 1, 0x80000001, 0x7f800000, 0xff800000, 0x7f800001, 0xffc12345]
+    elif dtype_name == "float16":
+        patterns = [0x8000, 1, 0x8001, 0x7c00, 0xfc00, 0x7c01, 0xfe15]
+    else:
+        patterns = [0x8000, 1, 0x8001, 0x7f80, 0xff80, 0x7f81, 0xffc5]
+    bits = torch.tensor(patterns, dtype=torch.int64).to(int_dtype)
+    n = len(patterns)
+    # Read the special values through both branches. Integer uploads/downloads
+    # keep any signaling NaN intact so an unintended float conversion is visible.
+    fallback_bits = bits.repeat(2)
+    source = bits.to("mps").view(dtype)
+    fallback = fallback_bits.to("mps").view(dtype)
+    out = torch.empty(2 * n, dtype=int_dtype, device="mps")
+    _masked_scalar_load_kernel[(2 * n,)](
+        source, fallback, out.view(dtype), n, 0, MODE="loaded", num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), fallback_bits)

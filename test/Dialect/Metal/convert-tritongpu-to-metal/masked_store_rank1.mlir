@@ -17,6 +17,16 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scalar_masked_store_f32(%out: !tt.ptr<f32>, %value: f32, %mask: i1) {
+    tt.store %out, %value, %mask : !tt.ptr<f32>
+    tt.return
+  }
+  tt.func public @scalar_masked_store_i16_offset(%out: !tt.ptr<i16>, %value: i16, %mask: i1, %base: i32, %offset: i32) {
+    %ptr0 = tt.addptr %out, %base : !tt.ptr<i16>, i32
+    %ptr1 = tt.addptr %ptr0, %offset : !tt.ptr<i16>, i32
+    tt.store %ptr1, %value, %mask : !tt.ptr<i16>
+    tt.return
+  }
   tt.func public @masked_store_rank1(%out_ptr: !tt.ptr<f32>, %val_ptr: !tt.ptr<f32>, %n_cols: i32) {
     %offsets = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
     %n_splat = tt.splat %n_cols : i32 -> tensor<1024xi32, #blocked>
@@ -54,6 +64,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// CHECK-LABEL: metal.kernel scalar_masked_store_f32
+// CHECK-NOT: metal.store
+// CHECK: scf.if
+// CHECK: metal.store
+// CHECK-NEXT: }
+// CHECK-NOT: metal.store
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel scalar_masked_store_i16_offset
+// CHECK-NOT: metal.store
+// CHECK: scf.if
+// CHECK: arith.addi
+// CHECK: metal.store {{.*}} : ui16, !metal.memref<? x ui16>, ui32
+// CHECK-NEXT: }
+// CHECK-NOT: metal.store
+// CHECK: metal.return
 
 // CHECK-LABEL: metal.kernel masked_store_rank1
 // tpb derivation: threadsPerWarp[0]=32 × warpsPerCTA[0]=8 = 256.

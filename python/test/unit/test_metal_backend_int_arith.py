@@ -136,6 +136,22 @@ def _shrui_kernel(out_ptr, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _minui_kernel(out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK).to(tl.uint32)
+    pivot = tl.full((BLOCK,), 63, tl.uint32)
+    idx = tl.minimum(offs, pivot).to(tl.int32, bitcast=True)
+    tl.store(out_ptr + idx, tl.full((BLOCK,), 1.0, tl.float32))
+
+
+@triton.jit
+def _maxui_kernel(out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK).to(tl.uint32)
+    pivot = tl.full((BLOCK,), 63, tl.uint32)
+    idx = tl.maximum(offs, pivot).to(tl.int32, bitcast=True)
+    tl.store(out_ptr + idx, tl.full((BLOCK,), 1.0, tl.float32))
+
+
+@triton.jit
 def _select_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     x = tl.load(x_ptr + offs)
@@ -152,6 +168,36 @@ def _umulhi_u64_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     y = tl.load(y_ptr + offs, mask=mask, other=0)
     high = tl.umulhi(x, y)
     tl.store(out_ptr + offs, high, mask=mask)
+
+
+@triton.jit
+def _unsigned_minmax_u32_kernel(
+    a_ptr, b_ptr, min_ptr, max_ptr, signed_min_ptr, N, BLOCK: tl.constexpr
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a_s = tl.load(a_ptr + offs, mask=mask, other=0)
+    b_s = tl.load(b_ptr + offs, mask=mask, other=0)
+    a_u = a_s.to(tl.uint32, bitcast=True)
+    b_u = b_s.to(tl.uint32, bitcast=True)
+    tl.store(min_ptr + offs, tl.minimum(a_u, b_u).to(tl.int32, bitcast=True), mask=mask)
+    tl.store(max_ptr + offs, tl.maximum(a_u, b_u).to(tl.int32, bitcast=True), mask=mask)
+    tl.store(signed_min_ptr + offs, tl.minimum(a_s, b_s), mask=mask)
+
+
+@triton.jit
+def _unsigned_minmax_u64_kernel(
+    a_ptr, b_ptr, min_ptr, max_ptr, signed_max_ptr, N, BLOCK: tl.constexpr
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a_s = tl.load(a_ptr + offs, mask=mask, other=0)
+    b_s = tl.load(b_ptr + offs, mask=mask, other=0)
+    a_u = a_s.to(tl.uint64, bitcast=True)
+    b_u = b_s.to(tl.uint64, bitcast=True)
+    tl.store(min_ptr + offs, tl.minimum(a_u, b_u).to(tl.int64, bitcast=True), mask=mask)
+    tl.store(max_ptr + offs, tl.maximum(a_u, b_u).to(tl.int64, bitcast=True), mask=mask)
+    tl.store(signed_max_ptr + offs, tl.maximum(a_s, b_s), mask=mask)
 
 
 @triton.jit
@@ -201,6 +247,8 @@ _CASES = [
     ("divui", _divui_kernel, _SIGNATURE_1ARG),
     ("remui", _remui_kernel, _SIGNATURE_1ARG),
     ("shrui", _shrui_kernel, _SIGNATURE_1ARG),
+    ("minui", _minui_kernel, _SIGNATURE_1ARG),
+    ("maxui", _maxui_kernel, _SIGNATURE_1ARG),
     ("select", _select_kernel, _SIGNATURE_SELECT),
 ]
 
@@ -315,6 +363,122 @@ def test_umulhi_u64_runtime_edge_carries():
     _umulhi_u64_kernel[(1,)](x, y, out, len(x_host), BLOCK=8)
     torch.mps.synchronize()
     assert out.cpu().tolist() == expected_host
+
+
+def _to_signed(bits: int, width: int) -> int:
+    bits &= (1 << width) - 1
+    sign = 1 << (width - 1)
+    return bits - (1 << width) if bits & sign else bits
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_unsigned_minmax_u32_runtime_high_bits_and_mask():
+    n, block = 13, 8
+    a_bits = [
+        0,
+        0xFFFFFFFF,
+        0x80000000,
+        17,
+        0x7FFFFFFF,
+        0x80000001,
+        42,
+        0xFFFFFFFE,
+        0,
+        0x90000000,
+        0xFFFFFFFF,
+        123456789,
+        0x80000000,
+    ]
+    b_bits = [
+        0xFFFFFFFF,
+        0,
+        0x7FFFFFFF,
+        17,
+        0x80000000,
+        0x80000001,
+        0xFFFFFFFE,
+        42,
+        0,
+        0x70000000,
+        0xFFFFFFFF,
+        987654321,
+        0x80000000,
+    ]
+    sentinel = _to_signed(0x5A5A5A5A, 32)
+    a = torch.tensor([_to_signed(v, 32) for v in a_bits], dtype=torch.int32, device="mps")
+    b = torch.tensor([_to_signed(v, 32) for v in b_bits], dtype=torch.int32, device="mps")
+    out_min = torch.full((block * 2,), sentinel, dtype=torch.int32, device="mps")
+    out_max = torch.full((block * 2,), sentinel, dtype=torch.int32, device="mps")
+    signed_min = torch.full((block * 2,), sentinel, dtype=torch.int32, device="mps")
+
+    _unsigned_minmax_u32_kernel[(2,)](a, b, out_min, out_max, signed_min, n, BLOCK=block)
+    torch.mps.synchronize()
+
+    expected_min = torch.tensor(
+        [_to_signed(min(x, y), 32) for x, y in zip(a_bits, b_bits)],
+        dtype=torch.int32,
+    )
+    expected_max = torch.tensor(
+        [_to_signed(max(x, y), 32) for x, y in zip(a_bits, b_bits)],
+        dtype=torch.int32,
+    )
+    expected_signed_min = torch.minimum(a.cpu(), b.cpu())
+    assert torch.equal(out_min.cpu()[:n], expected_min)
+    assert torch.equal(out_max.cpu()[:n], expected_max)
+    assert torch.equal(signed_min.cpu()[:n], expected_signed_min)
+    assert torch.equal(out_min.cpu()[n:], torch.full((block * 2 - n,), sentinel, dtype=torch.int32))
+    assert torch.equal(out_max.cpu()[n:], torch.full((block * 2 - n,), sentinel, dtype=torch.int32))
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_unsigned_minmax_u64_runtime_high_bits_and_mask():
+    n, block = 7, 4
+    a_bits = [
+        0,
+        0xFFFFFFFFFFFFFFFF,
+        0x8000000000000000,
+        17,
+        0x7FFFFFFFFFFFFFFF,
+        0x8000000000000001,
+        0xFEDCBA9876543210,
+    ]
+    b_bits = [
+        0xFFFFFFFFFFFFFFFF,
+        0,
+        0x7FFFFFFFFFFFFFFF,
+        17,
+        0x8000000000000000,
+        0x8000000000000001,
+        0x0123456789ABCDEF,
+    ]
+    sentinel = _to_signed(0x5A5A5A5A5A5A5A5A, 64)
+    a = torch.tensor([_to_signed(v, 64) for v in a_bits], dtype=torch.int64, device="mps")
+    b = torch.tensor([_to_signed(v, 64) for v in b_bits], dtype=torch.int64, device="mps")
+    out_min = torch.full((block * 2,), sentinel, dtype=torch.int64, device="mps")
+    out_max = torch.full((block * 2,), sentinel, dtype=torch.int64, device="mps")
+    signed_max = torch.full((block * 2,), sentinel, dtype=torch.int64, device="mps")
+
+    _unsigned_minmax_u64_kernel[(2,)](a, b, out_min, out_max, signed_max, n, BLOCK=block)
+    torch.mps.synchronize()
+
+    expected_min = torch.tensor(
+        [_to_signed(min(x, y), 64) for x, y in zip(a_bits, b_bits)],
+        dtype=torch.int64,
+    )
+    expected_max = torch.tensor(
+        [_to_signed(max(x, y), 64) for x, y in zip(a_bits, b_bits)],
+        dtype=torch.int64,
+    )
+    expected_signed_max = torch.maximum(a.cpu(), b.cpu())
+    assert torch.equal(out_min.cpu()[:n], expected_min)
+    assert torch.equal(out_max.cpu()[:n], expected_max)
+    assert torch.equal(signed_max.cpu()[:n], expected_signed_max)
+    assert torch.equal(out_min.cpu()[n:], torch.full((block * 2 - n,), sentinel, dtype=torch.int64))
+    assert torch.equal(out_max.cpu()[n:], torch.full((block * 2 - n,), sentinel, dtype=torch.int64))
 
 
 @triton.jit
