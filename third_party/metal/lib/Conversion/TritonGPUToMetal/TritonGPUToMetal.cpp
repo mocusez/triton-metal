@@ -5053,6 +5053,12 @@ struct ArithDivFLowering
 // arith/math ops in TTIR. Metal already has exact f32 expression primitives
 // for both operations, so lower the per-thread scalar directly instead of
 // letting an illegal Triton op reach failed-conversion cleanup.
+static bool hasF32ElementType(mlir::Type type) {
+  if (auto ranked = mlir::dyn_cast<mlir::RankedTensorType>(type))
+    type = ranked.getElementType();
+  return type.isF32();
+}
+
 struct TritonPreciseSqrtLowering
     : public mlir::OpConversionPattern<mlir::triton::PreciseSqrtOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -5060,7 +5066,7 @@ struct TritonPreciseSqrtLowering
   matchAndRewrite(mlir::triton::PreciseSqrtOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return rewriter.notifyMatchFailure(op, "precise_sqrt requires f32");
     auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
                                           UnaryExpOperator::sqrtOp);
@@ -5076,7 +5082,7 @@ struct TritonPreciseDivFLowering
   matchAndRewrite(mlir::triton::PreciseDivFOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
+    if (!resultTy || !hasF32ElementType(resultTy))
       return rewriter.notifyMatchFailure(op, "precise_divf requires f32");
     auto kind = BinaryExpOperatorAttr::get(rewriter.getContext(),
                                            BinaryExpOperator::divOp);
@@ -31723,6 +31729,28 @@ validateTensorConstantSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// PreciseSqrt/Div lower directly to Metal expression ops whose current type
+// envelope is f32. TTIR permits adjacent float widths; reject those before the
+// conversion patterns decline and leave an unsafe partially rewritten module.
+static mlir::LogicalResult validatePreciseMathSupport(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::PreciseSqrtOp op) {
+    if (hasF32ElementType(op.getType()))
+      return;
+    op.emitOpError(
+        "Metal backend: tt.precise_sqrt requires f32 operands and result");
+    valid = false;
+  });
+  moduleOp.walk([&](mlir::triton::PreciseDivFOp op) {
+    if (hasF32ElementType(op.getType()))
+      return;
+    op.emitOpError(
+        "Metal backend: tt.precise_divf requires f32 operands and result");
+    valid = false;
+  });
+  return mlir::success(valid);
+}
+
 // `tt.scan` shapes ScanLowering cannot lower.
 //
 // It declines by `notifyMatchFailure`, which in this backend is a process kill
@@ -32642,6 +32670,7 @@ struct ConvertTritonGPUToMetalPass
 
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateTensorConstantSupport(moduleOp)) ||
+        mlir::failed(validatePreciseMathSupport(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateUnitAxisReduce(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
