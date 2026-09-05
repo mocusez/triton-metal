@@ -192,6 +192,67 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // Mixed E5M2/E4M3 payloads are still byte-backed per operand; the scalar
+  // exact path must decode A and B independently before applying E8M0 scales.
+  tt.func public @dot_scaled_e8m0_mixed_e5m2_e4m3(
+      %a_ptr: !tt.ptr<f8E5M2>, %b_ptr: !tt.ptr<f8E4M3FN>,
+      %a_scale_ptr: !tt.ptr<i8>, %b_scale_ptr: !tt.ptr<i8>,
+      %c_ptr: !tt.ptr<f32>) {
+    %m = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #slice_row>
+    %n = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #slice_col>
+    %n_as_row = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #slice_row>
+    %k_as_col = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #slice_col>
+    %k_as_row = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #slice_row>
+    %m_2d = tt.expand_dims %m {axis = 1 : i32} : tensor<16xi32, #slice_row> -> tensor<16x1xi32, #blocked>
+    %n_2d = tt.expand_dims %n {axis = 0 : i32} : tensor<16xi32, #slice_col> -> tensor<1x16xi32, #blocked>
+    %k_a_2d = tt.expand_dims %k_as_col {axis = 0 : i32} : tensor<32xi32, #slice_col> -> tensor<1x32xi32, #blocked>
+    %k_b_2d = tt.expand_dims %k_as_row {axis = 1 : i32} : tensor<32xi32, #slice_row> -> tensor<32x1xi32, #blocked>
+
+    %c32 = arith.constant dense<32> : tensor<16x1xi32, #blocked>
+    %a_row = arith.muli %m_2d, %c32 : tensor<16x1xi32, #blocked>
+    %a_row_bc = tt.broadcast %a_row : tensor<16x1xi32, #blocked> -> tensor<16x32xi32, #blocked>
+    %k_a_bc = tt.broadcast %k_a_2d : tensor<1x32xi32, #blocked> -> tensor<16x32xi32, #blocked>
+    %a_off = arith.addi %a_row_bc, %k_a_bc : tensor<16x32xi32, #blocked>
+    %a_base = tt.splat %a_ptr : !tt.ptr<f8E5M2> -> tensor<16x32x!tt.ptr<f8E5M2>, #blocked>
+    %a_addr = tt.addptr %a_base, %a_off : tensor<16x32x!tt.ptr<f8E5M2>, #blocked>, tensor<16x32xi32, #blocked>
+    %a = tt.load %a_addr : tensor<16x32x!tt.ptr<f8E5M2>, #blocked>
+
+    %c16_k = arith.constant dense<16> : tensor<32x1xi32, #blocked>
+    %b_row = arith.muli %k_b_2d, %c16_k : tensor<32x1xi32, #blocked>
+    %b_row_bc = tt.broadcast %b_row : tensor<32x1xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %n_bc = tt.broadcast %n_2d : tensor<1x16xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %b_off = arith.addi %b_row_bc, %n_bc : tensor<32x16xi32, #blocked>
+    %b_base = tt.splat %b_ptr : !tt.ptr<f8E4M3FN> -> tensor<32x16x!tt.ptr<f8E4M3FN>, #blocked>
+    %b_addr = tt.addptr %b_base, %b_off : tensor<32x16x!tt.ptr<f8E4M3FN>, #blocked>, tensor<32x16xi32, #blocked>
+    %b = tt.load %b_addr : tensor<32x16x!tt.ptr<f8E4M3FN>, #blocked>
+
+    %c1_m = arith.constant dense<1> : tensor<16x1xi32, #blocked>
+    %a_scale_off = arith.muli %m_2d, %c1_m : tensor<16x1xi32, #blocked>
+    %a_scale_base = tt.splat %a_scale_ptr : !tt.ptr<i8> -> tensor<16x1x!tt.ptr<i8>, #blocked>
+    %a_scale_addr = tt.addptr %a_scale_base, %a_scale_off : tensor<16x1x!tt.ptr<i8>, #blocked>, tensor<16x1xi32, #blocked>
+    %a_scale = tt.load %a_scale_addr : tensor<16x1x!tt.ptr<i8>, #blocked>
+
+    %n_scale_2d = tt.expand_dims %n_as_row {axis = 1 : i32} : tensor<16xi32, #slice_row> -> tensor<16x1xi32, #blocked>
+    %c1_n = arith.constant dense<1> : tensor<16x1xi32, #blocked>
+    %b_scale_off = arith.muli %n_scale_2d, %c1_n : tensor<16x1xi32, #blocked>
+    %b_scale_base = tt.splat %b_scale_ptr : !tt.ptr<i8> -> tensor<16x1x!tt.ptr<i8>, #blocked>
+    %b_scale_addr = tt.addptr %b_scale_base, %b_scale_off : tensor<16x1x!tt.ptr<i8>, #blocked>, tensor<16x1xi32, #blocked>
+    %b_scale = tt.load %b_scale_addr : tensor<16x1x!tt.ptr<i8>, #blocked>
+
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #blocked>
+    %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %acc lhs = e5m2 rhs = e4m3 {fastMath = false} : tensor<16x32xf8E5M2, #blocked>, tensor<16x1xi8, #blocked> * tensor<32x16xf8E4M3FN, #blocked>, tensor<16x1xi8, #blocked> -> tensor<16x16xf32, #blocked>
+
+    %c16_m = arith.constant dense<16> : tensor<16x1xi32, #blocked>
+    %c_row = arith.muli %m_2d, %c16_m : tensor<16x1xi32, #blocked>
+    %c_row_bc = tt.broadcast %c_row : tensor<16x1xi32, #blocked> -> tensor<16x16xi32, #blocked>
+    %c_n_bc = tt.broadcast %n_2d : tensor<1x16xi32, #blocked> -> tensor<16x16xi32, #blocked>
+    %c_off = arith.addi %c_row_bc, %c_n_bc : tensor<16x16xi32, #blocked>
+    %c_base = tt.splat %c_ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #blocked>
+    %c_addr = tt.addptr %c_base, %c_off : tensor<16x16x!tt.ptr<f32>, #blocked>, tensor<16x16xi32, #blocked>
+    tt.store %c_addr, %result : tensor<16x16x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
   // E4M3FN has no infinities: all finite payloads, including the extended
   // exponent encodings through +/-448, are decoded exactly to bf16.  The two
   // 0x7f-magnitude payloads preserve NaN class without promising payload bits.
@@ -351,6 +412,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: arith.mulf %[[A_ACCUM]], {{.*}} : f32
 // CHECK: metal.return
 
+// CHECK-LABEL: metal.kernel dot_scaled_e8m0_mixed_e5m2_e4m3
+// CHECK-NOT: tt.dot_scaled
+// CHECK: %[[A_RAW:.*]] = metal.get_element {{.*}} -> i8
+// CHECK: %[[B_RAW:.*]] = metal.get_element {{.*}} -> i8
+// CHECK: %[[A_WIDE:.*]] = arith.extui %[[A_RAW]] : i8 to i16
+// CHECK: %[[A_MASKED:.*]] = arith.andi %[[A_WIDE]], {{.*}} : i16
+// CHECK: %[[A_SHIFTED:.*]] = arith.shli %[[A_MASKED]], {{.*}} : i16
+// CHECK: %[[A_F16:.*]] = metal.bitcast {{.*}} -> f16
+// CHECK: %[[A_F32:.*]] = arith.extf %[[A_F16]] : f16 to f32
+// CHECK: %[[A_BF16:.*]] = arith.truncf %[[A_F32]] : f32 to bf16
+// CHECK: %[[B_WIDE:.*]] = arith.extui %[[B_RAW]] : i8 to i16
+// CHECK: %[[B_MASKED:.*]] = arith.andi %[[B_WIDE]], {{.*}} : i16
+// CHECK: %[[B_MAG:.*]] = arith.andi %[[B_MASKED]], {{.*}} : i16
+// CHECK: arith.cmpi ult, %[[B_MAG]]
+// CHECK: metal.bitcast {{.*}} -> bf16
+// CHECK: arith.mulf %[[A_BF16]], {{.*}} : bf16
+// CHECK: arith.mulf {{.*}} : bf16
+// CHECK: arith.extf {{.*}} : bf16 to f32
+// CHECK: metal.return
+
 // CHECK-LABEL: metal.kernel dot_scaled_e8m0_e4m3
 // CHECK-NOT: tt.dot_scaled
 // CHECK: %[[E4_RAW:.*]] = metal.get_element {{.*}} -> i8
@@ -398,6 +479,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: << 8
 // MSL: as_type<half>(uint16_t(
 // MSL: as_type<bfloat>
+
+// MSL-LABEL: kernel void dot_scaled_e8m0_mixed_e5m2_e4m3
+// MSL: as_type<half>
+// MSL-SAME: v0
+// MSL-SAME: << 8
+// MSL-SAME: as_type<bfloat>
+// MSL-SAME: v1
+// MSL-SAME: & 128) << 8
+// MSL-SAME: == (int16_t)(127)
 
 // MSL-LABEL: kernel void dot_scaled_e8m0_e4m3
 // MSL: / (uint32_t)(32)

@@ -6,15 +6,62 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @dot_scaled_mixed_fp8_unsupported(
-      %a: tensor<16x32xf8E4M3FN, #blocked>,
-      %b: tensor<32x16xf8E5M2, #blocked>,
-      %a_scale: tensor<16x1xi8, #blocked>,
-      %b_scale: tensor<16x1xi8, #blocked>,
+  tt.func public @dot_scaled_e2m1_mixed_fp8_unsupported(
+      %a: tensor<16x32xi8, #blocked>,
+      %b: tensor<64x16xf8E4M3FN, #blocked>,
+      %a_scale: tensor<16x2xi8, #blocked>,
+      %b_scale: tensor<16x2xi8, #blocked>,
       %acc: tensor<16x16xf32, #blocked>) {
-    // expected-error@+1 {{'tt.dot_scaled' op Metal backend: requires matching fp16/fp16, bf16/bf16, e2m1/e2m1, e4m3/e4m3, or e5m2/e5m2 payload formats}}
-    %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %acc lhs = e4m3 rhs = e5m2 {fastMath = false} : tensor<16x32xf8E4M3FN, #blocked>, tensor<16x1xi8, #blocked> * tensor<32x16xf8E5M2, #blocked>, tensor<16x1xi8, #blocked> -> tensor<16x16xf32, #blocked>
+    // expected-error@+1 {{'tt.dot_scaled' op Metal backend: requires matching fp16/fp16, bf16/bf16, e2m1/e2m1, e4m3/e4m3, e5m2/e5m2, or mixed e4m3/e5m2 payload formats}}
+    %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %acc lhs = e2m1 rhs = e4m3 {fastMath = false} : tensor<16x32xi8, #blocked>, tensor<16x2xi8, #blocked> * tensor<64x16xf8E4M3FN, #blocked>, tensor<16x2xi8, #blocked> -> tensor<16x16xf32, #blocked>
     tt.return
+  }
+}
+
+// -----
+
+// Internal scalar-dot payload markers must select exactly one decoder for
+// each operand.  E2M1 describes both operands, so an additional per-side FP8
+// marker is contradictory and must not be silently prioritized.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  metal.module {
+    metal.kernel conflicting_payload_markers address_space_device [true, true, true, true, true] {
+    ^bb0(%arg0: !metal.memref<? x i8>, %arg1: !metal.memref<? x i8>, %arg2: !metal.memref<? x i8>, %arg3: !metal.memref<? x i8>, %arg4: !metal.memref<? x f32>):
+      %c0 = metal.constant 0 : ui32
+      %c1 = metal.constant 1 : ui32
+      %c16 = metal.constant 16 : ui32
+      %c32 = metal.constant 32 : ui32
+      %z = arith.constant 0.000000e+00 : f32
+      // expected-error@+1 {{failed to legalize operation 'metal.scalar_dot'}}
+      %0 = metal.scalar_dot %arg0, %arg1 offset [%c0, %c0] batch_offset [%c0, %c0] origin [%c0, %c0, %c0], %c32, %c16, %c1, %c1, %c0, %c32, %z scales [%arg2, %arg3] params [%c0, %c0, %c1, %c1, %c0, %c0, %c32] {metal.a_scaled, metal.b_scaled, metal.e2m1_payloads, metal.a_e4m3_payload, metal.tile_elem_per_thread = 1 : i64, metal.tile_threads_per_block = 256 : i64} : (!metal.memref<? x i8>, !metal.memref<? x i8>, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, f32, !metal.memref<? x i8>, !metal.memref<? x i8>, ui32, ui32, ui32, ui32, ui32, ui32, ui32) -> tensor<16x16xf32, #blocked>
+      metal.return
+    }
+    metal.module_end
+  }
+}
+
+// -----
+
+// A byte-backed FP8 payload marker on only one side is malformed: both raw i8
+// buffers need an explicit packed format before scalar reconstruction.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  metal.module {
+    metal.kernel one_sided_payload_marker address_space_device [true, true, true, true, true] {
+    ^bb0(%arg0: !metal.memref<? x i8>, %arg1: !metal.memref<? x i8>, %arg2: !metal.memref<? x i8>, %arg3: !metal.memref<? x i8>, %arg4: !metal.memref<? x f32>):
+      %c0 = metal.constant 0 : ui32
+      %c1 = metal.constant 1 : ui32
+      %c16 = metal.constant 16 : ui32
+      %c32 = metal.constant 32 : ui32
+      %z = arith.constant 0.000000e+00 : f32
+      // expected-error@+1 {{failed to legalize operation 'metal.scalar_dot'}}
+      %0 = metal.scalar_dot %arg0, %arg1 offset [%c0, %c0] batch_offset [%c0, %c0] origin [%c0, %c0, %c0], %c32, %c16, %c1, %c1, %c0, %c32, %z scales [%arg2, %arg3] params [%c0, %c0, %c1, %c1, %c0, %c0, %c32] {metal.a_scaled, metal.b_scaled, metal.a_e4m3_payload, metal.tile_elem_per_thread = 1 : i64, metal.tile_threads_per_block = 256 : i64} : (!metal.memref<? x i8>, !metal.memref<? x i8>, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, ui32, f32, !metal.memref<? x i8>, !metal.memref<? x i8>, ui32, ui32, ui32, ui32, ui32, ui32, ui32) -> tensor<16x16xf32, #blocked>
+      metal.return
+    }
+    metal.module_end
   }
 }
 

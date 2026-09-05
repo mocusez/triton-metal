@@ -212,6 +212,56 @@ def dot_scaled_e4m3_batched_u8_kernel(
 
 
 @triton.jit
+def dot_scaled_e4m3_batched_dynamic_scale_stride_u8_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    a_scale_batch_stride,
+    b_scale_batch_stride,
+    BATCH: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    SCALE_BATCH_ORIGIN: tl.constexpr,
+):
+    offs_b = tl.arange(0, BATCH)
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, K)
+    offs_scale_k = tl.arange(0, K // 32)
+    a = tl.load(a_ptr + offs_b[:, None, None] * M * K + offs_m[None, :, None] * K + offs_k[None, None, :])
+    b = tl.load(b_ptr + offs_b[:, None, None] * K * N + offs_k[None, :, None] * N + offs_n[None, None, :])
+    scale_batch = offs_b + SCALE_BATCH_ORIGIN
+    a_scale = tl.load(
+        a_scale_ptr
+        + scale_batch[:, None, None] * a_scale_batch_stride
+        + offs_m[None, :, None] * (K // 32)
+        + offs_scale_k[None, None, :]
+    )
+    b_scale = tl.load(
+        b_scale_ptr
+        + scale_batch[:, None, None] * b_scale_batch_stride
+        + offs_n[None, :, None] * (K // 32)
+        + offs_scale_k[None, None, :]
+    )
+    result = tl.dot_scaled(
+        a,
+        a_scale,
+        "e4m3",
+        b,
+        b_scale,
+        "e4m3",
+        fast_math=False,
+    )
+    tl.store(
+        c_ptr + offs_b[:, None, None] * M * N + offs_m[None, :, None] * N + offs_n[None, None, :],
+        result,
+    )
+
+
+@triton.jit
 def dot_scaled_e4m3_batched_masked_u8_kernel(
     a_ptr,
     b_ptr,
@@ -285,7 +335,8 @@ def dot_scaled_loop_kernel(
     BLOCK_K: tl.constexpr,
     SCALE_FACTOR: tl.constexpr,
     LOOP_START: tl.constexpr,
-    ELEM_TYPE: tl.constexpr,
+    A_ELEM_TYPE: tl.constexpr,
+    B_ELEM_TYPE: tl.constexpr,
 ):
     offs_m = tl.arange(0, M)
     offs_n = tl.arange(0, N)
@@ -304,10 +355,175 @@ def dot_scaled_loop_kernel(
         acc = tl.dot_scaled(
             a,
             a_scale,
-            ELEM_TYPE,
+            A_ELEM_TYPE,
             b,
             b_scale,
-            ELEM_TYPE,
+            B_ELEM_TYPE,
+            acc,
+            fast_math=False,
+        )
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+@triton.jit
+def dot_scaled_masked_loop_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    actual_m,
+    actual_n,
+    actual_k,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_FACTOR: tl.constexpr,
+    LOOP_START: tl.constexpr,
+    A_ELEM_TYPE: tl.constexpr,
+    B_ELEM_TYPE: tl.constexpr,
+    LOAD_OTHER: tl.constexpr,
+    A_K_BOUND_BIAS: tl.constexpr,
+):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        logical_k = k_start + offs_k
+        a_mask = (offs_m[:, None] < actual_m) & (logical_k[None, :] < actual_k + A_K_BOUND_BIAS)
+        b_mask = (logical_k[:, None] < actual_k) & (offs_n[None, :] < actual_n)
+        a = tl.load(
+            a_ptr + offs_m[:, None] * K + logical_k[None, :],
+            mask=a_mask,
+            other=LOAD_OTHER,
+        )
+        b = tl.load(
+            b_ptr + logical_k[:, None] * N + offs_n[None, :],
+            mask=b_mask,
+            other=LOAD_OTHER,
+        )
+        a_scale = tl.load(
+            a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            A_ELEM_TYPE,
+            b,
+            b_scale,
+            B_ELEM_TYPE,
+            acc,
+            fast_math=False,
+        )
+    output_mask = (offs_m[:, None] < actual_m) & (offs_n[None, :] < actual_n)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc, mask=output_mask)
+
+
+@triton.jit
+def dot_scaled_dynamic_upper_masked_loop_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    actual_m,
+    actual_n,
+    actual_k,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_FACTOR: tl.constexpr,
+    A_ELEM_TYPE: tl.constexpr,
+    B_ELEM_TYPE: tl.constexpr,
+    LOOP_UPPER_BIAS: tl.constexpr,
+    A_SCALE_ROW_STRIDE_BIAS: tl.constexpr,
+):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    loop_k = tl.minimum(tl.maximum(actual_k + LOOP_UPPER_BIAS, 0), K)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(0, loop_k, BLOCK_K):
+        logical_k = k_start + offs_k
+        a_mask = (offs_m[:, None] < actual_m) & (logical_k[None, :] < actual_k)
+        b_mask = (logical_k[:, None] < actual_k) & (offs_n[None, :] < actual_n)
+        a = tl.load(
+            a_ptr + offs_m[:, None] * K + logical_k[None, :],
+            mask=a_mask,
+            other=0,
+        )
+        b = tl.load(
+            b_ptr + logical_k[:, None] * N + offs_n[None, :],
+            mask=b_mask,
+            other=0,
+        )
+        a_scale = tl.load(
+            a_scale_ptr
+            + offs_m[:, None] * (K // SCALE_FACTOR + A_SCALE_ROW_STRIDE_BIAS)
+            + k_start // SCALE_FACTOR
+            + offs_scale_k[None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            A_ELEM_TYPE,
+            b,
+            b_scale,
+            B_ELEM_TYPE,
+            acc,
+            fast_math=False,
+        )
+    output_mask = (offs_m[:, None] < actual_m) & (offs_n[None, :] < actual_n)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc, mask=output_mask)
+
+
+@triton.jit
+def dot_scaled_dynamic_upper_unmasked_loop_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    actual_k,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_FACTOR: tl.constexpr,
+):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    loop_k = tl.minimum(tl.maximum(actual_k, 0), K)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(0, loop_k, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(
+            a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        b_scale = tl.load(
+            b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR) + k_start // SCALE_FACTOR + offs_scale_k[None, :]
+        )
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            "fp16",
+            b,
+            b_scale,
+            "fp16",
             acc,
             fast_math=False,
         )
@@ -604,31 +820,97 @@ def test_dot_scaled_e4m3_batched_per_batch_scales():
     assert torch.equal(output.cpu(), expected)
 
 
-def test_dot_scaled_batched_noncontiguous_scale_batch_stride_is_named(capfd):
-    batch, M, N, K = 2, 16, 16, 32
-    a = torch.zeros((batch, M, K), dtype=torch.uint8, device="mps")
-    b = torch.zeros((batch, K, N), dtype=torch.uint8, device="mps")
-    a_scale = torch.full((batch * (M + 1), K // 32), 127, dtype=torch.uint8, device="mps")
-    b_scale = torch.full((batch, N, K // 32), 127, dtype=torch.uint8, device="mps")
+def test_dot_scaled_batched_noncontiguous_scale_batch_stride_reads_padded_scales():
+    batch, M, N, K = 2, 16, 16, 64
+    one = 0x38
+    a = torch.full((batch, M, K), one, dtype=torch.uint8, device="mps")
+    b = torch.full((batch, K, N), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((batch * (M + 1), K // 32), 255, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((batch * (N + 1), K // 32), 255, dtype=torch.uint8, device="mps")
+    a_scale[:M] = 127
+    a_scale[M + 1 : M + 1 + M] = 128
+    b_scale[:N] = 127
+    b_scale[N + 1 : N + 1 + N] = 129
+    output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_batched_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        batch,
+        M,
+        N,
+        K,
+        PER_BATCH_SCALES=True,
+        A_SCALE_BATCH_STRIDE=(M + 1) * (K // 32),
+        B_SCALE_BATCH_STRIDE=(N + 1) * (K // 32),
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.stack([torch.full((M, N), float(K)), torch.full((M, N), float(8 * K))])
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_dot_scaled_batched_dynamic_scale_batch_stride_reads_padded_scales():
+    batch, M, N, K = 2, 16, 16, 64
+    one = 0x38
+    a = torch.full((batch, M, K), one, dtype=torch.uint8, device="mps")
+    b = torch.full((batch, K, N), one, dtype=torch.uint8, device="mps")
+    a_scale = torch.full((batch * (M + 1), K // 32), 255, dtype=torch.uint8, device="mps")
+    b_scale = torch.full((batch * (N + 1), K // 32), 255, dtype=torch.uint8, device="mps")
+    a_scale[:M] = 127
+    a_scale[M + 1 : M + 1 + M] = 128
+    b_scale[:N] = 127
+    b_scale[N + 1 : N + 1 + N] = 129
+    output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_e4m3_batched_dynamic_scale_stride_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        (M + 1) * (K // 32),
+        (N + 1) * (K // 32),
+        batch,
+        M,
+        N,
+        K,
+        SCALE_BATCH_ORIGIN=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.stack([torch.full((M, N), float(K)), torch.full((M, N), float(8 * K))])
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_dot_scaled_batched_dynamic_scale_batch_origin_is_named(capfd):
+    batch, M, N, K = 2, 16, 16, 64
+    a = torch.full((batch, M, K), 0x38, dtype=torch.uint8, device="mps")
+    b = torch.full((batch, K, N), 0x38, dtype=torch.uint8, device="mps")
+    a_scale = torch.full(((batch + 1) * (M + 1), K // 32), 127, dtype=torch.uint8, device="mps")
+    b_scale = torch.full(((batch + 1) * (N + 1), K // 32), 127, dtype=torch.uint8, device="mps")
     output = torch.empty((batch, M, N), dtype=torch.float32, device="mps")
 
     with pytest.raises(Exception):
-        dot_scaled_e4m3_batched_u8_kernel[(1,)](
+        dot_scaled_e4m3_batched_dynamic_scale_stride_u8_kernel[(1,)](
             a,
             b,
             a_scale,
             b_scale,
             output,
+            (M + 1) * (K // 32),
+            (N + 1) * (K // 32),
             batch,
             M,
             N,
             K,
-            PER_BATCH_SCALES=True,
-            A_SCALE_BATCH_STRIDE=M * (K // 32) + 1,
-            B_SCALE_BATCH_STRIDE=N * (K // 32),
+            SCALE_BATCH_ORIGIN=1,
             num_warps=4,
         )
-    assert "contiguous per-batch scale matrices" in capfd.readouterr().err
+    assert "canonical zero-based per-batch scale stride" in capfd.readouterr().err
 
 
 def test_dot_scaled_e4m3_batched_masked_ragged_mnk():
@@ -786,11 +1068,68 @@ def test_dot_scaled_loop_accumulates_payload_and_scale_groups(elem_type, one, tw
         BLOCK_K=scale_factor,
         SCALE_FACTOR=scale_factor,
         LOOP_START=0,
-        ELEM_TYPE=elem_type,
+        A_ELEM_TYPE=elem_type,
+        B_ELEM_TYPE=elem_type,
         num_warps=4,
     )
     torch.mps.synchronize()
     assert torch.equal(output.cpu(), torch.full((M, N), 160.0))
+
+
+@pytest.mark.parametrize(
+    ("a_elem_type", "b_elem_type", "a_one", "a_two", "b_one", "b_two"),
+    [
+        pytest.param("e4m3", "e5m2", 0x38, 0x40, 0x40, 0x44, id="a-e4m3-b-e5m2"),
+        pytest.param("e5m2", "e4m3", 0x3C, 0x40, 0x40, 0x48, id="a-e5m2-b-e4m3"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("K", "loop_start", "expected"),
+    [
+        pytest.param(64, 0, 320.0, id="zero-start"),
+        pytest.param(96, 32, 416.0, id="nonzero-start"),
+    ],
+)
+def test_dot_scaled_loop_mixed_e4m3_e5m2_accumulates_payload_and_scale_groups(
+    a_elem_type,
+    b_elem_type,
+    a_one,
+    a_two,
+    b_one,
+    b_two,
+    K,
+    loop_start,
+    expected,
+):
+    M = N = 16
+    a = torch.full((M, K), a_one, dtype=torch.uint8)
+    a[:, K // 2 :] = a_two
+    b = torch.full((K, N), b_one, dtype=torch.uint8)
+    b[K // 2 :, :] = b_two
+    a_scale = torch.full((M, K // 32), 127, dtype=torch.uint8)
+    a_scale[:, 1:] = 128
+    b_scale = torch.full((N, K // 32), 127, dtype=torch.uint8)
+    b_scale[:, 1:] = 126
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_loop_kernel[(1,)](
+        a.to("mps"),
+        b.to("mps"),
+        a_scale.to("mps"),
+        b_scale.to("mps"),
+        output,
+        M,
+        N,
+        K,
+        BLOCK_K=32,
+        SCALE_FACTOR=32,
+        LOOP_START=loop_start,
+        A_ELEM_TYPE=a_elem_type,
+        B_ELEM_TYPE=b_elem_type,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(output.cpu(), torch.full((M, N), expected))
 
 
 @pytest.mark.parametrize(
@@ -804,11 +1143,40 @@ def test_dot_scaled_loop_accumulates_payload_and_scale_groups(elem_type, one, tw
         pytest.param("bf16", 1.0, 2.0, torch.bfloat16, 32, id="bf16-sf32"),
     ],
 )
-def test_dot_scaled_loop_nonzero_start_is_named(capfd, elem_type, one, two, dtype, scale_factor):
+def test_dot_scaled_loop_accumulates_nonzero_start_payload_and_scale_groups(elem_type, one, two, dtype, scale_factor):
     M = N = 16
     K = 4 * scale_factor
     a, b, a_scale, b_scale = _loop_scaled_inputs(
         M=M, N=N, K=K, one=one, two=two, dtype=dtype, scale_factor=scale_factor
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    dot_scaled_loop_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        BLOCK_K=scale_factor,
+        SCALE_FACTOR=scale_factor,
+        LOOP_START=scale_factor,
+        A_ELEM_TYPE=elem_type,
+        B_ELEM_TYPE=elem_type,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(output.cpu(), torch.full((M, N), float(9 * scale_factor)))
+
+
+def test_dot_scaled_loop_misaligned_nonzero_start_is_named(capfd):
+    M = N = 16
+    scale_factor = 32
+    K = 4 * scale_factor
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=0x38, two=0x40, dtype=torch.uint8, scale_factor=scale_factor
     )
     output = torch.empty((M, N), dtype=torch.float32, device="mps")
 
@@ -824,11 +1192,348 @@ def test_dot_scaled_loop_nonzero_start_is_named(capfd, elem_type, one, two, dtyp
             K,
             BLOCK_K=scale_factor,
             SCALE_FACTOR=scale_factor,
-            LOOP_START=scale_factor,
-            ELEM_TYPE=elem_type,
+            LOOP_START=scale_factor // 2,
+            A_ELEM_TYPE="e4m3",
+            B_ELEM_TYPE="e4m3",
             num_warps=4,
         )
-    assert "zero-based full-K loop" in capfd.readouterr().err
+    assert "nonnegative aligned divisible bounds" in capfd.readouterr().err
+
+
+def test_dot_scaled_loop_negative_start_is_named(capfd):
+    M = N = 16
+    scale_factor = 32
+    K = 2 * scale_factor
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=0x38, two=0x40, dtype=torch.uint8, scale_factor=scale_factor
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            M,
+            N,
+            K,
+            BLOCK_K=scale_factor,
+            SCALE_FACTOR=scale_factor,
+            LOOP_START=-scale_factor,
+            A_ELEM_TYPE="e4m3",
+            B_ELEM_TYPE="e4m3",
+            num_warps=4,
+        )
+    assert "nonnegative aligned divisible bounds" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("elem_type", "one", "two", "dtype", "scale_factor"),
+    [
+        pytest.param("e4m3", 0x38, 0x40, torch.uint8, 32, id="e4m3-sf32"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 16, id="fp16-sf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("actual_k", "expected_value"),
+    [
+        pytest.param(-1, 0.0, id="negative-k-clamps-to-zero"),
+        pytest.param(48, 96.0, id="partial-k"),
+        pytest.param(80, 160.0, id="oversized-k-clamps-to-static-upper"),
+    ],
+)
+def test_dot_scaled_masked_loop_clamps_k_and_preserves_mn_tails(
+    elem_type,
+    one,
+    two,
+    dtype,
+    scale_factor,
+    actual_k,
+    expected_value,
+):
+    M = N = 16
+    K = 64
+    actual_m, actual_n = 13, 11
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=one, two=two, dtype=dtype, scale_factor=scale_factor
+    )
+    sentinel = -7.0
+    output = torch.full((M, N), sentinel, dtype=torch.float32, device="mps")
+
+    dot_scaled_masked_loop_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        actual_m,
+        actual_n,
+        actual_k,
+        M,
+        N,
+        K,
+        BLOCK_K=scale_factor,
+        SCALE_FACTOR=scale_factor,
+        LOOP_START=0,
+        A_ELEM_TYPE=elem_type,
+        B_ELEM_TYPE=elem_type,
+        LOAD_OTHER=0,
+        A_K_BOUND_BIAS=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.full((M, N), sentinel)
+    expected[:actual_m, :actual_n] = expected_value
+    assert torch.equal(output.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    ("elem_type", "one", "two", "dtype", "scale_factor"),
+    [
+        pytest.param("e4m3", 0x38, 0x40, torch.uint8, 32, id="e4m3-sf32"),
+        pytest.param("fp16", 1.0, 2.0, torch.float16, 16, id="fp16-sf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("actual_k", "expected_value"),
+    [
+        pytest.param(-1, 0.0, id="negative-k-clamps-to-zero"),
+        pytest.param(0, 0.0, id="zero-k"),
+        pytest.param(27, 27.0, id="partial-first-group"),
+        pytest.param(48, 96.0, id="partial-k"),
+        pytest.param(64, 160.0, id="capacity-k"),
+        pytest.param(80, 160.0, id="oversized-k-clamps-to-capacity"),
+    ],
+)
+def test_dot_scaled_dynamic_upper_masked_loop_clamps_k_and_preserves_mn_tails(
+    elem_type,
+    one,
+    two,
+    dtype,
+    scale_factor,
+    actual_k,
+    expected_value,
+):
+    M = N = 16
+    K = 64
+    actual_m, actual_n = 13, 11
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=one, two=two, dtype=dtype, scale_factor=scale_factor
+    )
+    sentinel = -7.0
+    output = torch.full((M, N), sentinel, dtype=torch.float32, device="mps")
+
+    dot_scaled_dynamic_upper_masked_loop_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        actual_m,
+        actual_n,
+        actual_k,
+        M,
+        N,
+        K,
+        BLOCK_K=scale_factor,
+        SCALE_FACTOR=scale_factor,
+        A_ELEM_TYPE=elem_type,
+        B_ELEM_TYPE=elem_type,
+        LOOP_UPPER_BIAS=0,
+        A_SCALE_ROW_STRIDE_BIAS=0,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    expected = torch.full((M, N), sentinel)
+    expected[:actual_m, :actual_n] = expected_value
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_dot_scaled_dynamic_upper_unmasked_loop_is_named(capfd):
+    M = N = 16
+    K = 64
+    scale_factor = 16
+    a, b, a_scale, b_scale = _loop_scaled_inputs(
+        M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=scale_factor
+    )
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_dynamic_upper_unmasked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            48,
+            M,
+            N,
+            K,
+            BLOCK_K=scale_factor,
+            SCALE_FACTOR=scale_factor,
+            num_warps=4,
+        )
+    assert "dynamic-upper form requires matched zero-filled rectangular A/B loads" in capfd.readouterr().err
+
+
+def test_dot_scaled_dynamic_upper_masked_loop_rejects_noncanonical_upper(capfd):
+    M = N = 16
+    K = 64
+    actual_m, actual_n, actual_k = 13, 11, 48
+    a, b, a_scale, b_scale = _loop_scaled_inputs(M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=16)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_dynamic_upper_masked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            actual_m,
+            actual_n,
+            actual_k,
+            M,
+            N,
+            K,
+            BLOCK_K=16,
+            SCALE_FACTOR=16,
+            A_ELEM_TYPE="fp16",
+            B_ELEM_TYPE="fp16",
+            LOOP_UPPER_BIAS=1,
+            A_SCALE_ROW_STRIDE_BIAS=0,
+            num_warps=4,
+        )
+    assert "min(max(mask_k, 0), full_k) upper" in capfd.readouterr().err
+
+
+def test_dot_scaled_dynamic_upper_masked_loop_rejects_padded_scale_row(capfd):
+    M = N = 16
+    K = 64
+    actual_m, actual_n, actual_k = 13, 11, 48
+    a, b, a_scale, b_scale = _loop_scaled_inputs(M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=16)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_dynamic_upper_masked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            actual_m,
+            actual_n,
+            actual_k,
+            M,
+            N,
+            K,
+            BLOCK_K=16,
+            SCALE_FACTOR=16,
+            A_ELEM_TYPE="fp16",
+            B_ELEM_TYPE="fp16",
+            LOOP_UPPER_BIAS=0,
+            A_SCALE_ROW_STRIDE_BIAS=1,
+            num_warps=4,
+        )
+    assert "requires direct unmasked row-major i8 scale loads" in capfd.readouterr().err
+
+
+def test_dot_scaled_masked_loop_nonzero_other_is_named(capfd):
+    M = N = 16
+    K = 64
+    actual_m, actual_n, actual_k = 13, 11, 48
+    a, b, a_scale, b_scale = _loop_scaled_inputs(M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=16)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_masked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            actual_m,
+            actual_n,
+            actual_k,
+            M,
+            N,
+            K,
+            BLOCK_K=16,
+            SCALE_FACTOR=16,
+            LOOP_START=0,
+            A_ELEM_TYPE="fp16",
+            B_ELEM_TYPE="fp16",
+            LOAD_OTHER=1,
+            A_K_BOUND_BIAS=0,
+            num_warps=4,
+        )
+    assert "matched zero-filled rectangular A/B loads" in capfd.readouterr().err
+
+
+def test_dot_scaled_masked_loop_mismatched_k_bound_is_named(capfd):
+    M = N = 16
+    K = 64
+    actual_m, actual_n, actual_k = 13, 11, 48
+    a, b, a_scale, b_scale = _loop_scaled_inputs(M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=16)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_masked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            actual_m,
+            actual_n,
+            actual_k,
+            M,
+            N,
+            K,
+            BLOCK_K=16,
+            SCALE_FACTOR=16,
+            LOOP_START=0,
+            A_ELEM_TYPE="fp16",
+            B_ELEM_TYPE="fp16",
+            LOAD_OTHER=0,
+            A_K_BOUND_BIAS=1,
+            num_warps=4,
+        )
+    assert "matched zero-filled rectangular A/B loads" in capfd.readouterr().err
+
+
+def test_dot_scaled_masked_loop_nonzero_start_is_named(capfd):
+    M = N = 16
+    K = 64
+    actual_m, actual_n, actual_k = 13, 11, 48
+    a, b, a_scale, b_scale = _loop_scaled_inputs(M=M, N=N, K=K, one=1.0, two=2.0, dtype=torch.float16, scale_factor=16)
+    output = torch.empty((M, N), dtype=torch.float32, device="mps")
+
+    with pytest.raises(Exception):
+        dot_scaled_masked_loop_kernel[(1,)](
+            a,
+            b,
+            a_scale,
+            b_scale,
+            output,
+            actual_m,
+            actual_n,
+            actual_k,
+            M,
+            N,
+            K,
+            BLOCK_K=16,
+            SCALE_FACTOR=16,
+            LOOP_START=16,
+            A_ELEM_TYPE="fp16",
+            B_ELEM_TYPE="fp16",
+            LOAD_OTHER=0,
+            A_K_BOUND_BIAS=0,
+            num_warps=4,
+        )
+    assert "masked form currently requires a zero-based K loop" in capfd.readouterr().err
 
 
 def _loop_e2m1_inputs(*, M, N, K, lhs_k_pack, rhs_k_pack):
@@ -893,7 +1598,7 @@ def test_dot_scaled_loop_e2m1_accumulates_packed_payload_and_scale_groups(lhs_k_
         pytest.param(False, False, id="oo"),
     ],
 )
-def test_dot_scaled_loop_e2m1_nonzero_start_is_named(capfd, lhs_k_pack, rhs_k_pack):
+def test_dot_scaled_loop_e2m1_accumulates_nonzero_start_packed_payload_and_scale_groups(lhs_k_pack, rhs_k_pack):
     M = N = 16
     K = 96
     a, b, a_scale, b_scale = _loop_e2m1_inputs(
@@ -905,24 +1610,24 @@ def test_dot_scaled_loop_e2m1_nonzero_start_is_named(capfd, lhs_k_pack, rhs_k_pa
     )
     output = torch.empty((M, N), dtype=torch.float32, device="mps")
 
-    with pytest.raises(Exception):
-        dot_scaled_loop_e2m1_u8_kernel[(1,)](
-            a,
-            b,
-            a_scale,
-            b_scale,
-            output,
-            M,
-            N,
-            K,
-            BLOCK_K=32,
-            LOOP_START=32,
-            LHS_K_PACK=lhs_k_pack,
-            RHS_K_PACK=rhs_k_pack,
-            PACKED_K_DIVISOR=2,
-            num_warps=4,
-        )
-    assert "zero-based full-K loop" in capfd.readouterr().err
+    dot_scaled_loop_e2m1_u8_kernel[(1,)](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        BLOCK_K=32,
+        LOOP_START=32,
+        LHS_K_PACK=lhs_k_pack,
+        RHS_K_PACK=rhs_k_pack,
+        PACKED_K_DIVISOR=2,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(output.cpu(), torch.full((M, N), 224.0))
 
 
 @pytest.mark.parametrize(

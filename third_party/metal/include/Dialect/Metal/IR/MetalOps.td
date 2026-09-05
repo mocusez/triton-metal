@@ -1856,11 +1856,13 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     tile-loop iteration) and emits an `scf.for` reduction
 
       acc = c_init;
-      for (k = 0; k < reduction_extent; ++k)
+      for (local_k = 0; local_k < reduction_extent; ++local_k) {
+        k = reduction_start + local_k;
         acc += a_buf[a_base_offset + a_batch_offset +
                      gRow*stride_a + k*a_inner_stride]
              * b_buf[b_base_offset + b_batch_offset +
                      k*stride_b + gCol*b_inner_stride];
+      }
 
     where `(localBatch, linRow, linCol)` are recovered from the blocked tile
     geometry and `(gRow, gCol) = (row_origin + linRow, col_origin + linCol)`.
@@ -1875,7 +1877,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     contributions for the current batch lane. The geometry is pinned to the
     function-wide tile loop so it remains aligned with the store when a folded
     result layout conversion uses a different blocked encoding. The reduction
-    trip count is `reduction_extent` (normally equal to logical K).  A
+    trip count is `reduction_extent` (normally equal to logical K) and starts
+    at `reduction_start` (normally zero).  A
     `transpose_a` unit attribute changes A's physical index to
     `k*stride_a + gRow*a_inner_stride`; a `transpose_b` unit attribute likewise
     changes B's to `gCol*stride_b + k*b_inner_stride`, which is what
@@ -1896,19 +1899,21 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
     before the tiled pointer chain, such as a batched matrix's per-program base.
     The optional `scale_bufs`/`scale_params` tail carries the first exact
     software `tt.dot_scaled` slice.  It contains two buffers (A then B, with an
-    unused matrix buffer as the placeholder for an unscaled side) and five
-    ui32 parameters: A/B scale base offsets, A/B scale row strides, and the
-    shared 16- or 32-element scale factor.  Unit attributes identify which
-    sides are scaled and whether scale-NaN masking may be skipped. Optional
-    `metal.a_scale_batch_stride`/`metal.b_scale_batch_stride` integer
-    attributes add the logical batch coordinate times a proven static
-    contiguous scale-matrix stride; absent attributes retain batch-shared
-    scales. The lowering decodes each E8M0 byte into the operand compute type;
+    unused matrix buffer as the placeholder for an unscaled side) and seven
+    ui32 parameters: A/B scale base offsets, A/B scale row strides, A/B scale
+    batch strides, and the shared 16- or 32-element scale factor. The batch
+    strides are exact operands, so zero retains batch-shared scales while
+    static padding and runtime strides remain observable. Unit attributes
+    identify which sides are scaled and whether scale-NaN masking may be
+    skipped. The lowering decodes each E8M0 byte into the operand compute type;
     optional markers identify E2M1 (packed along K or the outer matrix
-    dimension) or byte-backed E4M3FN/E5M2 payloads. Every finite payload is
-    widened exactly to bf16 before scaling; NaN class is preserved without
-    promising payload bits. The scaled operand is rounded at that compute type
-    and only then extended for f32 accumulation. Exact
+    dimension) or byte-backed E4M3FN/E5M2 payloads. E2M1 is always shared by
+    both operands; FP8 markers identify each operand independently so mixed
+    E4M3FN/E5M2 pairs retain their distinct decoders. Conflicting or one-sided
+    packed-payload markers are rejected. Every finite payload is widened
+    exactly to bf16 before scaling; NaN class is preserved without promising
+    payload bits. The scaled operand is rounded at that compute type and only
+    then extended for f32 accumulation. Exact
     cross-backend numerical parity excludes denormal products or accumulation
     results on targets whose native floating-point arithmetic flushes them.
     NOTE: this is O(M*N*K) scalar work with no matrix-unit reuse — a correctness
@@ -1922,7 +1927,7 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        UI32:$batch_origin, UI32:$row_origin, UI32:$col_origin,
                        UI32:$stride_a, UI32:$stride_b,
                        UI32:$a_inner_stride, UI32:$b_inner_stride,
-                       UI32:$reduction_extent,
+                       UI32:$reduction_start, UI32:$reduction_extent,
                        AnyType:$c_init,
                        Variadic<AnyType>:$output_indices,
                        Optional<Metal_MemRefType>:$weight_buf,
@@ -1937,7 +1942,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        " `,` $b_batch_offset `]` `origin` `[` $batch_origin"
                        " `,` $row_origin `,` $col_origin `]`"
                        " `,` $stride_a `,` $stride_b `,` $a_inner_stride"
-                       " `,` $b_inner_stride `,` $reduction_extent"
+                       " `,` $b_inner_stride `,` $reduction_start"
+                       " `,` $reduction_extent"
                        " `,` $c_init"
                        " (`output` `[` $output_indices^ `]`)?"
                        " (`weight` $weight_buf^)?"

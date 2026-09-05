@@ -21479,7 +21479,9 @@ struct SdScaleInfo {
   mlir::triton::LoadOp bScaleLoad;
   int32_t scaleFactor;
   bool fastMath;
-  enum class PackedPayloadKind { None, E2M1, E4M3, E5M2 } payloadKind;
+  enum class PackedPayloadKind { None, E2M1, E4M3, E5M2 };
+  PackedPayloadKind lhsPayloadKind;
+  PackedPayloadKind rhsPayloadKind;
   bool lhsKPack = true;
   bool rhsKPack = true;
 };
@@ -21533,16 +21535,16 @@ sdMakeAvailableBefore(mlir::Value v, mlir::Operation *insertBefore,
   return clone->getResult(mlir::cast<mlir::OpResult>(v).getResultNumber());
 }
 
-static std::optional<int64_t>
+static std::optional<SdAxisStride>
 sdCanonicalScaleBatchStride(mlir::Value ptr, mlir::RankedTensorType scaleTy);
 
 static ScalarDotOp sdCreateScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
-    mlir::Value reductionExtent = {}, bool transposeA = false,
-    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false,
-    bool inferPhysicalStrides = false) {
+    mlir::Value reductionStart = {}, mlir::Value reductionExtent = {},
+    bool transposeA = false, const SdScaleInfo *scaleInfo = nullptr,
+    bool transposeB = false, bool inferPhysicalStrides = false) {
   // Strides: A/B leading-dim (row) multiplier. For ordinary contiguous
   // row-major inputs the A row stride equals the (masked) K extent, so it is
   // also the default reduction trip count. The weighted-Gram path supplies a
@@ -21682,12 +21684,15 @@ static ScalarDotOp sdCreateScalarDot(
       return emitConstUi32(0);
     return toUi32(total);
   };
-  bool bytePayloads = scaleInfo && scaleInfo->payloadKind !=
-                                       SdScaleInfo::PackedPayloadKind::None;
+  auto isBytePayload = [](SdScaleInfo::PackedPayloadKind kind) {
+    return kind != SdScaleInfo::PackedPayloadKind::None;
+  };
+  bool aBytePayload = scaleInfo && isBytePayload(scaleInfo->lhsPayloadKind);
+  bool bBytePayload = scaleInfo && isBytePayload(scaleInfo->rhsPayloadKind);
   mlir::Type aStorageTy =
-      bytePayloads ? mlir::Type(builder.getI8Type()) : aTy.getElementType();
+      aBytePayload ? mlir::Type(builder.getI8Type()) : aTy.getElementType();
   mlir::Type bStorageTy =
-      bytePayloads ? mlir::Type(builder.getI8Type()) : bTy.getElementType();
+      bBytePayload ? mlir::Type(builder.getI8Type()) : bTy.getElementType();
   mlir::Value aBuf =
       bridgePtrToMemref(builder, loc, aParts.rootArg, aStorageTy);
   mlir::Value bBuf =
@@ -21781,6 +21786,8 @@ static ScalarDotOp sdCreateScalarDot(
                      /*defaultConstant=*/1);
   mlir::Value reductionExtentUi32 =
       reductionExtent ? toUi32(reductionExtent) : strideA;
+  mlir::Value reductionStartUi32 =
+      reductionStart ? toUi32(reductionStart) : emitConstUi32(0);
   llvm::SmallVector<mlir::Value, 4> outputIndices;
   const bool hasRank2OutputIndices = resultTensorTy.getRank() == 2 && store &&
                                      cParts.rowContrib && cParts.colContrib;
@@ -21824,22 +21831,20 @@ static ScalarDotOp sdCreateScalarDot(
   }
 
   llvm::SmallVector<mlir::Value, 2> scaleBufs;
-  llvm::SmallVector<mlir::Value, 5> scaleParams;
-  int64_t aScaleBatchStride = 0;
-  int64_t bScaleBatchStride = 0;
+  llvm::SmallVector<mlir::Value, 7> scaleParams;
   if (scaleInfo) {
     struct ScaleOperands {
       mlir::Value buffer;
       mlir::Value baseOffset;
       mlir::Value rowStride;
-      int64_t batchStride;
+      mlir::Value batchStride;
     };
     auto emitScaleOperands =
         [&](mlir::triton::LoadOp scaleLoad,
             mlir::Value placeholder) -> std::optional<ScaleOperands> {
       if (!scaleLoad)
         return ScaleOperands{placeholder, emitConstUi32(0), emitConstUi32(0),
-                             0};
+                             emitConstUi32(0)};
       auto scaleTy =
           mlir::dyn_cast<mlir::RankedTensorType>(scaleLoad.getType());
       if (!scaleTy || (scaleTy.getRank() != 2 && scaleTy.getRank() != 3) ||
@@ -21858,13 +21863,14 @@ static ScalarDotOp sdCreateScalarDot(
         constantStride = 1;
       if (!dynamicStride && (!constantStride || *constantStride <= 0))
         return std::nullopt;
-      int64_t batchStride = 0;
+      mlir::Value batchStride = emitConstUi32(0);
       if (scaleTy.getRank() == 3) {
         auto canonicalBatchStride =
             sdCanonicalScaleBatchStride(scaleLoad.getPtr(), scaleTy);
         if (!canonicalBatchStride)
           return std::nullopt;
-        batchStride = *canonicalBatchStride;
+        batchStride = emitAxisStride(canonicalBatchStride, {}, std::nullopt,
+                                     /*defaultConstant=*/0);
       }
       mlir::Value buffer = bridgePtrToMemref(builder, loc, parts.rootArg,
                                              scaleTy.getElementType());
@@ -21880,9 +21886,8 @@ static ScalarDotOp sdCreateScalarDot(
     scaleBufs.assign({aScale->buffer, bScale->buffer});
     scaleParams.assign({aScale->baseOffset, bScale->baseOffset,
                         aScale->rowStride, bScale->rowStride,
+                        aScale->batchStride, bScale->batchStride,
                         emitConstUi32(scaleInfo->scaleFactor)});
-    aScaleBatchStride = aScale->batchStride;
-    bScaleBatchStride = bScale->batchStride;
   }
 
   llvm::SmallVector<mlir::Value, 3> partialExtents;
@@ -21916,31 +21921,37 @@ static ScalarDotOp sdCreateScalarDot(
   auto scalarDot = ScalarDotOp::create(
       builder, loc, resultTensorTy, aBuf, bBuf, aBaseOffset, bBaseOffset,
       aBatchOffset, bBatchOffset, batchOrigin, rowOrigin, colOrigin, strideA,
-      strideB, innerStrideA, innerStrideB, reductionExtentUi32, cInit,
-      outputIndices, weightBuf, partialExtents, scaleBufs, scaleParams);
+      strideB, innerStrideA, innerStrideB, reductionStartUi32,
+      reductionExtentUi32, cInit, outputIndices, weightBuf, partialExtents,
+      scaleBufs, scaleParams);
   if (scaleInfo) {
-    if (aScaleBatchStride > 0)
-      scalarDot->setAttr("metal.a_scale_batch_stride",
-                         builder.getI64IntegerAttr(aScaleBatchStride));
-    if (bScaleBatchStride > 0)
-      scalarDot->setAttr("metal.b_scale_batch_stride",
-                         builder.getI64IntegerAttr(bScaleBatchStride));
     if (scaleInfo->aScaleLoad)
       scalarDot->setAttr("metal.a_scaled", builder.getUnitAttr());
     if (scaleInfo->bScaleLoad)
       scalarDot->setAttr("metal.b_scaled", builder.getUnitAttr());
     if (scaleInfo->fastMath)
       scalarDot->setAttr("metal.scale_fast_math", builder.getUnitAttr());
-    if (scaleInfo->payloadKind == SdScaleInfo::PackedPayloadKind::E2M1) {
+    if (scaleInfo->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E2M1 &&
+        scaleInfo->rhsPayloadKind == SdScaleInfo::PackedPayloadKind::E2M1) {
       scalarDot->setAttr("metal.e2m1_payloads", builder.getUnitAttr());
       if (!scaleInfo->lhsKPack)
         scalarDot->setAttr("metal.e2m1_lhs_non_k_pack", builder.getUnitAttr());
       if (!scaleInfo->rhsKPack)
         scalarDot->setAttr("metal.e2m1_rhs_non_k_pack", builder.getUnitAttr());
     }
-    if (scaleInfo->payloadKind == SdScaleInfo::PackedPayloadKind::E4M3)
+    if (scaleInfo->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E4M3)
+      scalarDot->setAttr("metal.a_e4m3_payload", builder.getUnitAttr());
+    if (scaleInfo->rhsPayloadKind == SdScaleInfo::PackedPayloadKind::E4M3)
+      scalarDot->setAttr("metal.b_e4m3_payload", builder.getUnitAttr());
+    if (scaleInfo->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E5M2)
+      scalarDot->setAttr("metal.a_e5m2_payload", builder.getUnitAttr());
+    if (scaleInfo->rhsPayloadKind == SdScaleInfo::PackedPayloadKind::E5M2)
+      scalarDot->setAttr("metal.b_e5m2_payload", builder.getUnitAttr());
+    if (scaleInfo->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E4M3 &&
+        scaleInfo->rhsPayloadKind == SdScaleInfo::PackedPayloadKind::E4M3)
       scalarDot->setAttr("metal.e4m3_payloads", builder.getUnitAttr());
-    if (scaleInfo->payloadKind == SdScaleInfo::PackedPayloadKind::E5M2)
+    if (scaleInfo->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E5M2 &&
+        scaleInfo->rhsPayloadKind == SdScaleInfo::PackedPayloadKind::E5M2)
       scalarDot->setAttr("metal.e5m2_payloads", builder.getUnitAttr());
   }
   // Tensor values are scalarized inside one function-wide tile loop.  Record
@@ -21992,12 +22003,14 @@ static ScalarDotOp sdEmitScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
-    mlir::Value reductionExtent = {}, bool transposeA = false,
-    const SdScaleInfo *scaleInfo = nullptr, bool transposeB = false) {
-  auto scalarDot = sdCreateScalarDot(
-      insertBefore, aLoad, bLoad, cInit, replaceTarget, resultTensorTy,
-      weightLoad, reductionExtent, transposeA, scaleInfo, transposeB,
-      /*inferPhysicalStrides=*/false);
+    mlir::Value reductionStart = {}, mlir::Value reductionExtent = {},
+    bool transposeA = false, const SdScaleInfo *scaleInfo = nullptr,
+    bool transposeB = false) {
+  auto scalarDot =
+      sdCreateScalarDot(insertBefore, aLoad, bLoad, cInit, replaceTarget,
+                        resultTensorTy, weightLoad, reductionStart,
+                        reductionExtent, transposeA, scaleInfo, transposeB,
+                        /*inferPhysicalStrides=*/false);
   if (!scalarDot)
     return {};
   replaceTarget.replaceAllUsesWith(scalarDot.getResult());
@@ -22028,13 +22041,17 @@ static void sdEraseCone(mlir::Value v) {
   }
 }
 
-// Exact tt.dot_scaled envelopes for Metal. Same-type fp16/bf16
-// payloads use their native storage; same-type E2M1 and E4M3FN/E5M2 payloads
-// use byte storage and are decoded explicitly before optional E8M0 scaling.
-// E2M1 may pack each operand along K or its outer matrix dimension. The exact
-// loop-carried slice is a zero-based static rank-2 same-type fp16, bf16, E2M1,
-// E4M3, or E5M2 K loop with one scale group per iteration; mixed formats
-// remain explicit later slices.
+// Exact tt.dot_scaled envelopes for Metal. Same-type fp16/bf16 payloads use
+// their native storage; E2M1 and E4M3FN/E5M2 payloads use byte storage and are
+// decoded explicitly before optional E8M0 scaling. E2M1 may pack each operand
+// along K or its outer matrix dimension, but only as an E2M1/E2M1 pair. The
+// exact loop-carried slice is a rank-2 fp16, bf16, E2M1, or E4M3/E5M2 K loop
+// with one scale group per iteration; mixed FP8 loops are limited to E4M3/E5M2
+// with scale factor 32. An unmasked loop must have a static upper bound. A
+// zero-based loop may use matched zero-filled rectangular A/B masks and a
+// rectangular output-store mask. A dynamic upper must clamp the shared K-mask
+// extent to the static physical full-K capacity proven independently by the A
+// and scale row strides.
 struct SdScaledDotMatch {
   mlir::triton::LoadOp aLoad;
   mlir::triton::LoadOp bLoad;
@@ -22045,7 +22062,8 @@ struct SdScaledDotMatch {
   mlir::Value maskedReductionExtent;
   mlir::RankedTensorType resultType;
   int32_t scaleFactor;
-  SdScaleInfo::PackedPayloadKind payloadKind;
+  SdScaleInfo::PackedPayloadKind lhsPayloadKind;
+  SdScaleInfo::PackedPayloadKind rhsPayloadKind;
   bool lhsKPack;
   bool rhsKPack;
 };
@@ -22100,6 +22118,35 @@ static bool sdAreSameMaskExtent(mlir::Value lhs, mlir::Value rhs) {
   auto lhsConstant = sdDenseSplatIntConstant(lhs);
   auto rhsConstant = sdDenseSplatIntConstant(rhs);
   return lhsConstant && rhsConstant && *lhsConstant == *rhsConstant;
+}
+
+// Match min(max(maskedK, 0), fullK). Dynamic loop-carried scaled dots use
+// this exact source-level clamp so the loop never advances beyond the static
+// payload/scale capacity, while the K masks retain the original runtime bound
+// for a partial final group. Keep this deliberately structural: accepting an
+// arbitrary related expression would make erasing the source loop depend on
+// cross-operation range reasoning that belongs in a separate analysis pass.
+static bool sdIsCanonicalClampedLoopUpper(mlir::Value upper,
+                                          mlir::Value maskedK, int64_t fullK) {
+  auto min = upper.getDefiningOp<mlir::arith::MinSIOp>();
+  if (!min)
+    return false;
+  mlir::Value clampedLow;
+  if (getScalarIntConstant(min.getLhs()) == fullK)
+    clampedLow = min.getRhs();
+  else if (getScalarIntConstant(min.getRhs()) == fullK)
+    clampedLow = min.getLhs();
+  else
+    return false;
+
+  auto max = clampedLow.getDefiningOp<mlir::arith::MaxSIOp>();
+  if (!max)
+    return false;
+  if (getScalarIntConstant(max.getLhs()) == 0)
+    return sdAreSameMaskExtent(max.getRhs(), maskedK);
+  if (getScalarIntConstant(max.getRhs()) == 0)
+    return sdAreSameMaskExtent(max.getLhs(), maskedK);
+  return false;
 }
 
 static bool sdIsScaleRowStride(mlir::Value v, int depth = 0) {
@@ -22175,9 +22222,8 @@ static bool sdIsCanonicalBatchContribution(mlir::Value v, int64_t batches,
 // `(row, column, rowStride)`.  Scalar addptrs before the tensor splat remain
 // valid because sdSplitPtr carries them as base offsets; shaped origins,
 // slices, padding, and non-unit inner strides must stay outside this envelope.
-static bool sdIsCanonicalRowMajorPointer(mlir::Value ptr,
-                                         mlir::RankedTensorType tensorTy,
-                                         bool allowBroadcastBatch = false) {
+static bool sdHasCanonicalRowMajorAxes(mlir::Value ptr,
+                                       mlir::RankedTensorType tensorTy) {
   if (!tensorTy || (tensorTy.getRank() != 2 && tensorTy.getRank() != 3))
     return false;
   SdPtrParts parts = sdSplitPtr(ptr);
@@ -22188,39 +22234,94 @@ static bool sdIsCanonicalRowMajorPointer(mlir::Value ptr,
   int64_t columns = shape.back();
   if (!dynamicStride && !constantStride && columns == 1)
     constantStride = 1;
-  bool canonicalMatrix =
-      parts.rootArg && parts.rowContrib &&
-      sdIsCanonicalScaleRow(parts.rowContrib, rows) &&
-      (dynamicStride || (constantStride && *constantStride > 0)) &&
-      sdIsUnitScaleColumn(parts.colContrib, columns);
+  return parts.rootArg && parts.rowContrib &&
+         sdIsCanonicalScaleRow(parts.rowContrib, rows) &&
+         (dynamicStride || (constantStride && *constantStride > 0)) &&
+         sdIsUnitScaleColumn(parts.colContrib, columns);
+}
+
+static bool sdIsCanonicalRowMajorPointer(mlir::Value ptr,
+                                         mlir::RankedTensorType tensorTy,
+                                         bool allowBroadcastBatch = false) {
+  bool canonicalMatrix = sdHasCanonicalRowMajorAxes(ptr, tensorTy);
+  SdPtrParts parts = sdSplitPtr(ptr);
   if (!canonicalMatrix || tensorTy.getRank() == 2)
     return canonicalMatrix && !parts.batchContrib;
   if (allowBroadcastBatch)
     return !parts.batchContrib;
   return parts.batchContrib &&
-         sdIsCanonicalBatchContribution(parts.batchContrib, shape.front());
+         sdIsCanonicalBatchContribution(parts.batchContrib,
+                                        tensorTy.getShape().front());
 }
 
-// Return zero for a batch-shared rank-3 scale matrix, its static contiguous
-// batch stride for a canonical per-batch matrix, and nullopt for any other
-// batch mapping. Keeping this stride exact lets scalar_dot reconstruct the
-// scale batch offset from the same logical batch coordinate as A/B/output.
-static std::optional<int64_t>
+// Accept exactly `zero_based_batch_range * dynamic_stride`. Static stride
+// chains are handled by sdIsCanonicalBatchContribution; keeping this separate
+// prevents a dynamic scalar elsewhere in the batch expression from being
+// mistaken for the stride that scalar_dot reconstructs.
+static bool sdIsCanonicalDynamicBatchContribution(mlir::Value v,
+                                                  int64_t batches,
+                                                  mlir::Value stride,
+                                                  int depth = 0) {
+  if (!v || !stride || depth > 8)
+    return false;
+  if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    return sdIsCanonicalDynamicBatchContribution(cvt.getSrc(), batches, stride,
+                                                 depth + 1);
+  if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
+    return sdIsCanonicalDynamicBatchContribution(bc.getSrc(), batches, stride,
+                                                 depth + 1);
+  if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
+    return sdIsCanonicalDynamicBatchContribution(ed.getSrc(), batches, stride,
+                                                 depth + 1);
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtSIOp>())
+    return sdIsCanonicalDynamicBatchContribution(ext.getIn(), batches, stride,
+                                                 depth + 1);
+  if (auto ext = v.getDefiningOp<mlir::arith::ExtUIOp>())
+    return sdIsCanonicalDynamicBatchContribution(ext.getIn(), batches, stride,
+                                                 depth + 1);
+  auto mul = v.getDefiningOp<mlir::arith::MulIOp>();
+  if (!mul)
+    return false;
+  return (sdIsScaleRowIndex(mul.getLhs(), batches, depth + 1) &&
+          sdSplatScalarSource(mul.getRhs()) == stride) ||
+         (sdIsScaleRowIndex(mul.getRhs(), batches, depth + 1) &&
+          sdSplatScalarSource(mul.getLhs()) == stride);
+}
+
+// Return zero for a batch-shared rank-3 scale matrix or the exact static or
+// dynamic stride for a canonical zero-based per-batch matrix. The stride is an
+// SSA operand of scalar_dot so padding is preserved and runtime strides are
+// not frozen into attributes.
+static std::optional<SdAxisStride>
 sdCanonicalScaleBatchStride(mlir::Value ptr, mlir::RankedTensorType scaleTy) {
   if (!scaleTy || scaleTy.getRank() != 3)
     return std::nullopt;
   SdPtrParts parts = sdSplitPtr(ptr);
   if (!parts.batchContrib)
-    return 0;
+    return SdAxisStride{{}, 0, 1};
   auto shape = scaleTy.getShape();
-  if (!sdIsCanonicalBatchContribution(parts.batchContrib, shape.front()))
-    return std::nullopt;
   auto physical = sdFindPhysicalAxisStride(ptr, BatchedMatrixAxis::Batch);
-  int64_t expected = shape[shape.size() - 2] * shape.back();
-  if (!physical || physical->dynamic || !physical->constant ||
-      *physical->constant != expected)
+  if (!physical)
     return std::nullopt;
-  return expected;
+  if (physical->dynamic) {
+    if (!sdIsCanonicalDynamicBatchContribution(
+            parts.batchContrib, shape.front(), physical->dynamic))
+      return std::nullopt;
+  } else if (!physical->constant || *physical->constant <= 0 ||
+             !sdIsCanonicalBatchContribution(parts.batchContrib,
+                                             shape.front())) {
+    return std::nullopt;
+  }
+  return physical;
+}
+
+static bool sdIsCanonicalScalePointer(mlir::Value ptr,
+                                      mlir::RankedTensorType scaleTy) {
+  if (!sdHasCanonicalRowMajorAxes(ptr, scaleTy))
+    return false;
+  if (scaleTy.getRank() == 2)
+    return !sdSplitPtr(ptr).batchContrib;
+  return sdCanonicalScaleBatchStride(ptr, scaleTy).has_value();
 }
 
 static bool sdIsSplatOfLoopBase(mlir::Value v, mlir::Value iv, int64_t divisor,
@@ -22379,10 +22480,13 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
     loopUpper = getScalarIntConstant(loop.getUpperBound());
     loopStep = getScalarIntConstant(loop.getStep());
     if (resultTy.getRank() != 2 || dot->getBlock() != loop.getBody() ||
-        !lower || *lower != 0 || !loopUpper || !loopStep || *loopStep <= 0 ||
-        *loopUpper <= *loopStep || *loopUpper % *loopStep != 0)
-      return reject("loop-carried dot_scaled requires a zero-based full-K loop "
-                    "with static divisible bounds and at least two iterations");
+        !lower || *lower < 0 || !loopStep || *loopStep <= 0 ||
+        *lower % *loopStep != 0 ||
+        (loopUpper && (*loopUpper <= *lower + *loopStep ||
+                       (*loopUpper - *lower) % *loopStep != 0)))
+      return reject(
+          "loop-carried dot_scaled requires a K loop with nonnegative aligned "
+          "divisible bounds and at least two static iterations when unmasked");
     if (loop.getNumResults() != 1 || loop.getNumRegionIterArgs() != 1)
       return reject("loop-carried dot_scaled requires exactly one accumulator");
 
@@ -22441,9 +22545,20 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
   bool sameE2M1 = aElem.isInteger(8) && bElem.isInteger(8) &&
                   dot.getAElemType() == mlir::triton::ScaleDotElemType::E2M1 &&
                   dot.getBElemType() == mlir::triton::ScaleDotElemType::E2M1;
-  if (!sameFp16 && !sameBf16 && !sameE2M1 && !sameE4M3 && !sameE5M2)
+  bool lhsE4M3 = mlir::isa<mlir::Float8E4M3FNType>(aElem) &&
+                 dot.getAElemType() == mlir::triton::ScaleDotElemType::E4M3;
+  bool rhsE4M3 = mlir::isa<mlir::Float8E4M3FNType>(bElem) &&
+                 dot.getBElemType() == mlir::triton::ScaleDotElemType::E4M3;
+  bool lhsE5M2 = mlir::isa<mlir::Float8E5M2Type>(aElem) &&
+                 dot.getAElemType() == mlir::triton::ScaleDotElemType::E5M2;
+  bool rhsE5M2 = mlir::isa<mlir::Float8E5M2Type>(bElem) &&
+                 dot.getBElemType() == mlir::triton::ScaleDotElemType::E5M2;
+  bool mixedE4M3E5M2 = (lhsE4M3 && rhsE5M2) || (lhsE5M2 && rhsE4M3);
+  if (!sameFp16 && !sameBf16 && !sameE2M1 && !sameE4M3 && !sameE5M2 &&
+      !mixedE4M3E5M2)
     return reject("requires matching fp16/fp16, bf16/bf16, "
-                  "e2m1/e2m1, e4m3/e4m3, or e5m2/e5m2 payload formats");
+                  "e2m1/e2m1, e4m3/e4m3, e5m2/e5m2, or mixed e4m3/e5m2 "
+                  "payload formats");
   if (!sameE2M1 && (!dot.getLhsKPack() || !dot.getRhsKPack()))
     return reject("packing outside K is supported only for E2M1 payloads");
   if (!dot.getAScale() && !dot.getBScale())
@@ -22451,13 +22566,15 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
   int32_t scaleFactor = dot.deduceScaleFactor();
   bool loopPayloadAndScaleSupported =
       ((sameFp16 || sameBf16) && (scaleFactor == 16 || scaleFactor == 32)) ||
-      ((sameE2M1 || sameE4M3 || sameE5M2) && scaleFactor == 32);
+      ((sameE2M1 || sameE4M3 || sameE5M2 || mixedE4M3E5M2) &&
+       scaleFactor == 32);
   if (loop && (!loopPayloadAndScaleSupported || !dot.getAScale() ||
                !dot.getBScale() || *loopStep != scaleFactor))
     return reject(
         "loop-carried dot_scaled currently requires matching fp16/fp16 or "
         "bf16/bf16 payloads with scale factor 16 or 32, or matching "
-        "E2M1/E2M1, E4M3/E4M3 or E5M2/E5M2 payloads with scale factor 32; "
+        "E2M1/E2M1, E4M3/E4M3, E5M2/E5M2, or mixed E4M3/E5M2 payloads with "
+        "scale factor 32; "
         "both E8M0 scales and exactly one scale group per iteration are "
         "required");
 
@@ -22465,6 +22582,21 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
   auto bLoad = sdPeelToLoad(dot.getB());
   if (!aLoad || !bLoad)
     return reject("requires direct matrix loads");
+
+  std::optional<int64_t> loopFullK;
+  if (loop) {
+    int64_t aKPackFactor = sameE2M1 && dot.getLhsKPack() ? 2 : 1;
+    SdPtrParts aParts = sdSplitPtr(aLoad.getPtr());
+    auto aRowStride = sdConstStride(aParts.rowContrib);
+    if (!aRowStride || *aRowStride <= 0)
+      return reject("loop-carried dot_scaled requires canonical contiguous "
+                    "full-K A and B pointer arithmetic");
+    loopFullK = *aRowStride * aKPackFactor;
+    if (*loopFullK % scaleFactor != 0 ||
+        (loopUpper && *loopFullK != *loopUpper))
+      return reject("loop-carried dot_scaled requires canonical contiguous "
+                    "full-K A and B pointer arithmetic");
+  }
 
   mlir::Value maskedReductionExtent;
   const bool hasMaskedMatrixLoad = aLoad.getMask() || aLoad.getOther() ||
@@ -22480,7 +22612,8 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
           sdSplitPtr(scaleLoad.getPtr()).batchContrib &&
           !sdCanonicalScaleBatchStride(scaleLoad.getPtr(), scaleTy))
         return reject(
-            "rank-3 dot_scaled requires contiguous per-batch scale matrices");
+            "rank-3 dot_scaled requires a canonical zero-based per-batch "
+            "scale stride");
     }
   }
 
@@ -22496,18 +22629,12 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
         !scaleTy.getElementType().isInteger(8))
       return false;
     if (loop)
-      return scaleLoad->getBlock() == loop.getBody() && loopUpper &&
+      return scaleLoad->getBlock() == loop.getBody() && loopFullK &&
              sdIsCanonicalLoopScalePointer(scaleLoad.getPtr(), scaleTy,
                                            loop.getInductionVar(), scaleFactor,
-                                           *loopUpper / scaleFactor);
+                                           *loopFullK / scaleFactor);
     if (resultTy.getRank() == 3) {
-      auto batchStride =
-          sdCanonicalScaleBatchStride(scaleLoad.getPtr(), scaleTy);
-      if (!batchStride)
-        return false;
-      return sdIsCanonicalRowMajorPointer(
-          scaleLoad.getPtr(), scaleTy,
-          /*allowBroadcastBatch=*/*batchStride == 0);
+      return sdIsCanonicalScalePointer(scaleLoad.getPtr(), scaleTy);
     }
     return sdIsCanonicalRowMajorPointer(scaleLoad.getPtr(), scaleTy);
   };
@@ -22534,11 +22661,12 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
         bLoad->getBlock() != loop.getBody() ||
         aLoadTy.getShape().back() * aKPackFactor != *loopStep ||
         bLoadTy.getShape()[bLoadTy.getRank() - 2] * bKPackFactor != *loopStep ||
+        !loopFullK ||
         !sdIsCanonicalLoopMatrixPointer(
             aLoad.getPtr(), aLoadTy, loop.getInductionVar(), 1, aKPackFactor) ||
         !sdIsCanonicalLoopMatrixPointer(
             bLoad.getPtr(), bLoadTy, loop.getInductionVar(), 0, bKPackFactor) ||
-        !aRowStride || *aRowStride != *loopUpper / aKPackFactor ||
+        !aRowStride || *aRowStride != *loopFullK / aKPackFactor ||
         !bRowStride || *bRowStride != resultN / bOuterPackFactor)
       return reject("loop-carried dot_scaled requires canonical contiguous "
                     "full-K A and B pointer arithmetic");
@@ -22560,10 +22688,17 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
       output = cvt.getResult();
     if (!output.hasOneUse() || *output.getUsers().begin() != store)
       return reject("loop-carried dot_scaled requires one output store");
-    if (hasMaskedMatrixLoad || store.getMask())
+    if (store.getMask() && !hasMaskedMatrixLoad)
       return reject(
-          "loop-carried dot_scaled currently requires unmasked matrix loads "
-          "and an unmasked output store");
+          "loop-carried dot_scaled masked form requires matched matrix loads "
+          "and an output store");
+    if (!loopUpper && !hasMaskedMatrixLoad)
+      return reject(
+          "loop-carried dot_scaled dynamic-upper form requires matched "
+          "zero-filled rectangular A/B loads and an output store");
+    if (hasMaskedMatrixLoad && getScalarIntConstant(loop.getLowerBound()) != 0)
+      return reject("loop-carried dot_scaled masked form currently requires a "
+                    "zero-based K loop");
   }
 
   if (hasMaskedMatrixLoad) {
@@ -22612,12 +22747,26 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
     maskedReductionExtent = aExt.nExtent;
   }
 
+  if (loop && !loopUpper &&
+      (!maskedReductionExtent || !loopFullK ||
+       !sdIsCanonicalClampedLoopUpper(loop.getUpperBound(),
+                                      maskedReductionExtent, *loopFullK)))
+    return reject(
+        "loop-carried dot_scaled dynamic upper bound requires matched "
+        "zero-filled matrix masks and min(max(mask_k, 0), full_k) upper");
+
+  if ((sameE2M1 || sameE4M3 || sameE5M2 || mixedE4M3E5M2) && scaleFactor != 32)
+    return reject("E2M1 and FP8 payloads require a scale factor of 32");
   if (scaleFactor != 16 && scaleFactor != 32)
     return reject("requires a scale factor of 16 or 32");
-  auto payloadKind = sameE2M1   ? SdScaleInfo::PackedPayloadKind::E2M1
-                     : sameE4M3 ? SdScaleInfo::PackedPayloadKind::E4M3
-                     : sameE5M2 ? SdScaleInfo::PackedPayloadKind::E5M2
-                                : SdScaleInfo::PackedPayloadKind::None;
+  auto lhsPayloadKind = sameE2M1  ? SdScaleInfo::PackedPayloadKind::E2M1
+                        : lhsE4M3 ? SdScaleInfo::PackedPayloadKind::E4M3
+                        : lhsE5M2 ? SdScaleInfo::PackedPayloadKind::E5M2
+                                  : SdScaleInfo::PackedPayloadKind::None;
+  auto rhsPayloadKind = sameE2M1  ? SdScaleInfo::PackedPayloadKind::E2M1
+                        : rhsE4M3 ? SdScaleInfo::PackedPayloadKind::E4M3
+                        : rhsE5M2 ? SdScaleInfo::PackedPayloadKind::E5M2
+                                  : SdScaleInfo::PackedPayloadKind::None;
   return SdScaledDotMatch{aLoad,
                           bLoad,
                           aScaleLoad,
@@ -22627,7 +22776,8 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
                           maskedReductionExtent,
                           resultTy,
                           scaleFactor,
-                          payloadKind,
+                          lhsPayloadKind,
+                          rhsPayloadKind,
                           dot.getLhsKPack(),
                           dot.getRhsKPack()};
 }
@@ -22651,15 +22801,49 @@ tryScaledScalarDotFallback(mlir::triton::DotScaledOp dot) {
   mlir::Value b = dot.getB();
   mlir::Value aScale = dot.getAScale();
   mlir::Value bScale = dot.getBScale();
-  SdScaleInfo scaleInfo{match->aScaleLoad,  match->bScaleLoad,
-                        match->scaleFactor, dot.getFastMath(),
-                        match->payloadKind, match->lhsKPack,
-                        match->rhsKPack};
+  SdScaleInfo scaleInfo{match->aScaleLoad,     match->bScaleLoad,
+                        match->scaleFactor,    dot.getFastMath(),
+                        match->lhsPayloadKind, match->rhsPayloadKind,
+                        match->lhsKPack,       match->rhsKPack};
   if (match->loop) {
+    mlir::OpBuilder builder(match->loop);
+    mlir::Value reductionExtent = match->loop.getUpperBound();
+    if (match->loop.getLowerBound()) {
+      reductionExtent =
+          mlir::arith::SubIOp::create(builder, match->loop.getLoc(),
+                                      match->loop.getUpperBound(),
+                                      match->loop.getLowerBound())
+              .getResult();
+    }
+    auto zero = mlir::arith::ConstantOp::create(builder, match->loop.getLoc(),
+                                                builder.getI32IntegerAttr(0));
+    reductionExtent =
+        mlir::arith::MaxSIOp::create(builder, match->loop.getLoc(),
+                                     reductionExtent, zero.getResult())
+            .getResult();
+    if (match->maskedReductionExtent) {
+      auto loc = match->loop.getLoc();
+      auto i32 = builder.getI32Type();
+      mlir::Value maskedExtent = match->maskedReductionExtent;
+      if (maskedExtent.getType() != i32) {
+        auto ui32 = builder.getIntegerType(32, /*isSigned=*/false);
+        maskedExtent = emitExtentUi32(builder, loc, ui32, maskedExtent);
+        maskedExtent = mlir::UnrealizedConversionCastOp::create(
+                           builder, loc, mlir::TypeRange{i32},
+                           mlir::ValueRange{maskedExtent})
+                           .getResult(0);
+      }
+      maskedExtent = mlir::arith::MaxSIOp::create(builder, loc, maskedExtent,
+                                                  zero.getResult())
+                         .getResult();
+      reductionExtent = mlir::arith::MinSIOp::create(builder, loc, maskedExtent,
+                                                     reductionExtent)
+                            .getResult();
+    }
     if (!sdEmitScalarDot(match->store, match->aLoad, match->bLoad,
                          match->loop.getInitArgs()[0], replaceTarget,
-                         resultTensorTy, {}, match->loop.getUpperBound(), false,
-                         &scaleInfo))
+                         resultTensorTy, {}, match->loop.getLowerBound(),
+                         reductionExtent, false, &scaleInfo))
       return mlir::failure();
     if (resultCvt)
       resultCvt.erase();
@@ -22671,7 +22855,7 @@ tryScaledScalarDotFallback(mlir::triton::DotScaledOp dot) {
   auto aShape =
       mlir::cast<mlir::RankedTensorType>(dot.getA().getType()).getShape();
   int64_t reductionElements = aShape.back();
-  if (match->payloadKind == SdScaleInfo::PackedPayloadKind::E2M1 &&
+  if (match->lhsPayloadKind == SdScaleInfo::PackedPayloadKind::E2M1 &&
       match->lhsKPack)
     reductionElements *= 2;
   auto staticReductionExtent = mlir::arith::ConstantOp::create(
@@ -22698,7 +22882,7 @@ tryScaledScalarDotFallback(mlir::triton::DotScaledOp dot) {
   }
   auto store = sdFindStore(replaceTarget);
   if (!store || !sdEmitScalarDot(store, match->aLoad, match->bLoad, dot.getC(),
-                                 replaceTarget, resultTensorTy, {},
+                                 replaceTarget, resultTensorTy, {}, {},
                                  reductionExtent, false, &scaleInfo))
     return mlir::failure();
 
@@ -22820,7 +23004,7 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
   auto cvtA = dot.getA().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
   auto cvtB = dot.getB().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
   if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
-                       resultTensorTy, {}, {}, /*transposeA=*/false,
+                       resultTensorTy, {}, {}, {}, /*transposeA=*/false,
                        /*scaleInfo=*/nullptr,
                        sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();
@@ -22997,30 +23181,26 @@ tryComplexFourDotLoopFallback(mlir::scf::ForOp forOp) {
       return mlir::failure();
     reductionExtent = forOp.getUpperBound();
   }
-  auto rr =
-      sdCreateScalarDot(forOp, rrA, rrB, forOp.getInitArgs()[realIdx],
-                        forOp.getResult(realIdx), resultTy, {}, reductionExtent,
-                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
-                        sdConeCrossesTranspose(rrDot.getB()),
-                        /*inferPhysicalStrides=*/true);
-  auto ii =
-      sdCreateScalarDot(forOp, iiA, iiB, forOp.getInitArgs()[realIdx],
-                        forOp.getResult(realIdx), resultTy, {}, reductionExtent,
-                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
-                        sdConeCrossesTranspose(iiDot.getB()),
-                        /*inferPhysicalStrides=*/true);
-  auto ri =
-      sdCreateScalarDot(forOp, rrA, iiB, forOp.getInitArgs()[imagIdx],
-                        forOp.getResult(imagIdx), resultTy, {}, reductionExtent,
-                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
-                        sdConeCrossesTranspose(riDot.getB()),
-                        /*inferPhysicalStrides=*/true);
-  auto ir =
-      sdCreateScalarDot(forOp, iiA, rrB, forOp.getInitArgs()[imagIdx],
-                        forOp.getResult(imagIdx), resultTy, {}, reductionExtent,
-                        /*transposeA=*/false, /*scaleInfo=*/nullptr,
-                        sdConeCrossesTranspose(irDot.getB()),
-                        /*inferPhysicalStrides=*/true);
+  auto rr = sdCreateScalarDot(
+      forOp, rrA, rrB, forOp.getInitArgs()[realIdx], forOp.getResult(realIdx),
+      resultTy, {}, {}, reductionExtent, /*transposeA=*/false,
+      /*scaleInfo=*/nullptr, sdConeCrossesTranspose(rrDot.getB()),
+      /*inferPhysicalStrides=*/true);
+  auto ii = sdCreateScalarDot(
+      forOp, iiA, iiB, forOp.getInitArgs()[realIdx], forOp.getResult(realIdx),
+      resultTy, {}, {}, reductionExtent, /*transposeA=*/false,
+      /*scaleInfo=*/nullptr, sdConeCrossesTranspose(iiDot.getB()),
+      /*inferPhysicalStrides=*/true);
+  auto ri = sdCreateScalarDot(
+      forOp, rrA, iiB, forOp.getInitArgs()[imagIdx], forOp.getResult(imagIdx),
+      resultTy, {}, {}, reductionExtent, /*transposeA=*/false,
+      /*scaleInfo=*/nullptr, sdConeCrossesTranspose(riDot.getB()),
+      /*inferPhysicalStrides=*/true);
+  auto ir = sdCreateScalarDot(
+      forOp, iiA, rrB, forOp.getInitArgs()[imagIdx], forOp.getResult(imagIdx),
+      resultTy, {}, {}, reductionExtent, /*transposeA=*/false,
+      /*scaleInfo=*/nullptr, sdConeCrossesTranspose(irDot.getB()),
+      /*inferPhysicalStrides=*/true);
   if (!rr || !ii || !ri || !ir)
     return mlir::failure();
 
@@ -23109,7 +23289,7 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
 
   mlir::Value cInit = forOp.getInitArgs()[0];
   if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
-                       resultTensorTy, {}, {}, /*transposeA=*/false,
+                       resultTensorTy, {}, {}, {}, /*transposeA=*/false,
                        /*scaleInfo=*/nullptr,
                        sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();
@@ -23259,7 +23439,7 @@ static mlir::LogicalResult tryGramLoopFallback(mlir::scf::ForOp forOp) {
     return mlir::failure();
   auto resultTy = mlir::cast<mlir::RankedTensorType>(loopResult.getType());
   if (!sdEmitScalarDot(forOp, aLoad, bLoad, forOp.getInitArgs()[0], loopResult,
-                       resultTy, weightLoad, forOp.getUpperBound(),
+                       resultTy, weightLoad, {}, forOp.getUpperBound(),
                        /*transposeA=*/true))
     return mlir::failure();
   forOp.erase();
@@ -23322,7 +23502,8 @@ static void finalizeScalarDots(mlir::ModuleOp moduleOp) {
 // element is `(localBatch, gRow, gCol)`, where `lin = emitPerIterIndex` gives
 // the row-major local-tile index and row/column origins make matrix coordinates
 // global. The reduction
-//   acc = c_init; for k in [0, reduction_extent): ...
+//   acc = c_init; for k in [reduction_start, reduction_start +
+//   reduction_extent): ...
 // Ordinary GEMM passes `stride_a` as the extent. Weighted-Gram passes the
 // sample count separately, reads transposed A, and multiplies by weight[k].
 // On tail tiles the whole reduction is guarded by batch/M/N extents to avoid
@@ -23345,9 +23526,9 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
       return rewriter.notifyMatchFailure(op, "scalar_dot: non-f32/i32 result");
     bool hasScales = !adaptor.getScaleBufs().empty();
     if (hasScales && (adaptor.getScaleBufs().size() != 2 ||
-                      adaptor.getScaleParams().size() != 5))
+                      adaptor.getScaleParams().size() != 7))
       return rewriter.notifyMatchFailure(
-          op, "scalar_dot: scaled form requires two buffers and five params");
+          op, "scalar_dot: scaled form requires two buffers and seven params");
     if (!hasScales && !adaptor.getScaleParams().empty())
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: scale params require scale buffers");
@@ -23427,6 +23608,7 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
 
       mlir::Value strideAui = adaptor.getStrideA();
       mlir::Value strideBui = adaptor.getStrideB();
+      mlir::Value reductionStartUi = adaptor.getReductionStart();
       mlir::Value reductionExtentUi = adaptor.getReductionExtent();
       mlir::Value rowOrigI32 = toI32(adaptor.getRowOrigin());
       mlir::Value colOrigI32 = toI32(adaptor.getColOrigin());
@@ -23537,7 +23719,6 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
             {
               mlir::OpBuilder::InsertionGuard g3(rewriter);
               rewriter.setInsertionPointToStart(kLoop.getBody());
-              mlir::Value kUi = toUi32(kLoop.getInductionVar());
               mlir::Value acc = kLoop.getRegionIterArgs()[0];
               mlir::Value widx =
                   (numWarps > 1) ? mlir::Value(widxStore[0]) : mlir::Value();
@@ -23551,9 +23732,13 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
                                   rewriter, loc, toI32(lhs), toI32(rhs))
                                   .getResult());
               };
+              mlir::Value kUi =
+                  addUi32(toUi32(kLoop.getInductionVar()), reductionStartUi);
+              mlir::Value reductionEndUi =
+                  addUi32(reductionStartUi, reductionExtentUi);
               mlir::Value aPhysicalCol = addUi32(kUi, adaptor.getABaseOffset());
               mlir::Value aPhysicalColExtent =
-                  addUi32(strideAui, adaptor.getABaseOffset());
+                  addUi32(reductionEndUi, adaptor.getABaseOffset());
               mlir::Value bPhysicalCol =
                   addUi32(bTileCol, adaptor.getBBaseOffset());
               mlir::Value bPhysicalColExtent =
@@ -23567,7 +23752,7 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
               mlir::Value bTile =
                   emitStagedLoad(rewriter, loc, matTy, adaptor.getBBuf(), kUi,
                                  bPhysicalCol, strideBui, /*transposed=*/false,
-                                 strideAui, bPhysicalColExtent, widx);
+                                 reductionEndUi, bPhysicalColExtent, widx);
               mlir::Value newAcc = SimdgroupMultiplyAccumulateOp::create(
                                        rewriter, loc, matTy, acc, aTile, bTile)
                                        .getResult();
@@ -23664,6 +23849,7 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     mlir::Value strideBI32 = toI32(adaptor.getStrideB());
     mlir::Value innerStrideAI32 = toI32(adaptor.getAInnerStride());
     mlir::Value innerStrideBI32 = toI32(adaptor.getBInnerStride());
+    mlir::Value reductionStartI32 = toI32(adaptor.getReductionStart());
     mlir::Value reductionExtentI32 = toI32(adaptor.getReductionExtent());
     mlir::Value aBaseI32 = toI32(adaptor.getABaseOffset());
     mlir::Value bBaseI32 = toI32(adaptor.getBBaseOffset());
@@ -23688,22 +23874,32 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     mlir::Type aElem = aMemTy.getType();
     mlir::Type bElem = bMemTy.getType();
     bool e2m1Payloads = op->hasAttr("metal.e2m1_payloads");
-    bool e4m3Payloads = op->hasAttr("metal.e4m3_payloads");
-    bool e5m2Payloads = op->hasAttr("metal.e5m2_payloads");
+    bool aE4M3Payload = op->hasAttr("metal.a_e4m3_payload") ||
+                        op->hasAttr("metal.e4m3_payloads");
+    bool bE4M3Payload = op->hasAttr("metal.b_e4m3_payload") ||
+                        op->hasAttr("metal.e4m3_payloads");
+    bool aE5M2Payload = op->hasAttr("metal.a_e5m2_payload") ||
+                        op->hasAttr("metal.e5m2_payloads");
+    bool bE5M2Payload = op->hasAttr("metal.b_e5m2_payload") ||
+                        op->hasAttr("metal.e5m2_payloads");
     bool e2m1LhsKPack = !op->hasAttr("metal.e2m1_lhs_non_k_pack");
     bool e2m1RhsKPack = !op->hasAttr("metal.e2m1_rhs_non_k_pack");
-    bool packedPayloads = e2m1Payloads || e4m3Payloads || e5m2Payloads;
-    unsigned payloadKindCount = static_cast<unsigned>(e2m1Payloads) +
-                                static_cast<unsigned>(e4m3Payloads) +
-                                static_cast<unsigned>(e5m2Payloads);
-    if (payloadKindCount > 1)
+    bool aPackedPayload = e2m1Payloads || aE4M3Payload || aE5M2Payload;
+    bool bPackedPayload = e2m1Payloads || bE4M3Payload || bE5M2Payload;
+    bool hasFp8PayloadMarker =
+        aE4M3Payload || bE4M3Payload || aE5M2Payload || bE5M2Payload;
+    if ((e2m1Payloads && hasFp8PayloadMarker) ||
+        (aE4M3Payload && aE5M2Payload) || (bE4M3Payload && bE5M2Payload))
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: conflicting packed payload markers");
+    if (aPackedPayload != bPackedPayload)
+      return rewriter.notifyMatchFailure(
+          op, "scalar_dot: packed payload markers must identify both operands");
     if (!e2m1Payloads && (!e2m1LhsKPack || !e2m1RhsKPack))
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: non-K packing markers require E2M1 payloads");
     mlir::Type computeElem = aElem;
-    if (hasScales && packedPayloads) {
+    if (hasScales && (aPackedPayload || bPackedPayload)) {
       if (!aElem.isInteger(8) || !bElem.isInteger(8))
         return rewriter.notifyMatchFailure(
             op, "scalar_dot: packed payload buffers must contain raw i8");
@@ -23713,7 +23909,7 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: scaled payloads must be same-type fp16 or bf16");
     }
-    if (!hasScales && packedPayloads)
+    if (!hasScales && (aPackedPayload || bPackedPayload))
       return rewriter.notifyMatchFailure(
           op, "scalar_dot: packed payload marker requires scales");
     if (hasScales) {
@@ -23916,33 +24112,26 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
           .getResult();
     };
 
-    mlir::Value aScaleBase, bScaleBase, aScaleStride, bScaleStride, scaleFactor;
+    mlir::Value aScaleBase, bScaleBase, aScaleStride, bScaleStride;
+    mlir::Value aScaleBatchStride, bScaleBatchStride, scaleFactor;
     if (hasScales) {
       aScaleBase = toI32(adaptor.getScaleParams()[0]);
       bScaleBase = toI32(adaptor.getScaleParams()[1]);
       aScaleStride = toI32(adaptor.getScaleParams()[2]);
       bScaleStride = toI32(adaptor.getScaleParams()[3]);
-      scaleFactor = toI32(adaptor.getScaleParams()[4]);
+      aScaleBatchStride = toI32(adaptor.getScaleParams()[4]);
+      bScaleBatchStride = toI32(adaptor.getScaleParams()[5]);
+      scaleFactor = toI32(adaptor.getScaleParams()[6]);
 
-      auto addBatchScaleOffset = [&](mlir::Value base,
-                                     llvm::StringRef attrName) {
-        auto strideAttr = op->getAttrOfType<mlir::IntegerAttr>(attrName);
-        if (!strideAttr)
-          return base;
-        auto stride = mlir::arith::ConstantOp::create(
-            rewriter, loc,
-            rewriter.getI32IntegerAttr(
-                static_cast<int32_t>(strideAttr.getInt())));
-        auto batchOffset = mlir::arith::MulIOp::create(rewriter, loc, gBatch,
-                                                       stride.getResult());
+      auto addBatchScaleOffset = [&](mlir::Value base, mlir::Value stride) {
+        auto batchOffset =
+            mlir::arith::MulIOp::create(rewriter, loc, gBatch, stride);
         return mlir::arith::AddIOp::create(rewriter, loc, base,
                                            batchOffset.getResult())
             .getResult();
       };
-      aScaleBase =
-          addBatchScaleOffset(aScaleBase, "metal.a_scale_batch_stride");
-      bScaleBase =
-          addBatchScaleOffset(bScaleBase, "metal.b_scale_batch_stride");
+      aScaleBase = addBatchScaleOffset(aScaleBase, aScaleBatchStride);
+      bScaleBase = addBatchScaleOffset(bScaleBase, bScaleBatchStride);
     }
 
     // E8M0 byte -> compute-type scale, matching DecomposeScaledBlocked:
@@ -24012,7 +24201,10 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
           .getResult();
     };
 
-    // The reduction, emitted as an scf.for over [0, reduction_extent).
+    // The reduction, emitted as an scf.for over [0, reduction_extent). The
+    // loop induction variable is a local offset; logical K starts at
+    // reduction_start so sliced source K loops preserve payload and scale
+    // coordinates.
     auto emitReduce = [&](mlir::OpBuilder &b) -> mlir::Value {
       auto lb = mlir::arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
       auto step =
@@ -24023,7 +24215,10 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
       {
         mlir::OpBuilder::InsertionGuard g(b);
         b.setInsertionPointToStart(kLoop.getBody());
-        mlir::Value k = kLoop.getInductionVar();
+        mlir::Value kLocal = kLoop.getInductionVar();
+        mlir::Value k =
+            mlir::arith::AddIOp::create(b, loc, reductionStartI32, kLocal)
+                .getResult();
         mlir::Value acc = kLoop.getRegionIterArgs()[0];
         mlir::Value aPhysicalRow = gRow;
         mlir::Value aPhysicalK = k;
@@ -24127,12 +24322,15 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         if (e2m1Payloads) {
           aPayload = decodeE2M1ToBf16(b, aPayload, aNibbleCoordinate);
           bPayload = decodeE2M1ToBf16(b, bPayload, bNibbleCoordinate);
-        } else if (e4m3Payloads) {
-          aPayload = decodeE4M3ToBf16(b, aPayload);
-          bPayload = decodeE4M3ToBf16(b, bPayload);
-        } else if (e5m2Payloads) {
-          aPayload = decodeE5M2ToBf16(b, aPayload);
-          bPayload = decodeE5M2ToBf16(b, bPayload);
+        } else {
+          if (aE4M3Payload)
+            aPayload = decodeE4M3ToBf16(b, aPayload);
+          else if (aE5M2Payload)
+            aPayload = decodeE5M2ToBf16(b, aPayload);
+          if (bE4M3Payload)
+            bPayload = decodeE4M3ToBf16(b, bPayload);
+          else if (bE5M2Payload)
+            bPayload = decodeE5M2ToBf16(b, bPayload);
         }
         if (hasScales && op->hasAttr("metal.a_scaled"))
           aPayload = applyE8M0Scale(b, aPayload, computeElem,
