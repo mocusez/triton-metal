@@ -955,6 +955,18 @@ are still whole-kernel replacements rather than layout-general lowering.
     still lower to Metal expression ops, the Pixi native build succeeds, and
     all 125 Metal conversion lit tests pass.
 
+35. **P0 preflights every reachable `tt.histogram` decline.** A rank-2
+    histogram reached the conversion pattern, printed a generic legalization
+    error, and then aborted in failed-conversion teardown. The lowering and a
+    new early validator now share `unsupportedHistogramReason`, including the
+    same dry-run `rank1ConeSupported` predicate used by the scalar evaluator.
+    Five fixtures pin rank, i32 element type, blocked result layout, source
+    cone, and mask cone diagnostics. Dynamic/empty tensor and non-power-of-two
+    thread-geometry guards were removed because TTIR tensor-size and TritonGPU
+    layout verification reject those shapes before this pass. The existing
+    masked i32 histogram still lowers, the Pixi native build succeeds, and all
+    125 Metal conversion lit tests pass.
+
 The latest post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

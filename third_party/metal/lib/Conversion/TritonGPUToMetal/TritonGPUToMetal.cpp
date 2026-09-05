@@ -8526,6 +8526,27 @@ materializeLoopCarriedGathers(mlir::Block &kernelBody,
 // is appropriate for the initial small-bin workload (16 bins) and keeps the
 // implementation inside existing scalar Metal + SCF primitives.
 //===----------------------------------------------------------------------===//
+static llvm::StringRef
+unsupportedHistogramReason(mlir::triton::HistogramOp op) {
+  auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
+  auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!srcTy || !dstTy || srcTy.getRank() != 1 || dstTy.getRank() != 1)
+    return "tt.histogram is implemented for rank-1 source and result tensors "
+           "only";
+  if (!srcTy.getElementType().isInteger(32) ||
+      !dstTy.getElementType().isInteger(32))
+    return "tt.histogram supports i32 source and result elements only";
+
+  auto dstTile = tileFromTensor(dstTy);
+  if (!dstTile || dstTile->rank != 1)
+    return "tt.histogram requires a blocked result layout";
+  if (!rank1ConeSupported(op.getSrc(), 0))
+    return "tt.histogram source cone is not rank-1 evaluable";
+  if (op.getMask() && !rank1ConeSupported(op.getMask(), 0))
+    return "tt.histogram mask cone is not rank-1 i1 evaluable";
+  return {};
+}
+
 struct HistogramLowering
     : public mlir::OpConversionPattern<mlir::triton::HistogramOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -8533,45 +8554,26 @@ struct HistogramLowering
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::HistogramOp op, OpAdaptor /*adaptor*/,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
-    auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
-    if (!srcTy || !dstTy || srcTy.getRank() != 1 || dstTy.getRank() != 1)
-      return rewriter.notifyMatchFailure(
-          op, "histogram: only rank-1 source/result supported");
-    if (srcTy.isDynamicDim(0) || dstTy.isDynamicDim(0))
-      return rewriter.notifyMatchFailure(
-          op, "histogram: dynamic source/result shape unsupported");
-    if (!srcTy.getElementType().isInteger(32) ||
-        !dstTy.getElementType().isInteger(32))
-      return rewriter.notifyMatchFailure(
-          op, "histogram: only i32 source/result supported");
+    if (llvm::StringRef reason = unsupportedHistogramReason(op);
+        !reason.empty())
+      return rewriter.notifyMatchFailure(op, reason);
 
-    auto dstTile = tileFromTensor(dstTy);
-    if (!dstTile || dstTile->rank != 1)
-      return rewriter.notifyMatchFailure(
-          op, "histogram: result requires a blocked layout");
+    auto loc = op.getLoc();
+    auto srcTy = mlir::cast<mlir::RankedTensorType>(op.getSrc().getType());
+    auto dstTy = mlir::cast<mlir::RankedTensorType>(op.getType());
+    auto dstTile = *tileFromTensor(dstTy);
     const int64_t sourceSize = srcTy.getDimSize(0);
     const int64_t numBins = dstTy.getDimSize(0);
-    const int64_t tpb = dstTile->threadsPerBlock;
-    if (sourceSize <= 0 || numBins <= 0 || tpb <= 0)
-      return rewriter.notifyMatchFailure(
-          op, "histogram: empty source/result or invalid thread geometry");
-    // The shared tile-loop infrastructure represents E as total/tpb. A
-    // super-threadgroup result therefore needs an exact number of iterations;
-    // sub-threadgroup results are handled by the bin<numBins guard below.
-    if (numBins > tpb && numBins % tpb != 0)
-      return rewriter.notifyMatchFailure(
-          op, "histogram: result bins above tpb must be divisible by tpb");
+    const int64_t tpb = dstTile.threadsPerBlock;
 
     auto i32 = rewriter.getI32Type();
     mlir::Value bin = emitLocalTid(rewriter, loc, tpb);
     auto tileLoop = findOutermostScfFor(op);
-    if (tileLoop && dstTile->elemPerThread > 1) {
+    if (tileLoop && dstTile.elemPerThread > 1) {
       mlir::Value iv = tileLoop.getInductionVar();
-      if (dstTile->contiguous) {
+      if (dstTile.contiguous) {
         auto cE = mlir::arith::ConstantOp::create(
-            rewriter, loc, rewriter.getI32IntegerAttr(dstTile->elemPerThread));
+            rewriter, loc, rewriter.getI32IntegerAttr(dstTile.elemPerThread));
         bin =
             mlir::arith::AddIOp::create(
                 rewriter, loc,
@@ -31751,6 +31753,24 @@ static mlir::LogicalResult validatePreciseMathSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// HistogramLowering re-evaluates the original rank-1 producer cone after the
+// function-level scalar loop has been introduced. A declined pattern is too
+// late to report an unsupported shape, layout, or producer: failed conversion
+// tears down that partially rewritten loop unsafely. Keep the preflight and
+// the lowering on the same predicate so every reachable decline is diagnosed
+// while the source module is still intact.
+static mlir::LogicalResult validateHistogramSupport(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::HistogramOp op) {
+    llvm::StringRef reason = unsupportedHistogramReason(op);
+    if (reason.empty())
+      return;
+    op.emitOpError("Metal backend: ") << reason;
+    valid = false;
+  });
+  return mlir::success(valid);
+}
+
 // `tt.scan` shapes ScanLowering cannot lower.
 //
 // It declines by `notifyMatchFailure`, which in this backend is a process kill
@@ -32671,6 +32691,7 @@ struct ConvertTritonGPUToMetalPass
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateTensorConstantSupport(moduleOp)) ||
         mlir::failed(validatePreciseMathSupport(moduleOp)) ||
+        mlir::failed(validateHistogramSupport(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
         mlir::failed(validateUnitAxisReduce(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
