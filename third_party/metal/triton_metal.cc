@@ -47,10 +47,10 @@ void init_triton_metal(py::module_ &m) {
   // piped into `triton-metal-translate --mlir-to-msl` produces in the
   // lit test harness.
   // Returns (msl, threads_per_group). `threads_per_group` is 0 when the launch
-  // geometry should follow `num_warps` as usual. A kernel consisting of one
-  // scheduled attention op reports the exact geometry chosen by the emitter.
-  // Keeping this decision shared with ModuleTranslation prevents launch
-  // metadata from drifting from the generated MSL.
+  // geometry should follow `num_warps` as usual. Scheduled attention reports
+  // the exact geometry chosen by its emitter; conversion may also prove that
+  // an otherwise-multi-warp straight-line matrix kernel contains exactly one
+  // SIMD-group's work and attach the corresponding launch override.
   m.def("ttgir_to_msl", [](mlir::ModuleOp &mod) -> py::tuple {
     mlir::PassManager pm(mod.getContext());
     pm.addPass(mlir::triton::metal::createConvertTritonGPUToMetalPass());
@@ -67,6 +67,9 @@ void init_triton_metal(py::module_ &m) {
     // not literally one op: whole-kernel matchers leave behind casts and
     // `metal.get_element`s that bridge operands, and those are pure.
     int threadsPerGroup = 0;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "metal.threads_per_group"))
+      threadsPerGroup = static_cast<int>(attr.getInt());
     {
       bool anyKernel = false, allScheduled = true;
       int commonThreadsPerGroup = 0;
@@ -111,7 +114,7 @@ void init_triton_metal(py::module_ &m) {
         else if (commonThreadsPerGroup != kernelThreads)
           allScheduled = false;
       });
-      if (anyKernel && allScheduled)
+      if (threadsPerGroup == 0 && anyKernel && allScheduled)
         threadsPerGroup = commonThreadsPerGroup;
     }
 

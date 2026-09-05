@@ -325,6 +325,18 @@ static const LoopCarriedGatherSet *g_loopCarriedGathers = nullptr;
 using TileInvariantReduceLoopSet = llvm::DenseSet<mlir::Operation *>;
 static const TileInvariantReduceLoopSet *g_tileInvariantReduceLoops = nullptr;
 
+// Straight-line rank-1 reductions whose scalar results feed a larger output
+// tile are whole-block aggregates.  FuncOpLowering clones their replayable
+// source cones into the kernel prologue before it builds the synthetic
+// per-register-band output loop.  The mutable sets are pass-local handoffs:
+// the materializer records the cloned reductions for deterministic early
+// lowering and their clone-only dependency ops for cleanup afterwards.
+using TileInvariantRank1ReduceSet = llvm::DenseSet<mlir::Operation *>;
+static const TileInvariantRank1ReduceSet *g_tileInvariantRank1Reduces = nullptr;
+static TileInvariantRank1ReduceSet *g_materializedRank1Reduces = nullptr;
+static llvm::DenseSet<mlir::Operation *> *g_materializedRank1Dependencies =
+    nullptr;
+
 // Pass-lifetime state used by the rank-1 cone evaluator while materializing
 // loop-carried gather recurrences.
 static llvm::DenseMap<mlir::Value, mlir::Value> *g_loopGatherBuffers = nullptr;
@@ -348,6 +360,10 @@ static mlir::LogicalResult
 materializeTileInvariantReduceLoops(mlir::Block &kernelBody,
                                     mlir::Operation *&lastPrologue,
                                     mlir::ConversionPatternRewriter &rewriter);
+
+static mlir::LogicalResult materializeTileInvariantRank1Reduces(
+    mlir::Block &kernelBody, mlir::Operation *&lastPrologue,
+    mlir::ConversionPatternRewriter &rewriter);
 
 // Per-op callers (LoadOp / StoreOp lowerings at :2036, :2394, :2494, :2571)
 // pass tensor<...x!tt.ptr<...>> and need a valid TileInfo. The kernel-level
@@ -624,6 +640,16 @@ static bool isCloneableTileInvariantPrefixOp(mlir::Operation *op) {
           mlir::isa<mlir::triton::GetProgramIdOp>(op));
 }
 
+static bool isCloneableTileInvariantRank1Dependency(mlir::Operation *op) {
+  // Device reads are the only effecting operations admitted to an aggregate
+  // replay cone.  Selection rejects every preceding write, atomic, barrier,
+  // user loop, and other region-bearing operation, so cloning such a read into
+  // the prologue preserves program order relative to all observable effects.
+  return isCloneableTileInvariantPrefixOp(op) ||
+         (op->getNumRegions() == 0 &&
+          mlir::isa<mlir::triton::LoadOp>(op));
+}
+
 static bool canHoistTileInvariantReduceLoopAcross(mlir::Operation *op) {
   // Threadgroup allocations inserted by earlier Metal pre-passes are
   // function-scope declarations, not observable reads or writes. Keep them in
@@ -853,6 +879,108 @@ materializeTileInvariantReduceLoops(mlir::Block &kernelBody,
     for (mlir::Operation *dependency : llvm::reverse(orderedDependencies))
       if (dependency->use_empty() &&
           isCloneableTileInvariantPrefixOp(dependency))
+        rewriter.eraseOp(dependency);
+  }
+  return mlir::success();
+}
+
+// Clone each selected straight-line rank-1 aggregate and its replay-only
+// source cone into the kernel prologue.  The original cone stays in place for
+// the output suffix: tensor producers such as tt.make_range must still be
+// scalarized against the synthetic output-loop induction variable.  Selected
+// reductions are processed in source order, so a later sum may consume an
+// already-materialized max without cloning or recomputing that aggregate.
+static mlir::LogicalResult materializeTileInvariantRank1Reduces(
+    mlir::Block &kernelBody, mlir::Operation *&lastPrologue,
+    mlir::ConversionPatternRewriter &rewriter) {
+  if (!g_tileInvariantRank1Reduces ||
+      g_tileInvariantRank1Reduces->empty())
+    return mlir::success();
+  if (!g_materializedRank1Reduces || !g_materializedRank1Dependencies)
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::triton::ReduceOp, 4> selected;
+  for (mlir::Operation &candidate : kernelBody)
+    if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(candidate);
+        reduce &&
+        g_tileInvariantRank1Reduces->contains(reduce.getOperation()))
+      selected.push_back(reduce);
+
+  for (mlir::triton::ReduceOp reduce : selected) {
+    llvm::SmallPtrSet<mlir::Operation *, 32> dependencySet;
+    std::function<bool(mlir::Value)> collectDependency =
+        [&](mlir::Value value) -> bool {
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def)
+        return true;
+      if (def->getBlock() != &kernelBody)
+        return false;
+      // Values already materialized in the prologue, most importantly an
+      // earlier selected aggregate's scalar result, are available as-is.
+      if (lastPrologue &&
+          (def == lastPrologue || def->isBeforeInBlock(lastPrologue)))
+        return true;
+      if (!def->isBeforeInBlock(reduce.getOperation()) ||
+          !isCloneableTileInvariantRank1Dependency(def))
+        return false;
+      if (!dependencySet.insert(def).second)
+        return true;
+      return llvm::all_of(def->getOperands(), collectDependency);
+    };
+
+    bool dependencyOk =
+        llvm::all_of(reduce.getSrcs(), collectDependency);
+    if (!dependencyOk) {
+      reduce.emitOpError(
+          "Metal backend could not materialize a tile-invariant rank-1 "
+          "aggregate from a top-level replayable dependency cone");
+      return mlir::failure();
+    }
+
+    llvm::SmallVector<mlir::Operation *, 32> orderedDependencies;
+    for (mlir::Operation &candidate : kernelBody) {
+      if (&candidate == reduce.getOperation())
+        break;
+      if (dependencySet.contains(&candidate))
+        orderedDependencies.push_back(&candidate);
+    }
+    if (orderedDependencies.size() != dependencySet.size()) {
+      reduce.emitOpError(
+          "Metal backend tile-invariant rank-1 aggregate has a dependency "
+          "outside its preceding top-level cone");
+      return mlir::failure();
+    }
+
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    if (lastPrologue)
+      rewriter.setInsertionPointAfter(lastPrologue);
+    else
+      rewriter.setInsertionPointToStart(&kernelBody);
+    mlir::IRMapping mapping;
+    for (mlir::Operation *dependency : orderedDependencies) {
+      mlir::Operation *clone = rewriter.clone(*dependency, mapping);
+      g_materializedRank1Dependencies->insert(clone);
+      rewriter.setInsertionPointAfter(clone);
+    }
+    auto clonedReduce = mlir::cast<mlir::triton::ReduceOp>(
+        rewriter.clone(*reduce, mapping));
+    clonedReduce->setAttr("metal.tile_invariant_rank1_reduce",
+                          rewriter.getUnitAttr());
+    g_materializedRank1Reduces->insert(clonedReduce.getOperation());
+
+    for (auto [original, replacement] :
+         llvm::zip(reduce.getResults(), clonedReduce.getResults()))
+      original.replaceAllUsesWith(replacement);
+    rewriter.eraseOp(reduce);
+    lastPrologue = clonedReduce.getOperation();
+
+    // Some inputs exist only to feed the aggregate.  Once the original reduce
+    // is gone, keep those dead operations out of the output-band loop.  Device
+    // loads are safe to erase here because the selector admitted no preceding
+    // observable effect and the cloned aggregate owns the equivalent read.
+    for (mlir::Operation *dependency : llvm::reverse(orderedDependencies))
+      if (dependency->use_empty() &&
+          isCloneableTileInvariantRank1Dependency(dependency))
         rewriter.eraseOp(dependency);
   }
   return mlir::success();
@@ -1210,6 +1338,14 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // rank-1 tiles must run once per CTA.  Materialize it before the synthetic
     // output-band loop; its scalar results may safely dominate that loop.
     if (mlir::failed(materializeTileInvariantReduceLoops(
+            emptyBlock, lastProloguePtr, rewriter)))
+      return mlir::failure();
+
+    // Straight-line rank-1 aggregates (softmax max/sum) are likewise complete
+    // CTA computations.  Clone their replay cones and commit their scalar
+    // results before the synthetic output-band loop so scratch/barriers are
+    // executed once rather than once per output register band.
+    if (mlir::failed(materializeTileInvariantRank1Reduces(
             emptyBlock, lastProloguePtr, rewriter)))
       return mlir::failure();
 
@@ -7037,6 +7173,14 @@ static mlir::LogicalResult lowerRank1Reduce(
                              .getResult(0);
   mlir::Value result =
       GetElementOp::create(rewriter, loc, storeTy, buf, zeroUI32).getResult();
+
+  // Keep a prologue-hoisted aggregate's scalar result as a named MSL value.
+  // Otherwise the translator may inline the scratch-buffer read into every
+  // use in the later synthetic output loop, obscuring the once-per-CTA
+  // placement and repeating even this final read for every register band.
+  if (op->hasAttr("metal.tile_invariant_rank1_reduce"))
+    result.getDefiningOp()->setAttr("metal.materialize",
+                                    rewriter.getUnitAttr());
 
   // For i32, bridge ui32 storage → signless i32 for downstream consumers.
   if (isI32 && result.getType() != elemTy) {
@@ -32108,6 +32252,173 @@ preprocessTileInvariantReduceLoops(mlir::ModuleOp moduleOp,
   });
 }
 
+static bool tileInvariantRank1ReduceDependenciesAreCloneable(
+    mlir::triton::ReduceOp reduce, mlir::Block &topLevelBlock,
+    const TileInvariantRank1ReduceSet &selected,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &dependencies) {
+  std::function<bool(mlir::Value)> check = [&](mlir::Value value) -> bool {
+    mlir::Operation *def = value.getDefiningOp();
+    if (!def)
+      return true;
+    if (selected.contains(def))
+      return true;
+    if (def->getBlock() != &topLevelBlock ||
+        !def->isBeforeInBlock(reduce.getOperation()) ||
+        !isCloneableTileInvariantRank1Dependency(def))
+      return false;
+    if (!dependencies.insert(def).second)
+      return true;
+    return llvm::all_of(def->getOperands(), check);
+  };
+  return llvm::all_of(reduce.getSrcs(), check);
+}
+
+static bool tileInvariantRank1ReducePrefixIsHoistable(
+    mlir::triton::ReduceOp reduce, mlir::Block &topLevelBlock,
+    const TileInvariantRank1ReduceSet &selected,
+    const llvm::SmallPtrSetImpl<mlir::Operation *> &dependencies) {
+  for (mlir::Operation &preceding : topLevelBlock) {
+    if (&preceding == reduce.getOperation())
+      break;
+    if (selected.contains(&preceding) ||
+        isCloneableTileInvariantPrefixOp(&preceding) ||
+        mlir::isa<ThreadgroupAllocaOp>(preceding))
+      continue;
+    // A device read may move only when it is part of this exact replay cone.
+    // An unrelated read is an ordering boundary under the aggregate-hoist
+    // contract even though it would be mechanically cloneable.
+    if (mlir::isa<mlir::triton::LoadOp>(preceding) &&
+        dependencies.contains(&preceding))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+// Select only straight-line, top-level f32 rank-1 add/max aggregates whose
+// scalar result contributes to a device output.  A selected aggregate is an
+// ordering boundary that a later selected aggregate may depend on, but every
+// other region/effect (including a user loop, divergent if, store, atomic, or
+// barrier) permanently closes the hoistable prefix.
+static void preprocessTileInvariantRank1Reduces(
+    mlir::ModuleOp moduleOp, TileInvariantRank1ReduceSet &selected) {
+  moduleOp.walk([&](mlir::triton::FuncOp funcOp) {
+    auto tileInfo = findTileInfo(funcOp);
+    if (!tileInfo || tileInfo->elemPerThread <= 1 || funcOp.getBody().empty())
+      return;
+
+    mlir::Block &entry = funcOp.getBody().front();
+    for (mlir::Operation &candidate : entry) {
+      if (candidate.hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+
+      auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(candidate);
+      if (!reduce)
+        continue;
+      auto srcs = reduce.getSrcs();
+      auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          srcs.empty() ? mlir::Type{} : srcs.front().getType());
+      mlir::Operation *combine = reduceCombineBinaryOp(reduce);
+      bool supportedCombine =
+          mlir::isa_and_nonnull<mlir::arith::AddFOp,
+                                mlir::arith::MaxNumFOp,
+                                mlir::arith::MaximumFOp>(combine);
+      llvm::SmallPtrSet<mlir::Operation *, 32> dependencies;
+      bool cloneableDependencies =
+          tileInvariantRank1ReduceDependenciesAreCloneable(
+              reduce, entry, selected, dependencies);
+      bool supported =
+          srcs.size() == 1 && reduce.getNumResults() == 1 && srcTy &&
+          srcTy.getRank() == 1 && !srcTy.isDynamicDim(0) &&
+          srcTy.getElementType().isF32() && reduce.getAxis() == 0 &&
+          reduce.getResult().front().getType().isF32() && supportedCombine &&
+          reachesOutputNotThroughAggregate(reduce.getResult().front()) &&
+          rank1ConeSupported(srcs.front(), 0) &&
+          findFirstLoadInCone(srcs.front(), 0) &&
+          cloneableDependencies && tileInvariantRank1ReducePrefixIsHoistable(
+                                       reduce, entry, selected, dependencies);
+      if (supported) {
+        selected.insert(reduce.getOperation());
+      }
+    }
+  });
+}
+
+// A fully unrolled 8x8 SIMD-group matmul can be emitted as one straight-line
+// matrix pipeline even when the source launch requested several warps.  In
+// that shape every extra SIMD-group repeats the same staged loads, MMA, and
+// store: there is no thread/simdgroup index that could assign it distinct
+// work.  Record the narrower launch only after conversion, where the complete
+// Metal kernel is available for a structural proof.  This deliberately does
+// not cover runtime loops, scalar/threadgroup epilogues, or multi-warp tiles.
+static bool isStraightLineSingleSimdgroupKernel(KernelOp kernel) {
+  unsigned stagedLoads = 0;
+  unsigned matrixMultiplies = 0;
+  unsigned matrixStores = 0;
+  bool supported = true;
+  kernel.getBodyRegion().walk([&](mlir::Operation *op) {
+    if (!supported || op == kernel.getOperation())
+      return;
+
+    // Any nested control-flow region or explicit per-thread/per-SIMD-group
+    // index can assign distinct work that must retain the source geometry.
+    if (op->getNumRegions() != 0 ||
+        mlir::isa<ThreadIdOp, SimdgroupIndexOp, TgLoadIndexedOp>(op)) {
+      supported = false;
+      return;
+    }
+    if (auto load = mlir::dyn_cast<SimdgroupLoadDeviceStagedOp>(op)) {
+      supported = load.getWarpIndex().empty();
+      ++stagedLoads;
+      return;
+    }
+    if (auto load =
+            mlir::dyn_cast<SimdgroupLoadDeviceStagedMaskedOp>(op)) {
+      supported = load.getWarpIndex().empty();
+      ++stagedLoads;
+      return;
+    }
+    if (mlir::isa<SimdgroupMultiplyAccumulateOp>(op)) {
+      ++matrixMultiplies;
+      return;
+    }
+    if (auto store = mlir::dyn_cast<SimdgroupStoreOp>(op)) {
+      supported = store.getWarpIndex().empty();
+      ++matrixStores;
+      return;
+    }
+    if (mlir::isa<BarrierOp>(op) ||
+        op->hasTrait<mlir::OpTrait::IsTerminator>() ||
+        mlir::isMemoryEffectFree(op))
+      return;
+    supported = false;
+  });
+  return supported && stagedLoads >= 2 && matrixMultiplies >= 1 &&
+         matrixStores == 1;
+}
+
+static void annotateSingleSimdgroupLaunch(mlir::ModuleOp moduleOp) {
+  static constexpr llvm::StringLiteral attrName =
+      "metal.threads_per_group";
+  moduleOp->removeAttr(attrName);
+  auto requestedWarps =
+      moduleOp->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
+  if (!requestedWarps || requestedWarps.getInt() <= 1)
+    return;
+
+  bool anyKernel = false;
+  bool allSingleSimdgroup = true;
+  moduleOp.walk([&](KernelOp kernel) {
+    anyKernel = true;
+    allSingleSimdgroup &= isStraightLineSingleSimdgroupKernel(kernel);
+  });
+  if (anyKernel && allSingleSimdgroup)
+    moduleOp->setAttr(attrName,
+                      mlir::IntegerAttr::get(mlir::IntegerType::get(
+                                                 moduleOp.getContext(), 32),
+                                             32));
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -33307,6 +33618,26 @@ struct ConvertTritonGPUToMetalPass
         tileInvariantReduceLoopsScope(g_tileInvariantReduceLoops,
                                       &tileInvariantReduceLoops);
 
+    // Straight-line softmax-style max/sum aggregates need the same placement
+    // decision, but are tracked separately from user-authored scalar loops so
+    // their cloned source cones can be lowered and discarded before general
+    // tensor scalarization.
+    TileInvariantRank1ReduceSet tileInvariantRank1Reduces;
+    preprocessTileInvariantRank1Reduces(moduleOp,
+                                        tileInvariantRank1Reduces);
+    llvm::SaveAndRestore<const TileInvariantRank1ReduceSet *>
+        tileInvariantRank1ReducesScope(g_tileInvariantRank1Reduces,
+                                       &tileInvariantRank1Reduces);
+    TileInvariantRank1ReduceSet materializedRank1Reduces;
+    llvm::DenseSet<mlir::Operation *> materializedRank1Dependencies;
+    llvm::SaveAndRestore<TileInvariantRank1ReduceSet *>
+        materializedRank1ReducesScope(g_materializedRank1Reduces,
+                                      &materializedRank1Reduces);
+    llvm::SaveAndRestore<llvm::DenseSet<mlir::Operation *> *>
+        materializedRank1DependenciesScope(
+            g_materializedRank1Dependencies,
+            &materializedRank1Dependencies);
+
     // Which `tt.expand_dims` broadcast a COLUMN-REDUCE result into a tile (and
     // so need the republish, see ExpandDimsLowering). Decided pre-conversion:
     // the reduce lowers before the expand_dims that consumes it, and a
@@ -33377,7 +33708,8 @@ struct ConvertTritonGPUToMetalPass
     // original store use. FuncOpLowering also hoists the scratch buffers named
     // by the rank-N phase planner.
     if (!preReduceOps.empty() || !g_rankNReducePublish.empty() ||
-        !loopCarriedGathers.empty() || !tileInvariantReduceLoops.empty()) {
+        !loopCarriedGathers.empty() || !tileInvariantReduceLoops.empty() ||
+        !tileInvariantRank1Reduces.empty()) {
       mlir::ConversionTarget funcTarget(*ctx);
       funcTarget.markUnknownOpDynamicallyLegal(
           [](mlir::Operation *) { return true; });
@@ -33397,13 +33729,14 @@ struct ConvertTritonGPUToMetalPass
       }
     }
 
-    if (!preReduceOps.empty()) {
+    if (!preReduceOps.empty() || !materializedRank1Reduces.empty()) {
       mlir::ConversionTarget reduceTarget(*ctx);
       reduceTarget.markUnknownOpDynamicallyLegal(
           [](mlir::Operation *) { return true; });
       reduceTarget.addDynamicallyLegalOp<mlir::triton::ReduceOp>(
           [&](mlir::triton::ReduceOp red) {
-            return !preReduceOps.contains(red.getOperation());
+            return !preReduceOps.contains(red.getOperation()) &&
+                   !materializedRank1Reduces.contains(red.getOperation());
           });
       mlir::RewritePatternSet reducePatterns(ctx);
       reducePatterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles,
@@ -33419,6 +33752,41 @@ struct ConvertTritonGPUToMetalPass
         g_reduceRowBufs = nullptr;
         g_subTpbCompanion = std::nullopt;
         g_axis0BroadcastExpands = nullptr;
+        signalPassFailure();
+        return;
+      }
+
+      // The selected rank-1 lowerings replay their cloned source tensors by
+      // logical index. Remove dead members of that bounded clone set before
+      // full conversion, including tt.load ops. Uniform scalar address values
+      // such as `pid * row_stride` may remain live because the replayed loads
+      // deliberately reuse them; only a live tensor result would mean the
+      // abandoned per-band source cone survived.
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        llvm::SmallVector<mlir::Operation *, 32> toErase;
+        for (mlir::Operation *dependency : materializedRank1Dependencies)
+          if (dependency->use_empty() &&
+              isCloneableTileInvariantRank1Dependency(dependency))
+            toErase.push_back(dependency);
+        for (mlir::Operation *dependency : toErase) {
+          materializedRank1Dependencies.erase(dependency);
+          dependency->erase();
+          changed = true;
+        }
+      }
+      bool retainedTensorDependency = false;
+      for (mlir::Operation *dependency : materializedRank1Dependencies)
+        if (llvm::any_of(dependency->getResultTypes(), [](mlir::Type type) {
+              return mlir::isa<mlir::RankedTensorType>(type);
+            })) {
+          dependency->emitError(
+              "Metal backend retained a live tensor from a clone-only "
+              "rank-1 aggregate cone");
+          retainedTensorDependency = true;
+        }
+      if (retainedTensorDependency) {
         signalPassFailure();
         return;
       }
@@ -33677,6 +34045,8 @@ struct ConvertTritonGPUToMetalPass
         loop->removeAttr("metal.tile_invariant_reduce");
       });
     });
+
+    annotateSingleSimdgroupLaunch(moduleOp);
   }
 };
 
