@@ -183,7 +183,7 @@ jobs:
           python-version: "3.12"
 
       - name: Download Metal wheel
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: triton-metal-macos15-arm64
           path: wheelhouse
