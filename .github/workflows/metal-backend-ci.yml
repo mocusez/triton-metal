@@ -154,7 +154,7 @@ jobs:
             pytest -s --tb=short python/test/unit/test_metal_wheel.py
 
       - name: Upload Metal wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: triton-metal-macos15-arm64
           path: wheelhouse/*.whl
