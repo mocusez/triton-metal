@@ -1669,6 +1669,44 @@ validation.
     entry 55. Both matrices now carry a comment naming the boundary and why
     raising it will produce wrong answers rather than failures.
 
+57. **Fixed: the sort band write. One wrong quantity in the final phase loop.**
+    Entry 56 left `tl.sort` writing only the first half of each per-thread
+    band. The cause is a single trip count.
+
+    `FuncOpLowering` splits the tile loop into one phase per exchange publish
+    plus a final segment holding everything after the last publish. Each phase
+    loop takes its trip count from that publish's `src.elemPerThread`; the
+    final one took `g_tileExchange[exchangePublishes.back()].dst.elemPerThread`.
+    But the final segment holds the exchange read AND everything after it,
+    including the output store, and the store is addressed
+    `localTid * tile.elemPerThread + iv`. When the last exchange's destination
+    has fewer elements per thread than the tile, the loop stops early and the
+    tail of every band is never written. Two elements per thread ran one trip,
+    four ran two, eight ran four — exactly the observed `E/2`.
+
+    🔑 The read index was never the problem. It already carried an `iv` term;
+    with a trip count of one that term was simply always zero. I had misread a
+    truncated MSL line as localTid-only and briefly suspected the index. Print
+    the whole expression before concluding a mapping is thread-only.
+
+    The fix takes the larger of the two, so a destination that legitimately
+    needs more trips keeps them and the tile's band is always covered.
+
+    Result: `tl.sort` goes from correct only at ONE element per thread to
+    correct at **four**, both directions, and `tl.topk` from two to two — the
+    topk defect at four is a different site and is untouched, which is itself
+    useful evidence that the two were never one bug. Above four the exchange
+    still cannot carry a value across phases; sort now returns wrong values
+    there rather than half-written ones.
+
+    The sort matrix now sweeps N up to 128 at one and four warps, so it spans
+    one, two and four elements per thread instead of sitting entirely at one.
+    Those twelve new cells were RED before this change.
+
+    157 of 157 Metal lit, fresh-cache Metal backend **2,557 passed / 3 skipped /
+    0 failed**, and `leet-all` at 1,664 passed with only the pre-existing
+    source-fidelity byte mismatch.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

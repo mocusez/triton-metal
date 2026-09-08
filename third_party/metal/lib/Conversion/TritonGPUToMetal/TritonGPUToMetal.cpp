@@ -1579,10 +1579,21 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           auto barrier = BarrierOp::create(rewriter, loc);
           rewriter.setInsertionPointAfter(barrier);
         }
+        // The final segment holds everything after the last publish, which is
+        // the exchange READ (indexed in the destination layout) AND the ops
+        // that follow it, including the output store (indexed in the tile's
+        // own layout). Those two layouts need not agree on elements per
+        // thread, and taking the destination's alone made the loop run
+        // `dst.elemPerThread` times while the store addressed
+        // `localTid * tile.elemPerThread + iv`. For `tl.sort` at two elements
+        // per thread that wrote only the even half of every band and left the
+        // rest of the output at its previous value. Cover both bands.
+        int64_t finalE =
+            g_tileExchange[exchangePublishes.back()].dst.elemPerThread;
+        if (tileInfo && tileInfo->elemPerThread > finalE)
+          finalE = tileInfo->elemPerThread;
         auto cFinalE = mlir::arith::ConstantOp::create(
-            rewriter, loc,
-            rewriter.getI32IntegerAttr(
-                g_tileExchange[exchangePublishes.back()].dst.elemPerThread));
+            rewriter, loc, rewriter.getI32IntegerAttr(finalE));
         auto finalPhase =
             mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
                                      cFinalE.getResult(), cStep.getResult());

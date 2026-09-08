@@ -1735,15 +1735,19 @@ def test_topk_masked_padding_sentinel(descending):
     assert torch.equal(out.cpu(), expected)
 
 
-# ⚠️ Every cell here is at ONE element per thread or fewer, because N never
-# exceeds 32 and num_warps is at least 1. That is not headroom, it is the whole
-# verified envelope: `tl.sort` writes only the first half of each per-thread
-# band from two elements per thread up, leaving the rest of the output at its
-# prior value, and the interpreter confirms the kernel is right and the backend
-# wrong. Open defect, measured 2026-09-08. Raising N here without fixing that
-# first will produce wrong answers, not failures to compile.
+# N and num_warps are swept together so the cells span ONE, TWO and FOUR
+# elements per thread, `N / (32 * num_warps)`. That axis is the one this path
+# breaks along and the matrix used to sit entirely at one element per thread,
+# which is how the band-write defect survived: the final phase loop ran
+# `dst.elemPerThread` trips while the store addressed
+# `localTid * tile.elemPerThread + iv`, so only the first half of every band
+# reached the output.
+#
+# ⚠️ Do not add a cell above four elements per thread, i.e. N > 128 at one warp
+# or N > 512 at four. The exchange still cannot carry a value across its phases
+# there and the result is wrong, not a compile failure. Open defect.
 @pytest.mark.parametrize("num_warps", [1, 4])
-@pytest.mark.parametrize("N", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("N", [2, 4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("kernel,ref", [
     (_sort_kernel, lambda x: x.sort().values),
     (_sort_desc_kernel, lambda x: x.sort(descending=True).values),
