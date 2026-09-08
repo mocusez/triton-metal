@@ -20987,13 +20987,20 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   const int mTiles = shape[0] / 8, nTiles = shape[1] / 8;
   // Multi-warp: partition the M-tile rows across warps (each warp owns
   // mTiles/numWarps rows, all N-tiles) so per-warp register pressure stays
-  // bounded. Requires mTiles % numWarps == 0. Multi-warp masked is not yet
-  // supported (the masked staged load has no per-warp buffer).
+  // bounded. Requires mTiles % numWarps == 0.
+  //
+  // Masked loads and a masked store used to be refused here as well, because
+  // the masked staged load had no per-warp staging buffer. It has one: the
+  // masked op carries the same optional warp index as the unmasked one and the
+  // emitter gives it a per-simdgroup slice, and the partial store has its own
+  // per-warp scratch. Keeping the refusal meant the ORDINARY Triton matmul —
+  // bounds masks on a shape that is not an exact multiple of its block, more
+  // than one warp — fell to a per-output-tile lowering that re-stages both
+  // operands inside every tile's own contraction loop, which measured 4.4x
+  // slower on a 1024-cubed f32 product.
   const bool multiWarp = numWarps > 1;
   if (multiWarp) {
     if (mTiles % numWarps != 0)
-      return mlir::failure();
-    if (loadA.getMask() || loadB.getMask())
       return mlir::failure();
   }
   const int mPerWarp = multiWarp ? mTiles / numWarps : mTiles;
@@ -21007,8 +21014,6 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
       *forOp.getResult(0).getUsers().begin());
   if (!store)
-    return mlir::failure();
-  if (multiWarp && store.getMask())
     return mlir::failure();
   MaskExtents storeExt;
   if (store.getMask()) {
