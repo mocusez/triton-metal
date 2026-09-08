@@ -52,6 +52,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    metal.kernel decay_scalar_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>, %lg: !metal.memref<? x f32>):
+      metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so params %lg {bm = 128 : i64, bn = 64 : i64, bd = 64 : i64, norm = 0 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x f32> {
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32, %log2g: f32):
+        %diff = metal.binary_exp %row, %key, subOp : (si32, si32) -> si32
+        %zero = metal.constant 0 : si32
+        %ge = metal.binary_exp %diff, %zero, geOp : (si32, si32) -> i1
+        %difff = metal.cast %diff : (si32) -> f32
+        %expo = metal.binary_exp %difff, %log2g, mulOp : (f32, f32) -> f32
+        %ninf = metal.constant 0xFF800000 : f32
+        %sel = arith.select %ge, %expo, %ninf : f32
+        %w = metal.unary_exp %sel, exp2Op : (f32) -> f32
+        %out = metal.binary_exp %score, %w, mulOp : (f32, f32) -> f32
+        metal.score_yield %out : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32, %log2g: f32):
+        // Causal: keys [0, min((blk+1)*bm, n)). The source's own loop bound,
+        // written out -- not an attribute standing in for it.
+        %zero = metal.constant 0 : si32
+        %one = metal.constant 1 : si32
+        %bm = metal.constant 128 : si32
+        %b1 = metal.binary_exp %blk, %one, addOp : (si32, si32) -> si32
+        %hi = metal.binary_exp %b1, %bm, mulOp : (si32, si32) -> si32
+        %end = metal.binary_exp %hi, %n2, minOp : (si32, si32) -> si32
+        metal.key_bounds_yield %zero, %end
+      }
+      metal.return
+    }
     metal.kernel softmax_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true] {
     ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>):
       metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
@@ -125,32 +153,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // --- decay kernel: norm = None. At 64x64x64 the simdgroup body would need
-// 3*64*64 + 2*64*64 + 2*64*64 = 28672 floats against a 8192 budget, so this one
-// takes the SCALAR floor instead of the op declining — that is what keeping two
-// bodies buys.
+// 3*64*64 + 2*64*64 + 2*64*64 = 28672 floats against an 8192 budget, so the
+// complete working set does not fit and the emitter takes the CHUNKED
+// simdgroup body: it searches a (key, d_head, out_d) blocking that fits and
+// keeps both matmuls on the matrix unit. Until 2026-09-08 a bm of 64 was
+// outside the MMA envelope entirely and this kernel took the scalar floor,
+// which measured 24x slower on the workload this fixture is modelled on
+// (`medium-decaying_causal_attention.py`). `decay_scalar_kernel` below pins
+// that floor at the new boundary.
 // CHECK-LABEL: kernel void decay_kernel
-// CHECK: threadgroup float _fa_qbuf[2048]
-// CHECK: threadgroup float _fa_obuf[2048]
+// CHECK: uint sgid {{\[\[}}simdgroup_index_in_threadgroup]]
+// The O accumulator spans the full bm x bd tile and persists across the
+// d_head chunk loop; the staged Q/K/V/S buffers are the chunk, not the tile.
+// CHECK: threadgroup float _fa_obuf[4096]
 // CHECK-NOT: _fa_rmax
-// bm=64 with bd=64 exceeds a single 32-lane pass, so the emitter chunks the
-// query rows (2 x 32) instead of declining the way flash_attention's bm<=32
-// gate did.
-// CHECK: for (uint _fa_c0 = 0u; _fa_c0 < 64u; _fa_c0 += 32u)
+// Four simdgroups, one per pair of the eight 8-row query tiles.
+// CHECK: bool _fa_active = _fa_tid < 128u
 // The causal key bound comes from the op's key-bounds region, so it is ordinary
 // emitted arithmetic rather than a hard-coded `min((tgid.x+1)*bm, n)`.
-// CHECK: // --- key phase 0 ---
 // CHECK: uint _fa_kbeg =
 // CHECK: uint _fa_kend =
+// CHECK: for (uint kb = _fa_kbeg; kb < _fa_kend; kb += {{[0-9]+}}u)
+// The d_head chunk loop is what the blocking search buys: S contracts over the
+// FULL d_head while only a chunk of Q and K^T is staged at a time.
+// CHECK: for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += {{[0-9]+}}u)
+// CHECK: for (uint mi = _fa_warp; mi < 8u; mi += 4u)
+// CHECK: simdgroup_multiply_accumulate
+// --- the region, emitted inline as let-bindings over the staged S tile: the
+// row and key indices are both in hand there, which is what lets one emitter
+// serve every attention variant.
+// CHECK: = (int)row;
+// CHECK: = (int)_fa_key;
+// CHECK: exp2(
+// CHECK-NOT: _fa_den
+
+// --- the SCALAR floor, kept at the new boundary. Identical to decay_kernel
+// except bm=128, which is outside the MMA envelope (`bm <= 64`), so the op
+// still lowers rather than declining. This is the only lit coverage of the
+// scalar body, which stays reachable for multi-phase ops, dimensions that are
+// not multiples of eight, and any tile too tall for the envelope.
+// CHECK-LABEL: kernel void decay_scalar_kernel
+// CHECK: threadgroup float _fa_qbuf[2048]
+// CHECK: threadgroup float _fa_obuf[2048]
+// CHECK-NOT: simdgroup_multiply_accumulate
+// The scalar body chunks the query rows 32 at a time rather than declining.
+// CHECK: for (uint _fa_c0 = 0u; _fa_c0 < 128u; _fa_c0 += 32u)
 // CHECK: for (uint _fa_key = _fa_kbeg; _fa_key < _fa_kend; ++_fa_key)
 // CHECK: _fa_a += _fa_qbuf
-// --- the region, emitted inline as let-bindings with score/row/key bound ---
 // CHECK: = _fa_a;
-// CHECK: = (int)_fa_row;
-// CHECK: = (int)_fa_key;
-// CHECK: [0];
 // CHECK: exp2(
 // CHECK: _fa_obuf{{.*}} +=
-// CHECK-NOT: _fa_den
 
 // --- softmax kernel: same op and same region, but its working set
 // (3*32*16 + 2*16*32 + 2*32*32 + 2*32 = 4672 floats) fits Apple's 8192, so the

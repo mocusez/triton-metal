@@ -3105,7 +3105,7 @@ mlir::triton::metal::getFusedAttentionSchedule(FusedAttentionOp op) {
   const int64_t fullNeed =
       3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
       (op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * BM : 0);
-  const bool mmaEnvelope = BM <= 32 && BM % 8 == 0 && BN % 8 == 0 &&
+  const bool mmaEnvelope = BM <= 64 && BM % 8 == 0 && BN % 8 == 0 &&
                            BD % 8 == 0 && op.getNumPhases() == 1 &&
                            !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR");
   if (!mmaEnvelope)
