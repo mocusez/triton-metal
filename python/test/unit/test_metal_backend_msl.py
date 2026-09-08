@@ -1735,6 +1735,13 @@ def test_topk_masked_padding_sentinel(descending):
     assert torch.equal(out.cpu(), expected)
 
 
+# ⚠️ Every cell here is at ONE element per thread or fewer, because N never
+# exceeds 32 and num_warps is at least 1. That is not headroom, it is the whole
+# verified envelope: `tl.sort` writes only the first half of each per-thread
+# band from two elements per thread up, leaving the rest of the output at its
+# prior value, and the interpreter confirms the kernel is right and the backend
+# wrong. Open defect, measured 2026-09-08. Raising N here without fixing that
+# first will produce wrong answers, not failures to compile.
 @pytest.mark.parametrize("num_warps", [1, 4])
 @pytest.mark.parametrize("N", [2, 4, 8, 16, 32])
 @pytest.mark.parametrize("kernel,ref", [

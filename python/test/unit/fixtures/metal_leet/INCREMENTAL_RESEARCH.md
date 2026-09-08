@@ -1629,6 +1629,46 @@ validation.
     aborts the process would break the run. Fixing the phase machinery is the
     next slice and is a design change, not a patch.
 
+56. **A second silent wrong answer, in `tl.sort`, and the axis both share.**
+    Chasing the topk root cause split the search space with one experiment:
+    topk is sort plus a slice, so is `tl.sort` wrong too? It is, and worse.
+
+    `tl.sort` is correct only at **one element per thread**. From two up it
+    writes only the first `E/2` entries of each `E`-sized per-thread band and
+    leaves the remainder at whatever the output buffer already held:
+
+        E=1                       correct
+        E=2   got [0, 0, 2, 0, 4, 0, 6, 0]   want [0..7]
+        E=4   got [0, 1, 0, 0, 4, 5, 0, 0]   want [0..7]
+        E=8   got [0, 1, 2, 3, 0, 0, 0, 0]   want [0..7]
+
+    The same kernel under `TRITON_INTERPRET=1` matches `torch.sort`, so the
+    kernel is right and the backend is wrong. The MSL contains none of this
+    branch's new spellings, so it predates this work.
+
+    🔑 **Elements per thread, `N / (32 * num_warps)`, is the axis the whole
+    sort/hypercube family is broken along, and no in-tree test sweeps it.**
+    sort breaks at E>=2, topk at E==4, the exchange carry at E>=8.
+    `test_hypercube_sort_and_flip` sweeps N in {2,4,8,16,32} at one and four
+    warps, so every cell is at most E==1; `test_mixed_sort_and_topk` uses N=128
+    at four warps, also E==1. Parameterize E directly when covering anything on
+    this path, or the cells land at E==1 by accident.
+
+    ⚠️ They are not one bug: topk is correct at E==2 where sort is already
+    wrong, so topk's slice compensates there and stops at E==4. Fix sort first;
+    its signature is simpler and topk is built on it.
+
+    Three hypotheses for the topk root cause were tried and discarded first, per
+    the stop rule: a gather factor fixed at 2 (the final publish and read
+    indices agree), a missing or repeated bitonic stage (both kernels alternate
+    distances 1 and 2, the larger one merely has an extra level), and pool
+    reuse in the final phase (the last three stages are individually correct).
+    The sort result supersedes all three as the place to start.
+
+    No test cells were added for the failing regimes, for the same reason as
+    entry 55. Both matrices now carry a comment naming the boundary and why
+    raising it will produce wrong answers rather than failures.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
