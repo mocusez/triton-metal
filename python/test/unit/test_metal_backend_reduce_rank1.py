@@ -957,3 +957,100 @@ def test_reduce_rank1_masked_without_other_contributes_the_identity():
     torch.mps.synchronize()
     want = torch.exp(x[:n_valid].double()).sum().item()
     assert out.cpu().item() == pytest.approx(want, rel=2e-5)
+
+
+# ---------------------------------------------------------------------------
+# A masked lane the program said nothing about contributes the combine
+# identity, at rank one, with or without a chain in between.
+#
+# The chain path already did this; the direct path kept the zero the load's
+# else branch fills with. So a maximum over an all-negative masked row returned
+# zero while the identical kernel with one elementwise op before the reduce
+# returned the maximum over the valid lanes. Making the two agree is also what
+# lets a masked PRODUCT exist: its identity is one, and a single zeroed lane
+# annihilates the product, which is why masked loads were refused there.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _masked_product_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + o, mask=o < n_valid)
+    tl.store(out_ptr, tl.reduce(v, 0, _mul_combine))
+
+
+@triton.jit
+def _mul_combine(a, b):
+    return a * b
+
+
+@triton.jit
+def _masked_product_other_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr,
+                                 OTHER: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + o, mask=o < n_valid, other=OTHER)
+    tl.store(out_ptr, tl.reduce(v, 0, _mul_combine))
+
+
+@triton.jit
+def _masked_max_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.max(tl.load(x_ptr + o, mask=o < n_valid), axis=0))
+
+
+@triton.jit
+def _masked_min_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.min(tl.load(x_ptr + o, mask=o < n_valid), axis=0))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block,n_valid", [(32, 21), (128, 77), (256, 256)])
+def test_reduce_rank1_masked_product_without_other(block, n_valid, num_warps):
+    """No `other`: the masked lanes take the multiplicative identity."""
+    torch.manual_seed(block * 3 + n_valid)
+    x = torch.rand(block) * 0.5 + 0.8
+    out = torch.zeros(1, device="mps")
+    _masked_product_kernel[(1,)](x.to("mps"), out, n_valid, BLOCK=block,
+                                 num_warps=num_warps)
+    torch.mps.synchronize()
+    want = x[:n_valid].double().prod().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-4)
+
+
+@pytest.mark.parametrize("other", [1.0, 2.0, 0.5])
+def test_reduce_rank1_masked_product_with_other(other):
+    """An explicit `other` multiplies in once per masked-off lane."""
+    torch.manual_seed(int(other * 10) + 7)
+    block, n_valid = 128, 77
+    x = torch.rand(block) * 0.5 + 0.8
+    full = x.clone()
+    full[n_valid:] = other
+    out = torch.zeros(1, device="mps")
+    _masked_product_other_kernel[(1,)](x.to("mps"), out, n_valid, BLOCK=block,
+                                       OTHER=other, num_warps=1)
+    torch.mps.synchronize()
+    want = full.double().prod().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-4)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_rank1_masked_extrema_without_other(num_warps):
+    """A masked maximum over all-negative data used to return the zero the
+    load's else branch fills with; the chained form of the same kernel already
+    returned the maximum over the valid lanes."""
+    torch.manual_seed(29 + num_warps)
+    block, n_valid = 128, 77
+    neg = -(torch.rand(block) * 5.0 + 1.0)
+    pos = torch.rand(block) * 5.0 + 1.0
+    out = torch.zeros(1, device="mps")
+    _masked_max_kernel[(1,)](neg.to("mps"), out, n_valid, BLOCK=block,
+                             num_warps=num_warps)
+    torch.mps.synchronize()
+    assert out.cpu().item() == pytest.approx(neg[:n_valid].max().item())
+
+    out = torch.zeros(1, device="mps")
+    _masked_min_kernel[(1,)](pos.to("mps"), out, n_valid, BLOCK=block,
+                             num_warps=num_warps)
+    torch.mps.synchronize()
+    assert out.cpu().item() == pytest.approx(pos[:n_valid].min().item())

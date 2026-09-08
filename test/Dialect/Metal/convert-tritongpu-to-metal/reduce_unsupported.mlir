@@ -27,34 +27,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// Rank-1 f32 product starts with a direct-unmasked load envelope. A computed
-// source remains behind a stable preflight diagnostic.
+// A rank-1 f32 product folds straight out of device memory, so a COMPUTED
+// source remains behind a stable preflight diagnostic. A masked load is no
+// longer one of these: it is covered as a positive in
+// rank1_reduce_addf_block32.mlir.
 #blocked1d = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_mulf_rank1_computed_deferred() {
     %x = arith.constant dense<1.0> : tensor<32xf32, #blocked1d>
-    // expected-error @+1 {{rank-1 f32 product requires a direct unmasked tt.load}}
-    %r = "tt.reduce"(%x) ({
-    ^bb0(%a: f32, %b: f32):
-      %product = arith.mulf %a, %b : f32
-      tt.reduce.return %product : f32
-    }) {axis = 0 : i32} : (tensor<32xf32, #blocked1d>) -> f32
-    tt.return
-  }
-}
-
-// -----
-// Masked rank-1 loads remain outside the initial f32 product slice.
-#blocked1d = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_mulf_rank1_masked_deferred(%x_ptr: !tt.ptr<f32>) {
-    %offsets = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked1d>
-    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked1d>
-    %ap = tt.addptr %sp, %offsets : tensor<32x!tt.ptr<f32>, #blocked1d>, tensor<32xi32, #blocked1d>
-    %mask = arith.constant dense<true> : tensor<32xi1, #blocked1d>
-    %other = arith.constant dense<1.0> : tensor<32xf32, #blocked1d>
-    %x = tt.load %ap, %mask, %other : tensor<32x!tt.ptr<f32>, #blocked1d>
-    // expected-error @+1 {{rank-1 f32 product requires a direct unmasked tt.load}}
+    // expected-error @+1 {{rank-1 f32 product requires a direct tt.load}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %product = arith.mulf %a, %b : f32

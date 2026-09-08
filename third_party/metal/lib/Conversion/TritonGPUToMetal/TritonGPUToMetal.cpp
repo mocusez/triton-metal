@@ -6394,6 +6394,97 @@ static mlir::Value emitScalarChain(llvm::ArrayRef<Wall11ChainStep> chain,
 // a general combine (below) or a named rejection — never a guess.
 //===----------------------------------------------------------------------===//
 
+// The one masked-load shape a rank-1 reduce can re-derive per thread when it
+// consumes the already-lowered per-thread scalar: `make_range(0, BLOCK) <
+// uniform`, with no `other`. In that regime a thread holds exactly one logical
+// element and its index IS the local thread id, so the lane predicate is
+// `localTid < bound`. A mask carrying a program offset (`splat(base) + range`)
+// is deliberately not accepted here -- the index is then not the thread id.
+// Pure inspection, so the pattern and the pre-conversion validator share it.
+static bool rank1SimpleMaskBound(mlir::triton::LoadOp load,
+                                 mlir::Value &splatBound,
+                                 mlir::TypedAttr &constBound) {
+  splatBound = nullptr;
+  constBound = nullptr;
+  mlir::Value maskVal = load.getMask();
+  if (!maskVal)
+    return false;
+  if (auto cvt = maskVal.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    maskVal = cvt.getSrc();
+  auto cmp = maskVal.getDefiningOp<mlir::arith::CmpIOp>();
+  if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+    return false;
+  auto range = cmp.getLhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+  if (!range || range.getStart() != 0)
+    return false;
+  if (auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>()) {
+    splatBound = splat.getSrc();
+    return true;
+  }
+  if (auto boundAttr = extractSplatConstantAttr(cmp.getRhs())) {
+    constBound = *boundAttr;
+    return true;
+  }
+  return false;
+}
+
+// Walk a rank-1 reduce source back to the single `tt.load` it bottoms out in,
+// through the elementwise ops the ordinary lowering already applied to the
+// per-thread scalar. Returns null when the cone has more than one tensor leaf,
+// which is exactly when a single lane predicate would not describe it.
+static mlir::triton::LoadOp rank1RootLoad(mlir::Value v, int depth = 0) {
+  if (depth > 8)
+    return {};
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return {};
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def))
+    return load;
+  mlir::triton::LoadOp found;
+  for (mlir::Value operand : def->getOperands()) {
+    if (!mlir::isa<mlir::RankedTensorType>(operand.getType()))
+      continue;
+    if (operand.getDefiningOp<mlir::triton::SplatOp>())
+      continue;
+    if (auto cst = operand.getDefiningOp<mlir::arith::ConstantOp>()) {
+      auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+      if (dense && dense.isSplat())
+        continue;
+    }
+    mlir::triton::LoadOp nested = rank1RootLoad(operand, depth + 1);
+    if (!nested || (found && found != nested))
+      return {};
+    found = nested;
+  }
+  return found;
+}
+
+// A rank-1 float product folds the tile directly out of device memory, so its
+// source has to be one `tt.load` and not a computed cone. A MASK is fine: a
+// masked-off lane contributes the load's `other`, or -- when the program did
+// not give one -- the combine identity, which for a product is one. It used to
+// be refused because the else value was hard-wired to zero, and a single zeroed
+// lane takes the whole product with it.
+//
+// The pattern and the pre-conversion validator both call this, so the shape
+// they accept cannot drift apart; the two used to spell the same rule twice.
+static bool rank1ProductSourceSupported(mlir::triton::ReduceOp op) {
+  mlir::Value src = op.getSrcs().front();
+  if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    src = cvt.getSrc();
+  auto load = src.getDefiningOp<mlir::triton::LoadOp>();
+  if (!load)
+    return false;
+  if (!load.getMask() || load.getOther())
+    return true;
+  // Masked with nothing said about the masked-off lanes: the lane has to be
+  // driven to the multiplicative identity, which needs a predicate this
+  // lowering can rebuild in either regime.
+  mlir::Value splatBound;
+  mlir::TypedAttr constBound;
+  return rank1SimpleMaskBound(load, splatBound, constBound);
+}
+
 // The single binary op a monoid combine region consists of, or null.
 //
 // Requires the region to be exactly `{ binop(arg0, arg1), reduce_return(binop)
@@ -6953,15 +7044,10 @@ static mlir::LogicalResult lowerRank1Reduce(
     return mlir::failure();
   if (isInt && !(isAddI || isMulI || isMaxI || isMinI || isBitwiseI))
     return mlir::failure();
-  if (isMulF) {
-    mlir::Value src = op.getSrcs().front();
-    if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-      src = cvt.getSrc();
-    auto load = src.getDefiningOp<mlir::triton::LoadOp>();
-    if (!load || load.getMask())
-      return rewriter.notifyMatchFailure(
-          op, "rank-1 f32 product requires a direct unmasked tt.load");
-  }
+  if (isMulF && !rank1ProductSourceSupported(op))
+    return rewriter.notifyMatchFailure(op,
+                                       "rank-1 f32 product requires a direct "
+                                       "tt.load");
 
   // Derive tpb from the blocked encoding directly (do NOT use
   // tileFromTensor.elemPerThread — it's 0 in the BLOCK < tpb regime).
@@ -7607,6 +7693,16 @@ static mlir::LogicalResult lowerRank1Reduce(
         } else {
           elt = chainElt;
         }
+      } else if (condKResult && !otherAttrPre) {
+        // The same rule with nothing in between. Without this the masked-off
+        // lane kept the zero the else branch fills with, so a maximum over an
+        // all-negative masked row returned zero while the identical kernel
+        // with one elementwise op before the reduce returned the maximum over
+        // the valid lanes. It is also what makes a masked product possible at
+        // all: its identity is one, and a zeroed lane annihilates the product.
+        elt = mlir::arith::SelectOp::create(rewriter, loc, condKResult, elt,
+                                            buildIdentityVal())
+                  .getResult();
       }
       // Combine: accumulator (region iter-arg) op elt.
       return emitCombine(acc, elt);
@@ -7716,7 +7812,39 @@ static mlir::LogicalResult lowerRank1Reduce(
                         rewriter, loc, mlir::TypeRange{storeTy},
                         mlir::ValueRange{inputScalarPT})
                         .getResult(0);
+  // A masked-off lane the program said nothing about contributes the combine
+  // identity here too. This regime hands the reduce the already-lowered
+  // per-thread scalar, which carries the load's zero fill, so without this a
+  // maximum over an all-negative masked row returned zero -- while the same
+  // kernel one warp narrower, on the tile-loop path, returned the maximum over
+  // the valid lanes. A thread holds one logical element here, so the lane
+  // predicate is `localTid < bound`.
   mlir::Value padded = inputScalarPT;
+  if (BLOCK <= tpb) {
+    if (mlir::triton::LoadOp rootLoad =
+            rank1RootLoad(op.getSrcs().front())) {
+      mlir::Value splatBound;
+      mlir::TypedAttr constBound;
+      if (!rootLoad.getOther() &&
+          rank1SimpleMaskBound(rootLoad, splatBound, constBound)) {
+        mlir::Value bound =
+            splatBound
+                ? splatBound
+                : mlir::arith::ConstantOp::create(rewriter, loc, constBound)
+                      .getResult();
+        if (bound.getType() == i32) {
+          mlir::Value inMask =
+              mlir::arith::CmpIOp::create(rewriter, loc,
+                                          mlir::arith::CmpIPredicate::slt,
+                                          tidI32, bound)
+                  .getResult();
+          padded = mlir::arith::SelectOp::create(rewriter, loc, inMask, padded,
+                                                 buildIdentityVal())
+                       .getResult();
+        }
+      }
+    }
+  }
   if (BLOCK < tpb) {
     auto cBlock = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BLOCK)));
@@ -7725,7 +7853,7 @@ static mlir::LogicalResult lowerRank1Reduce(
                                             tidI32, cBlock.getResult());
     mlir::Value identity = buildIdentityVal();
     padded = mlir::arith::SelectOp::create(rewriter, loc, cond.getResult(),
-                                           inputScalarPT, identity)
+                                           padded, identity)
                  .getResult();
   }
 
@@ -34071,17 +34199,11 @@ struct ConvertTritonGPUToMetalPass
           }
         }
       }
-      if (rtt.getRank() == 1 && combineName == "arith.mulf") {
-        mlir::Value src = red.getSrcs().front();
-        if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-          src = cvt.getSrc();
-        auto load = src.getDefiningOp<mlir::triton::LoadOp>();
-        if (!load || load.getMask()) {
-          red.emitOpError(
-              "rank-1 f32 product requires a direct unmasked tt.load");
-          reduceOk = false;
-          return;
-        }
+      if (rtt.getRank() == 1 && combineName == "arith.mulf" &&
+          !rank1ProductSourceSupported(red)) {
+        red.emitOpError("rank-1 f32 product requires a direct tt.load");
+        reduceOk = false;
+        return;
       }
       if (rtt.getRank() == 2 && axes == 1 && combineName == "arith.mulf") {
         mlir::Value src = red.getSrcs().front();

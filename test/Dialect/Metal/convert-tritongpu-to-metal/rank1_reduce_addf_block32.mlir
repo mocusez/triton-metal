@@ -38,6 +38,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     }) {axis = 0 : i32} : (tensor<32xf32, #blocked>) -> f32
     tt.return
   }
+
+  // A masked product. The masked-off lane takes the load's `other`, and with
+  // no `other` it takes the combine identity -- which for a product is one,
+  // where the else branch used to fill zero and annihilate the whole product.
+  tt.func public @rank1_reduce_mulf_block32_masked(%x_ptr: !tt.ptr<f32>, %n: i32) {
+    %offsets = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<32xi32, #blocked>
+    %mask = arith.cmpi slt, %offsets, %n_splat : tensor<32xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %offsets : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    %x = tt.load %ap, %mask : tensor<32x!tt.ptr<f32>, #blocked>
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %p = arith.mulf %a, %b : f32
+      tt.reduce.return %p : f32
+    }) {axis = 0 : i32} : (tensor<32xf32, #blocked>) -> f32
+    tt.return
+  }
 }
 // CHECK-LABEL: metal.kernel rank1_reduce_addf_block32
 // B2.1: tail predicate — threads with tid >= BLOCK get identity (0.0) written.
@@ -68,5 +86,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: arith.constant 1.000000e+00 : f32
 // CHECK: arith.select
 // CHECK: metal.threadgroup_alloca : !metal.memref<256 x f32>
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, mulOp
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel rank1_reduce_mulf_block32_masked
+// The masked lane is selected against the multiplicative identity, not the
+// zero the load's else branch fills with.
+// CHECK: scf.if
+// CHECK: arith.constant 1.000000e+00 : f32
+// CHECK: arith.select
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, mulOp
 // CHECK: metal.return
