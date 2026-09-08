@@ -1768,6 +1768,42 @@ validation.
     which carry all five `localTid` bits, from direction-flag reads, which carry
     one and clamp to slot 1; the defect should show as a data read with too few.
 
+60. **Root cause named, first fix attempt reverted.** A read-only review lane,
+    which the plan's own stop rule calls for after repeated failed hypotheses,
+    found the site: the exchange double-buffer slot allocator in
+    `FuncOpLowering` hands out slots by blind round-robin keyed only on element
+    type. Its comment assumes two alternating buffers suffice because a phase
+    may still be reading the preceding same-type exchange while publishing the
+    next, which holds only while same-type publishes alternate strictly. A
+    hypercube reduce along a thread axis interleaves small direction-table
+    publishes of the same element type, flipping the parity, so some
+    compare-exchange stages receive the slot they read from. With destination
+    equal to source and no barrier inside the loop body, a distance-1 stage
+    reads the partner after overwriting it and both lanes of the pair take the
+    smaller value.
+
+    ✅ Proven by simulation rather than argued: replaying the emitted
+    fifteen-stage network with snapshot reads reproduces the reference answer,
+    and replaying it with live-buffer reads reproduces the measured wrong output
+    exactly, `[10,10,13,13,19,19,21,21]`. The correct axis is safe only
+    incidentally, since at one element per thread there are no table publishes.
+
+    ⚠️ **The first fix made it worse and was reverted.** Replacing round-robin
+    with "a publish may not take a slot a read in its own segment still needs",
+    clearing the live set at each publish because a publish closes its segment
+    and a barrier follows, turned wrong answers into `[0, 0, ...]` — reads of a
+    buffer nobody had written. The liveness model is too short: exchange reads
+    are CLONED INTO LATER PHASES, which the rematerialization code states
+    outright, so a published buffer stays live beyond its own following segment
+    and clearing at every publish frees slots still in use.
+
+    The tree was restored to the committed state and re-verified: sort correct
+    through four elements per thread, reduce-then-sort back to its original
+    signature. Any real fix must derive liveness from the actual reads including
+    their clones, or add a third slot, and must keep
+    `validateTileExchangeScratchBudget` on the same assignment so the preflight
+    and the emission cannot disagree.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
