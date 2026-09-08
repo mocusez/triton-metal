@@ -1707,6 +1707,40 @@ validation.
     0 failed**, and `leet-all` at 1,664 passed with only the pre-existing
     source-fidelity byte mismatch.
 
+58. **The topk defect, isolated without topk, and an A/B that clears entry 57.**
+    Chasing the remaining wrong answer produced a far smaller reproducer and a
+    structural diagnosis, plus the A/B that entry 57's fix deserved.
+
+    **Minimal case: reduce one hypercube axis, then sort the result.** No topk
+    involved. It fails with topk's adjacent-duplicate signature,
+    `[10, 10, 13, 13, 19, 19]` for `[10, 13, 15, 19, 21, 22]`. That is exactly
+    what topk does internally, since its second loop alternates a hypercube-axis
+    reduce with a bitonic merge. The reduce alone is fine: every axis passes at
+    four elements per thread.
+
+    **Cause, from a perfect minimal pair.** Same N=64, same one warp, same
+    tile: axis 5 is correct and axis 4 is wrong. Their phase loop trip counts
+    are `2 1 1 1 ...` and `2 2 1 2 1 2 1 ...`. The reduce halves the tensor, so
+    the kernel holds two tiles, and the stray twos are segments belonging to the
+    REDUCED tile that were handed the ORIGINAL tile's count, processing every
+    element twice. `FuncOpLowering` takes `findTileInfo` over the whole
+    `tt.func`, one tile per function, and the per-phase counts come from the
+    exchange plan rather than from the ops actually in each segment. The
+    principled fix derives each segment's count from its own ops; that is a
+    change to the phase splitter, not another constant swap.
+
+    ✅ **A/B on entry 57.** Both arms were built and measured over seven
+    reduce-then-sort cells plus plain sort. The pre-fix arm gives wrong answers
+    for plain sort and four-ok/three-wrong on reduce-then-sort; the post-fix arm
+    gives correct plain sort and the identical four-ok/three-wrong. The
+    band-write fix turned plain sort from wrong to right and moved nothing else,
+    so the duplication is entirely pre-existing. ⚠️ Worth repeating before
+    blaming any phase-loop change for a duplicate-valued result: the two failure
+    modes look alike and live in the same few lines.
+
+    Reproducers are now in `.omc/fuzz/`: `red_then_sort.py`, `hyper_reduce.py`,
+    `sort_cell.py`, `topk_cell.py`. No compiler source changed in this entry.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
