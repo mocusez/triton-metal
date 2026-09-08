@@ -1577,6 +1577,58 @@ validation.
     No compiler source changed. This round is a bounded negative: 230 probes
     across the whole audit so far, one real gap, and that one is fixed.
 
+55. **Checking the README's CLAIMS instead of its rejections found a silent
+    wrong answer in `tl.topk`.** The decline audit had saturated at 230 probes
+    and one gap, so this round took the other half of the plan's stop
+    condition: the README, the diagnostics and the test matrix must agree with
+    what the backend does. The largest claim surface is topk, so it was checked
+    NUMERICALLY against `torch.topk` rather than merely compiled.
+
+    The axis that matters is **elements per thread**, `N / (32 * num_warps)`,
+    and the measured envelope is far narrower than the claim:
+
+        E <= 2                 correct for all four dtypes, both directions,
+                               ranks 1-3
+        E == 4, k == 2         correct
+        E == 4, k >= 4         **WRONG VALUES**, both directions
+        E >= 8                 rejects, or aborts the process
+
+    A representative failure: `tl.topk(x, 8, descending=False)` over a
+    permutation of 0..511 at four warps returned `[1, 4, 1, 4, 6, 7, 6, 10]`,
+    with duplicates, where the answer is `[0..7]`. Eight such cells across
+    N=128/256/512 and k=4..64.
+
+    The E >= 8 case is the other half. Its non-crashing runs print
+    `'tt.func' op Metal backend cannot carry a value across full-tile exchange
+    phases` — the message entry 54 concluded was unreachable. **That conclusion
+    was wrong**, and worth keeping as the correction it is: entry 54 probed the
+    exchange through transposes and permutes, where the layout is re-encoded
+    rather than moved, so no pool is ever allocated. topk reaches it because
+    its bitonic phases genuinely republish a slot before the phase anchor. It
+    is emitted from `FuncOpLowering::matchAndRewrite`, after the signature
+    rewrite, and it crashes **6 of 20 runs** with the rest exiting 1.
+
+    ⚠️ Two methodology failures produced this, both worth carrying. First, the
+    initial probe fed topk an ALREADY SORTED input, so every cell passed: a
+    broken selection still returns the right prefix of sorted data. Permuted
+    input is mandatory for any ordering primitive. Second, the in-tree matrix
+    has exactly one cell at four elements per thread and it uses `k=2`, the
+    single working corner — the same shape of blind spot as the phantom-encoding
+    and NaN bugs, where the suite's cells happen to sit outside the failing
+    regime.
+
+    ✅ Not caused by this session. The failing kernel's MSL contains none of the
+    new spellings: no `__triton_maximumf`, no `__triton_minimumf`, no NaN
+    operator, no clamp. topk decomposes to `arith.maxnumf` plus compare and
+    select, and the number-preferring path was left byte-identical.
+
+    This round corrects the README to the measured envelope and names both
+    defects as defects rather than as rejections. The two failing shapes are
+    NOT added to the suite: a test that returns wrong values would have to be
+    an xfail, which would legitimize a silent wrong answer, and a test that
+    aborts the process would break the run. Fixing the phase machinery is the
+    next slice and is a design change, not a patch.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

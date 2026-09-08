@@ -198,9 +198,20 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 
 The current values-only `tl.topk` is supported for static `i32`, `f16`,
 `bf16`, and `f32` tensors, ascending or descending, along the final dimension.
-This includes rank-1/2/3 and multi-register-band inputs when the compiler's
-typed phase-exchange scratch stays within Metal's 32 KiB threadgroup-memory
-budget. The shared Triton frontend rules still apply (`k > 0`, power-of-two
+This covers rank-1/2/3 inputs of **at most two elements per thread**, that is
+`N <= 2 * 32 * num_warps`, and only when the compiler's typed phase-exchange
+scratch stays within Metal's 32 KiB threadgroup-memory budget.
+
+Two open defects bound that envelope, both measured on 2026-09-08 and neither
+of them a supported rejection:
+
+- At exactly **four elements per thread**, `tl.topk` returns **wrong values**
+  for every `k >= 4`. Only `k == 2` is correct there, which is why the one
+  four-element cell in the test matrix passes.
+- At **eight or more elements per thread**, the phase exchange cannot carry a
+  value across its phases. The failure is raised inside the pass that has
+  already rewritten the function signature, so it aborts the process on roughly
+  a third of runs and otherwise exits with a diagnostic. The shared Triton frontend rules still apply (`k > 0`, power-of-two
 `k`, and `k <= N`); indices, dynamic shapes, non-final dimensions, and cases
 whose required phase scratch exceeds that budget are not part of this support
 contract.

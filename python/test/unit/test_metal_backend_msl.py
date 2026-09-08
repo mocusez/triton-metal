@@ -1537,6 +1537,14 @@ def test_topk_small_exhaustive(N, K, num_warps, descending, dtype):
     assert torch.equal(out.cpu(), expected)
 
 
+# ⚠️ Elements per thread, N / (32 * num_warps), is the axis that matters here
+# and every cell below sits at two or fewer, except (1024, 2, 8) which is at
+# four with k=2. That is not a coincidence to preserve casually: at four
+# elements per thread `tl.topk` returns WRONG VALUES for every k >= 4, and at
+# eight or more the phase exchange cannot carry a value across its phases and
+# the compiler aborts. Both are open defects, measured 2026-09-08. Adding a
+# cell above two elements per thread will either fail or, worse, pass only
+# because k=2 happens to be the one working corner.
 @pytest.mark.parametrize("N,K,num_warps,descending,dtype", [
     (64, 2, 1, True, "fp16"),
     (128, 8, 4, False, "bf16"),
