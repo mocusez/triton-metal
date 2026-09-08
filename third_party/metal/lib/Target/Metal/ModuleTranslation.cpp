@@ -460,6 +460,7 @@ void ModuleTranslation::translateKernels() {
       _buffers = {};
       _sharedStageBufferDeclared = false;
       _sharedStageBufferPerWarp = false;
+      _stageBufferAllPerWarp = false;
       _sgstoreScratchDeclared = false;
       _sgstoreScratchPerWarp = false;
       _fstoreScratchDeclared = false;
@@ -1536,7 +1537,9 @@ void ModuleTranslation::translate(
   // buffer is declared at kernel-body top (see `translate(Region&)`); each
   // staged load brackets its coop-load with `threadgroup_barrier` so the
   // buffer can be safely reused 100+ times within a kernel.
-  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  _output << (perWarp && _stageBufferAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
   printDelim();
   _output << "\n";
   indent();
@@ -1589,7 +1592,9 @@ void ModuleTranslation::translate(
   indent();
   _output << "}\n";
   indent();
-  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  _output << (perWarp && _stageBufferAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
   printDelim();
   _output << "\n";
   indent();
@@ -1633,7 +1638,9 @@ void ModuleTranslation::translate(
     }
   };
 
-  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  _output << (perWarp && _stageBufferAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
   printDelim();
   _output << "\n";
   indent();
@@ -1684,7 +1691,9 @@ void ModuleTranslation::translate(
   indent();
   _output << "}\n";
   indent();
-  _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+  _output << (perWarp && _stageBufferAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
   printDelim();
   _output << "\n";
   indent();
@@ -8025,11 +8034,14 @@ void ModuleTranslation::translate(mlir::Region &region) {
       };
       mlir::triton::metal::SimdgroupLoadDeviceStagedOp firstStaged;
       bool perWarpStage = false;
+      bool allPerWarpStage = true;
       kernelOp.walk([&](mlir::triton::metal::SimdgroupLoadDeviceStagedOp op) {
         if (!firstStaged)
           firstStaged = op;
         if (!op.getWarpIndex().empty())
           perWarpStage = true;
+        else
+          allPerWarpStage = false;
         return mlir::WalkResult::advance();
       });
       // A kernel may carry only MASKED staged loads (no unmasked); both share
@@ -8041,6 +8053,8 @@ void ModuleTranslation::translate(mlir::Region &region) {
               firstMasked = op;
             if (!op.getWarpIndex().empty())
               perWarpStage = true;
+            else
+              allPerWarpStage = false;
             return mlir::WalkResult::advance();
           });
       if (firstStaged || firstMasked) {
@@ -8065,6 +8079,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
         printDelim();
         _sharedStageBufferDeclared = true;
         _sharedStageBufferPerWarp = perWarpStage;
+        _stageBufferAllPerWarp = perWarpStage && allPerWarpStage;
       }
       // Fused-store scratch, shared across all simdgroup_fused_store ops (they
       // run sequentially with barriers) so threadgroup memory does not scale

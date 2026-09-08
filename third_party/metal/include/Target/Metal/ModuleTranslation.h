@@ -120,6 +120,13 @@ private:
   // emits the declaration exactly once.
   bool _sharedStageBufferDeclared = false;
   bool _sharedStageBufferPerWarp = false;
+  // True only when EVERY staged load in the kernel carries a warp index, so
+  // each simdgroup owns its slice of `_stage_shared` outright and no other
+  // simdgroup can read or write it. That is what makes a simdgroup-scoped
+  // fence sufficient in place of a threadgroup-wide barrier. A single
+  // warp-index-less load shares slice 0 across all warps and takes this back
+  // to false.
+  bool _stageBufferAllPerWarp = false;
   bool _sgstoreScratchDeclared = false;
   bool _sgstoreScratchPerWarp = false;
   bool _fstoreScratchDeclared = false;
