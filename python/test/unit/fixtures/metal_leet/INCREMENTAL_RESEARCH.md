@@ -1515,6 +1515,33 @@ validation.
     entry 51's 2,537 by exactly the two added cases. The measured checklist is
     now 159 fail-closed named diagnostics, 60 pinned, 99 not.
 
+53. **The loop-carried scaled-dot matcher is fail-closed; pin its boundary.**
+    Entry 52 fixed the loop-free form and left the loop-carried conditions as
+    the largest unpinned cluster. Nine near-misses on the working kernel from
+    `test_metal_backend_dot_universal.py` (M=N=16, K=64, BLOCK_K=SCALE_FACTOR=32,
+    e4m3 in u8, two static iterations) give **3 OK / 6 NAMED / 0 KILLER /
+    0 UNNAMED**. Unlike the loop-free form, this one already validated every
+    condition it relies on.
+
+    Four distinct reachable diagnostics came out, all previously unpinned, and
+    all now have a compile-only regression alongside a positive control: a K
+    loop that is not divisible by the block or starts below zero, a second
+    accumulator carried through the loop, a second output store, and a
+    non-contiguous A row stride.
+
+    Two probes compiled and are worth recording so they are not misread as
+    coverage. `K == BLOCK_K` compiles because Triton unrolls the single
+    iteration away and the kernel becomes the loop-free form, which is
+    supported — the "at least two static iterations" clause is unreachable from
+    that direction. And an extra fifth load in the body was folded out before
+    the matcher saw it, because the probe combined it with `& 0`; an
+    ineffective probe, not evidence that a fifth load is accepted.
+
+    Checklist after this round: 159 fail-closed named diagnostics, **62 pinned,
+    97 not**. 157 of 157 Metal lit and **2,545 passed / 3 skipped / 0 failed**,
+    up from entry 52's 2,539 by exactly the six added cases. No compiler source
+    changed.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

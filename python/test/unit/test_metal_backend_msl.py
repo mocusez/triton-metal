@@ -2898,3 +2898,159 @@ def test_scaled_dot_epilogue_between_dot_and_store_is_named(fn, out_ty, capfd):
     err = capfd.readouterr().err
     assert "dot_scaled requires its result to reach one store directly" in err, err
     assert "does not dominate this use" not in err, err
+
+
+# ---------------------------------------------------------------------------
+# Loop-carried scaled-dot matcher boundary.
+#
+# The matcher accepts a narrow canonical K loop. Each near-miss below must exit
+# with its own named diagnostic rather than a half-applied rewrite; a decline
+# reaching `applyFullConversion` is a process kill, not an error.
+# ---------------------------------------------------------------------------
+
+_SCALED_LOOP_SIGNATURE = {
+    "a_ptr": "*u8",
+    "b_ptr": "*u8",
+    "a_scale_ptr": "*u8",
+    "b_scale_ptr": "*u8",
+    "c_ptr": "*fp32",
+    "M": "constexpr",
+    "N": "constexpr",
+    "K": "constexpr",
+    "BLOCK_K": "constexpr",
+    "SCALE_FACTOR": "constexpr",
+    "LOOP_START": "constexpr",
+}
+
+
+@triton.jit
+def _scaled_loop_canonical_kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr,
+                                  M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                  BLOCK_K: tl.constexpr, SCALE_FACTOR: tl.constexpr,
+                                  LOOP_START: tl.constexpr):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc, fast_math=False)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+@triton.jit
+def _scaled_loop_two_accumulators_kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr,
+                                         M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                         BLOCK_K: tl.constexpr, SCALE_FACTOR: tl.constexpr,
+                                         LOOP_START: tl.constexpr):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    tally = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        tally += 1.0
+        acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc, fast_math=False)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc + tally)
+
+
+@triton.jit
+def _scaled_loop_two_stores_kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr,
+                                   M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                   BLOCK_K: tl.constexpr, SCALE_FACTOR: tl.constexpr,
+                                   LOOP_START: tl.constexpr):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc, fast_math=False)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+@triton.jit
+def _scaled_loop_non_canonical_a_kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr,
+                                        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                                        BLOCK_K: tl.constexpr, SCALE_FACTOR: tl.constexpr,
+                                        LOOP_START: tl.constexpr):
+    offs_m = tl.arange(0, M)
+    offs_n = tl.arange(0, N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_scale_k = tl.arange(0, BLOCK_K // SCALE_FACTOR)
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k_start in range(LOOP_START, K, BLOCK_K):
+        # Row stride K + 1 instead of K: not the contiguous full-K form.
+        a = tl.load(a_ptr + offs_m[:, None] * (K + 1) + (k_start + offs_k[None, :]))
+        b = tl.load(b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :])
+        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // SCALE_FACTOR)
+                          + k_start // SCALE_FACTOR + offs_scale_k[None, :])
+        acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc, fast_math=False)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+def _compile_scaled_loop(fn, *, K=64, loop_start=0):
+    src = ASTSource(
+        fn=fn,
+        signature=_SCALED_LOOP_SIGNATURE,
+        constexprs={"M": 16, "N": 16, "K": K, "BLOCK_K": 32,
+                    "SCALE_FACTOR": 32, "LOOP_START": loop_start},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    triton.compile(src, target=target, options={"num_warps": 4})
+
+
+def test_scaled_dot_canonical_loop_still_compiles():
+    """Positive control for the four rejections below: two static iterations
+    over a zero-based divisible K loop with one accumulator and one store."""
+    _compile_scaled_loop(_scaled_loop_canonical_kernel)
+
+
+@pytest.mark.parametrize(
+    "fn,kwargs,needle",
+    [
+        (_scaled_loop_canonical_kernel, {"K": 48},
+         "requires a K loop with nonnegative aligned divisible bounds"),
+        (_scaled_loop_canonical_kernel, {"K": 32, "loop_start": -32},
+         "requires a K loop with nonnegative aligned divisible bounds"),
+        (_scaled_loop_two_accumulators_kernel, {},
+         "loop-carried dot_scaled requires exactly one accumulator"),
+        (_scaled_loop_two_stores_kernel, {},
+         "loop-carried dot_scaled requires one output store"),
+        (_scaled_loop_non_canonical_a_kernel, {},
+         "requires canonical contiguous full-K A and B pointer arithmetic"),
+    ],
+    ids=["k_not_divisible", "negative_loop_start", "two_accumulators",
+         "two_output_stores", "non_canonical_a_pointer"],
+)
+def test_scaled_dot_loop_near_miss_is_named(fn, kwargs, needle, capfd):
+    """Each near-miss must name its own reason. Asserting only on the generic
+    `convert-tritongpu-to-metal failed` would also accept a dominance violation
+    from a half-applied rewrite, so read the diagnostic itself."""
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_scaled_loop(fn, **kwargs)
+    err = capfd.readouterr().err
+    assert needle in err, err
+    assert "does not dominate this use" not in err, err
