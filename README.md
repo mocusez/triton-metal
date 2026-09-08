@@ -198,20 +198,19 @@ In-tree pytest suites (`python/test/unit/test_metal_backend_*.py`) cover individ
 
 The current values-only `tl.topk` is supported for static `i32`, `f16`,
 `bf16`, and `f32` tensors, ascending or descending, along the final dimension.
-This covers rank-1/2/3 inputs of **at most two elements per thread**, that is
-`N <= 2 * 32 * num_warps`, and only when the compiler's typed phase-exchange
-scratch stays within Metal's 32 KiB threadgroup-memory budget.
+This covers rank-1/2/3 and multi-register-band inputs. The bound is the 32 KiB
+threadgroup-memory budget rather than a fixed number of elements per thread:
+while the phase-exchange scratch fits without reusing a buffer, every exchange
+gets its own and the result is correct. A 72-cell sweep over dtype, direction,
+`k` and `num_warps` gives 68 correct and 2 named rejections.
 
-Two open defects bound that envelope, both measured on 2026-09-08 and neither
-of them a supported rejection:
+One open defect remains, measured on 2026-09-08. When the no-reuse allocation
+does not fit the budget the compiler falls back to two alternating buffers per
+element type, and that scheme can hand a comparator the buffer it is reading,
+which loses one value of the pair. `N = 512`, `k = 32` at four warps is a
+measured shape that lands in the fallback and returns wrong values.
 
-- At exactly **four elements per thread**, `tl.topk` returns **wrong values**
-  for every `k >= 4`. Only `k == 2` is correct there, which is why the one
-  four-element cell in the test matrix passes.
-- At **eight or more elements per thread**, the phase exchange cannot carry a
-  value across its phases. The failure is raised inside the pass that has
-  already rewritten the function signature, so it aborts the process on roughly
-  a third of runs and otherwise exits with a diagnostic. The shared Triton frontend rules still apply (`k > 0`, power-of-two
+The shared Triton frontend rules still apply (`k > 0`, power-of-two
 `k`, and `k <= N`); indices, dynamic shapes, non-final dimensions, and cases
 whose required phase scratch exceeds that budget are not part of this support
 contract.

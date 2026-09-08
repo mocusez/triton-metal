@@ -1804,6 +1804,46 @@ validation.
     `validateTileExchangeScratchBudget` on the same assignment so the preflight
     and the emission cannot disagree.
 
+61. **Fixed: stop reusing exchange buffers when the budget allows.** Entry 60
+    named the root cause and recorded a failed fix. The working fix removes the
+    question instead of answering it.
+
+    Liveness is not cheaply knowable here, because exchange reads are cloned
+    into later phases, so any segment-scoped model frees buffers a later clone
+    still reads. Instead, compute what one buffer per publish would cost. If it
+    fits the 32 KiB threadgroup budget, give every publish its own and no reuse
+    hazard can exist. Only when it does not fit fall back to the historical
+    two-slot round-robin, leaving large-tile kernels exactly as they were. These
+    tiles are tiny, a 32-element f32 comparator being 128 bytes, so the no-reuse
+    total fits for essentially everything that reaches this path. The allocator
+    and `validateTileExchangeScratchBudget` call one `assignExchangeBuffers`, so
+    the preflight and the emission cannot drift.
+
+    Measured on the 72-cell topk sweep over dtype, direction, `k` and warps:
+
+        before   52 ok / 8 WRONG / 2 CRASH / 10 reject
+        after    68 ok / 2 WRONG / 0 CRASH /  2 reject
+
+    🔑 It also removed the crashes for free. "Cannot carry a value across
+    full-tile exchange phases" fires when a read's slot is republished before
+    the anchor, and with no reuse that condition cannot arise. The
+    exchange-carry defect and the duplicate-value defect were one root cause
+    seen from two sides, which is why entry 54 could not reach the message
+    through transposes: they never allocate a pool at all.
+
+    Still open, and separate: `tl.sort` is unchanged at four elements per thread
+    correct and eight wrong, so that is a different defect; and `N = 512`,
+    `k = 32` at four warps is large enough to take the budget fallback and keeps
+    the old wrong answer. The README now states the envelope as the budget
+    rather than as a fixed element count.
+
+    Pinned: three topk cells at four elements per thread with `k >= 4`, all
+    failing before this change, and a new `test_reduce_then_sort_hypercube_axis`
+    with seven cells — the isolated reproducer, which guards the path without
+    depending on topk. 157 of 157 Metal lit, fresh-cache Metal backend
+    **2,567 passed / 3 skipped / 0 failed**, and `leet-all` at 1,664 passed with
+    only the pre-existing source-fidelity byte mismatch.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

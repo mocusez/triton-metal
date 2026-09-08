@@ -1537,20 +1537,26 @@ def test_topk_small_exhaustive(N, K, num_warps, descending, dtype):
     assert torch.equal(out.cpu(), expected)
 
 
-# ⚠️ Elements per thread, N / (32 * num_warps), is the axis that matters here
-# and every cell below sits at two or fewer, except (1024, 2, 8) which is at
-# four with k=2. That is not a coincidence to preserve casually: at four
-# elements per thread `tl.topk` returns WRONG VALUES for every k >= 4, and at
-# eight or more the phase exchange cannot carry a value across its phases and
-# the compiler aborts. Both are open defects, measured 2026-09-08. Adding a
-# cell above two elements per thread will either fail or, worse, pass only
-# because k=2 happens to be the one working corner.
+# Elements per thread, N / (32 * num_warps), is the axis this path breaks
+# along, so the cells below deliberately span one, two and four of them at
+# several k. Everything at four with k >= 4 used to return WRONG VALUES because
+# the exchange allocator reused a buffer a live read still needed; those cells
+# are the regression for that fix and were failing before it.
+#
+# ⚠️ The envelope is now bounded by the 32 KiB threadgroup budget rather than by
+# elements per thread: while the exchange scratch fits without buffer reuse the
+# result is correct, and above that the allocator falls back to the reusing
+# scheme, which still has the defect. N=512 k=32 at four warps is one measured
+# shape that lands in the fallback and is still wrong, so do not add it here.
 @pytest.mark.parametrize("N,K,num_warps,descending,dtype", [
     (64, 2, 1, True, "fp16"),
     (128, 8, 4, False, "bf16"),
     (256, 128, 4, True, "i32"),
     (512, 8, 8, False, "fp32"),
     (1024, 2, 8, True, "i32"),
+    (128, 8, 1, True, "fp32"),
+    (128, 32, 1, False, "i32"),
+    (256, 16, 2, False, "fp32"),
 ])
 def test_topk_multiband_dtypes(N, K, num_warps, descending, dtype):
     torch = pytest.importorskip("torch")
@@ -3073,3 +3079,47 @@ def test_scaled_dot_loop_near_miss_is_named(fn, kwargs, needle, capfd):
     err = capfd.readouterr().err
     assert needle in err, err
     assert "does not dominate this use" not in err, err
+
+
+@triton.jit
+def _reduce_then_sort_kernel(X, O, N: tl.constexpr, ND: tl.constexpr,
+                             AX: tl.constexpr):
+    h = tl.reshape(tl.load(X + tl.arange(0, N)), [2] * ND)
+    r = tl.reshape(tl.max(h, axis=AX), [N // 2])
+    tl.store(O + tl.arange(0, N // 2), tl.sort(r, descending=False))
+
+
+@pytest.mark.parametrize("N,num_warps,axis", [
+    (64, 1, 4),
+    (64, 1, 5),
+    (128, 1, 5),
+    (128, 1, 6),
+    (128, 4, 5),
+    (256, 4, 6),
+    (32, 1, 4),
+])
+def test_reduce_then_sort_hypercube_axis(N, num_warps, axis):
+    """A hypercube-axis reduce followed by a sort is the smallest shape that
+    exercises exchange buffer reuse: reducing along a THREAD axis interleaves
+    small direction-table publishes of the same element type between the tile
+    publishes. While buffers were handed out by round-robin those tables flipped
+    the parity and a compare-exchange landed on the buffer it was reading, which
+    is a read-after-write inside one loop body with no barrier, so both lanes of
+    a pair kept the same value. Four of these cells returned adjacent duplicates
+    before the allocator stopped reusing buffers.
+
+    This is also `tl.topk`'s inner loop, which alternates exactly these two
+    steps, so it guards that path without depending on topk's own machinery."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    nd = N.bit_length() - 1
+    torch.manual_seed(N * 17 + axis)
+    x = torch.randperm(N).float()
+    out = torch.zeros(N // 2, device="mps")
+    _reduce_then_sort_kernel[(1,)](
+        x.to("mps"), out, N=N, ND=nd, AX=axis, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    expected = torch.sort(x.reshape([2] * nd).amax(dim=axis).reshape(-1)).values
+    assert torch.equal(out.cpu(), expected)

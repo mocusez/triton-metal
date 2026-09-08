@@ -294,6 +294,119 @@ static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
 static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
 
+static constexpr int64_t kThreadgroupBudgetBytes = 32 * 1024;
+
+// Threadgroup buffer assignment for the full-tile exchanges in one function
+// body. Shared by `FuncOpLowering`, which allocates the buffers, and
+// `validateTileExchangeScratchBudget`, which preflights their size, so the two
+// cannot describe different allocations.
+//
+// REUSE is the hazard. A publish that lands on a buffer some still-live read
+// consumes is a read-after-write inside a single loop body with no barrier
+// between them; a distance-1 compare-exchange then reads its partner slot after
+// having overwritten it, and both lanes of the pair keep the same value.
+// Round-robin over two slots avoids that only while same-type publishes
+// alternate strictly. A hypercube reduce along a THREAD axis interleaves small
+// direction-table publishes of the same element type, which flips the parity
+// and lands a comparator on the slot it reads from — measured as adjacent
+// duplicate values out of `tl.sort` after such a reduce.
+//
+// Liveness is not cheaply knowable at this point: exchange reads are CLONED
+// into later phases, so a published buffer outlives its own segment by an
+// amount the splitter only decides afterwards. An earlier attempt to scope
+// liveness to the publishing segment freed buffers that later clones still
+// read, and turned wrong answers into reads of never-written memory.
+//
+// So remove the question instead of modelling it. Give every publish its own
+// buffer whenever the total fits the threadgroup budget; then no buffer is ever
+// reused and the hazard cannot arise. These tiles are small — a 32-element f32
+// comparator is 128 bytes — so the no-reuse total fits comfortably for the
+// shapes that reach this path. Only when it does not do we fall back to the
+// historical two-slot round-robin, leaving large-tile kernels exactly as they
+// were.
+struct ExchangeBufferAssignment {
+  llvm::SmallVector<mlir::Operation *, 8> publishes;
+  // One entry per distinct buffer: (element type, element count).
+  llvm::SmallVector<std::pair<mlir::Type, int64_t>, 8> buffers;
+  // publishes[i] writes buffers[publishBuffer[i]].
+  llvm::SmallVector<unsigned, 8> publishBuffer;
+  // True when the budget forced the historical reusing scheme.
+  bool reusesBuffers = false;
+  int64_t totalBytes = 0;
+};
+
+static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
+  ExchangeBufferAssignment out;
+  llvm::SmallVector<const TileExchangePlan *, 8> plans;
+  for (mlir::Operation &op : body) {
+    auto tag = op.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+    auto planIt = g_tileExchange.find(&op);
+    if (!tag || tag.getValue() != "publish" || planIt == g_tileExchange.end())
+      continue;
+    out.publishes.push_back(&op);
+    plans.push_back(&planIt->second);
+  }
+
+  auto bytesOf = [](mlir::Type elemTy, int64_t elems) {
+    return elems * (elemTy.getIntOrFloatBitWidth() / 8);
+  };
+
+  int64_t noReuseBytes = 0;
+  for (const TileExchangePlan *plan : plans)
+    noReuseBytes += bytesOf(plan->elemTy, plan->numElements);
+
+  if (noReuseBytes <= kThreadgroupBudgetBytes) {
+    for (const TileExchangePlan *plan : plans) {
+      out.publishBuffer.push_back(out.buffers.size());
+      out.buffers.emplace_back(plan->elemTy, plan->numElements);
+    }
+    out.totalBytes = noReuseBytes;
+    return out;
+  }
+
+  // Fallback: two alternating slots per element type, sized to the largest
+  // tile assigned to each. Identical to the historical scheme, including its
+  // reuse hazard, so an over-budget kernel behaves exactly as it did before.
+  out.reusesBuffers = true;
+  struct Pool {
+    mlir::Type elemTy;
+    int64_t maxElements[2] = {0, 0};
+    unsigned bufferIdx[2] = {0, 0};
+    bool allocated[2] = {false, false};
+    unsigned nextSlot = 0;
+  };
+  llvm::SmallVector<Pool, 4> pools;
+  llvm::SmallVector<std::pair<unsigned, unsigned>, 8> chosen;
+  for (const TileExchangePlan *plan : plans) {
+    unsigned poolIdx = 0;
+    for (; poolIdx < pools.size(); ++poolIdx)
+      if (pools[poolIdx].elemTy == plan->elemTy)
+        break;
+    if (poolIdx == pools.size()) {
+      Pool pool;
+      pool.elemTy = plan->elemTy;
+      pools.push_back(pool);
+    }
+    Pool &pool = pools[poolIdx];
+    unsigned slot = pool.nextSlot++ % 2;
+    pool.maxElements[slot] = std::max(pool.maxElements[slot],
+                                      plan->numElements);
+    chosen.emplace_back(poolIdx, slot);
+  }
+  for (Pool &pool : pools)
+    for (unsigned slot = 0; slot < 2; ++slot) {
+      if (pool.maxElements[slot] == 0)
+        continue;
+      pool.bufferIdx[slot] = out.buffers.size();
+      pool.allocated[slot] = true;
+      out.buffers.emplace_back(pool.elemTy, pool.maxElements[slot]);
+      out.totalBytes += bytesOf(pool.elemTy, pool.maxElements[slot]);
+    }
+  for (auto [poolIdx, slot] : chosen)
+    out.publishBuffer.push_back(pools[poolIdx].bufferIdx[slot]);
+  return out;
+}
+
 // A broadcast whose destination coordinate projects to a source element held
 // by another physical lane is an exact single-band exchange, not a scalar
 // passthrough. Multi-band broadcasts use the full-tile phase scheduler below;
@@ -1357,72 +1470,31 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // The exchange's buffer is allocated in the PROLOGUE whether or not the
     // body gets split, because at one element per thread there is no loop to
     // split and the publish and read are plain straight-line ops.
-    llvm::SmallVector<mlir::Operation *, 4> exchangePublishes;
-    for (mlir::Operation &o : emptyBlock) {
-      auto attr = o.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
-      if (attr && attr.getValue() == "publish" && g_tileExchange.count(&o)) {
-        exchangePublishes.push_back(&o);
-      }
+    // Buffers come from `assignExchangeBuffers`, which the pre-conversion
+    // budget check shares, so the allocation emitted here and the one
+    // preflighted there cannot drift.
+    ExchangeBufferAssignment exch = assignExchangeBuffers(emptyBlock);
+    llvm::SmallVector<mlir::Operation *, 8> exchangePublishes = exch.publishes;
+    llvm::SmallVector<mlir::Value, 8> exchangeBuffers;
+    for (auto [elemTy, elems] : exch.buffers) {
+      auto bufTy = MetalMemRefType::get(rewriter.getContext(), elemTy, elems);
+      if (lastProloguePtr)
+        rewriter.setInsertionPointAfter(lastProloguePtr);
+      else
+        rewriter.setInsertionPointToStart(&emptyBlock);
+      exchangeBuffers.push_back(
+          ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult());
+      lastProloguePtr = exchangeBuffers.back().getDefiningOp();
     }
-    // A phase may still be reading the preceding same-type exchange while it
-    // publishes the next one.  Two alternating buffers per element type are
-    // therefore sufficient and necessary; later phases can reuse the older
-    // slot after the intervening barrier.  Size each slot for its largest
-    // assigned tile instead of allocating one full tile per topk comparator.
-    struct ExchangePool {
-      mlir::Type elemTy;
-      int64_t maxElements[2] = {0, 0};
-      mlir::Value buffers[2];
-      unsigned nextSlot = 0;
-    };
-    llvm::SmallVector<ExchangePool, 4> exchangePools;
-    llvm::SmallVector<unsigned, 4> publishPool;
-    llvm::SmallVector<unsigned, 4> publishSlot;
-    for (mlir::Operation *publish : exchangePublishes) {
-      const TileExchangePlan &plan = g_tileExchange[publish];
-      unsigned poolIdx = 0;
-      for (; poolIdx < exchangePools.size(); ++poolIdx)
-        if (exchangePools[poolIdx].elemTy == plan.elemTy)
-          break;
-      if (poolIdx == exchangePools.size()) {
-        ExchangePool pool;
-        pool.elemTy = plan.elemTy;
-        exchangePools.push_back(pool);
-      }
-      ExchangePool &pool = exchangePools[poolIdx];
-      unsigned slot = pool.nextSlot++ % 2;
-      pool.maxElements[slot] =
-          std::max(pool.maxElements[slot], plan.numElements);
-      publishPool.push_back(poolIdx);
-      publishSlot.push_back(slot);
-    }
-    int64_t exchangeScratchBytes = 0;
-    for (ExchangePool &pool : exchangePools) {
-      for (unsigned slot = 0; slot < 2; ++slot) {
-        if (pool.maxElements[slot] == 0)
-          continue;
-        exchangeScratchBytes +=
-            pool.maxElements[slot] * (pool.elemTy.getIntOrFloatBitWidth() / 8);
-        auto bufTy = MetalMemRefType::get(rewriter.getContext(), pool.elemTy,
-                                          pool.maxElements[slot]);
-        if (lastProloguePtr)
-          rewriter.setInsertionPointAfter(lastProloguePtr);
-        else
-          rewriter.setInsertionPointToStart(&emptyBlock);
-        pool.buffers[slot] =
-            ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
-        lastProloguePtr = pool.buffers[slot].getDefiningOp();
-      }
-    }
-    if (exchangeScratchBytes > 32 * 1024) {
+    int64_t exchangeScratchBytes = exch.totalBytes;
+    if (exchangeScratchBytes > kThreadgroupBudgetBytes) {
       op.emitOpError() << "Metal backend: full-tile exchange scratch needs "
                        << exchangeScratchBytes
                        << " bytes, exceeding the 32768-byte budget";
       return mlir::failure();
     }
     for (auto [idx, publish] : llvm::enumerate(exchangePublishes)) {
-      mlir::Value buf =
-          exchangePools[publishPool[idx]].buffers[publishSlot[idx]];
+      mlir::Value buf = exchangeBuffers[exch.publishBuffer[idx]];
       for (auto &entry : g_tileExchange)
         if (entry.second.publishOp == publish)
           g_tileExchangeBuf[entry.first] = buf;
@@ -26553,38 +26625,11 @@ static mlir::LogicalResult
 validateTileExchangeScratchBudget(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::FuncOp func) {
-    struct PoolSize {
-      mlir::Type elemTy;
-      int64_t maxElements[2] = {0, 0};
-      unsigned nextSlot = 0;
-    };
-    llvm::SmallVector<PoolSize, 4> pools;
-    for (mlir::Operation &op : func.getBody().front()) {
-      auto tag = op.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
-      auto planIt = g_tileExchange.find(&op);
-      if (!tag || tag.getValue() != "publish" || planIt == g_tileExchange.end())
-        continue;
-      const TileExchangePlan &plan = planIt->second;
-      unsigned poolIdx = 0;
-      for (; poolIdx < pools.size(); ++poolIdx)
-        if (pools[poolIdx].elemTy == plan.elemTy)
-          break;
-      if (poolIdx == pools.size()) {
-        PoolSize pool;
-        pool.elemTy = plan.elemTy;
-        pools.push_back(pool);
-      }
-      PoolSize &pool = pools[poolIdx];
-      unsigned slot = pool.nextSlot++ % 2;
-      pool.maxElements[slot] =
-          std::max(pool.maxElements[slot], plan.numElements);
-    }
-    int64_t requiredBytes = 0;
-    for (const PoolSize &pool : pools)
-      for (unsigned slot = 0; slot < 2; ++slot)
-        requiredBytes +=
-            pool.maxElements[slot] * (pool.elemTy.getIntOrFloatBitWidth() / 8);
-    if (requiredBytes > 32 * 1024) {
+    // Exactly the allocation FuncOpLowering emits, from the same function, so
+    // the preflight and the emission cannot disagree.
+    int64_t requiredBytes =
+        assignExchangeBuffers(func.getBody().front()).totalBytes;
+    if (requiredBytes > kThreadgroupBudgetBytes) {
       func.emitOpError() << "Metal backend: full-tile exchange scratch needs "
                          << requiredBytes
                          << " bytes, exceeding the 32768-byte budget";
