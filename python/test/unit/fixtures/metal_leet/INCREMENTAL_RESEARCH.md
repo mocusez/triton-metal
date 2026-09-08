@@ -2006,6 +2006,45 @@ validation.
     the phase partition without the lowering's cloned phase ops, behind one
     shared predicate so the two cannot drift.
 
+66. **The exchange-carry rejection moved into preflight; the last measured
+    process kill is closed.** A function whose full-tile exchange phases cannot
+    rematerialize a value crossing a phase boundary must be rejected, and that
+    rejection was emitted from the function lowering roughly two hundred and
+    thirty lines after the body had already been moved into the new kernel op.
+    Unwinding that move segfaulted on nine of thirty runs, measured on a
+    2048-element topk at one warp; the same shape at four warps behaved the
+    same. After the hoist both are thirty clean declines out of thirty, with the
+    same named diagnostic.
+
+    The hoist was cheap because the walk is pure. It only asks whether a value
+    crossing a phase boundary can be replayed: no regions, memory-effect-free or
+    a load, and — the condition that actually fires here — not an exchange read
+    whose buffer is published into again before the phase anchor. None of that
+    needs the lowering's clones or its materialized buffer values, so buffer
+    identity enters the predicate as an opaque integer and the preflight passes
+    assignment indices where the lowering passes its own. Both sides call the
+    one predicate, so they cannot disagree about which functions are rejected.
+
+    ⚠️ The risk worth measuring here is a FALSE rejection, not the crash. The
+    preflight sees the original body, while the lowering sees it after the
+    loop-carried gather, tile-invariant reduce and tile-invariant rank-one
+    reduce materializers have hoisted work into the prologue. A hoisted
+    definition is outside the loop body at lowering time and therefore trivially
+    carryable, but is still inside it before conversion, so the preflight
+    recurses into it — and a reduce carries a region, which the walk treats as
+    unreplayable. Nothing in this suite triggers that. If it ever does, narrow
+    the PREFLIGHT to the republish condition alone rather than weakening the
+    lowering: that condition involves only exchange operations, which are never
+    hoisted.
+
+    The regression test asserts the preventing mechanism rather than the crash,
+    because the crash is intermittent and when it fires it takes the whole
+    pytest process with it, which is why the shape had been deliberately kept
+    out of the suite. It rejects three times and then compiles and runs an
+    ordinary sort in the same interpreter and checks the answer: a rejection
+    raised before conversion leaves the context healthy, one raised during
+    teardown does not.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

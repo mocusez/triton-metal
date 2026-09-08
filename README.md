@@ -210,7 +210,8 @@ them together flipped the round-robin parity and handed a comparator the slot
 it was reading. That returned duplicated values at `N = 512` on four warps with
 `k = 32` or `k = 64` until the count joined the key on 2026-09-08. A 37-cell
 sweep over dtype, direction, rank and `num_warps`, fed PERMUTED inputs, gives
-35 correct and two named budget rejections.
+35 correct and two named rejections, the latter measured at thirty clean
+declines out of thirty since the phase-carry rejection moved into preflight.
 
 ⚠️ Probe an ordering primitive with a PERMUTATION. A broken selection still
 returns the correct prefix of already-sorted input, so an `arange`-fed sweep
@@ -383,6 +384,12 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   A function whose full-tile exchange phases cannot carry a value across the
+   split joined the preflight set on 2026-09-08. That rejection used to be
+   emitted from the function lowering, long after the body had been moved into
+   the new kernel op, and unwinding that move segfaulted on nine of thirty
+   runs; preflight and the lowering now call one shared predicate, so they
+   cannot disagree about which functions are rejected.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

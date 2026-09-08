@@ -2604,6 +2604,45 @@ def test_unit_axis_reduce_is_rejected_not_crash(num_warps):
 
 
 @triton.jit
+def _topk_beyond_phase_carry_kernel(x_ptr, o_ptr, N: tl.constexpr,
+                                    K: tl.constexpr):
+    v = tl.topk(tl.load(x_ptr + tl.arange(0, N)), K, descending=True)
+    tl.store(o_ptr + tl.arange(0, K), v)
+
+
+def test_exchange_phase_carry_rejection_leaves_the_context_usable():
+    """A 2048-element topk on one warp is over the threadgroup budget, so its
+    exchange reuses buffers and one of its phases can no longer rematerialize a
+    read. That rejection is correct. It used to be emitted from the function
+    lowering, long after `inlineRegionBefore` had moved the body into the new
+    kernel op, and unwinding that move segfaulted on nine of thirty runs.
+
+    Asserting the crash directly is useless: it is intermittent, and when it
+    does fire it takes the whole pytest process with it. So assert the
+    PREVENTING MECHANISM instead. A rejection raised before the conversion
+    starts leaves the process healthy, so a later compile in the same
+    interpreter still works and still gives the right answer; a rejection
+    raised during conversion teardown does not.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = torch.rand(2048, dtype=torch.float32, device="mps")
+    rejected = torch.zeros(8, dtype=torch.float32, device="mps")
+    for _ in range(3):
+        with pytest.raises(Exception):
+            _topk_beyond_phase_carry_kernel[(1,)](x, rejected, N=2048, K=8,
+                                                  num_warps=1)
+
+    torch.manual_seed(20260908)
+    values = torch.randperm(128).float()
+    out = torch.zeros(128, dtype=torch.float32, device="mps")
+    _sort_kernel[(1,)](values.to("mps"), out, 128, num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), values.sort().values)
+
+
+@triton.jit
 def _splat_store_1x1_kernel(x_ptr, o_ptr, M, N, BM: tl.constexpr,
                             BN: tl.constexpr):
     rm = tl.arange(0, BM)[:, None]

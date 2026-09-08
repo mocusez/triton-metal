@@ -429,6 +429,100 @@ static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
   return out;
 }
 
+// One shared answer to "will the phase split break this function?".
+//
+// `FuncOpLowering` splices the body into sibling `scf.for` phases, one per
+// exchange publish, so every SSA edge from an earlier phase into a later one
+// has to be rematerialized at the start of the later phase. An edge that cannot
+// be rematerialized has to reject the function — and rejecting from inside
+// `applyFullConversion` is fatal here. By the time the splitter runs,
+// `inlineRegionBefore` has already moved the body into the new kernel op, and
+// unwinding that move segfaults on roughly a third of runs (measured nine of
+// thirty on a 2048-element topk). So this predicate is the ONE decision, called
+// both from a pre-conversion check while the original `tt.func` is still intact
+// and from the lowering itself, which cannot then disagree with it.
+//
+// `bufferOf` identifies a publish's allocated buffer and returns a negative
+// value for a publish with none. The walk only ever compares two publishes for
+// equality, so the pre-pass can pass assignment indices where the lowering
+// would pass materialized values.
+static bool tileExchangePhasesCarryable(
+    llvm::ArrayRef<mlir::Operation *> publishes,
+    mlir::Block::iterator firstBodyIt, mlir::Block::iterator endIt,
+    llvm::function_ref<int(mlir::Operation *)> bufferOf) {
+  if (publishes.empty())
+    return true;
+  llvm::SmallPtrSet<mlir::Operation *, 32> loopBodyOps;
+  for (auto it = firstBodyIt; it != endIt; ++it)
+    loopBodyOps.insert(&*it);
+
+  for (unsigned phaseIdx = 0; phaseIdx < publishes.size(); ++phaseIdx) {
+    auto phaseBegin = std::next(publishes[phaseIdx]->getIterator());
+    auto phaseEnd = phaseIdx + 1 < publishes.size()
+                        ? std::next(publishes[phaseIdx + 1]->getIterator())
+                        : endIt;
+    if (phaseBegin == phaseEnd)
+      continue;
+    llvm::SmallPtrSet<mlir::Operation *, 32> phaseSet;
+    for (auto it = phaseBegin; it != phaseEnd; ++it)
+      phaseSet.insert(&*it);
+    mlir::Operation *phaseAnchor = &*phaseBegin;
+
+    llvm::SmallPtrSet<mlir::Operation *, 32> settled;
+    std::function<bool(mlir::Value)> carryable =
+        [&](mlir::Value value) -> bool {
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def || !loopBodyOps.count(def) || phaseSet.count(def))
+        return true;
+      if (!settled.insert(def).second)
+        return true;
+      // Only a regionless pure cone can be replayed. A load is admitted
+      // because its address is re-derived in-tile and it reads memory this
+      // body does not write.
+      if (def->getNumRegions() != 0 ||
+          (!mlir::isMemoryEffectFree(def) &&
+           !mlir::isa<mlir::triton::LoadOp>(def)))
+        return false;
+      // Reading an exchange buffer again is valid only until that exact
+      // alternating slot is published into again.
+      auto planIt = g_tileExchange.find(def);
+      auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      if (planIt != g_tileExchange.end() && tag && tag.getValue() == "read") {
+        const int buf = bufferOf(planIt->second.publishOp);
+        if (buf < 0)
+          return false;
+        for (mlir::Operation *scan = def->getNextNode();
+             scan && scan != phaseAnchor; scan = scan->getNextNode()) {
+          auto scanTag = scan->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+          if (!scanTag || scanTag.getValue() != "publish")
+            continue;
+          if (bufferOf(scan) == buf)
+            return false;
+        }
+      }
+      for (mlir::Value operand : def->getOperands())
+        if (!carryable(operand))
+          return false;
+      return true;
+    };
+
+    for (auto it = phaseBegin; it != phaseEnd; ++it)
+      for (mlir::Value operand : it->getOperands())
+        if (!carryable(operand))
+          return false;
+  }
+  return true;
+}
+
+// The publish-to-buffer map the predicate needs, straight out of an assignment.
+static llvm::DenseMap<mlir::Operation *, int>
+exchangePublishBufferIds(const ExchangeBufferAssignment &exch) {
+  llvm::DenseMap<mlir::Operation *, int> ids;
+  for (auto [idx, publish] : llvm::enumerate(exch.publishes))
+    ids[publish] = static_cast<int>(exch.publishBuffer[idx]);
+  return ids;
+}
+
 // A broadcast whose destination coordinate projects to a source element held
 // by another physical lane is an exact single-band exchange, not a scalar
 // passthrough. Multi-band broadcasts use the full-tile phase scheduler below;
@@ -1538,6 +1632,27 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
       // regionless pure cone at the start of every later phase.  A marked
       // exchange read may also be cloned while its double-buffer slot has not
       // been reused; its lowering still reads the same published tile.
+      // The same predicate `validateTileExchangePhaseCarry` ran before the
+      // conversion, on the same assignment, so the two cannot drift. Anything
+      // infeasible should already have been rejected there, while the original
+      // tt.func was still intact; reaching this failure means an earlier pass
+      // reshaped the body, and it is the rollback-crash path, so it stays a
+      // backstop rather than the decision.
+      {
+        llvm::DenseMap<mlir::Operation *, int> publishIds =
+            exchangePublishBufferIds(exch);
+        auto bufferOf = [&](mlir::Operation *publish) {
+          auto it = publishIds.find(publish);
+          return it == publishIds.end() ? -1 : it->second;
+        };
+        if (!tileExchangePhasesCarryable(exchangePublishes, firstOrigBodyIt,
+                                         returnIt, bufferOf)) {
+          op.emitOpError() << "Metal backend cannot carry a value across "
+                              "full-tile exchange phases";
+          return mlir::failure();
+        }
+      }
+
       llvm::SmallPtrSet<mlir::Operation *, 32> loopBodyOps;
       for (auto it = firstOrigBodyIt; it != returnIt; ++it)
         loopBodyOps.insert(&*it);
@@ -26838,6 +26953,37 @@ validateTileExchangeScratchBudget(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// Reject a function whose phase split cannot carry its values BEFORE the
+// conversion starts. The lowering asks the same question, but by the time it
+// can, the body has already been moved into the new kernel op and failing there
+// segfaults during rollback on roughly a third of runs.
+static mlir::LogicalResult
+validateTileExchangePhaseCarry(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    mlir::Block &body = func.getBody().front();
+    if (body.empty())
+      return;
+    ExchangeBufferAssignment exch = assignExchangeBuffers(body);
+    if (exch.publishes.empty())
+      return;
+    llvm::DenseMap<mlir::Operation *, int> ids =
+        exchangePublishBufferIds(exch);
+    auto bufferOf = [&](mlir::Operation *publish) {
+      auto it = ids.find(publish);
+      return it == ids.end() ? -1 : it->second;
+    };
+    // The lowering stops at the terminator, which never joins a phase.
+    if (!tileExchangePhasesCarryable(exch.publishes, body.begin(),
+                                     std::prev(body.end()), bufferOf)) {
+      func.emitOpError() << "Metal backend cannot carry a value across "
+                            "full-tile exchange phases";
+      valid = false;
+    }
+  });
+  return mlir::success(valid);
+}
+
 static void normalizeBlockedDivergentCvts(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> cvts;
   moduleOp.walk(
@@ -34188,6 +34334,10 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
     if (mlir::failed(validateTileExchangeScratchBudget(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+    if (mlir::failed(validateTileExchangePhaseCarry(moduleOp))) {
       signalPassFailure();
       return;
     }
