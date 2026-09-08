@@ -52,6 +52,43 @@ static void emitFloatLiteral(llvm::raw_ostream &os, mlir::FloatAttr attr) {
     os << ")";
 }
 
+// MSL's `max`, `min`, `fmax` and `fmin` are ALL number-preferring: measured on
+// Apple M4 / macOS 26.4, `max(NAN, 2.0f)` and `max(2.0f, NAN)` both return
+// 2.0f. That is IEEE-754 `maxNum`, which is exactly what Triton's default
+// `propagate_nan=tl.PropagateNan.NONE` (`arith.maxnumf` / `arith.minnumf`)
+// asks for, so maxOp/minOp keep spelling the builtin.
+//
+// `propagate_nan=tl.PropagateNan.ALL` (`arith.maximumf` / `arith.minimumf`) is
+// IEEE-754 `maximum`/`minimum` and needs the opposite: a NaN operand makes the
+// result NaN. It also orders -0.0 BELOW +0.0, which the builtin does not do
+// (`max(+0.0, -0.0)` and `max(-0.0, +0.0)` both returned -0.0 on the same
+// device). These helpers spell both rules once.
+//
+// The NaN operand itself is returned rather than a canonical quiet NaN so the
+// payload and sign survive, matching how `metal.clampf` propagates x.
+//
+// ONE name serves the tensor path (`metal.binary_exp` maxNanOp/minNanOp) and
+// the scalar path (an `arith.maximumf`/`minimumf` that survived conversion), so
+// the two spellings cannot drift apart. Emitted as a template because the same
+// helper serves f32, f16 and bf16 extrema.
+static llvm::StringRef nanPropagatingExtremumHelper(bool isMax) {
+  return isMax ? "__triton_maximumf" : "__triton_minimumf";
+}
+
+static constexpr llvm::StringLiteral kNanPropagatingExtremumHelpers =
+    "template <typename T> static inline T __triton_maximumf(T a, T b) {\n"
+    "  if (metal::isnan(a)) return a;\n"
+    "  if (metal::isnan(b)) return b;\n"
+    "  if (a == b) return metal::signbit(a) ? b : a;\n"
+    "  return a < b ? b : a;\n"
+    "}\n\n"
+    "template <typename T> static inline T __triton_minimumf(T a, T b) {\n"
+    "  if (metal::isnan(a)) return a;\n"
+    "  if (metal::isnan(b)) return b;\n"
+    "  if (a == b) return metal::signbit(a) ? a : b;\n"
+    "  return b < a ? b : a;\n"
+    "}\n\n";
+
 // MSL is a C++14 dialect, so the emitted entry-point name must not collide
 // with a reserved keyword. A Triton `@triton.jit` function may legitimately be
 // named `kernel`, `device`, `vertex`, `float`, ... — Python only forbids its
@@ -230,6 +267,32 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
                   "  return sign * y;\n"
                   "}\n\n";
       }
+      // IEEE-754 maximum/minimum (`propagate_nan=tl.PropagateNan.ALL`). Both
+      // the scalarized-tensor form (`metal.binary_exp` maxNanOp/minNanOp) and a
+      // scalar `arith.maximumf`/`minimumf` that survived conversion call these,
+      // so look for either. Kernels that only use the default NaN policy emit
+      // no helper and keep their previous MSL byte-for-byte.
+      // ONE walk covers both forms. A kernel on the default NaN policy finds
+      // neither and pays a single traversal, which is what keeps this feature
+      // free for the common case.
+      bool hasNanExtremum = false;
+      m.walk([&](mlir::Operation *candidate) {
+        if (auto bop =
+                mlir::dyn_cast<mlir::triton::metal::BinaryExpOp>(candidate)) {
+          if (bop.getBinaryOperator() !=
+                  mlir::triton::metal::BinaryExpOperator::maxNanOp &&
+              bop.getBinaryOperator() !=
+                  mlir::triton::metal::BinaryExpOperator::minNanOp)
+            return mlir::WalkResult::advance();
+        } else if (!llvm::isa<mlir::arith::MaximumFOp, mlir::arith::MinimumFOp>(
+                       candidate)) {
+          return mlir::WalkResult::advance();
+        }
+        hasNanExtremum = true;
+        return mlir::WalkResult::interrupt();
+      });
+      if (hasNanExtremum)
+        output << kNanPropagatingExtremumHelpers;
       // MSL has no atomic half. `tl.atomic_add` on an f16/bf16 buffer becomes a
       // compare-exchange loop over the 32-bit word that CONTAINS the element:
       // load the pair, add into this element's lane, swap the pair back, retry
@@ -8578,7 +8641,10 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << ")";
       })
       .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
-        _output << "metal::max(";
+        // IEEE-754 maximum (`propagate_nan=tl.PropagateNan.ALL`), NOT the
+        // maxNum spelled by MaxNumFOp above: `metal::max` would drop the NaN.
+        // Same helper the scalarized-tensor maxNanOp path calls.
+        _output << nanPropagatingExtremumHelper(/*isMax=*/true) << "(";
         translateValueOrVarName(op.getLhs());
         _output << ", ";
         translateValueOrVarName(op.getRhs());
@@ -8592,7 +8658,8 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         _output << ")";
       })
       .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
-        _output << "metal::min(";
+        // IEEE-754 minimum; mirrors the MaximumFOp case above.
+        _output << nanPropagatingExtremumHelper(/*isMax=*/false) << "(";
         translateValueOrVarName(op.getLhs());
         _output << ", ";
         translateValueOrVarName(op.getRhs());
@@ -9001,13 +9068,22 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
   // maxOp lowers to MSL's `max(a, b)` function call (rank-1 reduce spec
   // the implementation notes). All other ops
   // lower to an infix C operator.
+  const bool isNanExtremum = op.getBinaryOperator() == OP::maxNanOp ||
+                             op.getBinaryOperator() == OP::minNanOp;
   if (op.getBinaryOperator() == OP::maxOp ||
-      op.getBinaryOperator() == OP::minOp) {
+      op.getBinaryOperator() == OP::minOp || isNanExtremum) {
     // Emit `max(T(lhs), T(rhs))` / `min(...)` where T is the result element
     // type. The explicit cast forces a SIGNED comparison for i32 signed-min/max
     // even when an operand is rendered from ui32 storage (the ui32->si32 MLIR
     // bridge is a no-op in MSL). For f32 this is `max/min(float(x), float(y))`.
-    const char *fn = op.getBinaryOperator() == OP::minOp ? "min" : "max";
+    //
+    // maxNanOp/minNanOp keep the same shape but call the NaN-propagating
+    // preamble helper; T then also pins which template instantiation runs.
+    const bool isMin = op.getBinaryOperator() == OP::minOp ||
+                       op.getBinaryOperator() == OP::minNanOp;
+    llvm::StringRef fn =
+        isNanExtremum ? nanPropagatingExtremumHelper(/*isMax=*/!isMin)
+                      : (isMin ? llvm::StringRef("min") : llvm::StringRef("max"));
     auto ty = typeToString(op.getResult().getType());
     _output << fn << "(" << ty << "(";
     translateValueOrVarName(op.getLhs());
@@ -9072,6 +9148,8 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
     break;
   case OP::maxOp:
   case OP::minOp:
+  case OP::maxNanOp:
+  case OP::minNanOp:
     llvm_unreachable("min/maxOp handled above via function-call form");
   }
 
@@ -9120,7 +9198,24 @@ void ModuleTranslation::translate(mlir::triton::metal::MathIntrinsicOp op) {
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
+  // `metal::fmin`/`fmax` have native `float` and `half` overloads, but none for
+  // `bfloat`: both operands promote to `float`, and MSL will not implicitly
+  // convert that result back (it is a hard "assigning to 'bfloat' from
+  // incompatible type 'float'" error). Convert explicitly. The round trip is
+  // exact — the result is always one of the three operands, each already a
+  // bfloat value — so this narrows nothing. f32 and f16 keep their previous
+  // spelling byte-for-byte.
+  //
+  // Triton's own `binary_op_type_checking_impl` currently widens a bf16
+  // `tl.clamp` to f32 and truncates the result, so no `@triton.jit` kernel
+  // reaches this branch today; it exists for hand-written Metal IR and so the
+  // op stays correct if that frontend promotion ever goes away. The frontend
+  // path is covered by the f16 runtime tests, this branch by
+  // test/Dialect/Metal/metal-translate/direct_math_ops.mlir.
+  const bool bf16Result = op.getResult().getType().isBF16();
   auto emitClamp = [&]() {
+    if (bf16Result)
+      _output << "bfloat(";
     _output << "metal::fmin(metal::fmax(";
     translateValueOrVarName(op.getX());
     _output << ", ";
@@ -9128,6 +9223,8 @@ void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
     _output << "), ";
     translateValueOrVarName(op.getMax());
     _output << ")";
+    if (bf16Result)
+      _output << ")";
   };
 
   if (!op.getPropagateNan()) {

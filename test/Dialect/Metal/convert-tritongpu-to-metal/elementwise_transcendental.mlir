@@ -372,3 +372,121 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: %[[MAG:.*]] = metal.binary_exp %[[BITS]], %[[MASK]], bitAndOp : (ui16, ui16) -> ui16
 // CHECK: metal.bitcast %[[MAG]] : (ui16) -> bf16
 // CHECK: metal.store
+
+// -----
+
+// `tl.maximum`/`tl.minimum` with `propagate_nan=tl.PropagateNan.ALL` reach the
+// backend as `arith.maximumf`/`arith.minimumf` (IEEE-754 maximum/minimum). They
+// must NOT collapse onto maxOp/minOp: MSL's own `max`/`min` are number-
+// preferring and would drop the NaN.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @minmax_propagate_nan_all(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %max_out: !tt.ptr<f32>, %min_out: !tt.ptr<f32>) {
+    %offs = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %lb = tt.splat %lhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %la = tt.addptr %lb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %a = tt.load %la : tensor<256x!tt.ptr<f32>, #blocked>
+    %rb = tt.splat %rhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ra = tt.addptr %rb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %b = tt.load %ra : tensor<256x!tt.ptr<f32>, #blocked>
+    %mx = arith.maximumf %a, %b : tensor<256xf32, #blocked>
+    %mn = arith.minimumf %a, %b : tensor<256xf32, #blocked>
+    %xb = tt.splat %max_out : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %xa, %mx : tensor<256x!tt.ptr<f32>, #blocked>
+    %nb = tt.splat %min_out : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %na = tt.addptr %nb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %na, %mn : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel minmax_propagate_nan_all
+// CHECK-DAG: metal.binary_exp {{.*}}, {{.*}}, maxNanOp : (f32, f32) -> f32
+// CHECK-DAG: metal.binary_exp {{.*}}, {{.*}}, minNanOp : (f32, f32) -> f32
+// CHECK-NOT: maxOp
+// CHECK-NOT: minOp
+
+// -----
+
+// Adjacent negative: the DEFAULT `propagate_nan=tl.PropagateNan.NONE` is
+// `arith.maxnumf`/`arith.minnumf` (IEEE-754 maxNum/minNum), which is what MSL
+// already does. It must keep the plain maxOp/minOp spelling, so that fixing the
+// ALL policy costs the common policy nothing.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @minmax_propagate_nan_none(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %max_out: !tt.ptr<f32>, %min_out: !tt.ptr<f32>) {
+    %offs = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %lb = tt.splat %lhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %la = tt.addptr %lb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %a = tt.load %la : tensor<256x!tt.ptr<f32>, #blocked>
+    %rb = tt.splat %rhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ra = tt.addptr %rb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %b = tt.load %ra : tensor<256x!tt.ptr<f32>, #blocked>
+    %mx = arith.maxnumf %a, %b : tensor<256xf32, #blocked>
+    %mn = arith.minnumf %a, %b : tensor<256xf32, #blocked>
+    %xb = tt.splat %max_out : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %xa, %mx : tensor<256x!tt.ptr<f32>, #blocked>
+    %nb = tt.splat %min_out : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %na = tt.addptr %nb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %na, %mn : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel minmax_propagate_nan_none
+// CHECK-DAG: metal.binary_exp {{.*}}, {{.*}}, maxOp : (f32, f32) -> f32
+// CHECK-DAG: metal.binary_exp {{.*}}, {{.*}}, minOp : (f32, f32) -> f32
+// CHECK-NOT: maxNanOp
+// CHECK-NOT: minNanOp
+
+// -----
+
+// `tt.clampf` at the narrow float widths. f16 rides MSL's native `fmin`/`fmax`
+// half overloads; bf16 has none, so the translator converts the promoted float
+// result back (checked in metal-translate/direct_math_ops.mlir). Both keep the
+// f32 propagate_nan contract, so the ALL form still guards on x itself.
+//
+// f16 is what a @triton.jit kernel produces. Triton widens a bf16 tl.clamp to
+// f32 in the frontend, so the bf16 module below is legal IR that the current
+// frontend does not emit; it keeps the op honest for hand-written Metal IR.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clampf_f16_kernel(%in_ptr: !tt.ptr<f16>, %out_ptr: !tt.ptr<f16>) {
+    %offs = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %is = tt.splat %in_ptr : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
+    %ia = tt.addptr %is, %offs : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi32, #blocked>
+    %iv = tt.load %ia : tensor<256x!tt.ptr<f16>, #blocked>
+    %lo = arith.constant dense<-1.000000e+00> : tensor<256xf16, #blocked>
+    %hi = arith.constant dense<1.000000e+00> : tensor<256xf16, #blocked>
+    %r = tt.clampf %iv, %lo, %hi, propagateNan = all : tensor<256xf16, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %oa, %r : tensor<256x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel clampf_f16_kernel
+// CHECK-NOT:   tt.clampf
+// CHECK:       metal.clampf {{.*}}, propagate_nan = true : (f16, f16, f16) -> f16
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clampf_bf16_kernel(%in_ptr: !tt.ptr<bf16>, %out_ptr: !tt.ptr<bf16>) {
+    %offs = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %is = tt.splat %in_ptr : !tt.ptr<bf16> -> tensor<256x!tt.ptr<bf16>, #blocked>
+    %ia = tt.addptr %is, %offs : tensor<256x!tt.ptr<bf16>, #blocked>, tensor<256xi32, #blocked>
+    %iv = tt.load %ia : tensor<256x!tt.ptr<bf16>, #blocked>
+    %lo = arith.constant dense<-1.000000e+00> : tensor<256xbf16, #blocked>
+    %hi = arith.constant dense<1.000000e+00> : tensor<256xbf16, #blocked>
+    %r = tt.clampf %iv, %lo, %hi, propagateNan = none : tensor<256xbf16, #blocked>
+    %os = tt.splat %out_ptr : !tt.ptr<bf16> -> tensor<256x!tt.ptr<bf16>, #blocked>
+    %oa = tt.addptr %os, %offs : tensor<256x!tt.ptr<bf16>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %oa, %r : tensor<256x!tt.ptr<bf16>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel clampf_bf16_kernel
+// CHECK-NOT:   tt.clampf
+// CHECK:       metal.clampf {{.*}}, propagate_nan = false : (bf16, bf16, bf16) -> bf16

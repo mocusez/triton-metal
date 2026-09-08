@@ -53,3 +53,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Rank > 2, mirroring the tt.atomic_rmw rank guard in atomic_unsupported.mlir.
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [1, 1, 4], order = [2, 1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_cas_rank3(%out_ptr: !tt.ptr<i32>, %cmp: i32, %value: i32) {
+    %out = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<2x4x8x!tt.ptr<i32>, #blocked3>
+    %cmps = tt.splat %cmp : i32 -> tensor<2x4x8xi32, #blocked3>
+    %values = tt.splat %value : i32 -> tensor<2x4x8xi32, #blocked3>
+    // expected-error @+1 {{Metal backend: atomic_cas tensor form requires rank 1 or rank 2}}
+    %old = tt.atomic_cas acq_rel, gpu, %out, %cmps, %values : (tensor<2x4x8x!tt.ptr<i32>, #blocked3>, tensor<2x4x8xi32, #blocked3>, tensor<2x4x8xi32, #blocked3>) -> tensor<2x4x8xi32, #blocked3>
+    tt.return
+  }
+}

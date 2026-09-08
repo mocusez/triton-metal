@@ -2807,3 +2807,94 @@ def test_masked_scalar_load_compiles_with_guarded_memory_read(dtype, mode):
     # true branch; generating a select around an unconditional read is invalid.
     assert msl.count("v0[") == 1
     assert msl.index("if (") < msl.index("v0[") < msl.index("} else {")
+
+
+@triton.jit
+def dot_scaled_e4m3_f16_output_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_base + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_base + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+    result = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", fast_math=False)
+    # The f32 result truncates on the way into an f16 buffer, so an
+    # `arith.truncf` sits between the dot and the store.
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result)
+
+
+@triton.jit
+def dot_scaled_e4m3_scaled_epilogue_kernel(
+    a_base,
+    b_base,
+    a_scale_base,
+    b_scale_base,
+    output_base,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a = tl.load(a_base + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_base + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    SCALE_K: tl.constexpr = BLOCK_K // 32
+    offs_scale_k = tl.arange(0, SCALE_K)
+    a_scale = tl.load(a_scale_base + offs_m[:, None] * SCALE_K + offs_scale_k[None, :])
+    b_scale = tl.load(b_scale_base + offs_n[:, None] * SCALE_K + offs_scale_k[None, :])
+    result = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", fast_math=False)
+    # A multiply survives as its own op, unlike `+ bias`, which Triton folds
+    # into the dot's accumulator operand and which therefore still matches.
+    tl.store(output_base + offs_m[:, None] * BLOCK_N + offs_n[None, :], result * 2.0)
+
+
+@pytest.mark.parametrize(
+    "fn,out_ty",
+    [
+        (dot_scaled_e4m3_f16_output_kernel, "*fp16"),
+        (dot_scaled_e4m3_scaled_epilogue_kernel, "*fp32"),
+    ],
+    ids=["f16_output_buffer", "multiply_epilogue"],
+)
+def test_scaled_dot_epilogue_between_dot_and_store_is_named(fn, out_ty, capfd):
+    """The scaled-dot rewrite materializes its result at the store, so any real
+    op in between keeps its original position and would consume a value defined
+    after it. That used to leave `operand #0 does not dominate this use` — a
+    half-applied rewrite and invalid IR, which is the state that turns into an
+    intermittent process kill — instead of a named capability diagnostic.
+
+    Asserting only on the generic `convert-tritongpu-to-metal failed` cannot
+    tell those two apart, so this reads the diagnostic itself."""
+    src = ASTSource(
+        fn=fn,
+        signature={
+            "a_base": "*u8",
+            "b_base": "*u8",
+            "a_scale_base": "*u8",
+            "b_scale_base": "*u8",
+            "output_base": out_ty,
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+        },
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32},
+    )
+    target = GPUTarget(backend="metal", arch=80, warp_size=32)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        triton.compile(src, target=target, options={"num_warps": 4})
+    err = capfd.readouterr().err
+    assert "dot_scaled requires its result to reach one store directly" in err, err
+    assert "does not dominate this use" not in err, err

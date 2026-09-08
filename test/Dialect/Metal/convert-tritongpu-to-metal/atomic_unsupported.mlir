@@ -91,3 +91,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Rank > 2. The tensor atomic lowering indexes a rank-1 or rank-2 tile; a
+// rank-3 tile has no address decomposition, and the rank check runs before the
+// address-form check so a splat pointer tile is enough to reach it. Rejected
+// before conversion, since a decline inside it is a process kill.
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [1, 1, 4], order = [2, 1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_fadd_rank3(%out_ptr: !tt.ptr<f32>, %v: f32) {
+    %out = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<2x4x8x!tt.ptr<f32>, #blocked3>
+    %values = tt.splat %v : f32 -> tensor<2x4x8xf32, #blocked3>
+    // expected-error @+1 {{Metal backend: atomic tensor form requires rank 1 or rank 2}}
+    %old = tt.atomic_rmw fadd, acq_rel, gpu, %out, %values : (tensor<2x4x8x!tt.ptr<f32>, #blocked3>, tensor<2x4x8xf32, #blocked3>) -> tensor<2x4x8xf32, #blocked3>
+    tt.return
+  }
+}

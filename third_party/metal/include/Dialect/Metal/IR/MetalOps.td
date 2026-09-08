@@ -539,6 +539,16 @@ def BinaryExpOperatorMin : I64EnumAttrCase<"minOp", 14>;
 def BinaryExpOperatorBitAnd : I64EnumAttrCase<"bitAndOp", 15>;
 def BinaryExpOperatorBitOr  : I64EnumAttrCase<"bitOrOp", 16>;
 def BinaryExpOperatorBitXor : I64EnumAttrCase<"bitXorOp", 17>;
+// NaN-PROPAGATING float extrema, distinct from maxOp/minOp above. Triton's
+// `tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)` lowers to
+// `arith.maximumf` (IEEE-754 `maximum`): a NaN operand makes the result NaN.
+// The default `propagate_nan=NONE` lowers to `arith.maxnumf` (IEEE-754
+// `maxNum`), which IGNORES a NaN operand and is what maxOp/minOp spell.
+// MSL's `max`/`min`/`fmax`/`fmin` are all number-preferring, so these two
+// cases emit the `__triton_maximumf` / `__triton_minimumf` preamble helpers
+// instead. Float operands only — integers have no NaN.
+def BinaryExpOperatorMaxNan : I64EnumAttrCase<"maxNanOp", 18>;
+def BinaryExpOperatorMinNan : I64EnumAttrCase<"minNanOp", 19>;
 
 def BinaryExpOperator : I64EnumAttr<
     "BinaryExpOperator", "",
@@ -559,7 +569,9 @@ def BinaryExpOperator : I64EnumAttr<
      BinaryExpOperatorMin,
      BinaryExpOperatorBitAnd,
      BinaryExpOperatorBitOr,
-     BinaryExpOperatorBitXor]> {
+     BinaryExpOperatorBitXor,
+     BinaryExpOperatorMaxNan,
+     BinaryExpOperatorMinNan]> {
   let cppNamespace = "mlir::triton::metal";
 }
 
@@ -631,18 +643,27 @@ def MathIntrinsicOp : Metal_Op<"math_intrinsic", [Pure]> {
 // ClampFOp
 //===----------------------------------------------------------------------===//
 
+// The float widths `metal.clampf` can carry. MSL spells clamp as
+// `fmin(fmax(...))`, which has native `float` and `half` overloads; `bfloat`
+// promotes to `float` and the emitter converts the result back, which is exact
+// because the result is always one of the three operands. f64 is not a Metal
+// type and fp8 has no arithmetic form, so both stay rejected before conversion.
+def Metal_ClampFloat : AnyTypeOf<[F32, F16, BF16]>;
+
 def ClampFOp : Metal_Op<"clampf", [Pure]> {
-  let summary = "Clamp an f32 value with explicit input-NaN propagation";
+  let summary = "Clamp a float value with explicit input-NaN propagation";
   let description = [{
     Computes `fmin(fmax(x, min), max)`. When `propagateNan` is true, an NaN
     value of `x` is returned directly instead of being consumed by the
     number-preferring min/max operations. Triton leaves NaN bounds undefined,
     so only `x` participates in the explicit propagation rule.
+
+    All three operands and the result share one float type.
   }];
 
-  let arguments = (ins F32:$x, F32:$min, F32:$max,
-                        BoolAttr:$propagateNan);
-  let results = (outs F32:$result);
+  let arguments = (ins Metal_ClampFloat:$x, Metal_ClampFloat:$min,
+                        Metal_ClampFloat:$max, BoolAttr:$propagateNan);
+  let results = (outs Metal_ClampFloat:$result);
 
   let builders = [
     OpBuilder<(ins "Value":$x, "Value":$min, "Value":$max,

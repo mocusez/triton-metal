@@ -4779,9 +4779,47 @@ struct ArithMulFLowering
   }
 };
 
+// Triton's two float-extremum NaN policies, mapped to the Metal operator that
+// implements each one.
+//
+//   propagate_nan=tl.PropagateNan.NONE (the default) -> arith.maxnumf /
+//   arith.minnumf, IEEE-754 maxNum/minNum. A NaN operand is IGNORED and the
+//   other operand wins. MSL's own `max`/`min` already behave this way, so these
+//   map to maxOp/minOp.
+//
+//   propagate_nan=tl.PropagateNan.ALL -> arith.maximumf / arith.minimumf,
+//   IEEE-754 maximum/minimum. A NaN operand must make the result NaN, and -0.0
+//   orders below +0.0. MSL has no builtin for this, so these map to
+//   maxNanOp/minNanOp, which the translator spells with a preamble helper.
+//
+// Every site that turns a float min/max into a Metal operator routes through
+// this ONE function, so the elementwise lowering, the rank-1/rank-2/rank-N
+// reduce folds and the cone evaluators cannot disagree about a kernel's policy.
+static std::optional<BinaryExpOperator>
+floatExtremumOperator(mlir::Operation *op) {
+  if (mlir::isa_and_nonnull<mlir::arith::MaxNumFOp>(op))
+    return BinaryExpOperator::maxOp;
+  if (mlir::isa_and_nonnull<mlir::arith::MaximumFOp>(op))
+    return BinaryExpOperator::maxNanOp;
+  if (mlir::isa_and_nonnull<mlir::arith::MinNumFOp>(op))
+    return BinaryExpOperator::minOp;
+  if (mlir::isa_and_nonnull<mlir::arith::MinimumFOp>(op))
+    return BinaryExpOperator::minNanOp;
+  return std::nullopt;
+}
+
+// True when `op` is a float extremum whose NaN operand must survive into the
+// result. Reduce planners classify max-vs-min themselves and only need this
+// extra bit to pick between maxOp/minOp and maxNanOp/minNanOp.
+static bool isNanPropagatingExtremum(mlir::Operation *op) {
+  return mlir::isa_and_nonnull<mlir::arith::MaximumFOp, mlir::arith::MinimumFOp>(
+      op);
+}
+
 // Elementwise `arith.maxnumf` / `arith.maximumf` (`tl.maximum`) and
 // `arith.minnumf` / `arith.minimumf` (`tl.minimum`) → per-thread
-// metal.binary_exp maxOp / minOp. Mirrors ArithAddFLowering; needed by a
+// metal.binary_exp maxOp / minOp (maxNanOp / minNanOp under
+// `propagate_nan=ALL`). Mirrors ArithAddFLowering; needed by a
 // loop-carried column-max accumulator (`acc = tl.maximum(acc, tile)`) that
 // reassociateLoopCarriedAxis0Reduce turns into a scalar `max(s, reduce(...))`,
 // and by any clamp idiom (`tl.minimum(tl.maximum(x, lo), hi)` — the PPO/GRPO
@@ -5278,6 +5316,23 @@ struct TritonExternElementwiseLowering
   }
 };
 
+// The float widths `tt.clampf` supports. MSL spells clamp as
+// `fmin(fmax(x, lo), hi)`, which has native `float` and `half` overloads;
+// `bfloat` promotes to `float` and the emitter converts the result back, which
+// is exact because the result is always one of the three operands. f64 is not a
+// Metal type and fp8 has no arithmetic form, so both keep their rejection.
+//
+// f16 is the width a `@triton.jit` kernel actually reaches: Triton widens a
+// bf16 `tl.clamp` to f32 in the frontend and truncates the result, so bf16 is
+// accepted here for hand-written Metal IR and for the day that stops.
+//
+// The lowering pattern below and `validateClampFSupport` share this ONE
+// predicate, so the accepted envelope and the pre-conversion diagnostic cannot
+// drift apart.
+static bool metalClampFElementTypeSupported(mlir::Type elemTy) {
+  return elemTy.isF32() || elemTy.isF16() || elemTy.isBF16();
+}
+
 // Keep clamp's NaN contract explicit instead of composing the generic
 // metal.binary_exp min/max nodes, whose MSL spelling is shared by MLIR's
 // number-preferring and NaN-propagating arith variants.
@@ -5288,8 +5343,9 @@ struct TritonClampFLowering
   matchAndRewrite(mlir::triton::ClampFOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (!resultTy || !resultTy.isF32())
-      return rewriter.notifyMatchFailure(op, "clampf requires f32");
+    if (!resultTy || !metalClampFElementTypeSupported(resultTy))
+      return rewriter.notifyMatchFailure(op,
+                                         "clampf requires f32, f16 or bf16");
     bool propagateNan = op.getPropagateNan() == mlir::triton::PropagateNan::ALL;
     rewriter.replaceOpWithNewOp<mlir::triton::metal::ClampFOp>(
         op, adaptor.getX(), adaptor.getMin(), adaptor.getMax(), propagateNan);
@@ -6378,11 +6434,15 @@ static mlir::LogicalResult lowerRank1Reduce(
   bool isAddI = mlir::isa<mlir::arith::AddIOp>(combine);
   bool isMulI = mlir::isa<mlir::arith::MulIOp>(combine);
   // Accept both arith.maximumf (IEEE maximum) and arith.maxnumf (IEEE maxNum).
-  // Triton's tl.max emits arith.maxnumf; both map to MSL max(a,b).
+  // Triton's tl.max emits arith.maxnumf. The two differ only in what a NaN
+  // element does, so they share this plan and split at the fold operator via
+  // `isNanExtremum`. Either NaN policy keeps -inf as the max identity: a
+  // masked-out lane holding -inf loses to any real element, including a NaN.
   bool isMaxF = mlir::isa<mlir::arith::MaximumFOp>(combine) ||
                 mlir::isa<mlir::arith::MaxNumFOp>(combine);
   bool isMinF = mlir::isa<mlir::arith::MinimumFOp>(combine) ||
                 mlir::isa<mlir::arith::MinNumFOp>(combine);
+  const bool isNanExtremum = isNanPropagatingExtremum(combine);
   // Triton's tl.max on signed i32 emits arith.maxsi (signed max). Lowered via
   // a si32-typed butterfly/accumulator so MSL's `max` performs a SIGNED
   // comparison (see storeTy and the BinaryExpOp maxOp translator).
@@ -6494,8 +6554,13 @@ static mlir::LogicalResult lowerRank1Reduce(
           .getResult();
     }
     // Floating/integer extrema map to the matching Metal scalar operation.
-    auto op = (isMinF || isMinI) ? BinaryExpOperator::minOp
-                                 : BinaryExpOperator::maxOp;
+    // Under propagate_nan=ALL the float fold must carry a NaN element all the
+    // way out of the butterfly, so it takes the NaN-propagating operator.
+    auto op = (isMinF || isMinI)
+                  ? (isNanExtremum ? BinaryExpOperator::minNanOp
+                                   : BinaryExpOperator::minOp)
+                  : (isNanExtremum ? BinaryExpOperator::maxNanOp
+                                   : BinaryExpOperator::maxOp);
     auto opEnum = BinaryExpOperatorAttr::get(rewriter.getContext(), op);
     return BinaryExpOp::create(rewriter, loc, lhs.getType(), opEnum, lhs, rhs)
         .getResult();
@@ -8161,14 +8226,10 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
   if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MaximumFOp>(def))
-    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
-    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MinimumFOp>(def))
-    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MinNumFOp>(def))
-    return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
+  // Float extrema. The operand's NaN policy decides the operator, so a replayed
+  // cone keeps the same semantics as the elementwise lowering of the same op.
+  if (auto extremum = floatExtremumOperator(def))
+    return fbinary(def->getOperand(0), def->getOperand(1), *extremum);
 
   // int binary arith → raw scalar arith. Operands are normalised to signless
   // (see `toSignlessInt`): a cone leaf read from a device buffer carries the
@@ -8891,14 +8952,9 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
   if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MaximumFOp>(def))
-    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MaxNumFOp>(def))
-    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::maxOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MinimumFOp>(def))
-    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
-  if (auto o = mlir::dyn_cast<mlir::arith::MinNumFOp>(def))
-    return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::minOp);
+  // Float extrema; same NaN-policy dispatch as the rank-1 cone evaluator.
+  if (auto extremum = floatExtremumOperator(def))
+    return binary(def->getOperand(0), def->getOperand(1), *extremum);
 
   // tt.broadcast: rank-preserving replication over unit dims. Recurse the
   // source at the SAME (row, col) — the source's own structure (expand_dims /
@@ -11125,6 +11181,9 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   else
     return rewriter.notifyMatchFailure(
         op, "rank-2 axis0 reduce: unsupported combine");
+  // `kind` collapses the two NaN policies into MaxF/MinF; keep the policy so
+  // the fold below can pick the NaN-propagating operator.
+  const bool isNanExtremum = isNanPropagatingExtremum(combine);
   bool isF = (kind == SumF || kind == MulF || kind == MaxF || kind == MinF);
   bool isSum = (kind == SumF || kind == SumI);
   if (isF != eltTy.isF32())
@@ -11205,7 +11264,10 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
     if (kind == MaxF || kind == MinF) {
       auto opEnum = BinaryExpOperatorAttr::get(
           rewriter.getContext(),
-          kind == MinF ? BinaryExpOperator::minOp : BinaryExpOperator::maxOp);
+          kind == MinF ? (isNanExtremum ? BinaryExpOperator::minNanOp
+                                        : BinaryExpOperator::minOp)
+                       : (isNanExtremum ? BinaryExpOperator::maxNanOp
+                                        : BinaryExpOperator::maxOp));
       return BinaryExpOp::create(rewriter, loc, a.getType(), opEnum, a, b)
           .getResult();
     }
@@ -12133,6 +12195,7 @@ planRankNReduce(mlir::triton::ReduceOp op) {
                       mlir::isa<mlir::arith::MaxNumFOp>(combine);
   const bool isMinF = mlir::isa<mlir::arith::MinimumFOp>(combine) ||
                       mlir::isa<mlir::arith::MinNumFOp>(combine);
+  const bool isNanExtremum = isNanPropagatingExtremum(combine);
   const bool isAddI = mlir::isa<mlir::arith::AddIOp>(combine);
   const bool isMulI = mlir::isa<mlir::arith::MulIOp>(combine);
   const bool isMaxI = mlir::isa<mlir::arith::MaxSIOp>(combine);
@@ -12173,13 +12236,16 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     acc *= tile->shape[d];
   }
 
-  BinaryExpOperator kind = isAndI               ? BinaryExpOperator::bitAndOp
-                           : isOrI              ? BinaryExpOperator::bitOrOp
-                           : isXorI             ? BinaryExpOperator::bitXorOp
-                           : (isMulF || isMulI) ? BinaryExpOperator::mulOp
-                           : (isAddF || isAddI) ? BinaryExpOperator::addOp
-                           : (isMinF || isMinI) ? BinaryExpOperator::minOp
-                                                : BinaryExpOperator::maxOp;
+  BinaryExpOperator kind =
+      isAndI                 ? BinaryExpOperator::bitAndOp
+      : isOrI                ? BinaryExpOperator::bitOrOp
+      : isXorI               ? BinaryExpOperator::bitXorOp
+      : (isMulF || isMulI)   ? BinaryExpOperator::mulOp
+      : (isAddF || isAddI)   ? BinaryExpOperator::addOp
+      : (isMinF || isMinI)   ? (isNanExtremum ? BinaryExpOperator::minNanOp
+                                              : BinaryExpOperator::minOp)
+      : isNanExtremum        ? BinaryExpOperator::maxNanOp
+                             : BinaryExpOperator::maxOp;
   return finishPlan(RankNReducePlan{*tile, enc, axis, extent, strides[axis],
                                     strides, stageTy, kind});
 }
@@ -12796,6 +12862,7 @@ struct ReduceLowering
                   mlir::isa<mlir::arith::MaxNumFOp>(combine);
     bool isMinF = mlir::isa<mlir::arith::MinimumFOp>(combine) ||
                   mlir::isa<mlir::arith::MinNumFOp>(combine);
+    const bool isNanExtremum = isNanPropagatingExtremum(combine);
     bool isAddI = mlir::isa<mlir::arith::AddIOp>(combine);
     bool isMulI = mlir::isa<mlir::arith::MulIOp>(combine);
     bool isMaxI = mlir::isa<mlir::arith::MaxSIOp>(combine);
@@ -13030,15 +13097,19 @@ struct ReduceLowering
     }
 
     // Combine enum: addOp for sum, mulOp for direct-load product, maxOp /
-    // minOp for f32 extrema, and the bitwise trio for integer and/or/xor.
+    // minOp for f32 extrema (maxNanOp / minNanOp under propagate_nan=ALL), and
+    // the bitwise trio for integer and/or/xor.
     auto combineEnum = BinaryExpOperatorAttr::get(
-        rewriter.getContext(), isAndI   ? BinaryExpOperator::bitAndOp
-                               : isOrI  ? BinaryExpOperator::bitOrOp
-                               : isXorI ? BinaryExpOperator::bitXorOp
-                               : isMaxF ? BinaryExpOperator::maxOp
-                               : isMinF ? BinaryExpOperator::minOp
-                               : (isMulF || isMulI) ? BinaryExpOperator::mulOp
-                                                    : BinaryExpOperator::addOp);
+        rewriter.getContext(),
+        isAndI   ? BinaryExpOperator::bitAndOp
+        : isOrI  ? BinaryExpOperator::bitOrOp
+        : isXorI ? BinaryExpOperator::bitXorOp
+        : isMaxF ? (isNanExtremum ? BinaryExpOperator::maxNanOp
+                                  : BinaryExpOperator::maxOp)
+        : isMinF ? (isNanExtremum ? BinaryExpOperator::minNanOp
+                                  : BinaryExpOperator::minOp)
+        : (isMulF || isMulI) ? BinaryExpOperator::mulOp
+                             : BinaryExpOperator::addOp);
     mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
     // Hoisting the fill above `tileLoop` is only sound when the tile it reduces
     // is the same on every trip. `findOutermostScfFor` cannot tell a
@@ -23247,21 +23318,46 @@ sdMatchScaledDot(mlir::triton::DotScaledOp dot, std::string &reason) {
   } else if (!matrixPointerSupported(aLoad) || !matrixPointerSupported(bLoad)) {
     return reject("requires canonical row-major matrix pointer arithmetic");
   }
-  auto store = sdFindStore(loop ? loop.getResult(0) : dot.getResult());
+  mlir::Value dotOutput = loop ? loop.getResult(0) : dot.getResult();
+  auto store = sdFindStore(dotOutput);
   if (!store)
     return reject("requires a store-reachable result");
   if (!sdIsCanonicalRowMajorPointer(store.getPtr(), resultTy))
     return reject("requires canonical row-major result pointer arithmetic");
 
-  if (loop) {
-    mlir::Value output = loop.getResult(0);
+  // `sdFindStore` walks transitively, so it also succeeds when real work sits
+  // between the dot and the store. The rewrite cannot honour that: it
+  // materializes the result at the store, so an intervening op keeps its
+  // original position and ends up consuming a value that is now defined after
+  // it. MLIR reports that as "operand #0 does not dominate this use" — invalid
+  // IR from a half-applied rewrite, not an unsupported shape — and per the
+  // in-conversion-decline doctrine that is the state that turns into an
+  // intermittent process kill.
+  //
+  // Require the result to reach the store directly, at most through the layout
+  // conversion the epilogue already rebuilds. The loop-carried form always
+  // demanded this; the loop-free form did not, which is how an f16 output
+  // buffer (`arith.truncf` between dot and store) reached conversion. An
+  // epilogue that Triton folds INTO the dot, such as `+ bias` becoming the
+  // accumulator operand, leaves the chain direct and still matches.
+  {
+    mlir::Value output = dotOutput;
+    auto rejectChain = [&]() -> std::optional<SdScaledDotMatch> {
+      return reject(loop ? "loop-carried dot_scaled requires one output store"
+                         : "dot_scaled requires its result to reach one store "
+                           "directly; an epilogue between the dot and the "
+                           "store is unsupported");
+    };
     if (!output.hasOneUse())
-      return reject("loop-carried dot_scaled requires one output store");
+      return rejectChain();
     if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(
             *output.getUsers().begin()))
       output = cvt.getResult();
     if (!output.hasOneUse() || *output.getUsers().begin() != store)
-      return reject("loop-carried dot_scaled requires one output store");
+      return rejectChain();
+  }
+
+  if (loop) {
     if (store.getMask() && !hasMaskedMatrixLoad)
       return reject(
           "loop-carried dot_scaled masked form requires matched matrix loads "
@@ -31217,19 +31313,20 @@ static mlir::LogicalResult validateAtomicCasSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
-// The first direct tt.clampf slice is f32. Reject adjacent float widths before
-// dialect conversion mutates the containing function; otherwise an illegal
-// residual Triton op reaches failed-conversion teardown and obscures the real
-// unsupported shape with a crash-prone generic diagnostic.
+// `tt.clampf` covers f32, f16 and bf16 (see `metalClampFElementTypeSupported`,
+// the predicate the lowering pattern uses). Reject the remaining float widths
+// before dialect conversion mutates the containing function; otherwise an
+// illegal residual Triton op reaches failed-conversion teardown and obscures
+// the real unsupported shape with a crash-prone generic diagnostic.
 static mlir::LogicalResult validateClampFSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::ClampFOp op) {
     mlir::Type type = op.getResult().getType();
     if (auto ranked = mlir::dyn_cast<mlir::RankedTensorType>(type))
       type = ranked.getElementType();
-    if (!type.isF32()) {
-      op.emitOpError(
-          "Metal backend: tt.clampf requires f32 operands and result");
+    if (!metalClampFElementTypeSupported(type)) {
+      op.emitOpError("Metal backend: tt.clampf requires f32, f16 or bf16 "
+                     "operands and result");
       valid = false;
     }
   });
@@ -34335,9 +34432,11 @@ struct ConvertTritonGPUToMetalPass
         ArithMulFLowering, ArithSIToFPLowering, ArithUIToFPLowering,
         ArithFPToSILowering, ArithFPToUILowering, ArithNegFLowering,
         ArithMinMaxFLowering<mlir::arith::MaxNumFOp, BinaryExpOperator::maxOp>,
-        ArithMinMaxFLowering<mlir::arith::MaximumFOp, BinaryExpOperator::maxOp>,
+        ArithMinMaxFLowering<mlir::arith::MaximumFOp,
+                             BinaryExpOperator::maxNanOp>,
         ArithMinMaxFLowering<mlir::arith::MinNumFOp, BinaryExpOperator::minOp>,
-        ArithMinMaxFLowering<mlir::arith::MinimumFOp, BinaryExpOperator::minOp>,
+        ArithMinMaxFLowering<mlir::arith::MinimumFOp,
+                             BinaryExpOperator::minNanOp>,
         ArithIntMinMaxLowering<mlir::arith::MaxSIOp>,
         ArithIntMinMaxLowering<mlir::arith::MinSIOp>,
         ArithIntMinMaxLowering<mlir::arith::MaxUIOp>,

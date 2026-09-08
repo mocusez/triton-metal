@@ -1311,6 +1311,210 @@ validation.
     values, signed zeros, and reduction consumers. This is recorded in the
     current plan and README as unfinished; the cast fixes do not address it.
 
+49. **Propagate NaN through `tl.minimum`/`tl.maximum` under `PropagateNan.ALL`.**
+    The finding recorded at the end of item 48 is now fixed. Root cause: MSL
+    has no NaN-propagating extremum at all. A direct
+    `torch.mps.compile_shader` probe on Apple M4 / macOS 26.4 returned `2.0f`
+    for `max(NAN, 2.0f)`, for `max(2.0f, NAN)` and for `fmax` of either, so
+    every spelling available to the emitter is IEEE-754 `maxNum`. That is what
+    the default `propagate_nan=NONE` (`arith.maxnumf`/`arith.minnumf`) wants,
+    and all four arith extrema shared the single `maxOp`/`minOp` operator, so
+    the ALL policy silently got the number-preferring answer.
+
+    The fix adds `maxNanOp`/`minNanOp` to `BinaryExpOperator` and a pair of
+    templated preamble helpers, `__triton_maximumf`/`__triton_minimumf`, which
+    return a NaN operand as-is (preserving payload and sign, like
+    `metal.clampf` already does) and otherwise order `-0.0` below `+0.0`.
+    Operator selection goes through ONE pair of functions,
+    `floatExtremumOperator` and `isNanPropagatingExtremum`, used by the
+    elementwise lowering, both cone evaluators, and all four reduce planners
+    (rank-1, rank-2 axis-0, rank-N staged, rank-2), so the three paths named in
+    the plan cannot drift apart. The scalar emitter calls the same helper by
+    the same name. `-inf`/`+inf` remain the reduce identities under either
+    policy: they lose to every real element, a NaN included, so masked-out
+    lanes stay inert.
+
+    Measured RED, then GREEN, on the same three paths: elementwise tensor
+    `[NaN, 1]` vs `[2, NaN]` went `[2, 1]` -> `[NaN, NaN]`, the scalar form
+    went `2.0` -> `NaN`, and a `tl.reduce` with an ALL-policy maximum combine
+    over `[1, NaN, 3, 2]` went `3.0` -> `NaN`. Signed zeros were A/B'd through
+    the real pipeline rather than argued: the default policy, which still emits
+    the builtin, returns `-0` for `max(+0, -0)` and `+0` for `max(-0, +0)`,
+    while the fixed ALL policy returns `+0` for both.
+
+    The default policy is untouched by construction. A kernel that uses no ALL
+    extremum emits no helper, and its call site still reads
+    `max(float(a), float(b))`, so existing MSL is byte-for-byte unchanged.
+
+    Coverage: 66 new physical MPS cases over both policies, NaN on either side
+    and on both, the +/-inf bounds, ordinary and equal finite pairs, bit-exact
+    signed zeros, scalar and tensor forms, one and four warps, three programs
+    with a masked tail, and a reduce consumer with the NaN first, in the middle,
+    last, and absent, at BLOCK 32 and 256. f16 and bf16 elementwise cases pin
+    that the templated helper instantiates at the narrow widths too. Upstream
+    `test_core.py::test_propagate_nan` on `--device=mps` passes 10 of 12; the
+    two failures are `clamp` on `float16`, which is the pre-existing named
+    `tt.clampf requires f32 operands and result` boundary and is not touched by
+    this change. Two conversion lit cases pin both operator spellings and one
+    translate case pins the helper definition plus the call sites.
+
+    One existing fixture had encoded the defect as intended behaviour:
+    `reduce_maxf_rank2_axis1.mlir` fed `arith.maximumf` and asserted `maxOp`.
+    Its `maxnumf` positive still asserts `maxOp`; the `maximumf` case now
+    asserts `maxNanOp` and that no `maxOp` appears. That is also the A/B for
+    the lit additions, which reference an operator that did not previously
+    exist.
+
+    Full verification: 157 of 157 Metal lit cases pass, and the fresh-cache
+    complete Metal backend suite is **2,531 passed / 3 skipped / 0 failed**
+    in 197.81s, up from the 2,465 of item 48 by exactly the 66 added cases, so
+    the change carries no regression. Ruff, `py_compile` and `git diff --check`
+    pass. Command:
+    `TRITON_CACHE_DIR=<fresh> pixi run --frozen pytest python/test/unit/test_metal_backend_*.py -s --tb=short`.
+
+    The `linalg.reduce` -> `metal.reduce` matchers in `LinalgToMetal.cpp` and
+    `ConvertLinalgToMetal.cpp` also name `arith.maximumf`, but that is the
+    MLX-native reduce family and is not reachable from the Triton TTGIR
+    pipeline, so it is deliberately unchanged.
+
+50. **Widen `tt.clampf` from f32 to f32/f16/bf16.** Entry 49 left upstream
+    `test_core.py::test_propagate_nan` at 10 of 12 on `--device=mps`, with both
+    `clamp-float16` cases failing on `tt.clampf requires f32 operands and
+    result`. That was not a platform limit. MSL's `fmin`/`fmax` carry `half`
+    natively, and a direct shader probe confirmed an f16 clamp is exact.
+
+    The ODS operands and result now share one `Metal_ClampFloat` constraint,
+    the verifier requires a single float type across all four (ODS can restrict
+    each operand but cannot make them agree, and a mixed-width clamp would let
+    the emitted `fmin`/`fmax` promote silently), and the lowering pattern and
+    `validateClampFSupport` share `metalClampFElementTypeSupported`. f64 and fp8
+    keep a named pre-conversion rejection; the negative fixture moved from f16,
+    which is now a positive, to f64.
+
+    Two findings worth carrying. First, `bfloat` has no `fmin`/`fmax` overload
+    at all: both operands promote to `float` and MSL refuses to convert the
+    result back, a hard "assigning to 'bfloat' from incompatible type 'float'"
+    error rather than a silent narrowing. The emitter converts explicitly, which
+    is exact because the result is always one of the three operands. Second,
+    that branch is currently unreachable from Python: dumping TTIR shows Triton
+    widening a bf16 `tl.clamp` to f32 with `arith.extf` and truncating the
+    result, so `tt.clampf` never appears in bf16. The f16 TTIR, by contrast, is
+    a genuine `tt.clampf ... tensor<16xf16>`, and its MSL is the unwrapped
+    native half call. The bf16 support is kept for hand-written Metal IR and for
+    the day the frontend stops promoting, and it is pinned by the
+    metal-translate lit rather than by a runtime test that would not exercise
+    it.
+
+    Beware the reverse trap when probing this: `tl.clamp(x_f16, -1.0, 1.0)` with
+    Python float literals promotes x to f32, so it always worked and proves
+    nothing. The broken form is same-dtype bounds, which is what upstream's test
+    uses.
+
+    Verification: upstream `test_propagate_nan` goes 10/12 -> **12/12**, and
+    `test_clamp` plus `test_clamp_symmetric` pass 5/5. Six new physical MPS
+    cases cover f32/f16/bf16 against both NaN policies with both bounds hit
+    exactly, signed zeros, both infinities and NaN, at one and four warps. f32
+    and f16 MSL is byte-identical to before for the shapes that already worked.
+    157 of 157 Metal lit and a fresh-cache **2,537 passed / 3 skipped / 0
+    failed** in 194.06s, up from entry 49's 2,531 by exactly the six added
+    cases.
+
+51. **Measure the remaining P0 decline audit instead of describing it.** The
+    plan had carried "the rest of the pattern-decline list still needs pinning"
+    as prose since the audit began. Three sweeps under `.omc/fuzz/` turned that
+    into a number, and found no new gap on any axis they cover.
+
+    `gapprobe11.py` runs 164 legal frontend kernels over the arithmetic and
+    math element-type envelope: floor, ceil, remf, divf, fdiv, mul, sub,
+    sigmoid, compare-plus-where and absf at f32/f16/bf16, and add, mul, floor
+    division, remainder, both shifts, the three bitwise ops, abs, min, max and
+    compare-plus-where at i32/i8/i16/i64, each in tensor and scalar form.
+    Result **152 OK / 12 FRONT / 0 KILLER / 0 UNNAMED**. Every FRONT is Triton
+    refusing the kernel itself with `Expected dtype ['fp32', 'fp64']` for
+    floor/ceil/sigmoid at the narrow widths, in `ast_to_ttir`, before the
+    backend is involved. Worth keeping as a classifier trap: a harness that
+    greps for "error" files those as backend gaps.
+
+    `gapprobe11b.py` targets the decline surfaces that have no pre-conversion
+    validator at all. Twelve validators run today and none covers `gather`
+    (8 declines), `join` (5) or `split` (4), so their reason strings were read
+    straight out of the source and turned into 16 probes. Result **6 OK /
+    10 NAMED / 0 KILLER**: all four families already fail closed with a named
+    diagnostic, and each message already had a lit fixture.
+
+    `gapprobe11c.py` does the same for atomics, where the coverage audit listed
+    13 unpinned diagnostics. Result **5 OK / 4 FRONT / 8 NAMED / 0 KILLER**.
+    Six of the eight reachable rejections were already pinned. The two that were
+    not, rank-3 `tt.atomic_rmw` and rank-3 `tt.atomic_cas`, are now negatives in
+    `atomic_unsupported.mlir` and `atomic_cas_unsupported.mlir`. The rank check
+    runs before the address-form check, so a splat pointer tile reaches it
+    without any rank-3 index arithmetic.
+
+    **The metric that matters.** Counting `notifyMatchFailure` sites is
+    meaningless: the pass has 260 and most are "this pattern does not apply,
+    let the next one try". The countable quantity is the fail-closed named
+    diagnostic. There are 158; 58 are pinned by a lit or pytest fixture and 100
+    are not, and the unpinned set is dominated by `dot_scaled` (~20 messages)
+    and the tile-invariant / full-tile-exchange staging (~8). That is the
+    remaining checklist.
+
+    **Do not pin blindly.** "Unpinned" is not "reachable": 4 of the 17 atomic
+    probes were legal-looking Python that Triton refused before the backend saw
+    them. Probing first is what keeps the suite from filling with guards for
+    shapes no user can express, which is the same "pseudo-reachable guard" the
+    plan already rejects for TTIR-verifier-rejected shapes.
+
+    No compiler source changed in this round; the deliverable is two lit
+    negatives plus the measurement. 157 of 157 Metal lit pass.
+
+52. **A real P0 gap in `tl.dot_scaled`: an epilogue between the dot and the
+    store left invalid IR, not a diagnostic.** Entry 51 measured the remaining
+    checklist and named `dot_scaled` (~26 unpinned messages) as the largest
+    cluster. Probing it found the first genuine gap of the round.
+
+    An `@triton.jit` scaled-dot matmul that stores into an **f16 output buffer**
+    failed with `operand #0 does not dominate this use` on
+    `arith.truncf`, followed only by the generic
+    `Metal backend: convert-tritongpu-to-metal failed`. Deterministic, 30 of 30
+    runs. That is the half-applied-rewrite state from the in-conversion-decline
+    doctrine: invalid IR after the pass mutated the module, which is what turns
+    into an intermittent process kill, not an unsupported-shape diagnostic. An
+    f32 accumulator with an f16 output is an ordinary thing to write.
+
+    Root cause: `sdFindStore` walks transitively, so it finds the store even
+    when real work sits between it and the dot. The rewrite materializes the
+    result at the store, so the intervening op keeps its original position and
+    ends up consuming a value now defined after it. The loop-carried form
+    already required the result to reach the store directly, at most through a
+    layout conversion; the **loop-free form had no such check**. Hoisting it to
+    cover both forms is the fix, with its own message for the loop-free case.
+
+    🔑 The discriminator that makes the tightening safe: `result + bias` still
+    compiles, because Triton folds the add into the dot's **accumulator
+    operand**, leaving the TTGIR chain direct. Confirmed in the dump: no
+    `arith.addf` survives. `result * 2.0` and `tl.maximum(result, 0.0)` do
+    survive as their own ops, and both were already producing the dominance
+    error, so the new rejection only reclassifies shapes that never worked.
+    Plain `tl.dot` into an f16 buffer is unaffected and still compiles.
+
+    Pinned by two compile-only cases in `test_metal_backend_msl.py`, the f16
+    output buffer and a multiply epilogue. ⚠️ They read the DIAGNOSTIC from
+    stderr via `capfd` and also assert `does not dominate this use` is absent.
+    The neighbouring rejection tests match only on the generic
+    `convert-tritongpu-to-metal failed`, which cannot tell a named rejection
+    from invalid IR and would have passed throughout this bug.
+
+    The same mechanism was then checked at the other four `sdFindStore` call
+    sites, since a transitive store walk feeding a rewrite that materializes at
+    the store is the shape of the bug. Both remaining matchers with a real
+    workload came back clean: the OLS gram dot and the complex real/imag pair
+    from the 2D FFT each compile with a `* 0.5` epilogue and with an f16 output
+    buffer. The loop-free scaled dot was the only broken one.
+
+    157 of 157 Metal lit and **2,539 passed / 3 skipped / 0 failed**, up from
+    entry 51's 2,537 by exactly the two added cases. The measured checklist is
+    now 159 fail-closed named diagnostics, 60 pinned, 99 not.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

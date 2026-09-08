@@ -11,6 +11,8 @@ See the implementation notes.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -516,3 +518,384 @@ def test_libdevice_missing_function_is_a_clean_error():
     with pytest.raises(Exception) as excinfo:
         _libdevice_hypot_kernel[(1,)](x, out, BLOCK=16)
     assert "hypot" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# `tl.minimum` / `tl.maximum` NaN policy.
+#
+# `propagate_nan=tl.PropagateNan.ALL` is IEEE-754 maximum/minimum: a NaN
+# operand makes the result NaN. The default `PropagateNan.NONE` is IEEE-754
+# maxNum/minNum: a NaN operand is ignored and the other operand wins. MSL's
+# `max`/`min`/`fmax`/`fmin` are all number-preferring, so the ALL policy needs
+# its own spelling; before that existed both policies returned the number.
+# ---------------------------------------------------------------------------
+
+_NAN = float("nan")
+_INF = float("inf")
+
+# (lhs, rhs) pairs: NaN on the left, on the right, on both sides, against the
+# infinities that bound the reductions, plus ordinary finite pairs and equal
+# pairs. Signed zeros get their own bit-exact test below.
+_MINMAX_PAIRS = [
+    (_NAN, 2.0),
+    (2.0, _NAN),
+    (_NAN, _NAN),
+    (_NAN, -_INF),
+    (_INF, _NAN),
+    (_NAN, 0.0),
+    (1.0, 2.0),
+    (2.0, 1.0),
+    (-1.0, -2.0),
+    (-2.0, -1.0),
+    (-_INF, 2.0),
+    (_INF, 2.0),
+    (3.5, 3.5),
+    (0.0, 0.0),
+]
+
+
+def _ieee_extremum(a, b, want_max):
+    """IEEE-754 maximum/minimum: a NaN operand wins, -0.0 orders below +0.0."""
+    if math.isnan(a):
+        return a
+    if math.isnan(b):
+        return b
+    if a == b:  # the only interesting case is the +0.0 / -0.0 pair
+        negative = math.copysign(1.0, a) < 0.0
+        return (b if negative else a) if want_max else (a if negative else b)
+    return max(a, b) if want_max else min(a, b)
+
+
+def _num_extremum(a, b, want_max):
+    """IEEE-754 maxNum/minNum: a NaN operand is ignored (Triton's default)."""
+    if math.isnan(a):
+        return b
+    if math.isnan(b):
+        return a
+    return max(a, b) if want_max else min(a, b)
+
+
+def _minmax_inputs(n):
+    pairs = [_MINMAX_PAIRS[i % len(_MINMAX_PAIRS)] for i in range(n)]
+    lhs = torch.tensor([p[0] for p in pairs], dtype=torch.float32)
+    rhs = torch.tensor([p[1] for p in pairs], dtype=torch.float32)
+    return pairs, lhs, rhs
+
+
+@triton.jit
+def _minmax_nan_policy_kernel(X, Y, MAX_ALL, MIN_ALL, MAX_NUM, MIN_NUM, N,
+                              BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X + offs, mask, other=0.0)
+    y = tl.load(Y + offs, mask, other=0.0)
+    tl.store(MAX_ALL + offs, tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL), mask)
+    tl.store(MIN_ALL + offs, tl.minimum(x, y, propagate_nan=tl.PropagateNan.ALL), mask)
+    tl.store(MAX_NUM + offs, tl.maximum(x, y), mask)
+    tl.store(MIN_NUM + offs, tl.minimum(x, y), mask)
+
+
+@pytest.mark.parametrize("n", [1, 14, 259])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_minmax_propagate_nan_all_returns_nan(n, num_warps):
+    """The ALL policy must carry a NaN operand into the result, from either
+    side and from both. n=259 with BLOCK=128 also covers three programs and a
+    masked tail."""
+    pairs, lhs, rhs = _minmax_inputs(n)
+    outs = [torch.full((n,), 12345.0, device="mps") for _ in range(4)]
+    _minmax_nan_policy_kernel[(triton.cdiv(n, 128),)](
+        lhs.to("mps"), rhs.to("mps"), *outs, n, BLOCK=128, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    max_all, min_all = outs[0].cpu(), outs[1].cpu()
+    expected_max = torch.tensor([_ieee_extremum(a, b, True) for a, b in pairs])
+    expected_min = torch.tensor([_ieee_extremum(a, b, False) for a, b in pairs])
+    torch.testing.assert_close(max_all, expected_max, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(min_all, expected_min, rtol=0, atol=0, equal_nan=True)
+    # State the defect directly: every pair holding a NaN must produce a NaN,
+    # which is what an `assert_close` against a number-preferring result would
+    # otherwise let through if the reference were computed the same wrong way.
+    has_nan = torch.tensor([math.isnan(a) or math.isnan(b) for a, b in pairs])
+    assert torch.equal(torch.isnan(max_all), has_nan)
+    assert torch.equal(torch.isnan(min_all), has_nan)
+
+
+@pytest.mark.parametrize("n", [1, 14, 259])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_minmax_propagate_nan_none_prefers_the_number(n, num_warps):
+    """Adjacent policy: the default must keep ignoring a NaN operand. This is
+    what softmax and every clamp idiom in the backend rely on, so the ALL fix
+    must not leak into it."""
+    pairs, lhs, rhs = _minmax_inputs(n)
+    outs = [torch.full((n,), 12345.0, device="mps") for _ in range(4)]
+    _minmax_nan_policy_kernel[(triton.cdiv(n, 128),)](
+        lhs.to("mps"), rhs.to("mps"), *outs, n, BLOCK=128, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    max_num, min_num = outs[2].cpu(), outs[3].cpu()
+    expected_max = torch.tensor([_num_extremum(a, b, True) for a, b in pairs])
+    expected_min = torch.tensor([_num_extremum(a, b, False) for a, b in pairs])
+    torch.testing.assert_close(max_num, expected_max, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(min_num, expected_min, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_minmax_propagate_nan_all_orders_signed_zero(num_warps):
+    """IEEE-754 maximum/minimum order -0.0 below +0.0. The values compare equal,
+    so this has to be checked on the bit pattern."""
+    pairs = [(0.0, -0.0), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0)]
+    n = len(pairs)
+    lhs = torch.tensor([p[0] for p in pairs], dtype=torch.float32)
+    rhs = torch.tensor([p[1] for p in pairs], dtype=torch.float32)
+    outs = [torch.full((n,), 12345.0, device="mps") for _ in range(4)]
+    _minmax_nan_policy_kernel[(1,)](
+        lhs.to("mps"), rhs.to("mps"), *outs, n, BLOCK=128, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    max_bits = outs[0].cpu().view(torch.int32)
+    min_bits = outs[1].cpu().view(torch.int32)
+    expected_max = torch.tensor(
+        [_ieee_extremum(a, b, True) for a, b in pairs]).view(torch.int32)
+    expected_min = torch.tensor(
+        [_ieee_extremum(a, b, False) for a, b in pairs]).view(torch.int32)
+    assert torch.equal(max_bits, expected_max), (max_bits, expected_max)
+    assert torch.equal(min_bits, expected_min), (min_bits, expected_min)
+
+
+@triton.jit
+def _minmax_nan_policy_scalar_kernel(X, Y, MAX_ALL, MIN_ALL, MAX_NUM, MIN_NUM):
+    x = tl.load(X)
+    y = tl.load(Y)
+    tl.store(MAX_ALL, tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL))
+    tl.store(MIN_ALL, tl.minimum(x, y, propagate_nan=tl.PropagateNan.ALL))
+    tl.store(MAX_NUM, tl.maximum(x, y))
+    tl.store(MIN_NUM, tl.minimum(x, y))
+
+
+@pytest.mark.parametrize("lhs,rhs", _MINMAX_PAIRS)
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_minmax_propagate_nan_all_scalar_form(lhs, rhs, num_warps):
+    """The scalar form takes a different emitter path than the scalarized
+    tensor form, so it needs its own coverage of both policies."""
+    x = torch.tensor([lhs], dtype=torch.float32, device="mps")
+    y = torch.tensor([rhs], dtype=torch.float32, device="mps")
+    outs = [torch.full((1,), 12345.0, device="mps") for _ in range(4)]
+    _minmax_nan_policy_scalar_kernel[(1,)](x, y, *outs, num_warps=num_warps)
+    torch.mps.synchronize()
+    got = [o.cpu().item() for o in outs]
+    want = [
+        _ieee_extremum(lhs, rhs, True),
+        _ieee_extremum(lhs, rhs, False),
+        _num_extremum(lhs, rhs, True),
+        _num_extremum(lhs, rhs, False),
+    ]
+    for g, w, name in zip(got, want, ["max ALL", "min ALL", "max NONE", "min NONE"]):
+        if math.isnan(w):
+            assert math.isnan(g), f"{name}: expected NaN, got {g}"
+        else:
+            assert g == w, f"{name}: expected {w}, got {g}"
+
+
+@triton.jit
+def _reduce_max_all(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _reduce_min_all(a, b):
+    return tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _reduce_nan_policy_kernel(X, OMAX, OMIN, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(X + offs)
+    tl.store(OMAX, tl.reduce(x, 0, _reduce_max_all))
+    tl.store(OMIN, tl.reduce(x, 0, _reduce_min_all))
+
+
+@pytest.mark.parametrize("nan_at", [None, 0, 5, -1])
+@pytest.mark.parametrize("BLOCK", [32, 256])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_minmax_propagate_nan_all_returns_nan(nan_at, BLOCK, num_warps):
+    """Reduction consumer: a NaN anywhere in the tile must survive the fold,
+    wherever it lands relative to the per-thread partials and the cross-lane
+    butterfly. `nan_at=None` is the control that the fold still reduces."""
+    x = torch.linspace(-3.0, 5.0, BLOCK, dtype=torch.float32)
+    if nan_at is not None:
+        x[nan_at] = _NAN
+    omax = torch.full((1,), 12345.0, device="mps")
+    omin = torch.full((1,), 12345.0, device="mps")
+    _reduce_nan_policy_kernel[(1,)](
+        x.to("mps"), omax, omin, BLOCK=BLOCK, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    got_max, got_min = omax.cpu().item(), omin.cpu().item()
+    if nan_at is None:
+        assert got_max == x.max().item()
+        assert got_min == x.min().item()
+    else:
+        assert math.isnan(got_max), f"max fold dropped the NaN: {got_max}"
+        assert math.isnan(got_min), f"min fold dropped the NaN: {got_min}"
+
+
+@triton.jit
+def _minmax_nan_policy_half_kernel(X, Y, MAX_ALL, MIN_ALL, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(X + offs)
+    y = tl.load(Y + offs)
+    tl.store(MAX_ALL + offs, tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL))
+    tl.store(MIN_ALL + offs, tl.minimum(x, y, propagate_nan=tl.PropagateNan.ALL))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_minmax_propagate_nan_all_half_widths(dtype, num_warps):
+    """The NaN-propagating extremum is emitted as a template helper, so the
+    narrow float widths have to instantiate it rather than fall back to the
+    number-preferring builtin."""
+    pairs = [(_NAN, 2.0), (2.0, _NAN), (_NAN, _NAN), (1.0, 4.0)] * 8
+    n = len(pairs)
+    lhs = torch.tensor([p[0] for p in pairs], dtype=dtype)
+    rhs = torch.tensor([p[1] for p in pairs], dtype=dtype)
+    max_all = torch.zeros(n, dtype=dtype, device="mps")
+    min_all = torch.zeros(n, dtype=dtype, device="mps")
+    _minmax_nan_policy_half_kernel[(1,)](
+        lhs.to("mps"), rhs.to("mps"), max_all, min_all, BLOCK=n,
+        num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    got_max = max_all.float().cpu()
+    got_min = min_all.float().cpu()
+    has_nan = torch.tensor([math.isnan(a) or math.isnan(b) for a, b in pairs])
+    assert torch.equal(torch.isnan(got_max), has_nan)
+    assert torch.equal(torch.isnan(got_min), has_nan)
+    finite = ~has_nan
+    torch.testing.assert_close(got_max[finite], torch.full((finite.sum(),), 4.0))
+    torch.testing.assert_close(got_min[finite], torch.full((finite.sum(),), 1.0))
+
+
+@triton.jit
+def _reduce_rank2_axis0_kernel(X, OMAX, OMIN, M: tl.constexpr, N: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    cols = tl.arange(0, N)[None, :]
+    x = tl.load(X + rows * N + cols)
+    tl.store(OMAX + tl.arange(0, N), tl.reduce(x, 0, _reduce_max_all))
+    tl.store(OMIN + tl.arange(0, N), tl.reduce(x, 0, _reduce_min_all))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_rank2_axis0_propagate_nan_all_returns_nan(num_warps):
+    """The rank-2 axis-0 planner builds its own fold, separately from the
+    rank-1 butterfly. A NaN must reach exactly the column that holds it and
+    leave every other column bit-exact."""
+    M, N = 8, 16
+    x = torch.arange(M * N, dtype=torch.float32).reshape(M, N)
+    x[3, 5] = _NAN
+    out_max = torch.zeros(N, device="mps")
+    out_min = torch.zeros(N, device="mps")
+    _reduce_rank2_axis0_kernel[(1,)](
+        x.to("mps"), out_max, out_min, M=M, N=N, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    got_max, got_min = out_max.cpu(), out_min.cpu()
+    only_col5 = torch.zeros(N, dtype=torch.bool)
+    only_col5[5] = True
+    assert torch.equal(torch.isnan(got_max), only_col5)
+    assert torch.equal(torch.isnan(got_min), only_col5)
+    keep = ~only_col5
+    torch.testing.assert_close(got_max[keep], x.amax(dim=0)[keep], rtol=0, atol=0)
+    torch.testing.assert_close(got_min[keep], x.amin(dim=0)[keep], rtol=0, atol=0)
+
+
+@triton.jit
+def _reduce_rank3_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    x = tl.load(X + a * (B * C) + b * C + c)
+    r = tl.reduce(x, 1, _reduce_max_all)
+    out_a = tl.arange(0, A)[:, None]
+    out_c = tl.arange(0, C)[None, :]
+    tl.store(O + out_a * C + out_c, r)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_rank3_staged_propagate_nan_all_returns_nan(num_warps):
+    """Rank > 2 takes the staged planner, which publishes the tile to
+    threadgroup memory and walks the reduced axis. Its fold needs the same NaN
+    policy as the rank-1 and rank-2 ones."""
+    A, B, C = 4, 8, 4
+    x = torch.arange(A * B * C, dtype=torch.float32).reshape(A, B, C)
+    x[2, 3, 1] = _NAN
+    out = torch.zeros(A * C, device="mps")
+    _reduce_rank3_kernel[(1,)](
+        x.to("mps"), out, A=A, B=B, C=C, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    got = out.cpu().reshape(A, C)
+    only_cell = torch.zeros((A, C), dtype=torch.bool)
+    only_cell[2, 1] = True
+    assert torch.equal(torch.isnan(got), only_cell)
+    keep = ~only_cell
+    torch.testing.assert_close(got[keep], x.amax(dim=1)[keep], rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# `tl.clamp` float widths. MSL spells clamp as `fmin(fmax(x, lo), hi)`, which
+# carries f32 and half natively; bf16 has no overload, so the emitter converts
+# the promoted float result back. f64 keeps a named pre-conversion rejection.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _clamp_widths_kernel(X, LO, HI, OUT_NONE, OUT_ALL, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(X + offs)
+    lo = tl.load(LO)
+    hi = tl.load(HI)
+    tl.store(OUT_NONE + offs, tl.clamp(x, lo, hi))
+    tl.store(OUT_ALL + offs,
+             tl.clamp(x, lo, hi, propagate_nan=tl.PropagateNan.ALL))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_clamp_float_widths_and_nan_policy(dtype, num_warps):
+    """f16 clamp used to be rejected outright; this is the width that actually
+    reaches `metal.clampf` in f16. Triton widens a bf16 `tl.clamp` to f32 in the
+    frontend, so the bf16 row here proves the user-visible result, not the
+    narrow emitter path (that one is pinned by the metal-translate lit). Both
+    NaN policies must hold at every width: ALL returns NaN for a NaN input,
+    NONE lets the number-preferring min/max consume it."""
+    # A power of two, as tl.arange requires. Covers both bounds exactly, the
+    # two signed zeros, values outside on each side, both infinities and NaN.
+    values = [-5.0, -2.0, -1.0, -0.5, -0.25, -0.0, 0.0, 0.25,
+              0.5, 1.0, 2.0, 5.0, _NAN, _INF, -_INF, _NAN]
+    n = len(values)
+    x = torch.tensor(values, dtype=dtype)
+    lo = torch.tensor([-1.0], dtype=dtype)
+    hi = torch.tensor([1.0], dtype=dtype)
+    out_none = torch.zeros(n, dtype=dtype, device="mps")
+    out_all = torch.zeros(n, dtype=dtype, device="mps")
+    _clamp_widths_kernel[(1,)](
+        x.to("mps"), lo.to("mps"), hi.to("mps"), out_none, out_all,
+        BLOCK=n, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    got_none = out_none.float().cpu()
+    got_all = out_all.float().cpu()
+    is_nan_in = torch.tensor([math.isnan(v) for v in values])
+
+    # torch.clamp propagates NaN, so it is the oracle for the ALL policy.
+    expected_all = torch.clamp(x.float(), -1.0, 1.0)
+    torch.testing.assert_close(got_all, expected_all, rtol=0, atol=0,
+                               equal_nan=True)
+    assert torch.equal(torch.isnan(got_all), is_nan_in)
+
+    # Triton leaves the NONE result for a NaN input unspecified beyond "not a
+    # NaN", which is exactly what the upstream conformance test asserts.
+    assert not torch.isnan(got_none).any()
+    keep = ~is_nan_in
+    torch.testing.assert_close(got_none[keep], expected_all[keep],
+                               rtol=0, atol=0)

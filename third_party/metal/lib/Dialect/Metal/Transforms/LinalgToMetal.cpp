@@ -184,6 +184,14 @@ classifyReduceCombiner(mlir::linalg::ReduceOp op) {
 
   if (llvm::isa<mlir::arith::AddFOp>(arithOp))
     return MetalReduceKind::sum;
+  // WARNING if this pass is ever put into a pipeline: `arith.maximumf` is
+  // IEEE-754 maximum, which must propagate a NaN element, but
+  // MetalReduceKind::max is emitted as `simd_max` / `max(acc, v)`, and every
+  // MSL extremum builtin is number-preferring. This is the MLX-native
+  // `metal.reduce` family, reached only by running `convert-linalg-to-metal`
+  // directly from triton-opt, so no Triton kernel can observe the mismatch
+  // today. The TritonGPUToMetal path handles the two NaN policies separately
+  // via `floatExtremumOperator`; this classifier would need the same split.
   if (llvm::isa<mlir::arith::MaximumFOp>(arithOp))
     return MetalReduceKind::max;
   return std::nullopt;

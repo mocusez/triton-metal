@@ -2,9 +2,15 @@
 //
 // Rank-2 axis=1 `tt.reduce` with a MAX combine (arith.maxnumf — Triton's
 // tl.max — or arith.maximumf, f32) lowers through the same self-contained
-// per-row reduction body as the sum combine (L3a-tileloop-2), but with the
-// combine emitted as `metal.binary_exp ... maxOp` (MSL max(a, b)) and the
+// per-row reduction body as the sum combine (L3a-tileloop-2), with the
 // scf.for iter_arg identity-initialised to exact -infinity.
+//
+// The two float extrema differ ONLY in what a NaN element does, and the fold
+// operator is where that split lands: maxnumf (NaN ignored) keeps
+// `metal.binary_exp ... maxOp` (MSL `max(a, b)`, itself number-preferring),
+// while maximumf (IEEE-754 maximum, `propagate_nan=ALL`) must emit maxNanOp so
+// a NaN row element survives the fold. -infinity stays the identity either way:
+// it loses to every real element, NaN included.
 
 // -----
 // f32 / arith.maxnumf, shape <8x16xf32>, axis=1. M=8 < tpb=128, so there is no
@@ -60,7 +66,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.return
 
 // -----
-// f32 / arith.maximumf (IEEE maximum) accepted on the same path as maxnumf.
+// f32 / arith.maximumf (IEEE maximum) takes the same path as maxnumf but folds
+// with the NaN-propagating operator.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -93,7 +100,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 // CHECK-LABEL: metal.kernel reduce_maximumf_axis1_f32
 // CHECK: metal.threadgroup_alloca : !metal.memref<8 x f32>
-// CHECK: metal.binary_exp {{.*}}, {{.*}}, maxOp
+// The identity is still exact -infinity, and the fold is the NaN-propagating
+// operator so a NaN element cannot be dropped by the number-preferring MSL max.
+// CHECK: arith.constant 0xFF800000 : f32
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, maxNanOp
+// CHECK-NOT: metal.binary_exp {{.*}}, {{.*}}, maxOp
 // CHECK: metal.return
 
 // -----

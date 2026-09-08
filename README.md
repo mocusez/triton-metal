@@ -348,13 +348,17 @@ The current dependency-ordered priorities are:
    Non-f32 FMA and the f32-only unary math operations also fail in preflight
    with type diagnostics; explicitly convert operands to f32 to use them.
    Numeric casts with f64 operands or results also have named diagnostics.
+   `tl.clamp` now covers f32, f16 and bf16 rather than f32 alone, and names f64
+   in preflight; a bf16 clamp still reaches the backend widened to f32 because
+   Triton's frontend promotes it.
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
-   A newly reproduced correctness issue remains: floating `tl.minimum` and
-   `tl.maximum` with `propagate_nan=tl.PropagateNan.ALL` can return a number
-   when an input is NaN. Fixing it requires consistent elementwise, scalar,
-   and reduction-cone handling.
+   The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
+   `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
+   NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
+   reduction-fold paths alike. The default number-preferring policy is
+   unchanged and still compiles to the MSL builtin.
 2. Expand layout conversion and reduce/scan support, including cross-lane
    transpose, general tuple combines, and axis-0 reductions with multiple
    output elements per thread. Broader descriptor-reduce type/rank and
@@ -362,6 +366,11 @@ The current dependency-ordered priorities are:
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
    canonical dynamic/masked loops, and masked rank-3 batch tails; more general
    combinations and non-canonical scale addresses remain outside that scope.
+   A scaled dot must also reach its store directly: an epilogue in between,
+   including the implicit truncation of an f16 output buffer, is named in
+   preflight rather than half-rewritten. Accumulate and store f32, or apply the
+   epilogue in a second kernel. A bias add is fine because Triton folds it into
+   the dot's accumulator.
    Each extension needs a positive case and an adjacent rejection regression.
 3. Run the MPS numerical wheel smoke on a physical macOS 15 machine. CI now
    builds/audits on macOS 26, then installs and compile-smokes the

@@ -1037,6 +1037,8 @@ void BinaryExpOp::build(OpBuilder &builder, OperationState &result,
   case OP::remOp:
   case OP::maxOp:
   case OP::minOp:
+  case OP::maxNanOp:
+  case OP::minNanOp:
   case OP::bitAndOp:
   case OP::bitOrOp:
   case OP::bitXorOp:
@@ -1078,6 +1080,17 @@ llvm::LogicalResult BinaryExpOp::verify() {
   case OP::minOp:
     if (lhsType != resultType)
       return emitOpError() << "result type mismatch";
+    break;
+  case OP::maxNanOp:
+  case OP::minNanOp:
+    // IEEE-754 maximum/minimum. Only a float can carry a NaN, so an integer
+    // operand here means a caller confused the NaN-propagating extremum with
+    // the number-preferring maxOp/minOp.
+    if (lhsType != resultType)
+      return emitOpError() << "result type mismatch";
+    if (!mlir::isa<mlir::FloatType>(lhsType))
+      return emitOpError()
+             << "NaN-propagating extremum requires floating-point operands";
     break;
   case OP::bitAndOp:
   case OP::bitOrOp:
@@ -1133,9 +1146,14 @@ void ClampFOp::build(OpBuilder &builder, OperationState &result, Value x,
 }
 
 llvm::LogicalResult ClampFOp::verify() {
-  if (!getX().getType().isF32() || !getMin().getType().isF32() ||
-      !getMax().getType().isF32() || !getResult().getType().isF32())
-    return emitOpError() << "requires f32 operands and result";
+  // ODS already restricts each operand to f32/f16/bf16 individually; what it
+  // cannot say is that the four must agree. A mixed-width clamp would make the
+  // emitted `fmin`/`fmax` promote silently and change the rounding.
+  mlir::Type ty = getResult().getType();
+  if (getX().getType() != ty || getMin().getType() != ty ||
+      getMax().getType() != ty)
+    return emitOpError() << "requires one float type across x, min, max and "
+                            "the result";
   return mlir::success();
 }
 
