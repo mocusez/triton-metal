@@ -7579,11 +7579,27 @@ static mlir::LogicalResult lowerRank1Reduce(
                                                        mlir::ValueRange{elt})
                   .getResult(0);
       }
-      // Wall 11 chain re-emit + combiner-identity-override.
+      // Wall 11 chain re-emit.
+      //
+      // A masked-off lane holds the load's `other`, and Triton's contract is
+      // that the chain applies to it like any other element:
+      // `tl.sum(tl.exp(tl.load(p, mask, other=1.0)))` adds exp(1.0) once per
+      // masked-off lane. This used to substitute the COMBINER IDENTITY for the
+      // whole chained value whenever a mask was present, so every explicit
+      // `other` was silently dropped -- the kernel above returned the sum over
+      // the unmasked lanes alone, where the interpreter oracle and every other
+      // backend include them. The `other`-less form was correct by accident
+      // (its identity happens to be what a neutral lane should contribute) and
+      // that is the only form the suite covered.
+      //
+      // With NO `other` the masked-off value is unspecified, so the identity
+      // stays: it keeps the reduce deterministic rather than folding in the
+      // zero this backend happens to fill with, and it is what the softmax
+      // shapes built on this path have always seen.
       if (!chain.empty()) {
         mlir::Value chainElt =
             emitScalarChain(chain, elt, /*spt_idx=*/0, loc, rewriter);
-        if (condKResult) {
+        if (condKResult && !otherAttrPre) {
           mlir::Value identityV = buildIdentityVal();
           elt = mlir::arith::SelectOp::create(rewriter, loc, condKResult,
                                               chainElt, identityV)

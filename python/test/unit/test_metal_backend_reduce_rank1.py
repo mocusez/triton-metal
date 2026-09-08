@@ -872,3 +872,88 @@ def test_reduce_rank1_absf_keeps_the_bit_preserving_half_path(dtype):
     torch.mps.synchronize()
     assert out.cpu().float().item() == x.abs().float().max().item()
 
+
+# ---------------------------------------------------------------------------
+# A masked load's `other` inside the reduced chain.
+#
+# The chain path substituted the COMBINER IDENTITY for the whole chained value
+# of every masked-off lane, so an explicit `other` was silently dropped:
+# `tl.sum(tl.exp(tl.load(p, mask, other=1.0)))` returned the sum over the
+# unmasked lanes alone, where the interpreter oracle (and every other backend)
+# adds exp(1.0) once per masked-off lane. The `other`-less form was correct by
+# accident, and it was the only form the suite covered.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _masked_other_sum_exp_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr,
+                                 OTHER: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + o, mask=o < n_valid, other=OTHER)
+    tl.store(out_ptr, tl.sum(tl.exp(v), axis=0))
+
+
+@triton.jit
+def _masked_other_max_exp_kernel(x_ptr, out_ptr, n_valid, BLOCK: tl.constexpr,
+                                 OTHER: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + o, mask=o < n_valid, other=OTHER)
+    tl.store(out_ptr, tl.max(tl.exp(v), axis=0))
+
+
+@triton.jit
+def _masked_no_other_sum_exp_kernel(x_ptr, out_ptr, n_valid,
+                                    BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + o, mask=o < n_valid)
+    tl.store(out_ptr, tl.sum(tl.exp(v), axis=0))
+
+
+@pytest.mark.parametrize("other", [0.0, 1.0, 5.0, -3.0])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block,n_valid", [(128, 77), (64, 64), (256, 1)])
+def test_reduce_rank1_masked_other_survives_the_chain(block, n_valid, other,
+                                                      num_warps):
+    torch.manual_seed(block * 17 + n_valid)
+    x = torch.randn(block) * 0.5
+    full = x.clone()
+    full[n_valid:] = other
+    out = torch.zeros(1, device="mps")
+    _masked_other_sum_exp_kernel[(1,)](x.to("mps"), out, n_valid, BLOCK=block,
+                                       OTHER=other, num_warps=num_warps)
+    torch.mps.synchronize()
+    want = torch.exp(full.double()).sum().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-5)
+
+
+@pytest.mark.parametrize("other", [-3.0, 5.0])
+def test_reduce_rank1_masked_other_survives_the_chain_for_max(other):
+    """A max reduce reads the same lane; -inf as the dropped-in identity hid
+    the defect whenever `other` happened to be the smallest element."""
+    torch.manual_seed(int(other) + 91)
+    block, n_valid = 128, 77
+    x = torch.randn(block) * 0.5
+    full = x.clone()
+    full[n_valid:] = other
+    out = torch.zeros(1, device="mps")
+    _masked_other_max_exp_kernel[(1,)](x.to("mps"), out, n_valid, BLOCK=block,
+                                       OTHER=other, num_warps=1)
+    torch.mps.synchronize()
+    want = torch.exp(full.double()).max().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-5)
+
+
+def test_reduce_rank1_masked_without_other_contributes_the_identity():
+    """With no `other` Triton guarantees nothing about the masked-off value.
+    The backend keeps contributing the combiner identity, which is what makes a
+    masked reduce deterministic here; pin that so the `other` fix above cannot
+    quietly turn it into a fold over this backend's zero fill."""
+    torch.manual_seed(3)
+    block, n_valid = 128, 77
+    x = torch.randn(block) * 0.5
+    out = torch.zeros(1, device="mps")
+    _masked_no_other_sum_exp_kernel[(1,)](x.to("mps"), out, n_valid,
+                                          BLOCK=block, num_warps=1)
+    torch.mps.synchronize()
+    want = torch.exp(x[:n_valid].double()).sum().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-5)

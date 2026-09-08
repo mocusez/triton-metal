@@ -7,8 +7,9 @@
 // splat(rmax) → math.exp → tt.reduce addf.
 //
 // Wall 15: the Wall-11 chain re-emission now runs ONCE PER LOOP ITER
-// inside the scf.for body. Combiner-identity arith.select fires inside
-// the body after the chain, before the combine step.
+// inside the scf.for body. The masked lane's chained value folds straight into
+// the accumulator: `other` is -inf here, and exp(-inf - max) is already the
+// additive identity, so nothing has to be substituted for it.
 //
 // See the implementation notes AC8.
 
@@ -154,7 +155,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: scf.for {{.*}} step {{.*}} iter_args({{.*}}) -> (f32, f32, f32, f32, f32, f32, f32, f32)
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, subOp
 // CHECK: metal.unary_exp {{.*}}, expOp
-// CHECK: arith.select
+// The masked lane's `other` is -inf here, and exp(-inf - max) is already the
+// additive identity, so the chained value folds in directly. The identity
+// select is emitted only for a mask with no `other`; see
+// rank1_reduce_addf_block1024_chain_masked.mlir.
+// CHECK-NOT: arith.select
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
 // CHECK: scf.yield
 // CHECK: metal.threadgroup_alloca : !metal.memref<256 x f32>
