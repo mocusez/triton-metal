@@ -1741,6 +1741,33 @@ validation.
     Reproducers are now in `.omc/fuzz/`: `red_then_sort.py`, `hyper_reduce.py`,
     `sort_cell.py`, `topk_cell.py`. No compiler source changed in this entry.
 
+59. **Correction: the remaining defect is not a trip count.** Entry 58 read the
+    differing phase loop counts as segments of a reduced tile receiving the
+    original tile's count, and proposed deriving each segment's count from its
+    own operations. Checking that before building it showed the premise is
+    wrong on two grounds.
+
+    First, those counts are each exchange's own `src.elemPerThread`, and the
+    exchange plans take source and destination from the convert layout's actual
+    operand and result tensor types. They are per-exchange correct and should
+    differ once a reduce halves the tensor.
+
+    Second, and decisively: in the failing kernel the final store is
+    `v1[localTid]` at ONE element per thread, and the output reads
+    `[10, 10, 13, 13, 19, 19]`. Adjacent outputs being equal means two different
+    THREADS produced the same value, not one thread processing an element
+    twice. A trip count governs only the latter. The defect is a cross-lane
+    index collapse — a read or a compare-exchange partner index dropping a
+    `localTid` bit — and a per-segment trip count would have added machinery to
+    the phase splitter while leaving the wrong answer untouched.
+
+    Recorded rather than built. The minimal pair for whoever continues is
+    `.omc/fuzz/red_then_sort.py 64 1 5`, which is correct, against `... 64 1 4`,
+    which is wrong: same size, same warp count, same tile, only the reduced axis
+    differs. A bit-count sweep over the emitted reads separates data reads,
+    which carry all five `localTid` bits, from direction-flag reads, which carry
+    one and clamp to slot 1; the defect should show as a data read with too few.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
