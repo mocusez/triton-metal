@@ -80,6 +80,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       }
       metal.return
     }
+    metal.kernel sinks_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true] {
+    ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>):
+      metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, num_phases = 2 : i64, norm = 1 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
+      ^bb0(%score: f32, %row: si32, %key: si32, %phase: si32):
+        %scale = metal.constant 2.500000e-01 : f32
+        %scaled = metal.binary_exp %score, %scale, mulOp : (f32, f32) -> f32
+        metal.score_yield %scaled : f32
+      } bounds {
+      ^bb0(%blk: si32, %ph: si32, %m2: si32, %n2: si32):
+        // Phase 0 is the sink block [0, 8); phase 1 is the rest. The ranges are
+        // deliberately NOT block-aligned to the bn of 32, which is the case the
+        // simdgroup body used to decline.
+        %zero = metal.constant 0 : si32
+        %eight = metal.constant 8 : si32
+        %isSink = metal.binary_exp %ph, %zero, eqOp : (si32, si32) -> i1
+        %beg = arith.select %isSink, %zero, %eight : si32
+        %end = arith.select %isSink, %eight, %n2 : si32
+        metal.key_bounds_yield %beg, %end
+      }
+      metal.return
+    }
     metal.kernel softmax_kernel address_space_device [true, true, true, true, true, true, true, true, true, true, true] {
     ^bb0(%q: !metal.memref<? x f32>, %k: !metal.memref<? x f32>, %v: !metal.memref<? x f32>, %o: !metal.memref<? x f32>, %m: !metal.memref<? x ui32>, %n: !metal.memref<? x ui32>, %dh: !metal.memref<? x ui32>, %sq: !metal.memref<? x ui32>, %sk: !metal.memref<? x ui32>, %sv: !metal.memref<? x ui32>, %so: !metal.memref<? x ui32>):
       metal.fused_attention %q, %k, %v, %o, %m, %n, %dh strides %sq, %sk, %sv, %so {bm = 32 : i64, bn = 32 : i64, bd = 16 : i64, norm = 1 : i32} : !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x f32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32>, !metal.memref<? x ui32> {
@@ -203,6 +224,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: = _fa_a;
 // CHECK: exp2(
 // CHECK: _fa_obuf{{.*}} +=
+
+// --- sinks kernel: two key phases, the attention-sinks shape. Until
+// 2026-09-08 any `num_phases > 1` forced the scalar floor, on the theory that a
+// phase whose range is neither block-aligned nor block-sized would need its own
+// staging pass. It does not: the key-block loop already starts at each phase's
+// own `kbeg`, the staged K and V are guarded against `n`, and a key past `kend`
+// receives the softmax identity, so a ragged phase contributes nothing to
+// either matmul. The phases therefore compose here exactly as they always did
+// in the scalar body, against ONE running (accumulator, sum, max) state.
+//
+// The ranges below are deliberately not multiples of the bn of 32: phase 0 is
+// the eight-key sink block and phase 1 is everything after it.
+// CHECK-LABEL: kernel void sinks_kernel
+// The running state is initialized ONCE, before either phase.
+// CHECK: _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f;
+// CHECK: // --- key phase 0 ---
+// Each phase computes its own bounds from the region and sweeps its own key
+// blocks on the matrix unit; the names do not collide because each phase is
+// emitted inside its own block.
+// CHECK: uint _fa_kbeg =
+// CHECK: for (uint kb = _fa_kbeg; kb < _fa_kend; kb += 32u)
+// CHECK: simdgroup_multiply_accumulate
+// CHECK: // --- key phase 1 ---
+// CHECK: uint _fa_kbeg =
+// CHECK: for (uint kb = _fa_kbeg; kb < _fa_kend; kb += 32u)
+// CHECK: simdgroup_multiply_accumulate
+// The state is NOT re-initialized between phases.
+// CHECK-NOT: _fa_rmax[_fa_tid] = -INFINITY
 
 // --- softmax kernel: same op and same region, but its working set
 // (3*32*16 + 2*16*32 + 2*32*32 + 2*32 = 4672 floats) fits Apple's 8192, so the

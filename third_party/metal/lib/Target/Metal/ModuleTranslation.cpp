@@ -3105,8 +3105,11 @@ mlir::triton::metal::getFusedAttentionSchedule(FusedAttentionOp op) {
   const int64_t fullNeed =
       3 * BM * BD + 2 * BD * BN + 2 * BM * BN +
       (op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * BM : 0);
+  // Several key phases no longer force the scalar floor. Both simdgroup
+  // bodies now sweep one key-block loop per phase against the shared running
+  // state, the same composition the scalar body has always used.
   const bool mmaEnvelope = BM <= 64 && BM % 8 == 0 && BN % 8 == 0 &&
-                           BD % 8 == 0 && op.getNumPhases() == 1 &&
+                           BD % 8 == 0 &&
                            !::getenv("TRITON_METAL_FUSED_ATTN_SCALAR");
   if (!mmaEnvelope)
     return {/*useMma=*/false, /*chunked=*/false, /*numWarps=*/1,
@@ -3314,192 +3317,201 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   // The key range this program sweeps, computed by the op's key-bounds region.
   // A causal kernel's `min((pid+1)*bm, n)` is that region's yielded `end`.
-  auto [_fa_kbeg, _fa_kend] =
-      emitKeyBoundsRegion_(op, "(int)tgid.x", "0 /*phase*/", "(int)_fa_M",
-                           "(int)_fa_N", "  ");
-  os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
-     << "; kb += " << S(BN) << "u) {\n";
-  if (featureTiled) {
-    // V belongs to the y-selected output feature tile, while Q/K belong to a
-    // separate full-d_head reduction domain. Clear S once per key block, then
-    // accumulate one BD-wide Q/K chunk at a time so runtime d_head may exceed
-    // the statically-sized threadgroup tiles.
+  // One sweep per key phase, as in the chunked body and the scalar floor: the
+  // phases share the running state initialized above and run in source order,
+  // which an online softmax merges regardless of how the key set is split.
+  for (int64_t ph = 0; ph < op.getNumPhases(); ++ph) {
+    const std::string P = std::to_string(ph) + " /*phase*/";
+    os << "  // --- key phase " << ph << " ---\n";
+    os << "  {\n";
+    auto [_fa_kbeg, _fa_kend] =
+        emitKeyBoundsRegion_(op, "(int)tgid.x", P, "(int)_fa_M",
+                             "(int)_fa_N", "  ");
+    os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
+       << "; kb += " << S(BN) << "u) {\n";
+    if (featureTiled) {
+      // V belongs to the y-selected output feature tile, while Q/K belong to a
+      // separate full-d_head reduction domain. Clear S once per key block, then
+      // accumulate one BD-wide Q/K chunk at a time so runtime d_head may exceed
+      // the statically-sized threadgroup tiles.
+      os << "    if (_fa_active) {\n";
+      os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+         << "u; c += " << threadsPerGroup << "u) {\n";
+      os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
+         << "u; uint kk = kb + key;\n";
+      os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_out_d) ? " << V
+         << "[_fa_vbase + kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+      os << "      }\n";
+      os << "    }\n";
+      os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << "    // ---- feature-tiled QK full-dhead sweep ----\n";
+      os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(BD)
+         << "u) {\n";
+      os << "      if (_fa_active) {\n";
+      os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
+         << "u; c += " << threadsPerGroup << "u) {\n";
+      os << "          uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
+         << "u; uint row = _fa_rowoff + q;\n";
+      os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
+         << Q << "[_fa_qbase + row * _fa_sq + _fa_dc + d] : 0.0f;\n";
+      os << "        }\n";
+      os << "        for (uint c = _fa_tid; c < " << S(SZ_KTV)
+         << "u; c += " << threadsPerGroup << "u) {\n";
+      os << "          uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
+         << "u; uint kk = kb + key;\n";
+      os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
+         << K << "[_fa_kbase + (_fa_dc + d) * _fa_sk + kk] : 0.0f;\n";
+      os << "        }\n";
+      os << "      }\n";
+      os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << "      if (_fa_active) {\n";
+      os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+         << "u; mi += " << numWarps << "u)\n";
+      os << "        for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+      // The zero constructor and in-place MAC are both required on Apple family
+      // 9. Only later chunks reload the partial score tile.
+      os << "          simdgroup_float8x8 acc(0.0f);\n";
+      os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
+            "&_fa_sbuf[(mi*8u)*"
+         << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
+      os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+      os << "            simdgroup_float8x8 a, b;\n";
+      os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
+         << "u + ki*8u], " << S(BD) << ");\n";
+      os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
+         << "u + ni*8u], " << S(BN) << ");\n";
+      os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+      os << "          }\n";
+      os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
+         << "u + ni*8u], " << S(BN) << ");\n";
+      os << "        }\n";
+      os << "      }\n";
+      os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << "    }\n";
+    } else {
+      // Stage K^T and V for this key block.
+      os << "    if (_fa_active) {\n";
+      os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+         << "u; c += " << threadsPerGroup << "u) {\n";
+      os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
+         << "u; uint kk = kb + key;\n";
+      os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
+         << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "")
+         << "kk * _fa_sk + _fa_col + d] : 0.0f;\n";
+      os << "      }\n";
+      os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
+         << "u; c += " << threadsPerGroup << "u) {\n";
+      os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
+         << "u; uint kk = kb + key;\n";
+      os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
+         << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
+         << "kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+      os << "      }\n";
+      os << "    }\n";
+      os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      // Dot 1: S = Q @ K^T, straight into the staged S tile.
+      os << "    if (_fa_active) {\n";
+      os << "      for (uint mi = _fa_warp; mi < " << S(mT)
+         << "u; mi += " << numWarps << "u)\n";
+      os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+      os << "        simdgroup_float8x8 acc(0.0f);\n";
+      os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+      os << "          simdgroup_float8x8 a, b;\n";
+      os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
+         << "u + ki*8u], " << S(BD) << ");\n";
+      os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
+         << "u + ni*8u], " << S(BN) << ");\n";
+      os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+      os << "        }\n";
+      os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
+         << "u + ni*8u], " << S(BN) << ");\n";
+      os << "      }\n";
+      os << "    }\n";
+      os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    }
+    // The score transform, one query row per cooperative thread. Emitted ONCE,
+    // writing its
+    // result back over the S tile, so the softmax passes below re-read it instead
+    // of re-evaluating the region.
     os << "    if (_fa_active) {\n";
-    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
-       << "u; c += " << threadsPerGroup << "u) {\n";
-    os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
-       << "u; uint kk = kb + key;\n";
-    os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_out_d) ? " << V
-       << "[_fa_vbase + kk * _fa_sv + _fa_col + d] : 0.0f;\n";
-    os << "      }\n";
-    os << "    }\n";
-    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    os << "    // ---- feature-tiled QK full-dhead sweep ----\n";
-    os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(BD)
-       << "u) {\n";
-    os << "      if (_fa_active) {\n";
-    os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
-       << "u; c += " << threadsPerGroup << "u) {\n";
-    os << "          uint q = c / " << S(BD) << "u; uint d = c % " << S(BD)
-       << "u; uint row = _fa_rowoff + q;\n";
-    os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
-       << Q << "[_fa_qbase + row * _fa_sq + _fa_dc + d] : 0.0f;\n";
-    os << "        }\n";
-    os << "        for (uint c = _fa_tid; c < " << S(SZ_KTV)
-       << "u; c += " << threadsPerGroup << "u) {\n";
-    os << "          uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
-       << "u; uint kk = kb + key;\n";
-    os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
-       << K << "[_fa_kbase + (_fa_dc + d) * _fa_sk + kk] : 0.0f;\n";
-    os << "        }\n";
-    os << "      }\n";
-    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    os << "      if (_fa_active) {\n";
-    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-       << "u; mi += " << numWarps << "u)\n";
-    os << "        for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
-    // The zero constructor and in-place MAC are both required on Apple family
-    // 9. Only later chunks reload the partial score tile.
-    os << "          simdgroup_float8x8 acc(0.0f);\n";
-    os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
-          "&_fa_sbuf[(mi*8u)*"
-       << S(BN) << "u + ni*8u], " << S(BN) << ");\n";
-    os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
-    os << "            simdgroup_float8x8 a, b;\n";
-    os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
-       << "u + ki*8u], " << S(BD) << ");\n";
-    os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
-       << "u + ni*8u], " << S(BN) << ");\n";
-    os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+    os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
+    // `q < BM` FIRST: every per-row buffer is sized by BM and `row < M` does not
+    // imply it when BM < 32.
+    os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
+    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+    os << "          uint _fa_key = kb + kk;\n";
+    os << "          if (_fa_key < " << _fa_kend << ") {\n";
+    {
+      std::string sc = "_fa_sbuf[q*" + S(BN) + "u + kk]";
+      std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
+                                       P, "            ");
+      os << "            _fa_pbuf[q*" << S(BN) << "u + kk] = " << w << ";\n";
+    }
+    os << "          } else {\n";
+    // Out-of-range keys must not contribute: a zero weight under norm=none, and a
+    // logit of -inf (which exponentiates to zero) under the online softmax.
+    os << "            _fa_pbuf[q*" << S(BN)
+       << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
     os << "          }\n";
-    os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
-       << "u + ni*8u], " << S(BN) << ");\n";
     os << "        }\n";
-    os << "      }\n";
-    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    os << "    }\n";
-  } else {
-    // Stage K^T and V for this key block.
-    os << "    if (_fa_active) {\n";
-    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
-       << "u; c += " << threadsPerGroup << "u) {\n";
-    os << "        uint d = c / " << S(BN) << "u; uint key = c % " << S(BN)
-       << "u; uint kk = kb + key;\n";
-    os << "        _fa_ktbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << K
-       << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "")
-       << "kk * _fa_sk + _fa_col + d] : 0.0f;\n";
-    os << "      }\n";
-    os << "      for (uint c = _fa_tid; c < " << S(SZ_KTV)
-       << "u; c += " << threadsPerGroup << "u) {\n";
-    os << "        uint key = c / " << S(BD) << "u; uint d = c % " << S(BD)
-       << "u; uint kk = kb + key;\n";
-    os << "        _fa_vbuf[c] = (kk < _fa_N && d < _fa_dh) ? " << V
-       << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
-       << "kk * _fa_sv + _fa_col + d] : 0.0f;\n";
+    if (softmax) {
+      os << "        float m_cur = -INFINITY;\n";
+      os << "        for (uint kk = 0; kk < " << S(BN)
+         << "u; ++kk) m_cur = max(m_cur, _fa_pbuf[q*" << S(BN) << "u + kk]);\n";
+      os << "        float m_old = _fa_rmax[q];\n";
+      os << "        float m_new = max(m_old, m_cur);\n";
+      // Both guards keep -inf minus -inf (= NaN) out of the running state: the
+      // first for a block where every key was masked, the second per key.
+      os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
+         << "(m_old - m_new);\n";
+      os << "        float denom = 0.0f;\n";
+      os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+      os << "          float l = _fa_pbuf[q*" << S(BN) << "u + kk];\n";
+      os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
+         << E << "(l - m_new);\n";
+      os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
+      os << "        }\n";
+      os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
+      os << "        _fa_rmax[q] = m_new;\n";
+      if (featureTiled)
+        os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
+           << S(BD) << "u + d] *= scaler;\n";
+      else
+        os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
+           << S(BD) << "u + d] *= scaler;\n";
+    }
+    os << "      } else if (q < " << S(BM) << "u) {\n";
+    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*"
+       << S(BN) << "u + kk] = 0.0f;\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    // Dot 1: S = Q @ K^T, straight into the staged S tile.
+    // Dot 2: O_tile = P @ V.
     os << "    if (_fa_active) {\n";
     os << "      for (uint mi = _fa_warp; mi < " << S(mT)
        << "u; mi += " << numWarps << "u)\n";
-    os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+    os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
     os << "        simdgroup_float8x8 acc(0.0f);\n";
-    os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+    os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
     os << "          simdgroup_float8x8 a, b;\n";
-    os << "          simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(BD)
-       << "u + ki*8u], " << S(BD) << ");\n";
-    os << "          simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BN)
-       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "          simdgroup_load(a, &_fa_pbuf[(mi*8u)*" << S(BN)
+       << "u + ki*8u], " << S(BN) << ");\n";
+    os << "          simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BD)
+       << "u + di*8u], " << S(BD) << ");\n";
     os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
     os << "        }\n";
-    os << "        simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BN)
-       << "u + ni*8u], " << S(BN) << ");\n";
+    os << "        simdgroup_store(acc, &_fa_otbuf[(mi*8u)*" << S(BD)
+       << "u + di*8u], " << S(BD) << ");\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "    if (_fa_active) { for (uint c = _fa_tid; c < " << S(SZ_Q)
+       << "u; c += " << threadsPerGroup
+       << "u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
+    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "  }\n";
+    os << "  }\n";
   }
-  // The score transform, one query row per cooperative thread. Emitted ONCE,
-  // writing its
-  // result back over the S tile, so the softmax passes below re-read it instead
-  // of re-evaluating the region.
-  os << "    if (_fa_active) {\n";
-  os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-  // `q < BM` FIRST: every per-row buffer is sized by BM and `row < M` does not
-  // imply it when BM < 32.
-  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
-  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
-  os << "          uint _fa_key = kb + kk;\n";
-  os << "          if (_fa_key < " << _fa_kend << ") {\n";
-  {
-    std::string sc = "_fa_sbuf[q*" + S(BN) + "u + kk]";
-    std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
-                                     "0 /*phase*/", "            ");
-    os << "            _fa_pbuf[q*" << S(BN) << "u + kk] = " << w << ";\n";
-  }
-  os << "          } else {\n";
-  // Out-of-range keys must not contribute: a zero weight under norm=none, and a
-  // logit of -inf (which exponentiates to zero) under the online softmax.
-  os << "            _fa_pbuf[q*" << S(BN)
-     << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
-  os << "          }\n";
-  os << "        }\n";
-  if (softmax) {
-    os << "        float m_cur = -INFINITY;\n";
-    os << "        for (uint kk = 0; kk < " << S(BN)
-       << "u; ++kk) m_cur = max(m_cur, _fa_pbuf[q*" << S(BN) << "u + kk]);\n";
-    os << "        float m_old = _fa_rmax[q];\n";
-    os << "        float m_new = max(m_old, m_cur);\n";
-    // Both guards keep -inf minus -inf (= NaN) out of the running state: the
-    // first for a block where every key was masked, the second per key.
-    os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
-       << "(m_old - m_new);\n";
-    os << "        float denom = 0.0f;\n";
-    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
-    os << "          float l = _fa_pbuf[q*" << S(BN) << "u + kk];\n";
-    os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
-       << E << "(l - m_new);\n";
-    os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
-    os << "        }\n";
-    os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
-    os << "        _fa_rmax[q] = m_new;\n";
-    if (featureTiled)
-      os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
-         << S(BD) << "u + d] *= scaler;\n";
-    else
-      os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
-         << S(BD) << "u + d] *= scaler;\n";
-  }
-  os << "      } else if (q < " << S(BM) << "u) {\n";
-  os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*"
-     << S(BN) << "u + kk] = 0.0f;\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  // Dot 2: O_tile = P @ V.
-  os << "    if (_fa_active) {\n";
-  os << "      for (uint mi = _fa_warp; mi < " << S(mT)
-     << "u; mi += " << numWarps << "u)\n";
-  os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
-  os << "        simdgroup_float8x8 acc(0.0f);\n";
-  os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
-  os << "          simdgroup_float8x8 a, b;\n";
-  os << "          simdgroup_load(a, &_fa_pbuf[(mi*8u)*" << S(BN)
-     << "u + ki*8u], " << S(BN) << ");\n";
-  os << "          simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BD)
-     << "u + di*8u], " << S(BD) << ");\n";
-  os << "          simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "        }\n";
-  os << "        simdgroup_store(acc, &_fa_otbuf[(mi*8u)*" << S(BD)
-     << "u + di*8u], " << S(BD) << ");\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "    if (_fa_active) { for (uint c = _fa_tid; c < " << S(SZ_Q)
-     << "u; c += " << threadsPerGroup
-     << "u) _fa_obuf[c] += _fa_otbuf[c]; }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "  }\n";
   os << "  if (_fa_active) {\n";
   os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
   os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
@@ -3675,155 +3687,173 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
   os << "  }\n";
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
-  auto [_fa_kbeg, _fa_kend] =
-      emitKeyBoundsRegion_(op, "(int)tgid.x", "0 /*phase*/", "(int)_fa_M",
-                           "(int)_fa_N", "  ");
-  os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
-     << "; kb += " << S(BK) << "u) {\n";
-  os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(DK)
-     << "u) {\n";
-  os << "      if (_fa_active) {\n";
-  os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
-     << "u; c += " << threadsPerGroup << "u) {\n";
-  os << "          uint q = c / " << S(DK) << "u; uint d = c % " << S(DK)
-     << "u; uint row = _fa_rowoff + q;\n";
-  os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
-     << Q << "[_fa_qbase + " << (independentHeads ? "_fa_qhoff + " : "")
-     << "row * _fa_sq + ";
-  if (featureTiled)
-    os << "_fa_dc + d";
-  else
-    os << "_fa_col + _fa_dc + d";
-  os << "] : 0.0f;\n";
-  os << "        }\n";
-  os << "        for (uint c = _fa_tid; c < " << S(SZ_KT)
-     << "u; c += " << threadsPerGroup << "u) {\n";
-  os << "          uint d = c / " << S(BK) << "u; uint key = c % " << S(BK)
-     << "u; uint kk = kb + key;\n";
-  os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
-     << K << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "");
-  if (kFeatureMajor)
-    os << "(_fa_dc + d) * _fa_sk + kk";
-  else
-    os << "kk * _fa_sk + _fa_col + _fa_dc + d";
-  os << "] : 0.0f;\n";
-  os << "        }\n";
-  os << "      }\n";
-  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "      if (_fa_active) {\n";
-  os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-     << "u; mi += " << numWarps << "u)\n";
-  os << "        for (uint ni = 0; ni < " << S(kT) << "u; ++ni) {\n";
-  os << "          simdgroup_float8x8 acc(0.0f);\n";
-  os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
-        "&_fa_sbuf[(mi*8u)*"
-     << S(BK) << "u + ni*8u], " << S(BK) << ");\n";
-  os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
-  os << "            simdgroup_float8x8 a, b;\n";
-  os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(DK)
-     << "u + ki*8u], " << S(DK) << ");\n";
-  os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BK)
-     << "u + ni*8u], " << S(BK) << ");\n";
-  os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "          }\n";
-  os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BK)
-     << "u + ni*8u], " << S(BK) << ");\n";
-  os << "        }\n";
-  os << "      }\n";
-  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "    }\n";
-
-  os << "    if (_fa_active) {\n";
-  os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-  os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
-  os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
-  os << "          uint _fa_key = kb + kk;\n";
-  os << "          if (_fa_key < " << _fa_kend << ") {\n";
-  {
-    std::string sc = "_fa_sbuf[q*" + S(BK) + "u + kk]";
-    std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
-                                     "0 /*phase*/", "            ");
-    os << "            _fa_sbuf[q*" << S(BK) << "u + kk] = " << w << ";\n";
-  }
-  os << "          } else {\n";
-  os << "            _fa_sbuf[q*" << S(BK)
-     << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
-  os << "          }\n";
-  os << "        }\n";
-  if (softmax) {
-    os << "        float m_cur = -INFINITY;\n";
-    os << "        for (uint kk = 0; kk < " << S(BK)
-       << "u; ++kk) m_cur = max(m_cur, _fa_sbuf[q*" << S(BK)
-       << "u + kk]);\n";
-    os << "        float m_old = _fa_rmax[q];\n";
-    os << "        float m_new = max(m_old, m_cur);\n";
-    os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
-       << "(m_old - m_new);\n";
-    os << "        float denom = 0.0f;\n";
-    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
-    os << "          float l = _fa_sbuf[q*" << S(BK) << "u + kk];\n";
-    os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
-       << E << "(l - m_new);\n";
-    os << "          _fa_sbuf[q*" << S(BK) << "u + kk] = p; denom += p;\n";
-    os << "        }\n";
-    os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
-    os << "        _fa_rmax[q] = m_new;\n";
+  // One sweep per key phase, unrolled at emit time because `num_phases` is a
+  // compile-time attribute. The phases share the running (accumulator, sum,
+  // max) state initialized above and run in source order, exactly as the scalar
+  // body does: an online softmax merges any partition of the key set, so a sink
+  // block followed by a sliding window gives the same answer as one sweep over
+  // their union.
+  //
+  // A phase whose range is neither block-aligned nor block-sized needs no
+  // staging pass of its own. `kb` starts at that phase's own `kbeg`, the staged
+  // K and V are already guarded against `_fa_N`, and a key past `kend` writes
+  // the softmax identity into the score tile, so the ragged head and tail of
+  // every phase contribute nothing to either matmul.
+  for (int64_t ph = 0; ph < op.getNumPhases(); ++ph) {
+    const std::string P = std::to_string(ph) + " /*phase*/";
+    os << "  // --- key phase " << ph << " ---\n";
+    os << "  {\n";
+    auto [_fa_kbeg, _fa_kend] =
+        emitKeyBoundsRegion_(op, "(int)tgid.x", P, "(int)_fa_M",
+                             "(int)_fa_N", "  ");
+    os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
+       << "; kb += " << S(BK) << "u) {\n";
+    os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(DK)
+       << "u) {\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint c = _fa_tid; c < " << S(SZ_Q)
+       << "u; c += " << threadsPerGroup << "u) {\n";
+    os << "          uint q = c / " << S(DK) << "u; uint d = c % " << S(DK)
+       << "u; uint row = _fa_rowoff + q;\n";
+    os << "          _fa_qbuf[c] = (row < _fa_M && _fa_dc + d < _fa_dh) ? "
+       << Q << "[_fa_qbase + " << (independentHeads ? "_fa_qhoff + " : "")
+       << "row * _fa_sq + ";
     if (featureTiled)
-      os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
-         << S(BD) << "u + d] *= scaler;\n";
+      os << "_fa_dc + d";
     else
-      os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
-         << S(BD) << "u + d] *= scaler;\n";
-  }
-  os << "      } else if (q < " << S(BM) << "u) {\n";
-  os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) _fa_sbuf[q*"
-     << S(BK) << "u + kk] = 0.0f;\n";
-  os << "      }\n";
-  os << "    }\n";
-  os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+      os << "_fa_col + _fa_dc + d";
+    os << "] : 0.0f;\n";
+    os << "        }\n";
+    os << "        for (uint c = _fa_tid; c < " << S(SZ_KT)
+       << "u; c += " << threadsPerGroup << "u) {\n";
+    os << "          uint d = c / " << S(BK) << "u; uint key = c % " << S(BK)
+       << "u; uint kk = kb + key;\n";
+    os << "          _fa_ktbuf[c] = (kk < _fa_N && _fa_dc + d < _fa_dh) ? "
+       << K << "[_fa_kbase + " << (independentHeads ? "_fa_khoff + " : "");
+    if (kFeatureMajor)
+      os << "(_fa_dc + d) * _fa_sk + kk";
+    else
+      os << "kk * _fa_sk + _fa_col + _fa_dc + d";
+    os << "] : 0.0f;\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+       << "u; mi += " << numWarps << "u)\n";
+    os << "        for (uint ni = 0; ni < " << S(kT) << "u; ++ni) {\n";
+    os << "          simdgroup_float8x8 acc(0.0f);\n";
+    os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
+          "&_fa_sbuf[(mi*8u)*"
+       << S(BK) << "u + ni*8u], " << S(BK) << ");\n";
+    os << "          for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
+    os << "            simdgroup_float8x8 a, b;\n";
+    os << "            simdgroup_load(a, &_fa_qbuf[(mi*8u)*" << S(DK)
+       << "u + ki*8u], " << S(DK) << ");\n";
+    os << "            simdgroup_load(b, &_fa_ktbuf[(ki*8u)*" << S(BK)
+       << "u + ni*8u], " << S(BK) << ");\n";
+    os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+    os << "          }\n";
+    os << "          simdgroup_store(acc, &_fa_sbuf[(mi*8u)*" << S(BK)
+       << "u + ni*8u], " << S(BK) << ");\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "    }\n";
 
-  os << "    for (uint _fa_oc = 0u; _fa_oc < " << S(BD) << "u; _fa_oc += "
-     << S(BO) << "u) {\n";
-  os << "      if (_fa_active) {\n";
-  os << "        for (uint c = _fa_tid; c < " << S(SZ_V)
-     << "u; c += " << threadsPerGroup << "u) {\n";
-  os << "          uint key = c / " << S(BO) << "u; uint d = c % " << S(BO)
-     << "u; uint kk = kb + key; uint od = _fa_oc + d;\n";
-  if (featureTiled)
-    os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_out_d) ? " << V
-       << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
-       << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
-  else
-    os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_dh) ? "
-       << V << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
-       << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
-  os << "        }\n";
-  os << "      }\n";
-  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "      if (_fa_active) {\n";
-  os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-     << "u; mi += " << numWarps << "u)\n";
-  os << "        for (uint oi = 0; oi < " << S(oT) << "u; ++oi) {\n";
-  os << "          if (_fa_oc + oi*8u < " << S(BD) << "u) {\n";
-  os << "          simdgroup_float8x8 acc;\n";
-  os << "          simdgroup_load(acc, &_fa_obuf[(mi*8u)*" << S(BD)
-     << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
-  os << "          for (uint ki = 0; ki < " << S(kT) << "u; ++ki) {\n";
-  os << "            simdgroup_float8x8 a, b;\n";
-  os << "            simdgroup_load(a, &_fa_sbuf[(mi*8u)*" << S(BK)
-     << "u + ki*8u], " << S(BK) << ");\n";
-  os << "            simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BO)
-     << "u + oi*8u], " << S(BO) << ");\n";
-  os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
-  os << "          }\n";
-  os << "          simdgroup_store(acc, &_fa_obuf[(mi*8u)*" << S(BD)
-     << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
-  os << "          }\n";
-  os << "        }\n";
-  os << "      }\n";
-  os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-  os << "    }\n";
-  os << "  }\n";
+    os << "    if (_fa_active) {\n";
+    os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
+    os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
+    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+    os << "          uint _fa_key = kb + kk;\n";
+    os << "          if (_fa_key < " << _fa_kend << ") {\n";
+    {
+      std::string sc = "_fa_sbuf[q*" + S(BK) + "u + kk]";
+      std::string w = emitScoreRegion_(op, sc, "(int)row", "(int)_fa_key",
+                                       P, "            ");
+      os << "            _fa_sbuf[q*" << S(BK) << "u + kk] = " << w << ";\n";
+    }
+    os << "          } else {\n";
+    os << "            _fa_sbuf[q*" << S(BK)
+       << "u + kk] = " << (softmax ? "-INFINITY" : "0.0f") << ";\n";
+    os << "          }\n";
+    os << "        }\n";
+    if (softmax) {
+      os << "        float m_cur = -INFINITY;\n";
+      os << "        for (uint kk = 0; kk < " << S(BK)
+         << "u; ++kk) m_cur = max(m_cur, _fa_sbuf[q*" << S(BK)
+         << "u + kk]);\n";
+      os << "        float m_old = _fa_rmax[q];\n";
+      os << "        float m_new = max(m_old, m_cur);\n";
+      os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
+         << "(m_old - m_new);\n";
+      os << "        float denom = 0.0f;\n";
+      os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+      os << "          float l = _fa_sbuf[q*" << S(BK) << "u + kk];\n";
+      os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
+         << E << "(l - m_new);\n";
+      os << "          _fa_sbuf[q*" << S(BK) << "u + kk] = p; denom += p;\n";
+      os << "        }\n";
+      os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
+      os << "        _fa_rmax[q] = m_new;\n";
+      if (featureTiled)
+        os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
+           << S(BD) << "u + d] *= scaler;\n";
+      else
+        os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
+           << S(BD) << "u + d] *= scaler;\n";
+    }
+    os << "      } else if (q < " << S(BM) << "u) {\n";
+    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) _fa_sbuf[q*"
+       << S(BK) << "u + kk] = 0.0f;\n";
+    os << "      }\n";
+    os << "    }\n";
+    os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+
+    os << "    for (uint _fa_oc = 0u; _fa_oc < " << S(BD) << "u; _fa_oc += "
+       << S(BO) << "u) {\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint c = _fa_tid; c < " << S(SZ_V)
+       << "u; c += " << threadsPerGroup << "u) {\n";
+    os << "          uint key = c / " << S(BO) << "u; uint d = c % " << S(BO)
+       << "u; uint kk = kb + key; uint od = _fa_oc + d;\n";
+    if (featureTiled)
+      os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_out_d) ? " << V
+         << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
+         << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
+    else
+      os << "          _fa_vbuf[c] = (kk < _fa_N && od < _fa_dh) ? "
+         << V << "[_fa_vbase + " << (independentHeads ? "_fa_vhoff + " : "")
+         << "kk * _fa_sv + _fa_col + od] : 0.0f;\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "      if (_fa_active) {\n";
+    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
+       << "u; mi += " << numWarps << "u)\n";
+    os << "        for (uint oi = 0; oi < " << S(oT) << "u; ++oi) {\n";
+    os << "          if (_fa_oc + oi*8u < " << S(BD) << "u) {\n";
+    os << "          simdgroup_float8x8 acc;\n";
+    os << "          simdgroup_load(acc, &_fa_obuf[(mi*8u)*" << S(BD)
+       << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
+    os << "          for (uint ki = 0; ki < " << S(kT) << "u; ++ki) {\n";
+    os << "            simdgroup_float8x8 a, b;\n";
+    os << "            simdgroup_load(a, &_fa_sbuf[(mi*8u)*" << S(BK)
+       << "u + ki*8u], " << S(BK) << ");\n";
+    os << "            simdgroup_load(b, &_fa_vbuf[(ki*8u)*" << S(BO)
+       << "u + oi*8u], " << S(BO) << ");\n";
+    os << "            simdgroup_multiply_accumulate(acc, a, b, acc);\n";
+    os << "          }\n";
+    os << "          simdgroup_store(acc, &_fa_obuf[(mi*8u)*" << S(BD)
+       << "u + _fa_oc + oi*8u], " << S(BD) << ");\n";
+    os << "          }\n";
+    os << "        }\n";
+    os << "      }\n";
+    os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "    }\n";
+    os << "  }\n";
+    os << "  }\n";
+  }
   os << "  if (_fa_active) {\n";
   os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
   os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
