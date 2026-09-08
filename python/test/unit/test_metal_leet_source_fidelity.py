@@ -37,6 +37,10 @@ def _source_path(manifest, relative):
     return manifest.get("source_name_overrides", {}).get(relative, relative)
 
 
+def _rstrip_lines(data: bytes) -> bytes:
+    return b"\n".join(line.rstrip() for line in data.split(b"\n"))
+
+
 def _literal_assignment(tree, name):
     for node in tree.body:
         if not isinstance(node, ast.Assign):
@@ -158,9 +162,29 @@ def test_source_fidelity_matches_pinned_checkout_when_available():
     for relative in manifest["fixture_only"]:
         assert not (SOURCE / relative).exists()
 
+    # This repo's own pre-commit `trailing-whitespace` hook rewrites files
+    # under `python/`, fixtures included, so a verbatim copy of an upstream
+    # file that happens to carry trailing whitespace cannot survive here byte
+    # for byte. Excluding the fixture tree from that hook would mean editing
+    # `.pre-commit-config.yaml`, which upstream owns and this fork already has
+    # a merge backlog against. Name the affected files here instead. They still
+    # have to match line for line after the strip, and they still have to
+    # differ before it, so a real edit cannot be parked in this list and a
+    # stale entry fails rather than passing quietly.
+    stripped = set(manifest.get("trailing_whitespace_stripped", []))
+    assert stripped <= set(manifest["classifications"]["verbatim_kernel"])
     for relative in manifest["classifications"]["verbatim_kernel"]:
         source = SOURCE / _source_path(manifest, relative)
-        assert (FIXTURES / relative).read_bytes() == source.read_bytes(), relative
+        fixture_bytes = (FIXTURES / relative).read_bytes()
+        source_bytes = source.read_bytes()
+        if relative in stripped:
+            assert fixture_bytes != source_bytes, (
+                f"{relative} is byte-identical; drop it from "
+                "trailing_whitespace_stripped")
+            assert _rstrip_lines(fixture_bytes) == _rstrip_lines(source_bytes), (
+                relative)
+        else:
+            assert fixture_bytes == source_bytes, relative
 
     for relative in manifest["classifications"]["host_only_adaptation"]:
         source = SOURCE / _source_path(manifest, relative)

@@ -17,6 +17,9 @@
     "tutorials_python/01-vector-add.py",
     "tutorials_python/02-fused-softmax.py"
   ],
+  "trailing_whitespace_stripped": [
+    "easy-swish-gated_linear_unit.py"
+  ],
   "classifications": {
     "verbatim_kernel": [
       "easy-matrix-addition.py",
