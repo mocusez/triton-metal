@@ -21011,9 +21011,42 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
 
   if (!forOp.getResult(0).hasOneUse())
     return mlir::failure();
-  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
-      *forOp.getResult(0).getUsers().begin());
+  // A matmul that writes a narrower element than its f32 accumulator puts one
+  // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
+  // `arith.truncf`, and the layout convert that an f32 accumulator loses to an
+  // earlier pass survives here because it hangs off the truncation rather than
+  // off the loop. Step through both. The accumulator stays f32 in the simdgroup
+  // matrices either way; only the element written to the destination narrows,
+  // which the masked store emitter does with an explicit cast out of its f32
+  // staging slot. Without this the early scalar-dot fallback claims every real
+  // f16 matmul: measured medians of 187 against 713 billion floating-point
+  // operations a second on a 1024-cubed product.
+  mlir::Operation *accUser = *forOp.getResult(0).getUsers().begin();
+  mlir::arith::TruncFOp narrowing;
+  mlir::triton::gpu::ConvertLayoutOp narrowCvt;
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
+    if (!trunc.getResult().hasOneUse())
+      return mlir::failure();
+    narrowing = trunc;
+    accUser = *trunc.getResult().getUsers().begin();
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(accUser)) {
+      if (!cvt.getResult().hasOneUse())
+        return mlir::failure();
+      narrowCvt = cvt;
+      accUser = *cvt.getResult().getUsers().begin();
+    }
+  }
+  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(accUser);
   if (!store)
+    return mlir::failure();
+  // A narrowed store is only emittable through the MASKED store path, which
+  // goes via an f32 threadgroup slot and casts on the element write. The
+  // unmasked path stores the simdgroup matrix straight into the destination
+  // buffer, and Metal has no overload writing an f32 matrix into a half
+  // buffer — accepting narrowing unconditionally failed to BUILD on 24 of 80
+  // sweep cells, every one of them unmasked. An unmasked narrowed store
+  // therefore stays with the scalar fallback, exactly as before.
+  if (narrowing && !store.getMask())
     return mlir::failure();
   MaskExtents storeExt;
   if (store.getMask()) {
@@ -21063,7 +21096,14 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
   mlir::Value aBuf = bridgePtrToMemref(builder, loc, aPtr, elemTy);
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
-  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
+  // The destination carries the STORE's element type, narrower than the
+  // accumulator whenever a convert was stepped through above.
+  mlir::Type cElemTy = elemTy;
+  if (narrowing)
+    if (auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(
+            store.getValue().getType()))
+      cElemTy = vTy.getElementType();
+  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, cElemTy);
 
   auto toUi32 = [&](mlir::OpBuilder &b, mlir::Value v) -> mlir::Value {
     if (v.getType() == ui32)
@@ -21196,6 +21236,10 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
                                        : mlir::ValueRange{});
 
   store.erase();
+  if (narrowCvt)
+    narrowCvt.erase();
+  if (narrowing)
+    narrowing.erase();
   forOp.erase();
   return mlir::success();
 }
@@ -24352,10 +24396,35 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   mlir::RankedTensorType resultTensorTy;
   sdDetectResultCvt(loopRes, loopResTy, resCvt, replaceTarget, resultTensorTy);
   mlir::Value afterRes = resCvt ? resCvt.getResult() : loopRes;
-  if (!allowStoreConsumer &&
-      llvm::any_of(afterRes.getUsers(), [](mlir::Operation *u) {
-        return mlir::isa<mlir::triton::StoreOp>(u);
-      }))
+  // A store reached through ONE narrowing convert is still a bare-store loop:
+  // `acc.to(tl.float16)` before `tt.store` is what every f16 matmul writes, and
+  // the accumulator is f32 on both sides of it. Not stepping through the
+  // convert here meant this early pass claimed every f16 matmul and the
+  // SIMD-group recompute path never saw one, which measured 180 against 778
+  // billion operations a second on the same shape.
+  auto reachesStore = [](mlir::Value v) {
+    return llvm::any_of(v.getUsers(), [](mlir::Operation *u) {
+      if (mlir::isa<mlir::triton::StoreOp>(u))
+        return true;
+      auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(u);
+      if (!trunc)
+        return false;
+      // The layout convert that `preprocessDotCvtChains` strips for an f32
+      // accumulator survives here, because for a narrowed store it hangs off
+      // the convert's result rather than the loop's.
+      return llvm::any_of(
+          trunc.getResult().getUsers(), [](mlir::Operation *w) {
+            if (mlir::isa<mlir::triton::StoreOp>(w))
+              return true;
+            auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(w);
+            return cvt && llvm::any_of(cvt.getResult().getUsers(),
+                                       [](mlir::Operation *x) {
+                                         return mlir::isa<mlir::triton::StoreOp>(x);
+                                       });
+          });
+    });
+  };
+  if (!allowStoreConsumer && reachesStore(afterRes))
     return mlir::failure();
 
   mlir::Value cInit = forOp.getInitArgs()[0];

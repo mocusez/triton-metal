@@ -1879,7 +1879,19 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
         translateVarName(op.getMemref());
         _output << "[gi * ";
         translateValue(op.getStride().getDefiningOp());
-        _output << " + gj] = _sgstore_shared";
+        _output << " + gj] = ";
+        // The staging slot carries the ACCUMULATOR's type; the destination may
+        // be narrower when a matmul writes f16 or bf16 out of an f32
+        // accumulator. Cast explicitly rather than relying on the assignment:
+        // MSL narrows float to half implicitly but refuses float to bfloat
+        // outright. The cast is the identity when the types already agree.
+        _output << "("
+                << typeToString(
+                       llvm::cast<mlir::triton::metal::MetalMemRefType>(
+                           op.getMemref().getType())
+                           .getType())
+                << ")";
+        _output << "_sgstore_shared";
         warpDim();
         _output << "[c]";
         printDelim();
