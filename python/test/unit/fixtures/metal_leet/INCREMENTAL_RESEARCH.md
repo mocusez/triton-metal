@@ -1869,6 +1869,43 @@ validation.
     Something is capped at four elements while the store addresses
     `localTid * E + iv` with E of eight or more.
 
+63. **`tl.sort` above four elements per thread: diagnosis closed.** Two
+    linearizations meet in one loop. The final phase reads the exchange buffer
+    with the producer's index and stores with the consumer's, and the two agree
+    only while the register bits sit contiguously at the bottom.
+
+    With `LT` the lane, `b_k` its bits and `iv` the loop variable, the emitted
+    expressions are:
+
+        E=4   read  buf[64b4+32b3+16b2+8b1+4b0+2iv1+iv0] == LT*4 + iv
+              store v1[LT*4 + iv]                            agree
+        E=8   read  buf[128*iv2 + 64b4+32b3+16b2+8b1+4b0 + 2iv1+iv0]
+                    == 128*iv2 + LT*4 + (iv & 3)
+              store v1[LT*8 + iv]                            DISAGREE
+
+    The read index is the hypercube's own linearization: `tl.sort` reshapes to
+    `[2]*log2(N)` and that rank-N blocked layout places two register bits at the
+    bottom and the third at the top, weight 128, which is `tpb * 4` and so the
+    constant in the signature. `planLayoutIndex` renders the layout faithfully
+    and caps nothing, so there is no stray four to find in it.
+
+    The mapping is a bijection onto `0..N-1`, so the buffer is indexed by
+    logical linear position. That closes the arithmetic: output slot `LT*8+iv`
+    receives logical element `128*iv2 + LT*4 + (iv&3)`, giving thread 0 the
+    elements 0,1,2,3,128,129,130,131 — exactly the measured output, for every
+    failing shape.
+
+    So the fix is to read the exchange buffer with the CONSUMER's linearization
+    rather than the producer's; the buffer already holds logical element j at
+    slot j, so it is a re-index and not a data movement. Rejecting a reshape
+    that changes the linearization, instead of passing it through, would be the
+    conservative alternative.
+
+    ⚠️ Two isolations that do NOT reproduce it, recorded so they are not
+    retried: a bare reshape round trip, whose pair folds away, and reshape plus
+    elementwise plus reshape back, since elementwise work is insensitive to the
+    mapping. Only an operation that moves data across lanes exposes it.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
