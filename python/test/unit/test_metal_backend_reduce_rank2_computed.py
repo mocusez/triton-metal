@@ -558,3 +558,65 @@ def test_token_embedding_layernorm_matches_torch(B, T, V, P, D, dtype):
     torch.testing.assert_close(
         output.cpu().float(), expected, atol=atol, rtol=rtol
     )
+
+
+# ---------------------------------------------------------------------------
+# Unary math the rank-2 cone could not replay.
+#
+# `rank2ConeSupported` and `evalRank2ConeAt` carried their own copy of the
+# admitted-op list, so abs/floor/ceil/exp2/log2 and a plain negation were
+# missing here for the same reason as at rank 1. A `tl.sum(tl.sigmoid(x),
+# axis=1)` aborted the process instead of reducing.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _sum_sigmoid(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rm, tl.sum(tl.sigmoid(x), axis=1))
+
+
+@triton.jit
+def _sum_floor(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rm, tl.sum(tl.floor(x), axis=1))
+
+
+@triton.jit
+def _max_abs(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rm, tl.max(tl.abs(x), axis=1))
+
+
+@triton.jit
+def _sum_neg_exp2(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rm, tl.sum(tl.exp2(-x), axis=1))
+
+
+_RANK2_CONE_CASES = {
+    "sigmoid": (_sum_sigmoid, lambda t: torch.sigmoid(t).sum(dim=1)),
+    "floor": (_sum_floor, lambda t: torch.floor(t).sum(dim=1)),
+    "abs": (_max_abs, lambda t: torch.abs(t).amax(dim=1)),
+    "neg_exp2": (_sum_neg_exp2, lambda t: torch.exp2(-t).sum(dim=1)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_RANK2_CONE_CASES))
+@pytest.mark.parametrize("M,N", [(4, 32), (8, 16), (2, 64)])
+def test_rank2_unary_math_cone_matches_torch(case, M, N):
+    kernel, ref = _RANK2_CONE_CASES[case]
+    torch.manual_seed(M * 131 + N)
+    x = torch.randn(M, N) * 2.0
+    out = torch.zeros(M, device="mps")
+    kernel[(1,)](x.to("mps"), out, M=M, N=N, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref(x), atol=1e-4, rtol=1e-4)

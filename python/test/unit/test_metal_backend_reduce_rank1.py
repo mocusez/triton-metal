@@ -749,3 +749,126 @@ def test_reduce_rank1_combine_with_captured_literal(dtype):
     reduce_addheaded_rank1_kernel[(1,)](x.to("mps"), out, BLOCK=32)
     torch.mps.synchronize()
     assert out.cpu().item() == x.max().item()
+
+
+# ---------------------------------------------------------------------------
+# Elementwise math in the reduced cone.
+#
+# The cone replayers (`evalRank1ValueAt` and its dry-run predicate) listed the
+# unary math they could re-derive per element. exp2/log2/abs/floor/ceil and a
+# plain negation were missing from that list even though each already had an
+# exact Metal spelling for the elementwise path, so an ordinary
+# `tl.sum(tl.sigmoid(x))` matched no reduce tier at all and failed to legalize
+# AFTER FuncOpLowering had rewritten the function signature -- a process kill
+# (measured 17 SIGSEGV / 30 runs), not a diagnostic.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _cone_exp2_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.exp2(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_log2_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.log2(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_absf_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.abs(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_floor_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.floor(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_ceil_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.ceil(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_neg_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(-tl.load(x_ptr + o), axis=0))
+
+
+@triton.jit
+def _cone_sigmoid_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.sigmoid(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_absi_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.sum(tl.abs(tl.load(x_ptr + o)), axis=0))
+
+
+@triton.jit
+def _cone_max_absf_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(out_ptr, tl.max(tl.abs(tl.load(x_ptr + o)), axis=0))
+
+
+_CONE_F32_CASES = {
+    "exp2": (_cone_exp2_kernel, torch.exp2),
+    "log2": (_cone_log2_kernel, torch.log2),
+    "abs": (_cone_absf_kernel, torch.abs),
+    "floor": (_cone_floor_kernel, torch.floor),
+    "ceil": (_cone_ceil_kernel, torch.ceil),
+    "neg": (_cone_neg_kernel, torch.neg),
+    "sigmoid": (_cone_sigmoid_kernel, torch.sigmoid),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_CONE_F32_CASES))
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block", [32, 128])
+def test_reduce_rank1_unary_math_cone(case, block, num_warps):
+    """Every unary math op with a Metal spelling reduces through the cone."""
+    kernel, ref = _CONE_F32_CASES[case]
+    torch.manual_seed(block * 7 + num_warps)
+    # Positive and bounded: log2 needs x > 0, and floor/ceil want a spread of
+    # fractional parts rather than values that all round the same way.
+    x = torch.rand(block) * 3.0 + 0.25
+    out = torch.zeros(1, device="mps")
+    kernel[(1,)](x.to("mps"), out, BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    want = ref(x.double()).sum().item()
+    assert out.cpu().item() == pytest.approx(want, rel=2e-5, abs=1e-5)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block", [32, 128])
+def test_reduce_rank1_integer_abs_cone(block, num_warps):
+    """`tl.abs` on i32 is math.absi, which the translator reads back as SIGNED;
+    a signless-to-storage slip here turns abs into the identity."""
+    torch.manual_seed(block + num_warps)
+    x = torch.randint(-500, 500, (block,), dtype=torch.int32)
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+    _cone_absi_kernel[(1,)](x.to("mps"), out, BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert int(out.cpu().item()) == int(x.abs().sum().item())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_reduce_rank1_absf_keeps_the_bit_preserving_half_path(dtype):
+    """f16/bf16 abs is a sign-bit mask, not a float conversion; the cone must
+    use the same emitter as the elementwise pattern or -0.0 and NaN payloads
+    diverge between the two paths."""
+    torch.manual_seed(5)
+    x = torch.tensor([-0.0, 0.0, -1.5, 2.25, -3.75, 4.0, -5.5, 6.125] * 4,
+                     dtype=dtype)
+    out = torch.zeros(1, dtype=dtype, device="mps")
+    _cone_max_absf_kernel[(1,)](x.to("mps"), out, BLOCK=32)
+    torch.mps.synchronize()
+    assert out.cpu().float().item() == x.abs().float().max().item()
+

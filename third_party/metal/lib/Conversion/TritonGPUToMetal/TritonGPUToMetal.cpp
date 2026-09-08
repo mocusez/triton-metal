@@ -5944,33 +5944,122 @@ struct MathLog2Lowering : public mlir::OpConversionPattern<mlir::math::Log2Op> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Shared elementwise-math tables for the reduce/scan cone replayers.
+//
+// `evalRank1ValueAt` / `evalRank2ConeAt` re-derive a reduce's source cone one
+// element at a time, and each is gated by a predicate listing the ops it can
+// replay. Those lists were written out four times. An op present in the
+// evaluator but missing from its predicate is silently unreachable (the note on
+// those lists says so); an op missing from BOTH, in a cone no other tier
+// claims, is worse — the reduce fails to legalize after FuncOpLowering has
+// already rewritten the function signature, which is a process kill, not a
+// diagnostic. `tl.sum(tl.sigmoid(x))` and `tl.sum(tl.floor(x))` crashed that
+// way. One table per emission shape, consulted by the elementwise patterns and
+// by all four cone sites, is what keeps them from drifting apart again.
+//===----------------------------------------------------------------------===//
+
+// Unary math with a single `metal.unary_exp` spelling. `math.absf` is NOT here:
+// its f16/bf16 emission is a bit mask, not a unary expression (see
+// `emitMetalAbsF`).
+static std::optional<UnaryExpOperator>
+coneUnaryExpOperator(mlir::Operation *def) {
+  if (!def)
+    return std::nullopt;
+  if (mlir::isa<mlir::math::ExpOp>(def))
+    return UnaryExpOperator::expOp;
+  if (mlir::isa<mlir::math::Exp2Op>(def))
+    return UnaryExpOperator::exp2Op;
+  if (mlir::isa<mlir::math::SqrtOp>(def))
+    return UnaryExpOperator::sqrtOp;
+  if (mlir::isa<mlir::math::LogOp>(def))
+    return UnaryExpOperator::logOp;
+  if (mlir::isa<mlir::math::Log2Op>(def))
+    return UnaryExpOperator::log2Op;
+  if (mlir::isa<mlir::math::SinOp>(def))
+    return UnaryExpOperator::sinOp;
+  if (mlir::isa<mlir::math::CosOp>(def))
+    return UnaryExpOperator::cosOp;
+  if (mlir::isa<mlir::math::ErfOp>(def))
+    return UnaryExpOperator::erfOp;
+  if (mlir::isa<mlir::math::RsqrtOp>(def))
+    return UnaryExpOperator::rsqrtOp;
+  return std::nullopt;
+}
+
+// Element types `math.absf` has an exact Metal emission for.
+static bool metalAbsFTypeSupported(mlir::Type ty) {
+  if (auto rtt = mlir::dyn_cast_or_null<mlir::RankedTensorType>(ty))
+    ty = rtt.getElementType();
+  return ty && (ty.isF32() || ty.isF16() || ty.isBF16());
+}
+
+// The one place `math.absf` becomes Metal IR, shared by the elementwise pattern
+// and by both cone evaluators so they cannot disagree about a NaN payload or a
+// signed zero.
+static mlir::Value emitMetalAbsF(mlir::OpBuilder &builder, mlir::Location loc,
+                                 mlir::Value operand) {
+  mlir::Type ty = operand.getType();
+  if (ty.isF16() || ty.isBF16()) {
+    // Both 16-bit formats store the sign in bit 15. Clearing that bit
+    // implements abs exactly, including signed zero and NaN payloads,
+    // without a floating conversion that could quiet or canonicalize NaNs.
+    auto ui16 = builder.getIntegerType(16, /*isSigned=*/false);
+    auto bits = BitcastOp::create(builder, loc, ui16, operand);
+    auto mask = ConstantOp::create(builder, loc,
+                                   builder.getIntegerAttr(ui16, 0x7fff));
+    auto magnitude = BinaryExpOp::create(
+        builder, loc, BinaryExpOperator::bitAndOp, bits, mask);
+    return BitcastOp::create(builder, loc, ty, magnitude).getResult();
+  }
+  if (!ty.isF32())
+    return mlir::Value{};
+  auto kind =
+      UnaryExpOperatorAttr::get(builder.getContext(), UnaryExpOperator::absOp);
+  return UnaryExpOp::create(builder, loc, ty, kind, operand).getResult();
+}
+
+// Unary ops that stay LEGAL through conversion (the Metal translator spells
+// each one directly) and are therefore replayed in a cone by cloning them onto
+// the evaluated operand.
+static bool coneClonableUnaryOp(mlir::Operation *def) {
+  return def && mlir::isa<mlir::math::FloorOp, mlir::math::CeilOp,
+                          mlir::math::AbsIOp, mlir::arith::NegFOp>(def);
+}
+
+// Emit the clonable unary `def` on an already-evaluated scalar operand.
+static mlir::Value emitConeClonableUnary(mlir::Operation *def, mlir::Value x,
+                                         mlir::OpBuilder &builder,
+                                         mlir::Location loc) {
+  if (mlir::isa<mlir::math::FloorOp>(def))
+    return mlir::math::FloorOp::create(builder, loc, x).getResult();
+  if (mlir::isa<mlir::math::CeilOp>(def))
+    return mlir::math::CeilOp::create(builder, loc, x).getResult();
+  if (mlir::isa<mlir::arith::NegFOp>(def))
+    return mlir::arith::NegFOp::create(builder, loc, x).getResult();
+  if (mlir::isa<mlir::math::AbsIOp>(def)) {
+    // A cone leaf read from a device buffer carries the ui32 STORAGE type,
+    // which math.absi rejects; the translator re-reads the operand as signed.
+    return mlir::math::AbsIOp::create(builder, loc,
+                                      toSignlessInt(x, builder, loc))
+        .getResult();
+  }
+  return mlir::Value{};
+}
+
 struct MathAbsFLowering : public mlir::OpConversionPattern<mlir::math::AbsFOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
   matchAndRewrite(mlir::math::AbsFOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto resultTy = getTypeConverter()->convertType(op.getType());
-    if (resultTy && (resultTy.isF16() || resultTy.isBF16())) {
-      // Both 16-bit formats store the sign in bit 15. Clearing that bit
-      // implements abs exactly, including signed zero and NaN payloads,
-      // without a floating conversion that could quiet or canonicalize NaNs.
-      auto ui16 = rewriter.getIntegerType(16, /*isSigned=*/false);
-      auto bits = BitcastOp::create(rewriter, op.getLoc(), ui16,
-                                    adaptor.getOperand());
-      auto mask = ConstantOp::create(
-          rewriter, op.getLoc(), rewriter.getIntegerAttr(ui16, 0x7fff));
-      auto magnitude = BinaryExpOp::create(rewriter, op.getLoc(),
-                                           BinaryExpOperator::bitAndOp, bits,
-                                           mask);
-      rewriter.replaceOpWithNewOp<BitcastOp>(op, resultTy, magnitude);
-      return mlir::success();
-    }
-    if (!resultTy || !resultTy.isF32())
+    if (!metalAbsFTypeSupported(resultTy))
       return rewriter.notifyMatchFailure(op, "absf requires f16, bf16 or f32");
-    auto kind = UnaryExpOperatorAttr::get(rewriter.getContext(),
-                                          UnaryExpOperator::absOp);
-    rewriter.replaceOpWithNewOp<UnaryExpOp>(op, resultTy, kind,
-                                            adaptor.getOperand());
+    mlir::Value abs =
+        emitMetalAbsF(rewriter, op.getLoc(), adaptor.getOperand());
+    if (!abs)
+      return rewriter.notifyMatchFailure(op, "absf requires f16, bf16 or f32");
+    rewriter.replaceOp(op, abs);
     return mlir::success();
   }
 };
@@ -8270,22 +8359,21 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     // same scalar operation at the current insertion point.
     mlir::Operation *scalarDef = v.getDefiningOp();
     if (!scalarDef ||
-        !mlir::isa<
-            mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp,
-            mlir::arith::SIToFPOp, mlir::arith::UIToFPOp, mlir::arith::ExtFOp,
-            mlir::arith::TruncFOp, mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-            mlir::arith::TruncIOp, mlir::math::ExpOp, mlir::math::SqrtOp,
-            mlir::math::LogOp, mlir::math::SinOp, mlir::math::CosOp,
-            mlir::math::ErfOp, mlir::math::RsqrtOp, mlir::arith::AddFOp,
-            mlir::arith::SubFOp, mlir::arith::MulFOp, mlir::arith::DivFOp,
-            mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
-            mlir::arith::MinimumFOp, mlir::arith::MinNumFOp,
-            mlir::arith::AddIOp, mlir::arith::SubIOp, mlir::arith::MulIOp,
-            mlir::arith::DivSIOp, mlir::arith::DivUIOp, mlir::arith::RemSIOp,
-            mlir::arith::RemUIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
-            mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
-            mlir::arith::ShRUIOp, mlir::arith::SelectOp, mlir::arith::CmpIOp,
-            mlir::arith::CmpFOp>(scalarDef)) {
+        (!mlir::isa<
+             mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp,
+             mlir::arith::SIToFPOp, mlir::arith::UIToFPOp, mlir::arith::ExtFOp,
+             mlir::arith::TruncFOp, mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
+             mlir::arith::TruncIOp, mlir::math::AbsFOp, mlir::arith::AddFOp,
+             mlir::arith::SubFOp, mlir::arith::MulFOp, mlir::arith::DivFOp,
+             mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
+             mlir::arith::MinimumFOp, mlir::arith::MinNumFOp,
+             mlir::arith::AddIOp, mlir::arith::SubIOp, mlir::arith::MulIOp,
+             mlir::arith::DivSIOp, mlir::arith::DivUIOp, mlir::arith::RemSIOp,
+             mlir::arith::RemUIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
+             mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
+             mlir::arith::ShRUIOp, mlir::arith::SelectOp, mlir::arith::CmpIOp,
+             mlir::arith::CmpFOp>(scalarDef) &&
+         !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef))) {
       // Ops inside the old loop are erased and can never be reused. Prefix ops
       // were already validated by the pre-conversion dry run; after function
       // conversion some of their supported constants/casts may be represented
@@ -8588,20 +8676,18 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(), k);
     return UnaryExpOp::create(rewriter, loc, x.getType(), attr, x).getResult();
   };
-  if (auto e = mlir::dyn_cast<mlir::math::ExpOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::expOp);
-  if (auto e = mlir::dyn_cast<mlir::math::SqrtOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::sqrtOp);
-  if (auto e = mlir::dyn_cast<mlir::math::LogOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::logOp);
-  if (auto e = mlir::dyn_cast<mlir::math::SinOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::sinOp);
-  if (auto e = mlir::dyn_cast<mlir::math::CosOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::cosOp);
-  if (auto e = mlir::dyn_cast<mlir::math::ErfOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::erfOp);
-  if (auto e = mlir::dyn_cast<mlir::math::RsqrtOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::rsqrtOp);
+  if (std::optional<UnaryExpOperator> kind = coneUnaryExpOperator(def))
+    return unary(def->getOperand(0), *kind);
+  if (mlir::isa<mlir::math::AbsFOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc, depth + 1);
+    return x ? emitMetalAbsF(rewriter, loc, x) : mlir::Value{};
+  }
+  if (coneClonableUnaryOp(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc, depth + 1);
+    return x ? emitConeClonableUnary(def, x, rewriter, loc) : mlir::Value{};
+  }
 
   // f32 binary arith → metal.binary_exp (recurse both operands).
   auto fbinary = [&](mlir::Value lhs, mlir::Value rhs,
@@ -9312,20 +9398,18 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     auto attr = UnaryExpOperatorAttr::get(rewriter.getContext(), k);
     return UnaryExpOp::create(rewriter, loc, x.getType(), attr, x).getResult();
   };
-  if (auto e = mlir::dyn_cast<mlir::math::ExpOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::expOp);
-  if (auto e = mlir::dyn_cast<mlir::math::SqrtOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::sqrtOp);
-  if (auto e = mlir::dyn_cast<mlir::math::LogOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::logOp);
-  if (auto e = mlir::dyn_cast<mlir::math::SinOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::sinOp);
-  if (auto e = mlir::dyn_cast<mlir::math::CosOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::cosOp);
-  if (auto e = mlir::dyn_cast<mlir::math::ErfOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::erfOp);
-  if (auto e = mlir::dyn_cast<mlir::math::RsqrtOp>(def))
-    return unary(e.getOperand(), UnaryExpOperator::rsqrtOp);
+  if (std::optional<UnaryExpOperator> kind = coneUnaryExpOperator(def))
+    return unary(def->getOperand(0), *kind);
+  if (mlir::isa<mlir::math::AbsFOp>(def)) {
+    mlir::Value x = evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    return x ? emitMetalAbsF(rewriter, loc, x) : mlir::Value{};
+  }
+  if (coneClonableUnaryOp(def)) {
+    mlir::Value x = evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    return x ? emitConeClonableUnary(def, x, rewriter, loc) : mlir::Value{};
+  }
 
   // Binary f32 arith → metal.binary_exp (recurse BOTH operands).
   auto binary = [&](mlir::Value lhs, mlir::Value rhs,
@@ -9807,10 +9891,12 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
     if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
                   mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                   mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                  mlir::arith::TruncIOp, mlir::math::ExpOp, mlir::math::SqrtOp,
-                  mlir::math::LogOp, mlir::math::SinOp, mlir::math::CosOp,
-                  mlir::math::ErfOp, mlir::math::RsqrtOp>(def))
+                  mlir::arith::TruncIOp>(def) ||
+        coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
       return rank1ConeSupported(def->getOperand(0), depth + 1);
+    if (mlir::isa<mlir::math::AbsFOp>(def))
+      return metalAbsFTypeSupported(def->getResult(0).getType()) &&
+             rank1ConeSupported(def->getOperand(0), depth + 1);
     if (mlir::isa<
             mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
             mlir::arith::DivFOp, mlir::arith::MaximumFOp,
@@ -9909,10 +9995,11 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
                 mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                 mlir::arith::TruncIOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
-  if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
-                mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
-                mlir::math::RsqrtOp>(def))
+  if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::math::AbsFOp>(def))
+    return metalAbsFTypeSupported(def->getResult(0).getType()) &&
+           rank1ConeSupported(def->getOperand(0), depth + 1);
   // NOTE: this list must stay in sync with the binary cases in
   // `evalRank1ValueAt` — this predicate is the dry run that decides whether the
   // evaluator gets to emit at all, so an op accepted there but missing here is
@@ -10116,10 +10203,11 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
   if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
     return rank2ConeSupported(def->getOperand(0), depth + 1);
-  if (mlir::isa<mlir::math::ExpOp, mlir::math::SqrtOp, mlir::math::LogOp,
-                mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
-                mlir::math::RsqrtOp>(def))
+  if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1);
+  if (mlir::isa<mlir::math::AbsFOp>(def))
+    return metalAbsFTypeSupported(def->getResult(0).getType()) &&
+           rank2ConeSupported(def->getOperand(0), depth + 1);
   // Keep in sync with the binary cases in `evalRank2ConeAt` — same trap the
   // rank-1 predicate documents: an op the evaluator handles but this list omits
   // is silently unreachable. arith.and/or were exactly that, so a cone whose

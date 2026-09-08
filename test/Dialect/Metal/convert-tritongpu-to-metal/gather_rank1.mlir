@@ -99,6 +99,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // is hoisted to the function prologue and must not reuse that non-dominating
 // SSA value.
 //
+// The declined scalar op has to be one with no scalar replay at all:
+// math.absi USED to be that op, and is not any more -- abs/floor/ceil and
+// the unary_exp family are all replayable in a cone now, so this case would
+// silently stop testing the rejection path if it kept using one of them.
+// math.ctpop has no Metal spelling in either table.
 //--- unsupported_scalar.mlir
 #blocked_loop = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
@@ -112,7 +117,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %xa = tt.addptr %xp, %r : tensor<1024x!tt.ptr<i32>, #blocked_loop>, tensor<1024xi32, #blocked_loop>
     %initial = tt.load %xa : tensor<1024x!tt.ptr<i32>, #blocked_loop>
     %delta = arith.subi %steps, %c1 : i32
-    %abs_step = math.absi %delta : i32
+    %abs_step = math.ctpop %delta : i32
     %result = scf.for %step = %c0 to %steps step %c1 iter_args(%state = %initial) -> (tensor<1024xi32, #blocked_loop>)  : i32 {
       %step_offset = arith.muli %abs_step, %c1024 : i32
       %step_base = tt.addptr %ix, %step_offset : !tt.ptr<i32>, i32
