@@ -364,46 +364,68 @@ static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
     return out;
   }
 
-  // Fallback: two alternating slots per element type, sized to the largest
-  // tile assigned to each. Identical to the historical scheme, including its
-  // reuse hazard, so an over-budget kernel behaves exactly as it did before.
+  // Over budget: two alternating slots per pool. Round-robin is only safe while
+  // the publishes sharing a pool ALTERNATE STRICTLY, and keying a pool by
+  // element type alone breaks that. A hypercube reduce interleaves two-element
+  // direction-table publishes between the tile publishes of the same element
+  // type; those flip the round-robin parity and hand a comparator the slot it
+  // is reading. Keying the pool by (element type, element COUNT) puts the
+  // tables in their own tiny pool and restores strict alternation among the
+  // tiles, at the cost of two slots per distinct size. `tl.topk` at N=512 and
+  // k=32 on four warps is the measured shape that needs this.
+  //
+  // The historical type-only scheme stays as the last resort, so a kernel too
+  // large even for the size-keyed pools behaves exactly as it did before.
+  // Each tier allocates no more than the one above it: one buffer per publish,
+  // then two per (type, size), then two per type.
   out.reusesBuffers = true;
   struct Pool {
     mlir::Type elemTy;
+    int64_t keyElements = 0; // 0 when the pool is keyed by type alone
     int64_t maxElements[2] = {0, 0};
     unsigned bufferIdx[2] = {0, 0};
-    bool allocated[2] = {false, false};
     unsigned nextSlot = 0;
   };
-  llvm::SmallVector<Pool, 4> pools;
-  llvm::SmallVector<std::pair<unsigned, unsigned>, 8> chosen;
-  for (const TileExchangePlan *plan : plans) {
-    unsigned poolIdx = 0;
-    for (; poolIdx < pools.size(); ++poolIdx)
-      if (pools[poolIdx].elemTy == plan->elemTy)
-        break;
-    if (poolIdx == pools.size()) {
-      Pool pool;
-      pool.elemTy = plan->elemTy;
-      pools.push_back(pool);
+  auto assignPooled = [&](bool keyBySize) {
+    out.buffers.clear();
+    out.publishBuffer.clear();
+    out.totalBytes = 0;
+    llvm::SmallVector<Pool, 8> pools;
+    llvm::SmallVector<std::pair<unsigned, unsigned>, 8> chosen;
+    for (const TileExchangePlan *plan : plans) {
+      const int64_t key = keyBySize ? plan->numElements : 0;
+      unsigned poolIdx = 0;
+      for (; poolIdx < pools.size(); ++poolIdx)
+        if (pools[poolIdx].elemTy == plan->elemTy &&
+            pools[poolIdx].keyElements == key)
+          break;
+      if (poolIdx == pools.size()) {
+        Pool pool;
+        pool.elemTy = plan->elemTy;
+        pool.keyElements = key;
+        pools.push_back(pool);
+      }
+      Pool &pool = pools[poolIdx];
+      unsigned slot = pool.nextSlot++ % 2;
+      pool.maxElements[slot] =
+          std::max(pool.maxElements[slot], plan->numElements);
+      chosen.emplace_back(poolIdx, slot);
     }
-    Pool &pool = pools[poolIdx];
-    unsigned slot = pool.nextSlot++ % 2;
-    pool.maxElements[slot] = std::max(pool.maxElements[slot],
-                                      plan->numElements);
-    chosen.emplace_back(poolIdx, slot);
-  }
-  for (Pool &pool : pools)
-    for (unsigned slot = 0; slot < 2; ++slot) {
-      if (pool.maxElements[slot] == 0)
-        continue;
-      pool.bufferIdx[slot] = out.buffers.size();
-      pool.allocated[slot] = true;
-      out.buffers.emplace_back(pool.elemTy, pool.maxElements[slot]);
-      out.totalBytes += bytesOf(pool.elemTy, pool.maxElements[slot]);
-    }
-  for (auto [poolIdx, slot] : chosen)
-    out.publishBuffer.push_back(pools[poolIdx].bufferIdx[slot]);
+    for (Pool &pool : pools)
+      for (unsigned slot = 0; slot < 2; ++slot) {
+        if (pool.maxElements[slot] == 0)
+          continue;
+        pool.bufferIdx[slot] = out.buffers.size();
+        out.buffers.emplace_back(pool.elemTy, pool.maxElements[slot]);
+        out.totalBytes += bytesOf(pool.elemTy, pool.maxElements[slot]);
+      }
+    for (auto [poolIdx, slot] : chosen)
+      out.publishBuffer.push_back(pools[poolIdx].bufferIdx[slot]);
+  };
+
+  assignPooled(/*keyBySize=*/true);
+  if (out.totalBytes > kThreadgroupBudgetBytes)
+    assignPooled(/*keyBySize=*/false);
   return out;
 }
 
@@ -2691,6 +2713,18 @@ planBroadcastReadIndex(mlir::RankedTensorType srcTy,
   return readPlan;
 }
 
+// How much one physical bit adds to the row-major flat element index.
+static int64_t layoutFlatBitContribution(const LayoutIndexPlan &plan,
+                                         LayoutIndexPlan::Coord coord,
+                                         int bit) {
+  int64_t flat = 0;
+  for (size_t d = 0; d < plan.dimTerms.size(); ++d)
+    for (const LayoutIndexPlan::Term &term : plan.dimTerms[d])
+      if (term.coord == coord && term.bit == bit)
+        flat += static_cast<int64_t>(term.basis) * plan.rowMajorStride[d];
+  return flat;
+}
+
 // The legacy one-band reduction scratch uses physical localTid as its slot.
 // Keep that cheap path only when the distributed layout maps every thread bit
 // to the same row-major bit and has no register coordinate.  A topk hypercube
@@ -2699,20 +2733,40 @@ planBroadcastReadIndex(mlir::RankedTensorType srcTy,
 static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
   if (plan.registerBits != 0 || plan.registerUsedMask != 0)
     return false;
-  auto contribution = [&](LayoutIndexPlan::Coord coord, int bit) {
-    int64_t flat = 0;
-    for (size_t d = 0; d < plan.dimTerms.size(); ++d)
-      for (const LayoutIndexPlan::Term &term : plan.dimTerms[d])
-        if (term.coord == coord && term.bit == bit)
-          flat += static_cast<int64_t>(term.basis) * plan.rowMajorStride[d];
-    return flat;
-  };
   for (int bit = 0; bit < plan.laneBits; ++bit)
-    if (contribution(LayoutIndexPlan::Lane, bit) != (int64_t{1} << bit))
+    if (layoutFlatBitContribution(plan, LayoutIndexPlan::Lane, bit) !=
+        (int64_t{1} << bit))
       return false;
   for (int bit = 0; bit < plan.warpBits; ++bit)
-    if (contribution(LayoutIndexPlan::Warp, bit) !=
+    if (layoutFlatBitContribution(plan, LayoutIndexPlan::Warp, bit) !=
         (int64_t{1} << (plan.laneBits + bit)))
+      return false;
+  return true;
+}
+
+// Everything this backend emits outside the layout-indexed phase paths places
+// the element a thread holds at tile iteration `iv` at row-major flat index
+// `localTid * elemPerThread + iv`: the register bits are the LOW bits and the
+// thread bits sit above them. A blocked layout agrees with that only while the
+// tile fits the CTA exactly once. Give it a second register band and it
+// interleaves the bands at the CTA-tile stride instead, so the same (thread,
+// iv) pair names two different logical elements. That is not a free choice
+// when both mappings appear in one kernel, which is what `tl.sort` above four
+// elements per thread does: the global load and store use this thread-major
+// order while the hypercube scratch uses the layout's.
+static bool layoutFlatIndexIsThreadMajor(const LayoutIndexPlan &plan) {
+  const int64_t elems = plan.elemPerThread;
+  for (int bit = 0; bit < plan.registerBits; ++bit)
+    if (layoutFlatBitContribution(plan, LayoutIndexPlan::Register, bit) !=
+        (int64_t{1} << bit))
+      return false;
+  for (int bit = 0; bit < plan.laneBits; ++bit)
+    if (layoutFlatBitContribution(plan, LayoutIndexPlan::Lane, bit) !=
+        (elems << bit))
+      return false;
+  for (int bit = 0; bit < plan.warpBits; ++bit)
+    if (layoutFlatBitContribution(plan, LayoutIndexPlan::Warp, bit) !=
+        (elems << (plan.laneBits + bit)))
       return false;
   return true;
 }
@@ -2949,11 +3003,110 @@ static void splitMixedHypercubeMakeRanges(mlir::ModuleOp moduleOp) {
     }
   });
 
+  // A size-2 indicator CSE'd across two DIFFERENT hypercube axes cannot be
+  // resolved from its own layout either. `tl.sort` above eight elements per
+  // thread needs a fourth register bit, and Triton's `#ttg.linear` basis for
+  // the indicator names only three: one value then stands for both the
+  // stride-128 and the stride-256 axis, and the final merge compares along the
+  // wrong one. Give each consuming reshape its own range so the DESTINATION
+  // hypercube can name the axis. Applies to linear and blocked ranges alike;
+  // the axes genuinely differ, so no reading of the source can serve both.
+  llvm::SmallVector<
+      std::pair<mlir::triton::MakeRangeOp, mlir::triton::ReshapeOp>, 4>
+      axisSplits;
+  moduleOp.walk([&](mlir::triton::MakeRangeOp range) {
+    if (!range->hasAttr(kRankNPhaseAttr))
+      return;
+    auto rangeTy = mlir::dyn_cast<mlir::RankedTensorType>(range.getType());
+    if (!rangeTy || rangeTy.getRank() != 1)
+      return;
+    const int64_t extent = rangeTy.getDimSize(0);
+    if (extent <= 1)
+      return;
+    llvm::SmallVector<std::pair<mlir::triton::ReshapeOp, int>, 4> uses;
+    bool usable = true;
+    for (mlir::Operation *user : range.getResult().getUsers()) {
+      auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(user);
+      auto outTy =
+          reshape ? mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType())
+                  : mlir::RankedTensorType();
+      if (!outTy || outTy.getRank() < 2 ||
+          !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              outTy.getEncoding())) {
+        usable = false;
+        break;
+      }
+      int nonUnit = -1;
+      for (int64_t d = 0; d < outTy.getRank(); ++d) {
+        if (outTy.getDimSize(d) == 1)
+          continue;
+        if (nonUnit >= 0 || outTy.getDimSize(d) != extent) {
+          nonUnit = -1;
+          break;
+        }
+        nonUnit = static_cast<int>(d);
+      }
+      if (nonUnit < 0) {
+        usable = false;
+        break;
+      }
+      uses.emplace_back(reshape, nonUnit);
+    }
+    if (!usable || uses.size() < 2)
+      return;
+    const bool differ = llvm::any_of(
+        uses, [&](const auto &u) { return u.second != uses.front().second; });
+    if (!differ)
+      return;
+    for (size_t i = 1; i < uses.size(); ++i)
+      axisSplits.emplace_back(range, uses[i].first);
+  });
+
   for (auto [range, reshape] : splits) {
     mlir::OpBuilder builder(reshape);
     mlir::Operation *clone = builder.clone(*range.getOperation());
     reshape->setOperand(0, clone->getResult(0));
   }
+  for (auto [range, reshape] : axisSplits) {
+    mlir::OpBuilder builder(reshape);
+    mlir::Operation *clone = builder.clone(*range.getOperation());
+    reshape->setOperand(0, clone->getResult(0));
+  }
+}
+
+// The axis a size-2 hypercube indicator selects belongs to the CONSUMING
+// reshape; the physical bit that carries that axis belongs to the FULL
+// hypercube tile. A range's own `#ttg.linear` basis names both correctly only
+// while Triton mints a distinct basis per axis, and it stops doing that once
+// the hypercube needs more register bits than the basis has: `tl.sort` above
+// eight elements per thread reuses one indicator for the stride-128 and the
+// stride-256 merge, so the final merge compares along the wrong axis. Note the
+// reshape's own destination is the degenerate `1x2x1...` broadcast source,
+// whose layout collapses to the same basis for every axis — only the full tile
+// distinguishes them.
+static std::optional<LayoutIndexPlan>
+planRangeFromHypercubeConsumer(mlir::triton::MakeRangeOp op) {
+  std::optional<LinearRangeAxis> hyper = linearRangeHypercubeAxis(op);
+  if (!hyper || hyper->axis < 0 ||
+      hyper->axis >= static_cast<int>(hyper->tile.shape.size()))
+    return std::nullopt;
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+  if (!resTy)
+    return std::nullopt;
+  auto tileTy = mlir::RankedTensorType::get(hyper->tile.shape,
+                                            resTy.getElementType(), hyper->enc);
+  std::optional<LayoutIndexPlan> dst = planLayoutIndex(tileTy);
+  if (!dst || hyper->axis >= static_cast<int>(dst->dimTerms.size()) ||
+      dst->dimTerms[hyper->axis].empty())
+    return std::nullopt;
+  LayoutIndexPlan plan;
+  plan.dimTerms.assign(1, dst->dimTerms[hyper->axis]);
+  plan.rowMajorStride.assign(1, 1);
+  plan.laneBits = dst->laneBits;
+  plan.warpBits = dst->warpBits;
+  plan.registerBits = dst->registerBits;
+  plan.elemPerThread = dst->elemPerThread;
+  return plan;
 }
 
 // POLICY for the general linear-range path; `planLayoutIndex` is the MECHANISM,
@@ -3041,22 +3194,67 @@ struct MakeRangeLowering
     // In a rank-N phase cone a linear range carries its exact
     // register/lane/warp coordinate. Prefer it over the consumer-shape
     // fallback so one CSE'd indicator may safely feed several hypercube ranks.
+    auto withStart = [&](mlir::Value idx) {
+      if (op.getStart() == 0)
+        return idx;
+      auto start = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(op.getStart())));
+      return mlir::arith::AddIOp::create(rewriter, loc, idx, start.getResult())
+          .getResult();
+    };
     if (rankNPhase) {
       if (std::optional<LayoutIndexPlan> plan =
               planLinearRange(op, /*allowMixedHypercube=*/true)) {
+        // The range's own basis stays authoritative while it agrees with the
+        // hypercube it feeds. When it does not, it is a CSE'd indicator whose
+        // layout names some OTHER axis's bit, and the destination wins.
+        if (std::optional<LayoutIndexPlan> consumer =
+                planRangeFromHypercubeConsumer(op)) {
+          auto sameAxisTerms = [&] {
+            if (plan->laneBits != consumer->laneBits ||
+                plan->warpBits != consumer->warpBits ||
+                plan->dimTerms.size() != 1 ||
+                plan->dimTerms.front().size() !=
+                    consumer->dimTerms.front().size())
+              return false;
+            for (auto [a, b] :
+                 llvm::zip(plan->dimTerms.front(), consumer->dimTerms.front()))
+              if (a.coord != b.coord || a.bit != b.bit || a.basis != b.basis)
+                return false;
+            return true;
+          };
+          if (!sameAxisTerms())
+            plan = consumer;
+        }
         if (mlir::Value idx =
                 emitLayoutElementIndex(op, *plan, rewriter, loc)) {
-          if (op.getStart() != 0) {
-            auto start = mlir::arith::ConstantOp::create(
-                rewriter, loc,
-                rewriter.getI32IntegerAttr(
-                    static_cast<int32_t>(op.getStart())));
-            idx = mlir::arith::AddIOp::create(rewriter, loc, idx,
-                                              start.getResult())
-                      .getResult();
-          }
-          rewriter.replaceOp(op, idx);
+          rewriter.replaceOp(op, withStart(idx));
           return mlir::success();
+        }
+      }
+      // The hypercube phase indexes its threadgroup scratch by the layout's
+      // own row-major flat index. A plain blocked range feeding the global
+      // load and store of the same kernel has to be emitted the same way, or
+      // the load fills scratch slot `flat` with the element the rest of the
+      // emitter believes lives at `localTid * elemPerThread + iv`, the phase
+      // sorts a permuted array and the store permutes it again. The two
+      // mappings coincide while the tile fits the CTA once, which is why this
+      // only ever hit `tl.sort` above four elements per thread. Ranges that
+      // already agree keep the cheaper thread-major expression, and a range
+      // with replicated owners is narrower than the CTA and never multi-band.
+      if (resTy.getRank() == 1 &&
+          mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              resTy.getEncoding())) {
+        if (std::optional<LayoutIndexPlan> plan = planLayoutIndex(resTy)) {
+          if (!layoutFlatIndexIsThreadMajor(*plan) &&
+              !layoutHasReplicatedOwners(*plan)) {
+            if (mlir::Value idx =
+                    emitLayoutElementIndex(op, *plan, rewriter, loc)) {
+              rewriter.replaceOp(op, withStart(idx));
+              return mlir::success();
+            }
+          }
         }
       }
     }
@@ -26618,7 +26816,8 @@ static bool planTileExchange(mlir::Operation *exchange,
   return true;
 }
 
-// Preflight the same two-slot-per-type allocation that FuncOpLowering emits.
+// Preflight the same allocation ladder that FuncOpLowering emits, through the
+// one shared `assignExchangeBuffers` so preflight and emission cannot drift.
 // Conversion failure is not a safe diagnostic path in this backend, so an
 // over-budget function must stop while its original tt.func is still intact.
 static mlir::LogicalResult

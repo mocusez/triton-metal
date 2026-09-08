@@ -1543,11 +1543,16 @@ def test_topk_small_exhaustive(N, K, num_warps, descending, dtype):
 # the exchange allocator reused a buffer a live read still needed; those cells
 # are the regression for that fix and were failing before it.
 #
-# ⚠️ The envelope is now bounded by the 32 KiB threadgroup budget rather than by
-# elements per thread: while the exchange scratch fits without buffer reuse the
-# result is correct, and above that the allocator falls back to the reusing
-# scheme, which still has the defect. N=512 k=32 at four warps is one measured
-# shape that lands in the fallback and is still wrong, so do not add it here.
+# The envelope is bounded by the 32 KiB threadgroup budget rather than by
+# elements per thread. While the exchange scratch fits without buffer reuse
+# every publish gets its own buffer and no reuse hazard exists. Above that the
+# allocator falls back to two alternating slots per pool, and round-robin is
+# only safe while the publishes sharing a pool alternate strictly. Keying those
+# pools by element type ALONE broke that: a hypercube reduce interleaves
+# two-element direction-table publishes between the tile publishes of the same
+# element type, flipping the parity and handing a comparator the slot it reads.
+# The last four cells below are over budget and exercise that fallback; they
+# returned duplicated values until the pool key gained the element count.
 @pytest.mark.parametrize("N,K,num_warps,descending,dtype", [
     (64, 2, 1, True, "fp16"),
     (128, 8, 4, False, "bf16"),
@@ -1557,6 +1562,10 @@ def test_topk_small_exhaustive(N, K, num_warps, descending, dtype):
     (128, 8, 1, True, "fp32"),
     (128, 32, 1, False, "i32"),
     (256, 16, 2, False, "fp32"),
+    (512, 32, 4, True, "fp32"),
+    (512, 32, 4, False, "i32"),
+    (512, 64, 4, True, "fp32"),
+    (1024, 32, 4, True, "fp32"),
 ])
 def test_topk_multiband_dtypes(N, K, num_warps, descending, dtype):
     torch = pytest.importorskip("torch")
@@ -1741,7 +1750,7 @@ def test_topk_masked_padding_sentinel(descending):
     assert torch.equal(out.cpu(), expected)
 
 
-# N and num_warps are swept together so the cells span ONE, TWO and FOUR
+# N and num_warps are swept together so the cells span ONE through THIRTY-TWO
 # elements per thread, `N / (32 * num_warps)`. That axis is the one this path
 # breaks along and the matrix used to sit entirely at one element per thread,
 # which is how the band-write defect survived: the final phase loop ran
@@ -1749,11 +1758,20 @@ def test_topk_masked_padding_sentinel(descending):
 # `localTid * tile.elemPerThread + iv`, so only the first half of every band
 # reached the output.
 #
-# ⚠️ Do not add a cell above four elements per thread, i.e. N > 128 at one warp
-# or N > 512 at four. The exchange still cannot carry a value across its phases
-# there and the result is wrong, not a compile failure. Open defect.
+# The cells above four elements per thread are the regression for two further
+# defects, both of which returned a PERMUTED array rather than failing:
+#   * the global load and store placed element `localTid * E + iv` while the
+#     hypercube scratch placed it where the blocked layout does, and the two
+#     agree only while the tile fits the CTA once. A second register band
+#     interleaves the bands at the CTA-tile stride, so the phase sorted a
+#     permuted array and the store permuted it again (N >= 256 at one warp);
+#   * Triton CSEs one size-2 axis indicator across two hypercube axes once the
+#     cube needs more register bits than the indicator's `#ttg.linear` basis
+#     names, so the widest merge compared along the neighbouring axis
+#     (N >= 512 at one warp).
+# Both are invisible at 128 and below, which is why the matrix reaches 1024.
 @pytest.mark.parametrize("num_warps", [1, 4])
-@pytest.mark.parametrize("N", [2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("N", [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("kernel,ref", [
     (_sort_kernel, lambda x: x.sort().values),
     (_sort_desc_kernel, lambda x: x.sort(descending=True).values),

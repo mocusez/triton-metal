@@ -1906,6 +1906,106 @@ validation.
     elementwise plus reshape back, since elementwise work is insensitive to the
     mapping. Only an operation that moves data across lanes exposes it.
 
+64. **`tl.sort` fixed for every elements-per-thread cell: two more silent
+    permutations.** Entry 63 named the disagreement correctly but proposed the
+    wrong side to change. The exchange slot AND the hypercube's per-axis
+    compare direction are both defined in the tile's blocked linearization; the
+    odd one out is the global load and store, so re-indexing the exchange read
+    would have been the wrong repair.
+
+    The first defect is thread-major versus layout order. Everything outside the
+    layout-indexed phase paths places the element a thread holds at tile
+    iteration `iv` at flat index `localTid * E + iv`, register bits low and
+    thread bits above. A blocked layout agrees with that only while the tile
+    fits the threadgroup exactly once; a second register band interleaves the
+    bands at the CTA-tile stride instead. Both are bijections, so a purely
+    elementwise kernel cancels the difference and stays correct, and only a
+    layout-indexed scratch exposes it: the phase sorted a permuted array and the
+    store permuted it again. A rank-1 blocked `tt.make_range` inside a rank-N
+    phase now lowers through `emitLayoutElementIndex` whenever its plan is not
+    thread-major. The new `layoutFlatIndexIsThreadMajor` predicate generalizes
+    `layoutFlatIndexIsLocalTid` from one element per thread to any number and
+    states the condition exactly: register bit `b` must weigh `2^b`, lane bit
+    `b` must weigh `E << b`, and warp bit `b` must weigh `E << (laneBits + b)`.
+    That alone moved `tl.sort` from four to eight elements per thread.
+
+    The second defect is one size-2 indicator standing for two hypercube axes.
+    Triton mints a distinct `#ttg.linear` basis per axis only while the cube
+    fits the register bits its indicator layouts name. At `N = 512` and one warp
+    the rank-9 cube needs four register bits and the indicators only ever name
+    three, so a single value is reshaped into both the stride-128 and the
+    stride-256 axis and the widest merge compares along the neighbour.
+    `splitMixedHypercubeMakeRanges` now also clones a range whose reshape
+    consumers name different axes — it previously skipped linear layouts on the
+    belief that their basis is authoritative for mixed consumers, which is not
+    true once the basis is short — and `planRangeFromHypercubeConsumer` resolves
+    each clone from its consumer.
+
+    ⚠️ The trap inside that second fix: the reshape's own destination type is
+    the degenerate `1x2x1...` broadcast source, not the cube. Its layout
+    collapses to the same basis for every axis, so reading the physical bit from
+    it agrees with the stale indicator and changes nothing. Take the axis from
+    the reshape's non-unit dimension and the BIT from the full hypercube tile;
+    `linearRangeHypercubeAxis` already returns exactly that pair.
+
+    The method that made this tractable was simulating the emitted MSL. The
+    bitonic body is regular enough to parse: per stage, extract the flat index
+    expression, the partner stride and the direction predicate, inline the local
+    definitions, and replay the network in Python. Validated against a working
+    shape and a failing one, then fitted each stage's direction to a single bit
+    of the flat index, it printed `S=256 dir=~f7` where the reference needs
+    `~f8` and named the defect in one line.
+
+    ⚠️ Do not read a `gapprobe12` KILLER/NAMED delta as a regression without
+    re-running: `REPEAT` defaults to one, and topk at `N = 1024` sits on a
+    decline path that segfaults intermittently. Measured thirty times per arm,
+    nine of thirty crashed with the fix and six of thirty without, so it is the
+    same pre-existing flake.
+
+    Measured after: `tl.sort` exact at 1, 2, 4, 8, 16, 32, 64 and 128 elements
+    per thread, both directions, at one, two, four and eight warps; `N = 8192`
+    at four warps is a clean named budget rejection. Metal lit 157/157 and the
+    backend pytest suite 2,568 passed with three skips. The in-tree matrix
+    `test_hypercube_sort_and_flip` now reaches `N = 1024`.
+
+65. **The last `tl.topk` silent wrong answer: pool the budget fallback by
+    element COUNT as well as element type.** The fallback was never inherently
+    unsafe — plain `tl.sort` at 256 elements and above uses it and is exact.
+    Round-robin over two slots is safe exactly while the publishes sharing a
+    pool alternate strictly, and the pool key was the element type alone. A
+    hypercube reduce interleaves two-element direction-table publishes of the
+    same element type between the tile publishes; those flip the parity and
+    hand a comparator the slot it is reading. Adding the element count to the
+    key gives the tables their own tiny pool and restores strict alternation
+    among the tiles.
+
+    The allocator is now a three-tier ladder, each tier allocating no more than
+    the one above it: one buffer per publish, then two per (type, size), then
+    the historical two per type as a last resort, so a kernel too large even
+    for the size-keyed pools behaves exactly as it did before. Preflight and
+    emission still share the one `assignExchangeBuffers`.
+
+    Measured on the shape that motivated it, `tl.topk` at `N = 512`, `k = 32`,
+    four warps: six buffers and 11,272 bytes returning
+    `[509, 508, 509, 508, ...]` before, twenty-one buffers and 11,932 bytes
+    returning the reference after. Six hundred and sixty bytes more scratch. It
+    also pulled three cells off the decline path at `N = 1024`, because the
+    size-keyed pools fit the budget where the no-reuse scheme did not. The
+    permuted 37-cell sweep went from 32 correct, four named rejections and one
+    crash to 35 correct and two crashes, and the two remaining are `N = 2048`
+    on the intermittent decline path, measured at nine crashes and twenty-one
+    clean declines out of thirty — never a wrong answer.
+
+    🔴 The only defect left in this family is that decline crash.
+    `'tt.func' op Metal backend cannot carry a value across full-tile exchange
+    phases` is emitted from inside `FuncOpLowering::matchAndRewrite`, well after
+    `inlineRegionBefore` has moved the body into the new kernel op, which is the
+    canonical rollback-corruption site. The feasibility walk is pure and the
+    buffer assignment is already available before conversion, so it can be
+    hoisted beside `validateTileExchangeScratchBudget`; the work is replaying
+    the phase partition without the lowering's cloned phase ops, behind one
+    shared predicate so the two cannot drift.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the

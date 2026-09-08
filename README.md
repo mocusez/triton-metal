@@ -201,19 +201,38 @@ The current values-only `tl.topk` is supported for static `i32`, `f16`,
 This covers rank-1/2/3 and multi-register-band inputs. The bound is the 32 KiB
 threadgroup-memory budget rather than a fixed number of elements per thread:
 while the phase-exchange scratch fits without reusing a buffer, every exchange
-gets its own and the result is correct. A 72-cell sweep over dtype, direction,
-`k` and `num_warps` gives 68 correct and 2 named rejections.
+gets its own and the result is correct. Above the budget the allocator falls
+back to two alternating slots per pool, which is safe only while the publishes
+sharing a pool alternate strictly. Those pools are keyed by element type AND
+element count: a hypercube reduce interleaves two-element direction-table
+publishes between the tile publishes of the same element type, and pooling
+them together flipped the round-robin parity and handed a comparator the slot
+it was reading. That returned duplicated values at `N = 512` on four warps with
+`k = 32` or `k = 64` until the count joined the key on 2026-09-08. A 37-cell
+sweep over dtype, direction, rank and `num_warps`, fed PERMUTED inputs, gives
+35 correct and two named budget rejections.
 
-One open defect remains, measured on 2026-09-08. When the no-reuse allocation
-does not fit the budget the compiler falls back to two alternating buffers per
-element type, and that scheme can hand a comparator the buffer it is reading,
-which loses one value of the pair. `N = 512`, `k = 32` at four warps is a
-measured shape that lands in the fallback and returns wrong values.
+⚠️ Probe an ordering primitive with a PERMUTATION. A broken selection still
+returns the correct prefix of already-sorted input, so an `arange`-fed sweep
+reported those cells as correct while they were wrong.
 
 The shared Triton frontend rules still apply (`k > 0`, power-of-two
 `k`, and `k <= N`); indices, dynamic shapes, non-final dimensions, and cases
 whose required phase scratch exceeds that budget are not part of this support
 contract.
+
+`tl.sort` and `tl.flip` are supported ascending and descending over static
+power-of-two tiles, and are bounded by the same 32 KiB threadgroup budget
+rather than by elements per thread. Sweeping `N / (32 * num_warps)` from one to
+128 elements per thread is exact in both directions; above the budget the
+compiler declines with a named diagnostic. Two defects that returned a permuted
+array rather than failing were fixed on 2026-09-08. The first: the global load
+and store placed a thread's element at `localTid * E + iv` while the hypercube
+scratch placed it where the tile's blocked layout does, and those agree only
+while the tile fits the threadgroup once. The second: Triton reuses one size-2
+axis indicator for two different hypercube axes once the cube needs more
+register bits than the indicator's linear layout names, so the widest merge
+compared along the neighbouring axis.
 
 `tt.unsplat` is supported for its verifier-valid source shape: a tensor with
 exactly one logical element. The Metal type conversion maps that tensor to its
