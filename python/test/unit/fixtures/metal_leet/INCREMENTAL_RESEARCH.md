@@ -1542,6 +1542,41 @@ validation.
     up from entry 52's 2,539 by exactly the six added cases. No compiler source
     changed.
 
+54. **The full-tile exchange cluster: nothing to fix, and one correction to
+    the audit.** The two exchange diagnostics were the next target because both
+    are emitted from `FuncOpLowering::matchAndRewrite`, and that pattern is the
+    specific generator of the rollback corruption in the decline doctrine: it
+    rewrites the function signature, so a failure returned from it leaves the
+    entry block mismatched. A named `emitOpError` there would still be a
+    process kill.
+
+    It is not reachable that way. Thirteen shapes — standalone rank-2
+    transposes from 32x32 to 256x64 at one and eight warps, a rank-3 permute, a
+    two-transpose kernel, and a symmetric sum `tl.trans(a) + a` up to 256x256
+    that keeps the source live so both layouts must coexist — all compile. A
+    standalone transpose never allocates a pool at all, because the L1d3 work
+    re-encodes the layout instead of moving the data.
+
+    The audit had flagged the scratch-budget message as unpinned. That is a
+    false positive of the guard kind: the same check runs BEFORE conversion in
+    `validateTileExchangeScratchBudget`, whose comment says why in as many
+    words, that conversion failure is not a safe diagnostic path here and an
+    over-budget function must stop while its `tt.func` is still intact. The
+    in-conversion copy is a deliberate backstop and pinning it would pin a
+    shape no user can produce.
+
+    🔑 One result that refines the doctrine. The rank-3 permute lands on
+    `ttg.convert_layout: broader staged-transpose deferred to L1d3`, an
+    in-conversion decline, and it is **stable: 30 of 30 runs exit 1, no signal**.
+    §1a-bis measured a different shape at 8 of 30 crashes. So an in-conversion
+    decline is not uniformly fatal; whether rollback corrupts depends on what
+    the pattern already mutated, and a decline that happens before any
+    signature rewrite is survivable. Exit-code repetition remains the only way
+    to tell the two apart.
+
+    No compiler source changed. This round is a bounded negative: 230 probes
+    across the whole audit so far, one real gap, and that one is fixed.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
