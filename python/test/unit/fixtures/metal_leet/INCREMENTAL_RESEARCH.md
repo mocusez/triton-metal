@@ -1844,6 +1844,31 @@ validation.
     **2,567 passed / 3 skipped / 0 failed**, and `leet-all` at 1,664 passed with
     only the pre-existing source-fidelity byte mismatch.
 
+62. **`tl.sort` at eight or more elements per thread is not the reuse bug.**
+    The natural hypothesis after entry 61 was that sort's remaining failure is
+    the same reuse hazard landing in the budget fallback: a 256-element bitonic
+    sort has 36 stages at a kilobyte each, which does not fit the 32 KiB budget,
+    so it takes two alternating slots.
+
+    Tested rather than assumed. Scaling the fallback from two slots to as many
+    as the budget affords was verified to take effect — the emitted kernel went
+    from two threadgroup buffers to thirty-two, so only four of the thirty-six
+    publishes reuse, at a distance of thirty-two phases — and **the wrong answer
+    did not change at all**, same values, same signature. Meanwhile four
+    elements per thread, with twenty-eight fully distinct buffers, is correct.
+
+    So this is a different defect and the change was reverted: it does not fix
+    the target and it raises threadgroup scratch for those kernels from two
+    kilobytes to thirty-two, exactly at Metal's limit, which costs occupancy for
+    no benefit.
+
+    ⚠️ Recorded so it is not retried. The signature left to explain is that
+    outputs zero through three are correct while outputs four through seven hold
+    values starting at `tpb * 4`: measured at N=256 and N=512 at one warp, both
+    starting from 128, and N=1024 and N=2048 at four warps, both from 512.
+    Something is capped at four elements while the store addresses
+    `localTid * E + iv` with E of eight or more.
+
 The historical post-P3-slice acceptance run collected 1,525 tests and completed with
 1,522 passes and three skips. This total includes the two source-fidelity checks
 in the `leet-all` entry point. All 24 standalone scripts passed, the
