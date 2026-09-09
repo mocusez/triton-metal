@@ -1,4 +1,4 @@
-// RUN: triton-metal-opt --convert-tritongpu-to-metal %s | FileCheck %s
+// RUN: triton-metal-opt --convert-tritongpu-to-metal --split-input-file %s | FileCheck %s
 //
 // A general multi-value `tl.associative_scan((a, b), 0, combine)`: an inclusive
 // Hillis-Steele prefix over one lockstep threadgroup buffer per carried value,
@@ -77,3 +77,66 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.barrier
 // CHECK: metal.get_element %[[BUF0]][%{{.*}}] {metal.materialize}
 // CHECK: metal.get_element %[[BUF1]][%{{.*}}] {metal.materialize}
+
+// -----
+
+// The reverse form is the MIRROR of the same traversal, not a flag on the
+// result: the partner is `tid + stride`, live while it is inside the block, and
+// the partner's range is STILL the left operand. Triton defines a reverse scan
+// as a forward scan of the reversed sequence, so out[i] folds N-1 down to i and
+// the higher positions are applied first.
+//
+// ⚠️ Getting that backwards is invisible to every commutative combine -- a
+// reversed running sum and count are identical under both orders. Measured with
+// the operands swapped: fifty-four of a hundred and eight differential cells
+// against `TRITON_INTERPRET=1` disagreed, and every one of them was a
+// reverse=True cell.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_tuple_reverse(%x: !tt.ptr<f32>, %oa: !tt.ptr<f32>, %ob: !tt.ptr<f32>) {
+    %o = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %o : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    %v = tt.load %ap : tensor<32x!tt.ptr<f32>, #blocked>
+    %r:2 = "tt.scan"(%v, %v) ({
+    ^bb0(%a1: f32, %a2: f32, %b1: f32, %b2: f32):
+      %s = arith.addf %a1, %b1 : f32
+      %m = arith.maxnumf %a2, %b2 : f32
+      tt.scan.return %s, %m : f32, f32
+    }) {axis = 0 : i32, reverse = true} : (tensor<32xf32, #blocked>, tensor<32xf32, #blocked>) -> (tensor<32xf32, #blocked>, tensor<32xf32, #blocked>)
+    %asp = tt.splat %oa : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %aap = tt.addptr %asp, %o : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    tt.store %aap, %r#0 : tensor<32x!tt.ptr<f32>, #blocked>
+    %bsp = tt.splat %ob : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %bap = tt.addptr %bsp, %o : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    tt.store %bap, %r#1 : tensor<32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_tuple_reverse
+// CHECK: %[[BUF0:.*]] = metal.threadgroup_alloca : !metal.memref<32 x f32>
+// CHECK: %[[BUF1:.*]] = metal.threadgroup_alloca : !metal.memref<32 x f32>
+// CHECK: metal.barrier
+// CHECK: metal.store %{{.*}}, %[[BUF0]]
+// CHECK: metal.store %{{.*}}, %[[BUF1]]
+// CHECK: metal.barrier
+// The partner is ABOVE this lane, and it is live while it is inside the block.
+// CHECK: %[[STRIDE:.*]] = arith.constant 1 : i32
+// CHECK: %[[RAW:.*]] = arith.addi %{{.*}}, %[[STRIDE]] : i32
+// CHECK: %[[HAS:.*]] = arith.cmpi slt, %[[RAW]], %{{.*}} : i32
+// CHECK: %[[PARTNER:.*]] = arith.select %[[HAS]], %[[RAW]], %{{.*}} : i32
+// CHECK: %[[L0:.*]] = metal.get_element %[[BUF0]][%{{.*}}] {metal.materialize}
+// CHECK: %[[R0:.*]] = metal.get_element %[[BUF0]][%{{.*}}] {metal.materialize}
+// CHECK: %[[L1:.*]] = metal.get_element %[[BUF1]][%{{.*}}] {metal.materialize}
+// CHECK: %[[R1:.*]] = metal.get_element %[[BUF1]][%{{.*}}] {metal.materialize}
+// The partner's range is the left operand here too.
+// CHECK: %[[SUM:.*]] = arith.addf %[[L0]], %[[R0]] : f32
+// CHECK: %[[MAX:.*]] = arith.maxnumf %[[L1]], %[[R1]] : f32
+// CHECK: %[[N0:.*]] = arith.select %[[HAS]], %[[SUM]], %[[R0]] : f32
+// CHECK: %[[N1:.*]] = arith.select %[[HAS]], %[[MAX]], %[[R1]] : f32
+// CHECK: metal.barrier
+// CHECK: metal.store %[[N0]], %[[BUF0]]
+// CHECK: metal.store %[[N1]], %[[BUF1]]
+// CHECK: metal.barrier

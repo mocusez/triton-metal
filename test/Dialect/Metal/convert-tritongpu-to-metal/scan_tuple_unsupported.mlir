@@ -28,26 +28,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// A reverse tuple scan. The prefix merges `buf[i - stride]` into `buf[i]`, so
-// running it backwards is a different traversal, not a flag; it stays refused
-// rather than silently producing the forward answer.
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scan_tuple_reverse_deferred(%x: !tt.ptr<f32>) {
-    %v = arith.constant dense<1.0> : tensor<32xf32, #blocked>
-    %w = arith.constant dense<2.0> : tensor<32xf32, #blocked>
-    // expected-error @+1 {{a reverse tuple scan is not implemented}}
-    %r:2 = "tt.scan"(%v, %w) ({
-    ^bb0(%a1: f32, %a2: f32, %b1: f32, %b2: f32):
-      %s = arith.addf %a1, %b1 : f32
-      %m = arith.maxnumf %a2, %b2 : f32
-      tt.scan.return %s, %m : f32, f32
-    }) {axis = 0 : i32, reverse = true} : (tensor<32xf32, #blocked>, tensor<32xf32, #blocked>) -> (tensor<32xf32, #blocked>, tensor<32xf32, #blocked>)
-    tt.return
-  }
-}
-
-// -----
 // f16 slots. Each buffer element is one 32-bit slot, and only f32 and i32 have
 // a spelling on both sides of its ui32 storage bridge.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>

@@ -11,9 +11,9 @@ A general tuple scan no longer has to be one of those two shapes: an inclusive
 Hillis-Steele prefix over one threadgroup buffer per carried value replays the
 scan's own combine region, so any associative combine over rank-1 blocked
 f32/i32 sources holding at most one element per thread is lowered.  What is
-still refused -- a narrower slot type, a reverse scan, a rank-2 tile, more than
-one element per thread -- is refused before conversion, by the same predicate
-the pattern dispatches on.
+still refused -- a narrower slot type, a rank-2 tile, more than one element per
+thread -- is refused before conversion, by the same predicate the pattern
+dispatches on.
 """
 
 from __future__ import annotations
@@ -691,3 +691,108 @@ def test_tuple_scan_above_one_element_per_thread_is_named(capfd):
     torch.testing.assert_close(got.cpu().double(),
                                survivor.cpu().double().cumsum(0), atol=1e-4,
                                rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# The reverse direction.
+#
+# Triton defines a reverse scan as a forward scan of the REVERSED sequence, so
+# `out[i]` folds N-1 down to i and the higher positions are applied first. The
+# prefix mirrors accordingly -- partner at `tid + stride`, live while inside the
+# block -- and the partner's range stays the LEFT operand.
+#
+# ⚠️ Nothing commutative can see that last part. A reversed running sum and
+# count come out identical under either operand order; it took an asymmetric
+# combine and `TRITON_INTERPRET=1` as the oracle to catch it, and with the
+# operands swapped fifty-four of a hundred and eight differential cells
+# disagreed -- every reverse one.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _tuple_reverse_sum_and_count_kernel(x_ptr, sum_ptr, count_ptr,
+                                        BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    ones = tl.full((BLOCK,), 1.0, tl.float32)
+    suffix, count = tl.associative_scan((row, ones), 0,
+                                        _tuple_sum_and_count_combine,
+                                        reverse=True)
+    tl.store(sum_ptr + offs, suffix)
+    tl.store(count_ptr + offs, count)
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+@pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
+def test_tuple_scan_reverse_sum_and_count(block, num_warps):
+    if block > 32 * num_warps:
+        pytest.skip("a tuple scan needs at most one element per thread")
+    torch.manual_seed(block * 5 + num_warps)
+    x = torch.randn(block)
+    suffix = torch.zeros(block, device="mps")
+    count = torch.zeros(block, device="mps")
+    _tuple_reverse_sum_and_count_kernel[(1,)](x.to("mps"), suffix, count,
+                                              BLOCK=block,
+                                              num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(suffix.cpu().double(),
+                               x.double().flip(0).cumsum(0).flip(0),
+                               atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        count.cpu(), torch.arange(block, 0, -1, dtype=torch.float32))
+
+
+@triton.jit
+def _tuple_take_right_nonzero_combine(a_value, a_index, b_value, b_index):
+    keep = b_value != 0.0
+    return tl.where(keep, b_value, a_value), tl.where(keep, b_index, a_index)
+
+
+@triton.jit
+def _tuple_take_right_nonzero_kernel(x_ptr, idx_ptr, BLOCK: tl.constexpr,
+                                     REVERSE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    _, index = tl.associative_scan(
+        (tl.load(x_ptr + offs), offs.to(tl.int32)), 0,
+        _tuple_take_right_nonzero_combine, reverse=REVERSE)
+    tl.store(idx_ptr + offs, index)
+
+
+@mps_only
+@pytest.mark.parametrize("block,num_warps", [(32, 1), (64, 2), (128, 4)])
+def test_tuple_scan_reverse_applies_the_higher_positions_first(block,
+                                                               num_warps):
+    """`take the right operand when it is non-zero` is associative and not
+    commutative. Forward it names the LAST non-zero at or before each position;
+    reversed -- a forward scan of the reversed sequence -- it names the FIRST
+    non-zero at or after it. Swap the operands in the reverse merge and the
+    second answer becomes the last non-zero instead."""
+    torch.manual_seed(block * 9 + num_warps)
+    x = torch.zeros(block)
+    hits = sorted(torch.randperm(block)[:4].tolist())
+    for h in hits:
+        x[h] = float(h) + 1.0
+
+    forward = torch.zeros(block, dtype=torch.int32, device="mps")
+    _tuple_take_right_nonzero_kernel[(1,)](x.to("mps"), forward, BLOCK=block,
+                                           REVERSE=False,
+                                           num_warps=num_warps)
+    reverse = torch.zeros(block, dtype=torch.int32, device="mps")
+    _tuple_take_right_nonzero_kernel[(1,)](x.to("mps"), reverse, BLOCK=block,
+                                           REVERSE=True, num_warps=num_warps)
+    torch.mps.synchronize()
+
+    want_forward, last = [], 0
+    for i in range(block):
+        if x[i] != 0:
+            last = i
+        want_forward.append(last)
+    want_reverse, nxt = [0] * block, 0
+    for i in range(block - 1, -1, -1):
+        if x[i] != 0:
+            nxt = i
+        want_reverse[i] = nxt
+
+    assert forward.cpu().tolist()[hits[0]:] == want_forward[hits[0]:]
+    assert reverse.cpu().tolist()[:hits[-1] + 1] == want_reverse[:hits[-1] + 1]

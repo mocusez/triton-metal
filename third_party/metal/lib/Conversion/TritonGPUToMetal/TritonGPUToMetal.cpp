@@ -11527,8 +11527,6 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
     return no("a tuple scan needs one result per source");
   if (op.getAxis() != 0)
     return no("a general tuple scan is implemented for axis 0 only");
-  if (op.getReverse())
-    return no("a reverse tuple scan is not implemented");
   if (underDivergentControlFlow(op))
     return no("a tuple scan needs uniform control flow: its barriers must be "
               "reached by every thread of the threadgroup");
@@ -11574,19 +11572,23 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
 
 // Lower a general multi-value rank-1 scan as an inclusive Hillis-Steele prefix
 // over N lockstep threadgroup buffers, one per carried value, replaying the
-// scan's own combine region at each merge.
+// scan's own combine region at each merge. A reverse scan is the mirror of the
+// same traversal, not a flag on the result: it merges the HIGHER partner into
+// each lane, with that lane's own range still on the left.
 //
 // The dedicated `metal.threadgroup_prefix_sum` the single-value path uses
 // cannot serve this: it carries ONE value and one of two hard-wired monoids.
 // Everything below is the same shape as the tuple reduce's tree, with three
 // differences that matter:
 //
-//  * The merge is `combine(buf[i - stride], buf[i])`, and the left operand is
-//    the LOWER position, so an associative-but-not-commutative combine
-//    concatenates its ranges in order.
-//  * There is no identity, and none is needed: a lane below the stride keeps
-//    what it holds, and lanes at or above BLOCK are never read by a lane below
-//    them.
+//  * The merge is `combine(buf[i - stride], buf[i])` forward and
+//    `combine(buf[i + stride], buf[i])` reversed -- the PARTNER's range is the
+//    left operand in both, because Triton's reverse scan is a forward scan of
+//    the reversed sequence, so an associative-but-not-commutative combine
+//    concatenates its ranges in the order that scan applies them.
+//  * There is no identity, and none is needed: a lane whose partner falls
+//    outside the block keeps what it holds, and a slot at or above BLOCK is
+//    never merged in.
 //  * The read and the write of one step are separated by a barrier, so every
 //    lane has read the previous step's values before any lane overwrites them.
 //    The reads are forced into named bindings for the same reason -- the
@@ -11674,22 +11676,35 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
     StoreOp::create(rewriter, loc, toStorage(mine[i], i), bufs[i], tidUI32);
   BarrierOp::create(rewriter, loc);
 
+  const bool reverse = op.getReverse();
   auto cZeroI32 = mlir::arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(0));
+  auto cBlock = mlir::arith::ConstantOp::create(
+      rewriter, loc,
+      rewriter.getI32IntegerAttr(static_cast<int32_t>(blockSize)));
   for (int64_t stride = 1; stride < blockSize; stride *= 2) {
     auto cStride = mlir::arith::ConstantOp::create(
         rewriter, loc,
         rewriter.getI32IntegerAttr(static_cast<int32_t>(stride)));
-    // The partner is `tid - stride`, clamped so a lane below the stride still
-    // addresses inside the buffer; its merge is discarded by the select below.
+    // The partner is `tid - stride` forward, `tid + stride` reversed, clamped
+    // so a lane whose partner falls outside the block still addresses inside
+    // the buffer; its merge is discarded by the select below.
     mlir::Value rawPartner =
-        mlir::arith::SubIOp::create(rewriter, loc, tidI32, cStride.getResult())
-            .getResult();
-    mlir::Value hasPartner = mlir::arith::CmpIOp::create(
-                                 rewriter, loc,
-                                 mlir::arith::CmpIPredicate::sge, tidI32,
-                                 cStride.getResult())
-                                 .getResult();
+        reverse ? mlir::arith::AddIOp::create(rewriter, loc, tidI32,
+                                              cStride.getResult())
+                      .getResult()
+                : mlir::arith::SubIOp::create(rewriter, loc, tidI32,
+                                              cStride.getResult())
+                      .getResult();
+    mlir::Value hasPartner =
+        reverse ? mlir::arith::CmpIOp::create(
+                      rewriter, loc, mlir::arith::CmpIPredicate::slt,
+                      rawPartner, cBlock.getResult())
+                      .getResult()
+                : mlir::arith::CmpIOp::create(
+                      rewriter, loc, mlir::arith::CmpIPredicate::sge, tidI32,
+                      cStride.getResult())
+                      .getResult();
     mlir::Value partner =
         mlir::arith::SelectOp::create(rewriter, loc, hasPartner, rawPartner,
                                       cZeroI32.getResult())
@@ -11698,11 +11713,24 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
                                 rewriter, loc, mlir::TypeRange{ui32},
                                 mlir::ValueRange{partner})
                                 .getResult(0);
-    llvm::SmallVector<mlir::Value, 4> lhs, rhs;
+    // The PARTNER's range is the left operand in both directions, and that is
+    // not symmetry -- it is what `reverse` means. Triton defines a reverse scan
+    // as a forward scan of the reversed sequence, so out[i] folds N-1 down to
+    // i, with the higher positions applied FIRST. Forward the partner holds the
+    // lower positions and reversed it holds the higher ones, and either way it
+    // is the side that comes first in the fold.
+    //
+    // ⚠️ Getting this backwards is invisible to every commutative combine: a
+    // reversed running sum and count are identical under both orders. It shows
+    // up on a combine like "take the right operand when it is non-zero", where
+    // the reversed scan must report the LEFTMOST non-zero at or after i and the
+    // swapped version reports the rightmost.
+    llvm::SmallVector<mlir::Value, 4> own, lhs, rhs;
     for (size_t i = 0; i < n; ++i) {
       lhs.push_back(readSlot(i, partnerUI));
-      rhs.push_back(readSlot(i, tidUI32));
+      own.push_back(readSlot(i, tidUI32));
     }
+    rhs.assign(own.begin(), own.end());
     llvm::SmallVector<mlir::Value, 4> merged =
         emitClonedRegionCombine(op->getRegion(0), lhs, rhs, rewriter, loc);
     if (merged.size() != n)
@@ -11714,7 +11742,7 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
         return rewriter.notifyMatchFailure(
             op, "tuple scan: combine region yielded nothing");
       next.push_back(mlir::arith::SelectOp::create(rewriter, loc, hasPartner,
-                                                   merged[i], rhs[i])
+                                                   merged[i], own[i])
                          .getResult());
     }
     // Every lane has read this step's inputs before any lane overwrites them.
