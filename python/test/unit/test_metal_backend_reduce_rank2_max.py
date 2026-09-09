@@ -515,19 +515,45 @@ def _axis0_reduce_kernel(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
     tl.store(out_ptr + rn, tl.sum(v, axis=0))
 
 
-def test_axis0_reduce_wide_tile_is_rejected_not_crashed(capfd):
-    """An axis=0 reduce with more columns than threads is deferred. That
-    decline used to happen INSIDE applyFullConversion, where a
-    notifyMatchFailure does not produce a catchable error — it segfaults the
-    process during the failed conversion's rollback, taking the caller with it.
-    Pre-pass rejections unwind cleanly, so this asserts both that the error is
-    catchable AND that the process can still compile afterwards."""
+def test_axis0_reduce_wide_tile_is_lowered():
+    """An axis=0 reduce with more columns than threads used to be deferred, on
+    the assumption that the output layout was one the tile-loop model would
+    mis-address. The lowering now reads that layout off the rank-1 value the
+    result becomes, so this shape -- two rows, sixty-four columns, one warp --
+    is an ordinary column sum."""
+    m, n = 2, 64  # tpb = 32 at num_warps=1, so N > tpb
+    x = torch.rand(m, n, dtype=torch.float32)
+    out = torch.zeros(n, dtype=torch.float32, device="mps")
+    _axis0_reduce_kernel[(1,)](x.to("mps"), out, M=m, N=n, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x.sum(0), atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _axis0_reduce_reexpand_kernel(x_ptr, out_ptr, M: tl.constexpr,
+                                  N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :],
+             v - tl.sum(v, axis=0)[None, :])
+
+
+def test_axis0_reduce_reexpanded_result_is_rejected_not_crashed(capfd):
+    """What is still deferred at more columns than threads is a result pushed
+    back into a 2-D tile: Triton gives that tile a sizePerThread=[1, E] layout
+    whose slice `tt.expand_dims` cannot lower. That decline happens INSIDE
+    applyFullConversion, where a failure does not produce a catchable error --
+    it aborts the process during the failed conversion's rollback, taking the
+    caller with it. The pre-pass refusal unwinds cleanly, so this asserts both
+    that the error is catchable AND that the process can still compile
+    afterwards."""
     m, n = 2, 64  # tpb = 32 at num_warps=1, so N > tpb
     x = torch.rand(m, n, dtype=torch.float32, device="mps")
-    out = torch.zeros(n, dtype=torch.float32, device="mps")
+    out = torch.zeros(m, n, dtype=torch.float32, device="mps")
     with pytest.raises(Exception):
-        _axis0_reduce_kernel[(1,)](x, out, M=m, N=n, num_warps=1)
-    assert "one output column per thread" in capfd.readouterr().err
+        _axis0_reduce_reexpand_kernel[(1,)](x, out, M=m, N=n, num_warps=1)
+    assert "no re-expansion back to a 2-D tile" in capfd.readouterr().err
 
     # Still usable: a compile after the caught failure must succeed.
     y = torch.rand(64, dtype=torch.float32, device="mps")

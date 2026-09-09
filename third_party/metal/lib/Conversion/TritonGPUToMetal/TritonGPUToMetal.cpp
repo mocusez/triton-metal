@@ -1217,22 +1217,40 @@ static mlir::LogicalResult materializeTileInvariantRank1Reduces(
 
 using ReduceOutTileMap = llvm::DenseMap<mlir::Operation *, TileInfo>;
 
-// Recover the blocked tile that materializes a rank-2 axis=1 reduce result.
-// This must run on the original TTGIR, before full conversion scalarizes
-// broadcast/arith/store users and erases the tensor result types that carry the
-// consumer geometry.
+// Recover the blocked tile that materializes a rank-2 reduce result, along
+// either axis. This must run on the original TTGIR, before full conversion
+// scalarizes broadcast/arith/store users and erases the tensor result types
+// that carry the consumer geometry.
+//
+// Both axes need it for the same reason: the result carries a `#ttg.slice`
+// encoding, which names no blocked tile of its own, so the geometry the
+// consuming threads iterate has to come from the value the result BECOMES.
+// Taking it from the consumer is also what keeps the reduce and its store on
+// one index mapping -- the divisor and the order must come from the same
+// tensor, or the two agree only in kernels with a single layout.
 static std::optional<TileInfo>
-findRank2Axis1ReduceOutTile(mlir::triton::ReduceOp op) {
+findRank2ReduceOutTile(mlir::triton::ReduceOp op) {
   auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(
       op.getSrcs().empty() ? mlir::Type{} : op.getSrcs().front().getType());
-  if (!srcTy || srcTy.getRank() != 2 || op.getAxis() != 1)
+  if (!srcTy || srcTy.getRank() != 2 || op.getAxis() > 1)
     return std::nullopt;
 
+  // Axis 0 wants the rank-1 [BN] value the result becomes, and NOTHING wider.
+  // Its result is commonly broadcast straight back into a [BM, BN] tile
+  // (`x - mean[None, :]`), which is a larger consumer and would win the size
+  // tiebreak below while describing a completely different iteration. Axis 1
+  // keeps taking the largest, where the widest consumer IS the geometry the
+  // per-row scanner needs.
+  const bool axis0 = op.getAxis() == 0;
+  const int64_t wantColumns = axis0 ? srcTy.getDimSize(1) : 0;
   std::optional<TileInfo> outTile;
   int64_t bestSize = 0;
   auto consider = [&](mlir::Type t) {
     auto ti = tileFromTensor(t);
     if (!ti)
+      return;
+    if (axis0 &&
+        (ti->rank != 1 || ti->shape.size() != 1 || ti->shape[0] != wantColumns))
       return;
     int64_t sz = 1;
     for (auto s : ti->shape)
@@ -1283,10 +1301,55 @@ findRank2Axis1ReduceOutTile(mlir::triton::ReduceOp op) {
   return outTile;
 }
 
-static ReduceOutTileMap precomputeRank2Axis1ReduceOutTiles(mlir::ModuleOp m) {
+// True when a rank-2 axis=0 reduce's result stays a rank-1 value everywhere it
+// is used.
+//
+// This only matters once the columns outnumber the threads, and it is not a
+// property of the reduce at all: `mean[None, :]` re-expands the result into a
+// [BM, BN] tile, and at E_out > 1 Triton gives that tile a
+// `sizePerThread = [1, E]` layout whose slice `tt.expand_dims` has no lowering
+// for. That failure is raised from inside `applyFullConversion`, which aborts
+// the process rather than raising -- so the shape has to be refused before
+// conversion, by the same predicate the pattern uses.
+static bool rank2Axis0ResultStaysRank1(mlir::triton::ReduceOp op) {
+  llvm::SmallVector<mlir::Operation *, 8> worklist;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (auto *u : op->getResult(0).getUsers())
+    worklist.push_back(u);
+  while (!worklist.empty()) {
+    mlir::Operation *u = worklist.pop_back_val();
+    if (!seen.insert(u).second)
+      continue;
+    for (auto res : u->getResults()) {
+      if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(res.getType()))
+        if (rt.getRank() > 1)
+          return false;
+      for (auto *next : res.getUsers())
+        worklist.push_back(next);
+    }
+  }
+  return true;
+}
+
+// True when a rank-2 axis=0 reduce whose columns outnumber the threads has the
+// consumer geometry its lowering needs: a rank-1 tile over the same threads,
+// holding exactly this result's columns, one band per tile-loop iteration.
+// The pattern and the pre-conversion validator both ask this, so a shape the
+// pattern would decline is named before conversion rather than declined inside
+// it -- an in-conversion decline SEGFAULTS the rollback on this backend.
+static bool rank2Axis0OutTileUsable(const TileInfo *tile, int64_t tpb,
+                                    int64_t bn) {
+  if (!tile || tpb <= 0 || bn <= 0)
+    return false;
+  const int64_t eOut = (bn + tpb - 1) / tpb;
+  return tile->rank == 1 && tile->shape.size() == 1 && tile->shape[0] == bn &&
+         tile->threadsPerBlock == tpb && tile->elemPerThread == eOut;
+}
+
+static ReduceOutTileMap precomputeRank2ReduceOutTiles(mlir::ModuleOp m) {
   ReduceOutTileMap result;
   m.walk([&](mlir::triton::ReduceOp red) {
-    if (auto outTile = findRank2Axis1ReduceOutTile(red))
+    if (auto outTile = findRank2ReduceOutTile(red))
       result[red.getOperation()] = *outTile;
   });
   return result;
@@ -12054,7 +12117,8 @@ struct GatherLowering
 // per-program column base (pid*BN) are recovered from the cone, not extracted.
 static mlir::LogicalResult
 lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
-                      mlir::ConversionPatternRewriter &rewriter) {
+                      mlir::ConversionPatternRewriter &rewriter,
+                      const TileInfo *outTile) {
   auto loc = op.getLoc();
   auto rtt =
       mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
@@ -12338,14 +12402,8 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
         op, "rank-2 axis0 reduce: base memref not found");
   mlir::Value maskV = loadOp.getMask();
 
-  // tpb from the source tile's blocked encoding (mirrors the axis=1 path — a
-  // forward walk to the store is fragile under conversion ordering). Require
-  // E_out == 1 (BN <= tpb) so each thread owns exactly one output column
-  // c == localTid. BN > tpb is DEFERRED: at that point coalescing has moved the
-  // output to a sizePerThread>1 layout (not the naive spt=1, E>1 the tile-loop
-  // model assumes), so a per-iteration column index would silently mis-address.
-  // The caller avoids it by launching tpb >= BN (as the layer-norm backward
-  // does) or tiling the columns across the grid.
+  // tpb from the source tile's blocked encoding (the reduce's own result
+  // carries a `#ttg.slice` encoding, which names no blocked tile).
   auto srcBlocked =
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
           rtt.getEncoding());
@@ -12358,30 +12416,58 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   for (auto w : srcBlocked.getWarpsPerCTA())
     tpb *= w;
   int64_t BN = rtt.getDimSize(1);
-  if (tpb <= 0 || BN > tpb)
-    return rewriter.notifyMatchFailure(
-        op, "rank-2 axis0 reduce: E_out>1 deferred (launch tpb>=BN)");
+  if (tpb <= 0)
+    return rewriter.notifyMatchFailure(op,
+                                       "rank-2 axis0 reduce: empty geometry");
 
-  // nVal = per-thread output column = localTid = globalTid - tgid*tpb.
-  auto tidG =
-      ThreadIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
-  mlir::Value tidI = mlir::UnrealizedConversionCastOp::create(
-                         rewriter, loc, mlir::TypeRange{i32},
-                         mlir::ValueRange{tidG.getResult()})
-                         .getResult(0);
-  auto tgG =
-      ThreadgroupIdOp::create(rewriter, loc, ui32, rewriter.getStringAttr("x"));
-  mlir::Value tgI = mlir::UnrealizedConversionCastOp::create(
-                        rewriter, loc, mlir::TypeRange{i32},
-                        mlir::ValueRange{tgG.getResult()})
-                        .getResult(0);
-  auto cTpb = mlir::arith::ConstantOp::create(
-      rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
-  mlir::Value tgOff =
-      mlir::arith::MulIOp::create(rewriter, loc, tgI, cTpb.getResult())
-          .getResult();
-  mlir::Value nVal =
-      mlir::arith::SubIOp::create(rewriter, loc, tidI, tgOff).getResult();
+  // nVal = the output column this thread produces on this tile-loop iteration.
+  //
+  // At E_out == 1 (BN <= tpb) that is just the local thread id. Above it the
+  // columns outnumber the threads and the column depends on the iteration as
+  // well, in whichever of the two shapes the OUT tile's layout uses --
+  // `tid * E + iv` when a thread holds a contiguous band, `tid + iv * tpb`
+  // when the bands interleave. Taking the tile from the CONSUMER rather than
+  // inventing one is what keeps this reduce and its store on a single index
+  // mapping; `emitPerIterIndex` is the same function the store itself uses.
+  //
+  // This used to be refused outright, on the assumption that coalescing had
+  // moved the output to a `sizePerThread > 1` layout the tile-loop model would
+  // mis-address. The layout is not assumed any more: it is read.
+  mlir::Value tidLocal = emitLocalTid(rewriter, loc, tpb);
+  mlir::Value nVal = tidLocal;
+  const int64_t eOut = (BN + tpb - 1) / tpb;
+  if (BN > tpb) {
+    // The tile loop is not checked before conversion because it does not exist
+    // yet: `FuncOpLowering` builds it. It cannot be missing here either --
+    // E_out > 1 means the [BM, BN] source tile has more than one element per
+    // thread too, which is what makes the function's tile loop exist at all.
+    mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
+    if (!rank2Axis0OutTileUsable(outTile, tpb, BN) ||
+        !rank2Axis0ResultStaysRank1(op) || !tileLoop)
+      return rewriter.notifyMatchFailure(
+          op, "rank-2 axis0 reduce: more output columns than threads needs the "
+              "consumer's rank-1 blocked tile and the tile loop");
+    nVal = mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{i32},
+               mlir::ValueRange{
+                   emitPerIterIndex(*outTile, tileLoop, rewriter, loc)})
+               .getResult(0);
+    // The tile loop is sized by the LARGEST tile in the function, which here is
+    // the [BM, BN] source, so it runs past this result's own element count. A
+    // column read on such an iteration is discarded by the store's own guard,
+    // but it must not address outside the row first.
+    auto cBN = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(BN)));
+    auto cZeroCol = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(0));
+    mlir::Value inRow = mlir::arith::CmpIOp::create(
+                            rewriter, loc, mlir::arith::CmpIPredicate::slt,
+                            nVal, cBN.getResult())
+                            .getResult();
+    nVal = mlir::arith::SelectOp::create(rewriter, loc, inRow, nVal,
+                                         cZeroCol.getResult())
+               .getResult();
+  }
   mlir::Value dummyRowBase = mlir::arith::ConstantOp::create(
                                  rewriter, loc, rewriter.getI32IntegerAttr(0))
                                  .getResult();
@@ -13757,8 +13843,19 @@ struct ReduceLowering
       return mlir::failure();
     if (rtt.isDynamicDim(0) || rtt.isDynamicDim(1))
       return mlir::failure();
-    if (op.getAxis() == 0)
-      return lowerRank2Axis0Reduce(op, rewriter);
+    if (op.getAxis() == 0) {
+      // The tile of the value this result BECOMES downstream. It is what says
+      // which output column a thread owns at a given tile-loop iteration once
+      // the columns outnumber the threads; the result's own `#ttg.slice`
+      // encoding names no blocked tile.
+      const TileInfo *axis0OutTile = nullptr;
+      if (outTileMap) {
+        auto it = outTileMap->find(op.getOperation());
+        if (it != outTileMap->end())
+          axis0OutTile = &it->second;
+      }
+      return lowerRank2Axis0Reduce(op, rewriter, axis0OutTile);
+    }
     if (op.getAxis() != 1)
       return mlir::failure();
     mlir::Type elemTy = rtt.getElementType();
@@ -34323,13 +34420,15 @@ struct ConvertTritonGPUToMetalPass
               "sum/product/max/min (Session L3a2); other combines deferred");
           reduceOk = false;
         }
-        // E_out > 1 (BN > tpb) is deferred in lowerRank2Axis0Reduce. That
-        // decline has to be made HERE: a pattern that declines inside
-        // `applyFullConversion` does not produce a catchable error, it
-        // SEGFAULTS the process during the failed conversion's rollback, so
-        // `tl.sum(x, axis=0)` with BN > threads-per-block killed any script
-        // that reached it, try/except included. Pre-pass rejections unwind
-        // cleanly and the process stays usable.
+        // More output columns than threads (E_out > 1) is lowered by reading
+        // the CONSUMER's rank-1 tile, which says which column a thread owns on
+        // each tile-loop iteration. When no such consumer exists the lowering
+        // declines, and that decline has to be made HERE: a pattern that
+        // declines inside `applyFullConversion` does not produce a catchable
+        // error, it SEGFAULTS the process during the failed conversion's
+        // rollback, so `tl.sum(x, axis=0)` with BN > threads-per-block killed
+        // any script that reached it, try/except included. Pre-pass rejections
+        // unwind cleanly and the process stays usable.
         if (auto srcBlocked =
                 mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
                     rtt.getEncoding())) {
@@ -34338,12 +34437,20 @@ struct ConvertTritonGPUToMetalPass
             tpb *= t;
           for (auto w : srcBlocked.getWarpsPerCTA())
             tpb *= w;
-          if (tpb > 0 && rtt.getDimSize(1) > tpb) {
-            red.emitOpError(
-                "rank-2 axis=0 reduce needs one output column per thread; "
-                "launch with threads-per-block >= the tile's column count, or "
-                "tile the columns across the grid");
-            reduceOk = false;
+          int64_t bn = rtt.getDimSize(1);
+          if (tpb > 0 && bn > tpb) {
+            std::optional<TileInfo> outTile = findRank2ReduceOutTile(red);
+            if (!rank2Axis0OutTileUsable(outTile ? &*outTile : nullptr, tpb,
+                                         bn) ||
+                !rank2Axis0ResultStaysRank1(red)) {
+              red.emitOpError(
+                  "rank-2 axis=0 reduce with more output columns than threads "
+                  "needs a rank-1 consumer carrying exactly those columns and "
+                  "no re-expansion back to a 2-D tile; launch with "
+                  "threads-per-block >= the tile's column count, or tile the "
+                  "columns across the grid");
+              reduceOk = false;
+            }
           }
         }
         if (iOk && combineName == "arith.muli") {
@@ -35201,7 +35308,7 @@ struct ConvertTritonGPUToMetalPass
     g_reduceRowBufs = &reduceRowBufs;
 
     ReduceOutTileMap reduceOutTiles =
-        precomputeRank2Axis1ReduceOutTiles(moduleOp);
+        precomputeRank2ReduceOutTiles(moduleOp);
 
     TritonGPUToMetalTypeConverter typeConverter(ctx);
 

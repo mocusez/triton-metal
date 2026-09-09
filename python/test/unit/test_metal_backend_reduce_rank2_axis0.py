@@ -21,10 +21,18 @@ reassociation reassociates any same-kind loop-carried accumulator whose tensor
 update op has an elementwise scalarizing lowering — arith.add{f,i},
 metal.binary_exp for f32 max, and scalar arith.maxsi/minsi for i32 max/min). Sum
 uses scalar arith; f32 max uses metal.binary_exp; i32 max/min use cmpi+select in
-the reduce body (binary_exp rejects signless i32). Only output E==1 (BN <= tpb):
-BN > tpb is deferred (coalescing moves the output to sizePerThread>1, so a
-per-iteration column index would mis-address — the caller launches tpb >= BN or
-tiles columns across the grid).
+the reduce body (binary_exp rejects signless i32).
+
+MORE COLUMNS THAN THREADS (output E>1, BN > tpb). Each thread then owns several
+output columns, one per tile-loop iteration, and which one it owns on a given
+iteration is a property of the CONSUMING value's layout — `tid + iv*tpb` when
+the bands interleave, `tid*E + iv` when a thread holds a contiguous band. The
+lowering reads that layout off the rank-1 value the result becomes (the same
+tile, and the same index function, the consuming store uses) rather than
+assuming one. It stays refused when the result is re-expanded into a 2-D tile
+(`mean[None, :]`): at E>1 Triton gives that tile a sizePerThread=[1, E] layout
+whose slice `tt.expand_dims` cannot lower, and that failure is raised from
+inside conversion, which aborts the process.
 
 ADDRESS SPELLING (`test_*_two_level_addptr` below). Triton emits one of two
 shapes for the same tile address, chosen purely by how the Python is
@@ -578,3 +586,160 @@ def test_reduce_axis0_chained_cone(M, N, BM, BN):
     xc = x.cpu().double()
     ref = ((xc - xc.mean(0)) ** 2).mean(0).float()
     torch.testing.assert_close(out.cpu(), ref, atol=1e-5, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# More output columns than the threadgroup has threads (output E > 1).
+#
+# This used to be refused outright, on the assumption that the output layout
+# would be one the tile-loop model mis-addresses. The layout is no longer
+# assumed: the column a thread owns on a given iteration comes from the rank-1
+# tile the result becomes, which is the same tile the consuming store indexes
+# with. The same kernel at four warps (tpb=128, E=1) and at one warp (tpb=32,
+# E=4) must give the same answer.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _colsum_direct(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    tl.store(Out + tl.arange(0, BN), tl.sum(tile, axis=0))
+
+
+@triton.jit
+def _colmax_direct(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    tl.store(Out + tl.arange(0, BN), tl.max(tile, axis=0))
+
+
+@pytest.mark.parametrize("BM, BN, num_warps", [
+    (8, 64, 1),     # E_out = 2
+    (8, 128, 1),    # E_out = 4
+    (4, 256, 1),    # E_out = 8
+    (8, 256, 4),    # E_out = 2, four warps
+    (16, 512, 4),   # E_out = 4
+    (8, 1024, 8),   # E_out = 4, eight warps
+    (32, 128, 1),   # more rows than threads as well
+])
+def test_reduce_axis0_more_columns_than_threads(BM, BN, num_warps):
+    torch.manual_seed(BM * 101 + BN + num_warps)
+    inp = torch.randn(BM, BN)
+    out = torch.empty(BN, device="mps")
+    _colsum_direct[(1,)](inp.to("mps").contiguous(), out, BM=BM, BN=BN,
+                         num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().double(), inp.double().sum(0),
+                               atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("BM, BN, num_warps", [(8, 128, 1), (8, 256, 4)])
+def test_reduce_axis0_more_columns_than_threads_max(BM, BN, num_warps):
+    """A maximum reads the same address relation as the sum but folds with a
+    different operator, so it catches a column index that is off by a band
+    rather than merely mis-scaled."""
+    torch.manual_seed(BM + BN)
+    inp = torch.randn(BM, BN)
+    out = torch.empty(BN, device="mps")
+    _colmax_direct[(1,)](inp.to("mps").contiguous(), out, BM=BM, BN=BN,
+                         num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.max(dim=0).values, atol=1e-5,
+                               rtol=1e-5)
+
+
+@pytest.mark.parametrize("M, N, num_warps", [(64, 256, 1), (96, 700, 2),
+                                             (100, 512, 4)])
+def test_reduce_axis0_colsum_masked_more_columns_than_threads(M, N, num_warps):
+    """The loop-carried, masked, multi-program form -- tutorial-05's shape --
+    with the column block wider than the threadgroup."""
+    torch.manual_seed(M * 7 + N + num_warps)
+    inp = torch.randn(M, N, device="mps")
+    out = torch.empty(N, device="mps")
+    block_n = 256
+    _colsum[(triton.cdiv(N, block_n),)](inp, out, M, N, BLOCK_M=32,
+                                        BLOCK_N=block_n, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), inp.cpu().sum(0), atol=1e-3,
+                               rtol=1e-3)
+
+
+@triton.jit
+def _colsum_i32_direct(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    tl.store(Out + tl.arange(0, BN), tl.sum(tile, axis=0))
+
+
+def test_reduce_axis0_more_columns_than_threads_i32():
+    torch.manual_seed(5)
+    BM, BN = 8, 128
+    inp = torch.randint(-500, 500, (BM, BN), dtype=torch.int32)
+    out = torch.empty(BN, dtype=torch.int32, device="mps")
+    _colsum_i32_direct[(1,)](inp.to("mps").contiguous(), out, BM=BM, BN=BN,
+                             num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), inp.sum(0, dtype=torch.int32))
+
+
+@triton.jit
+def _colsum_rows_per_program(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + (pid * BM + rows) * BN + cols)
+    tl.store(Out + pid * BN + tl.arange(0, BN), tl.sum(tile, axis=0))
+
+
+def test_reduce_axis0_more_columns_than_threads_multiprogram():
+    """Each threadgroup addresses its own columns by a LOCAL thread id; a
+    global one would shift every group's window by tgid*tpb."""
+    torch.manual_seed(6)
+    P, BM, BN = 3, 8, 128
+    inp = torch.randn(P * BM, BN)
+    out = torch.zeros(P, BN, device="mps")
+    _colsum_rows_per_program[(P,)](inp.to("mps").contiguous(), out, BM=BM,
+                                   BN=BN, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().double(),
+                               inp.view(P, BM, BN).double().sum(1), atol=1e-4,
+                               rtol=1e-4)
+
+
+@triton.jit
+def _colmean_reexpanded(In, OutMean, OutDev, BM: tl.constexpr,
+                        BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    mean = tl.sum(tile, axis=0) / BM
+    tl.store(OutMean + tl.arange(0, BN), mean)
+    tl.store(OutDev + rows * BN + cols, tile - mean[None, :])
+
+
+def test_reduce_axis0_reexpanded_result_is_named(capfd):
+    """`mean[None, :]` at more columns than threads gives the re-expanded tile
+    a sizePerThread=[1, E] layout whose slice `tt.expand_dims` cannot lower.
+    That failure is raised from INSIDE conversion, which aborts the process, so
+    the shape has to be refused before conversion. Without this refusal the
+    same kernel killed the interpreter on seven runs out of ten."""
+    BM, BN = 8, 128
+    inp = torch.randn(BM, BN, device="mps")
+    mean = torch.zeros(BN, device="mps")
+    dev = torch.zeros(BM, BN, device="mps")
+    with pytest.raises(Exception) as error:
+        _colmean_reexpanded[(1,)](inp, mean, dev, BM=BM, BN=BN, num_warps=1)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    reason = capfd.readouterr()
+    assert "no re-expansion back to a 2-D tile" in reason.err + reason.out
+
+    survivor = torch.randn(4, 32, device="mps")
+    out = torch.empty(32, device="mps")
+    _colsum_direct[(1,)](survivor, out, BM=4, BN=32, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), survivor.cpu().sum(0), atol=1e-4,
+                               rtol=1e-4)
