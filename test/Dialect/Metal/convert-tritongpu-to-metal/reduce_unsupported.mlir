@@ -46,32 +46,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 }
 
 // -----
-// A two-source reducer that is close to argmax but selects the HIGHER index on
-// ties must not be claimed by the canonical argmax lowering.
+// A tuple reduce holding MORE THAN ONE element per thread. The lockstep
+// buffers give each thread one slot, and its converted scalar is its single
+// logical element; above that the thread owns a band the tree cannot address.
 //
-// It is now refused one gate earlier, as a multi-value reduce, rather than by
-// the single-result combine allowlist noticing `arith.cmpf`. Same verdict, and
-// the reason is the accurate one: the shape has two sources, which is what the
-// lowering cannot do. The allowlist only ever caught this by accident -- see
-// the `maxnumf` pair at the end of this file, whose first region op IS on the
-// allowlist and which therefore crashed the process instead.
+// This is the adjacent negative of `rank1_reduce_tuple.mlir`: the same
+// combine, one warp instead of four. A near-miss argmax that breaks ties
+// towards the HIGHER index used to sit here too -- it is now lowered, which is
+// the point of that fixture.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_tuple_above_one_element_per_thread(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %y = arith.constant dense<2.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{a general tuple reduce needs at most one element per thread (BLOCK <= threads per block)}}
+    %r:2 = "tt.reduce"(%x, %y) ({
+    ^bb0(%a1: f32, %b1: f32, %a2: f32, %b2: f32):
+      %m1 = arith.minnumf %a1, %a2 : f32
+      %m2 = arith.maxnumf %b1, %b2 : f32
+      tt.reduce.return %m1, %m2 : f32, f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (f32, f32)
+    tt.return
+  }
+}
+
+// -----
+// A tuple reduce whose slots are f16. Each lockstep buffer is one 32-bit slot,
+// and only f32 and i32 have a spelling on both sides of its ui32 storage
+// bridge; a narrower type would need its own staging decision, so it stays
+// refused rather than silently widened.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_argmax_near_miss(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<1.0> : tensor<32xf32, #blocked>
-    %idx = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
-    // expected-error @+1 {{multi-value tt.reduce is implemented only for the canonical rank-1 argmax and rank-2 axis=1 argmin pairs}}
-    %r:2 = "tt.reduce"(%x, %idx) ({
-    ^bb0(%lhs_value: f32, %lhs_index: i32, %rhs_value: f32, %rhs_index: i32):
-      %equal = arith.cmpf oeq, %lhs_value, %rhs_value : f32
-      %higher_index = arith.cmpi sgt, %lhs_index, %rhs_index : i32
-      %equal_and_higher = arith.andi %equal, %higher_index : i1
-      %greater = arith.cmpf ogt, %lhs_value, %rhs_value : f32
-      %take_left = arith.ori %greater, %equal_and_higher : i1
-      %value = arith.select %take_left, %lhs_value, %rhs_value : f32
-      %index = arith.select %take_left, %lhs_index, %rhs_index : i32
-      tt.reduce.return %value, %index : f32, i32
-    }) {axis = 0 : i32} : (tensor<32xf32, #blocked>, tensor<32xi32, #blocked>) -> (f32, i32)
+  tt.func public @reduce_tuple_f16_deferred(%x_ptr: !tt.ptr<f16>) {
+    %x = arith.constant dense<1.0> : tensor<64xf16, #blocked>
+    %y = arith.constant dense<2.0> : tensor<64xf16, #blocked>
+    // expected-error @+1 {{a general tuple reduce carries f32 and i32 values only}}
+    %r:2 = "tt.reduce"(%x, %y) ({
+    ^bb0(%a1: f16, %b1: f16, %a2: f16, %b2: f16):
+      %m1 = arith.minnumf %a1, %a2 : f16
+      %m2 = arith.maxnumf %b1, %b2 : f16
+      tt.reduce.return %m1, %m2 : f16, f16
+    }) {axis = 0 : i32} : (tensor<64xf16, #blocked>, tensor<64xf16, #blocked>) -> (f16, f16)
     tt.return
   }
 }
@@ -284,30 +299,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
-// A multi-value `tl.reduce((a, b), axis, combine)` that is neither of the two
-// canonical paired forms (rank-1 argmax, rank-2 axis=1 argmin) has no lowering:
-// `ReduceLowering::matchAndRewrite` bails on `op.getSrcs().size() != 1`.
-//
-// That decline used to happen INSIDE `applyFullConversion`, which SIGSEGVs the
-// process during the failed conversion's rollback. The shape below is the one
-// that reached it: a tuple combine whose FIRST region op is `arith.maxnumf`
-// looks exactly like a supported single-value max reduce to the combine
-// allowlist, so it sailed past every earlier gate. The same reduce written with
-// `tl.where` was rejected all along, by accident, because `arith.cmpf` is not
-// an admitted combine -- i.e. the crashing shape was precisely the one that
-// looked supported.
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// A multi-value reduce along axis 1. The tuple lowering is a cross-THREAD tree
+// over one rank-1 tile; a rank-2 axis=1 pair is a per-row fold, which only the
+// canonical argmin form has. This is the shape whose single-value sibling the
+// row scanner takes, so the refusal has to name the axis, not the arity.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_tuple_maxnum_pair(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<0.0> : tensor<128xf32, #blocked>
-    %y = arith.constant dense<0.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{multi-value tt.reduce is implemented only for the canonical rank-1 argmax and rank-2 axis=1 argmin pairs}}
+  tt.func public @reduce_tuple_axis1_deferred(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<1.0> : tensor<8x16xf32, #blocked>
+    %y = arith.constant dense<2.0> : tensor<8x16xf32, #blocked>
+    // expected-error @+1 {{a general tuple reduce is implemented for axis 0 only}}
     %r:2 = "tt.reduce"(%x, %y) ({
     ^bb0(%a1: f32, %b1: f32, %a2: f32, %b2: f32):
-      %m1 = arith.maxnumf %a1, %a2 : f32
+      %m1 = arith.minnumf %a1, %a2 : f32
       %m2 = arith.maxnumf %b1, %b2 : f32
       tt.reduce.return %m1, %m2 : f32, f32
-    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (f32, f32)
+    }) {axis = 1 : i32} : (tensor<8x16xf32, #blocked>, tensor<8x16xf32, #blocked>) -> (tensor<8xf32, #slice1>, tensor<8xf32, #slice1>)
+    tt.return
+  }
+}
+
+// -----
+// A tuple combine containing an op the replayer has no scalar spelling for.
+// The tree clones the region at every merge, so an op it cannot clone is not a
+// combine it can perform -- and the pre-pass has to say so, because declining
+// inside `applyFullConversion` SIGSEGVs the process during the failed
+// conversion's rollback rather than raising.
+//
+// A tuple combine whose FIRST region op is `arith.maxnumf` used to reach
+// exactly that kill: it looked like a supported single-value max reduce to the
+// combine allowlist and sailed past every earlier gate. It is now lowered --
+// see `rank1_reduce_tuple.mlir` -- so the crash-safety case is carried by a
+// region that genuinely has no lowering.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_tuple_unreplayable_combine(%x_ptr: !tt.ptr<i32>) {
+    %x = arith.constant dense<1> : tensor<128xi32, #blocked>
+    %y = arith.constant dense<2> : tensor<128xi32, #blocked>
+    // expected-error @+1 {{the combine region must be one block of replayable scalar ops over its own arguments}}
+    %r:2 = "tt.reduce"(%x, %y) ({
+    ^bb0(%a1: i32, %b1: i32, %a2: i32, %b2: i32):
+      %pop = math.ctpop %a1 : i32
+      %m1 = arith.addi %pop, %a2 : i32
+      %m2 = arith.addi %b1, %b2 : i32
+      tt.reduce.return %m1, %m2 : i32, i32
+    }) {axis = 0 : i32} : (tensor<128xi32, #blocked>, tensor<128xi32, #blocked>) -> (i32, i32)
     tt.return
   }
 }

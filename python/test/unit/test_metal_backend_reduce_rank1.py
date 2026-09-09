@@ -1054,3 +1054,287 @@ def test_reduce_rank1_masked_extrema_without_other(num_warps):
                              num_warps=num_warps)
     torch.mps.synchronize()
     assert out.cpu().item() == pytest.approx(pos[:n_valid].min().item())
+
+
+# ---------------------------------------------------------------------------
+# A general multi-value `tl.reduce((a, b, ...), 0, combine)`.
+#
+# Only the two shapes the frontend emits for `tl.argmax` / `tl.argmin` had a
+# lowering; every other tuple combine was refused, and the refusal had to be
+# made before conversion because declining inside it takes the process down.
+# The lockstep butterfly generalises to N carried values by replaying the
+# reduce's own region at each merge, so no combine has to be recognised.
+#
+# Two properties the tree needs that the argmax butterfly does not:
+#   * merges run in LOGICAL order (stride 1, 2, 4, ...), because a tuple
+#     combine is only required to be associative — see the first-non-zero test,
+#     which the halving butterfly answers with a later index;
+#   * a partner past the end of the block contributes NOTHING, since a general
+#     combine has no identity to pad the tail with.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _tuple_minmax_combine(a_min, a_max, b_min, b_max):
+    return tl.minimum(a_min, b_min), tl.maximum(a_max, b_max)
+
+
+@triton.jit
+def _tuple_minmax_kernel(x_ptr, min_ptr, max_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    lo, hi = tl.reduce((row, row), 0, _tuple_minmax_combine)
+    tl.store(min_ptr, lo)
+    tl.store(max_ptr, hi)
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("block", [16, 32, 64, 128])
+def test_reduce_rank1_tuple_min_and_max(block, num_warps):
+    if block > 32 * num_warps:
+        pytest.skip("a tuple reduce needs at most one element per thread")
+    torch.manual_seed(block * 13 + num_warps)
+    x = torch.randn(block)
+    lo = torch.zeros(1, device="mps")
+    hi = torch.zeros(1, device="mps")
+    _tuple_minmax_kernel[(1,)](x.to("mps"), lo, hi, BLOCK=block,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert lo.cpu().item() == x.min().item()
+    assert hi.cpu().item() == x.max().item()
+
+
+@triton.jit
+def _tuple_first_nonzero_combine(a_val, a_idx, b_val, b_idx):
+    keep = a_val != 0.0
+    return tl.where(keep, a_val, b_val), tl.where(keep, a_idx, b_idx)
+
+
+@triton.jit
+def _tuple_first_nonzero_kernel(x_ptr, val_ptr, idx_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    val, idx = tl.reduce((row, offs.to(tl.int32)), 0,
+                         _tuple_first_nonzero_combine)
+    tl.store(val_ptr, val)
+    tl.store(idx_ptr, idx)
+
+
+@pytest.mark.parametrize("num_warps,block,hits", [
+    (4, 128, (96, 5, 70)),
+    (2, 64, (48, 3)),
+    (1, 32, (16, 1)),
+    (4, 64, (40, 9)),
+])
+def test_reduce_rank1_tuple_merges_in_logical_order(block, num_warps, hits):
+    """`first non-zero` is associative and order-SENSITIVE, unlike every
+    combine the canonical pairs carry. A butterfly whose stride halves merges
+    lane 0 with lane tpb/2 first and answers with a later element: with hits at
+    {5, 70, 96} it reports 96."""
+    x = torch.zeros(block)
+    for h in hits:
+        x[h] = float(h) + 0.5
+    val = torch.zeros(1, device="mps")
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_first_nonzero_kernel[(1,)](x.to("mps"), val, idx, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    assert idx.cpu().item() == min(hits)
+    assert val.cpu().item() == float(min(hits)) + 0.5
+
+
+@triton.jit
+def _tuple_argmax_combine(a_val, a_idx, b_val, b_idx):
+    take_left = a_val > b_val
+    return tl.where(take_left, a_val, b_val), tl.where(take_left, a_idx, b_idx)
+
+
+@triton.jit
+def _tuple_argmax_kernel(x_ptr, val_ptr, idx_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    val, idx = tl.reduce((row, offs.to(tl.int32)), 0, _tuple_argmax_combine)
+    tl.store(val_ptr, val)
+    tl.store(idx_ptr, idx)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block", [32, 128])
+def test_reduce_rank1_tuple_hand_written_argmax(block, num_warps):
+    """The same reduction `tl.argmax` performs, written by hand. It does not
+    match the canonical structural matcher, so it exercises the general path."""
+    if block > 32 * num_warps:
+        pytest.skip("a tuple reduce needs at most one element per thread")
+    torch.manual_seed(block + num_warps * 7)
+    x = torch.randn(block)
+    val = torch.zeros(1, device="mps")
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_argmax_kernel[(1,)](x.to("mps"), val, idx, BLOCK=block,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert val.cpu().item() == x.max().item()
+    assert idx.cpu().item() == x.argmax().item()
+
+
+@triton.jit
+def _tuple_argmax_high_tie_combine(a_val, a_idx, b_val, b_idx):
+    take_left = (a_val > b_val) | ((a_val == b_val) & (a_idx > b_idx))
+    return tl.where(take_left, a_val, b_val), tl.where(take_left, a_idx, b_idx)
+
+
+@triton.jit
+def _tuple_argmax_high_tie_kernel(x_ptr, idx_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    _, idx = tl.reduce((row, offs.to(tl.int32)), 0,
+                       _tuple_argmax_high_tie_combine)
+    tl.store(idx_ptr, idx)
+
+
+def test_reduce_rank1_tuple_tie_breaks_to_the_higher_index():
+    """An argmax that resolves ties the OTHER way. It must not be claimed by
+    the canonical lowering, whose ties go to the lower index; the general path
+    replays this region, so it answers 40 rather than 7."""
+    x = torch.zeros(64)
+    x[7] = 3.0
+    x[40] = 3.0
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_argmax_high_tie_kernel[(1,)](x.to("mps"), idx, BLOCK=64,
+                                        num_warps=4)
+    torch.mps.synchronize()
+    assert idx.cpu().item() == 40
+
+
+@triton.jit
+def _tuple_three_combine(a_sum, a_min, a_max, b_sum, b_min, b_max):
+    return a_sum + b_sum, tl.minimum(a_min, b_min), tl.maximum(a_max, b_max)
+
+
+@triton.jit
+def _tuple_three_kernel(x_ptr, sum_ptr, min_ptr, max_ptr,
+                        BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    total, lo, hi = tl.reduce((row, row, row), 0, _tuple_three_combine)
+    tl.store(sum_ptr, total)
+    tl.store(min_ptr, lo)
+    tl.store(max_ptr, hi)
+
+
+@pytest.mark.parametrize("block,num_warps", [(64, 2), (256, 8)])
+def test_reduce_rank1_tuple_of_three_values(block, num_warps):
+    torch.manual_seed(block)
+    x = torch.randn(block)
+    total = torch.zeros(1, device="mps")
+    lo = torch.zeros(1, device="mps")
+    hi = torch.zeros(1, device="mps")
+    _tuple_three_kernel[(1,)](x.to("mps"), total, lo, hi, BLOCK=block,
+                              num_warps=num_warps)
+    torch.mps.synchronize()
+    assert total.cpu().item() == pytest.approx(x.double().sum().item(),
+                                               rel=2e-5)
+    assert lo.cpu().item() == x.min().item()
+    assert hi.cpu().item() == x.max().item()
+
+
+@triton.jit
+def _tuple_sum_count_combine(a_sum, a_count, b_sum, b_count):
+    return a_sum + b_sum, a_count + b_count
+
+
+@triton.jit
+def _tuple_sum_count_kernel(x_ptr, sum_ptr, count_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    positive = (row > 0.0).to(tl.int32)
+    total, count = tl.reduce((row, positive), 0, _tuple_sum_count_combine)
+    tl.store(sum_ptr, total)
+    tl.store(count_ptr, count)
+
+
+@pytest.mark.parametrize("block,num_warps", [(32, 1), (128, 4)])
+def test_reduce_rank1_tuple_mixes_f32_and_i32(block, num_warps):
+    """The i32 slot rides a ui32 threadgroup buffer while the f32 slot does
+    not, so the two bridges have to agree per value, not per reduce."""
+    torch.manual_seed(block * 3)
+    x = torch.randn(block)
+    total = torch.zeros(1, device="mps")
+    count = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_sum_count_kernel[(1,)](x.to("mps"), total, count, BLOCK=block,
+                                  num_warps=num_warps)
+    torch.mps.synchronize()
+    assert total.cpu().item() == pytest.approx(x.double().sum().item(),
+                                               rel=2e-5)
+    assert count.cpu().item() == int((x > 0).sum().item())
+
+
+@triton.jit
+def _tuple_i32_minmax_kernel(x_ptr, min_ptr, max_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    lo, hi = tl.reduce((row, row), 0, _tuple_minmax_combine)
+    tl.store(min_ptr, lo)
+    tl.store(max_ptr, hi)
+
+
+def test_reduce_rank1_tuple_signed_i32_pair():
+    """Negative values decide it: the slots are stored as ui32, so a signed
+    comparison has to survive the round trip."""
+    torch.manual_seed(21)
+    x = torch.randint(-1000, 1000, (128,), dtype=torch.int32)
+    lo = torch.zeros(1, dtype=torch.int32, device="mps")
+    hi = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_i32_minmax_kernel[(1,)](x.to("mps"), lo, hi, BLOCK=128,
+                                   num_warps=4)
+    torch.mps.synchronize()
+    assert lo.cpu().item() == x.min().item()
+    assert hi.cpu().item() == x.max().item()
+
+
+@triton.jit
+def _tuple_minmax_row_kernel(x_ptr, min_ptr, max_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + pid * BLOCK + offs)
+    lo, hi = tl.reduce((row, row), 0, _tuple_minmax_combine)
+    tl.store(min_ptr + pid, lo)
+    tl.store(max_ptr + pid, hi)
+
+
+def test_reduce_rank1_tuple_multiprogram():
+    """Each threadgroup must address its own slice of the scratch buffers by a
+    LOCAL thread id, or the rows overwrite each other."""
+    torch.manual_seed(33)
+    rows, block = 5, 64
+    x = torch.randn(rows, block)
+    lo = torch.zeros(rows, device="mps")
+    hi = torch.zeros(rows, device="mps")
+    _tuple_minmax_row_kernel[(rows,)](x.to("mps").contiguous(), lo, hi,
+                                      BLOCK=block, num_warps=2)
+    torch.mps.synchronize()
+    assert torch.equal(lo.cpu(), x.min(dim=1).values)
+    assert torch.equal(hi.cpu(), x.max(dim=1).values)
+
+
+def test_reduce_rank1_tuple_above_one_element_per_thread_is_named(capfd):
+    """Outside the envelope the refusal has to come from the pre-conversion
+    validator: a pattern that declines inside `applyFullConversion` takes the
+    process down instead of raising, so this asserts a catchable error, the
+    named reason on the diagnostic stream, AND that the interpreter still runs
+    a kernel afterwards."""
+    x = torch.randn(256).to("mps")
+    lo = torch.zeros(1, device="mps")
+    hi = torch.zeros(1, device="mps")
+    with pytest.raises(Exception) as error:
+        _tuple_minmax_kernel[(1,)](x, lo, hi, BLOCK=256, num_warps=1)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    diagnostics = capfd.readouterr()
+    reason = diagnostics.err + diagnostics.out
+    assert "multi-value tt.reduce" in reason
+    assert "at most one element per thread" in reason
+
+    survivor = torch.arange(32, dtype=torch.float32).to("mps")
+    out = torch.zeros(1, device="mps")
+    reduce_sum_rank1_kernel[(1,)](survivor, out, BLOCK=32)
+    torch.mps.synchronize()
+    assert out.cpu().item() == 496.0
