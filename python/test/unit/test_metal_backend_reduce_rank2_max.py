@@ -539,24 +539,75 @@ def _axis0_reduce_reexpand_kernel(x_ptr, out_ptr, M: tl.constexpr,
              v - tl.sum(v, axis=0)[None, :])
 
 
-def test_axis0_reduce_reexpanded_result_is_rejected_not_crashed(capfd):
-    """What is still deferred at more columns than threads is a result pushed
-    back into a 2-D tile: Triton gives that tile a sizePerThread=[1, E] layout
-    whose slice `tt.expand_dims` cannot lower. That decline happens INSIDE
-    applyFullConversion, where a failure does not produce a catchable error --
-    it aborts the process during the failed conversion's rollback, taking the
-    caller with it. The pre-pass refusal unwinds cleanly, so this asserts both
-    that the error is catchable AND that the process can still compile
-    afterwards."""
+@triton.jit
+def _axis0_reduce_reexpand_with_vector_kernel(x_ptr, sum_ptr, out_ptr,
+                                              M: tl.constexpr,
+                                              N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    s = tl.sum(v, axis=0)
+    tl.store(sum_ptr + rn, s)
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :], v - s[None, :])
+
+
+def test_axis0_reduce_reexpanded_result_is_lowered():
+    """A result pushed back into a 2-D tile at more columns than threads used to
+    be refused. The reduce now leaves all of its columns in a per-column buffer
+    and the re-expansion reads that buffer at the column its lane needs, so
+    centring a tile against its own column sums is an ordinary kernel."""
     m, n = 2, 64  # tpb = 32 at num_warps=1, so N > tpb
+    x = torch.rand(m, n, dtype=torch.float32)
+    sums = torch.zeros(n, dtype=torch.float32, device="mps")
+    out = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _axis0_reduce_reexpand_with_vector_kernel[(1,)](x.to("mps"), sums, out,
+                                                    M=m, N=n, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(sums.cpu(), x.sum(0), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out.cpu(), x - x.sum(0), atol=1e-5, rtol=1e-5)
+
+
+def test_axis0_reduce_reexpanded_without_a_rank1_consumer_is_rejected(capfd):
+    """A result that never becomes a rank-1 value has no per-thread output
+    geometry to take, so it stays refused -- before conversion, because a
+    decline inside it does not raise, it takes the process down."""
+    m, n = 2, 64
     x = torch.rand(m, n, dtype=torch.float32, device="mps")
     out = torch.zeros(m, n, dtype=torch.float32, device="mps")
     with pytest.raises(Exception):
         _axis0_reduce_reexpand_kernel[(1,)](x, out, M=m, N=n, num_warps=1)
-    assert "no re-expansion back to a 2-D tile" in capfd.readouterr().err
+    assert "rank-1 consumer carrying exactly those columns" in (
+        capfd.readouterr().err)
+
+
+@triton.jit
+def _axis0_reduce_reexpand_i32_kernel(x_ptr, sum_ptr, out_ptr, M: tl.constexpr,
+                                      N: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    v = tl.load(x_ptr + rm[:, None] * N + rn[None, :])
+    s = tl.sum(v, axis=0)
+    tl.store(sum_ptr + rn, s)
+    tl.store(out_ptr + rm[:, None] * N + rn[None, :], v - s[None, :])
+
+
+def test_axis0_reduce_reexpanded_i32_is_rejected_not_crashed(capfd):
+    """The per-column buffer is read back through the rank-1 cone evaluator,
+    whose arithmetic is signless, while an i32 buffer hands back its ui32
+    storage type; the two would meet at a type mismatch, so i32 keeps a named
+    refusal. It has to be named before conversion, because a decline inside it
+    does not raise -- it takes the process down."""
+    m, n = 2, 64
+    x = torch.randint(-50, 50, (m, n), dtype=torch.int32, device="mps")
+    sums = torch.zeros(n, dtype=torch.int32, device="mps")
+    out = torch.zeros(m, n, dtype=torch.int32, device="mps")
+    with pytest.raises(Exception):
+        _axis0_reduce_reexpand_i32_kernel[(1,)](x, sums, out, M=m, N=n,
+                                                num_warps=1)
+    assert "f32 result whose elementwise cone" in capfd.readouterr().err
 
     # Still usable: a compile after the caught failure must succeed.
-    y = torch.rand(64, dtype=torch.float32, device="mps")
+    y = torch.rand(64, dtype=torch.float32)
     got = torch.zeros(64, dtype=torch.float32, device="mps")
     _masked_center_rank2_kernel[(1,)](y.reshape(64, 1).to("mps"), got.reshape(64, 1),
                                       64, 1, BM=64, BN=4)

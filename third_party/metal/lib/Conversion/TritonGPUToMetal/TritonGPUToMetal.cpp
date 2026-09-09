@@ -1301,6 +1301,26 @@ findRank2ReduceOutTile(mlir::triton::ReduceOp op) {
   return outTile;
 }
 
+// True when a rank-2 axis=0 reduce whose columns outnumber the threads can
+// leave all of them in a per-column threadgroup buffer, which is what a result
+// pushed back into a 2-D tile needs. Pattern and pre-conversion validator share
+// it.
+static bool rank2Axis0ColumnBufferUsable(mlir::triton::ReduceOp op, int64_t tpb,
+                                         int64_t bn) {
+  if (tpb <= 0 || bn <= 0 || bn % tpb != 0)
+    return false;
+  auto rtt =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  // f32 only: the buffer is read back through the rank-1 cone evaluator, whose
+  // elementwise arithmetic is signless, and an i32 buffer hands back its ui32
+  // storage type. f32 has no such split.
+  if (!rtt || !rtt.getElementType().isF32())
+    return false;
+  // One slot per column. Conservative against the rest of the kernel's staging,
+  // which this cannot see.
+  return bn * 4 <= kThreadgroupBudgetBytes / 2;
+}
+
 // True when a rank-2 axis=0 reduce's result stays a rank-1 value everywhere it
 // is used.
 //
@@ -4587,6 +4607,12 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
   return status;
 }
 
+// Defined below, next to the rest of the rank-1 cone machinery; the wide-column
+// re-expansion path needs it here.
+static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
+                                    mlir::ConversionPatternRewriter &rewriter,
+                                    mlir::Location loc, int depth);
+
 struct ExpandDimsLowering
     : public mlir::OpConversionPattern<mlir::triton::ExpandDimsOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -4626,11 +4652,29 @@ struct ExpandDimsLowering
       // Only BLOCK_N == tpb makes them identical, and paying one barrier pair
       // there is cheaper than a rule that is wrong in the other direction.
       if (!parentBlocked || !tile || tile->rank != 2 ||
-          tile->shape.size() != 2 || tile->shape[1] > tile->threadsPerBlock ||
+          tile->shape.size() != 2 ||
           mlir::isa<mlir::RankedTensorType>(scalar.getType()))
         return rewriter.notifyMatchFailure(
             op, "expand_dims: column-reduce republish needs a rank-2 blocked "
-                "tile with BLOCK_N <= tpb and a scalarized source");
+                "tile and a scalarized source");
+      if (tile->shape[1] > tile->threadsPerBlock) {
+        // More columns than threads: no lane holds the value for the column
+        // its tile position names, and publishing this lane's scalar would
+        // only make one column per thread available. The producing column
+        // reduce has left ALL of them in a per-column buffer instead, so the
+        // cone is simply re-evaluated at the column this lane needs -- the
+        // reduce leaf resolves to that buffer, and everything above it is
+        // elementwise.
+        mlir::Value col = emitTileAxisCoord(op, *tile, parentBlocked,
+                                            /*axis=*/1, rewriter, loc);
+        mlir::Value v = evalRank1ValueAt(op.getSrc(), col, rewriter, loc, 0);
+        if (!v)
+          return rewriter.notifyMatchFailure(
+              op, "expand_dims: column-reduce cone is not evaluable at an "
+                  "arbitrary column");
+        rewriter.replaceOp(op, v);
+        return mlir::success();
+      }
       {
         // Publish this lane's element, then read the slot this lane's COLUMN
         // needs — slot `col` was written by thread `col`. Shares the publish /
@@ -10693,6 +10737,43 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   return false;
 }
 
+// Can every re-expansion of this column reduce be replayed at an ARBITRARY
+// column? Above one element per thread the reduce leaves all of its columns in
+// a per-column buffer and `tt.expand_dims` re-evaluates the cone above it at
+// whichever column its lane's tile position names, so the ops between the two
+// have to be ones the rank-1 cone evaluator can re-emit.
+//
+// The reduce result itself is a resolvable leaf there -- it becomes a buffer
+// read -- so it is registered as a staged leaf for the duration of the walk.
+// That is the same trick the axis-0 cone path already uses, and it keeps the
+// ONE op allowlist instead of spelling a second copy of it here.
+static bool axis0ReexpansionConeEvaluable(mlir::triton::ReduceOp op) {
+  llvm::DenseMap<mlir::Value, mlir::Value> leaf;
+  leaf[op->getResult(0)] = op->getResult(0);
+  const llvm::DenseMap<mlir::Value, mlir::Value> *saved = g_stagedLeaves;
+  g_stagedLeaves = &leaf;
+  bool ok = true;
+  llvm::SmallVector<mlir::Operation *, 8> worklist;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (auto *u : op->getResult(0).getUsers())
+    worklist.push_back(u);
+  while (ok && !worklist.empty()) {
+    mlir::Operation *u = worklist.pop_back_val();
+    if (!seen.insert(u).second)
+      continue;
+    if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(u)) {
+      ok = rank1ConeSupported(ed.getSrc(), 0);
+      continue;
+    }
+    for (auto res : u->getResults())
+      for (auto *next : res.getUsers())
+        worklist.push_back(next);
+  }
+  g_stagedLeaves = saved;
+  return ok;
+}
+
+
 // Select direct function-body scf.for recurrences that can be replaced by the
 // whole-tile state machine in materializeLoopCarriedGathers.  This is the only
 // place that reasons across the loop/gather/yield/store boundary; the actual
@@ -12757,7 +12838,8 @@ struct GatherLowering
 static mlir::LogicalResult
 lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
                       mlir::ConversionPatternRewriter &rewriter,
-                      const TileInfo *outTile) {
+                      const TileInfo *outTile,
+                      llvm::DenseMap<mlir::Value, mlir::Value> *rowBufMap) {
   auto loc = op.getLoc();
   auto rtt =
       mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
@@ -13075,22 +13157,26 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   mlir::Value tidLocal = emitLocalTid(rewriter, loc, tpb);
   mlir::Value nVal = tidLocal;
   const int64_t eOut = (BN + tpb - 1) / tpb;
+  // Set when this reduce has to leave ALL of its columns behind in a
+  // threadgroup buffer rather than only the one its own thread produces.
+  mlir::Value columnBuf;
+  mlir::scf::ForOp columnLoop;
+  mlir::Value perIterCol;
   if (BN > tpb) {
     // The tile loop is not checked before conversion because it does not exist
     // yet: `FuncOpLowering` builds it. It cannot be missing here either --
     // E_out > 1 means the [BM, BN] source tile has more than one element per
     // thread too, which is what makes the function's tile loop exist at all.
     mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
-    if (!rank2Axis0OutTileUsable(outTile, tpb, BN) ||
-        !rank2Axis0ResultStaysRank1(op) || !tileLoop)
+    if (!rank2Axis0OutTileUsable(outTile, tpb, BN) || !tileLoop)
       return rewriter.notifyMatchFailure(
           op, "rank-2 axis0 reduce: more output columns than threads needs the "
               "consumer's rank-1 blocked tile and the tile loop");
-    nVal = mlir::UnrealizedConversionCastOp::create(
-               rewriter, loc, mlir::TypeRange{i32},
-               mlir::ValueRange{
-                   emitPerIterIndex(*outTile, tileLoop, rewriter, loc)})
-               .getResult(0);
+    perIterCol = mlir::UnrealizedConversionCastOp::create(
+                     rewriter, loc, mlir::TypeRange{i32},
+                     mlir::ValueRange{
+                         emitPerIterIndex(*outTile, tileLoop, rewriter, loc)})
+                     .getResult(0);
     // The tile loop is sized by the LARGEST tile in the function, which here is
     // the [BM, BN] source, so it runs past this result's own element count. A
     // column read on such an iteration is discarded by the store's own guard,
@@ -13101,11 +13187,54 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
         rewriter, loc, rewriter.getI32IntegerAttr(0));
     mlir::Value inRow = mlir::arith::CmpIOp::create(
                             rewriter, loc, mlir::arith::CmpIPredicate::slt,
-                            nVal, cBN.getResult())
+                            perIterCol, cBN.getResult())
                             .getResult();
-    nVal = mlir::arith::SelectOp::create(rewriter, loc, inRow, nVal,
-                                         cZeroCol.getResult())
-               .getResult();
+    perIterCol = mlir::arith::SelectOp::create(rewriter, loc, inRow, perIterCol,
+                                               cZeroCol.getResult())
+                     .getResult();
+    nVal = perIterCol;
+
+    // A result that is pushed back into a 2-D tile needs EVERY column, not
+    // just this thread's: `mean[None, :]` asks each lane for the mean of the
+    // column its rank-2 tile position names, and that column belongs to some
+    // other lane. So the fold runs once per column into a buffer indexed BY
+    // column, and both this reduce's own scalar and the re-expansion read it.
+    //
+    // ⚠️ Which lane fills which column is a free choice -- the buffer is
+    // indexed by column and the fold re-derives the row addresses from the
+    // load's own cone -- so `localTid + j*tpb` is used purely because it covers
+    // [0, BN) once.
+    if (!rank2Axis0ResultStaysRank1(op)) {
+      if (!rank2Axis0ColumnBufferUsable(op, tpb, BN) || !rowBufMap)
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 axis0 reduce: re-expanding more columns than threads "
+                "needs an f32 result, a whole number of threadgroups of "
+                "columns, and room in the threadgroup budget");
+      auto bufTy = MetalMemRefType::get(rewriter.getContext(), eltTy, BN);
+      columnBuf = ThreadgroupAllocaOp::create(rewriter, loc, bufTy).getResult();
+      // Inside the tile loop the allocation is ONE static buffer reused every
+      // trip, so this trip's fill would race the previous trip's reads.
+      BarrierOp::create(rewriter, loc);
+      auto cZeroJ = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(0));
+      auto cEOut = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(eOut)));
+      auto cOneJ = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(1));
+      auto cTpbJ = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb)));
+      columnLoop = mlir::scf::ForOp::create(rewriter, loc, cZeroJ.getResult(),
+                                            cEOut.getResult(),
+                                            cOneJ.getResult());
+      rewriter.setInsertionPointToStart(columnLoop.getBody());
+      nVal = mlir::arith::AddIOp::create(
+                 rewriter, loc, tidLocal,
+                 mlir::arith::MulIOp::create(rewriter, loc,
+                                             columnLoop.getInductionVar(),
+                                             cTpbJ.getResult())
+                     .getResult())
+                 .getResult();
+    }
   }
   mlir::Value dummyRowBase = mlir::arith::ConstantOp::create(
                                  rewriter, loc, rewriter.getI32IntegerAttr(0))
@@ -13205,6 +13334,26 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
                                                       mlir::TypeRange{eltTy},
                                                       mlir::ValueRange{result})
                  .getResult(0);
+  if (columnBuf) {
+    mlir::Value colUI = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{ui32},
+                            mlir::ValueRange{nVal})
+                            .getResult(0);
+    StoreOp::create(rewriter, loc, result, columnBuf, colUI);
+    rewriter.setInsertionPointAfter(columnLoop);
+    BarrierOp::create(rewriter, loc);
+    // Key by the ORIGINAL result: `replaceOp` is lazy under conversion, so the
+    // re-expansion's cone walk still sees this value and resolves it to the
+    // buffer at whatever column it is asking about.
+    (*rowBufMap)[op->getResult(0)] = columnBuf;
+    mlir::Value ownUI = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{ui32},
+                            mlir::ValueRange{perIterCol})
+                            .getResult(0);
+    auto own = GetElementOp::create(rewriter, loc, eltTy, columnBuf, ownUI);
+    own->setAttr("metal.materialize", rewriter.getUnitAttr());
+    result = own.getResult();
+  }
   rewriter.replaceOp(op, result);
   return mlir::success();
 }
@@ -14493,7 +14642,7 @@ struct ReduceLowering
         if (it != outTileMap->end())
           axis0OutTile = &it->second;
       }
-      return lowerRank2Axis0Reduce(op, rewriter, axis0OutTile);
+      return lowerRank2Axis0Reduce(op, rewriter, axis0OutTile, rowBufMap);
     }
     if (op.getAxis() != 1)
       return mlir::failure();
@@ -35104,13 +35253,17 @@ struct ConvertTritonGPUToMetalPass
           int64_t bn = rtt.getDimSize(1);
           if (tpb > 0 && bn > tpb) {
             std::optional<TileInfo> outTile = findRank2ReduceOutTile(red);
+            const bool reexpanded = !rank2Axis0ResultStaysRank1(red);
             if (!rank2Axis0OutTileUsable(outTile ? &*outTile : nullptr, tpb,
                                          bn) ||
-                !rank2Axis0ResultStaysRank1(red)) {
+                (reexpanded &&
+                 !(rank2Axis0ColumnBufferUsable(red, tpb, bn) &&
+                   axis0ReexpansionConeEvaluable(red)))) {
               red.emitOpError(
                   "rank-2 axis=0 reduce with more output columns than threads "
-                  "needs a rank-1 consumer carrying exactly those columns and "
-                  "no re-expansion back to a 2-D tile; launch with "
+                  "needs a rank-1 consumer carrying exactly those columns, and "
+                  "a re-expansion back to a 2-D tile needs an f32 result whose "
+                  "elementwise cone can be replayed at any column; launch with "
                   "threads-per-block >= the tile's column count, or tile the "
                   "columns across the grid");
               reduceOk = false;

@@ -349,20 +349,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
+
 // -----
-// A rank-2 axis=0 reduce with more output columns than threads is lowered (see
-// rank2_axis0_reduce_multi_column.mlir) -- unless its result is pushed BACK
-// into a 2-D tile. At E_out > 1 Triton gives that tile a
-// `sizePerThread = [1, E]` layout, and `tt.expand_dims` has no lowering for the
-// slice of it; that failure is raised from inside `applyFullConversion`, which
-// aborts the process during the failed conversion's rollback rather than
-// raising. Measured: seven of ten runs killed the interpreter before this
-// refusal existed.
+// A rank-2 axis=0 reduce with more output columns than threads, pushed back
+// into a 2-D tile (`x - sum[None, :]`) and NEVER becoming a rank-1 value.
+// Re-expansion itself is lowered now -- see
+// rank2_axis0_reduce_reexpanded.mlir -- but the per-thread output geometry
+// still has to come from a rank-1 consumer carrying exactly these columns, and
+// this kernel has none.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
-#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 #slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @colsum_reexpanded_deferred(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+  tt.func public @colsum_reexpanded_without_vector(%in: !tt.ptr<f32>) {
     %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %rows2 = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
     %cN = arith.constant dense<64> : tensor<8x1xi32, #blocked>
@@ -375,17 +373,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     %colsb = tt.broadcast %cols2 : tensor<1x64xi32, #blocked> -> tensor<8x64xi32, #blocked>
     %ap = tt.addptr %apb, %colsb : tensor<8x64x!tt.ptr<f32>, #blocked>, tensor<8x64xi32, #blocked>
     %tile = tt.load %ap : tensor<8x64x!tt.ptr<f32>, #blocked>
-    // expected-error @+1 {{no re-expansion back to a 2-D tile}}
+    // expected-error @+1 {{rank-1 consumer carrying exactly those columns}}
     %s = "tt.reduce"(%tile) ({
     ^bb0(%a: f32, %b: f32):
       %add = arith.addf %a, %b : f32
       tt.reduce.return %add : f32
     }) {axis = 0 : i32} : (tensor<8x64xf32, #blocked>) -> tensor<64xf32, #slice0>
-    %ocols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
-    %osp = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked1>
-    %oap = tt.addptr %osp, %ocols : tensor<64x!tt.ptr<f32>, #blocked1>, tensor<64xi32, #blocked1>
-    %sc = ttg.convert_layout %s : tensor<64xf32, #slice0> -> tensor<64xf32, #blocked1>
-    tt.store %oap, %sc : tensor<64x!tt.ptr<f32>, #blocked1>
     %s2 = tt.expand_dims %s {axis = 0 : i32} : tensor<64xf32, #slice0> -> tensor<1x64xf32, #blocked>
     %sb = tt.broadcast %s2 : tensor<1x64xf32, #blocked> -> tensor<8x64xf32, #blocked>
     %dev = arith.subf %tile, %sb : tensor<8x64xf32, #blocked>

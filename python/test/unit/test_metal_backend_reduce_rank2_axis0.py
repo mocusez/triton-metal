@@ -29,10 +29,12 @@ iteration is a property of the CONSUMING value's layout — `tid + iv*tpb` when
 the bands interleave, `tid*E + iv` when a thread holds a contiguous band. The
 lowering reads that layout off the rank-1 value the result becomes (the same
 tile, and the same index function, the consuming store uses) rather than
-assuming one. It stays refused when the result is re-expanded into a 2-D tile
-(`mean[None, :]`): at E>1 Triton gives that tile a sizePerThread=[1, E] layout
-whose slice `tt.expand_dims` cannot lower, and that failure is raised from
-inside conversion, which aborts the process.
+assuming one. A result re-expanded into a 2-D tile (`mean[None, :]`) needs one more thing:
+no lane holds the column its tile position names, so the reduce leaves ALL of
+its columns in a per-column threadgroup buffer and the re-expansion reads that
+buffer at whichever column it needs, replaying the elementwise cone between the
+two. That path is f32-only and wants a rank-1 consumer to take the output
+geometry from; without one the shape is still refused before conversion.
 
 ADDRESS SPELLING (`test_*_two_level_addptr` below). Triton emits one of two
 shapes for the same tile address, chosen purely by how the Python is
@@ -721,25 +723,91 @@ def _colmean_reexpanded(In, OutMean, OutDev, BM: tl.constexpr,
     tl.store(OutDev + rows * BN + cols, tile - mean[None, :])
 
 
-def test_reduce_axis0_reexpanded_result_is_named(capfd):
-    """`mean[None, :]` at more columns than threads gives the re-expanded tile
-    a sizePerThread=[1, E] layout whose slice `tt.expand_dims` cannot lower.
-    That failure is raised from INSIDE conversion, which aborts the process, so
-    the shape has to be refused before conversion. Without this refusal the
-    same kernel killed the interpreter on seven runs out of ten."""
+def test_reduce_axis0_reexpanded_result_is_lowered():
+    """`mean[None, :]` at more columns than threads used to be refused, and had
+    to be: the re-expansion republishes one column per thread, and no lane held
+    the column its tile position named. The reduce now leaves ALL of its columns
+    in a per-column buffer and the re-expansion reads that buffer at whichever
+    column it needs, so this is the ordinary centring kernel."""
     BM, BN = 8, 128
-    inp = torch.randn(BM, BN, device="mps")
+    torch.manual_seed(19)
+    inp = torch.randn(BM, BN)
     mean = torch.zeros(BN, device="mps")
     dev = torch.zeros(BM, BN, device="mps")
+    _colmean_reexpanded[(1,)](inp.to("mps").contiguous(), mean, dev, BM=BM,
+                              BN=BN, num_warps=1)
+    torch.mps.synchronize()
+    want_mean = inp.double().mean(0)
+    torch.testing.assert_close(mean.cpu().double(), want_mean, atol=1e-4,
+                               rtol=1e-4)
+    torch.testing.assert_close(dev.cpu().double(), inp.double() - want_mean,
+                               atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _colsum_reexpanded_only(In, OutDev, BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    tl.store(OutDev + rows * BN + cols, tile - tl.sum(tile, axis=0) / BM)
+
+
+def test_reduce_axis0_reexpanded_without_a_rank1_consumer_is_named(capfd):
+    """What is still refused is a result that never becomes a rank-1 value at
+    all: the per-thread output geometry then has nothing to come from. The
+    refusal is made before conversion, because a pattern that declines inside
+    it takes the process down."""
+    BM, BN = 8, 128
+    inp = torch.randn(BM, BN, device="mps")
+    dev = torch.zeros(BM, BN, device="mps")
     with pytest.raises(Exception) as error:
-        _colmean_reexpanded[(1,)](inp, mean, dev, BM=BM, BN=BN, num_warps=1)
+        _colsum_reexpanded_only[(1,)](inp, dev, BM=BM, BN=BN, num_warps=1)
     assert "convert-tritongpu-to-metal failed" in str(error.value)
     reason = capfd.readouterr()
-    assert "no re-expansion back to a 2-D tile" in reason.err + reason.out
+    assert "rank-1 consumer carrying exactly those columns" in (reason.err
+                                                                + reason.out)
 
     survivor = torch.randn(4, 32, device="mps")
     out = torch.empty(32, device="mps")
     _colsum_direct[(1,)](survivor, out, BM=4, BN=32, num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), survivor.cpu().sum(0), atol=1e-4,
+                               rtol=1e-4)
+
+
+@triton.jit
+def _colmean_reexpanded_var(In, OutMean, OutVar, OutDev, BM: tl.constexpr,
+                            BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    mean = tl.sum(tile, axis=0) / BM
+    dev = tile - mean[None, :]
+    var = tl.sum(dev * dev, axis=0) / BM
+    tl.store(OutMean + tl.arange(0, BN), mean)
+    tl.store(OutVar + tl.arange(0, BN), var)
+    tl.store(OutDev + rows * BN + cols, dev)
+
+
+@pytest.mark.parametrize("BM,BN,num_warps", [(8, 128, 1), (8, 256, 4),
+                                             (4, 512, 4), (8, 1024, 8),
+                                             (32, 128, 1), (8, 64, 1)])
+def test_reduce_axis0_batch_norm_wide_columns(BM, BN, num_warps):
+    """Two column reduces where the second consumes the first's re-expansion --
+    batch norm's shape, with more columns than the threadgroup has threads."""
+    torch.manual_seed(BM * 53 + BN + num_warps)
+    inp = torch.randn(BM, BN)
+    mean = torch.zeros(BN, device="mps")
+    var = torch.zeros(BN, device="mps")
+    dev = torch.zeros(BM, BN, device="mps")
+    _colmean_reexpanded_var[(1,)](inp.to("mps").contiguous(), mean, var, dev,
+                                  BM=BM, BN=BN, num_warps=num_warps)
+    torch.mps.synchronize()
+    want_mean = inp.double().mean(0)
+    want_dev = inp.double() - want_mean
+    torch.testing.assert_close(mean.cpu().double(), want_mean, atol=1e-4,
+                               rtol=1e-4)
+    torch.testing.assert_close(var.cpu().double(), (want_dev * want_dev).mean(0),
+                               atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(dev.cpu().double(), want_dev, atol=1e-4,
                                rtol=1e-4)
