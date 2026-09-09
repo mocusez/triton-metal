@@ -11668,9 +11668,33 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
   if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
     return no("a general tuple scan needs a power-of-two threads-per-block");
   int64_t blockSize = first.getDimSize(0);
-  if (blockSize <= 0 || blockSize > tpb)
-    return no("a general tuple scan needs at most one element per thread "
-              "(BLOCK <= threads per block)");
+  if (blockSize <= 0)
+    return no("a general tuple scan needs a non-empty block");
+  if (blockSize > tpb) {
+    // Above one element per thread the prefix is three phases over a
+    // contiguous band per thread, and every position needs a slot of its own
+    // because the consumer reads one position per tile-loop iteration.
+    if (blockSize % tpb != 0)
+      return no("a general tuple scan above one element per thread needs "
+                "BLOCK to be a multiple of the threads per block");
+    if (blockSize / tpb > 64)
+      return no("a general tuple scan is implemented up to sixty-four "
+                "elements per thread");
+    if (op.getReverse())
+      return no("a reverse tuple scan above one element per thread is not "
+                "implemented: the band prefix and the carry both run the other "
+                "way, and that is a separate shape");
+    if (static_cast<int64_t>(n) * (blockSize + tpb) * 4 >
+        kThreadgroupBudgetBytes)
+      return no("a general tuple scan above one element per thread needs one "
+                "threadgroup slot per position per value plus one per thread, "
+                "and this block does not fit the threadgroup budget");
+    for (mlir::Value src : op.getSrcs())
+      if (!rank1ConeSupported(src, 0))
+        return no("a general tuple scan above one element per thread has to "
+                  "re-derive each source at a logical position, and one of "
+                  "them is not a re-emittable cone");
+  }
   for (size_t i = 0; i < n; ++i) {
     auto ty = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[i].getType());
     auto res = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
@@ -11750,26 +11774,41 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
           rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{tidI32})
           .getResult(0);
 
+  // Above one element per thread the prefix is three phases, and the extra
+  // buffer is what pays for them: `bufs` scans the per-thread TOTALS across
+  // threads exactly as it does at one element per thread, and `resBufs` holds
+  // one slot per logical position, because the consumer reads a different
+  // position on every tile-loop iteration and those positions land in other
+  // threads' bands.
+  const int64_t ePerThread = blockSize > tpb ? blockSize / tpb : 1;
   llvm::SmallVector<mlir::Type, 4> eltTys, storeTys;
-  llvm::SmallVector<mlir::Value, 4> bufs, mine;
+  llvm::SmallVector<mlir::Value, 4> bufs, resBufs, mine;
   for (size_t i = 0; i < n; ++i) {
     mlir::Type ety =
         mlir::cast<mlir::RankedTensorType>(op.getSrcs()[i].getType())
             .getElementType();
-    mlir::Value v = toSignlessInt(adaptor.getSrcs()[i], rewriter, loc);
-    if (v.getType() != ety)
-      return rewriter.notifyMatchFailure(
-          op,
-          "tuple scan: a source did not convert to its scalar element type");
+    if (ePerThread == 1) {
+      mlir::Value v = toSignlessInt(adaptor.getSrcs()[i], rewriter, loc);
+      if (v.getType() != ety)
+        return rewriter.notifyMatchFailure(
+            op,
+            "tuple scan: a source did not convert to its scalar element type");
+      mine.push_back(v);
+    }
     mlir::Type storeTy = ety.isF32() ? ety : mlir::Type(ui32);
     eltTys.push_back(ety);
     storeTys.push_back(storeTy);
-    mine.push_back(v);
     bufs.push_back(
         ThreadgroupAllocaOp::create(
             rewriter, loc,
             MetalMemRefType::get(rewriter.getContext(), storeTy, tpb))
             .getResult());
+    if (ePerThread > 1)
+      resBufs.push_back(
+          ThreadgroupAllocaOp::create(
+              rewriter, loc,
+              MetalMemRefType::get(rewriter.getContext(), storeTy, blockSize))
+              .getResult());
   }
   auto toStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
     if (storeTys[i] == eltTys[i])
@@ -11794,6 +11833,78 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   // ONE static buffer reused every trip, so this trip's fill would race the
   // previous trip's final reads.
   BarrierOp::create(rewriter, loc);
+
+  // Phase one, above one element per thread: each thread scans its OWN
+  // contiguous band `[t*E, (t+1)*E)` into `resBufs`, in increasing position
+  // order, and keeps the band's total. Contiguous is what makes the
+  // cross-thread scan of those totals stand for a scan of the positions; the
+  // values are re-derived at their logical positions, which is what makes the
+  // mapping a free choice. Nothing here crosses threads, so no barrier is
+  // needed until the totals are published.
+  mlir::Value bandBase;
+  if (ePerThread > 1) {
+    auto cE = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(ePerThread)));
+    bandBase =
+        mlir::arith::MulIOp::create(rewriter, loc, tidI32, cE.getResult())
+            .getResult();
+    mlir::Value baseUI = mlir::UnrealizedConversionCastOp::create(
+                             rewriter, loc, mlir::TypeRange{ui32},
+                             mlir::ValueRange{bandBase})
+                             .getResult(0);
+    llvm::SmallVector<mlir::Value, 4> seed;
+    for (size_t i = 0; i < n; ++i) {
+      mlir::Value elt =
+          evalRank1ValueAt(op.getSrcs()[i], bandBase, rewriter, loc, 0);
+      if (!elt)
+        return rewriter.notifyMatchFailure(
+            op, "tuple scan: a source is not evaluable at a logical position");
+      elt = toSignlessInt(elt, rewriter, loc);
+      if (elt.getType() != eltTys[i])
+        return rewriter.notifyMatchFailure(
+            op, "tuple scan: a re-derived source has the wrong element type");
+      seed.push_back(elt);
+      StoreOp::create(rewriter, loc, toStorage(elt, i), resBufs[i], baseUI);
+    }
+    auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI32IntegerAttr(1));
+    auto band = mlir::scf::ForOp::create(rewriter, loc, cOne.getResult(),
+                                         cE.getResult(), cOne.getResult(),
+                                         seed);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(band.getBody());
+      mlir::Value pos = mlir::arith::AddIOp::create(rewriter, loc, bandBase,
+                                                    band.getInductionVar())
+                            .getResult();
+      mlir::Value posUI = mlir::UnrealizedConversionCastOp::create(
+                              rewriter, loc, mlir::TypeRange{ui32},
+                              mlir::ValueRange{pos})
+                              .getResult(0);
+      llvm::SmallVector<mlir::Value, 4> elts;
+      for (size_t i = 0; i < n; ++i) {
+        mlir::Value elt =
+            evalRank1ValueAt(op.getSrcs()[i], pos, rewriter, loc, 0);
+        if (!elt)
+          return rewriter.notifyMatchFailure(
+              op, "tuple scan: a source is not evaluable inside the band");
+        elts.push_back(toSignlessInt(elt, rewriter, loc));
+      }
+      // The running prefix is the LOWER range, so it is the left operand.
+      llvm::SmallVector<mlir::Value, 4> merged = emitClonedRegionCombine(
+          op->getRegion(0), band.getRegionIterArgs(), elts, rewriter, loc);
+      if (merged.size() != n)
+        return rewriter.notifyMatchFailure(
+            op, "tuple scan: band prefix combine yielded the wrong arity");
+      for (size_t i = 0; i < n; ++i)
+        StoreOp::create(rewriter, loc, toStorage(merged[i], i), resBufs[i],
+                        posUI);
+      mlir::scf::YieldOp::create(rewriter, loc, merged);
+    }
+    mine.assign(band.getResults().begin(), band.getResults().end());
+  }
+
   for (size_t i = 0; i < n; ++i)
     StoreOp::create(rewriter, loc, toStorage(mine[i], i), bufs[i], tidUI32);
   BarrierOp::create(rewriter, loc);
@@ -11801,10 +11912,13 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   const bool reverse = op.getReverse();
   auto cZeroI32 = mlir::arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(0));
+  // What this tree scans: the positions themselves at one element per thread,
+  // the per-thread band TOTALS above it.
+  const int64_t treeExtent = ePerThread == 1 ? blockSize : tpb;
   auto cBlock = mlir::arith::ConstantOp::create(
       rewriter, loc,
-      rewriter.getI32IntegerAttr(static_cast<int32_t>(blockSize)));
-  for (int64_t stride = 1; stride < blockSize; stride *= 2) {
+      rewriter.getI32IntegerAttr(static_cast<int32_t>(treeExtent)));
+  for (int64_t stride = 1; stride < treeExtent; stride *= 2) {
     auto cStride = mlir::arith::ConstantOp::create(
         rewriter, loc,
         rewriter.getI32IntegerAttr(static_cast<int32_t>(stride)));
@@ -11875,8 +11989,95 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   }
 
   llvm::SmallVector<mlir::Value, 4> results;
+  if (ePerThread == 1) {
+    for (size_t i = 0; i < n; ++i)
+      results.push_back(readSlot(i, tidUI32));
+    rewriter.replaceOp(op, results);
+    return mlir::success();
+  }
+
+  // Phase three: fold the exclusive prefix of the bands BEFORE this one into
+  // every element of this band. Thread zero has no such prefix, and there is no
+  // identity to stand in for one, so it keeps what its band already holds.
+  auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
+                                              rewriter.getI32IntegerAttr(1));
+  mlir::Value hasPrefix = mlir::arith::CmpIOp::create(
+                              rewriter, loc, mlir::arith::CmpIPredicate::sgt,
+                              tidI32, cZeroI32.getResult())
+                              .getResult();
+  mlir::Value prevI32 =
+      mlir::arith::SubIOp::create(rewriter, loc, tidI32, cOne.getResult())
+          .getResult();
+  mlir::Value prevSafe = mlir::arith::SelectOp::create(
+                             rewriter, loc, hasPrefix, prevI32,
+                             cZeroI32.getResult())
+                             .getResult();
+  mlir::Value prevUI = mlir::UnrealizedConversionCastOp::create(
+                           rewriter, loc, mlir::TypeRange{ui32},
+                           mlir::ValueRange{prevSafe})
+                           .getResult(0);
+  llvm::SmallVector<mlir::Value, 4> carry;
   for (size_t i = 0; i < n; ++i)
-    results.push_back(readSlot(i, tidUI32));
+    carry.push_back(readSlot(i, prevUI));
+
+  auto cE = mlir::arith::ConstantOp::create(
+      rewriter, loc,
+      rewriter.getI32IntegerAttr(static_cast<int32_t>(ePerThread)));
+  auto addBack = mlir::scf::ForOp::create(
+      rewriter, loc, cZeroI32.getResult(), cE.getResult(), cOne.getResult());
+  {
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(addBack.getBody());
+    mlir::Value pos = mlir::arith::AddIOp::create(rewriter, loc, bandBase,
+                                                  addBack.getInductionVar())
+                          .getResult();
+    mlir::Value posUI = mlir::UnrealizedConversionCastOp::create(
+                            rewriter, loc, mlir::TypeRange{ui32},
+                            mlir::ValueRange{pos})
+                            .getResult(0);
+    llvm::SmallVector<mlir::Value, 4> here;
+    for (size_t i = 0; i < n; ++i) {
+      auto get = GetElementOp::create(rewriter, loc, storeTys[i], resBufs[i],
+                                      posUI);
+      get->setAttr("metal.materialize", rewriter.getUnitAttr());
+      here.push_back(fromStorage(get.getResult(), i));
+    }
+    // The carried prefix covers the LOWER positions, so it is the left operand.
+    llvm::SmallVector<mlir::Value, 4> merged =
+        emitClonedRegionCombine(op->getRegion(0), carry, here, rewriter, loc);
+    if (merged.size() != n)
+      return rewriter.notifyMatchFailure(
+          op, "tuple scan: carry combine yielded the wrong arity");
+    for (size_t i = 0; i < n; ++i) {
+      mlir::Value out = mlir::arith::SelectOp::create(rewriter, loc, hasPrefix,
+                                                      merged[i], here[i])
+                            .getResult();
+      StoreOp::create(rewriter, loc, toStorage(out, i), resBufs[i], posUI);
+    }
+    // No explicit `scf.yield`: a loop with no iteration arguments already has
+    // one, and adding a second is a verifier error.
+  }
+  // The consumer reads ONE position per tile-loop iteration, and its layout
+  // need not put that position in this thread's band, so every band has to be
+  // finished before any of them is read.
+  BarrierOp::create(rewriter, loc);
+
+  mlir::Value idxUI;
+  auto resultTile = tileFromTensor(op.getType(0));
+  mlir::scf::ForOp tileLoop = findOutermostScfFor(op);
+  if (resultTile && resultTile->elemPerThread > 1 && tileLoop) {
+    idxUI = emitPerIterIndex(*resultTile, tileLoop, rewriter, loc);
+  } else {
+    return rewriter.notifyMatchFailure(
+        op, "tuple scan above one element per thread needs the tile loop and a "
+            "blocked result tile to read this iteration's position from");
+  }
+  for (size_t i = 0; i < n; ++i) {
+    auto get =
+        GetElementOp::create(rewriter, loc, storeTys[i], resBufs[i], idxUI);
+    get->setAttr("metal.materialize", rewriter.getUnitAttr());
+    results.push_back(fromStorage(get.getResult(), i));
+  }
   rewriter.replaceOp(op, results);
   return mlir::success();
 }

@@ -140,3 +140,82 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.store %[[N0]], %[[BUF0]]
 // CHECK: metal.store %[[N1]], %[[BUF1]]
 // CHECK: metal.barrier
+
+// -----
+
+// More than one element per thread: three phases. Each thread scans its OWN
+// contiguous band into a buffer with one slot per POSITION, the band totals are
+// scanned across threads by the same tree the one-element case uses, and each
+// thread then folds the exclusive prefix of the bands before it into every
+// element of its own. Thread zero has no such prefix and there is no identity
+// to stand in for one, so it keeps what its band holds.
+//
+// The band has to be contiguous for a scan of the totals to stand for a scan of
+// the positions, and the result buffer needs a slot per position because the
+// consumer reads a DIFFERENT position on each tile-loop iteration -- one that
+// need not lie in this thread's band, which is what the last barrier is for.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_tuple_band(%x: !tt.ptr<f32>, %oa: !tt.ptr<f32>, %ob: !tt.ptr<i32>) {
+    %o = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %o : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %v = tt.load %ap : tensor<64x!tt.ptr<f32>, #blocked>
+    %r:2 = "tt.scan"(%v, %o) ({
+    ^bb0(%a1: f32, %a2: i32, %b1: f32, %b2: i32):
+      %s = arith.addf %a1, %b1 : f32
+      %m = arith.addi %a2, %b2 : i32
+      tt.scan.return %s, %m : f32, i32
+    }) {axis = 0 : i32, reverse = false} : (tensor<64xf32, #blocked>, tensor<64xi32, #blocked>) -> (tensor<64xf32, #blocked>, tensor<64xi32, #blocked>)
+    %asp = tt.splat %oa : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %aap = tt.addptr %asp, %o : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    tt.store %aap, %r#0 : tensor<64x!tt.ptr<f32>, #blocked>
+    %bsp = tt.splat %ob : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #blocked>
+    %bap = tt.addptr %bsp, %o : tensor<64x!tt.ptr<i32>, #blocked>, tensor<64xi32, #blocked>
+    tt.store %bap, %r#1 : tensor<64x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_tuple_band
+// One totals slot per thread and one result slot per position, per value.
+// CHECK: %[[TOTV:.*]] = metal.threadgroup_alloca : !metal.memref<32 x f32>
+// CHECK: %[[RESV:.*]] = metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: %[[TOTI:.*]] = metal.threadgroup_alloca : !metal.memref<32 x ui32>
+// CHECK: %[[RESI:.*]] = metal.threadgroup_alloca : !metal.memref<64 x ui32>
+// CHECK: metal.barrier
+// Phase one: the thread's own band, `[t*E, (t+1)*E)`.
+// CHECK: %[[E:.*]] = arith.constant 2 : i32
+// CHECK: %[[BASE:.*]] = arith.muli %{{.*}}, %[[E]] : i32
+// CHECK: %[[SEED:.*]] = metal.get_element
+// CHECK: metal.store %[[SEED]], %[[RESV]]
+// CHECK: metal.store %{{.*}}, %[[RESI]]
+// CHECK: %[[BAND:.*]]:2 = scf.for %[[K:.*]] = %{{.*}} to %[[E]] step %{{.*}} iter_args(%[[PV:.*]] = %[[SEED]], %[[PI:.*]] = %[[BASE]])
+// CHECK:   %[[POS:.*]] = arith.addi %[[BASE]], %[[K]] : i32
+// The running prefix is the LOWER range, so it is the left operand.
+// CHECK:   %[[SUM:.*]] = arith.addf %[[PV]], %{{.*}} : f32
+// CHECK:   arith.addi %[[PI]], %[[POS]] : i32
+// CHECK:   metal.store %[[SUM]], %[[RESV]]
+// CHECK:   metal.store %{{.*}}, %[[RESI]]
+// Phase two: the band totals, scanned across threads by the ordinary tree.
+// CHECK: metal.store %[[BAND]]#0, %[[TOTV]]
+// CHECK: metal.store %{{.*}}, %[[TOTI]]
+// CHECK: metal.barrier
+// CHECK: arith.cmpi sge
+// CHECK: metal.barrier
+// Phase three: fold the exclusive prefix of the earlier bands into every
+// element of this one. Thread zero keeps what it has -- there is no identity.
+// CHECK: %[[HAS:.*]] = arith.cmpi sgt, %{{.*}}, %{{.*}} : i32
+// CHECK: %[[PREV:.*]] = arith.subi %{{.*}}, %{{.*}} : i32
+// CHECK: arith.select %[[HAS]], %[[PREV]], %{{.*}} : i32
+// CHECK: %[[CARRYV:.*]] = metal.get_element %[[TOTV]][%{{.*}}] {metal.materialize}
+// CHECK: scf.for
+// CHECK:   %[[HERE:.*]] = metal.get_element %[[RESV]][%{{.*}}] {metal.materialize}
+// CHECK:   %[[ADDED:.*]] = arith.addf %[[CARRYV]], %[[HERE]] : f32
+// CHECK:   %[[OUT:.*]] = arith.select %[[HAS]], %[[ADDED]], %[[HERE]] : f32
+// CHECK:   metal.store %[[OUT]], %[[RESV]]
+// Every band has to be finished before any of them is read.
+// CHECK: metal.barrier
+// CHECK: metal.get_element %[[RESV]][%{{.*}}] {metal.materialize}
+// CHECK: metal.get_element %[[RESI]][%{{.*}}] {metal.materialize}

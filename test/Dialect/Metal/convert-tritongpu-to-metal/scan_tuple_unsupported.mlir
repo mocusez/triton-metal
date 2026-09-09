@@ -8,21 +8,42 @@
 // disagree about which shapes are lowered.
 
 // -----
-// More than one element per thread. Each lockstep buffer gives a thread one
-// slot, and its converted scalar is its single logical element; above that a
-// thread owns a band the prefix cannot address.
+// A per-thread band longer than the prefix is implemented for. Above one
+// element per thread a thread scans its own band first (see
+// rank1_scan_tuple.mlir), and that band is capped: a four-thousand-element
+// block over one warp gives each thread a hundred and twenty-eight elements.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scan_tuple_above_one_element_per_thread(%x: !tt.ptr<f32>) {
-    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    %w = arith.constant dense<2.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{a general tuple scan needs at most one element per thread (BLOCK <= threads per block)}}
+  tt.func public @scan_tuple_band_too_long(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<4096xf32, #blocked>
+    %w = arith.constant dense<2.0> : tensor<4096xf32, #blocked>
+    // expected-error @+1 {{a general tuple scan is implemented up to sixty-four elements per thread}}
     %r:2 = "tt.scan"(%v, %w) ({
     ^bb0(%a1: f32, %a2: f32, %b1: f32, %b2: f32):
       %s = arith.addf %a1, %b1 : f32
       %m = arith.maxnumf %a2, %b2 : f32
       tt.scan.return %s, %m : f32, f32
-    }) {axis = 0 : i32, reverse = false} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>)
+    }) {axis = 0 : i32, reverse = false} : (tensor<4096xf32, #blocked>, tensor<4096xf32, #blocked>) -> (tensor<4096xf32, #blocked>, tensor<4096xf32, #blocked>)
+    tt.return
+  }
+}
+
+// -----
+// A REVERSE tuple scan above one element per thread. The band prefix and the
+// carry both run the other way round, which is a separate shape rather than a
+// flag; refusing it is what keeps it from quietly producing the forward answer.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_tuple_reverse_band_deferred(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %w = arith.constant dense<2.0> : tensor<128xf32, #blocked>
+    // expected-error @+1 {{a reverse tuple scan above one element per thread is not implemented}}
+    %r:2 = "tt.scan"(%v, %w) ({
+    ^bb0(%a1: f32, %a2: f32, %b1: f32, %b2: f32):
+      %s = arith.addf %a1, %b1 : f32
+      %m = arith.maxnumf %a2, %b2 : f32
+      tt.scan.return %s, %m : f32, f32
+    }) {axis = 0 : i32, reverse = true} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>)
     tt.return
   }
 }

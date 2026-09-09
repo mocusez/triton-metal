@@ -668,19 +668,22 @@ def test_tuple_scan_inside_a_user_loop():
 
 
 @mps_only
-def test_tuple_scan_above_one_element_per_thread_is_named(capfd):
+def test_tuple_scan_beyond_the_band_envelope_is_named(capfd):
     """Outside the envelope the refusal has to come from the pre-conversion
     validator: a pattern that declines inside `applyFullConversion` does not
-    raise, it takes the process down."""
-    x = torch.randn(256, device="mps")
-    prefix = torch.zeros(256, device="mps")
-    count = torch.zeros(256, device="mps")
+    raise, it takes the process down.
+
+    More than one element per thread is no longer outside it -- a thread scans
+    its own band first -- so the boundary this pins is the band LENGTH."""
+    x = torch.randn(4096, device="mps")
+    prefix = torch.zeros(4096, device="mps")
+    count = torch.zeros(4096, device="mps")
     with pytest.raises(Exception) as error:
-        _tuple_sum_and_count_kernel[(1,)](x, prefix, count, BLOCK=256,
+        _tuple_sum_and_count_kernel[(1,)](x, prefix, count, BLOCK=4096,
                                           num_warps=1)
     assert "convert-tritongpu-to-metal failed" in str(error.value)
     reason = capfd.readouterr()
-    assert "at most one element per thread" in reason.err + reason.out
+    assert "sixty-four elements per thread" in reason.err + reason.out
 
     survivor = torch.randn(32, device="mps")
     got = torch.zeros(32, device="mps")
@@ -796,3 +799,105 @@ def test_tuple_scan_reverse_applies_the_higher_positions_first(block,
 
     assert forward.cpu().tolist()[hits[0]:] == want_forward[hits[0]:]
     assert reverse.cpu().tolist()[:hits[-1] + 1] == want_reverse[:hits[-1] + 1]
+
+
+# ---------------------------------------------------------------------------
+# More than one element per thread.
+#
+# Three phases: each thread scans its OWN contiguous band [t*E, (t+1)*E), the
+# band totals are scanned across threads by the same tree the one-element case
+# uses, and each thread then folds the exclusive prefix of the bands before it
+# into every element of its own. Thread zero has no such prefix and there is no
+# identity to stand in for one, so it keeps what its band holds.
+#
+# The band has to be CONTIGUOUS for the cross-thread scan of totals to stand
+# for a scan of positions, and the result buffer needs one slot per position
+# because the consumer reads a different position on every tile-loop iteration
+# -- positions that need not be in this thread's band, which is what the
+# barrier before the read is for.
+# ---------------------------------------------------------------------------
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+@pytest.mark.parametrize("block", [64, 128, 512, 1024, 2048])
+def test_tuple_scan_above_one_element_per_thread(block, num_warps):
+    tpb = 32 * num_warps
+    if block > tpb and (block % tpb or block // tpb > 64):
+        pytest.skip("outside the band envelope")
+    torch.manual_seed(block * 11 + num_warps)
+    x = torch.randn(block)
+    prefix = torch.zeros(block, device="mps")
+    count = torch.zeros(block, device="mps")
+    _tuple_sum_and_count_kernel[(1,)](x.to("mps"), prefix, count, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(prefix.cpu().double(), x.double().cumsum(0),
+                               atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(count.cpu(),
+                               torch.arange(1, block + 1, dtype=torch.float32))
+
+
+@mps_only
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (1024, 4), (2048, 8)])
+def test_tuple_scan_hand_written_segmented_above_one_element_per_thread(
+        block, num_warps):
+    """The order-sensitive case at more than one element per thread: a reset
+    inside a band, and one that lands exactly on a band boundary, both have to
+    cut the prefix."""
+    torch.manual_seed(block + num_warps * 3)
+    x = torch.randn(block)
+    flags = (torch.rand(block) < 0.25).to(torch.int32)
+    e = block // (32 * num_warps)
+    flags[e] = 1          # first element of the second band
+    flags[e + 1] = 1      # inside the second band
+    out = torch.zeros(block, device="mps")
+    _tuple_segmented_kernel[(1,)](x.to("mps"), flags.to("mps"), out,
+                                  BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    want = torch.zeros(block, dtype=torch.float64)
+    acc = 0.0
+    for i in range(block):
+        acc = float(x[i]) if int(flags[i]) else acc + float(x[i])
+        want[i] = acc
+    torch.testing.assert_close(out.cpu().double(), want, atol=1e-3, rtol=1e-3)
+
+
+@mps_only
+def test_tuple_scan_above_one_element_per_thread_multiprogram():
+    torch.manual_seed(41)
+    rows, block = 3, 512
+    x = torch.randn(rows, block)
+    out = torch.zeros(rows, block, device="mps")
+    _tuple_sum_and_count_rows_kernel[(rows,)](x.to("mps").contiguous(), out,
+                                              BLOCK=block, num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().double(), x.double().cumsum(1),
+                               atol=1e-3, rtol=1e-3)
+
+
+@mps_only
+def test_tuple_scan_reverse_above_one_element_per_thread_is_named(capfd):
+    """Reverse runs the band prefix and the carry the other way round, which is
+    a separate shape; it stays refused before conversion rather than quietly
+    producing the forward answer."""
+    x = torch.randn(1024, device="mps")
+    prefix = torch.zeros(1024, device="mps")
+    count = torch.zeros(1024, device="mps")
+    with pytest.raises(Exception) as error:
+        _tuple_reverse_sum_and_count_kernel[(1,)](x, prefix, count, BLOCK=1024,
+                                                  num_warps=4)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    reason = capfd.readouterr()
+    assert "reverse tuple scan above one element per thread" in (reason.err
+                                                                 + reason.out)
+
+    survivor = torch.randn(128, device="mps")
+    got = torch.zeros(128, device="mps")
+    other = torch.zeros(128, device="mps")
+    _tuple_sum_and_count_kernel[(1,)](survivor, got, other, BLOCK=128,
+                                      num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(got.cpu().double(),
+                               survivor.cpu().double().cumsum(0), atol=1e-4,
+                               rtol=1e-4)
