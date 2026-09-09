@@ -5,9 +5,15 @@ each pass must compile to Metal, and the original three-pass ``solve`` entry
 must match a CPU segmented-exclusive reference on MPS.
 
 They also pin the two-state affine composition used by the medium linear
-recurrence.  That algebra has a dedicated narrow lowering; unrelated tuple
-scans must remain rejected instead of being miscompiled as one of the supported
-monoids.
+recurrence.  That algebra has a dedicated narrow lowering.
+
+A general tuple scan no longer has to be one of those two shapes: an inclusive
+Hillis-Steele prefix over one threadgroup buffer per carried value replays the
+scan's own combine region, so any associative combine over rank-1 blocked
+f32/i32 sources holding at most one element per thread is lowered.  What is
+still refused -- a narrower slot type, a reverse scan, a rank-2 tile, more than
+one element per thread -- is refused before conversion, by the same predicate
+the pattern dispatches on.
 """
 
 from __future__ import annotations
@@ -235,6 +241,11 @@ def test_linear_recurrence_chunk_scan_original_kernel_compiles_to_metal(
 
 
 def test_noncanonical_tuple_scan_remains_rejected():
+    # Still refused, but no longer for its combine: a general tuple combine is
+    # lowered now. This one carries an i1 flag, and a lockstep buffer slot is
+    # f32 or i32 -- the two types with a spelling on both sides of the ui32
+    # storage bridge.
+    #
     # Conversion failures can crash while cleaning up after the useful
     # diagnostic. Keep this intentionally unsupported case in a child process.
     script = textwrap.dedent(
@@ -442,3 +453,241 @@ def test_original_stream_compaction_solve_matches_reference():
         "original stream-compaction solve failed "
         f"(returncode={result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The general multi-value scan.
+#
+# Only the segmented-sum and affine forms had a lowering, both matched
+# structurally. Everything else was refused. The prefix is now built from the
+# scan's own combine region: read both slots, replay the region with the LOWER
+# position as the left operand, barrier, write, barrier.
+#
+# The barrier between a step's reads and its writes is NOT observable from a
+# numeric test -- with it deleted, a hundred and forty differential runs over
+# one, two, four and eight warps all still passed. It is pinned structurally by
+# `rank1_scan_tuple.mlir` instead.
+# ---------------------------------------------------------------------------
+
+
+mps_only = pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="Metal backend requires an MPS-enabled PyTorch (Apple Silicon)",
+)
+
+
+@triton.jit
+def _tuple_sum_and_count_combine(a_sum, a_count, b_sum, b_count):
+    return a_sum + b_sum, a_count + b_count
+
+
+@triton.jit
+def _tuple_sum_and_count_kernel(x_ptr, sum_ptr, count_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    ones = tl.full((BLOCK,), 1.0, tl.float32)
+    prefix, count = tl.associative_scan((row, ones), 0,
+                                        _tuple_sum_and_count_combine)
+    tl.store(sum_ptr + offs, prefix)
+    tl.store(count_ptr + offs, count)
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+@pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
+def test_tuple_scan_sum_and_count(block, num_warps):
+    if block > 32 * num_warps:
+        pytest.skip("a tuple scan needs at most one element per thread")
+    torch.manual_seed(block * 7 + num_warps)
+    x = torch.randn(block)
+    prefix = torch.zeros(block, device="mps")
+    count = torch.zeros(block, device="mps")
+    _tuple_sum_and_count_kernel[(1,)](x.to("mps"), prefix, count, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(prefix.cpu().double(), x.double().cumsum(0),
+                               atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(count.cpu(),
+                               torch.arange(1, block + 1, dtype=torch.float32))
+
+
+@triton.jit
+def _tuple_segmented_combine(a_value, a_flag, b_value, b_flag):
+    return tl.where(b_flag != 0, b_value, a_value + b_value), a_flag | b_flag
+
+
+@triton.jit
+def _tuple_segmented_kernel(x_ptr, flag_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    value, _ = tl.associative_scan(
+        (tl.load(x_ptr + offs), tl.load(flag_ptr + offs)), 0,
+        _tuple_segmented_combine)
+    tl.store(out_ptr + offs, value)
+
+
+@mps_only
+@pytest.mark.parametrize("block,num_warps", [(32, 1), (128, 4), (64, 8)])
+def test_tuple_scan_hand_written_segmented(block, num_warps):
+    """A segmented scan written by hand rather than matched structurally. The
+    combine is associative and NOT commutative -- swap the operands and a reset
+    keeps the wrong side -- so it also pins the merge order."""
+    torch.manual_seed(block + num_warps)
+    x = torch.randn(block)
+    flags = (torch.rand(block) < 0.25).to(torch.int32)
+    out = torch.zeros(block, device="mps")
+    _tuple_segmented_kernel[(1,)](x.to("mps"), flags.to("mps"), out,
+                                  BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    want = torch.zeros(block, dtype=torch.float64)
+    acc = 0.0
+    for i in range(block):
+        acc = float(x[i]) if int(flags[i]) else acc + float(x[i])
+        want[i] = acc
+    torch.testing.assert_close(out.cpu().double(), want, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _tuple_running_max_and_sum_combine(a_max, a_sum, b_max, b_sum):
+    return tl.maximum(a_max, b_max), a_sum + b_sum
+
+
+@triton.jit
+def _tuple_running_max_and_sum_kernel(x_ptr, max_ptr, sum_ptr,
+                                      BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    running_max, running_sum = tl.associative_scan(
+        (row, row), 0, _tuple_running_max_and_sum_combine)
+    tl.store(max_ptr + offs, running_max)
+    tl.store(sum_ptr + offs, running_sum)
+
+
+@mps_only
+@pytest.mark.parametrize("block,num_warps", [(64, 2), (128, 4)])
+def test_tuple_scan_i32_running_max_and_sum(block, num_warps):
+    """Both slots are i32, so both ride the ui32 storage bridge, and the
+    comparison has to stay signed across it."""
+    torch.manual_seed(block)
+    x = torch.randint(-1000, 1000, (block,), dtype=torch.int32)
+    running_max = torch.zeros(block, dtype=torch.int32, device="mps")
+    running_sum = torch.zeros(block, dtype=torch.int32, device="mps")
+    _tuple_running_max_and_sum_kernel[(1,)](x.to("mps"), running_max,
+                                            running_sum, BLOCK=block,
+                                            num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(running_max.cpu(), torch.cummax(x, 0).values)
+    assert torch.equal(running_sum.cpu(), x.cumsum(0, dtype=torch.int32))
+
+
+@triton.jit
+def _tuple_first_nonzero_combine(a_value, a_index, b_value, b_index):
+    keep = a_value != 0.0
+    return tl.where(keep, a_value, b_value), tl.where(keep, a_index, b_index)
+
+
+@triton.jit
+def _tuple_first_nonzero_kernel(x_ptr, idx_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    _, index = tl.associative_scan(
+        (tl.load(x_ptr + offs), offs.to(tl.int32)), 0,
+        _tuple_first_nonzero_combine)
+    tl.store(idx_ptr + offs, index)
+
+
+@mps_only
+@pytest.mark.parametrize("block,num_warps", [(32, 1), (64, 2), (128, 4)])
+def test_tuple_scan_keeps_the_prefix_order(block, num_warps):
+    """`first non-zero so far` is associative, not commutative, and its answer
+    depends on which side of the merge each range is on. Every position at or
+    after the first non-zero must name that first one."""
+    torch.manual_seed(block * 3 + num_warps)
+    x = torch.zeros(block)
+    hits = sorted(torch.randperm(block)[:4].tolist())
+    for h in hits:
+        x[h] = float(h) + 1.0
+    index = torch.zeros(block, dtype=torch.int32, device="mps")
+    _tuple_first_nonzero_kernel[(1,)](x.to("mps"), index, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    got = index.cpu().tolist()
+    assert all(g == hits[0] for g in got[hits[0]:]), got[hits[0]:hits[0] + 8]
+
+
+@triton.jit
+def _tuple_sum_and_count_rows_kernel(x_ptr, sum_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + pid * BLOCK + offs)
+    ones = tl.full((BLOCK,), 1.0, tl.float32)
+    prefix, _ = tl.associative_scan((row, ones), 0,
+                                    _tuple_sum_and_count_combine)
+    tl.store(sum_ptr + pid * BLOCK + offs, prefix)
+
+
+@mps_only
+def test_tuple_scan_multiprogram():
+    """Each threadgroup addresses its own slice of the buffers by a LOCAL
+    thread id, and the leading barrier keeps one trip's fill off the previous
+    trip's reads."""
+    torch.manual_seed(21)
+    rows, block = 4, 64
+    x = torch.randn(rows, block)
+    out = torch.zeros(rows, block, device="mps")
+    _tuple_sum_and_count_rows_kernel[(rows,)](x.to("mps").contiguous(), out,
+                                              BLOCK=block, num_warps=2)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().double(), x.double().cumsum(1),
+                               atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _tuple_scan_in_loop_kernel(x_ptr, out_ptr, rows, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    for r in range(0, rows):
+        row = tl.load(x_ptr + r * BLOCK + offs)
+        ones = tl.full((BLOCK,), 1.0, tl.float32)
+        prefix, _ = tl.associative_scan((row, ones), 0,
+                                        _tuple_sum_and_count_combine)
+        tl.store(out_ptr + r * BLOCK + offs, prefix)
+
+
+@mps_only
+def test_tuple_scan_inside_a_user_loop():
+    """One static threadgroup allocation is reused every trip, so this trip's
+    fill would race the previous trip's final reads without the leading
+    barrier."""
+    torch.manual_seed(22)
+    rows, block = 3, 64
+    x = torch.randn(rows, block)
+    out = torch.zeros(rows, block, device="mps")
+    _tuple_scan_in_loop_kernel[(1,)](x.to("mps").contiguous(), out, rows,
+                                     BLOCK=block, num_warps=2)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().double(), x.double().cumsum(1),
+                               atol=1e-4, rtol=1e-4)
+
+
+@mps_only
+def test_tuple_scan_above_one_element_per_thread_is_named(capfd):
+    """Outside the envelope the refusal has to come from the pre-conversion
+    validator: a pattern that declines inside `applyFullConversion` does not
+    raise, it takes the process down."""
+    x = torch.randn(256, device="mps")
+    prefix = torch.zeros(256, device="mps")
+    count = torch.zeros(256, device="mps")
+    with pytest.raises(Exception) as error:
+        _tuple_sum_and_count_kernel[(1,)](x, prefix, count, BLOCK=256,
+                                          num_warps=1)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    reason = capfd.readouterr()
+    assert "at most one element per thread" in reason.err + reason.out
+
+    survivor = torch.randn(32, device="mps")
+    got = torch.zeros(32, device="mps")
+    other = torch.zeros(32, device="mps")
+    _tuple_sum_and_count_kernel[(1,)](survivor, got, other, BLOCK=32,
+                                      num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(got.cpu().double(),
+                               survivor.cpu().double().cumsum(0), atol=1e-4,
+                               rtol=1e-4)

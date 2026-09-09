@@ -6610,7 +6610,8 @@ static bool reduceCombineOpIsClonable(mlir::Operation *op) {
       mlir::math::LogOp, mlir::math::SqrtOp, mlir::math::RsqrtOp,
       mlir::math::SinOp, mlir::math::CosOp, mlir::math::ErfOp,
       mlir::math::FloorOp, mlir::math::CeilOp, mlir::math::AbsIOp,
-      mlir::math::AbsFOp, mlir::triton::ReduceReturnOp>(op);
+      mlir::math::AbsFOp, mlir::triton::ReduceReturnOp,
+      mlir::triton::ScanReturnOp>(op);
 }
 
 // True when the combine region can be replayed per element by cloning it, for
@@ -6619,16 +6620,13 @@ static bool reduceCombineOpIsClonable(mlir::Operation *op) {
 // every op clonable, and no value captured from outside the region beyond a
 // scalar constant (any other capture would not dominate the point the clone is
 // emitted at).
-static bool reduceCombineIsClonableNAry(mlir::triton::ReduceOp op) {
-  size_t n = op.getSrcs().size();
-  if (n == 0 || op->getNumResults() != n)
+static bool combineRegionIsClonableNAry(mlir::Region &region, size_t n) {
+  if (n == 0 || region.getBlocks().size() != 1)
     return false;
-  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
-    return false;
-  mlir::Block &body = op->getRegion(0).front();
+  mlir::Block &body = region.front();
   if (body.getNumArguments() != 2 * n)
     return false;
-  auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(body.getTerminator());
+  mlir::Operation *ret = body.getTerminator();
   if (!ret || ret->getNumOperands() != n)
     return false;
   for (auto &nested : body) {
@@ -6652,6 +6650,13 @@ static bool reduceCombineIsClonableNAry(mlir::triton::ReduceOp op) {
   return true;
 }
 
+static bool reduceCombineIsClonableNAry(mlir::triton::ReduceOp op) {
+  size_t n = op.getSrcs().size();
+  if (n == 0 || op->getNumResults() != n || op->getNumRegions() != 1)
+    return false;
+  return combineRegionIsClonableNAry(op->getRegion(0), n);
+}
+
 // True when a SINGLE-value combine region can be replayed per element. The
 // arity-general form is what actually inspects the region; this only adds the
 // one-source/one-result restriction the monoid paths rely on.
@@ -6667,12 +6672,12 @@ static bool reduceCombineIsClonable(mlir::triton::ReduceOp op) {
 // a` is a legal reducer), so every caller passes the LOWER logical position as
 // `lhs`. Cloning preserves that; a BinaryExpOp-based fold could not express it.
 static llvm::SmallVector<mlir::Value, 4>
-emitClonedCombineNAry(mlir::triton::ReduceOp op, mlir::ValueRange lhs,
-                      mlir::ValueRange rhs,
-                      mlir::ConversionPatternRewriter &rewriter,
-                      mlir::Location loc) {
+emitClonedRegionCombine(mlir::Region &region, mlir::ValueRange lhs,
+                        mlir::ValueRange rhs,
+                        mlir::ConversionPatternRewriter &rewriter,
+                        mlir::Location loc) {
   llvm::SmallVector<mlir::Value, 4> yielded;
-  mlir::Block &body = op->getRegion(0).front();
+  mlir::Block &body = region.front();
   size_t n = lhs.size();
   if (rhs.size() != n || body.getNumArguments() != 2 * n)
     return yielded;
@@ -6694,14 +6699,22 @@ emitClonedCombineNAry(mlir::triton::ReduceOp op, mlir::ValueRange lhs,
                        mlir::cast<mlir::OpResult>(v).getResultNumber()));
     }
   for (auto &nested : body) {
-    if (auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(nested)) {
-      for (mlir::Value v : ret->getOperands())
+    if (nested.hasTrait<mlir::OpTrait::IsTerminator>()) {
+      for (mlir::Value v : nested.getOperands())
         yielded.push_back(map.lookupOrDefault(v));
       break;
     }
     rewriter.clone(nested, map);
   }
   return yielded;
+}
+
+static llvm::SmallVector<mlir::Value, 4>
+emitClonedCombineNAry(mlir::triton::ReduceOp op, mlir::ValueRange lhs,
+                      mlir::ValueRange rhs,
+                      mlir::ConversionPatternRewriter &rewriter,
+                      mlir::Location loc) {
+  return emitClonedRegionCombine(op->getRegion(0), lhs, rhs, rewriter, loc);
 }
 
 // Replay a single-value combine region on two scalars.
@@ -11492,6 +11505,232 @@ struct StagedScanLowering
   }
 };
 
+// The general multi-value `tl.associative_scan((a, b, ...), 0, combine)` this
+// backend lowers: N >= 2 sources of one shared rank-1 shape and blocked
+// encoding, N results, a replayable combine region over its 2N arguments, and
+// at most one element per thread so a thread's converted scalar IS its logical
+// element.
+//
+// Pattern and pre-conversion validator share it, so a shape the pattern would
+// decline is named before conversion rather than declined inside it.
+static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
+                                         llvm::StringRef *why = nullptr) {
+  auto no = [&](const char *reason) {
+    if (why)
+      *why = reason;
+    return false;
+  };
+  size_t n = op.getSrcs().size();
+  if (n < 2)
+    return no("a tuple scan needs at least two sources");
+  if (op.getNumResults() != n)
+    return no("a tuple scan needs one result per source");
+  if (op.getAxis() != 0)
+    return no("a general tuple scan is implemented for axis 0 only");
+  if (op.getReverse())
+    return no("a reverse tuple scan is not implemented");
+  if (underDivergentControlFlow(op))
+    return no("a tuple scan needs uniform control flow: its barriers must be "
+              "reached by every thread of the threadgroup");
+  auto first =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!first || first.getRank() != 1 || first.isDynamicDim(0))
+    return no("a general tuple scan needs statically shaped rank-1 sources");
+  auto blocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      first.getEncoding());
+  if (!blocked)
+    return no("a general tuple scan needs a blocked source encoding");
+  int64_t tpb = 1;
+  for (int64_t threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (int64_t warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
+    return no("a general tuple scan needs a power-of-two threads-per-block");
+  int64_t blockSize = first.getDimSize(0);
+  if (blockSize <= 0 || blockSize > tpb)
+    return no("a general tuple scan needs at most one element per thread "
+              "(BLOCK <= threads per block)");
+  for (size_t i = 0; i < n; ++i) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[i].getType());
+    auto res = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
+    if (!ty || ty.getShape() != first.getShape() ||
+        ty.getEncoding() != first.getEncoding())
+      return no("every source of a tuple scan must share one shape and "
+                "encoding");
+    if (!rank1TupleSlotTypeSupported(ty.getElementType()))
+      return no("a general tuple scan carries f32 and i32 values only");
+    if (!res || res.getShape() != ty.getShape() ||
+        res.getElementType() != ty.getElementType())
+      return no("each tuple result must have its source's shape and element "
+                "type");
+  }
+  if (op->getNumRegions() != 1 ||
+      !combineRegionIsClonableNAry(op->getRegion(0), n))
+    return no("the combine region must be one block of replayable scalar ops "
+              "over its own arguments");
+  return true;
+}
+
+// Lower a general multi-value rank-1 scan as an inclusive Hillis-Steele prefix
+// over N lockstep threadgroup buffers, one per carried value, replaying the
+// scan's own combine region at each merge.
+//
+// The dedicated `metal.threadgroup_prefix_sum` the single-value path uses
+// cannot serve this: it carries ONE value and one of two hard-wired monoids.
+// Everything below is the same shape as the tuple reduce's tree, with three
+// differences that matter:
+//
+//  * The merge is `combine(buf[i - stride], buf[i])`, and the left operand is
+//    the LOWER position, so an associative-but-not-commutative combine
+//    concatenates its ranges in order.
+//  * There is no identity, and none is needed: a lane below the stride keeps
+//    what it holds, and lanes at or above BLOCK are never read by a lane below
+//    them.
+//  * The read and the write of one step are separated by a barrier, so every
+//    lane has read the previous step's values before any lane overwrites them.
+//    The reads are forced into named bindings for the same reason -- the
+//    emitter inlines a single-use value at its USE, which would move the read
+//    past that barrier.
+//
+// The whole step is branchless: `scf.if` around a barrier would put the barrier
+// in divergent control flow, which is undefined on Metal.
+static mlir::LogicalResult lowerRank1MultiValueScan(
+    mlir::triton::ScanOp op,
+    typename mlir::OpConversionPattern<mlir::triton::ScanOp>::OpAdaptor adaptor,
+    mlir::ConversionPatternRewriter &rewriter) {
+  llvm::StringRef why;
+  if (!rank1MultiValueScanSupported(op, &why))
+    return rewriter.notifyMatchFailure(op, why);
+  size_t n = op.getSrcs().size();
+  if (adaptor.getSrcs().size() != n)
+    return rewriter.notifyMatchFailure(
+        op, "tuple scan: adaptor operand count does not match");
+
+  auto loc = op.getLoc();
+  auto srcTy =
+      mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  auto blocked =
+      mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(srcTy.getEncoding());
+  int64_t tpb = 1;
+  for (int64_t threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (int64_t warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  int64_t blockSize = srcTy.getDimSize(0);
+
+  auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  mlir::Value tidI32 = emitLocalTid(rewriter, loc, tpb);
+  mlir::Value tidUI32 =
+      mlir::UnrealizedConversionCastOp::create(
+          rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{tidI32})
+          .getResult(0);
+
+  llvm::SmallVector<mlir::Type, 4> eltTys, storeTys;
+  llvm::SmallVector<mlir::Value, 4> bufs, mine;
+  for (size_t i = 0; i < n; ++i) {
+    mlir::Type ety =
+        mlir::cast<mlir::RankedTensorType>(op.getSrcs()[i].getType())
+            .getElementType();
+    mlir::Value v = toSignlessInt(adaptor.getSrcs()[i], rewriter, loc);
+    if (v.getType() != ety)
+      return rewriter.notifyMatchFailure(
+          op,
+          "tuple scan: a source did not convert to its scalar element type");
+    mlir::Type storeTy = ety.isF32() ? ety : mlir::Type(ui32);
+    eltTys.push_back(ety);
+    storeTys.push_back(storeTy);
+    mine.push_back(v);
+    bufs.push_back(
+        ThreadgroupAllocaOp::create(
+            rewriter, loc,
+            MetalMemRefType::get(rewriter.getContext(), storeTy, tpb))
+            .getResult());
+  }
+  auto toStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
+    if (storeTys[i] == eltTys[i])
+      return v;
+    return mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{storeTys[i]}, mlir::ValueRange{v})
+        .getResult(0);
+  };
+  auto fromStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
+    return storeTys[i] == eltTys[i] ? v : toSignlessInt(v, rewriter, loc);
+  };
+  // Read a slot and pin the read to HERE: the emitter inlines a single-use
+  // value at its use site, which for these would be after the step's barrier,
+  // i.e. after another lane has overwritten the slot.
+  auto readSlot = [&](size_t i, mlir::Value idxUI) -> mlir::Value {
+    auto get = GetElementOp::create(rewriter, loc, storeTys[i], bufs[i], idxUI);
+    get->setAttr("metal.materialize", rewriter.getUnitAttr());
+    return fromStorage(get.getResult(), i);
+  };
+
+  // Leading barrier: under the tile loop (or a user loop) these allocations are
+  // ONE static buffer reused every trip, so this trip's fill would race the
+  // previous trip's final reads.
+  BarrierOp::create(rewriter, loc);
+  for (size_t i = 0; i < n; ++i)
+    StoreOp::create(rewriter, loc, toStorage(mine[i], i), bufs[i], tidUI32);
+  BarrierOp::create(rewriter, loc);
+
+  auto cZeroI32 = mlir::arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(0));
+  for (int64_t stride = 1; stride < blockSize; stride *= 2) {
+    auto cStride = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(stride)));
+    // The partner is `tid - stride`, clamped so a lane below the stride still
+    // addresses inside the buffer; its merge is discarded by the select below.
+    mlir::Value rawPartner =
+        mlir::arith::SubIOp::create(rewriter, loc, tidI32, cStride.getResult())
+            .getResult();
+    mlir::Value hasPartner = mlir::arith::CmpIOp::create(
+                                 rewriter, loc,
+                                 mlir::arith::CmpIPredicate::sge, tidI32,
+                                 cStride.getResult())
+                                 .getResult();
+    mlir::Value partner =
+        mlir::arith::SelectOp::create(rewriter, loc, hasPartner, rawPartner,
+                                      cZeroI32.getResult())
+            .getResult();
+    mlir::Value partnerUI = mlir::UnrealizedConversionCastOp::create(
+                                rewriter, loc, mlir::TypeRange{ui32},
+                                mlir::ValueRange{partner})
+                                .getResult(0);
+    llvm::SmallVector<mlir::Value, 4> lhs, rhs;
+    for (size_t i = 0; i < n; ++i) {
+      lhs.push_back(readSlot(i, partnerUI));
+      rhs.push_back(readSlot(i, tidUI32));
+    }
+    llvm::SmallVector<mlir::Value, 4> merged =
+        emitClonedRegionCombine(op->getRegion(0), lhs, rhs, rewriter, loc);
+    if (merged.size() != n)
+      return rewriter.notifyMatchFailure(
+          op, "tuple scan: combine region yielded the wrong arity");
+    llvm::SmallVector<mlir::Value, 4> next;
+    for (size_t i = 0; i < n; ++i) {
+      if (!merged[i])
+        return rewriter.notifyMatchFailure(
+            op, "tuple scan: combine region yielded nothing");
+      next.push_back(mlir::arith::SelectOp::create(rewriter, loc, hasPartner,
+                                                   merged[i], rhs[i])
+                         .getResult());
+    }
+    // Every lane has read this step's inputs before any lane overwrites them.
+    BarrierOp::create(rewriter, loc);
+    for (size_t i = 0; i < n; ++i)
+      StoreOp::create(rewriter, loc, toStorage(next[i], i), bufs[i], tidUI32);
+    BarrierOp::create(rewriter, loc);
+  }
+
+  llvm::SmallVector<mlir::Value, 4> results;
+  for (size_t i = 0; i < n; ++i)
+    results.push_back(readSlot(i, tidUI32));
+  rewriter.replaceOp(op, results);
+  return mlir::success();
+}
+
 struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
   ScanLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
                llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
@@ -11509,9 +11748,15 @@ struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
       return lowerCanonicalSegmentedSumScan(op, scanBufs, rewriter);
     if (isCanonicalAffineScan(op))
       return lowerCanonicalAffineScan(op, scanBufs, rewriter);
-    if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
+    // Any other scan carrying more than one value: the general lockstep tuple
+    // scan, whose envelope the pre-conversion validator asks about with the
+    // same predicate.
+    if (op.getSrcs().size() != 1 || op.getNumResults() != 1) {
+      if (rank1MultiValueScanSupported(op))
+        return lowerRank1MultiValueScan(op, adaptor, rewriter);
       return rewriter.notifyMatchFailure(op,
                                          "scan: single operand/result only");
+    }
     if (op.getAxis() != 0)
       return rewriter.notifyMatchFailure(op, "scan: axis=0 only");
     auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(0));
@@ -33194,8 +33439,16 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
       valid = false;
     };
     if (op.getSrcs().size() != 1 || op.getNumResults() != 1) {
-      reject("tl.associative_scan carrying more than one value is implemented "
-             "only for the segmented-sum and affine forms");
+      llvm::StringRef why = "the shape is outside the tuple envelope";
+      if (rank1MultiValueScanSupported(op, &why))
+        return;
+      reject(llvm::Twine("tl.associative_scan carrying more than one value is "
+                         "implemented for the segmented-sum and affine forms, "
+                         "and for a general tuple combine over rank-1 blocked "
+                         "f32/i32 sources holding at most one element per "
+                         "thread: ")
+                 .concat(why)
+                 .str());
       return;
     }
     // A rank >= 2 scan goes to the staged fallback; `planStagedScan` is its
