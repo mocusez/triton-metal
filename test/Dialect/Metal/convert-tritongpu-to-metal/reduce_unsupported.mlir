@@ -46,26 +46,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 }
 
 // -----
-// A tuple reduce holding MORE THAN ONE element per thread. The lockstep
-// buffers give each thread one slot, and its converted scalar is its single
-// logical element; above that the thread owns a band the tree cannot address.
+// A tuple reduce whose per-thread band is longer than the fold is implemented
+// for. Above one element per thread a thread folds its own band first (see
+// rank1_reduce_tuple.mlir), and that band is capped: a four-thousand-element
+// block over one warp gives each thread a hundred and twenty-eight elements.
 //
-// This is the adjacent negative of `rank1_reduce_tuple.mlir`: the same
-// combine, one warp instead of four. A near-miss argmax that breaks ties
-// towards the HIGHER index used to sit here too -- it is now lowered, which is
-// the point of that fixture.
+// A near-miss argmax that breaks ties towards the HIGHER index used to sit
+// here, and so did a hundred-and-twenty-eight-element block over one warp.
+// Both are lowered now, which is the point of that fixture.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_tuple_above_one_element_per_thread(%x_ptr: !tt.ptr<f32>) {
-    %x = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    %y = arith.constant dense<2.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{a general tuple reduce needs at most one element per thread (BLOCK <= threads per block)}}
+  tt.func public @reduce_tuple_band_too_long(%x_ptr: !tt.ptr<f32>) {
+    %x = arith.constant dense<1.0> : tensor<4096xf32, #blocked>
+    %y = arith.constant dense<2.0> : tensor<4096xf32, #blocked>
+    // expected-error @+1 {{a general tuple reduce is implemented up to sixty-four elements per thread}}
     %r:2 = "tt.reduce"(%x, %y) ({
     ^bb0(%a1: f32, %b1: f32, %a2: f32, %b2: f32):
       %m1 = arith.minnumf %a1, %a2 : f32
       %m2 = arith.maxnumf %b1, %b2 : f32
       tt.reduce.return %m1, %m2 : f32, f32
-    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (f32, f32)
+    }) {axis = 0 : i32} : (tensor<4096xf32, #blocked>, tensor<4096xf32, #blocked>) -> (f32, f32)
     tt.return
   }
 }

@@ -6880,6 +6880,31 @@ static bool isCanonicalRank2Axis1ArgminReduce(mlir::triton::ReduceOp op) {
          ret->getOperand(1) == selectIndex.getResult();
 }
 
+// The geometry `lowerRank1ArgmaxReduce` can actually lower: one element per
+// thread, over a power-of-two threadgroup. Above that its butterfly has no
+// slot for a thread's second element, and the general tuple reduce takes the
+// shape instead -- the canonical combine is replayable like any other. Factored
+// out so the dispatch, the pre-conversion validator and the lowering cannot
+// disagree about where the boundary is.
+static bool canonicalRank1ArgmaxFits(mlir::triton::ReduceOp op) {
+  auto valueTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!valueTy)
+    return false;
+  auto blocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      valueTy.getEncoding());
+  if (!blocked)
+    return false;
+  int64_t tpb = 1;
+  for (int64_t threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (int64_t warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  int64_t blockSize = valueTy.getDimSize(0);
+  return tpb > 0 && (tpb & (tpb - 1)) == 0 && blockSize > 0 &&
+         blockSize <= tpb;
+}
+
 // Lower the canonical rank-1 argmax pair reducer through two lockstep
 // threadgroup buffers. The value buffer decides the winner; the index buffer
 // carries the selected logical index through the same butterfly. Ties select
@@ -7109,9 +7134,28 @@ static bool rank1MultiValueReduceSupported(mlir::triton::ReduceOp op,
   if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
     return no("a general tuple reduce needs a power-of-two threads-per-block");
   int64_t blockSize = first.getDimSize(0);
-  if (blockSize <= 0 || blockSize > tpb)
-    return no("a general tuple reduce needs at most one element per thread "
-              "(BLOCK <= threads per block)");
+  if (blockSize <= 0)
+    return no("a general tuple reduce needs a non-empty block");
+  if (blockSize > tpb) {
+    // Above one element per thread a thread folds its own contiguous band
+    // before the tree runs, and it re-derives that band at its logical
+    // positions rather than reading its converted scalar.
+    // Defensive: not reachable from any module the TritonGPU verifier accepts,
+    // since it requires a power-of-two element count and tpb is a power of two
+    // as well. Deliberately left unpinned by a fixture -- a test for it would
+    // have to be a module the verifier rejects first.
+    if (blockSize % tpb != 0)
+      return no("a general tuple reduce above one element per thread needs "
+                "BLOCK to be a multiple of the threads per block");
+    if (blockSize / tpb > 64)
+      return no("a general tuple reduce is implemented up to sixty-four "
+                "elements per thread");
+    for (mlir::Value src : op.getSrcs())
+      if (!rank1ConeSupported(src, 0))
+        return no("a general tuple reduce above one element per thread has to "
+                  "re-derive each source at a logical position, and one of "
+                  "them is not a re-emittable cone");
+  }
   for (size_t i = 0; i < n; ++i) {
     auto ty = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[i].getType());
     if (!ty || ty.getShape() != first.getShape() ||
@@ -7185,25 +7229,41 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
   // Per carried value: the element type the region is written against, the
   // buffer's storage type (ui32 for i32, which has no signless memref
   // spelling), and the buffer itself.
+  // Above one element per thread, a thread first folds its OWN elements and
+  // the cross-thread tree then runs unchanged over the per-thread partials.
+  // That works because this path CHOOSES the mapping: thread t takes the
+  // contiguous band [t*E, (t+1)*E), so the thread order the tree merges in IS
+  // the position order the combine needs.
+  //
+  // Publishing all BLOCK positions and running the tree over them is the other
+  // way to be order-exact, and it costs E times the threadgroup memory:
+  // measured, a 4096-element argmax then takes the entire 32 KiB budget, and
+  // one more staged reduce in the same kernel turns the launch into an opaque
+  // `Failed to create pipeline state object` rather than any diagnostic this
+  // backend controls.
+  const int64_t ePerThread = blockSize > tpb ? blockSize / tpb : 1;
+  const int64_t slots = tpb;
   llvm::SmallVector<mlir::Type, 4> eltTys, storeTys;
   llvm::SmallVector<mlir::Value, 4> bufs, mine;
   for (size_t i = 0; i < n; ++i) {
     mlir::Type ety =
         mlir::cast<mlir::RankedTensorType>(op.getSrcs()[i].getType())
             .getElementType();
-    mlir::Value v = toSignlessInt(adaptor.getSrcs()[i], rewriter, loc);
-    if (v.getType() != ety)
-      return rewriter.notifyMatchFailure(
-          op, "tuple reduce: a source did not convert to its scalar element "
-              "type");
+    if (ePerThread == 1) {
+      mlir::Value v = toSignlessInt(adaptor.getSrcs()[i], rewriter, loc);
+      if (v.getType() != ety)
+        return rewriter.notifyMatchFailure(
+            op, "tuple reduce: a source did not convert to its scalar element "
+                "type");
+      mine.push_back(v);
+    }
     mlir::Type storeTy = ety.isF32() ? ety : mlir::Type(ui32);
     eltTys.push_back(ety);
     storeTys.push_back(storeTy);
-    mine.push_back(v);
     bufs.push_back(ThreadgroupAllocaOp::create(
                        rewriter, loc,
                        MetalMemRefType::get(rewriter.getContext(), storeTy,
-                                            tpb))
+                                            slots))
                        .getResult());
   }
   auto toStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
@@ -7220,6 +7280,68 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
   // The leading barrier prevents iteration t+1 from overwriting a static
   // scratch allocation before all threads have consumed iteration t's slot 0
   // (same hazard the argmax butterfly guards against).
+  // The thread's own band, folded in increasing position order before it ever
+  // reaches the tree. ⚠️ `localTid * E + k` is NOT a claim about where the
+  // source layout puts a thread's k-th element, and it does not have to be: the
+  // value is re-derived AT that position from the cone, so all the mapping owes
+  // is to cover [0, BLOCK) exactly once across the threadgroup -- and to give
+  // each thread a CONTIGUOUS range, which is what lets the thread-ordered tree
+  // stand in for a position-ordered one. `sizePerThread` is irrelevant here,
+  // the same way it is in the rank-1 scan's fill.
+  if (ePerThread > 1) {
+    auto cE = mlir::arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(ePerThread)));
+    mlir::Value base =
+        mlir::arith::MulIOp::create(rewriter, loc, tidI32, cE.getResult())
+            .getResult();
+    llvm::SmallVector<mlir::Value, 4> acc;
+    for (size_t i = 0; i < n; ++i) {
+      mlir::Value elt =
+          evalRank1ValueAt(op.getSrcs()[i], base, rewriter, loc, 0);
+      if (!elt)
+        return rewriter.notifyMatchFailure(
+            op,
+            "tuple reduce: a source is not evaluable at a logical position");
+      elt = toSignlessInt(elt, rewriter, loc);
+      if (elt.getType() != eltTys[i])
+        return rewriter.notifyMatchFailure(
+            op, "tuple reduce: a re-derived source has the wrong element type");
+      acc.push_back(elt);
+    }
+    // An `scf.for` rather than an unrolled band, so the combine region is
+    // cloned ONCE however many elements a thread owns.
+    auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI32IntegerAttr(1));
+    auto fold = mlir::scf::ForOp::create(rewriter, loc, cOne.getResult(),
+                                         cE.getResult(), cOne.getResult(), acc);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(fold.getBody());
+      mlir::Value pos = mlir::arith::AddIOp::create(rewriter, loc, base,
+                                                    fold.getInductionVar())
+                            .getResult();
+      llvm::SmallVector<mlir::Value, 4> elts;
+      for (size_t i = 0; i < n; ++i) {
+        mlir::Value elt =
+            evalRank1ValueAt(op.getSrcs()[i], pos, rewriter, loc, 0);
+        if (!elt)
+          return rewriter.notifyMatchFailure(
+              op,
+              "tuple reduce: a source is not evaluable inside the band fold");
+        elts.push_back(toSignlessInt(elt, rewriter, loc));
+      }
+      // The accumulated prefix is the LOWER range, so it is the left operand.
+      llvm::SmallVector<mlir::Value, 4> merged = emitClonedCombineNAry(
+          op, fold.getRegionIterArgs(), elts, rewriter, loc);
+      if (merged.size() != n)
+        return rewriter.notifyMatchFailure(
+            op, "tuple reduce: band fold combine yielded the wrong arity");
+      mlir::scf::YieldOp::create(rewriter, loc, merged);
+    }
+    mine.assign(fold.getResults().begin(), fold.getResults().end());
+  }
+
   BarrierOp::create(rewriter, loc);
   for (size_t i = 0; i < n; ++i)
     StoreOp::create(rewriter, loc, toStorage(mine[i], i), bufs[i], tidUI32);
@@ -7228,7 +7350,7 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
   auto cBlock = mlir::arith::ConstantOp::create(
       rewriter, loc,
       rewriter.getI32IntegerAttr(static_cast<int32_t>(blockSize)));
-  for (int64_t stride = 1; stride < tpb; stride *= 2) {
+  for (int64_t stride = 1; stride < slots; stride *= 2) {
     auto cStride = mlir::arith::ConstantOp::create(
         rewriter, loc,
         rewriter.getI32IntegerAttr(static_cast<int32_t>(stride)));
@@ -7279,8 +7401,8 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
         return rewriter.notifyMatchFailure(
             op, "tuple reduce: combine region yielded the wrong arity");
       // A partner past the end of the block holds no element of the tensor, so
-      // this lane keeps what it already had. With BLOCK == tpb every partner
-      // is live and the guard is not emitted at all.
+      // this lane keeps what it already had. With BLOCK >= tpb every thread
+      // owns a full band and the guard is not emitted at all.
       mlir::Value partnerLive;
       if (blockSize < tpb)
         partnerLive = mlir::arith::CmpIOp::create(
@@ -14076,7 +14198,7 @@ struct ReduceLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     if (isCanonicalRank2Axis1ArgminReduce(op))
       return lowerRank2Axis1ArgminReduce(op, rewriter);
-    if (isCanonicalRank1ArgmaxReduce(op))
+    if (isCanonicalRank1ArgmaxReduce(op) && canonicalRank1ArgmaxFits(op))
       return lowerRank1ArgmaxReduce(op, adaptor, rewriter);
     // Any other reduce carrying more than one value: the general lockstep
     // tuple reduce, whose envelope the pre-conversion validator asks about with
@@ -34601,26 +34723,14 @@ struct ConvertTritonGPUToMetalPass
       // (f32 value, i32 logical index). It is lowered by the dedicated
       // lockstep value/index butterfly rather than the single-result combine
       // allowlist below.
-      if (isCanonicalRank1ArgmaxReduce(red)) {
-        auto blocked =
-            mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
-                rtt.getEncoding());
-        int64_t tpb = 1;
-        if (blocked) {
-          for (int64_t threads : blocked.getThreadsPerWarp())
-            tpb *= threads;
-          for (int64_t warps : blocked.getWarpsPerCTA())
-            tpb *= warps;
-        }
-        int64_t blockSize = rtt.getDimSize(0);
-        if (!blocked || tpb <= 0 || (tpb & (tpb - 1)) != 0 || blockSize <= 0 ||
-            blockSize > tpb) {
-          red.emitOpError(
-              "rank-1 argmax requires blocked 0 < BLOCK <= power-of-two tpb");
-          reduceOk = false;
-        }
+      // Inside its own geometry the dedicated butterfly takes it. Outside --
+      // a block bigger than the threadgroup, which is what `tl.argmax` over an
+      // ordinary row is -- it falls through to the general tuple reduce below,
+      // whose tree runs over positions rather than threads. The canonical
+      // combine is replayable like any other; nothing about it needed the
+      // dedicated path except that it was written first.
+      if (isCanonicalRank1ArgmaxReduce(red) && canonicalRank1ArgmaxFits(red))
         return;
-      }
       // Canonical rank-2 axis=1 argmin is a paired f32-value/i32-index
       // reduction, so its first region op is a comparison rather than one of
       // the single-result combine ops admitted below.
@@ -34671,8 +34781,7 @@ struct ConvertTritonGPUToMetalPass
         red.emitOpError(
             "multi-value tt.reduce is implemented for the canonical rank-1 "
             "argmax and rank-2 axis=1 argmin pairs, and for a general tuple "
-            "combine over rank-1 blocked f32/i32 sources holding at most one "
-            "element per thread: ")
+            "combine over rank-1 blocked f32/i32 sources: ")
             << why << " (got " << red.getSrcs().size() << " operands)";
         reduceOk = false;
         return;

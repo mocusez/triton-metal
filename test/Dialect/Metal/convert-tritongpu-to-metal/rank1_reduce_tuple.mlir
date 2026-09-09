@@ -118,3 +118,64 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK:   metal.store %{{.*}}, %[[VBUF]]
 // CHECK:   arith.select %[[LIVE]]
 // CHECK:   metal.store %{{.*}}, %[[IBUF]]
+
+// -----
+
+// More than one element per thread: a thread folds its OWN contiguous band
+// first, and the cross-thread tree then runs unchanged over the partials.
+// Thread t takes [t*E, (t+1)*E), so merging threads in order merges positions
+// in order -- which is what an associative-but-not-commutative combine needs,
+// and what the interleaved mapping would not give.
+//
+// The band fold is an `scf.for` rather than an unrolled sequence, so the
+// combine region is cloned ONCE however many elements a thread owns.
+//
+// This is the geometry `tl.argmax` over an ordinary row has: the canonical pair
+// lowering owns one slot per thread, so every block bigger than the threadgroup
+// used to be refused.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_tuple_band_fold(%x: !tt.ptr<f32>, %ov: !tt.ptr<f32>, %oi: !tt.ptr<i32>) {
+    %o = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %o : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %v = tt.load %ap : tensor<128x!tt.ptr<f32>, #blocked>
+    %r:2 = "tt.reduce"(%v, %o) ({
+    ^bb0(%a1: f32, %a2: i32, %b1: f32, %b2: i32):
+      %gt = arith.cmpf ogt, %a1, %b1 : f32
+      %mv = arith.select %gt, %a1, %b1 : f32
+      %mi = arith.select %gt, %a2, %b2 : i32
+      tt.reduce.return %mv, %mi : f32, i32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xi32, #blocked>) -> (f32, i32)
+    tt.store %ov, %r#0 : !tt.ptr<f32>
+    tt.store %oi, %r#1 : !tt.ptr<i32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel reduce_tuple_band_fold
+// One slot per THREAD, not per position -- the band fold is what keeps the
+// scratch at that size.
+// CHECK: %[[VBUF:.*]] = metal.threadgroup_alloca : !metal.memref<32 x f32>
+// CHECK: %[[IBUF:.*]] = metal.threadgroup_alloca : !metal.memref<32 x ui32>
+// CHECK: %[[E:.*]] = arith.constant 4 : i32
+// CHECK: %[[BASE:.*]] = arith.muli %{{.*}}, %[[E]] : i32
+// The band's first element seeds the accumulator; there is no identity for a
+// general combine to start from.
+// CHECK: %[[SEED:.*]] = metal.get_element
+// CHECK: %[[FOLD:.*]]:2 = scf.for %[[K:.*]] = %{{.*}} to %[[E]] step %{{.*}} iter_args(%[[ACCV:.*]] = %[[SEED]], %[[ACCI:.*]] = %[[BASE]])
+// CHECK:   %[[POS:.*]] = arith.addi %[[BASE]], %[[K]] : i32
+// CHECK:   %[[ELT:.*]] = metal.get_element
+// The accumulated prefix is the LOWER range, so it is the left operand.
+// CHECK:   %[[GT:.*]] = arith.cmpf ogt, %[[ACCV]], %[[ELT]] : f32
+// CHECK:   arith.select %[[GT]], %[[ACCV]], %[[ELT]] : f32
+// CHECK:   arith.select %[[GT]], %[[ACCI]], %[[POS]] : i32
+// CHECK: metal.barrier
+// CHECK: metal.store %[[FOLD]]#0, %[[VBUF]]
+// CHECK: metal.store %{{.*}}, %[[IBUF]]
+// CHECK: metal.barrier
+// and then the ordinary cross-thread tree over the partials.
+// CHECK: arith.andi
+// CHECK: scf.if
+// CHECK:   arith.cmpf ogt

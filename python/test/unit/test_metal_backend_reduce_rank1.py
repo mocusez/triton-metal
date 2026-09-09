@@ -1091,8 +1091,6 @@ def _tuple_minmax_kernel(x_ptr, min_ptr, max_ptr, BLOCK: tl.constexpr):
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
 @pytest.mark.parametrize("block", [16, 32, 64, 128])
 def test_reduce_rank1_tuple_min_and_max(block, num_warps):
-    if block > 32 * num_warps:
-        pytest.skip("a tuple reduce needs at most one element per thread")
     torch.manual_seed(block * 13 + num_warps)
     x = torch.randn(block)
     lo = torch.zeros(1, device="mps")
@@ -1163,8 +1161,6 @@ def _tuple_argmax_kernel(x_ptr, val_ptr, idx_ptr, BLOCK: tl.constexpr):
 def test_reduce_rank1_tuple_hand_written_argmax(block, num_warps):
     """The same reduction `tl.argmax` performs, written by hand. It does not
     match the canonical structural matcher, so it exercises the general path."""
-    if block > 32 * num_warps:
-        pytest.skip("a tuple reduce needs at most one element per thread")
     torch.manual_seed(block + num_warps * 7)
     x = torch.randn(block)
     val = torch.zeros(1, device="mps")
@@ -1316,25 +1312,165 @@ def test_reduce_rank1_tuple_multiprogram():
     assert torch.equal(hi.cpu(), x.max(dim=1).values)
 
 
-def test_reduce_rank1_tuple_above_one_element_per_thread_is_named(capfd):
+def test_reduce_rank1_tuple_beyond_the_band_envelope_is_named(capfd):
     """Outside the envelope the refusal has to come from the pre-conversion
-    validator: a pattern that declines inside `applyFullConversion` takes the
-    process down instead of raising, so this asserts a catchable error, the
+    validator: a pattern that declines inside `applyFullConversion` does not
+    raise, it takes the process down, so this asserts a catchable error, the
     named reason on the diagnostic stream, AND that the interpreter still runs
-    a kernel afterwards."""
-    x = torch.randn(256).to("mps")
+    a kernel afterwards.
+
+    More than one element per thread is no longer outside it -- a thread folds
+    its own band first -- so the boundary this pins is the band LENGTH."""
+    x = torch.randn(4096).to("mps")
     lo = torch.zeros(1, device="mps")
     hi = torch.zeros(1, device="mps")
     with pytest.raises(Exception) as error:
-        _tuple_minmax_kernel[(1,)](x, lo, hi, BLOCK=256, num_warps=1)
+        _tuple_minmax_kernel[(1,)](x, lo, hi, BLOCK=4096, num_warps=1)
     assert "convert-tritongpu-to-metal failed" in str(error.value)
     diagnostics = capfd.readouterr()
     reason = diagnostics.err + diagnostics.out
     assert "multi-value tt.reduce" in reason
-    assert "at most one element per thread" in reason
+    assert "sixty-four elements per thread" in reason
 
     survivor = torch.arange(32, dtype=torch.float32).to("mps")
     out = torch.zeros(1, device="mps")
     reduce_sum_rank1_kernel[(1,)](survivor, out, BLOCK=32)
     torch.mps.synchronize()
     assert out.cpu().item() == 496.0
+
+
+# ---------------------------------------------------------------------------
+# More than one element per thread.
+#
+# This is where `tl.argmax` over an ordinary row lived: the canonical pair
+# lowering owns one buffer slot per thread, so a block bigger than the
+# threadgroup had nowhere to put a thread's second element and every such
+# kernel was refused -- `tl.argmax` over 1024 elements included.
+#
+# A thread now folds its OWN elements first and the cross-thread tree runs
+# unchanged over the partials. That is only order-correct because this path
+# picks the mapping: thread t takes the contiguous band [t*E, (t+1)*E), so
+# merging threads in order merges positions in order. Hand the threads the
+# interleaved mapping instead and an order-sensitive combine goes wrong while
+# every commutative one -- and the canonical argmax, whose ties resolve by
+# index -- stays right.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _argmax_block_kernel(x_ptr, val_ptr, idx_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    row = tl.load(x_ptr + offs)
+    tl.store(val_ptr, tl.max(row, axis=0))
+    tl.store(idx_ptr, tl.argmax(row, axis=0))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4, 8])
+@pytest.mark.parametrize("block", [64, 128, 512, 1024, 4096])
+def test_argmax_rank1_above_one_element_per_thread(block, num_warps):
+    tpb = 32 * num_warps
+    if block > tpb and (block % tpb or block // tpb > 64):
+        pytest.skip("outside the band envelope")
+    torch.manual_seed(block * 3 + num_warps)
+    x = torch.randn(block)
+    val = torch.zeros(1, device="mps")
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _argmax_block_kernel[(1,)](x.to("mps"), val, idx, BLOCK=block,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert val.cpu().item() == x.max().item()
+    assert idx.cpu().item() == x.argmax().item()
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("block", [128, 1024])
+def test_argmax_rank1_above_one_element_per_thread_ties_go_left(block,
+                                                                num_warps):
+    """Ties resolve to the lower index. Across a band fold that is the pair the
+    thread keeps; across the tree it is the partner on the left."""
+    tpb = 32 * num_warps
+    if block > tpb and (block % tpb or block // tpb > 64):
+        pytest.skip("outside the band envelope")
+    x = torch.zeros(block)
+    first, second = block // 3, 2 * block // 3
+    x[first] = 5.0
+    x[second] = 5.0
+    val = torch.zeros(1, device="mps")
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _argmax_block_kernel[(1,)](x.to("mps"), val, idx, BLOCK=block,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert val.cpu().item() == 5.0
+    assert idx.cpu().item() == first
+
+
+@pytest.mark.parametrize("num_warps", [1, 4, 8])
+@pytest.mark.parametrize("block", [64, 256, 2048])
+def test_reduce_rank1_tuple_above_one_element_per_thread(block, num_warps):
+    tpb = 32 * num_warps
+    if block > tpb and (block % tpb or block // tpb > 64):
+        pytest.skip("outside the band envelope")
+    torch.manual_seed(block + num_warps * 5)
+    x = torch.randn(block)
+    lo = torch.zeros(1, device="mps")
+    hi = torch.zeros(1, device="mps")
+    _tuple_minmax_kernel[(1,)](x.to("mps"), lo, hi, BLOCK=block,
+                               num_warps=num_warps)
+    torch.mps.synchronize()
+    assert lo.cpu().item() == x.min().item()
+    assert hi.cpu().item() == x.max().item()
+
+
+@pytest.mark.parametrize("num_warps,block,hits", [
+    (1, 128, (96, 5, 70)),
+    (1, 512, (400, 33, 260)),
+    (4, 1024, (900, 17, 500)),
+    (8, 4096, (3000, 129, 2048)),
+])
+def test_reduce_rank1_tuple_band_fold_keeps_the_logical_order(block, num_warps,
+                                                              hits):
+    """The order-sensitive probe, now above one element per thread. With the
+    interleaved mapping instead of the contiguous band this reports a later
+    index; with the canonical argmax it would report the same either way, which
+    is why the combine here is `first non-zero` and not an argmax."""
+    x = torch.zeros(block)
+    for h in hits:
+        x[h] = float(h) + 0.5
+    val = torch.zeros(1, device="mps")
+    idx = torch.zeros(1, dtype=torch.int32, device="mps")
+    _tuple_first_nonzero_kernel[(1,)](x.to("mps"), val, idx, BLOCK=block,
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    assert idx.cpu().item() == min(hits)
+    assert val.cpu().item() == float(min(hits)) + 0.5
+
+
+def test_reduce_rank1_tuple_above_one_element_per_thread_multiprogram():
+    """Each threadgroup folds its own row and addresses the scratch by a LOCAL
+    thread id; the band base is a local offset too."""
+    torch.manual_seed(77)
+    rows, block = 4, 256
+    x = torch.randn(rows, block)
+    lo = torch.zeros(rows, device="mps")
+    hi = torch.zeros(rows, device="mps")
+    _tuple_minmax_row_kernel[(rows,)](x.to("mps").contiguous(), lo, hi,
+                                      BLOCK=block, num_warps=2)
+    torch.mps.synchronize()
+    assert torch.equal(lo.cpu(), x.min(dim=1).values)
+    assert torch.equal(hi.cpu(), x.max(dim=1).values)
+
+
+def test_reduce_rank1_tuple_of_three_above_one_element_per_thread():
+    torch.manual_seed(78)
+    block = 1024
+    x = torch.randn(block)
+    total = torch.zeros(1, device="mps")
+    lo = torch.zeros(1, device="mps")
+    hi = torch.zeros(1, device="mps")
+    _tuple_three_kernel[(1,)](x.to("mps"), total, lo, hi, BLOCK=block,
+                              num_warps=4)
+    torch.mps.synchronize()
+    assert total.cpu().item() == pytest.approx(x.double().sum().item(),
+                                               rel=2e-5)
+    assert lo.cpu().item() == x.min().item()
+    assert hi.cpu().item() == x.max().item()
