@@ -1376,6 +1376,49 @@ static mlir::scf::ForOp findOutermostScfFor(mlir::Operation *op) {
   return outermost;
 }
 
+// The tile loop runs as many trips as the LARGEST tile in the function needs,
+// so an op whose own tile holds fewer elements per thread is asked for more
+// iterations than it has elements -- and `emitPerIterIndex` keeps counting, so
+// those trips address past the end of its own tensor. Metal binds tensors
+// zero-copy, which makes such a write land in whatever live tensor follows.
+//
+// Returns the predicate that stops it, or null when no guard is needed. The
+// guard is on the ITERATION rather than the index: for `iv` in [0, E) the index
+// covers [0, numElements) exactly, in the interleaved and the contiguous
+// mapping alike, so `iv < E` IS the in-tile predicate.
+//
+// ⚠️ The gate this replaces read "whenever a tile loop is present (E > 1,
+// indices span exactly [0, numElements)), no guard is emitted" -- true only
+// while the loop is sized by this op's own tile.
+static mlir::Value
+emitTileLoopIterGuard(const TileInfo &tile, mlir::scf::ForOp parentFor,
+                      mlir::ConversionPatternRewriter &rewriter,
+                      mlir::Location loc) {
+  if (!parentFor || tile.elemPerThread <= 1)
+    return {};
+  auto constantOf = [](mlir::Value v) -> std::optional<int64_t> {
+    if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()))
+        return ia.getInt();
+    return std::nullopt;
+  };
+  std::optional<int64_t> lb = constantOf(parentFor.getLowerBound());
+  std::optional<int64_t> ub = constantOf(parentFor.getUpperBound());
+  std::optional<int64_t> step = constantOf(parentFor.getStep());
+  if (!lb || !ub || !step || *step <= 0)
+    return {};
+  int64_t trips = (*ub - *lb + *step - 1) / *step;
+  if (trips <= tile.elemPerThread)
+    return {};
+  auto cE = mlir::arith::ConstantOp::create(
+      rewriter, loc,
+      rewriter.getI32IntegerAttr(static_cast<int32_t>(tile.elemPerThread)));
+  return mlir::arith::CmpIOp::create(
+             rewriter, loc, mlir::arith::CmpIPredicate::slt,
+             parentFor.getInductionVar(), cE.getResult())
+      .getResult();
+}
+
 // localTid = thread_id.x - threadgroup_id.x * tpb. Multi-program safe: each
 // threadgroup must address its own slice by a LOCAL offset (Wall 13).
 static mlir::Value emitLocalTid(mlir::OpBuilder &rewriter, mlir::Location loc,
@@ -16527,7 +16570,9 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
         if (numElements == companion->shape[0])
           needGuard = false;
     }
-    if (!needGuard) {
+    mlir::Value iterGuard =
+        emitTileLoopIterGuard(*tile, parentFor, rewriter, loc);
+    if (!needGuard && !iterGuard) {
       StoreOp::create(rewriter, loc, sval, memref, idx);
       rewriter.eraseOp(op);
       return mlir::success();
@@ -16558,11 +16603,19 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
     auto cNum = mlir::arith::ConstantOp::create(
         rewriter, loc,
         rewriter.getI32IntegerAttr(static_cast<int32_t>(numElements)));
-    auto cond = mlir::arith::CmpIOp::create(rewriter, loc,
-                                            mlir::arith::CmpIPredicate::slt,
-                                            localTid, cNum.getResult());
+    mlir::Value guardCond;
+    if (needGuard)
+      guardCond = mlir::arith::CmpIOp::create(rewriter, loc,
+                                              mlir::arith::CmpIPredicate::slt,
+                                              localTid, cNum.getResult())
+                      .getResult();
+    if (iterGuard)
+      guardCond = guardCond ? mlir::arith::AndIOp::create(rewriter, loc,
+                                                          guardCond, iterGuard)
+                                  .getResult()
+                            : iterGuard;
     auto guardIf = mlir::scf::IfOp::create(rewriter, loc, mlir::TypeRange{},
-                                           cond.getResult(),
+                                           guardCond,
                                            /*addThenBlock=*/true,
                                            /*addElseBlock=*/false);
     {
@@ -16865,6 +16918,12 @@ struct AtomicRmwLowering
                          .getResult()
                    : laneValid;
       }
+      if (mlir::Value iterGuard =
+              emitTileLoopIterGuard(*tile, parentFor, rewriter, loc))
+        cond = cond ? mlir::arith::AndIOp::create(rewriter, loc, cond,
+                                                  iterGuard)
+                          .getResult()
+                    : iterGuard;
 
       mlir::Value oldValue;
       if (cond && resultUsed) {
@@ -17167,6 +17226,13 @@ struct AtomicCasLowering
                                                 localTid, bound.getResult())
                         .getResult();
       }
+      if (mlir::Value iterGuard = emitTileLoopIterGuard(
+              *tile, findOutermostScfFor(op), rewriter, loc))
+        laneValid = laneValid ? mlir::arith::AndIOp::create(rewriter, loc,
+                                                            laneValid,
+                                                            iterGuard)
+                                    .getResult()
+                              : iterGuard;
 
       mlir::Value oldValue;
       if (laneValid && resultUsed) {
@@ -17651,6 +17717,13 @@ struct MaskedStoreLowering
             mlir::arith::AndIOp::create(rewriter, loc, cond, inTile.getResult())
                 .getResult();
       }
+      // ... and the same tile's iterations past its own element count, which a
+      // user mask cannot subsume either: it is a bound on the DATA, not on how
+      // many trips the function's largest tile asked the loop for.
+      if (mlir::Value iterGuard =
+              emitTileLoopIterGuard(*tile, parentFor, rewriter, loc))
+        cond = mlir::arith::AndIOp::create(rewriter, loc, cond, iterGuard)
+                   .getResult();
     }
 
     // L2b: route the masked-store value/scratch/device path through the memref
