@@ -6449,7 +6449,8 @@ using ScanBufPool =
 static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
                                     mlir::ConversionPatternRewriter &rewriter,
                                     mlir::Location loc, int depth);
-static bool rank1ConeSupported(mlir::Value v, int depth);
+static bool rank1ConeSupported(mlir::Value v, int depth,
+                               bool deferAggregateLeaves = false);
 
 //===----------------------------------------------------------------------===//
 // Wall 11 (the implementation notes AC4-AC5):
@@ -6470,28 +6471,30 @@ struct Wall11ChainStep {
 };
 
 // Architect F2 (stale splat), F5 (splat dominance), F7 (rank-1 guard at
-// every depth), F9 (failure semantics: walker calls notifyMatchFailure and
-// the caller propagates `failure()` verbatim). Critic D2 (two-splat rejected),
+// every depth). The read-only walker also serves preflight; the caller emits
+// its diagnostic only if the general cone evaluator cannot handle the source.
+// Critic D2 (two-splat rejected),
 // D6 (cvt-mid-chain rejected before unknown-op fallback).
 static mlir::LogicalResult walkBackThroughElementwiseChain(
     mlir::Value v, int depth, llvm::SmallVectorImpl<Wall11ChainStep> &chain,
     mlir::triton::LoadOp &outLoad, mlir::Operation *reduceOp,
-    mlir::ConversionPatternRewriter &rewriter, mlir::DominanceInfo &dominance) {
+    mlir::DominanceInfo &dominance, std::string &reason) {
+  auto reject = [&](llvm::StringRef message) {
+    reason = message.str();
+    return mlir::failure();
+  };
   // Depth guard (Critic D2 spec; mitigates R3).
   if (depth > 8)
-    return rewriter.notifyMatchFailure(reduceOp,
-                                       "rank-1 reduce B2.3: chain depth > 8");
+    return reject("rank-1 reduce B2.3: chain depth > 8");
 
   // Architect F7: every chain producer must be rank-1.
   auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!rtt || rtt.getRank() != 1)
-    return rewriter.notifyMatchFailure(
-        reduceOp, "rank-1 reduce B2.3: non-rank-1 producer in chain");
+    return reject("rank-1 reduce B2.3: non-rank-1 producer in chain");
 
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
-    return rewriter.notifyMatchFailure(
-        reduceOp,
+    return reject(
         "rank-1 reduce B2.3: chain value has no defining op (block arg)");
 
   // Terminator: tt.load.
@@ -6500,11 +6503,10 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
     return mlir::success();
   }
 
-  // Critic D6: cvt mid-chain emits a cvt-specific diagnostic before the
+  // Critic D6: cvt mid-chain records a cvt-specific diagnostic before the
   // generic unknown-op fallback.
   if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(def))
-    return rewriter.notifyMatchFailure(
-        reduceOp, "rank-1 reduce B2.3: cvt mid-chain not supported "
+    return reject("rank-1 reduce B2.3: cvt mid-chain not supported "
                   "(see spec follow-up F1)");
 
   auto doBinary = [&](mlir::Value lhs, mlir::Value rhs,
@@ -6513,13 +6515,11 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
     auto rhsSplat = rhs.getDefiningOp<mlir::triton::SplatOp>();
     // Critic D2: two-splat binary has no per-iter value.
     if (lhsSplat && rhsSplat)
-      return rewriter.notifyMatchFailure(
-          reduceOp,
+      return reject(
           "rank-1 reduce B2.3: binary op with two splat operands has no "
           "per-iter value");
     if (!lhsSplat && !rhsSplat)
-      return rewriter.notifyMatchFailure(
-          reduceOp,
+      return reject(
           "rank-1 reduce B2.3: binary op with two tensor operands (no splat) "
           "not supported by this walker");
 
@@ -6541,8 +6541,7 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
     // Architect F2: stale splat check (splat may have been rewritten by
     // SplatLowering before this walker runs).
     if (!splat.getOperation()->getBlock())
-      return rewriter.notifyMatchFailure(
-          reduceOp, "rank-1 reduce B2.3: splat already converted");
+      return reject("rank-1 reduce B2.3: splat already converted");
 
     step.splatScalar = splat.getSrc();
 
@@ -6550,15 +6549,14 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
     // reduce's insertion point.
     if (mlir::Operation *scalarDef = step.splatScalar.getDefiningOp()) {
       if (!dominance.dominates(scalarDef, reduceOp))
-        return rewriter.notifyMatchFailure(
-            reduceOp, "rank-1 reduce B2.3: splat operand dominance");
+        return reject("rank-1 reduce B2.3: splat operand dominance");
     }
 
     // Recurse on the running side; on success, push the step so `chain` is
     // in load-to-reduce order.
     if (mlir::failed(walkBackThroughElementwiseChain(runningSide, depth + 1,
                                                      chain, outLoad, reduceOp,
-                                                     rewriter, dominance)))
+                                                     dominance, reason)))
       return mlir::failure();
     chain.push_back(step);
     return mlir::success();
@@ -6567,7 +6565,7 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
   auto doUnary = [&](mlir::Value operand,
                      Wall11ChainStep::Kind kind) -> mlir::LogicalResult {
     if (mlir::failed(walkBackThroughElementwiseChain(
-            operand, depth + 1, chain, outLoad, reduceOp, rewriter, dominance)))
+            operand, depth + 1, chain, outLoad, reduceOp, dominance, reason)))
       return mlir::failure();
     Wall11ChainStep step;
     step.unary = true;
@@ -6588,8 +6586,7 @@ static mlir::LogicalResult walkBackThroughElementwiseChain(
     return doUnary(expOp.getOperand(), Wall11ChainStep::Kind::Exp);
 
   // Architect F9: unknown producer — AC4-exact diagnostic substring.
-  return rewriter.notifyMatchFailure(
-      reduceOp,
+  return reject(
       llvm::formatv("rank-1 reduce B2.3: unsupported producer in elementwise "
                     "chain: {0}",
                     def->getName().getStringRef())
@@ -8030,8 +8027,7 @@ static mlir::LogicalResult lowerRank1Reduce(
     // Wall 11 (the implementation notes AC4):
     // walk back through whitelisted elementwise ops to the producing tt.load.
     // Empty chain = trivial reduce<-tt.load case → Wall 7/8 behavior preserved
-    // bit-for-bit. Architect F9: walker issues notifyMatchFailure on its own
-    // rejection paths; the caller propagates failure() verbatim.
+    // bit-for-bit. The same read-only walker is used by preflight.
     mlir::DominanceInfo dominance(op->getParentOp());
     llvm::SmallVector<Wall11ChainStep, 4> chain;
     mlir::triton::LoadOp loadOp;
@@ -8043,10 +8039,12 @@ static mlir::LogicalResult lowerRank1Reduce(
     // independently). Validate the whole cone up front so an unsupported one is
     // a clean notifyMatchFailure rather than a mid-emission abort.
     bool richCone = false;
+    std::string replayFailure;
     if (mlir::failed(walkBackThroughElementwiseChain(
-            reduceSrc, /*depth=*/0, chain, loadOp, op, rewriter, dominance))) {
+            reduceSrc, /*depth=*/0, chain, loadOp, op, dominance,
+            replayFailure))) {
       if (!rank1ConeSupported(reduceSrc, 0))
-        return mlir::failure(); // walker already emitted a diagnostic
+        return rewriter.notifyMatchFailure(op, replayFailure);
       richCone = true;
     }
     // Wall 7 (the implementation notes):
@@ -10662,7 +10660,8 @@ static mlir::triton::LoadOp findFirstRank2LoadInCone(mlir::Value v, int depth) {
 }
 
 // Mirrors `scalarizeConeAtIndex`'s accepted index producers (predicate only).
-static bool indexConeSupported(mlir::Value v, int depth) {
+static bool indexConeSupported(mlir::Value v, int depth,
+                               bool deferAggregateLeaves = false) {
   if (depth > 24)
     return false;
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
@@ -10673,7 +10672,8 @@ static bool indexConeSupported(mlir::Value v, int depth) {
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return indexConeSupported(def->getOperand(0), depth + 1);
+    return indexConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::triton::MakeRangeOp>(def))
     return true;
   if (auto sp = mlir::dyn_cast<mlir::triton::SplatOp>(def))
@@ -10684,19 +10684,23 @@ static bool indexConeSupported(mlir::Value v, int depth) {
   }
   if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                 mlir::arith::TruncIOp>(def))
-    return indexConeSupported(def->getOperand(0), depth + 1);
+    return indexConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::triton::LoadOp>(def))
-    return rank1ConeSupported(v, depth + 1);
+    return rank1ConeSupported(v, depth + 1, deferAggregateLeaves);
   if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp, mlir::arith::SubIOp,
                 mlir::arith::DivSIOp, mlir::arith::DivUIOp,
                 mlir::arith::RemSIOp, mlir::arith::RemUIOp>(def))
-    return indexConeSupported(def->getOperand(0), depth + 1) &&
-           indexConeSupported(def->getOperand(1), depth + 1);
+    return indexConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           indexConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves);
   return false;
 }
 
 // Mirrors `evalRank1ValueAt`'s accepted producers (predicate only).
-static bool rank1ConeSupported(mlir::Value v, int depth) {
+static bool rank1ConeSupported(mlir::Value v, int depth,
+                               bool deferAggregateLeaves) {
   if (depth > 24)
     return false;
   if (g_loopGatherStagedValues && g_loopGatherStagedValues->count(v))
@@ -10730,10 +10734,12 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
                   mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                   mlir::arith::TruncIOp>(def) ||
         coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
-      return rank1ConeSupported(def->getOperand(0), depth + 1);
+      return rank1ConeSupported(def->getOperand(0), depth + 1,
+                                deferAggregateLeaves);
     if (mlir::isa<mlir::math::AbsFOp>(def))
       return metalAbsFTypeSupported(def->getResult(0).getType()) &&
-             rank1ConeSupported(def->getOperand(0), depth + 1);
+             rank1ConeSupported(def->getOperand(0), depth + 1,
+                                deferAggregateLeaves);
     if (mlir::isa<
             mlir::arith::AddFOp, mlir::arith::SubFOp, mlir::arith::MulFOp,
             mlir::arith::DivFOp, mlir::arith::MaximumFOp,
@@ -10744,14 +10750,27 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
             mlir::arith::OrIOp, mlir::arith::XOrIOp, mlir::arith::ShLIOp,
             mlir::arith::ShRSIOp, mlir::arith::ShRUIOp, mlir::arith::CmpIOp,
             mlir::arith::CmpFOp>(def))
-      return rank1ConeSupported(def->getOperand(0), depth + 1) &&
-             rank1ConeSupported(def->getOperand(1), depth + 1);
+      return rank1ConeSupported(def->getOperand(0), depth + 1,
+                                deferAggregateLeaves) &&
+             rank1ConeSupported(def->getOperand(1), depth + 1,
+                                deferAggregateLeaves);
     if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
-      return rank1ConeSupported(sel.getCondition(), depth + 1) &&
-             rank1ConeSupported(sel.getTrueValue(), depth + 1) &&
-             rank1ConeSupported(sel.getFalseValue(), depth + 1);
+      return rank1ConeSupported(sel.getCondition(), depth + 1,
+                                deferAggregateLeaves) &&
+             rank1ConeSupported(sel.getTrueValue(), depth + 1,
+                                deferAggregateLeaves) &&
+             rank1ConeSupported(sel.getFalseValue(), depth + 1,
+                                deferAggregateLeaves);
     return false;
   }
+  // Before conversion, aggregate buffers have not been registered yet.
+  // Their own validators/lowerings decide materialization;
+  // this dry run checks only the elementwise cone above those boundaries.
+  // Emission always uses the strict default and requires a registered buffer.
+  if (deferAggregateLeaves &&
+      mlir::isa_and_nonnull<mlir::triton::ReduceOp, mlir::triton::ScanOp>(
+          v.getDefiningOp()))
+    return true;
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
     return splat.getOperation()->getBlock() != nullptr;
   if (auto cst = v.getDefiningOp<mlir::arith::ConstantOp>()) {
@@ -10764,7 +10783,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return rank1ConeSupported(def->getOperand(0), depth + 1);
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   // Tensor-yielding scf.if with a scalar (uniform) condition → per-element
   // select of the two branch yields.
   if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(def)) {
@@ -10772,8 +10792,10 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
         mlir::isa<mlir::RankedTensorType>(ifOp.getCondition().getType()))
       return false;
     unsigned resIdx = mlir::cast<mlir::OpResult>(v).getResultNumber();
-    return rank1ConeSupported(ifOp.thenYield().getOperand(resIdx), depth + 1) &&
-           rank1ConeSupported(ifOp.elseYield().getOperand(resIdx), depth + 1);
+    return rank1ConeSupported(ifOp.thenYield().getOperand(resIdx), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(ifOp.elseYield().getOperand(resIdx), depth + 1,
+                              deferAggregateLeaves);
   }
   if (mlir::isa<mlir::triton::MakeRangeOp>(def))
     return true;
@@ -10784,8 +10806,10 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
         mlir::dyn_cast<mlir::RankedTensorType>(gather.getIndices().getType());
     return gather.getAxis() == 0 && srcTy && idxTy && srcTy.getRank() == 1 &&
            idxTy.getRank() == 1 && idxTy.getElementType().isInteger(32) &&
-           rank1ConeSupported(gather.getSrc(), depth + 1) &&
-           rank1ConeSupported(gather.getIndices(), depth + 1);
+           rank1ConeSupported(gather.getSrc(), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(gather.getIndices(), depth + 1,
+                              deferAggregateLeaves);
   }
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
     // Rank-1 singleton loads canonicalise to `tt.load(tt.splat(base))` for a
@@ -10806,10 +10830,10 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
       sawAddPtr = true;
       mlir::Value offset = addptr.getOffset();
       if (mlir::isa<mlir::RankedTensorType>(offset.getType()) &&
-          !indexConeSupported(offset, 0))
+          !indexConeSupported(offset, 0, deferAggregateLeaves))
         return false;
       if (!mlir::isa<mlir::RankedTensorType>(offset.getType()) &&
-          !rank1ConeSupported(offset, depth + 1))
+          !rank1ConeSupported(offset, depth + 1, deferAggregateLeaves))
         return false;
       cur = addptr.getPtr();
     }
@@ -10817,26 +10841,31 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
       return false;
     // Masked loads are handled by an scf.if guard; the mask + other cones must
     // themselves be evaluable at an index.
-    if (load.getMask() && !rank1ConeSupported(load.getMask(), depth + 1))
+    if (load.getMask() &&
+        !rank1ConeSupported(load.getMask(), depth + 1, deferAggregateLeaves))
       return false;
-    if (load.getOther() && !rank1ConeSupported(load.getOther(), depth + 1))
+    if (load.getOther() &&
+        !rank1ConeSupported(load.getOther(), depth + 1, deferAggregateLeaves))
       return false;
     return true;
   }
   if (auto s = mlir::dyn_cast<mlir::arith::SIToFPOp>(def))
-    return rank1ConeSupported(s.getIn(), depth + 1);
+    return rank1ConeSupported(s.getIn(), depth + 1, deferAggregateLeaves);
   if (auto s = mlir::dyn_cast<mlir::arith::UIToFPOp>(def))
-    return rank1ConeSupported(s.getIn(), depth + 1);
+    return rank1ConeSupported(s.getIn(), depth + 1, deferAggregateLeaves);
   // Integer width casts mirror the corresponding cases in evalRank1ValueAt.
   if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                 mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                 mlir::arith::TruncIOp>(def))
-    return rank1ConeSupported(def->getOperand(0), depth + 1);
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
-    return rank1ConeSupported(def->getOperand(0), depth + 1);
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
-           rank1ConeSupported(def->getOperand(0), depth + 1);
+           rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves);
   // NOTE: this list must stay in sync with the binary cases in
   // `evalRank1ValueAt` — this predicate is the dry run that decides whether the
   // evaluator gets to emit at all, so an op accepted there but missing here is
@@ -10851,12 +10880,17 @@ static bool rank1ConeSupported(mlir::Value v, int depth) {
           mlir::arith::ShRSIOp, mlir::arith::ShRUIOp, mlir::arith::DivSIOp,
           mlir::arith::DivUIOp, mlir::arith::RemSIOp, mlir::arith::RemUIOp,
           mlir::arith::CmpIOp, mlir::arith::CmpFOp>(def))
-    return rank1ConeSupported(def->getOperand(0), depth + 1) &&
-           rank1ConeSupported(def->getOperand(1), depth + 1);
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves);
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
-    return rank1ConeSupported(sel.getCondition(), depth + 1) &&
-           rank1ConeSupported(sel.getTrueValue(), depth + 1) &&
-           rank1ConeSupported(sel.getFalseValue(), depth + 1);
+    return rank1ConeSupported(sel.getCondition(), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(sel.getTrueValue(), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(sel.getFalseValue(), depth + 1,
+                              deferAggregateLeaves);
   return false;
 }
 
@@ -36459,6 +36493,40 @@ struct ConvertTritonGPUToMetalPass
         red.emitOpError("rank-1 f32 product requires a direct tt.load");
         reduceOk = false;
         return;
+      }
+      // A blocked rank-1 reduce above one element per thread replays its
+      // source. Use the lowering's two existing eligibility paths before any
+      // dialect conversion, where declining still raises a catchable error.
+      // Single-band inputs consume the converted scalar and need no replay.
+      if (rtt.getRank() == 1 && axes == 0) {
+        auto blocked =
+            mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+                rtt.getEncoding());
+        int64_t tpb = 1;
+        if (blocked) {
+          for (unsigned threads : blocked.getThreadsPerWarp())
+            tpb *= threads;
+          for (unsigned warps : blocked.getWarpsPerCTA())
+            tpb *= warps;
+        }
+        if (blocked && tpb > 0 && rtt.getDimSize(0) > tpb) {
+          mlir::Value src = red.getSrcs().front();
+          if (auto cvt =
+                  src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+            src = cvt.getSrc();
+          mlir::DominanceInfo dominance(red->getParentOp());
+          llvm::SmallVector<Wall11ChainStep, 4> chain;
+          mlir::triton::LoadOp load;
+          std::string reason;
+          if (mlir::failed(walkBackThroughElementwiseChain(
+                  src, 0, chain, load, red, dominance, reason)) &&
+              !rank1ConeSupported(src, 0, /*deferAggregateLeaves=*/true)) {
+            red.emitOpError("rank-1 reduce cannot replay its source: ")
+                << reason;
+            reduceOk = false;
+            return;
+          }
+        }
       }
       if (rtt.getRank() == 2 && axes == 1 && combineName == "arith.mulf") {
         mlir::Value src = red.getSrcs().front();

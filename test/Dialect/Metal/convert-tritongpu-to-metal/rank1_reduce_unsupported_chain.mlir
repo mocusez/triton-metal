@@ -1,26 +1,9 @@
-// RUN: not --crash triton-metal-opt --convert-tritongpu-to-metal -debug-only=dialect-conversion %s 2>&1 | FileCheck %s
+// RUN: not triton-metal-opt --convert-tritongpu-to-metal %s 2>&1 | FileCheck %s --implicit-check-not="failed to legalize"
 //
-// NOTE on `not --crash`: triton-metal-opt has a known cleanup-on-conversion-
-// failure bug where the post-failure region teardown SIGSEGVs (see exit code
-// 139 in the lit output). The bug is unrelated to Wall 11 — it occurs on any
-// conversion failure, not specifically chain rejection. `not --crash` accepts
-// the crash exit so we can FileCheck the diagnostic that fires BEFORE the
-// crash.
-//
-// Negative fixture: a rank-1 reduce whose producer chain contains an op outside
-// BOTH the Wall-11 single-load walker whitelist AND the W-B rich cone evaluator
-// (`evalRank1ValueAt` / `rank1ConeSupported`, which cover splat/const/make_range/
-// masked-load/sitofp/unary-math/f32-arith/int-arith/select/cmp).
-//
-// `arith.maxsi` is chosen because it HAS a Metal tensor lowering
-// (`ArithMaxSILowering`) — so the conversion driver does NOT hard-crash on a
-// totally-unconvertible op — yet it is NOT a rank-1 cone producer, so the reduce
-// is cleanly rejected: the walker emits
-// `unsupported producer in elementwise chain:` and the rich fallback's
-// `rank1ConeSupported` returns false. (Earlier versions used `math.log`, then
-// `arith.remsi`; both are now supported by the rich cone evaluator.)
-//
-// See the implementation notes AC4.
+// arith.maxsi has a Metal tensor lowering but cannot be replayed by either
+// rank-1 source evaluator. Reject before dialect conversion: this fixture used
+// to require `not --crash` because failed-conversion teardown raised SIGSEGV.
+// The shared source-cone preflight must now fail with a normal diagnostic.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
@@ -41,4 +24,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
   }
 }
 
-// CHECK: unsupported producer in elementwise chain:
+// CHECK: rank-1 reduce cannot replay its source:
+// CHECK-SAME: unsupported producer in elementwise chain: arith.maxsi

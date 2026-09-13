@@ -3406,3 +3406,127 @@ def test_reduce_then_sort_hypercube_axis(N, num_warps, axis):
     torch.mps.synchronize()
     expected = torch.sort(x.reshape([2] * nd).amax(dim=axis).reshape(-1)).values
     assert torch.equal(out.cpu(), expected)
+
+
+@triton.jit
+def _reduce_replay_math_kernel(X, Y, O, BLOCK: tl.constexpr,
+                               OP: tl.constexpr, WRAPPED: tl.constexpr,
+                               REDUCE: tl.constexpr):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + index)
+    y = tl.load(Y + index)
+    if OP == "sqrt_rn":
+        value = tl.sqrt_rn(x)
+    elif OP == "div_rn":
+        value = tl.div_rn(x, y)
+    elif OP == "fma":
+        value = tl.fma(x, y, x)
+    elif OP == "clamp":
+        value = tl.clamp(x, 0.5, 1.5)
+    else:
+        value = tl.sqrt(x)
+    if WRAPPED:
+        value = tl.abs(value)
+    if REDUCE == "sum":
+        result = tl.sum(value, 0)
+    else:
+        result = tl.max(value, 0)
+    tl.store(O + tl.program_id(0), result)
+
+
+@triton.jit
+def _reduce_replay_loop_kernel(X, Y, O, BLOCK: tl.constexpr,
+                               OP: tl.constexpr, WRAPPED: tl.constexpr,
+                               REDUCE: tl.constexpr):
+    x = tl.load(X + tl.arange(0, BLOCK))
+    state = x
+    steps = tl.load(Y).to(tl.int32)
+    for i in range(steps):
+        # A nonlinear recurrence cannot be reassociated into scalar reductions.
+        state = tl.sin(state + x)
+        if OP == "loop_iter_arg":
+            value = tl.abs(state) if WRAPPED else state
+            result = tl.sum(value, 0) if REDUCE == "sum" else tl.max(value, 0)
+            tl.store(O + i, result)
+    if OP == "loop_result":
+        value = tl.abs(state) if WRAPPED else state
+        result = tl.sum(value, 0) if REDUCE == "sum" else tl.max(value, 0)
+        tl.store(O, result)
+
+
+@pytest.mark.parametrize("operation", ["sqrt_rn", "div_rn", "fma", "clamp",
+                                       "loop_result", "loop_iter_arg"])
+@pytest.mark.parametrize("num_warps,wrapped,reduction", [(1, False, "sum"), (4, True, "max")])
+def test_reduce_rank1_unreplayable_source_fails_without_crashing(
+        operation, num_warps, wrapped, reduction, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    # Repeat in one process, then compile a supported cone. Conversion rollback
+    # used to kill the interpreter; a Python exception must leave it usable.
+    script = tmp_path / "reduce_replay.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        signature = {{"X": "*fp32", "Y": "*fp32", "O": "*fp32"}}
+        constants = {{"BLOCK": {num_warps * 128}, "OP": {operation!r},
+                     "WRAPPED": {wrapped}, "REDUCE": {reduction!r}}}
+        kernel = (module._reduce_replay_loop_kernel if {operation.startswith("loop_")}
+                  else module._reduce_replay_math_kernel)
+        for attempt in range(3):
+            try:
+                triton.compile(ASTSource(kernel,
+                    signature=signature, constexprs=constants),
+                    target=GPUTarget("metal", 80, 32), options={{"num_warps": {num_warps}}})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported replay unexpectedly compiled")
+        constants["OP"] = "sqrt"
+        triton.compile(ASTSource(module._reduce_replay_math_kernel,
+            signature=signature, constexprs=constants),
+            target=GPUTarget("metal", 80, 32), options={{"num_warps": {num_warps}}})
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count("rank-1 reduce cannot replay its source") == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize("operation", ["sqrt_rn", "div_rn", "fma", "clamp", "sqrt"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("reduction", ["sum", "max"])
+def test_reduce_rank1_math_single_band_remains_supported(operation, num_warps, reduction):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires physical MPS")
+    block = num_warps * 32
+    x = (torch.arange(3 * block).reshape(3, block) % 19 + 1).float() / 8
+    y = (torch.arange(3 * block).reshape(3, block) % 11 + 1).float() / 8
+    if operation in ("sqrt_rn", "sqrt"):
+        values = x.sqrt()
+    elif operation == "div_rn":
+        values = x / y
+    elif operation == "fma":
+        values = (x.double() * y.double() + x.double()).float()
+    else:
+        values = x.clamp(0.5, 1.5)
+    expected = values.sum(1) if reduction == "sum" else values.max(1).values
+    out = torch.empty(3, device="mps")
+    _reduce_replay_math_kernel[(3,)](
+        x.to("mps"), y.to("mps"), out, BLOCK=block, OP=operation,
+        WRAPPED=True, REDUCE=reduction, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
