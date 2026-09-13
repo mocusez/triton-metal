@@ -285,6 +285,8 @@ struct TileExchangePlan {
   // identity is stable for the lifetime of this conversion pass and avoids
   // aliasing every exchange in a function onto the first allocation.
   mlir::Operation *publishOp = nullptr;
+  // Tuple components publish together; only the last member ends the phase.
+  bool endsPhase = true;
 };
 // Keyed by the marked `ttg.convert_layout` op (publish and read share a plan).
 static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
@@ -292,6 +294,8 @@ static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
 // dominates both loops. Keyed the same way.
 static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
 static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
+static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
+    "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
 
 static constexpr int64_t kThreadgroupBudgetBytes = 32 * 1024;
@@ -355,7 +359,12 @@ static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
   for (const TileExchangePlan *plan : plans)
     noReuseBytes += bytesOf(plan->elemTy, plan->numElements);
 
-  if (noReuseBytes <= kThreadgroupBudgetBytes) {
+  // Group members are live simultaneously. The historical two-slot fallback
+  // cannot preserve an arbitrary tuple, so grouped functions keep dedicated
+  // buffers and let the shared budget validator reject overflow.
+  bool hasGroupedPublishes =
+      llvm::any_of(plans, [](const auto *plan) { return !plan->endsPhase; });
+  if (noReuseBytes <= kThreadgroupBudgetBytes || hasGroupedPublishes) {
     for (const TileExchangePlan *plan : plans) {
       out.publishBuffer.push_back(out.buffers.size());
       out.buffers.emplace_back(plan->elemTy, plan->numElements);
@@ -427,6 +436,16 @@ static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
   if (out.totalBytes > kThreadgroupBudgetBytes)
     assignPooled(/*keyBySize=*/false);
   return out;
+}
+
+// Allocation sees every publish; splitting sees only complete publish groups.
+static llvm::SmallVector<mlir::Operation *, 8>
+exchangePhaseEnds(const ExchangeBufferAssignment &assignment) {
+  llvm::SmallVector<mlir::Operation *, 8> ends;
+  for (mlir::Operation *publish : assignment.publishes)
+    if (g_tileExchange.lookup(publish).endsPhase)
+      ends.push_back(publish);
+  return ends;
 }
 
 // One shared answer to "will the phase split break this function?".
@@ -536,6 +555,23 @@ static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_broadcastExchange;
 static llvm::DenseMap<mlir::Operation *, mlir::Operation *>
     g_rankNReducePublish;
 static llvm::DenseSet<mlir::Operation *> g_rankNPlannedReduces;
+static llvm::DenseMap<mlir::Operation *, mlir::Operation *> g_stagedScanPublish;
+static llvm::DenseMap<mlir::Operation *,
+                      llvm::SmallVector<mlir::Operation *, 4>>
+    g_stagedTupleScanPublishes;
+static llvm::DenseMap<int64_t, LayoutIndexPlan> g_stagedScanRanges;
+static llvm::DenseSet<mlir::Operation *> g_nestedScanLoops;
+static llvm::DenseSet<mlir::Operation *> g_nestedScanFunctions;
+static constexpr llvm::StringLiteral kScanBandLoopAttr = "metal.scan_band_loop";
+
+static int64_t nestedScanExchangeBytes(mlir::triton::FuncOp func) {
+  int64_t bytes = 0;
+  func.walk([&](mlir::scf::ForOp loop) {
+    if (g_nestedScanLoops.count(loop.getOperation()))
+      bytes += assignExchangeBuffers(*loop.getBody()).totalBytes;
+  });
+  return bytes;
+}
 
 // Runtime scf.for loops whose rank-1 iter_args feed tt.gather need the same
 // whole-tile scheduling treatment as a multi-element layout exchange. The
@@ -1389,8 +1425,13 @@ static mlir::scf::ForOp findOutermostScfFor(mlir::Operation *op) {
   mlir::scf::ForOp outermost;
   mlir::Operation *p = op->getParentOp();
   while (p) {
-    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(p))
+    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(p)) {
+      // Local scan phases are nested inside a runtime loop; their register
+      // iteration, not the user's induction variable, indexes the tile.
+      if (f->hasAttr(kScanBandLoopAttr))
+        return f;
       outermost = f;
+    }
     p = p->getParentOp();
   }
   return outermost;
@@ -1594,6 +1635,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // Compute the tile shape from the ORIGINAL body (before any region
     // inlining empties it).
     auto tileInfo = findTileInfo(op);
+    bool hasNestedScanPhases = g_nestedScanFunctions.count(op.getOperation());
     llvm::SmallVector<mlir::Type> kernelArgTypes;
     llvm::SmallVector<bool> isAddressSpaceDevice;
     // For arg i, holds the original scalar type if it was wrapped, else null.
@@ -1716,7 +1758,26 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // budget check shares, so the allocation emitted here and the one
     // preflighted there cannot drift.
     ExchangeBufferAssignment exch = assignExchangeBuffers(emptyBlock);
-    llvm::SmallVector<mlir::Operation *, 8> exchangePublishes = exch.publishes;
+    llvm::SmallVector<mlir::Operation *, 8> exchangePublishes =
+        exchangePhaseEnds(exch);
+    // Pre-passes register these declarations by SSA identity (masked-store
+    // sentinels, pooled scan buffers). Keep them outside every sibling phase.
+    if (!exchangePublishes.empty()) {
+      llvm::SmallVector<mlir::Operation *, 8> declarations;
+      for (mlir::Operation &candidate : emptyBlock)
+        if (mlir::isa<ThreadgroupAllocaOp>(candidate))
+          declarations.push_back(&candidate);
+      for (mlir::Operation *declaration : declarations) {
+        if (declaration == lastProloguePtr)
+          continue;
+        if (lastProloguePtr)
+          declaration->moveAfter(lastProloguePtr);
+        else
+          declaration->moveBefore(&emptyBlock, emptyBlock.begin());
+        lastProloguePtr = declaration;
+      }
+    }
+
     llvm::SmallVector<mlir::Value, 8> exchangeBuffers;
     for (auto [elemTy, elems] : exch.buffers) {
       auto bufTy = MetalMemRefType::get(rewriter.getContext(), elemTy, elems);
@@ -1735,13 +1796,14 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
                        << " bytes, exceeding the 32768-byte budget";
       return mlir::failure();
     }
-    for (auto [idx, publish] : llvm::enumerate(exchangePublishes)) {
+    for (auto [idx, publish] : llvm::enumerate(exch.publishes)) {
       mlir::Value buf = exchangeBuffers[exch.publishBuffer[idx]];
       for (auto &entry : g_tileExchange)
         if (entry.second.publishOp == publish)
           g_tileExchangeBuf[entry.first] = buf;
     }
-    if ((!exchangePublishes.empty() ||
+    if (!hasNestedScanPhases &&
+        (!exchangePublishes.empty() ||
          (tileInfo && tileInfo->elemPerThread > 1)) &&
         !emptyBlock.empty()) {
       mlir::Operation *returnOp = &emptyBlock.back();
@@ -1889,9 +1951,9 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           rewriter, loc, rewriter.getI32IntegerAttr(0));
       auto cStep = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(1));
-      // Every publish ends one complete register-band phase.  A function may
-      // contain several dependent exchanges; emit one loop per segment and a
-      // uniform barrier between adjacent segments.  The older two-loop shape
+      // Every publish-group end completes one register-band phase. A function
+      // may contain several dependent exchanges; emit one loop per segment and
+      // a uniform barrier between adjacent segments.  The older two-loop shape
       // is the one-publish special case of this schedule.
       if (!exchangePublishes.empty()) {
         mlir::Block::iterator segmentBegin = firstOrigBodyIt;
@@ -3390,6 +3452,51 @@ planLinearRange(mlir::triton::MakeRangeOp op, bool allowMixedHypercube) {
   return plan;
 }
 
+// Slice layouts compact register bases when dimensions are removed. Recover
+// the full consumer tile before projecting the range axis, so e.g. a row bit
+// above two column register bits still reads iv bit 2 rather than iv bit 0.
+static std::optional<LayoutIndexPlan>
+planStagedScanRange(mlir::triton::MakeRangeOp range) {
+  auto rangeTy = mlir::cast<mlir::RankedTensorType>(range.getType());
+  mlir::Attribute parent = rangeTy.getEncoding();
+  unsigned axis = 0;
+  bool sliced = false;
+  while (auto slice =
+             mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                 parent)) {
+    sliced = true;
+    if (axis >= slice.getDim())
+      ++axis;
+    parent = slice.getParent();
+  }
+  if (!sliced)
+    return planLayoutIndex(rangeTy);
+  mlir::RankedTensorType tile;
+  llvm::SmallVector<mlir::Value, 16> worklist{range.getResult()};
+  llvm::SmallPtrSet<mlir::Value, 32> seen;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    if (auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        type && type.getEncoding() == parent && type.hasStaticShape() &&
+        (!tile || type.getNumElements() > tile.getNumElements()))
+      tile = type;
+    for (mlir::Operation *user : value.getUsers())
+      if (!mlir::isa<mlir::triton::ScanOp, mlir::triton::ReduceOp>(user))
+        llvm::append_range(worklist, user->getResults());
+  }
+  if (!tile || axis >= static_cast<unsigned>(tile.getRank()))
+    return std::nullopt;
+  auto plan = planLayoutIndex(tile);
+  if (!plan)
+    return std::nullopt;
+  auto terms = plan->dimTerms[axis];
+  plan->dimTerms = {terms};
+  plan->rowMajorStride = {1};
+  return plan;
+}
+
 struct MakeRangeLowering
     : public mlir::OpConversionPattern<mlir::triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3398,6 +3505,22 @@ struct MakeRangeLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto resTy = mlir::cast<mlir::RankedTensorType>(op.getType());
+    if (op->hasAttr(kStagedScanPhaseAttr)) {
+      auto cached = g_stagedScanRanges.find(
+          op->getAttrOfType<mlir::IntegerAttr>(kStagedScanPhaseAttr).getInt());
+      if (cached == g_stagedScanRanges.end())
+        return rewriter.notifyMatchFailure(op, "staged scan range layout");
+      const auto &plan = cached->second;
+      mlir::Value idx = emitLayoutElementIndex(op, plan, rewriter, loc);
+      if (op.getStart() != 0) {
+        auto start = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(op.getStart()));
+        idx =
+            mlir::arith::AddIOp::create(rewriter, loc, idx, start.getResult());
+      }
+      rewriter.replaceOp(op, idx);
+      return mlir::success();
+    }
     if (auto slice =
             mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
                 resTy.getEncoding())) {
@@ -11585,7 +11708,9 @@ static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
 // one threadgroup buffer per BLOCK-long run, which has no meaning once the tile
 // has rows. This takes the same staged route as the rank >= 3 reduce — publish
 // the tile, barrier, then each lane accumulates its own axis prefix — so both
-// axes and any rank work at one element per thread.
+// axes and any rank work. Tiles above one element per thread are split into
+// publish/read phases before scalarization so every register band is visible
+// before any prefix reads from the staged tile.
 //
 // Unlike the reduce there is no output-mapping question: a scan's result has
 // the SAME shape as its source, so the value this lane owes is the prefix at
@@ -11600,6 +11725,8 @@ struct StagedScanPlan {
   mlir::Type stageTy;
   BinaryExpOperator combineKind;
   bool reverse;
+  int64_t numElements;
+  std::optional<LayoutIndexPlan> layout;
 };
 
 static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
@@ -11619,8 +11746,20 @@ static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
   int64_t numElements = 1;
   for (auto s : tile->shape)
     numElements *= s;
-  if (numElements > tile->threadsPerBlock)
-    return std::nullopt;
+  std::optional<LayoutIndexPlan> layout;
+  if (numElements > tile->threadsPerBlock ||
+      op->hasAttr(kStagedScanPhaseAttr)) {
+    // The function phase scheduler publishes all register bands before reads.
+    // Nested user control flow does not participate in that scheduler.
+    if (!g_stagedScanPublish.count(op.getOperation()) &&
+        !g_nestedScanLoops.count(op->getParentOp()) &&
+        !mlir::isa<mlir::triton::FuncOp>(op->getParentOp()))
+      return std::nullopt;
+    layout = planLayoutIndex(srcTy);
+    if (!layout || layout->threadsPerBlock() != tile->threadsPerBlock ||
+        numElements > kThreadgroupBudgetBytes / 4)
+      return std::nullopt;
+  }
   const int axis = static_cast<int>(op.getAxis());
   if (axis < 0 || axis >= srcTy.getRank())
     return std::nullopt;
@@ -11648,8 +11787,16 @@ static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
     acc *= tile->shape[d];
   }
   mlir::Type stageTy = metalStorageElementType(elemTy);
-  return StagedScanPlan{*tile,         enc,     axis,  extent,
-                        strides[axis], stageTy, *kind, op.getReverse()};
+  return StagedScanPlan{*tile,
+                        enc,
+                        axis,
+                        extent,
+                        layout ? layout->rowMajorStride[axis] : strides[axis],
+                        stageTy,
+                        *kind,
+                        op.getReverse(),
+                        numElements,
+                        layout};
 }
 
 struct StagedScanLowering
@@ -11666,9 +11813,11 @@ struct StagedScanLowering
     if (!plan)
       return rewriter.notifyMatchFailure(op, "staged scan: out of envelope");
     mlir::Value scalar = adaptor.getSrcs().front();
-    if (mlir::isa<mlir::RankedTensorType>(scalar.getType()))
+    if (!plan->layout && mlir::isa<mlir::RankedTensorType>(scalar.getType()))
       return rewriter.notifyMatchFailure(op, "staged scan: not scalarized");
-    mlir::Type elemTy = scalar.getType();
+    mlir::Type elemTy =
+        mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType())
+            .getElementType();
 
     auto bridge = [&](mlir::Value v, mlir::Type to) -> mlir::Value {
       if (v.getType() == to)
@@ -11679,11 +11828,35 @@ struct StagedScanLowering
     };
 
     const int64_t tpb = plan->tile.threadsPerBlock;
-    mlir::Value buf = publishLaneBands({bridge(scalar, plan->stageTy)}, tpb,
-                                       plan->stageTy, rewriter, loc);
-    mlir::Value flat = emitTileFlatIndex(op, plan->tile, rewriter, loc);
-    mlir::Value coord = emitTileCoordByOrder(
-        op, plan->tile, plan->enc.getOrder(), plan->axis, rewriter, loc);
+    mlir::Value buf;
+    mlir::Value flat;
+    mlir::Value coord;
+    int64_t scratchSlots = tpb;
+    if (plan->layout) {
+      auto publish = g_stagedScanPublish.find(op.getOperation());
+      if (publish == g_stagedScanPublish.end())
+        return rewriter.notifyMatchFailure(op, "staged scan: publish missing");
+      auto scratch = g_tileExchangeBuf.find(publish->second);
+      if (scratch == g_tileExchangeBuf.end())
+        return rewriter.notifyMatchFailure(op, "staged scan: scratch missing");
+      buf = scratch->second;
+      scratchSlots = plan->numElements;
+      flat = emitLayoutElementIndex(op, *plan->layout, rewriter, loc);
+      auto stride = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(plan->stride));
+      auto extent = mlir::arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(plan->extent));
+      auto quotient =
+          mlir::arith::DivSIOp::create(rewriter, loc, flat, stride.getResult());
+      coord = mlir::arith::RemSIOp::create(rewriter, loc, quotient.getResult(),
+                                           extent.getResult());
+    } else {
+      buf = publishLaneBands({bridge(scalar, plan->stageTy)}, tpb,
+                             plan->stageTy, rewriter, loc);
+      flat = emitTileFlatIndex(op, plan->tile, rewriter, loc);
+      coord = emitTileCoordByOrder(op, plan->tile, plan->enc.getOrder(),
+                                   plan->axis, rewriter, loc);
+    }
     if (!coord)
       return rewriter.notifyMatchFailure(op, "staged scan: no coordinate");
     auto cStride = mlir::arith::ConstantOp::create(
@@ -11725,8 +11898,8 @@ struct StagedScanLowering
             mlir::arith::AddIOp::create(rewriter, loc, base, cOff.getResult())
                 .getResult();
       }
-      mlir::Value v = readLaneBandSlot(buf, slot, tpb, plan->stageTy, elemTy,
-                                       rewriter, loc);
+      mlir::Value v = readLaneBandSlot(buf, slot, scratchSlots, plan->stageTy,
+                                       elemTy, rewriter, loc);
       // Inclusive prefix: positions up to this lane's coordinate (or from it,
       // for a reverse scan) contribute; the rest fold in as the identity.
       auto cK = mlir::arith::ConstantOp::create(
@@ -11754,8 +11927,8 @@ struct StagedScanLowering
 // The general multi-value `tl.associative_scan((a, b, ...), 0, combine)` this
 // backend lowers: N >= 2 sources of one shared rank-1 shape and blocked
 // encoding, N results, a replayable combine region over its 2N arguments, and
-// at most one element per thread so a thread's converted scalar IS its logical
-// element.
+// up to 64 elements per thread. Multi-element sources are replayed by logical
+// position, with one scratch slot per position and carried value.
 //
 // Pattern and pre-conversion validator share it, so a shape the pattern would
 // decline is named before conversion rather than declined inside it.
@@ -11804,10 +11977,6 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
     if (blockSize / tpb > 64)
       return no("a general tuple scan is implemented up to sixty-four "
                 "elements per thread");
-    if (op.getReverse())
-      return no("a reverse tuple scan above one element per thread is not "
-                "implemented: the band prefix and the carry both run the other "
-                "way, and that is a separate shape");
     if (static_cast<int64_t>(n) * (blockSize + tpb) * 4 >
         kThreadgroupBudgetBytes)
       return no("a general tuple scan above one element per thread needs one "
@@ -11844,7 +12013,7 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
 // over N lockstep threadgroup buffers, one per carried value, replaying the
 // scan's own combine region at each merge. A reverse scan is the mirror of the
 // same traversal, not a flag on the result: it merges the HIGHER partner into
-// each lane, with that lane's own range still on the left.
+// each lane, with the partner's range still on the left.
 //
 // The dedicated `metal.threadgroup_prefix_sum` the single-value path uses
 // cannot serve this: it carries ONE value and one of two hard-wired monoids.
@@ -11905,6 +12074,7 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   // position on every tile-loop iteration and those positions land in other
   // threads' bands.
   const int64_t ePerThread = blockSize > tpb ? blockSize / tpb : 1;
+  const bool reverse = op.getReverse();
   llvm::SmallVector<mlir::Type, 4> eltTys, storeTys;
   llvm::SmallVector<mlir::Value, 4> bufs, resBufs, mine;
   for (size_t i = 0; i < n; ++i) {
@@ -11959,9 +12129,10 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   BarrierOp::create(rewriter, loc);
 
   // Phase one, above one element per thread: each thread scans its OWN
-  // contiguous band `[t*E, (t+1)*E)` into `resBufs`, in increasing position
-  // order, and keeps the band's total. Contiguous is what makes the
-  // cross-thread scan of those totals stand for a scan of the positions; the
+  // contiguous band `[t*E, (t+1)*E)` into `resBufs`, in scan order, and keeps
+  // the band's total. Reverse starts at the band's last position and walks
+  // downwards, just as a forward scan of the reversed sequence. Contiguous
+  // bands make the cross-thread scan of totals a scan of the positions; the
   // values are re-derived at their logical positions, which is what makes the
   // mapping a free choice. Nothing here crosses threads, so no barrier is
   // needed until the totals are published.
@@ -11973,14 +12144,23 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
     bandBase =
         mlir::arith::MulIOp::create(rewriter, loc, tidI32, cE.getResult())
             .getResult();
-    mlir::Value baseUI = mlir::UnrealizedConversionCastOp::create(
-                             rewriter, loc, mlir::TypeRange{ui32},
-                             mlir::ValueRange{bandBase})
-                             .getResult(0);
+    mlir::Value bandStart = bandBase;
+    if (reverse) {
+      auto cLast = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(ePerThread - 1)));
+      bandStart = mlir::arith::AddIOp::create(rewriter, loc, bandBase,
+                                              cLast.getResult())
+                      .getResult();
+    }
+    mlir::Value baseUI =
+        mlir::UnrealizedConversionCastOp::create(
+            rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{bandStart})
+            .getResult(0);
     llvm::SmallVector<mlir::Value, 4> seed;
     for (size_t i = 0; i < n; ++i) {
       mlir::Value elt =
-          evalRank1ValueAt(op.getSrcs()[i], bandBase, rewriter, loc, 0);
+          evalRank1ValueAt(op.getSrcs()[i], bandStart, rewriter, loc, 0);
       if (!elt)
         return rewriter.notifyMatchFailure(
             op, "tuple scan: a source is not evaluable at a logical position");
@@ -11999,9 +12179,13 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(band.getBody());
-      mlir::Value pos = mlir::arith::AddIOp::create(rewriter, loc, bandBase,
-                                                    band.getInductionVar())
-                            .getResult();
+      mlir::Value pos =
+          reverse ? mlir::arith::SubIOp::create(rewriter, loc, bandStart,
+                                                band.getInductionVar())
+                        .getResult()
+                  : mlir::arith::AddIOp::create(rewriter, loc, bandStart,
+                                                band.getInductionVar())
+                        .getResult();
       mlir::Value posUI = mlir::UnrealizedConversionCastOp::create(
                               rewriter, loc, mlir::TypeRange{ui32},
                               mlir::ValueRange{pos})
@@ -12015,7 +12199,7 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
               op, "tuple scan: a source is not evaluable inside the band");
         elts.push_back(toSignlessInt(elt, rewriter, loc));
       }
-      // The running prefix is the LOWER range, so it is the left operand.
+      // The running prefix comes first in scan order in both directions.
       llvm::SmallVector<mlir::Value, 4> merged = emitClonedRegionCombine(
           op->getRegion(0), band.getRegionIterArgs(), elts, rewriter, loc);
       if (merged.size() != n)
@@ -12033,7 +12217,6 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
     StoreOp::create(rewriter, loc, toStorage(mine[i], i), bufs[i], tidUI32);
   BarrierOp::create(rewriter, loc);
 
-  const bool reverse = op.getReverse();
   auto cZeroI32 = mlir::arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(0));
   // What this tree scans: the positions themselves at one element per thread,
@@ -12120,18 +12303,29 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
     return mlir::success();
   }
 
-  // Phase three: fold the exclusive prefix of the bands BEFORE this one into
-  // every element of this band. Thread zero has no such prefix, and there is no
-  // identity to stand in for one, so it keeps what its band already holds.
+  // Phase three: fold the bands preceding this one IN SCAN ORDER into every
+  // element of this band. The first band (last in reverse) has no such prefix;
+  // there is no identity to stand in for it, so keep its existing values.
   auto cOne = mlir::arith::ConstantOp::create(rewriter, loc,
                                               rewriter.getI32IntegerAttr(1));
-  mlir::Value hasPrefix = mlir::arith::CmpIOp::create(
-                              rewriter, loc, mlir::arith::CmpIPredicate::sgt,
-                              tidI32, cZeroI32.getResult())
-                              .getResult();
-  mlir::Value prevI32 =
-      mlir::arith::SubIOp::create(rewriter, loc, tidI32, cOne.getResult())
+  mlir::Value boundary = cZeroI32.getResult();
+  if (reverse)
+    boundary = mlir::arith::ConstantOp::create(
+                   rewriter, loc,
+                   rewriter.getI32IntegerAttr(static_cast<int32_t>(tpb - 1)))
+                   .getResult();
+  mlir::Value hasPrefix =
+      mlir::arith::CmpIOp::create(rewriter, loc,
+                                  reverse ? mlir::arith::CmpIPredicate::slt
+                                          : mlir::arith::CmpIPredicate::sgt,
+                                  tidI32, boundary)
           .getResult();
+  mlir::Value prevI32 =
+      reverse
+          ? mlir::arith::AddIOp::create(rewriter, loc, tidI32, cOne.getResult())
+                .getResult()
+          : mlir::arith::SubIOp::create(rewriter, loc, tidI32, cOne.getResult())
+                .getResult();
   mlir::Value prevSafe = mlir::arith::SelectOp::create(
                              rewriter, loc, hasPrefix, prevI32,
                              cZeroI32.getResult())
@@ -12166,7 +12360,7 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
       get->setAttr("metal.materialize", rewriter.getUnitAttr());
       here.push_back(fromStorage(get.getResult(), i));
     }
-    // The carried prefix covers the LOWER positions, so it is the left operand.
+    // The carried range precedes this band in scan order, in either direction.
     llvm::SmallVector<mlir::Value, 4> merged =
         emitClonedRegionCombine(op->getRegion(0), carry, here, rewriter, loc);
     if (merged.size() != n)
@@ -12206,6 +12400,214 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
   return mlir::success();
 }
 
+// Multidimensional tuples use the single-value staged path's coordinates:
+// lane slots for one band, exact logical slots for full-tile publish phases.
+// Prefix folds preserve scan order without an identity for the user combine.
+static bool rankNMultiValueScanSupported(mlir::triton::ScanOp op,
+                                         llvm::StringRef *why = nullptr) {
+  auto no = [&](const char *reason) {
+    if (why)
+      *why = reason;
+    return false;
+  };
+  size_t n = op.getSrcs().size();
+  if (n < 2 || op.getNumResults() != n)
+    return no(
+        "a multidimensional tuple scan needs matching source/result arity");
+  auto first =
+      mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (!first || first.getRank() < 2 || !first.hasStaticShape())
+    return no("a multidimensional tuple scan needs static rank >= 2 sources");
+  if (!mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+          first.getEncoding()))
+    return no("a multidimensional tuple scan needs a blocked source encoding");
+  auto tile = tileFromTensor(first);
+  if (!tile || first.getNumElements() <= 0)
+    return no("a multidimensional tuple scan needs a non-empty blocked tile");
+  bool phased = first.getNumElements() > tile->threadsPerBlock ||
+                op->hasAttr(kStagedScanPhaseAttr);
+  if (phased) {
+    if (!g_stagedTupleScanPublishes.count(op.getOperation()) &&
+        !g_nestedScanLoops.count(op->getParentOp()) &&
+        !mlir::isa<mlir::triton::FuncOp>(op->getParentOp()))
+      return no("a multidimensional tuple scan requires top-level exact-layout "
+                "phases");
+    auto layout = planLayoutIndex(first);
+    if (!layout || layout->threadsPerBlock() != tile->threadsPerBlock)
+      return no(
+          "a multidimensional tuple scan requires an exact blocked layout");
+  }
+  if (op.getAxis() < 0 || op.getAxis() >= first.getRank() ||
+      first.getDimSize(op.getAxis()) < 2 || first.getDimSize(op.getAxis()) > 64)
+    return no("a multidimensional tuple scan requires scan-axis extent 2..64");
+  if (underDivergentControlFlow(op))
+    return no("a multidimensional tuple scan requires uniform control flow");
+  int64_t scratchSlots =
+      phased ? first.getNumElements() : tile->threadsPerBlock;
+  if (n > static_cast<size_t>(kThreadgroupBudgetBytes / (scratchSlots * 4)))
+    return no("a multidimensional tuple scan exceeds the threadgroup budget");
+  for (size_t i = 0; i < n; ++i) {
+    auto src =
+        mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs()[i].getType());
+    auto dst = mlir::dyn_cast<mlir::RankedTensorType>(op.getType(i));
+    if (!src || src.getShape() != first.getShape() ||
+        src.getEncoding() != first.getEncoding() || dst != src)
+      return no("multidimensional tuple sources and results must share their "
+                "shape and encoding");
+    if (!rank1TupleSlotTypeSupported(src.getElementType()))
+      return no(
+          "a multidimensional tuple scan carries f32 and i32 values only");
+  }
+  if (op->getNumRegions() != 1 ||
+      !combineRegionIsClonableNAry(op->getRegion(0), n))
+    return no("the combine region must be one block of replayable scalar ops "
+              "over its own arguments");
+  return true;
+}
+
+static std::optional<LayoutIndexPlan>
+planRankNTupleScanLayout(mlir::triton::ScanOp op) {
+  if (!rankNMultiValueScanSupported(op))
+    return std::nullopt;
+  auto type =
+      mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  if (type.getNumElements() <= tileFromTensor(type)->threadsPerBlock &&
+      !op->hasAttr(kStagedScanPhaseAttr))
+    return std::nullopt;
+  return planLayoutIndex(type);
+}
+
+static mlir::LogicalResult lowerRankNMultiValueScan(
+    mlir::triton::ScanOp op,
+    typename mlir::OpConversionPattern<mlir::triton::ScanOp>::OpAdaptor adaptor,
+    mlir::ConversionPatternRewriter &rewriter) {
+  llvm::StringRef why;
+  if (!rankNMultiValueScanSupported(op, &why))
+    return rewriter.notifyMatchFailure(op, why);
+  auto loc = op.getLoc();
+  auto srcTy =
+      mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+  auto enc =
+      mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(srcTy.getEncoding());
+  TileInfo tile = *tileFromTensor(srcTy);
+  const int64_t tpb = tile.threadsPerBlock;
+  const int64_t extent = srcTy.getDimSize(op.getAxis());
+  auto layout = planRankNTupleScanLayout(op);
+  int64_t scratchSlots = layout ? srcTy.getNumElements() : tpb;
+  int64_t stride = 1;
+  for (unsigned dim : enc.getOrder()) {
+    if (dim == op.getAxis())
+      break;
+    stride *= srcTy.getDimSize(dim);
+  }
+  if (layout)
+    stride = layout->rowMajorStride[op.getAxis()];
+  llvm::SmallVector<mlir::Value, 4> values, buffers;
+  llvm::SmallVector<mlir::Type, 4> elementTypes, storageTypes;
+  for (auto [source, scalar] : llvm::zip(op.getSrcs(), adaptor.getSrcs())) {
+    auto type =
+        mlir::cast<mlir::RankedTensorType>(source.getType()).getElementType();
+    if (!layout) {
+      scalar = toSignlessInt(scalar, rewriter, loc);
+      if (scalar.getType() != type)
+        return rewriter.notifyMatchFailure(
+            op, "multidimensional tuple source is not scalarized");
+      values.push_back(scalar);
+    }
+    elementTypes.push_back(type);
+    storageTypes.push_back(metalStorageElementType(type));
+  }
+  auto bridge = [&](mlir::Value value, mlir::Type type) -> mlir::Value {
+    if (value.getType() == type)
+      return value;
+    return mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{type}, mlir::ValueRange{value})
+        .getResult(0);
+  };
+  auto constant = [&](int64_t value) -> mlir::Value {
+    return mlir::arith::ConstantOp::create(rewriter, loc,
+                                           rewriter.getI32IntegerAttr(value))
+        .getResult();
+  };
+  mlir::Value flat, coord;
+  if (layout) {
+    auto publishes = g_stagedTupleScanPublishes.find(op.getOperation());
+    if (publishes == g_stagedTupleScanPublishes.end())
+      return rewriter.notifyMatchFailure(op,
+                                         "tuple scan: grouped publish missing");
+    for (mlir::Operation *publish : publishes->second) {
+      auto buffer = g_tileExchangeBuf.find(publish);
+      if (buffer == g_tileExchangeBuf.end())
+        return rewriter.notifyMatchFailure(op, "tuple scan: scratch missing");
+      buffers.push_back(buffer->second);
+    }
+    flat = emitLayoutElementIndex(op, *layout, rewriter, loc);
+    auto quotient =
+        mlir::arith::DivSIOp::create(rewriter, loc, flat, constant(stride));
+    coord =
+        mlir::arith::RemSIOp::create(rewriter, loc, quotient, constant(extent));
+  } else {
+    for (mlir::Type type : storageTypes)
+      buffers.push_back(ThreadgroupAllocaOp::create(
+          rewriter, loc,
+          MetalMemRefType::get(rewriter.getContext(), type, tpb)));
+    mlir::Value tid = emitLocalTid(rewriter, loc, tpb);
+    mlir::Value tidU =
+        bridge(tid, rewriter.getIntegerType(32, /*isSigned=*/false));
+    // Protect buffer reuse across user-loop iterations.
+    BarrierOp::create(rewriter, loc);
+    for (size_t i = 0; i < values.size(); ++i)
+      StoreOp::create(rewriter, loc, bridge(values[i], storageTypes[i]),
+                      buffers[i], tidU);
+    BarrierOp::create(rewriter, loc);
+    flat = emitTileFlatIndex(op, tile, rewriter, loc);
+    coord = emitTileCoordByOrder(op, tile, enc.getOrder(), op.getAxis(),
+                                 rewriter, loc);
+  }
+  mlir::Value axisOffset =
+      mlir::arith::MulIOp::create(rewriter, loc, coord, constant(stride));
+  mlir::Value base =
+      mlir::arith::SubIOp::create(rewriter, loc, flat, axisOffset);
+  auto readTuple = [&](int64_t k) {
+    mlir::Value slot =
+        mlir::arith::AddIOp::create(rewriter, loc, base, constant(k * stride));
+    llvm::SmallVector<mlir::Value, 4> tuple;
+    for (size_t i = 0; i < elementTypes.size(); ++i)
+      tuple.push_back(readLaneBandSlot(buffers[i], slot, scratchSlots,
+                                       storageTypes[i], elementTypes[i],
+                                       rewriter, loc));
+    return tuple;
+  };
+  auto result = readTuple(op.getReverse() ? extent - 1 : 0);
+  for (int64_t step = 1; step < extent; ++step) {
+    int64_t k = op.getReverse() ? extent - 1 - step : step;
+    mlir::Value active = mlir::arith::CmpIOp::create(
+        rewriter, loc,
+        op.getReverse() ? mlir::arith::CmpIPredicate::sge
+                        : mlir::arith::CmpIPredicate::sle,
+        constant(k), coord);
+    auto merge =
+        mlir::scf::IfOp::create(rewriter, loc, elementTypes, active,
+                                /*addThenBlock=*/true, /*addElseBlock=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&merge.getThenRegion().front());
+      auto next = readTuple(k);
+      // Earlier positions in scan order stay on the left, also in reverse.
+      // Guard the entire combine so integer division and similar partial ops
+      // are never executed for a tuple beyond this lane's requested prefix.
+      auto combined = emitClonedRegionCombine(op->getRegion(0), result, next,
+                                              rewriter, loc);
+      mlir::scf::YieldOp::create(rewriter, loc, combined);
+      rewriter.setInsertionPointToStart(&merge.getElseRegion().front());
+      mlir::scf::YieldOp::create(rewriter, loc, result);
+    }
+    result.assign(merge.getResults().begin(), merge.getResults().end());
+  }
+  rewriter.replaceOp(op, result);
+  return mlir::success();
+}
+
 struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
   ScanLowering(mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
                llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
@@ -12229,6 +12631,8 @@ struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
     if (op.getSrcs().size() != 1 || op.getNumResults() != 1) {
       if (rank1MultiValueScanSupported(op))
         return lowerRank1MultiValueScan(op, adaptor, rewriter);
+      if (rankNMultiValueScanSupported(op))
+        return lowerRankNMultiValueScan(op, adaptor, rewriter);
       return rewriter.notifyMatchFailure(op,
                                          "scan: single operand/result only");
     }
@@ -14273,6 +14677,314 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
     g_tileExchange[publish.getOperation()] = publishPlan;
     g_tileExchange[read.getOperation()] = readPlan;
     g_rankNReducePublish[reduce.getOperation()] = publish.getOperation();
+  }
+  return mlir::success();
+}
+
+// Publish every source register band before a staged scan reads any prefix.
+// Keep independent work before the boundary and rematerialize shared indices.
+static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
+  auto phaseLayout =
+      [](mlir::triton::ScanOp scan) -> std::optional<LayoutIndexPlan> {
+    if (scan.getSrcs().size() > 1)
+      return planRankNTupleScanLayout(scan);
+    if (auto plan = planStagedScan(scan))
+      return plan->layout;
+    return std::nullopt;
+  };
+  llvm::SmallPtrSet<mlir::Operation *, 8> phaseFunctions;
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    if (phaseLayout(scan))
+      phaseFunctions.insert(scan->getParentOfType<mlir::triton::FuncOp>());
+  });
+  llvm::SmallVector<mlir::triton::ScanOp, 8> scans;
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    auto func = scan->getParentOfType<mlir::triton::FuncOp>();
+    if (!func || !phaseFunctions.count(func))
+      return;
+    auto type =
+        mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
+    if (type.getRank() < 2)
+      return;
+    // All staged scans in this function share the exact coordinate system,
+    // including replicated one-band tiles beside a multi-band scan.
+    scan->setAttr(kStagedScanPhaseAttr,
+                  mlir::UnitAttr::get(moduleOp.getContext()));
+    if (phaseLayout(scan))
+      scans.push_back(scan);
+    else {
+      scan.emitOpError("Metal backend: mixed staged scans require top-level "
+                       "exact-layout phases");
+      valid = false;
+    }
+  });
+  if (!valid)
+    return mlir::failure();
+  for (mlir::triton::ScanOp scan : scans) {
+    auto layout = phaseLayout(scan);
+    if (!layout)
+      return scan.emitOpError("Metal backend: staged scan cannot safely "
+                              "partition its source and consumers");
+    mlir::Block *block = scan->getBlock();
+    if (!block)
+      return scan.emitOpError("Metal backend: staged scan cannot safely "
+                              "partition its source and consumers");
+    // A scan hoisted out by LICM can still feed a runtime region. The
+    // block-local partitioner cannot replay that region's captured values.
+    // Follow consumers rather than rejecting unrelated loops in this block.
+    llvm::SmallVector<mlir::Value, 16> consumerValues(scan.getResults());
+    llvm::SmallPtrSet<mlir::Operation *, 16> visitedConsumers;
+    while (!consumerValues.empty()) {
+      for (mlir::Operation *user : consumerValues.pop_back_val().getUsers()) {
+        if (!visitedConsumers.insert(user).second)
+          continue;
+        mlir::Operation *region = user;
+        while (region && region->getBlock() != block)
+          region = region->getParentOp();
+        if (region && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(region))
+          return scan.emitOpError(
+              "Metal backend: staged scan cannot partition surrounding loops");
+        if (user->getBlock() == block)
+          llvm::append_range(consumerValues, user->getResults());
+      }
+    }
+    auto srcTy =
+        mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
+    llvm::SmallVector<mlir::Value, 4> sources(scan.getSrcs());
+
+    mlir::Operation *segmentAnchor = nullptr;
+    for (mlir::Operation &candidate : *block) {
+      if (&candidate == scan.getOperation())
+        break;
+      auto tag = candidate.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      if (tag && g_tileExchange.count(&candidate))
+        segmentAnchor = &candidate;
+    }
+    auto inCurrentSegment = [&](mlir::Operation *candidate) {
+      if (!candidate || candidate->getBlock() != block)
+        return false;
+      return !segmentAnchor || segmentAnchor->isBeforeInBlock(candidate);
+    };
+    llvm::SmallPtrSet<mlir::Operation *, 32> preSet;
+    llvm::SmallVector<mlir::Value, 32> worklist(sources.begin(), sources.end());
+    while (!worklist.empty()) {
+      mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+      if (!inCurrentSegment(def) || !preSet.insert(def).second)
+        continue;
+      if (!mlir::isMemoryEffectFree(def) &&
+          !mlir::isa<mlir::triton::LoadOp>(def))
+        return scan.emitOpError("Metal backend: staged scan cannot safely "
+                                "partition its source and consumers");
+      llvm::append_range(worklist, def->getOperands());
+    }
+    llvm::SmallPtrSet<mlir::Operation *, 32> postSet;
+    postSet.insert(scan.getOperation());
+    for (mlir::Operation &candidate : *block) {
+      if (!inCurrentSegment(&candidate) || !scan->isBeforeInBlock(&candidate) ||
+          (mlir::isMemoryEffectFree(&candidate) &&
+           !mlir::isa<mlir::triton::ScanOp, mlir::triton::ReduceOp>(
+               &candidate)))
+        continue;
+      llvm::SmallVector<mlir::Value, 32> futureWork(candidate.getOperands());
+      postSet.insert(&candidate);
+      while (!futureWork.empty()) {
+        mlir::Operation *def = futureWork.pop_back_val().getDefiningOp();
+        if (!inCurrentSegment(def) || preSet.count(def) ||
+            !postSet.insert(def).second)
+          continue;
+        llvm::append_range(futureWork, def->getOperands());
+      }
+    }
+    llvm::SmallVector<mlir::Operation *, 64> postWork(postSet.begin(),
+                                                      postSet.end());
+    while (!postWork.empty()) {
+      mlir::Operation *producer = postWork.pop_back_val();
+      for (mlir::Value result : producer->getResults())
+        for (mlir::Operation *user : result.getUsers())
+          if (inCurrentSegment(user) && !preSet.count(user) &&
+              postSet.insert(user).second)
+            postWork.push_back(user);
+    }
+    llvm::SmallVector<mlir::Value, 64> postOperands;
+    for (mlir::Operation *post : postSet)
+      llvm::append_range(postOperands, post->getOperands());
+    while (!postOperands.empty()) {
+      mlir::Operation *def = postOperands.pop_back_val().getDefiningOp();
+      if (!inCurrentSegment(def) || preSet.count(def) ||
+          !postSet.insert(def).second)
+        continue;
+      llvm::append_range(postOperands, def->getOperands());
+    }
+
+    llvm::SmallVector<mlir::Operation *, 16> sharedPostRoots;
+    for (mlir::Operation *post : postSet) {
+      bool hasEarlierUser = false;
+      for (mlir::Value result : post->getResults())
+        for (mlir::Operation *user : result.getUsers())
+          if (inCurrentSegment(user) && !postSet.count(user))
+            hasEarlierUser = true;
+      if (hasEarlierUser)
+        sharedPostRoots.push_back(post);
+    }
+    llvm::SmallVector<mlir::Operation *, 32> sharedWork;
+    llvm::append_range(sharedWork, sharedPostRoots);
+    while (!sharedWork.empty()) {
+      mlir::Operation *shared = sharedWork.pop_back_val();
+      if (!postSet.count(shared))
+        continue;
+      if (shared->getNumRegions() != 0 ||
+          (!mlir::isMemoryEffectFree(shared) &&
+           !mlir::isa<mlir::triton::LoadOp>(shared)))
+        return scan.emitOpError("Metal backend: staged scan cannot safely "
+                                "partition its source and consumers");
+      postSet.erase(shared);
+      preSet.insert(shared);
+      for (mlir::Value operand : shared->getOperands())
+        if (mlir::Operation *def = operand.getDefiningOp();
+            inCurrentSegment(def) && postSet.count(def))
+          sharedWork.push_back(def);
+    }
+    llvm::SmallVector<mlir::Operation *, 32> prePhaseOps;
+    llvm::SmallVector<mlir::Operation *, 32> postOps;
+    for (mlir::Operation &candidate : *block) {
+      if (!inCurrentSegment(&candidate) ||
+          candidate.hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      if (postSet.count(&candidate))
+        postOps.push_back(&candidate);
+      else
+        prePhaseOps.push_back(&candidate);
+    }
+
+    for (mlir::Operation *post : postOps) {
+      if (!post->isBeforeInBlock(scan) || mlir::isMemoryEffectFree(post) ||
+          mlir::isa<mlir::triton::GetProgramIdOp>(post))
+        continue;
+      bool isLoad = mlir::isa<mlir::triton::LoadOp>(post);
+      if (!isLoad && !mlir::isa<mlir::triton::StoreOp>(post))
+        return scan.emitOpError(
+            "Metal backend: staged scan cannot move a pre-scan memory effect");
+      for (auto it = std::next(post->getIterator()); &*it != scan; ++it)
+        if (!mlir::isMemoryEffectFree(&*it) &&
+            !mlir::isa<mlir::triton::GetProgramIdOp>(&*it) &&
+            !(isLoad && mlir::isa<mlir::triton::LoadOp>(&*it)))
+          return scan.emitOpError(
+              "Metal backend: staged scan cannot move a load across a write or "
+              "reorder memory effects");
+    }
+
+    llvm::SmallPtrSet<mlir::Value, 32> checkedCrossings;
+    mlir::Operation *crossingUser = nullptr;
+    std::function<bool(mlir::Value)> canRecompute = [&](mlir::Value value) {
+      if (llvm::is_contained(sources, value) ||
+          !checkedCrossings.insert(value).second)
+        return true;
+      auto def = value.getDefiningOp();
+      if (!def || !preSet.count(def))
+        return true;
+      if (def->getNumRegions() != 0)
+        return false;
+      // A load reused after a write must retain its original snapshot. The
+      // published source is available above; other snapshots cannot be
+      // replayed.
+      if (mlir::isa<mlir::triton::LoadOp>(def))
+        for (auto it = std::next(def->getIterator());
+             it != block->end() && &*it != crossingUser; ++it)
+          if (!mlir::isMemoryEffectFree(&*it) &&
+              !mlir::isa<mlir::triton::LoadOp>(&*it))
+            return false;
+      return llvm::all_of(def->getOperands(), canRecompute);
+    };
+    for (mlir::Operation *post : postOps) {
+      crossingUser = post;
+      checkedCrossings.clear();
+      if (!llvm::all_of(post->getOperands(), canRecompute))
+        return scan.emitOpError("Metal backend: staged scan cannot safely "
+                                "replay a cross-phase value");
+    }
+
+    mlir::OpBuilder builder(scan);
+    llvm::SmallVector<mlir::Operation *, 4> publishes, reads;
+    llvm::SmallVector<mlir::Value, 4> placeholders;
+    // All components and their shared producer cone stay in one phase. A
+    // barrier follows the last publish, after every register band is stored.
+    for (mlir::Value source : sources) {
+      auto type = mlir::cast<mlir::RankedTensorType>(source.getType());
+      auto publish = mlir::triton::gpu::ConvertLayoutOp::create(
+          builder, scan.getLoc(), type, source);
+      publish->setAttr(kExchangeAttr, builder.getStringAttr("publish"));
+      publishes.push_back(publish);
+    }
+    for (mlir::Value source : sources) {
+      auto type = mlir::cast<mlir::RankedTensorType>(source.getType());
+      auto placeholder =
+          mlir::arith::ConstantOp::create(
+              builder, scan.getLoc(),
+              mlir::DenseElementsAttr::get(
+                  type, builder.getZeroAttr(type.getElementType())))
+              .getResult();
+      placeholders.push_back(placeholder);
+      auto read = mlir::triton::gpu::ConvertLayoutOp::create(
+          builder, scan.getLoc(), type, placeholder);
+      read->setAttr(kExchangeAttr, builder.getStringAttr("read"));
+      reads.push_back(read);
+    }
+    scan->setOperands(placeholders);
+
+    for (mlir::Operation *post : llvm::reverse(postOps))
+      post->moveAfter(reads.back());
+    for (mlir::Operation *pre : prePhaseOps)
+      pre->moveBefore(publishes.front());
+
+    mlir::IRMapping mapping;
+    for (auto [source, read] : llvm::zip(sources, reads))
+      mapping.map(source, read->getResult(0));
+    builder.setInsertionPointAfter(reads.back());
+    for (auto [source, read] : llvm::zip(sources, reads)) {
+      if (auto bitcast = source.getDefiningOp<mlir::triton::BitcastOp>();
+          bitcast && !mapping.lookupOrNull(bitcast.getSrc())) {
+        auto inverse = mlir::triton::BitcastOp::create(
+            builder, scan.getLoc(), bitcast.getSrc().getType(),
+            read->getResult(0));
+        mapping.map(bitcast.getSrc(), inverse.getResult());
+      }
+    }
+    std::function<mlir::Value(mlir::Value)> recompute =
+        [&](mlir::Value value) -> mlir::Value {
+      if (mlir::Value mapped = mapping.lookupOrNull(value))
+        return mapped;
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def || !preSet.count(def))
+        return value;
+      for (mlir::Value operand : def->getOperands())
+        recompute(operand);
+      mlir::Operation *clone = builder.clone(*def, mapping);
+      return mapping.lookupOrNull(value) ? mapping.lookup(value)
+                                         : clone->getResult(0);
+    };
+    for (mlir::Operation *post : postOps)
+      for (mlir::OpOperand &use : post->getOpOperands()) {
+        mlir::Operation *def = use.get().getDefiningOp();
+        if (def && preSet.count(def))
+          use.set(recompute(use.get()));
+      }
+
+    for (size_t i = 0; i < sources.size(); ++i) {
+      auto type = mlir::cast<mlir::RankedTensorType>(sources[i].getType());
+      TileExchangePlan publishPlan{
+          *layout,
+          *layout,
+          srcTy.getNumElements(),
+          metalStorageElementType(type.getElementType()),
+          publishes[i],
+          i + 1 == sources.size()};
+      g_tileExchange[publishes[i]] = publishPlan;
+      g_tileExchange[reads[i]] = publishPlan;
+    }
+    g_stagedScanPublish[scan.getOperation()] = publishes.front();
+    if (sources.size() > 1)
+      g_stagedTupleScanPublishes[scan.getOperation()] = publishes;
   }
   return mlir::success();
 }
@@ -28456,7 +29168,15 @@ validateTileExchangeScratchBudget(mlir::ModuleOp moduleOp) {
     // Exactly the allocation FuncOpLowering emits, from the same function, so
     // the preflight and the emission cannot disagree.
     int64_t requiredBytes =
-        assignExchangeBuffers(func.getBody().front()).totalBytes;
+        assignExchangeBuffers(func.getBody().front()).totalBytes +
+        nestedScanExchangeBytes(func);
+    for (mlir::Operation &candidate : func.getBody().front())
+      if (auto alloca = mlir::dyn_cast<ThreadgroupAllocaOp>(candidate)) {
+        auto type = mlir::cast<MetalMemRefType>(alloca.getResult().getType());
+        requiredBytes +=
+            type.getSize() * ((type.getType().getIntOrFloatBitWidth() + 7) / 8);
+      }
+
     if (requiredBytes > kThreadgroupBudgetBytes) {
       func.emitOpError() << "Metal backend: full-tile exchange scratch needs "
                          << requiredBytes
@@ -28474,8 +29194,7 @@ validateTileExchangeScratchBudget(mlir::ModuleOp moduleOp) {
 static mlir::LogicalResult
 validateTileExchangePhaseCarry(mlir::ModuleOp moduleOp) {
   bool valid = true;
-  moduleOp.walk([&](mlir::triton::FuncOp func) {
-    mlir::Block &body = func.getBody().front();
+  auto validate = [&](mlir::Operation *scope, mlir::Block &body) {
     if (body.empty())
       return;
     ExchangeBufferAssignment exch = assignExchangeBuffers(body);
@@ -28488,12 +29207,19 @@ validateTileExchangePhaseCarry(mlir::ModuleOp moduleOp) {
       return it == ids.end() ? -1 : it->second;
     };
     // The lowering stops at the terminator, which never joins a phase.
-    if (!tileExchangePhasesCarryable(exch.publishes, body.begin(),
+    if (!tileExchangePhasesCarryable(exchangePhaseEnds(exch), body.begin(),
                                      std::prev(body.end()), bufferOf)) {
-      func.emitOpError() << "Metal backend cannot carry a value across "
-                            "full-tile exchange phases";
+      scope->emitOpError() << "Metal backend cannot carry a value across "
+                              "full-tile exchange phases";
       valid = false;
     }
+  };
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    validate(func, func.getBody().front());
+    func.walk([&](mlir::scf::ForOp loop) {
+      if (g_nestedScanLoops.count(loop.getOperation()))
+        validate(loop, *loop.getBody());
+    });
   });
   return mlir::success(valid);
 }
@@ -34002,6 +34728,292 @@ static mlir::LogicalResult validateUnitAxisReduce(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// Include each tuple's static buffers and the declarations already emitted
+// by pre-passes (notably masked-store sentinels) before native conversion.
+static mlir::LogicalResult
+validateRankNTupleScanScratchBudget(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    int64_t tupleBytes = 0;
+    func.walk([&](mlir::triton::ScanOp scan) {
+      if (!rankNMultiValueScanSupported(scan) || planRankNTupleScanLayout(scan))
+        return;
+      auto tile = tileFromTensor(scan.getSrcs().front().getType());
+      tupleBytes += scan.getSrcs().size() * tile->threadsPerBlock * 4;
+    });
+    bool hasStagedScan = false;
+    func.walk([&](mlir::triton::ScanOp scan) {
+      hasStagedScan |= g_stagedScanPublish.count(scan.getOperation()) != 0;
+    });
+    if (tupleBytes == 0 && !hasStagedScan)
+      return;
+    int64_t requiredBytes =
+        tupleBytes + assignExchangeBuffers(func.getBody().front()).totalBytes +
+        nestedScanExchangeBytes(func);
+    // These other scan paths allocate during conversion rather than in the
+    // pre-passes. Include them when they share a function with a new tuple.
+    func.walk([&](mlir::triton::ScanOp scan) {
+      if (isCanonicalSegmentedSumScan(scan) || isCanonicalAffineScan(scan))
+        return;
+      if (rank1MultiValueScanSupported(scan)) {
+        auto type = mlir::cast<mlir::RankedTensorType>(
+            scan.getSrcs().front().getType());
+        auto tile = *tileFromTensor(type);
+        int64_t slots = tile.threadsPerBlock;
+        if (type.getNumElements() > slots)
+          slots += type.getNumElements();
+        requiredBytes += scan.getSrcs().size() * slots * 4;
+      } else if (auto plan = planStagedScan(scan); plan && !plan->layout) {
+        requiredBytes += plan->tile.threadsPerBlock *
+                         ((plan->stageTy.getIntOrFloatBitWidth() + 7) / 8);
+      }
+    });
+    func.walk([&](ThreadgroupAllocaOp alloca) {
+      auto type = mlir::cast<MetalMemRefType>(alloca.getResult().getType());
+      requiredBytes +=
+          type.getSize() * ((type.getType().getIntOrFloatBitWidth() + 7) / 8);
+    });
+    if (requiredBytes > kThreadgroupBudgetBytes) {
+      func.emitOpError()
+          << "Metal backend: multidimensional tuple scan scratch needs "
+          << requiredBytes << " bytes, exceeding the 32768-byte budget";
+      valid = false;
+    }
+  });
+  return mlir::success(valid);
+}
+
+// The first local phase envelope keeps all tensor effects in a single
+// top-level runtime loop. Scalars outside it are uniform function inputs or
+// pure expressions. Tensor snapshots cannot be reloaded inside the loop.
+static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+        scan.getSrcs().front().getType());
+    auto tile = type ? tileFromTensor(type) : std::nullopt;
+    if (!type || type.getRank() < 2 || !tile ||
+        type.getNumElements() <= tile->threadsPerBlock ||
+        mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()))
+      return;
+    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(scan->getParentOp());
+    if (!loop || !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()) ||
+        loop.getNumRegionIterArgs() != 0) {
+      scan.emitOpError("Metal backend: nested scan requires one top-level for "
+                       "loop without iter_args");
+      valid = false;
+      return;
+    }
+    if (g_nestedScanLoops.insert(loop.getOperation()).second)
+      loops.push_back(loop);
+  });
+  if (!valid)
+    return mlir::failure();
+  for (auto loop : loops) {
+    auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+    for (mlir::Operation &op : func.getBody().front()) {
+      if (&op == loop || op.hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      if (op.getNumRegions() || (!mlir::isMemoryEffectFree(&op) &&
+                                 !mlir::isa<mlir::triton::GetProgramIdOp>(&op)))
+        return loop.emitOpError("Metal backend: nested scan cannot replay an "
+                                "external tensor value or move outer effects");
+    }
+    for (mlir::Operation &op : *loop.getBody()) {
+      if (mlir::isa<mlir::triton::ScanOp>(&op) ||
+          op.hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      if (op.getNumRegions() ||
+          (!mlir::isMemoryEffectFree(&op) &&
+           !mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp,
+                      mlir::triton::GetProgramIdOp>(&op)))
+        return loop.emitOpError("Metal backend: nested scan requires a flat "
+                                "load/compute/store loop body");
+    }
+    mlir::OpBuilder builder(loop.getContext());
+    builder.setInsertionPointToStart(loop.getBody());
+    mlir::IRMapping mapping;
+    bool cloneable = true;
+    std::function<mlir::Value(mlir::Value)> localize =
+        [&](mlir::Value value) -> mlir::Value {
+      if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
+        return value;
+      if (auto mapped = mapping.lookupOrNull(value))
+        return mapped;
+      auto def = value.getDefiningOp();
+      if (def && loop->isAncestor(def))
+        return value;
+      if (!def || def->getNumRegions() || !mlir::isMemoryEffectFree(def)) {
+        cloneable = false;
+        return value;
+      }
+      for (mlir::Value operand : def->getOperands())
+        localize(operand);
+      if (!cloneable)
+        return value;
+      builder.clone(*def, mapping);
+      return mapping.lookup(value);
+    };
+    llvm::SmallVector<mlir::Operation *, 32> bodyOps;
+    for (mlir::Operation &op : *loop.getBody())
+      bodyOps.push_back(&op);
+    for (mlir::Operation *op : bodyOps)
+      for (mlir::OpOperand &use : op->getOpOperands())
+        use.set(localize(use.get()));
+    if (!cloneable)
+      return loop.emitOpError(
+          "Metal backend: nested scan cannot replay an external tensor value");
+    // Pure external tensor cones now have local copies. Remove only dead
+    // originals so no tensor outside a band loop is accidentally scalarized.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto it = func.getBody().front().rbegin();
+           it != func.getBody().front().rend();) {
+        mlir::Operation &op = *it++;
+        if (&op != loop && op.getNumResults() && mlir::isOpTriviallyDead(&op)) {
+          op.erase();
+          changed = true;
+        }
+      }
+    }
+    for (mlir::Operation &op : func.getBody().front())
+      if (&op != loop && llvm::any_of(op.getResultTypes(), [](mlir::Type type) {
+            return mlir::isa<mlir::RankedTensorType>(type);
+          }))
+        return loop.emitOpError("Metal backend: nested scan cannot leave "
+                                "tensor work outside its loop");
+    g_nestedScanFunctions.insert(func.getOperation());
+  }
+  return mlir::success();
+}
+
+// Commit local band phases while tensor operands and the original user loop
+// are still intact. The same assignments/carry predicate were preflighted.
+static mlir::LogicalResult
+materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  moduleOp.walk([&](mlir::scf::ForOp loop) {
+    if (g_nestedScanLoops.count(loop.getOperation()))
+      loops.push_back(loop);
+  });
+  for (auto loop : loops) {
+    auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+    mlir::Block &body = *loop.getBody();
+    auto assignment = assignExchangeBuffers(body);
+    auto ends = exchangePhaseEnds(assignment);
+    if (ends.empty())
+      return loop.emitOpError(
+          "Metal backend: nested scan is missing its local phases");
+    auto ids = exchangePublishBufferIds(assignment);
+    auto bufferOf = [&](mlir::Operation *publish) {
+      auto it = ids.find(publish);
+      return it == ids.end() ? -1 : it->second;
+    };
+    if (!tileExchangePhasesCarryable(ends, body.begin(), std::prev(body.end()),
+                                     bufferOf))
+      return loop.emitOpError("Metal backend cannot carry a value across "
+                              "full-tile exchange phases");
+
+    mlir::OpBuilder builder(func.getContext());
+    builder.setInsertionPointToStart(&func.getBody().front());
+    llvm::SmallVector<mlir::Value, 8> buffers;
+    for (auto [type, elements] : assignment.buffers)
+      buffers.push_back(ThreadgroupAllocaOp::create(
+          builder, loop.getLoc(),
+          MetalMemRefType::get(func.getContext(), type, elements)));
+    for (auto [i, publish] : llvm::enumerate(assignment.publishes))
+      for (auto &entry : g_tileExchange)
+        if (entry.second.publishOp == publish)
+          g_tileExchangeBuf[entry.first] = buffers[assignment.publishBuffer[i]];
+
+    llvm::SmallPtrSet<mlir::Operation *, 32> originalOps;
+    for (mlir::Operation &op : body)
+      originalOps.insert(&op);
+    for (size_t i = 0; i < ends.size(); ++i) {
+      auto begin = std::next(ends[i]->getIterator());
+      auto end = i + 1 < ends.size() ? std::next(ends[i + 1]->getIterator())
+                                     : std::prev(body.end());
+      if (begin == end)
+        continue;
+      llvm::SmallVector<mlir::Operation *, 32> phaseOps;
+      llvm::SmallPtrSet<mlir::Operation *, 32> phaseSet;
+      for (auto it = begin; it != end; ++it) {
+        phaseOps.push_back(&*it);
+        phaseSet.insert(&*it);
+      }
+      builder.setInsertionPoint(phaseOps.front());
+      mlir::IRMapping mapping;
+      std::function<mlir::Value(mlir::Value)> replay =
+          [&](mlir::Value value) -> mlir::Value {
+        if (auto mapped = mapping.lookupOrNull(value))
+          return mapped;
+        auto def = value.getDefiningOp();
+        if (!def || !originalOps.count(def) || phaseSet.count(def))
+          return value;
+        // The shared carry predicate above has proved this regionless cone
+        // replayable and checked that no intervening publish overwrites it.
+        for (mlir::Value operand : def->getOperands())
+          replay(operand);
+        auto clone = builder.clone(*def, mapping);
+        originalOps.insert(clone);
+        if (auto plan = g_tileExchange.find(def);
+            plan != g_tileExchange.end()) {
+          auto copiedPlan = plan->second;
+          auto buffer = g_tileExchangeBuf.lookup(def);
+          g_tileExchange[clone] = copiedPlan;
+          g_tileExchangeBuf[clone] = buffer;
+        }
+        return mapping.lookup(value);
+      };
+      for (mlir::Operation *op : phaseOps)
+        for (mlir::OpOperand &operand : op->getOpOperands())
+          operand.set(replay(operand.get()));
+    }
+
+    auto tile = findTileInfo(func);
+    int64_t finalE = g_tileExchange.lookup(ends.back()).dst.elemPerThread;
+    if (tile)
+      finalE = std::max(finalE, tile->elemPerThread);
+    auto segmentBegin = body.begin();
+    auto terminator = std::prev(body.end());
+    builder.setInsertionPointToStart(&body);
+    auto constant = [&](int64_t n) {
+      return mlir::arith::ConstantOp::create(builder, loop.getLoc(),
+                                             builder.getI32IntegerAttr(n))
+          .getResult();
+    };
+    auto zero = constant(0);
+    auto one = constant(1);
+    // No next-iteration publish may race with the previous prefix reads.
+    BarrierOp::create(builder, loop.getLoc());
+    for (mlir::Operation *publish : ends) {
+      auto segmentEnd = std::next(publish->getIterator());
+      auto limit = constant(g_tileExchange.lookup(publish).src.elemPerThread);
+      auto phase =
+          mlir::scf::ForOp::create(builder, loop.getLoc(), zero, limit, one);
+      phase->setAttr(kScanBandLoopAttr, builder.getUnitAttr());
+      auto &phaseBody = *phase.getBody();
+      phaseBody.getOperations().splice(std::prev(phaseBody.end()),
+                                       body.getOperations(), segmentBegin,
+                                       segmentEnd);
+      segmentBegin = segmentEnd;
+      builder.setInsertionPointAfter(phase);
+      BarrierOp::create(builder, loop.getLoc());
+    }
+    auto limit = constant(finalE);
+    auto phase =
+        mlir::scf::ForOp::create(builder, loop.getLoc(), zero, limit, one);
+    phase->setAttr(kScanBandLoopAttr, builder.getUnitAttr());
+    auto &phaseBody = *phase.getBody();
+    phaseBody.getOperations().splice(std::prev(phaseBody.end()),
+                                     body.getOperations(), segmentBegin,
+                                     terminator);
+  }
+  return mlir::success();
+}
+
 static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::ScanOp op) {
@@ -34015,11 +35027,19 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
       llvm::StringRef why = "the shape is outside the tuple envelope";
       if (rank1MultiValueScanSupported(op, &why))
         return;
+      auto first = mlir::dyn_cast<mlir::RankedTensorType>(
+          op.getSrcs().front().getType());
+      if (first && first.getRank() >= 2) {
+        if (rankNMultiValueScanSupported(op, &why))
+          return;
+        reject(why);
+        return;
+      }
       reject(llvm::Twine("tl.associative_scan carrying more than one value is "
                          "implemented for the segmented-sum and affine forms, "
                          "and for a general tuple combine over rank-1 blocked "
-                         "f32/i32 sources holding at most one element per "
-                         "thread: ")
+                         "f32/i32 sources holding up to sixty-four elements "
+                         "per thread within the threadgroup budget: ")
                  .concat(why)
                  .str());
       return;
@@ -34031,10 +35051,12 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
     if (rtt && rtt.getRank() >= 2) {
       if (planStagedScan(op))
         return;
-      reject("rank >= 2 scan is implemented for a blocked tile of at most one "
-             "element per thread, along an axis of extent 2..64, with an "
-             "add or mul combine (tl.cumsum / tl.cumprod) on f32, f16, bf16 or "
-             "i32, or an xor combine on i32, outside divergent control flow");
+      reject("rank >= 2 scan is implemented for a blocked tile whose element "
+             "count fits the "
+             "threadgroup budget, along an axis of extent 2..64, with an add "
+             "or mul combine (tl.cumsum / tl.cumprod) on f32, f16, bf16 or "
+             "i32, or an xor combine on i32, outside divergent control flow; "
+             "multi-element scans require a top-level function phase");
       return;
     }
     if (op.getAxis() != 0) {
@@ -34876,9 +35898,18 @@ struct ConvertTritonGPUToMetalPass
     g_tileExchange.clear();
     g_tileExchangeBuf.clear();
     g_rankNReducePublish.clear();
+    g_stagedScanPublish.clear();
+    g_stagedTupleScanPublishes.clear();
+    g_stagedScanRanges.clear();
+    g_nestedScanLoops.clear();
+    g_nestedScanFunctions.clear();
     g_rankNPlannedReduces.clear();
     g_broadcastExchange.clear();
 
+    if (mlir::failed(selectNestedScanLoops(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
     if (mlir::failed(validateUnsupportedOpsRejected(moduleOp)) ||
         mlir::failed(validateTensorConstantSupport(moduleOp)) ||
         mlir::failed(validatePreciseMathSupport(moduleOp)) ||
@@ -35620,7 +36651,21 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    if (mlir::failed(preprocessStagedScanPhases(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+    auto functionHasStagedScanPhase = [&](mlir::Operation *candidate) {
+      auto func = candidate->getParentOfType<mlir::triton::FuncOp>();
+      return func && llvm::any_of(g_stagedScanPublish, [&](const auto &entry) {
+               return entry.first
+                          ->template getParentOfType<mlir::triton::FuncOp>() ==
+                      func;
+             });
+    };
     auto functionHasRankNPhase = [&](mlir::Operation *candidate) {
+      if (functionHasStagedScanPhase(candidate))
+        return true;
       auto func = candidate->getParentOfType<mlir::triton::FuncOp>();
       if (!func)
         return false;
@@ -35628,10 +36673,28 @@ struct ConvertTritonGPUToMetalPass
         return reduce->template getParentOfType<mlir::triton::FuncOp>() == func;
       });
     };
+    bool scanRangesValid = true;
     moduleOp.walk([&](mlir::triton::MakeRangeOp range) {
+      if (functionHasStagedScanPhase(range.getOperation())) {
+        int64_t planId = g_stagedScanRanges.size();
+        range->setAttr(kStagedScanPhaseAttr,
+                       mlir::IntegerAttr::get(
+                           mlir::IntegerType::get(&getContext(), 64), planId));
+        if (auto plan = planStagedScanRange(range))
+          g_stagedScanRanges[planId] = *plan;
+        else {
+          range.emitOpError(
+              "Metal backend: staged scan range has no exact consumer layout");
+          scanRangesValid = false;
+        }
+      }
       if (functionHasRankNPhase(range.getOperation()))
         range->setAttr(kRankNPhaseAttr, mlir::UnitAttr::get(&getContext()));
     });
+    if (!scanRangesValid) {
+      signalPassFailure();
+      return;
+    }
 
     // Only exact rank-N phase cones need the size-2 indicator split. Applying
     // this generic CSE repair to unrelated rank-3 kernels changes which
@@ -36058,6 +37121,15 @@ struct ConvertTritonGPUToMetalPass
     // land in the original function's entry block and dominate every scan.
     ScanBufPool scanBufPool;
     preprocessScanBuffers(moduleOp, scanBufPool);
+    if (mlir::failed(validateRankNTupleScanScratchBudget(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+    if (!g_stagedScanPublish.empty() &&
+        mlir::failed(validateTileExchangeScratchBudget(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
 
     // Inc 2.5 rank-2: stage loop-carried [M,N] reduce tiles in threadgroup
     // memory. Must run pre-conversion — the SCF structural conversion rebuilds
@@ -36127,6 +37199,11 @@ struct ConvertTritonGPUToMetalPass
     ReduceOutTileMap reduceOutTiles =
         precomputeRank2ReduceOutTiles(moduleOp);
 
+    if (mlir::failed(materializeNestedScanPhases(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+
     TritonGPUToMetalTypeConverter typeConverter(ctx);
 
     llvm::DenseMap<mlir::Value, mlir::Value> loopGatherBuffers;
@@ -36175,7 +37252,8 @@ struct ConvertTritonGPUToMetalPass
     // original store use. FuncOpLowering also hoists the scratch buffers named
     // by the rank-N phase planner.
     if (!preReduceOps.empty() || !g_rankNReducePublish.empty() ||
-        !loopCarriedGathers.empty() || !tileInvariantReduceLoops.empty() ||
+        !g_stagedScanPublish.empty() || !loopCarriedGathers.empty() ||
+        !tileInvariantReduceLoops.empty() ||
         !tileInvariantRank1Reduces.empty()) {
       mlir::ConversionTarget funcTarget(*ctx);
       funcTarget.markUnknownOpDynamicallyLegal(
@@ -36285,6 +37363,24 @@ struct ConvertTritonGPUToMetalPass
         g_reduceRowBufs = nullptr;
         g_subTpbCompanion = std::nullopt;
         g_axis0BroadcastExpands = nullptr;
+        signalPassFailure();
+        return;
+      }
+    }
+
+    if (!g_stagedScanPublish.empty()) {
+      mlir::ConversionTarget scanTarget(*ctx);
+      scanTarget.markUnknownOpDynamicallyLegal(
+          [](mlir::Operation *) { return true; });
+      scanTarget.addDynamicallyLegalOp<mlir::triton::ScanOp>(
+          [&](mlir::triton::ScanOp scan) {
+            return !g_stagedScanPublish.count(scan.getOperation());
+          });
+      mlir::RewritePatternSet scanPatterns(ctx);
+      scanPatterns.add<StagedScanLowering>(typeConverter, ctx);
+      scanPatterns.add<ScanLowering>(typeConverter, ctx, nullptr, &scanBufPool);
+      if (mlir::failed(mlir::applyPartialConversion(moduleOp, scanTarget,
+                                                    std::move(scanPatterns)))) {
         signalPassFailure();
         return;
       }

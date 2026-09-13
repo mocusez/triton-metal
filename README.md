@@ -271,10 +271,16 @@ input memory access; loop-varying masks and address offsets are preserved.
 Scalar `tl.store` also supports a block-uniform mask: false masks leave the
 destination untouched, including inside loops with changing address offsets.
 
-Multidimensional inclusive scans support an exact i32 XOR combine, forward or
-reverse, on blocked tiles with at most one element per thread and scan-axis
-extent 2–64. This uses the existing staged scan path; rank-1 XOR, wider integer
-types, and compound XOR combine regions retain named preflight rejection.
+Multidimensional inclusive scans support add/multiply on f32/f16/bf16/i32 and
+exact i32 XOR, forward or reverse, on blocked tiles with scan-axis extent 2–64.
+Top-level scans can stage multiple elements per thread, with up to 8192 logical
+elements and total scratch within 32 KiB. Source ranges and prefix reads use
+the same layout mapping. Single-value and tuple scans also stage multiple
+elements per thread inside one top-level uniform runtime loop without loop-carried
+values, with tensor work confined to its flat body. Each iteration publishes
+complete tiles before prefix reads and synchronizes scratch reuse. Deeper control
+flow, external tensor snapshots, unsafe cross-phase replay, rank-1 XOR, wider
+integers, and compound XOR combines retain named preflight rejection.
 
 Tensor-descriptor reducing stores use Triton's standard
 `triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
@@ -395,9 +401,22 @@ The current dependency-ordered priorities are:
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
    reduction-fold paths alike. The default number-preferring policy is
    unchanged and still compiles to the MSL builtin.
-2. Expand layout conversion and reduce/scan support, including cross-lane
-   transpose, general tuple combines, and axis-0 reductions with multiple
-   output elements per thread. Broader descriptor-reduce type/rank and
+2. Expand layout conversion, including the shared tile mapping needed for
+   cross-lane transpose. Top-level single-value rank >= 2 scans now support
+   multiple elements per thread. Rank >= 2 tuple scans now support f32/i32
+   carried values, both directions, and axis extents 2..64. Top-level tuples
+   support multiple elements per thread, consecutive scans, and mixed
+   tuple/single-value exact phases. All components publish together before
+   prefix reads; grouped buffers use dedicated storage within the combined
+   32 KiB threadgroup budget. One-element-per-thread tuples also support
+   uniform user loops. Multi-element single-value and tuple scans now support
+   one top-level uniform runtime loop without loop-carried values, including
+   consecutive scans and memory updates across iterations. Deeper control flow,
+   external tensor snapshots, and unsafe cross-phase replay remain rejected.
+   General rank-1 tuple combines and axis-0 reductions with multiple output
+   elements per thread are implemented. General rank-1 tuple scans support
+   both directions with up to 64 elements per thread, within the existing
+   f32/i32 and threadgroup-memory limits. Broader descriptor-reduce type/rank and
    `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
    canonical dynamic/masked loops, and masked rank-3 batch tails; more general

@@ -2219,14 +2219,15 @@ def _cumprod_rank2_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
     tl.store(o_ptr + off, tl.cumprod(tl.load(x_ptr + off), axis=AXIS))
 
 
+@pytest.mark.parametrize("shape", [(4, 8), (8, 8), (8, 16)])
 @pytest.mark.parametrize("num_warps", [1, 4])
 @pytest.mark.parametrize("axis", [0, 1])
-def test_cumsum_rank2_both_axes(axis, num_warps):
+def test_cumsum_rank2_both_axes(shape, axis, num_warps):
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    M, N = 4, 8
-    torch.manual_seed(axis * 10 + num_warps)
+    M, N = shape
+    torch.manual_seed(M * 100 + N * 10 + axis * 2 + num_warps)
     x = torch.randn(M, N, dtype=torch.float32)
     out = torch.zeros(M, N, dtype=torch.float32, device="mps")
     _cumsum_rank2_kernel[(1,)](x.to("mps"), out, M, N, axis,
@@ -2235,13 +2236,14 @@ def test_cumsum_rank2_both_axes(axis, num_warps):
     torch.testing.assert_close(out.cpu(), x.cumsum(axis), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("shape", [(4, 8), (8, 8)])
 @pytest.mark.parametrize("axis", [0, 1])
-def test_cumprod_rank2_is_bit_exact(axis):
+def test_cumprod_rank2_is_bit_exact(shape, axis):
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    M, N = 4, 8
-    torch.manual_seed(axis)
+    M, N = shape
+    torch.manual_seed(M + N + axis)
     # Small integers keep every partial product exactly representable, so the
     # identity element (1, not 0) is pinned by an equality rather than a
     # tolerance.
@@ -2281,10 +2283,14 @@ def _xor_scan_tile_kernel(x_ptr, out_ptr, SHAPE: tl.constexpr,
 
 
 @pytest.mark.parametrize("shape,axis,num_warps", [
-    ((4, 8), axis, nw) for axis in (0, 1) for nw in (1, 4)
+    (shape, axis, nw)
+    for shape in ((4, 8), (8, 8), (8, 16))
+    for axis in range(len(shape))
+    for nw in (1, 4)
 ] + [
-    ((2, 4, 4), axis, nw) for axis in (0, 1, 2) for nw in (1, 4)
-] + [((2, 64), 1, 4), ((64, 2), 0, 4)])
+    (shape, axis, nw) for shape in ((2, 4, 4), (4, 4, 8))
+    for axis in (0, 1, 2) for nw in (1, 4)
+] + [((2, 64), 1, 4), ((64, 2), 0, 4), ((64, 128), 0, 4)])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_xor_scan_staged_axes_are_bit_exact(shape, axis, num_warps, reverse):
     import math
@@ -2311,8 +2317,8 @@ def test_xor_scan_staged_axes_are_bit_exact(shape, axis, num_warps, reverse):
 
 @pytest.mark.parametrize("shape,block,axis,diagnostic", [
     ((32,), 32, 0, "scan combine must be add or mul"),
-    ((8, 8), 64, 1, "rank >= 2 scan is implemented"),
     ((1, 128), 128, 1, "rank >= 2 scan is implemented"),
+    ((8192, 2), 16384, 1, "rank >= 2 scan is implemented"),
 ])
 def test_xor_scan_outside_staged_envelope_is_rejected(
         shape, block, axis, diagnostic, capfd):
@@ -2322,6 +2328,226 @@ def test_xor_scan_outside_staged_envelope_is_rejected(
             {"SHAPE": shape, "BLOCK": block, "AXIS": axis, "REVERSE": False},
             num_warps=1)
     assert diagnostic in capfd.readouterr().err
+
+
+@triton.jit
+def _staged_scan_add(a, b):
+    return a + b
+
+
+@triton.jit
+def _staged_scan_mul(a, b):
+    return a * b
+
+
+@triton.jit
+def _staged_scan_masked_kernel(x_ptr, out_ptr, valid, SHAPE: tl.constexpr,
+                               BLOCK: tl.constexpr, AXIS: tl.constexpr,
+                               REVERSE: tl.constexpr, PRODUCT: tl.constexpr):
+    local = tl.arange(0, BLOCK).reshape(SHAPE)
+    off = tl.program_id(0) * BLOCK + local
+    x = tl.load(x_ptr + off, local < valid, other=0)
+    # Compute the source before publication; preserve the input element type.
+    x = (x + 1).to(x.dtype)
+    if PRODUCT:
+        y = tl.associative_scan(x, AXIS, _staged_scan_mul, reverse=REVERSE)
+    else:
+        y = tl.associative_scan(x, AXIS, _staged_scan_add, reverse=REVERSE)
+    tl.store(out_ptr + off, y, local < valid)
+
+
+@pytest.mark.parametrize("shape,axis,num_warps", [
+    ((8, 16), 0, 1), ((8, 16), 1, 1),
+    ((4, 4, 16), 0, 4), ((4, 4, 16), 1, 4), ((4, 4, 16), 2, 4),
+])
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16", "int32"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("product", [False, True])
+def test_staged_scan_multiband_masked_computed_source(
+        shape, axis, num_warps, dtype, reverse, product):
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = math.prod(shape)
+    valid = block - 7
+    generator = torch.Generator().manual_seed(block + axis)
+    if dtype == "int32":
+        x = torch.randint(-(2**31), 2**31, (3, *shape), dtype=torch.int32,
+                          generator=generator)
+    else:
+        # Small exact values isolate mapping/synchronization from reassociation.
+        x = torch.randint(-2, 1, (3, *shape), generator=generator).to(getattr(torch, dtype))
+    source = x.clone().reshape(3, block)
+    source[:, valid:] = 0
+    expected = (source.reshape(3, *shape) + 1).to(x.dtype)
+    slices = expected.unbind(axis + 1)
+    indices = range(len(slices) - 2, -1, -1) if reverse else range(1, len(slices))
+    for i in indices:
+        previous = slices[i + 1 if reverse else i - 1]
+        if product:
+            slices[i].mul_(previous)
+        else:
+            slices[i].add_(previous)
+    expected.reshape(3, block)[:, valid:] = -13
+    out = torch.full_like(x, -13, device="mps")
+    _staged_scan_masked_kernel[(3,)](
+        x.to("mps"), out, valid, shape, block, axis, reverse, product,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), expected)
+
+
+@triton.jit
+def _staged_scan_pair_kernel(x_ptr, first_ptr, second_ptr,
+                             CHAINED: tl.constexpr, REVERSE: tl.constexpr):
+    off = tl.program_id(0) * 128 + tl.arange(0, 128).reshape((8, 16))
+    x = tl.load(x_ptr + off)
+    first = tl.cumsum(x, 0, reverse=REVERSE)
+    tl.store(first_ptr + off, first)
+    if CHAINED:
+        second = tl.cumsum(first, 1, reverse=not REVERSE)
+    else:
+        second = tl.cumsum(x + 3, 1, reverse=not REVERSE)
+    tl.store(second_ptr + off, second)
+
+
+@pytest.mark.parametrize("chained", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_staged_scan_multiband_consecutive(chained, reverse):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.arange(3 * 128, dtype=torch.int32) % 19 - 9).reshape(3, 8, 16)
+
+    def scan(value, axis, backward):
+        if backward:
+            return value.flip((axis,)).cumsum(axis, dtype=torch.int32).flip((axis,))
+        return value.cumsum(axis, dtype=torch.int32)
+
+    first = scan(x, 1, reverse)
+    second = scan(first if chained else x + 3, 2, not reverse)
+    out1 = torch.empty_like(x, device="mps")
+    out2 = torch.empty_like(x, device="mps")
+    _staged_scan_pair_kernel[(3,)](x.to("mps"), out1, out2, chained, reverse, num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out1.cpu(), first)
+    assert torch.equal(out2.cpu(), second)
+
+
+@triton.jit
+def _staged_scan_nested_kernel(x_ptr, out_ptr, iterations):
+    off = tl.arange(0, 128).reshape((8, 16))
+    for i in range(iterations):
+        x = tl.load(x_ptr + i * 128 + off)
+        tl.store(out_ptr + i * 128 + off, tl.cumsum(x, 1))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16", "int32"])
+@pytest.mark.parametrize("iterations", [0, 1, 7])
+def test_staged_scan_multiband_nested_loop(dtype, iterations):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.arange(7 * 128) % 7 - 3).reshape(7, 8, 16).to(getattr(torch, dtype))
+    out = torch.full_like(x, -123, device="mps")
+    _staged_scan_nested_kernel[(1,)](x.to("mps"), out, iterations, num_warps=1)
+    torch.mps.synchronize()
+    expected = torch.full_like(x, -123)
+    expected[:iterations] = x[:iterations].cumsum(2, dtype=x.dtype)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _staged_scan_mixed_bands_kernel(x_ptr, small_ptr, large_ptr):
+    small = tl.arange(0, 4)[:, None] * 8 + tl.arange(0, 8)[None, :]
+    a = tl.load(x_ptr + small)
+    tl.store(small_ptr + small, tl.cumsum(a, 0))
+    large = tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :]
+    b = tl.load(x_ptr + large)
+    tl.store(large_ptr + large, tl.cumsum(b, 1, reverse=True))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_staged_scan_multiband_with_one_band_scan(num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.arange(256, dtype=torch.int32) % 17 - 8).reshape(16, 16)
+    small = torch.empty((4, 8), dtype=torch.int32, device="mps")
+    large = torch.empty_like(x, device="mps")
+    _staged_scan_mixed_bands_kernel[(1,)](x.to("mps"), small, large, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(small.cpu(), x.flatten()[:32].reshape(4, 8).cumsum(0, dtype=torch.int32))
+    assert torch.equal(large.cpu(), x.flip((1,)).cumsum(1, dtype=torch.int32).flip((1,)))
+
+
+@triton.jit
+def _staged_scan_snapshot_kernel(x_ptr, out_ptr):
+    off = tl.arange(0, 128).reshape((8, 16))
+    x = tl.load(x_ptr + off)
+    result = tl.cumsum(x + 1, 1)
+    tl.store(x_ptr + off, x + 5)
+    tl.store(out_ptr + off, result + x)
+
+
+def test_staged_scan_multiband_load_snapshot_is_not_replayed(capfd):
+    with pytest.raises(Exception):
+        _compile_to_msl(_staged_scan_snapshot_kernel,
+                        {"x_ptr": "*i32", "out_ptr": "*i32"}, {}, num_warps=1)
+    assert "staged scan cannot safely replay a cross-phase value" in capfd.readouterr().err
+
+
+@triton.jit
+def _staged_scan_rank3_ranges_kernel(x_ptr, out_ptr, AXIS: tl.constexpr):
+    off = (tl.arange(0, 4)[:, None, None] * 128 +
+           tl.arange(0, 8)[None, :, None] * 16 +
+           tl.arange(0, 16)[None, None, :])
+    x = tl.load(x_ptr + off)
+    tl.store(out_ptr + off, tl.cumsum(x, AXIS, reverse=True))
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_staged_scan_multiband_rank3_slice_ranges(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.arange(512, dtype=torch.int32) % 17 - 8).reshape(4, 8, 16)
+    out = torch.empty_like(x, device="mps")
+    _staged_scan_rank3_ranges_kernel[(1,)](x.to("mps"), out, axis, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x.flip((axis,)).cumsum(axis, dtype=torch.int32).flip((axis,))
+    assert torch.equal(out.cpu(), expected)
+
+
+@triton.jit
+def _staged_scan_independent_snapshot_kernel(x_ptr, saved_ptr, out_ptr):
+    off = tl.arange(0, 128).reshape((8, 16))
+    saved = tl.load(saved_ptr + off)
+    x = tl.load(x_ptr + off)
+    tl.store(saved_ptr + off, tl.full((8, 16), 7, tl.int32))
+    result = tl.cumsum(x, 1)
+    tl.store(out_ptr + off, result + saved)
+
+
+def test_staged_scan_multiband_independent_snapshot_is_not_moved(capfd):
+    with pytest.raises(Exception):
+        _compile_to_msl(_staged_scan_independent_snapshot_kernel,
+                        {"x_ptr": "*i32", "saved_ptr": "*i32", "out_ptr": "*i32"},
+                        {}, num_warps=1)
+    assert "staged scan cannot move a load across a write" in capfd.readouterr().err
+
+
+def test_staged_scan_multiband_masked_scratch_budget_is_checked(capfd):
+    with pytest.raises(Exception):
+        _compile_to_msl(
+            _staged_scan_masked_kernel,
+            {"x_ptr": "*fp32", "out_ptr": "*fp32", "valid": "i32"},
+            {"SHAPE": (64, 128), "BLOCK": 8192, "AXIS": 0,
+             "REVERSE": False, "PRODUCT": False}, num_warps=1)
+    assert "exceeding the 32768-byte budget" in capfd.readouterr().err
 
 
 # --- tl.join / tl.split / tl.cat / tl.interleave ---------------------------

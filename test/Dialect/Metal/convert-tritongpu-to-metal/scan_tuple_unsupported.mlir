@@ -29,21 +29,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// A REVERSE tuple scan above one element per thread. The band prefix and the
-// carry both run the other way round, which is a separate shape rather than a
-// flag; refusing it is what keeps it from quietly producing the forward answer.
+// The same band limit applies in reverse.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scan_tuple_reverse_band_deferred(%x: !tt.ptr<f32>) {
-    %v = arith.constant dense<1.0> : tensor<128xf32, #blocked>
-    %w = arith.constant dense<2.0> : tensor<128xf32, #blocked>
-    // expected-error @+1 {{a reverse tuple scan above one element per thread is not implemented}}
+  tt.func public @scan_tuple_reverse_band_too_long(%x: !tt.ptr<f32>) {
+    %v = arith.constant dense<1.0> : tensor<4096xf32, #blocked>
+    %w = arith.constant dense<2.0> : tensor<4096xf32, #blocked>
+    // expected-error @+1 {{a general tuple scan is implemented up to sixty-four elements per thread}}
     %r:2 = "tt.scan"(%v, %w) ({
     ^bb0(%a1: f32, %a2: f32, %b1: f32, %b2: f32):
       %s = arith.addf %a1, %b1 : f32
       %m = arith.maxnumf %a2, %b2 : f32
       tt.scan.return %s, %m : f32, f32
-    }) {axis = 0 : i32, reverse = true} : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>)
+    }) {axis = 0 : i32, reverse = true} : (tensor<4096xf32, #blocked>, tensor<4096xf32, #blocked>) -> (tensor<4096xf32, #blocked>, tensor<4096xf32, #blocked>)
     tt.return
   }
 }
@@ -84,6 +82,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
       %m = arith.addi %a2, %b2 : i32
       tt.scan.return %s, %m : i32, i32
     }) {axis = 0 : i32, reverse = false} : (tensor<32xi32, #blocked>, tensor<32xi32, #blocked>) -> (tensor<32xi32, #blocked>, tensor<32xi32, #blocked>)
+    tt.return
+  }
+}
+
+// -----
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_tuple_rank2_over_budget(%x: i32) {
+    %v = tt.splat %x : i32 -> tensor<128x64xi32, #blocked>
+    // expected-error @+1 {{a multidimensional tuple scan exceeds the threadgroup budget}}
+    %scan:2 = "tt.scan"(%v, %v) <{axis = 1 : i32, reverse = true}> ({
+    ^bb0(%lhs0: i32, %lhs1: i32, %rhs0: i32, %rhs1: i32):
+      %sum = arith.addi %lhs0, %rhs0 : i32
+      tt.scan.return %sum, %rhs1 : i32, i32
+    }) : (tensor<128x64xi32, #blocked>, tensor<128x64xi32, #blocked>) -> (tensor<128x64xi32, #blocked>, tensor<128x64xi32, #blocked>)
     tt.return
   }
 }

@@ -53,6 +53,11 @@ module {
       }
       metal.store %pair#0, %out_f[%idx] : f32, !metal.memref<? x f32>, ui32
       metal.store %pair#1, %out_i[%idx] : ui32, !metal.memref<? x ui32>, ui32
+      %scratch = metal.threadgroup_alloca : !metal.memref<16 x f32>
+      metal.tg_store_indexed %scratch[%pair#1], %pair#0 : !metal.memref<16 x f32>, ui32, f32
+      metal.barrier
+      %loaded = metal.tg_load_indexed %scratch[%pair#1] : (!metal.memref<16 x f32>, ui32) -> f32
+      metal.store %loaded, %out_f[%idx] : f32, !metal.memref<? x f32>, ui32
       metal.return
     }
     metal.module_end
@@ -82,3 +87,9 @@ module {
 // CHECK: v[[#I]] = 9;
 // CHECK: v{{[0-9]+}}[0] = v[[#F]];
 // CHECK: v{{[0-9]+}}[0] = v[[#I]];
+// Both indexed operands must retain their individual SSA result numbers.
+// CHECK: threadgroup float v[[#SCRATCH:]][16];
+// CHECK: v[[#SCRATCH]][v[[#I]]] = v[[#F]];
+// CHECK: threadgroup_barrier(mem_flags::mem_threadgroup);
+// CHECK: float v[[#LOADED:]] = v[[#SCRATCH]][v[[#I]]];
+// CHECK: v{{[0-9]+}}[0] = v[[#LOADED]];

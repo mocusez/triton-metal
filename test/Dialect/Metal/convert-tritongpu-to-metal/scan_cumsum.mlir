@@ -364,3 +364,93 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: arith.select {{.*}}, %[[ZERO]] : i32
 // CHECK: bitXorOp
 // CHECK-NOT: tt.scan
+
+// -----
+
+// Rank-2 staged scan above one element per thread: BLOCK=64 with tpb=32, so
+// every thread publishes two logical tile positions before reading axis
+// prefixes from the completed tile.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#row = #ttg.slice<{dim = 1, parent = #blocked}>
+#col = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @staged_rank2_scan_multiband(%out: !tt.ptr<f32>, %x: f32) {
+    %v = tt.splat %x : f32 -> tensor<8x8xf32, #blocked>
+    %scan = "tt.scan"(%v) <{axis = 1 : i32, reverse = false}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %r = arith.addf %lhs, %rhs : f32
+      tt.scan.return %r : f32
+    }) : (tensor<8x8xf32, #blocked>) -> tensor<8x8xf32, #blocked>
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #row>
+    %col = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #col>
+    %eight = arith.constant dense<8> : tensor<8xi32, #row>
+    %rowOff = arith.muli %row, %eight : tensor<8xi32, #row>
+    %r = tt.expand_dims %rowOff {axis = 1 : i32} : tensor<8xi32, #row> -> tensor<8x1xi32, #blocked>
+    %c = tt.expand_dims %col {axis = 0 : i32} : tensor<8xi32, #col> -> tensor<1x8xi32, #blocked>
+    %rr = tt.broadcast %r : tensor<8x1xi32, #blocked> -> tensor<8x8xi32, #blocked>
+    %cc = tt.broadcast %c : tensor<1x8xi32, #blocked> -> tensor<8x8xi32, #blocked>
+    %off = arith.addi %rr, %cc : tensor<8x8xi32, #blocked>
+    %ptr = tt.splat %out : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, #blocked>
+    %outp = tt.addptr %ptr, %off : tensor<8x8x!tt.ptr<f32>, #blocked>, tensor<8x8xi32, #blocked>
+    // An independent store after the scan must stay on the read side.
+    tt.store %outp, %v : tensor<8x8x!tt.ptr<f32>, #blocked>
+    tt.store %outp, %scan : tensor<8x8x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel staged_rank2_scan_multiband
+// CHECK: %[[BUF:.*]] = metal.threadgroup_alloca : !metal.memref<64 x f32>
+// CHECK: scf.for
+// CHECK-NOT: metal.store
+// CHECK: metal.tg_store_indexed %[[BUF]][
+// CHECK-NEXT: }
+// CHECK-NEXT: metal.barrier
+// CHECK: metal.tg_load_indexed %[[BUF]][
+// CHECK: addOp
+// CHECK: metal.store
+// CHECK: metal.store
+// CHECK-NOT: tt.scan
+
+// -----
+
+// Staged XOR uses the same publication barrier as add/mul, a zero identity,
+// and ui32 storage. Swapped combine operands are equivalent for this monoid.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#row = #ttg.slice<{dim = 1, parent = #blocked}>
+#col = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @staged_xor_reverse_multiband(%out: !tt.ptr<i32>, %x: i32) {
+    %v = tt.splat %x : i32 -> tensor<8x8xi32, #blocked>
+    %scan = "tt.scan"(%v) <{axis = 0 : i32, reverse = true}> ({
+    ^bb0(%lhs: i32, %rhs: i32):
+      %r = arith.xori %rhs, %lhs : i32
+      tt.scan.return %r : i32
+    }) : (tensor<8x8xi32, #blocked>) -> tensor<8x8xi32, #blocked>
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #row>
+    %col = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #col>
+    %eight = arith.constant dense<8> : tensor<8xi32, #row>
+    %rowOff = arith.muli %row, %eight : tensor<8xi32, #row>
+    %r = tt.expand_dims %rowOff {axis = 1 : i32} : tensor<8xi32, #row> -> tensor<8x1xi32, #blocked>
+    %c = tt.expand_dims %col {axis = 0 : i32} : tensor<8xi32, #col> -> tensor<1x8xi32, #blocked>
+    %rr = tt.broadcast %r : tensor<8x1xi32, #blocked> -> tensor<8x8xi32, #blocked>
+    %cc = tt.broadcast %c : tensor<1x8xi32, #blocked> -> tensor<8x8xi32, #blocked>
+    %off = arith.addi %rr, %cc : tensor<8x8xi32, #blocked>
+    %base = tt.splat %out : !tt.ptr<i32> -> tensor<8x8x!tt.ptr<i32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<8x8x!tt.ptr<i32>, #blocked>, tensor<8x8xi32, #blocked>
+    tt.store %ptr, %scan : tensor<8x8x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel staged_xor_reverse_multiband
+// CHECK: %[[XBUF:.*]] = metal.threadgroup_alloca : !metal.memref<64 x ui32>
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed %[[XBUF]][
+// CHECK-NEXT: }
+// CHECK-NEXT: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed %[[XBUF]][
+// CHECK: arith.cmpi sge
+// CHECK: bitXorOp
+// CHECK-NOT: tt.scan

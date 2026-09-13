@@ -766,9 +766,11 @@ void ModuleTranslation::translate(mlir::triton::metal::TgStoreIndexedOp op) {
   // the implementation notes.
   translateVarName(op.getBuffer());
   _output << "[";
-  translateValue(op.getIndex().getDefiningOp());
+  translateValueOrVarName(op.getIndex());
   _output << "] = ";
-  translateValue(op.getValue().getDefiningOp());
+  // A staged tuple may publish one result of a multi-result scf.if.
+  // Preserve the SSA value so its own result temporary is selected.
+  translateValueOrVarName(op.getValue());
   printDelim();
 }
 
@@ -778,7 +780,7 @@ void ModuleTranslation::translate(mlir::triton::metal::TgLoadIndexedOp op) {
   // the implementation notes.
   translateVarName(op.getBuffer());
   _output << "[";
-  translateValue(op.getIndex().getDefiningOp());
+  translateValueOrVarName(op.getIndex());
   _output << "]";
 }
 
