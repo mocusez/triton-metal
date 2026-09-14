@@ -4522,6 +4522,10 @@ def test_reduce_rank3_double_fails_without_crashing(form, tmp_path):
     import sys
     import textwrap
 
+    # 2x4x4: a shape whose layout stays thread-major under this compile path, so
+    # the INNER rank-3 reduce is accepted and the refusal under test is the
+    # rank-2 one above it. A tile whose layout wraps into a second register band
+    # is refused earlier, by the rank >= 3 envelope.
     script = tmp_path / "reduce_rank3_double.py"
     script.write_text(textwrap.dedent(f"""
         import importlib.util
@@ -4538,7 +4542,7 @@ def test_reduce_rank3_double_fails_without_crashing(form, tmp_path):
             triton.compile(ASTSource(
                 module._reduce_rank3_double_kernel,
                 signature=signature,
-                constexprs={{"D0": 2, "D1": 4, "D2": 8, "FORM": form}}),
+                constexprs={{"D0": 2, "D1": 4, "D2": 4, "FORM": form}}),
                 target=target, options={{"num_warps": 1}})
 
         for attempt in range(3):
@@ -4578,3 +4582,108 @@ def test_reduce_rank3_single_inner_still_matches_torch():
     torch.mps.synchronize()
     expected = x.reshape(d0, d1, d2).sum(dim=2).flatten()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _reduce_rank3_axis_kernel(X, O, D0: tl.constexpr, D1: tl.constexpr,
+                              D2: tl.constexpr, AXIS: tl.constexpr):
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    off = i * D1 * D2 + j * D2 + k
+    v = tl.load(X + off)
+    if AXIS == 2:
+        r = tl.sum(v, axis=2)[:, :, None]
+    elif AXIS == 1:
+        r = tl.sum(v, axis=1)[:, None, :]
+    else:
+        r = tl.sum(v, axis=0)[None, :, :]
+    tl.store(O + off, r + 0.0 * v)
+
+
+@pytest.mark.parametrize(
+    "d0,d1,d2,num_warps,axis",
+    [
+        (8, 4, 4, 1, 2), (8, 4, 4, 1, 1), (8, 4, 4, 1, 0),
+        (2, 4, 4, 1, 2), (2, 8, 32, 4, 1), (4, 8, 16, 4, 0),
+    ],
+    ids=["e4_axis2", "e4_axis1", "e4_axis0", "small_axis2", "wide_axis1",
+         "wide_axis0"],
+)
+def test_reduce_rank3_single_band_matches_torch(d0, d1, d2, num_warps, axis):
+    """One register band per thread: the layout's flat index and the
+    `localTid * elemPerThread + iv` order the rest of the emitter uses are the
+    same mapping, so the staged fold groups the elements it addressed."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n = d0 * d1 * d2
+    x = ((torch.arange(n) % 43).float() - 19.0) / 11.0
+    out = torch.empty(n, device="mps")
+    _reduce_rank3_axis_kernel[(1,)](x.to("mps"), out, D0=d0, D1=d1, D2=d2,
+                                    AXIS=axis, num_warps=num_warps)
+    torch.mps.synchronize()
+    tile = x.reshape(d0, d1, d2)
+    expected = tile.sum(dim=axis, keepdim=True).expand(d0, d1, d2).flatten()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "d0,d1,d2,num_warps,axis",
+    [(4, 8, 16, 1, 2), (4, 8, 16, 2, 1), (4, 4, 64, 4, 0)],
+    ids=["e16_axis2", "e8_axis1", "e8_axis0"],
+)
+def test_reduce_rank3_multiband_fails_without_crashing(d0, d1, d2, num_warps,
+                                                       axis, tmp_path):
+    """A layout that wraps into a second register band has two mappings.
+
+    The staged publish stores at the LAYOUT's flat index while the value it
+    stores is the element `localTid * elemPerThread + iv` names. Those coincide
+    only while the tile fits the CTA once; past that the fold reduced the wrong
+    group and returned a plausible number. Refused by name until the rank-3
+    address cone is emitted in layout space.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_rank3_multiband.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "O": "*fp32"}}
+
+        def compile_case(d0, d1, d2, axis, warps):
+            triton.compile(ASTSource(
+                module._reduce_rank3_axis_kernel,
+                signature=signature,
+                constexprs={{"D0": d0, "D1": d1, "D2": d2, "AXIS": axis}}),
+                target=target, options={{"num_warps": warps}})
+
+        for attempt in range(3):
+            try:
+                compile_case({d0}, {d1}, {d2}, {axis}, {num_warps})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("multi-band rank-3 reduce compiled")
+        compile_case(2, 4, 4, 2, 1)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "one register band"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output

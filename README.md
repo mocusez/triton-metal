@@ -436,6 +436,13 @@ The current dependency-ordered priorities are:
    Both rank-2 paths need a blocked source tile and the staged rank-N path
    covers only the binary hypercube shape, so the combination previously
    surfaced as an unnamed legalization failure.
+   A rank >= 3 reduction over a directly loaded tile requires a layout that
+   reaches each thread in one register band. A tile whose layout wraps into a
+   second band is addressed in thread-major order while its staged fold indexes
+   the layout's own order, so it previously reduced a group it never addressed
+   and returned a plausible wrong number; it is now refused by name. `tl.sort`
+   and `tl.topk` are unaffected — their ranges are already emitted in layout
+   space, so both mappings agree.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

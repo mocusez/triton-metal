@@ -14795,6 +14795,38 @@ planRankNReduce(mlir::triton::ReduceOp op) {
            srcTy.getEncoding()) ||
        !layoutHasReplicatedOwners(*srcIndexPlan) || !binaryHypercube))
     return std::nullopt;
+  // Everything this backend emits outside the layout-indexed phase paths
+  // addresses the element a thread holds at tile iteration `iv` as row-major
+  // flat `localTid * elemPerThread + iv`, while the staged publish stores that
+  // value at the LAYOUT's flat index. The two agree only while the tile fits
+  // the CTA exactly once: give the layout a second register band and it
+  // interleaves the bands at the CTA-tile stride, so slot `layout(t, iv)`
+  // receives the element `t*E + iv` names — a different element — and the fold
+  // reduces the wrong group silently. Measured on a rank-3 sum: every cell
+  // whose elements reach a thread in one band is exact and every cell with
+  // more than one is wrong, on all three axes.
+  // `tl.sort`'s hypercube is safe because `MakeRangeLowering` re-emits its
+  // blocked rank-1 ranges in layout space, so its addresses and its scratch
+  // share one mapping; the expanded slice ranges a rank-3 tile is built from
+  // never get that treatment. Until they do, refuse the shape rather than
+  // answer a different program. Replicated owners are the topk hypercube,
+  // which is narrower than the CTA and never multi-band.
+  // Narrowed to the shape that actually carries thread-major addresses: a tile
+  // the kernel LOADED at rank >= 3, whose per-axis ranges are slice-encoded
+  // `tt.expand_dims` and so never reach the layout-space range emission. A
+  // hypercube stage reduces a RESHAPE of a rank-1 blocked tile instead, whose
+  // range did reach it, and stays correct.
+  if (enc && srcTy.getRank() >= 3 &&
+      !layoutFlatIndexIsThreadMajor(*srcIndexPlan) &&
+      !layoutHasReplicatedOwners(*srcIndexPlan)) {
+    mlir::Value probe = op.getSrcs().front();
+    while (auto cvt = probe.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      probe = cvt.getSrc();
+    if (auto load = probe.getDefiningOp<mlir::triton::LoadOp>())
+      if (auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType()))
+        if (loadTy.getRank() == srcTy.getRank())
+          return std::nullopt;
+  }
   const int axis = static_cast<int>(op.getAxis());
   if (axis < 0 || axis >= srcTy.getRank())
     return std::nullopt;
@@ -36724,8 +36756,8 @@ struct ConvertTritonGPUToMetalPass
           return;
         red.emitOpError(
             "rank >= 3 reduce is implemented for a top-level blocked tile "
-            "with an exact distributed layout, over an axis of extent 2..64, "
-            "with an "
+            "with an exact distributed layout whose elements reach a thread in "
+            "one register band, over an axis of extent 2..64, with an "
             "add/mul/min/max/and/or/xor combine on f32, f16, bf16 or i32, "
             "outside divergent control flow");
         reduceOk = false;
