@@ -445,6 +445,11 @@ The current dependency-ordered priorities are:
    kernel never addressed. `tl.sort` and `tl.topk` keep the layout's own
    indexing — their ranges are emitted in layout space, so for them the two
    already agree.
+   Tiles of rank >= 4 are refused by name before conversion: their per-axis
+   ranges have no per-element index, so the whole tile is unsupported, not only
+   a reduction over it. A rank-3 reduction over a tile accumulated by an
+   enclosing loop is likewise refused by name; it previously failed the pass
+   with no diagnostic at all.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

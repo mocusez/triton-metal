@@ -15199,11 +15199,21 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
     }
   for (mlir::triton::ReduceOp reduce : reduces) {
     std::optional<RankNReducePlan> plan = planRankNReduce(reduce);
-    if (!plan || !plan->multiBand)
+    // Every bail below ends the pass, and the caller only calls
+    // `signalPassFailure()` — without a diagnostic here the compiler exits with
+    // no message at all, which is what a rank-3 reduce over a loop-carried
+    // accumulator used to do.
+    if (!plan || !plan->multiBand) {
+      reduce.emitOpError(
+          "staged rank-N reduce lost its multi-band plan between phase "
+          "scheduling and phase construction; the shape is not supported here");
       return mlir::failure();
+    }
     mlir::Block *block = reduce->getBlock();
-    if (!block)
+    if (!block) {
+      reduce.emitOpError("staged rank-N reduce has no enclosing block");
       return mlir::failure();
+    }
     auto srcTy =
         mlir::cast<mlir::RankedTensorType>(reduce.getSrcs().front().getType());
     mlir::Value source = reduce.getSrcs().front();
@@ -15233,8 +15243,13 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
       if (!inCurrentSegment(def) || !preSet.insert(def).second)
         continue;
       if (!mlir::isMemoryEffectFree(def) &&
-          !mlir::isa<mlir::triton::LoadOp>(def))
+          !mlir::isa<mlir::triton::LoadOp>(def)) {
+        reduce.emitOpError(
+            "staged rank-N reduce cannot hoist its source before the phase "
+            "boundary: the cone contains an operation with side effects (a "
+            "tile accumulated by an enclosing loop is one)");
         return mlir::failure();
+      }
       llvm::append_range(worklist, def->getOperands());
     }
     // Keep only the current reduction, its consumers, and later reduction
@@ -15304,8 +15319,13 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
         continue;
       if (shared->getNumRegions() != 0 ||
           (!mlir::isMemoryEffectFree(shared) &&
-           !mlir::isa<mlir::triton::LoadOp>(shared)))
+           !mlir::isa<mlir::triton::LoadOp>(shared))) {
+        reduce.emitOpError(
+            "staged rank-N reduce cannot split its phase: a value live across "
+            "the boundary is produced by an operation carrying a region or "
+            "side effects");
         return mlir::failure();
+      }
       postSet.erase(shared);
       preSet.insert(shared);
       for (mlir::Value operand : shared->getOperands())
@@ -35271,6 +35291,34 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
     if (!rtt || rtt.getNumElements() == 1)
       return;
     mlir::Attribute enc = rtt.getEncoding();
+    // A per-axis range of a rank >= 4 tile: `tl.arange(...)[:, None, None,
+    // None]` is a `tt.make_range` under a slice chain whose root is a rank >= 4
+    // blocked encoding, and MakeRangeLowering has no path for one. The whole
+    // tile is therefore unsupported — even a plain elementwise copy of it fails
+    // — and the conversion otherwise says only `failed to legalize operation
+    // 'tt.make_range'`, after FuncOpLowering has rewritten the kernel
+    // signature. ⚠️ `tl.sort`/`tl.topk` DO build slice chains over rank >= 4
+    // parents — rejecting on the chain alone took 7 of their tests with it —
+    // but a hypercube axis has extent 2 by definition, which the tile of a
+    // real rank >= 4 kernel does not; that, plus the two decomposers this walk
+    // already consults, is the discriminator — the rank alone is not.
+    {
+      mlir::Attribute root = enc;
+      while (auto slice =
+                 mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                     root))
+        root = slice.getParent();
+      if (auto blocked =
+              mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+                  root))
+        if (blocked.getOrder().size() >= 4 && root != enc &&
+            rtt.getNumElements() > 2 && !linearRangeHypercubeAxis(range) &&
+            !planLinearRange(range, /*allowMixedHypercube=*/true)) {
+          reject(range, "tl.arange over a rank >= 4 tile has no per-element "
+                        "index; rank >= 4 tiles are not implemented");
+          return;
+        }
+    }
     if (mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr,
                               mlir::triton::gpu::SliceEncodingAttr>(enc))
       return;

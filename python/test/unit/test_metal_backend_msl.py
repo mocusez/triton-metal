@@ -4757,3 +4757,121 @@ def test_reduce_rank3_source_and_address_match_torch(d0, d1, d2, num_warps,
             tile.sum(dim=axis, keepdim=True).expand(d0, d1, d2).flatten())
     torch.testing.assert_close(out.cpu(), torch.cat(expected), atol=3e-3,
                                rtol=1e-4)
+
+
+@triton.jit
+def _reduce_rank4_kernel(X, O, D0: tl.constexpr, D1: tl.constexpr,
+                         D2: tl.constexpr, D3: tl.constexpr,
+                         AXIS: tl.constexpr):
+    a = tl.arange(0, D0)[:, None, None, None]
+    b = tl.arange(0, D1)[None, :, None, None]
+    c = tl.arange(0, D2)[None, None, :, None]
+    d = tl.arange(0, D3)[None, None, None, :]
+    off = a * D1 * D2 * D3 + b * D2 * D3 + c * D3 + d
+    v = tl.load(X + off)
+    if AXIS == 3:
+        r = tl.sum(v, axis=3)[:, :, :, None]
+    else:
+        r = tl.sum(v, axis=0)[None, :, :, :]
+    tl.store(O + off, r + 0.0 * v)
+
+
+@triton.jit
+def _reduce_rank3_loop_carried_kernel(X, O, T, PLANE_STRIDE,
+                                      D0: tl.constexpr, D1: tl.constexpr,
+                                      D2: tl.constexpr, AXIS: tl.constexpr):
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    off = i * D1 * D2 + j * D2 + k
+    acc = tl.zeros((D0, D1, D2), dtype=tl.float32)
+    for t in range(0, T):
+        acc += tl.load(X + t * PLANE_STRIDE + off)
+    if AXIS == 2:
+        r = tl.sum(acc, axis=2)[:, :, None]
+    else:
+        r = tl.sum(acc, axis=0)[None, :, :]
+    tl.store(O + off, r + 0.0 * acc)
+
+
+@pytest.mark.parametrize(
+    "kernel,constexprs,needle",
+    [
+        ("_reduce_rank4_kernel",
+         '{"D0": 2, "D1": 4, "D2": 4, "D3": 8, "AXIS": 3}',
+         "rank >= 4 tiles are not implemented"),
+        ("_reduce_rank4_kernel",
+         '{"D0": 2, "D1": 4, "D2": 4, "D3": 8, "AXIS": 0}',
+         "rank >= 4 tiles are not implemented"),
+        ("_reduce_rank3_loop_carried_kernel",
+         '{"D0": 4, "D1": 8, "D2": 16, "AXIS": 2}',
+         "cannot hoist its source before the phase boundary"),
+        ("_reduce_rank3_loop_carried_kernel",
+         '{"D0": 4, "D1": 8, "D2": 16, "AXIS": 0}',
+         "cannot hoist its source before the phase boundary"),
+    ],
+    ids=["rank4_axis3", "rank4_axis0", "loop_carried_axis2",
+         "loop_carried_axis0"],
+)
+def test_reduce_rank4_and_loop_carried_fail_without_crashing(
+        kernel, constexprs, needle, tmp_path):
+    """Both shapes are out of envelope; both must SAY so before conversion.
+
+    A rank >= 4 tile has no per-element range lowering at all — even a plain
+    elementwise copy of one fails — and used to report only `failed to legalize
+    operation 'tt.make_range'`. A rank-3 reduce over a loop-carried accumulator
+    used to fail the pass with NO diagnostic whatsoever, because the phase
+    pre-pass returned failure and its caller only signalled.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    signature = ('{"X": "*fp32", "O": "*fp32"}' if "rank4" in kernel else
+                 '{"X": "*fp32", "O": "*fp32", "T": "i32", '
+                 '"PLANE_STRIDE": "i32"}')
+    script = tmp_path / "reduce_rank4_loop.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+
+        def compile_case():
+            triton.compile(ASTSource(
+                getattr(module, {kernel!r}),
+                signature={signature},
+                constexprs={constexprs}),
+                target=target, options={{"num_warps": 1}})
+
+        def compile_supported():
+            triton.compile(ASTSource(
+                module._reduce_rank3_axis_kernel,
+                signature={{"X": "*fp32", "O": "*fp32"}},
+                constexprs={{"D0": 2, "D1": 4, "D2": 4, "AXIS": 2}}),
+                target=target, options={{"num_warps": 1}})
+
+        for attempt in range(3):
+            try:
+                compile_case()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("out-of-envelope shape compiled")
+        compile_supported()
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) >= 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
