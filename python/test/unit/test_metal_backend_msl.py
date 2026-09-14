@@ -3685,6 +3685,35 @@ def _reduce_rank1_contiguous_masked_index_kernel(
     tl.store(O, tl.sum(values, axis=0))
 
 
+@triton.jit
+def _reduce_rank1_contiguous_masked_chain_kernel(
+        X, O, N, K, RUNTIME_STRIDE, BLOCK: tl.constexpr, DEPTH: tl.constexpr,
+        INNER_MODE: tl.constexpr, MASK_MODE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    if INNER_MODE == "stride":
+        inner = offsets * RUNTIME_STRIDE
+    elif INNER_MODE == "modulo":
+        inner = offsets % K
+    elif INNER_MODE == "bitand":
+        inner = offsets & K
+    else:
+        inner = offsets
+
+    row = X + pid * K + inner
+    if DEPTH == 3:
+        ptrs = row + offsets + RUNTIME_STRIDE
+    else:
+        ptrs = row + offsets
+
+    if MASK_MODE == "compound":
+        mask = (pid >= 0) & (offsets <= N)
+    else:
+        mask = offsets < N
+    values = tl.load(ptrs, mask=mask, other=0.0)
+    tl.store(O + pid, tl.sum(values, axis=0))
+
+
 @pytest.mark.parametrize(
     "num_warps,operation,computed",
     [
@@ -4321,3 +4350,136 @@ def test_reduce_rank1_contiguous_masked_index_supported_controls_match_torch(
         num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+def _contiguous_masked_chain_reference(torch, block, depth, inner_mode,
+                                       mask_mode, n, k, runtime_stride,
+                                       programs, x):
+    offsets = torch.arange(block)
+    if inner_mode == "stride":
+        inner = offsets * runtime_stride
+    elif inner_mode == "modulo":
+        inner = offsets.remainder(k)
+    elif inner_mode == "bitand":
+        inner = offsets & k
+    else:
+        inner = offsets
+    mask = offsets <= n if mask_mode == "compound" else offsets < n
+    rows = []
+    for pid in range(programs):
+        index = pid * k + inner + offsets
+        if depth == 3:
+            index = index + runtime_stride
+        rows.append(torch.where(mask, x[index], torch.zeros(block)).sum())
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize(
+    "block,num_warps,depth,inner_mode,mask_mode",
+    [
+        (128, 1, 2, "canonical", "simple"),
+        (128, 1, 2, "stride", "simple"),
+        (128, 1, 3, "stride", "compound"),
+        (128, 1, 2, "modulo", "simple"),
+        (32, 1, 2, "stride", "simple"),
+        (32, 1, 3, "canonical", "compound"),
+        (512, 4, 2, "stride", "simple"),
+        (512, 4, 3, "modulo", "compound"),
+        (2048, 2, 2, "canonical", "simple"),
+    ],
+    ids=[
+        "depth2_canonical_e4",
+        "depth2_stride_e4",
+        "depth3_stride_compound_e4",
+        "depth2_modulo_e4",
+        "depth2_stride_e1",
+        "depth3_canonical_compound_e1",
+        "depth2_stride_nw4",
+        "depth3_modulo_compound_nw4",
+        "depth2_canonical_block2048",
+    ],
+)
+def test_reduce_rank1_contiguous_masked_chain_matches_torch(
+        block, num_warps, depth, inner_mode, mask_mode):
+    """Every tt.addptr level of the load's chain must reach the address.
+
+    `p = X + rows; tl.load(p + cols)` stacks two tensor offsets. Replaying only
+    the outermost one reads `X + cols` and still returns a plausible number, so
+    these cases compare against torch rather than against a rejection.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+
+    programs = 3
+    n = max(1, block - 19)
+    k = 7
+    runtime_stride = 3
+    extent = programs * k + block * (runtime_stride + 1) + runtime_stride + 8
+    x = ((torch.arange(extent) % 43).float() - 19.0) / 11.0
+    expected = _contiguous_masked_chain_reference(
+        torch, block, depth, inner_mode, mask_mode, n, k, runtime_stride,
+        programs, x)
+    out = torch.empty(programs, device="mps")
+    _reduce_rank1_contiguous_masked_chain_kernel[(programs,)](
+        x.to("mps"), out, n, k, runtime_stride, BLOCK=block, DEPTH=depth,
+        INNER_MODE=inner_mode, MASK_MODE=mask_mode, num_warps=num_warps)
+    torch.mps.synchronize()
+    tolerance = 2e-3 if block >= 512 else 1e-5
+    torch.testing.assert_close(out.cpu(), expected, atol=tolerance, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "block,depth",
+    [(128, 2), (32, 2), (128, 3)],
+    ids=["inner_bitand_e4", "inner_bitand_e1", "inner_bitand_depth3"],
+)
+def test_reduce_rank1_contiguous_masked_chain_unsupported_fails_without_crashing(
+        block, depth, tmp_path):
+    """An inner level is proved before conversion, exactly like the outer one."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_contiguous_masked_chain.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "O": "*fp32", "N": "i32",
+                     "K": "i32", "RUNTIME_STRIDE": "i32"}}
+
+        def compile_case(block, depth, inner_mode):
+            triton.compile(ASTSource(
+                module._reduce_rank1_contiguous_masked_chain_kernel,
+                signature=signature,
+                constexprs={{"BLOCK": block, "DEPTH": depth,
+                            "INNER_MODE": inner_mode, "MASK_MODE": "simple"}}),
+                target=target, options={{"num_warps": 1}})
+
+        for attempt in range(3):
+            try:
+                compile_case({block}, {depth}, "bitand")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported chain level compiled")
+        compile_case({block}, {depth}, "stride")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "contiguous masked reduce cannot replay its load index"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output

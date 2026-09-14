@@ -551,3 +551,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// Every level of the pointer chain is proved, not just the outermost one. The
+// inner level's bitwise index has no scalarization, so the whole chain must be
+// refused by name instead of silently dropping that level's term.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_contiguous_masked_inner_level_bitand_deferred(%x_ptr: !tt.ptr<f32>, %n: i32, %k: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %k_splat = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %row_off = arith.andi %offsets, %k_splat : tensor<128xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<128xi32, #blocked>
+    %mask = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %row_addr = tt.addptr %x_splat, %row_off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x_addr = tt.addptr %row_addr, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{contiguous masked reduce cannot replay its load index}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}

@@ -81,3 +81,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.get_element
 // CHECK: metal.store {{.*}} : f32, !metal.memref<? x f32>, ui32
 // CHECK: metal.return
+
+// -----
+// Two tensor `tt.addptr` levels: `p = X + row*stride` then `tl.load(p + col)`.
+// Both levels are replayed at the element's index and SUMMED, so the address
+// the element is fetched from carries the stride term. Replaying only the
+// outermost level reads `X + col` and still returns a plausible sum.
+#blocked_chain = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @rank1_reduce_addf_nested_addptr_chain(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %n_cols: i32, %stride: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_chain>
+    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked_chain>
+    %row_off = arith.muli %offsets, %stride_splat : tensor<128xi32, #blocked_chain>
+    %n_splat = tt.splat %n_cols : i32 -> tensor<128xi32, #blocked_chain>
+    %mask = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked_chain>
+    %zero = arith.constant dense<0.000000e+00> : tensor<128xf32, #blocked_chain>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked_chain>
+    %row_addr = tt.addptr %x_splat, %row_off : tensor<128x!tt.ptr<f32>, #blocked_chain>, tensor<128xi32, #blocked_chain>
+    %x_addr = tt.addptr %row_addr, %offsets : tensor<128x!tt.ptr<f32>, #blocked_chain>, tensor<128xi32, #blocked_chain>
+    %x = tt.load %x_addr, %mask, %zero : tensor<128x!tt.ptr<f32>, #blocked_chain>
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked_chain>) -> f32
+    tt.store %out_ptr, %r : !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel rank1_reduce_addf_nested_addptr_chain
+// CHECK: [[E:%.*]] = arith.constant 4 : i32
+// CHECK: scf.for {{.*}} to [[E]] {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// The element's index, then BOTH chain levels summed into one address.
+// CHECK: [[IDX:%.*]] = arith.addi
+// CHECK: [[ROW:%.*]] = arith.muli [[IDX]], %{{.*}} : i32
+// CHECK: [[ADDR:%.*]] = arith.addi [[IDX]], [[ROW]] : i32
+// CHECK: arith.cmpi slt, [[IDX]]
+// CHECK: [[ADDR_UI:%.*]] = builtin.unrealized_conversion_cast [[ADDR]] : i32 to ui32
+// CHECK: scf.if
+// CHECK: metal.get_element %{{.*}}{{\[}}[[ADDR_UI]]{{\]}}
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+// CHECK: metal.return

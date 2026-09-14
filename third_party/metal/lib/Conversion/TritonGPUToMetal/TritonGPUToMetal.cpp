@@ -9026,10 +9026,67 @@ scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
 // lowerRank1Reduce.
 struct ContiguousMaskedReducePlan {
   mlir::triton::LoadOp load;
-  mlir::Value offsetTensor, rowOK, boundScalar, colIdxCone;
+  llvm::SmallVector<mlir::Value, 2> offsetTensors;
+  mlir::Value rowOK, boundScalar, colIdxCone;
   mlir::arith::CmpIPredicate predicate;
   int64_t threadsPerBlock, elementsPerThread;
 };
+
+// Every `tt.addptr` level of the load's pointer chain contributes to the
+// address. The lowering replays the TENSOR offsets element by element and sums
+// the SCALAR ones with `accumulateScalarAddPtrOffsets`, so the chain is only
+// replayable when those two walks together account for every node down to the
+// kernel's pointer argument. `p = X + rows; tl.load(p + cols)` stacks two
+// tensor levels, and reading only the outermost one silently addresses
+// `X + cols`. Anything the walks do not cover — a shape op between two levels,
+// a pointer read from memory — would drop a term the same way, so collect
+// nothing and let the canonical rank-1 path answer for that shape instead.
+static bool
+collectContiguousReduceOffsets(mlir::Value ptr,
+                               llvm::SmallVectorImpl<mlir::Value> &offsets) {
+  mlir::Value cur = ptr;
+  while (mlir::isa<mlir::RankedTensorType>(cur.getType())) {
+    auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!addptr)
+      break;
+    mlir::Value off = addptr.getOffset();
+    if (!mlir::isa<mlir::RankedTensorType>(off.getType()))
+      return false;
+    offsets.push_back(off);
+    cur = addptr.getPtr();
+  }
+  if (offsets.empty())
+    return false;
+  // Below the tensor levels only the nodes `accumulateScalarAddPtrOffsets`
+  // itself walks may appear; it stops at every other op and would leave the
+  // offsets underneath out of the address.
+  while (cur) {
+    if (mlir::isa<mlir::BlockArgument>(cur))
+      return true;
+    if (auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (mlir::isa<mlir::RankedTensorType>(addptr.getOffset().getType()))
+        return false;
+      cur = addptr.getPtr();
+      continue;
+    }
+    if (auto splat = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+      cur = splat.getSrc();
+      continue;
+    }
+    if (auto bitcast = cur.getDefiningOp<mlir::triton::BitcastOp>()) {
+      cur = bitcast.getSrc();
+      continue;
+    }
+    if (auto cast = cur.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast.getInputs().size() != 1)
+        return false;
+      cur = cast.getInputs()[0];
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
 
 static std::optional<ContiguousMaskedReducePlan>
 inspectContiguousMaskedReduce(mlir::triton::ReduceOp op) {
@@ -9066,10 +9123,9 @@ inspectContiguousMaskedReduce(mlir::triton::ReduceOp op) {
     if (!fa || fa.getValueAsDouble() != 0.0)
       return std::nullopt;
   }
-  auto addptr = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
-  if (!addptr)
+  llvm::SmallVector<mlir::Value, 2> offsetTensors;
+  if (!collectContiguousReduceOffsets(loadOp.getPtr(), offsetTensors))
     return std::nullopt;
-  mlir::Value offsetTensor = addptr.getOffset();
   // Mask: andi(splat(rowOK_i1), colCmpCone) or a bare colCmpCone.
   mlir::Value maskRoot = peelShapeOps(loadOp.getMask());
   mlir::Value rowOK; // optional uniform i1 scalar
@@ -9123,8 +9179,10 @@ inspectContiguousMaskedReduce(mlir::triton::ReduceOp op) {
   if (E < 1 || E > 1024 || (E & (E - 1)) != 0)
     return std::nullopt;
 
-  return ContiguousMaskedReducePlan{
-      loadOp, offsetTensor, rowOK, boundScalar, colIdxCone, pred, tpb, E};
+  return ContiguousMaskedReducePlan{loadOp,     std::move(offsetTensors),
+                                    rowOK,      boundScalar,
+                                    colIdxCone, pred,
+                                    tpb,        E};
 }
 
 static mlir::LogicalResult
@@ -9135,7 +9193,7 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
     return mlir::failure();
   auto loc = op.getLoc();
   auto loadOp = plan->load;
-  auto offsetTensor = plan->offsetTensor;
+  auto &offsetTensors = plan->offsetTensors;
   auto rowOK = plan->rowOK;
   auto boundScalar = plan->boundScalar;
   auto colIdxCone = plan->colIdxCone;
@@ -9206,12 +9264,25 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
     mlir::Value idx =
         mlir::arith::AddIOp::create(rewriter, loc, localTid, kOff.getResult())
             .getResult();
-    mlir::Value addrI32 =
-        scalarizeConeAtIndex(offsetTensor, idx, rewriter, loc);
+    // Replay every tensor level of the pointer chain at this element. Each
+    // level shares the load tile's shape, so one index serves them all.
+    mlir::Value addrI32;
+    for (mlir::Value offsetTensor : offsetTensors) {
+      mlir::Value term = scalarizeConeAtIndex(offsetTensor, idx, rewriter, loc);
+      if (!term) {
+        addrI32 = mlir::Value();
+        break;
+      }
+      addrI32 = addrI32
+                    ? mlir::arith::AddIOp::create(rewriter, loc, addrI32, term)
+                          .getResult()
+                    : term;
+    }
     // Add the scalar tt.addptr chain offset (e.g. the per-program row base
-    // `program_id * N`) carried in the load ptr's splat base. `offsetTensor` is
-    // only the per-COLUMN tensor offset; without this, every threadgroup reads
-    // program 0's row (multi-program per-row reduce, e.g. layer-norm mean).
+    // `program_id * N`) carried in the load ptr's splat base. The levels above
+    // are only the per-COLUMN tensor offsets; without this, every threadgroup
+    // reads program 0's row (multi-program per-row reduce, e.g. layer-norm
+    // mean).
     if (addrI32)
       if (mlir::Value soff =
               accumulateScalarAddPtrOffsets(loadOp.getPtr(), rewriter, loc))
@@ -36909,8 +36980,11 @@ struct ConvertTritonGPUToMetalPass
           // thread. Reject unsupported cones before a partially emitted fold
           // reaches conversion rollback. Keep the inspector's dispatch and
           // E<=1024 envelope unchanged.
-          if (!indexConeSupported(contiguousMasked->offsetTensor, 0,
-                                  /*deferAggregateLeaves=*/true)) {
+          bool loadIndexOk = true;
+          for (mlir::Value offsetTensor : contiguousMasked->offsetTensors)
+            loadIndexOk &= indexConeSupported(offsetTensor, 0,
+                                              /*deferAggregateLeaves=*/true);
+          if (!loadIndexOk) {
             red.emitOpError(
                 "contiguous masked reduce cannot replay its load index");
             reduceOk = false;

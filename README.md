@@ -414,6 +414,10 @@ The current dependency-ordered priorities are:
    index expressions, including its one-element-per-thread boundary. Index
    expressions it cannot replay now fail before conversion; supported integer
    casts retain the general evaluator's broader operand support.
+   That specialization also replays every `tt.addptr` level of its load's
+   pointer chain, so `rows = base + offsets` followed by `tl.load(rows + cols)`
+   addresses both terms. A chain carrying a level it cannot account for raises
+   a named error before conversion rather than dropping that level's offset.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
