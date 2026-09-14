@@ -386,3 +386,168 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// Canonical blocked rank-1 single-result reducers keep the direct tree bounded
+// to E=BLOCK/tpb <= 64. E=128 must be rejected before conversion declines and
+// leaves `tt.reduce` behind for failed legalization rollback.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_e128_geometry_deferred(%x_ptr: !tt.ptr<f32>) {
+    %offsets = tt.make_range {end = 4096 : i32, start = 0 : i32} : tensor<4096xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<4096x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<4096x!tt.ptr<f32>, #blocked>, tensor<4096xi32, #blocked>
+    %x = tt.load %x_addr : tensor<4096x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<4096xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// The legacy rank-1 masked path only replays the canonical loop-offset
+// `offset < runtime_bound` predicate. A compound max mask must fail in the
+// preflight with the named reason instead of reaching conversion rollback.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_masked_compound_max_deferred(%x_ptr: !tt.ptr<f32>, %n: i32, %row: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<128xi32, #blocked>
+    %col_ok = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked>
+    %zero_i32 = arith.constant 0 : i32
+    %row_ok_scalar = arith.cmpi sge, %row, %zero_i32 : i32
+    %row_ok = tt.splat %row_ok_scalar : i1 -> tensor<128xi1, #blocked>
+    %mask = arith.andi %col_ok, %row_ok : tensor<128xi1, #blocked>
+    %other = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce B2.3 masked: mask not cmpi slt}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %m = arith.maxnumf %a, %b : f32
+      tt.reduce.return %m : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// The legacy single-load-chain rank-1 reduce replays addresses as a contiguous
+// logical range plus scalar pointer offsets. A tensor stride in the load offset
+// must be rejected before the direct load-chain path silently reads `offsets`.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_strided_address_deferred(%x_ptr: !tt.ptr<f32>, %stride: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked>
+    %strided = arith.muli %offsets, %stride_splat : tensor<128xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %strided : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// Looking only at the outer addptr is not enough: this spells a contiguous
+// outer range on top of an inner tensor offset, which the legacy path would
+// otherwise drop when it accumulates only scalar base terms.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_nested_tensor_address_deferred(%x_ptr: !tt.ptr<f32>, %stride: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked>
+    %inner_offsets = arith.muli %offsets, %stride_splat : tensor<128xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %inner_addr = tt.addptr %x_splat, %inner_offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x_addr = tt.addptr %inner_addr, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// A bare splat pointer has no per-element addptr offset for the legacy address
+// replay formula.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_bare_splat_address_deferred(%x_ptr: !tt.ptr<f32>) {
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x = tt.load %x_splat : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// The contiguous masked sum specialization replays each load lane from the
+// original index cone. Bitwise tensor index producers must fail preflight with
+// a named diagnostic rather than reaching scalarization asserts.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_contiguous_masked_load_bitand_deferred(%x_ptr: !tt.ptr<f32>, %n: i32, %k: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %k_splat = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %load_index = arith.andi %offsets, %k_splat : tensor<128xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<128xi32, #blocked>
+    %mask = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %load_index : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{contiguous masked reduce cannot replay its load index}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}
+
+// -----
+// The same contiguous masked sum path also replays the mask index. A non-linear
+// mask index must be rejected explicitly before conversion attempts rollback.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank1_contiguous_masked_mask_bitand_deferred(%x_ptr: !tt.ptr<f32>, %n: i32, %k: i32) {
+    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %k_splat = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %mask_index = arith.andi %offsets, %k_splat : tensor<128xi32, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<128xi32, #blocked>
+    %mask = arith.cmpi slt, %mask_index, %n_splat : tensor<128xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %x_addr, %mask, %other : tensor<128x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{contiguous masked reduce cannot replay its mask index}}
+    %r = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
+    tt.return
+  }
+}

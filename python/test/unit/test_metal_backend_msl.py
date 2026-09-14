@@ -3550,3 +3550,774 @@ def test_reduce_rank1_math_single_band_remains_supported(operation, num_warps, r
         WRAPPED=True, REDUCE=reduction, num_warps=num_warps)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _reduce_rank1_geometry_kernel(X, O, N, BLOCK: tl.constexpr,
+                                  OP: tl.constexpr, MASKED: tl.constexpr,
+                                  OTHER: tl.constexpr, COMPUTED: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    if MASKED:
+        values = tl.load(X + offsets, offsets < N, other=OTHER)
+    else:
+        values = tl.load(X + offsets)
+    if COMPUTED:
+        values = values + 1.0
+    result = tl.sum(values, axis=0) if OP == "sum" else tl.max(values, axis=0)
+    tl.store(O, result)
+
+
+@triton.jit
+def _reduce_rank1_mask_shape_kernel(X, Y, O, N, RUNTIME_BASE, RUNTIME_OTHER,
+                                    BLOCK: tl.constexpr, OP: tl.constexpr,
+                                    MASK_MODE: tl.constexpr,
+                                    OTHER_MODE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    ptr_offsets = offsets
+    if MASK_MODE == "compound":
+        row_ok = RUNTIME_BASE >= 0
+        mask = (offsets < N) & row_ok
+    elif MASK_MODE == "ge":
+        mask = offsets >= N
+    elif MASK_MODE == "scaled_lhs":
+        mask = offsets * 2 < N
+    elif MASK_MODE == "shifted_mismatch":
+        mask = offsets + RUNTIME_BASE < N
+    elif MASK_MODE == "shifted":
+        ptr_offsets = offsets + RUNTIME_BASE
+        mask = ptr_offsets < N
+    elif MASK_MODE == "tensor_rhs":
+        mask = offsets < tl.load(Y + offsets).to(tl.int32)
+    else:
+        mask = offsets < N
+
+    if OTHER_MODE == "runtime":
+        other = RUNTIME_OTHER
+    elif OTHER_MODE == "tensor":
+        other = offsets.to(tl.float32) * 0.25
+    elif OP == "max":
+        other = -float("inf")
+    else:
+        other = 0.0
+
+    values = tl.load(X + ptr_offsets, mask=mask, other=other)
+    result = tl.max(values, axis=0) if OP == "max" else tl.sum(values, axis=0)
+    tl.store(O, result)
+
+
+@triton.jit
+def _reduce_rank1_address_shape_kernel(X, Y, O, RUNTIME_BASE,
+                                       BLOCK: tl.constexpr,
+                                       OP: tl.constexpr,
+                                       ADDRESS_MODE: tl.constexpr,
+                                       VALUE_MODE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    if ADDRESS_MODE == "runtime_stride":
+        ptr_offsets = offsets * RUNTIME_BASE
+        values = tl.load(X + ptr_offsets)
+    elif ADDRESS_MODE == "constant_stride":
+        ptr_offsets = offsets * 3
+        values = tl.load(X + ptr_offsets)
+    elif ADDRESS_MODE == "modulo":
+        ptr_offsets = offsets % 7
+        values = tl.load(X + ptr_offsets)
+    elif ADDRESS_MODE == "gather":
+        ptr_offsets = tl.load(Y + offsets).to(tl.int32)
+        values = tl.load(X + ptr_offsets)
+    elif ADDRESS_MODE == "shifted_tensor":
+        ptr_offsets = offsets + RUNTIME_BASE
+        values = tl.load(X + ptr_offsets)
+    elif ADDRESS_MODE == "scalar_base":
+        values = tl.load(X + RUNTIME_BASE + offsets)
+    elif ADDRESS_MODE == "rich_strided":
+        strided = tl.load(X + offsets * RUNTIME_BASE)
+        contiguous = tl.load(X + offsets)
+        values = tl.where(offsets % 2 == 0, strided, contiguous)
+    else:
+        values = tl.load(X + offsets)
+
+    if VALUE_MODE == "chain":
+        values = tl.exp(values)
+    result = tl.max(values, axis=0) if OP == "max" else tl.sum(values, axis=0)
+    tl.store(O, result)
+
+
+@triton.jit
+def _reduce_rank1_contiguous_masked_address_kernel(X, O, N, RUNTIME_STRIDE,
+                                                   BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    ptr_offsets = offsets * RUNTIME_STRIDE
+    values = tl.load(X + ptr_offsets, mask=offsets < N, other=0.0)
+    tl.store(O, tl.sum(values, axis=0))
+
+
+@triton.jit
+def _reduce_rank1_contiguous_masked_index_kernel(
+        X, O, N, K, RUNTIME_STRIDE, BLOCK: tl.constexpr,
+        OFFSET_MODE: tl.constexpr, MASK_MODE: tl.constexpr,
+        WIDEN: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    load_index = offsets
+    if OFFSET_MODE == "bitand":
+        load_index = offsets & K
+    elif OFFSET_MODE == "select":
+        load_index = tl.where(offsets < K, offsets, offsets // 2)
+    elif OFFSET_MODE == "modulo":
+        load_index = offsets % K
+    elif OFFSET_MODE == "dynamic_stride":
+        load_index = offsets * RUNTIME_STRIDE
+    if WIDEN:
+        load_index = load_index.to(tl.int64)
+
+    mask_index = offsets
+    if MASK_MODE == "bitand":
+        mask_index = offsets & K
+    elif MASK_MODE == "select":
+        mask_index = tl.where(offsets < K, offsets, offsets // 2)
+    elif MASK_MODE == "modulo":
+        mask_index = offsets % K
+    elif MASK_MODE == "dynamic_stride":
+        mask_index = offsets * RUNTIME_STRIDE
+    if WIDEN:
+        mask_index = mask_index.to(tl.int64)
+
+    values = tl.load(X + load_index, mask=mask_index < N, other=0.0)
+    tl.store(O, tl.sum(values, axis=0))
+
+
+@pytest.mark.parametrize(
+    "num_warps,operation,computed",
+    [
+        (1, "sum", False),
+        (4, "max", False),
+        (1, "sum", True),
+        (4, "max", True),
+    ],
+    ids=["unmasked_sum_nw1", "unmasked_max_nw4",
+         "computed_sum_nw1", "computed_max_nw4"],
+)
+def test_reduce_rank1_geometry_over_e64_fails_without_crashing(
+        num_warps, operation, computed, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    threads_per_block = num_warps * 32
+    failing_block = threads_per_block * 128
+    supported_block = threads_per_block * 64
+    script = tmp_path / "reduce_geometry.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def compile_case(block, operation, computed):
+            triton.compile(ASTSource(
+                module._reduce_rank1_geometry_kernel,
+                signature={{"X": "*fp32", "O": "*fp32", "N": "i32"}},
+                constexprs={{"BLOCK": block, "OP": operation, "MASKED": False,
+                            "OTHER": 0.0, "COMPUTED": computed}}),
+                target=GPUTarget("metal", 80, 32),
+                options={{"num_warps": {num_warps}}})
+
+        for attempt in range(3):
+            try:
+                compile_case({failing_block}, {operation!r}, {computed})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported E>64 rank-1 reduce compiled")
+        compile_case({supported_block}, "sum", False)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    needle = "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]"
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize(
+    "num_warps,operation",
+    [
+        (1, "sum"),
+        (4, "max"),
+    ],
+    ids=["sum_nw1", "max_nw4"],
+)
+def test_reduce_rank1_geometry_e64_runtime_boundary(num_warps, operation):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = num_warps * 32 * 64
+    x = ((torch.arange(block) % 113).float() - 31.0) / 17.0
+    out = torch.empty((), device="mps")
+    _reduce_rank1_geometry_kernel[(1,)](
+        x.to("mps"), out, N=block, BLOCK=block, OP=operation, MASKED=False,
+        OTHER=0.0, COMPUTED=False, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x.sum() if operation == "sum" else x.max()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "num_warps,elements_per_thread",
+    [
+        (4, 128),
+        (1, 1024),
+    ],
+    ids=["e128_nw4", "e1024_nw1"],
+)
+def test_reduce_rank1_masked_zero_sum_runtime_boundary(
+        num_warps, elements_per_thread):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = num_warps * 32 * elements_per_thread
+    n = block - 17
+    x = ((torch.arange(block) % 29).float() + 1.0) / 11.0
+    out = torch.empty((), device="mps")
+    _reduce_rank1_geometry_kernel[(1,)](
+        x.to("mps"), out, N=n, BLOCK=block, OP="sum", MASKED=True,
+        OTHER=0.0, COMPUTED=False, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x[:n].sum(), atol=1e-3, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "elements_per_thread,operation,other",
+    [
+        (128, "sum", 1.0),
+        (128, "max", 0.0),
+        (2048, "sum", 0.0),
+    ],
+    ids=["masked_nonzero_other_e128", "masked_max_e128", "masked_sum_e2048"],
+)
+def test_reduce_rank1_masked_geometry_unsupported_caps(
+        elements_per_thread, operation, other, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    block = 32 * elements_per_thread
+    script = tmp_path / "reduce_masked_geometry.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        try:
+            triton.compile(ASTSource(
+                module._reduce_rank1_geometry_kernel,
+                signature={{"X": "*fp32", "O": "*fp32", "N": "i32"}},
+                constexprs={{"BLOCK": {block}, "OP": {operation!r},
+                            "MASKED": True, "OTHER": {other},
+                            "COMPUTED": False}}),
+                target=GPUTarget("metal", 80, 32),
+                options={{"num_warps": 1}})
+        except RuntimeError:
+            print("REJECTED")
+        else:
+            raise AssertionError("unsupported masked rank-1 reduce compiled")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    err = result.stdout + result.stderr
+    assert result.returncode == 0, err
+    assert "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]" in err
+    assert "REJECTED" in err
+    assert "failed to legalize" not in err
+
+
+@pytest.mark.parametrize(
+    "mask_mode,other_mode,operation,needle",
+    [
+        ("compound", "constant", "max",
+         "rank-1 reduce B2.3 masked: mask not cmpi slt"),
+        ("ge", "constant", "max",
+         "rank-1 reduce B2.3 masked: mask not cmpi slt"),
+        ("scaled_lhs", "constant", "max",
+         "rank-1 reduce B2.3 masked: mask lhs is neither"),
+        ("shifted_mismatch", "constant", "max",
+         "rank-1 reduce B2.3 masked: loop-offset mask does not match"),
+        ("tensor_rhs", "constant", "max",
+         "rank-1 reduce B2.3 masked: mask rhs is neither"),
+        ("canonical", "runtime", "sum",
+         "rank-1 reduce B2.3 masked: `other` not splat-constant"),
+        ("canonical", "tensor", "sum",
+         "Metal backend: a masked tt.load's `other` must be uniform across lanes"),
+    ],
+    ids=[
+        "compound_mask_max",
+        "ge_mask_max",
+        "scaled_lhs_mask_max",
+        "shifted_mask_mismatch_max",
+        "tensor_rhs_mask_max",
+        "runtime_other_sum",
+        "tensor_other_sum",
+    ],
+)
+def test_reduce_rank1_mask_shape_unsupported_fails_without_crashing(
+        mask_mode, other_mode, operation, needle, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_mask_shape.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "Y": "*fp32", "O": "*fp32",
+                     "N": "i32", "RUNTIME_BASE": "i32",
+                     "RUNTIME_OTHER": "fp32"}}
+
+        def compile_case(block, mask_mode, other_mode, operation, num_warps):
+            triton.compile(ASTSource(
+                module._reduce_rank1_mask_shape_kernel,
+                signature=signature,
+                constexprs={{"BLOCK": block, "MASK_MODE": mask_mode,
+                            "OTHER_MODE": other_mode, "OP": operation}}),
+                target=target, options={{"num_warps": num_warps}})
+
+        for attempt in range(3):
+            try:
+                compile_case(128, {mask_mode!r}, {other_mode!r},
+                             {operation!r}, 1)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported masked rank-1 reduce compiled")
+        compile_case(128, "canonical", "constant", "sum", 4)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize(
+    "address_mode,operation,value_mode",
+    [
+        ("runtime_stride", "sum", "plain"),
+        ("constant_stride", "max", "plain"),
+        ("modulo", "sum", "plain"),
+        ("gather", "max", "plain"),
+        ("shifted_tensor", "sum", "plain"),
+        ("runtime_stride", "max", "chain"),
+    ],
+    ids=[
+        "runtime_stride_sum",
+        "constant_stride_max",
+        "modulo_sum",
+        "gather_max",
+        "shifted_tensor_sum",
+        "runtime_stride_chain_max",
+    ],
+)
+def test_reduce_rank1_address_shape_unsupported_fails_without_crashing(
+        address_mode, operation, value_mode, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_address_shape.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "Y": "*fp32", "O": "*fp32",
+                     "RUNTIME_BASE": "i32"}}
+
+        def compile_case(block, address_mode, operation, value_mode, num_warps):
+            triton.compile(ASTSource(
+                module._reduce_rank1_address_shape_kernel,
+                signature=signature,
+                constexprs={{"BLOCK": block, "ADDRESS_MODE": address_mode,
+                            "OP": operation, "VALUE_MODE": value_mode}}),
+                target=target, options={{"num_warps": num_warps}})
+
+        for attempt in range(3):
+            try:
+                compile_case(128, {address_mode!r}, {operation!r},
+                             {value_mode!r}, 1)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported rank-1 reduce address compiled")
+        compile_case(128, "canonical", "sum", "plain", 4)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "rank-1 reduce address cannot be replayed by the single-load-chain path"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize(
+    "block,offset_mode,mask_mode,widen,needle",
+    [
+        (128, "bitand", "canonical", False,
+         "contiguous masked reduce cannot replay its load index"),
+        (128, "select", "canonical", False,
+         "contiguous masked reduce cannot replay its load index"),
+        (128, "canonical", "bitand", False,
+         "contiguous masked reduce cannot replay its mask index"),
+        (128, "canonical", "select", False,
+         "contiguous masked reduce cannot replay its mask index"),
+        (32, "bitand", "canonical", False,
+         "contiguous masked reduce cannot replay its load index"),
+        (32, "canonical", "bitand", False,
+         "contiguous masked reduce cannot replay its mask index"),
+    ],
+    ids=[
+        "offset_bitand_e4",
+        "offset_select_e4",
+        "mask_bitand_e4",
+        "mask_select_e4",
+        "offset_bitand_e1",
+        "mask_bitand_e1",
+    ],
+)
+def test_reduce_rank1_contiguous_masked_index_unsupported_fails_without_crashing(
+        block, offset_mode, mask_mode, widen, needle, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_contiguous_masked_index.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "O": "*fp32", "N": "i32",
+                     "K": "i32", "RUNTIME_STRIDE": "i32"}}
+
+        def compile_case(block, offset_mode, mask_mode, widen):
+            triton.compile(ASTSource(
+                module._reduce_rank1_contiguous_masked_index_kernel,
+                signature=signature,
+                constexprs={{"BLOCK": block, "OFFSET_MODE": offset_mode,
+                            "MASK_MODE": mask_mode, "WIDEN": widen}}),
+                target=target, options={{"num_warps": 1}})
+
+        for attempt in range(3):
+            try:
+                compile_case({block}, {offset_mode!r}, {mask_mode!r}, {widen})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported contiguous masked rank-1 reduce compiled")
+        compile_case(128, "modulo", "canonical", False)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize(
+    "mask_mode,other_mode,operation,n,runtime_base,runtime_other",
+    [
+        ("compound", "constant", "max", 17, 1, -9.0),
+        ("compound", "constant", "sum", 17, -1, -9.0),
+        ("ge", "constant", "max", 11, 1, -9.0),
+        ("scaled_lhs", "constant", "max", 19, 1, -9.0),
+        ("shifted_mismatch", "constant", "max", 23, 5, -9.0),
+        ("shifted", "constant", "sum", 29, 3, -9.0),
+        ("tensor_rhs", "constant", "max", 31, 1, -9.0),
+        ("canonical", "runtime", "sum", 21, 1, -3.5),
+    ],
+    ids=[
+        "compound_mask_max",
+        "compound_row_false_sum",
+        "ge_mask_max",
+        "scaled_lhs_mask_max",
+        "shifted_mask_mismatch_max",
+        "shifted_mask_sum",
+        "tensor_rhs_mask_max",
+        "runtime_other_sum",
+    ],
+)
+def test_reduce_rank1_mask_shape_single_band_matches_torch(
+        mask_mode, other_mode, operation, n, runtime_base, runtime_other):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 32
+    x_extent = block + max(runtime_base, 0) + 8
+    x = ((torch.arange(x_extent) % 23).float() - 7.0) / 5.0
+    y = torch.full((block,), float(n), dtype=torch.float32)
+    if mask_mode == "tensor_rhs":
+        y = (torch.arange(block, dtype=torch.float32) % 5) * 3.0 + 5.0
+    offsets = torch.arange(block)
+    if mask_mode == "compound":
+        mask = (offsets < n) & (runtime_base >= 0)
+    elif mask_mode == "ge":
+        mask = offsets >= n
+    elif mask_mode == "scaled_lhs":
+        mask = offsets * 2 < n
+    elif mask_mode == "shifted_mismatch":
+        mask = offsets + runtime_base < n
+    elif mask_mode == "shifted":
+        mask = offsets + runtime_base < n
+    elif mask_mode == "tensor_rhs":
+        mask = offsets < y.to(torch.int32)
+    else:
+        mask = offsets < n
+    ptr_offsets = offsets + runtime_base if mask_mode == "shifted" else offsets
+    if other_mode == "runtime":
+        other = torch.full((block,), runtime_other)
+    elif other_mode == "tensor":
+        other = offsets.to(torch.float32) * 0.25
+    elif operation == "max":
+        other = torch.full((block,), -float("inf"))
+    else:
+        other = torch.zeros(block)
+    values = torch.where(mask, x[ptr_offsets], other)
+    expected = values.max() if operation == "max" else values.sum()
+    out = torch.empty((), device="mps")
+    _reduce_rank1_mask_shape_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, n, runtime_base, runtime_other,
+        BLOCK=block, MASK_MODE=mask_mode, OTHER_MODE=other_mode, OP=operation,
+        num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "block,num_warps,operation,n",
+    [
+        (512, 4, "sum", 503),
+        (512, 4, "max", 497),
+    ],
+    ids=["runtime_sum_e4", "runtime_max_e4"],
+)
+def test_reduce_rank1_canonical_mask_multiband_runtime_bound_matches_torch(
+        block, num_warps, operation, n):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = ((torch.arange(block) % 37).float() - 13.0) / 7.0
+    y = torch.zeros(block, dtype=torch.float32)
+    out = torch.empty((), device="mps")
+    _reduce_rank1_mask_shape_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, n, 0, 0.0,
+        BLOCK=block, MASK_MODE="canonical", OTHER_MODE="constant",
+        OP=operation, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x[:n].sum() if operation == "sum" else x[:n].max()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "address_mode,operation,block,num_warps,runtime_base",
+    [
+        ("runtime_stride", "sum", 32, 1, 3),
+        ("constant_stride", "max", 32, 1, 0),
+        ("modulo", "sum", 32, 1, 0),
+        ("gather", "max", 32, 1, 0),
+        ("shifted_tensor", "sum", 32, 1, 5),
+        ("scalar_base", "sum", 512, 4, 7),
+        ("rich_strided", "sum", 512, 4, 3),
+        ("rich_strided", "max", 512, 4, 3),
+    ],
+    ids=[
+        "single_band_runtime_stride_sum",
+        "single_band_constant_stride_max",
+        "single_band_modulo_sum",
+        "single_band_gather_max",
+        "single_band_shifted_tensor_sum",
+        "multiband_scalar_base_sum",
+        "rich_cone_strided_sum",
+        "rich_cone_strided_max",
+    ],
+)
+def test_reduce_rank1_address_shape_supported_controls_match_torch(
+        address_mode, operation, block, num_warps, runtime_base):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    offsets = torch.arange(block)
+    y = (offsets * 5 + 11).remainder(block * 4).float()
+    x = ((torch.arange(block * 4 + runtime_base + 32) % 41).float() - 17.0) / 9.0
+    if address_mode == "runtime_stride":
+        ptr_offsets = offsets * runtime_base
+    elif address_mode == "constant_stride":
+        ptr_offsets = offsets * 3
+    elif address_mode == "modulo":
+        ptr_offsets = offsets % 7
+    elif address_mode == "gather":
+        ptr_offsets = y.to(torch.int64)
+    elif address_mode == "shifted_tensor":
+        ptr_offsets = offsets + runtime_base
+    elif address_mode == "scalar_base":
+        ptr_offsets = offsets + runtime_base
+    elif address_mode == "rich_strided":
+        ptr_offsets = torch.where(offsets % 2 == 0, offsets * runtime_base, offsets)
+    else:
+        ptr_offsets = offsets
+    values = x[ptr_offsets]
+    expected = values.max() if operation == "max" else values.sum()
+    out = torch.empty((), device="mps")
+    _reduce_rank1_address_shape_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, runtime_base, BLOCK=block,
+        ADDRESS_MODE=address_mode, OP=operation, VALUE_MODE="plain",
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+def test_reduce_rank1_shifted_canonical_mask_multiband_matches_torch():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 512
+    base = 9
+    n = block + base - 23
+    x = ((torch.arange(block + base + 4) % 37).float() - 13.0) / 7.0
+    y = torch.zeros(block, dtype=torch.float32)
+    out = torch.empty((), device="mps")
+    _reduce_rank1_mask_shape_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, n, base, 0.0,
+        BLOCK=block, MASK_MODE="shifted", OTHER_MODE="constant",
+        OP="max", num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x[base:n].max(), atol=1e-5, rtol=1e-5)
+
+
+def test_reduce_rank1_contiguous_masked_strided_sum_matches_torch():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 4096
+    n = block - 19
+    stride = 3
+    x = ((torch.arange(block * stride) % 29).float() + 1.0) / 11.0
+    out = torch.empty((), device="mps")
+    _reduce_rank1_contiguous_masked_address_kernel[(1,)](
+        x.to("mps"), out, n, stride, BLOCK=block, num_warps=1)
+    torch.mps.synchronize()
+    expected = x[torch.arange(n) * stride].sum()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "block,offset_mode,mask_mode,widen,n,k,runtime_stride",
+    [
+        (128, "modulo", "canonical", False, 113, 7, 3),
+        (128, "dynamic_stride", "canonical", False, 119, 5, 2),
+        (128, "canonical", "modulo", False, 5, 7, 3),
+        (128, "canonical", "dynamic_stride", False, 113, 7, 1),
+        (16, "bitand", "canonical", False, 11, 7, 3),
+        (16, "select", "canonical", False, 13, 7, 3),
+        (16, "canonical", "bitand", False, 5, 7, 3),
+        (16, "canonical", "select", False, 7, 9, 3),
+        (128, "bitand", "canonical", True, 17, 31, 3),
+        (128, "canonical", "select", True, 23, 17, 3),
+    ],
+    ids=[
+        "offset_modulo_e4",
+        "offset_dynamic_stride_e4",
+        "mask_modulo_e4",
+        "mask_dynamic_stride_e4",
+        "block16_offset_bitand",
+        "block16_offset_select",
+        "block16_mask_bitand",
+        "block16_mask_select",
+        "widened_offset_bitand_e4",
+        "widened_mask_select_e4",
+    ],
+)
+def test_reduce_rank1_contiguous_masked_index_supported_controls_match_torch(
+        block, offset_mode, mask_mode, widen, n, k, runtime_stride):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+
+    offsets = torch.arange(block, dtype=torch.int64)
+    if offset_mode == "bitand":
+        load_index = offsets & k
+    elif offset_mode == "select":
+        load_index = torch.where(offsets < k, offsets, offsets // 2)
+    elif offset_mode == "modulo":
+        load_index = offsets.remainder(k)
+    elif offset_mode == "dynamic_stride":
+        load_index = offsets * runtime_stride
+    else:
+        load_index = offsets
+
+    if mask_mode == "bitand":
+        mask_index = offsets & k
+    elif mask_mode == "select":
+        mask_index = torch.where(offsets < k, offsets, offsets // 2)
+    elif mask_mode == "modulo":
+        mask_index = offsets.remainder(k)
+    elif mask_mode == "dynamic_stride":
+        mask_index = offsets * runtime_stride
+    else:
+        mask_index = offsets
+
+    extent = int(max(load_index.max(), mask_index.max()).item()) + 8
+    x = ((torch.arange(extent) % 43).float() - 19.0) / 11.0
+    values = torch.where(mask_index < n, x[load_index], torch.zeros(block))
+    expected = values.sum()
+    out = torch.empty((), device="mps")
+    _reduce_rank1_contiguous_masked_index_kernel[(1,)](
+        x.to("mps"), out, n, k, runtime_stride, BLOCK=block,
+        OFFSET_MODE=offset_mode, MASK_MODE=mask_mode, WIDEN=widen,
+        num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)

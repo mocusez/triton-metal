@@ -7855,6 +7855,147 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
   return mlir::success();
 }
 
+// Canonical blocked multi-band geometry. Slice/companion replay and the
+// contiguous masked specialization have independent envelopes.
+static llvm::StringRef rank1ReduceGeometryFailure(int64_t block, int64_t tpb,
+                                                  int64_t spt) {
+  const int64_t elements = block / tpb;
+  if (block != tpb * elements)
+    return "rank-1 reduce: BLOCK not divisible by tpb (cyclic tile "
+           "addressing requires BLOCK = N * tpb)";
+  if (elements < 1 || elements > 64 || (elements & (elements - 1)) != 0)
+    return "rank-1 reduce E = BLOCK/tpb outside supported envelope "
+           "[1, 64] or not a power of 2";
+  if (spt != 1 && (spt & (spt - 1)) != 0)
+    return "rank-1 reduce spt-fold: spt > 1 must be a power of 2 for "
+           "cyclic tile decomposition";
+  return {};
+}
+
+// The legacy rank-1 load-chain fold can rebuild only this mask envelope.
+// Inspect it before conversion as well as in lowering: accepting the load
+// alone does not prove its mask or `other` can be replayed by that path.
+struct Rank1ReduceMaskPlan {
+  mlir::Value bound, indexBase;
+  mlir::TypedAttr constantBound, other;
+};
+
+static mlir::LogicalResult inspectRank1ReduceMask(mlir::triton::LoadOp loadOp,
+                                                  Rank1ReduceMaskPlan &plan,
+                                                  llvm::StringRef &reason) {
+  if (!loadOp.getMask())
+    return mlir::success();
+  auto reject = [&](llvm::StringRef message) {
+    reason = message;
+    return mlir::failure();
+  };
+  auto &maskBoundN = plan.bound;
+  auto &maskIndexBase = plan.indexBase;
+  auto &otherAttrPre = plan.other;
+  mlir::Value maskVal = loadOp.getMask();
+  // Mirror Wall 6 cvt-walkthrough for the mask path: propagate-coalesced
+  // may have inserted an spt=1 -> spt=N cvt on the mask alongside the
+  // value path.
+  if (auto cvt = maskVal.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+    auto sTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+    auto dTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+    if (!sTy || !dTy || sTy.getShape() != dTy.getShape())
+      return reject("rank-1 reduce B2.3 masked: mask cvt shape mismatch");
+    maskVal = cvt.getSrc();
+  }
+  auto cmp = maskVal.getDefiningOp<mlir::arith::CmpIOp>();
+  if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+    return reject("rank-1 reduce B2.3 masked: mask not cmpi slt");
+  mlir::Value maskIndex = cmp.getLhs();
+  auto range = maskIndex.getDefiningOp<mlir::triton::MakeRangeOp>();
+  if (!range) {
+    // A reduce nested in a tile loop uses absolute logical indices:
+    //   splat(loop_iv) + make_range(0, BLOCK)
+    // Keep the uniform base for both the replayed load address and mask.
+    if (auto add = maskIndex.getDefiningOp<mlir::arith::AddIOp>()) {
+      auto lhsSplat = add.getLhs().getDefiningOp<mlir::triton::SplatOp>();
+      auto rhsSplat = add.getRhs().getDefiningOp<mlir::triton::SplatOp>();
+      if (lhsSplat) {
+        range = add.getRhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+        maskIndexBase = lhsSplat.getSrc();
+      } else if (rhsSplat) {
+        range = add.getLhs().getDefiningOp<mlir::triton::MakeRangeOp>();
+        maskIndexBase = rhsSplat.getSrc();
+      }
+    }
+  }
+  if (!range || range.getStart() != 0)
+    return reject("rank-1 reduce B2.3 masked: mask lhs is neither "
+                  "make_range(start=0) nor splat(base) + make_range(start=0)");
+  if (maskIndexBase) {
+    auto ptrAdd = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+    if (!ptrAdd || ptrAdd.getOffset() != maskIndex)
+      return reject("rank-1 reduce B2.3 masked: loop-offset mask does not "
+                    "match the load pointer offset");
+  }
+  auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>();
+  if (splat) {
+    maskBoundN = splat.getSrc();
+  } else if (auto boundAttr = extractSplatConstantAttr(cmp.getRhs());
+             boundAttr && boundAttr->getType().isSignlessInteger(32)) {
+    // A constexpr bound (for example GroupNorm's M = Cg * HW) is folded
+    // by Triton to `arith.constant dense<M>` instead of `tt.splat %M`.
+    // Both forms are uniform scalar bounds once the tensor is replayed
+    // element-by-element. Leave materialization to emission.
+    plan.constantBound = *boundAttr;
+  } else {
+    return reject("rank-1 reduce B2.3 masked: mask rhs is neither tt.splat "
+                  "nor an i32 dense splat constant");
+  }
+  if (loadOp.getOther()) {
+    auto opt = extractSplatConstantAttr(loadOp.getOther());
+    if (!opt)
+      return reject("rank-1 reduce B2.3 masked: `other` not splat-constant");
+    otherAttrPre = *opt;
+  }
+  return mlir::success();
+}
+
+// The legacy fold reconstructs one contiguous tensor offset, an optional base
+// from the canonical mask, and scalar addptr offsets. Check that these are ALL
+// the address terms before conversion; otherwise a valid strided/repeated load
+// silently becomes a different contiguous load. Keep this cross-operation
+// analysis in preflight, not in the lowering.
+static bool rank1ReduceAddressSupported(mlir::triton::LoadOp load,
+                                        const Rank1ReduceMaskPlan &maskPlan) {
+  auto ptrAdd = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+  if (!ptrAdd)
+    return false;
+  // inspectRank1ReduceMask has already proved that a nonzero mask base belongs
+  // to this exact outer pointer offset. Without it, emission uses just arange.
+  if (!maskPlan.indexBase) {
+    auto range = ptrAdd.getOffset().getDefiningOp<mlir::triton::MakeRangeOp>();
+    if (!range || range.getStart() != 0)
+      return false;
+  }
+  mlir::Value cur = ptrAdd.getPtr();
+  while (cur) {
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
+      auto func =
+          mlir::dyn_cast<mlir::triton::FuncOp>(arg.getOwner()->getParentOp());
+      return func && arg.getOwner() == &func.getBody().front() &&
+             mlir::isa<mlir::triton::PointerType>(arg.getType());
+    }
+    if (auto add = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (mlir::isa<mlir::RankedTensorType>(add.getOffset().getType()))
+        return false;
+      cur = add.getPtr();
+    } else if (auto splat = cur.getDefiningOp<mlir::triton::SplatOp>()) {
+      cur = splat.getSrc();
+    } else if (auto bitcast = cur.getDefiningOp<mlir::triton::BitcastOp>()) {
+      cur = bitcast.getSrc();
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
 static mlir::LogicalResult lowerRank1Reduce(
     mlir::triton::ReduceOp op,
     typename mlir::OpConversionPattern<mlir::triton::ReduceOp>::OpAdaptor
@@ -8201,20 +8342,9 @@ static mlir::LogicalResult lowerRank1Reduce(
     // sizePerThread=[4] capped, BLOCK ∈ {2048, 4096, ..., 16384}, tpb=256).
     bool spt1Direct = (spt == 1);
     int64_t E = BLOCK / tpb;
-    if (BLOCK != tpb * E)
-      return rewriter.notifyMatchFailure(
-          op, "rank-1 reduce: BLOCK not divisible by tpb (cyclic tile "
-              "addressing requires BLOCK = N * tpb)");
-    if (E < 1 || E > 64 || (E & (E - 1)) != 0)
-      return rewriter.notifyMatchFailure(
-          op, "rank-1 reduce E = BLOCK/tpb outside supported envelope "
-              "[1, 64] or not a power of 2 (tutorial02 autotune caps "
-              "BLOCK <= 16384 at tpb = num_warps*warp_size = 8*32 = 256 "
-              "=> E <= 64)");
-    if (!spt1Direct && (spt & (spt - 1)) != 0)
-      return rewriter.notifyMatchFailure(
-          op, "rank-1 reduce spt-fold: spt > 1 must be a power of 2 for "
-              "cyclic tile decomposition");
+    if (auto reason = rank1ReduceGeometryFailure(BLOCK, tpb, spt);
+        !reason.empty())
+      return rewriter.notifyMatchFailure(op, reason);
 
     // Walk back to the producing tt.load, optionally through one cvt hop
     // inserted by tritongpu-propagate-coalesced-layouts (Wall 6 —
@@ -8254,89 +8384,18 @@ static mlir::LogicalResult lowerRank1Reduce(
         return rewriter.notifyMatchFailure(op, replayFailure);
       richCone = true;
     }
-    // Wall 7 (the implementation notes):
-    // masked tt.load extraction. Accepted mask shape: cmpi slt with a
-    // make_range(start=0), optionally offset by a uniform splat (tile loops),
-    // and a uniform RHS represented by tt.splat or a dense splat constant.
-    // Other shapes degrade to notifyMatchFailure.
-    // TODO(Wall 8): tl.sum on arith.divf chain — input is non-load, current
-    // 'src not produced by tt.load' reject at line ~1525 fires. See
-    // the implementation notes §Risks.
-    mlir::Value maskBoundN;       // i32 scalar; null = unmasked
-    mlir::Value maskIndexBase;    // uniform base in splat(base) + make_range
-    mlir::TypedAttr otherAttrPre; // populated only if user provided `other`
-    if (!richCone && loadOp.getMask()) {
-      mlir::Value maskVal = loadOp.getMask();
-      // Mirror Wall 6 cvt-walkthrough for the mask path: propagate-coalesced
-      // may have inserted an spt=1 -> spt=N cvt on the mask alongside the
-      // value path.
-      if (auto cvt =
-              maskVal.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
-        auto sTy =
-            mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
-        auto dTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
-        if (!sTy || !dTy || sTy.getShape() != dTy.getShape())
-          return rewriter.notifyMatchFailure(
-              op, "rank-1 reduce B2.3 masked: mask cvt shape mismatch");
-        maskVal = cvt.getSrc();
-      }
-      auto cmp = maskVal.getDefiningOp<mlir::arith::CmpIOp>();
-      if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
-        return rewriter.notifyMatchFailure(
-            op, "rank-1 reduce B2.3 masked: mask not cmpi slt");
-      mlir::Value maskIndex = cmp.getLhs();
-      auto range = maskIndex.getDefiningOp<mlir::triton::MakeRangeOp>();
-      if (!range) {
-        // A reduce nested in a tile loop uses absolute logical indices:
-        //   splat(loop_iv) + make_range(0, BLOCK)
-        // Keep the uniform base for both the replayed load address and mask.
-        if (auto add = maskIndex.getDefiningOp<mlir::arith::AddIOp>()) {
-          auto lhsSplat = add.getLhs().getDefiningOp<mlir::triton::SplatOp>();
-          auto rhsSplat = add.getRhs().getDefiningOp<mlir::triton::SplatOp>();
-          if (lhsSplat) {
-            range = add.getRhs().getDefiningOp<mlir::triton::MakeRangeOp>();
-            maskIndexBase = lhsSplat.getSrc();
-          } else if (rhsSplat) {
-            range = add.getLhs().getDefiningOp<mlir::triton::MakeRangeOp>();
-            maskIndexBase = rhsSplat.getSrc();
-          }
-        }
-      }
-      if (!range || range.getStart() != 0)
-        return rewriter.notifyMatchFailure(
-            op, "rank-1 reduce B2.3 masked: mask lhs is neither "
-                "make_range(start=0) nor splat(base) + make_range(start=0)");
-      if (maskIndexBase) {
-        auto ptrAdd = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
-        if (!ptrAdd || ptrAdd.getOffset() != maskIndex)
-          return rewriter.notifyMatchFailure(
-              op, "rank-1 reduce B2.3 masked: loop-offset mask does not "
-                  "match the load pointer offset");
-      }
-      auto splat = cmp.getRhs().getDefiningOp<mlir::triton::SplatOp>();
-      if (splat) {
-        maskBoundN = splat.getSrc();
-      } else if (auto boundAttr = extractSplatConstantAttr(cmp.getRhs());
-                 boundAttr && boundAttr->getType() == i32) {
-        // A constexpr bound (for example GroupNorm's M = Cg * HW) is folded
-        // by Triton to `arith.constant dense<M>` instead of `tt.splat %M`.
-        // Both forms are uniform scalar bounds once the tensor is replayed
-        // element-by-element, so materialize the dense splat's scalar value.
-        maskBoundN = mlir::arith::ConstantOp::create(rewriter, loc, *boundAttr)
-                         .getResult();
-      } else {
-        return rewriter.notifyMatchFailure(
-            op, "rank-1 reduce B2.3 masked: mask rhs is neither tt.splat "
-                "nor an i32 dense splat constant");
-      }
-      if (loadOp.getOther()) {
-        auto opt = extractSplatConstantAttr(loadOp.getOther());
-        if (!opt)
-          return rewriter.notifyMatchFailure(
-              op, "rank-1 reduce B2.3 masked: `other` not splat-constant");
-        otherAttrPre = *opt;
-      }
-    }
+    Rank1ReduceMaskPlan maskPlan;
+    llvm::StringRef maskFailure;
+    if (!richCone &&
+        mlir::failed(inspectRank1ReduceMask(loadOp, maskPlan, maskFailure)))
+      return rewriter.notifyMatchFailure(op, maskFailure);
+    mlir::Value maskBoundN = maskPlan.bound; // null for unmasked loads
+    if (maskPlan.constantBound)
+      maskBoundN =
+          mlir::arith::ConstantOp::create(rewriter, loc, maskPlan.constantBound)
+              .getResult();
+    mlir::Value maskIndexBase = maskPlan.indexBase;
+    mlir::TypedAttr otherAttrPre = maskPlan.other;
     mlir::Value memref;
     if (!richCone) {
       if (!loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
@@ -8962,48 +9021,54 @@ scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
 // `lowerRank1Reduce` masked path rejects this (reshape + 2D-unit-dim load +
 // compound `sle` mask), so re-derive the per-element device index and mask via
 // `scalarizeConeAtIndex` and run the same threadgroup butterfly. f32 add only.
-// Returns failure (creating NOTHING during the inspection phase) so the caller
-// can fall back to `lowerRank1Reduce`.
-static mlir::LogicalResult
-lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
-                            mlir::ConversionPatternRewriter &rewriter) {
-  auto loc = op.getLoc();
+// Read-only inspection is shared with preflight so the canonical geometry cap
+// does not reject this specialization. A non-match falls back to
+// lowerRank1Reduce.
+struct ContiguousMaskedReducePlan {
+  mlir::triton::LoadOp load;
+  mlir::Value offsetTensor, rowOK, boundScalar, colIdxCone;
+  mlir::arith::CmpIPredicate predicate;
+  int64_t threadsPerBlock, elementsPerThread;
+};
+
+static std::optional<ContiguousMaskedReducePlan>
+inspectContiguousMaskedReduce(mlir::triton::ReduceOp op) {
   auto rtt =
       mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
   if (!rtt || rtt.getRank() != 1 || rtt.isDynamicDim(0) || op.getAxis() != 0)
-    return mlir::failure();
+    return std::nullopt;
   if (!rtt.getElementType().isF32())
-    return mlir::failure();
+    return std::nullopt;
   // Combine must be addf — and be ONLY that (see reduceCombineBinaryOp).
   mlir::Operation *combine = reduceCombineBinaryOp(op);
   if (!combine || !mlir::isa<mlir::arith::AddFOp>(combine))
-    return mlir::failure();
+    return std::nullopt;
 
   // ---- Inspection phase (NO IR creation) ----
   mlir::Value loadVal = peelShapeOps(op.getSrcs().front());
   auto loadOp = loadVal.getDefiningOp<mlir::triton::LoadOp>();
   if (!loadOp || !loadOp.getMask())
-    return mlir::failure();
+    return std::nullopt;
   // Load tile must have exactly one non-unit dim (effectively 1-D).
   auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(loadVal.getType());
   if (!loadTy)
-    return mlir::failure();
+    return std::nullopt;
   int nonUnit = 0;
   for (auto s : loadTy.getShape())
     if (s != 1)
       ++nonUnit;
   if (nonUnit != 1)
-    return mlir::failure();
+    return std::nullopt;
   // `other` must be absent or 0 (masked lanes contribute the add identity).
   if (loadOp.getOther()) {
     auto oc = extractSplatConstantAttr(loadOp.getOther());
     auto fa = oc ? mlir::dyn_cast<mlir::FloatAttr>(*oc) : mlir::FloatAttr();
     if (!fa || fa.getValueAsDouble() != 0.0)
-      return mlir::failure();
+      return std::nullopt;
   }
   auto addptr = loadOp.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
   if (!addptr)
-    return mlir::failure();
+    return std::nullopt;
   mlir::Value offsetTensor = addptr.getOffset();
   // Mask: andi(splat(rowOK_i1), colCmpCone) or a bare colCmpCone.
   mlir::Value maskRoot = peelShapeOps(loadOp.getMask());
@@ -9021,21 +9086,21 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
       rowOK = rs.getSrc();
       colCmpVal = lhs;
     } else {
-      return mlir::failure();
+      return std::nullopt;
     }
   }
   auto colCmp = colCmpVal.getDefiningOp<mlir::arith::CmpIOp>();
   if (!colCmp)
-    return mlir::failure();
+    return std::nullopt;
   auto pred = colCmp.getPredicate();
   if (pred != mlir::arith::CmpIPredicate::slt &&
       pred != mlir::arith::CmpIPredicate::sle)
-    return mlir::failure();
+    return std::nullopt;
   // Require `cmpi {slt|sle} (idxCone) (splat bound)` — bound on the RHS.
   auto boundSplat =
       peelShapeOps(colCmp.getRhs()).getDefiningOp<mlir::triton::SplatOp>();
   if (!boundSplat)
-    return mlir::failure();
+    return std::nullopt;
   mlir::Value boundScalar = boundSplat.getSrc();
   mlir::Value colIdxCone = colCmp.getLhs();
 
@@ -9043,20 +9108,40 @@ lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
           rtt.getEncoding());
   if (!srcBlocked)
-    return mlir::failure();
+    return std::nullopt;
   int64_t tpb = 1;
   for (auto t : srcBlocked.getThreadsPerWarp())
     tpb *= t;
   for (auto w : srcBlocked.getWarpsPerCTA())
     tpb *= w;
   if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
-    return mlir::failure();
+    return std::nullopt;
   int64_t BLOCK = rtt.getDimSize(0);
   if (BLOCK <= 0 || BLOCK % tpb != 0)
-    return mlir::failure();
+    return std::nullopt;
   int64_t E = BLOCK / tpb;
   if (E < 1 || E > 1024 || (E & (E - 1)) != 0)
+    return std::nullopt;
+
+  return ContiguousMaskedReducePlan{
+      loadOp, offsetTensor, rowOK, boundScalar, colIdxCone, pred, tpb, E};
+}
+
+static mlir::LogicalResult
+lowerContiguousMaskedReduce(mlir::triton::ReduceOp op,
+                            mlir::ConversionPatternRewriter &rewriter) {
+  auto plan = inspectContiguousMaskedReduce(op);
+  if (!plan)
     return mlir::failure();
+  auto loc = op.getLoc();
+  auto loadOp = plan->load;
+  auto offsetTensor = plan->offsetTensor;
+  auto rowOK = plan->rowOK;
+  auto boundScalar = plan->boundScalar;
+  auto colIdxCone = plan->colIdxCone;
+  auto pred = plan->predicate;
+  const int64_t tpb = plan->threadsPerBlock;
+  const int64_t E = plan->elementsPerThread;
 
   mlir::Value memref = findBaseMemref(loadOp.getPtr(), rewriter);
   if (!memref)
@@ -10937,15 +11022,17 @@ static bool indexConeSupported(mlir::Value v, int depth,
   if (mlir::isa<mlir::triton::MakeRangeOp>(def))
     return true;
   if (auto sp = mlir::dyn_cast<mlir::triton::SplatOp>(def))
-    return sp.getOperation()->getBlock() != nullptr;
+    return sp.getOperation()->getBlock() != nullptr &&
+           rank1ConeSupported(sp.getSrc(), depth + 1, deferAggregateLeaves);
   if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
     return dense && dense.isSplat();
   }
   if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                 mlir::arith::TruncIOp>(def))
-    return indexConeSupported(def->getOperand(0), depth + 1,
-                              deferAggregateLeaves);
+    // The scalarizer delegates the whole cast to the general evaluator, which
+    // can replay more producers than the index-only arithmetic above it.
+    return rank1ConeSupported(v, depth + 1, deferAggregateLeaves);
   if (mlir::isa<mlir::triton::LoadOp>(def))
     return rank1ConeSupported(v, depth + 1, deferAggregateLeaves);
   if (mlir::isa<mlir::arith::AddIOp, mlir::arith::MulIOp, mlir::arith::SubIOp,
@@ -36816,6 +36903,27 @@ struct ConvertTritonGPUToMetalPass
       // dialect conversion, where declining still raises a catchable error.
       // Single-band inputs consume the converted scalar and need no replay.
       if (rtt.getRank() == 1 && axes == 0) {
+        auto contiguousMasked = inspectContiguousMaskedReduce(red);
+        if (contiguousMasked) {
+          // This specialization replays both indices even at one element per
+          // thread. Reject unsupported cones before a partially emitted fold
+          // reaches conversion rollback. Keep the inspector's dispatch and
+          // E<=1024 envelope unchanged.
+          if (!indexConeSupported(contiguousMasked->offsetTensor, 0,
+                                  /*deferAggregateLeaves=*/true)) {
+            red.emitOpError(
+                "contiguous masked reduce cannot replay its load index");
+            reduceOk = false;
+            return;
+          }
+          if (!indexConeSupported(contiguousMasked->colIdxCone, 0,
+                                  /*deferAggregateLeaves=*/true)) {
+            red.emitOpError(
+                "contiguous masked reduce cannot replay its mask index");
+            reduceOk = false;
+            return;
+          }
+        }
         auto blocked =
             mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
                 rtt.getEncoding());
@@ -36827,6 +36935,19 @@ struct ConvertTritonGPUToMetalPass
             tpb *= warps;
         }
         if (blocked && tpb > 0 && rtt.getDimSize(0) > tpb) {
+          // The masked f32-sum specialization is tried first by lowering and
+          // admits up to 1024 elements per thread. Only apply the canonical
+          // cap when that read-only inspection declines. Slice sources never
+          // enter this branch; sub-tpb companions cannot exceed tpb rows.
+          if (!contiguousMasked) {
+            auto reason = rank1ReduceGeometryFailure(
+                rtt.getDimSize(0), tpb, blocked.getSizePerThread()[0]);
+            if (!reason.empty()) {
+              red.emitOpError(reason);
+              reduceOk = false;
+              return;
+            }
+          }
           mlir::Value src = red.getSrcs().front();
           if (auto cvt =
                   src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
@@ -36836,12 +36957,33 @@ struct ConvertTritonGPUToMetalPass
           mlir::triton::LoadOp load;
           std::string reason;
           if (mlir::failed(walkBackThroughElementwiseChain(
-                  src, 0, chain, load, red, dominance, reason)) &&
-              !rank1ConeSupported(src, 0, /*deferAggregateLeaves=*/true)) {
-            red.emitOpError("rank-1 reduce cannot replay its source: ")
-                << reason;
-            reduceOk = false;
-            return;
+                  src, 0, chain, load, red, dominance, reason))) {
+            if (!rank1ConeSupported(src, 0, /*deferAggregateLeaves=*/true)) {
+              red.emitOpError("rank-1 reduce cannot replay its source: ")
+                  << reason;
+              reduceOk = false;
+              return;
+            }
+          } else if (!contiguousMasked) {
+            // Mirror the selected legacy path, not the richer evaluator's
+            // envelope. A matching contiguous masked sum uses its own mask
+            // inspection and must retain that specialization.
+            Rank1ReduceMaskPlan maskPlan;
+            llvm::StringRef maskFailure;
+            if (mlir::failed(
+                    inspectRank1ReduceMask(load, maskPlan, maskFailure))) {
+              red.emitOpError(maskFailure);
+              reduceOk = false;
+              return;
+            }
+            if (!rank1ReduceAddressSupported(load, maskPlan)) {
+              red.emitOpError(
+                  "rank-1 reduce address cannot be replayed by the "
+                  "single-load-chain path; requires a contiguous range with "
+                  "scalar pointer offsets or the matching canonical mask base");
+              reduceOk = false;
+              return;
+            }
           }
         }
       }

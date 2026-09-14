@@ -396,6 +396,24 @@ The current dependency-ordered priorities are:
    the new kernel op, and unwinding that move segfaulted on nine of thirty
    runs; preflight and the lowering now call one shared predicate, so they
    cannot disagree about which functions are rejected.
+   Canonical blocked single-result rank-1 reductions also check their geometry
+   before conversion: at most 64 elements per thread. The direct masked f32
+   sum specialization retains its separate limit of 1024 elements per thread
+   when its index/mask pattern matches and `other` is absent or zero. Slice
+   reductions keep their separate geometry rules.
+   Multi-element rank-1 reductions using the single-load-chain path also
+   validate mask/`other` representations before conversion. That path requires
+   its canonical `<` mask and constant `other`; unsupported forms now raise a
+   named error. Single-band, computed-cone, and contiguous masked-sum paths
+   retain their own support rules.
+   The single-load-chain path also checks that its load address is a contiguous
+   range plus scalar pointer offsets or the base from its matching mask.
+   Strided, repeated, and other unsupported tensor offsets raise a named error
+   before conversion instead of silently reading contiguous elements.
+   The masked f32-sum specialization separately validates both load and mask
+   index expressions, including its one-element-per-thread boundary. Index
+   expressions it cannot replay now fail before conversion; supported integer
+   casts retain the general evaluator's broader operand support.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
