@@ -4483,3 +4483,98 @@ def test_reduce_rank1_contiguous_masked_chain_unsupported_fails_without_crashing
     assert output.count(needle) == 3
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
+
+
+@triton.jit
+def _reduce_rank3_double_kernel(X, O, D0: tl.constexpr, D1: tl.constexpr,
+                                D2: tl.constexpr, FORM: tl.constexpr):
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    v = tl.load(X + i * D1 * D2 + j * D2 + k)
+    if FORM == "sum_sum_inner_middle":
+        tl.store(O + tl.arange(0, D0), tl.sum(tl.sum(v, axis=2), axis=1))
+    elif FORM == "sum_sum_inner_outer":
+        tl.store(O + tl.arange(0, D1), tl.sum(tl.sum(v, axis=2), axis=0))
+    elif FORM == "max_of_sum":
+        tl.store(O + tl.arange(0, D0), tl.max(tl.sum(v, axis=2), axis=1))
+    else:  # single inner reduce — the supported neighbour
+        r = tl.sum(v, axis=2)
+        tl.store(O + tl.arange(0, D0)[:, None] * D1
+                 + tl.arange(0, D1)[None, :], r)
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["sum_sum_inner_middle", "sum_sum_inner_outer", "max_of_sum"],
+    ids=["sum_sum_inner_middle", "sum_sum_inner_outer", "max_of_sum"],
+)
+def test_reduce_rank3_double_fails_without_crashing(form, tmp_path):
+    """The rank-2 result of an inner reduce carries a slice encoding.
+
+    Both rank-2 specializations need a blocked tile and the staged rank-N path
+    declines it, so the shape has no lowering. It used to reach conversion and
+    surface as an unnamed `failed to legalize operation 'tt.reduce'` after the
+    kernel signature had already been rewritten.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_rank3_double.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "O": "*fp32"}}
+
+        def compile_case(form):
+            triton.compile(ASTSource(
+                module._reduce_rank3_double_kernel,
+                signature=signature,
+                constexprs={{"D0": 2, "D1": 4, "D2": 8, "FORM": form}}),
+                target=target, options={{"num_warps": 1}})
+
+        for attempt in range(3):
+            try:
+                compile_case({form!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("rank-3 double reduce compiled")
+        compile_case("single_inner")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=120,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "rank-2 reduce requires a blocked source tile"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+def test_reduce_rank3_single_inner_still_matches_torch():
+    """The supported neighbour must keep working: the refusal is for the
+    rank-2 reduce ABOVE an inner one, not for the inner reduce itself."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    d0, d1, d2 = 2, 4, 8
+    x = ((torch.arange(d0 * d1 * d2) % 43).float() - 19.0) / 11.0
+    out = torch.empty(d0 * d1, device="mps")
+    _reduce_rank3_double_kernel[(1,)](
+        x.to("mps"), out, D0=d0, D1=d1, D2=d2, FORM="single_inner",
+        num_warps=1)
+    torch.mps.synchronize()
+    expected = x.reshape(d0, d1, d2).sum(dim=2).flatten()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)

@@ -431,6 +431,11 @@ The current dependency-ordered priorities are:
    `-inf`, and a partially masked column no longer drops those rows. A masked
    load with no `other` still folds the combine identity, which is what keeps
    that (unspecified) case deterministic.
+   A rank-2 reduction over the `#ttg.slice` result of an inner reduction —
+   `tl.sum(tl.sum(x, axis=2), axis=1)` — is refused by name before conversion.
+   Both rank-2 paths need a blocked source tile and the staged rank-N path
+   covers only the binary hypercube shape, so the combination previously
+   surfaced as an unnamed legalization failure.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

@@ -36738,6 +36738,25 @@ struct ConvertTritonGPUToMetalPass
         reduceOk = false;
         return;
       }
+      // A rank-2 source that is not a blocked tile — the `#ttg.slice` result of
+      // an inner reduce, as in `tl.sum(tl.sum(x, axis=2), axis=1)` — has no
+      // lowering at all: both rank-2 specialisations derive ownership from a
+      // blocked tile, and the staged rank-N path has already declined it above
+      // (its rank-2 slice envelope is the binary hypercube tl.topk leaves
+      // behind). Declining that inside `applyFullConversion` surfaces only as
+      // an unnamed "failed to legalize operation 'tt.reduce'", after
+      // `FuncOpLowering` has already rewritten the kernel signature, so name it
+      // here while raising is still catchable.
+      if (rtt.getRank() == 2 && !stagedFallback &&
+          !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              rtt.getEncoding())) {
+        red.emitOpError(
+            "rank-2 reduce requires a blocked source tile; a source carrying a "
+            "slice encoding (the result of an inner reduce, e.g. "
+            "tl.sum(tl.sum(x, axis=2), axis=1)) has no lowering");
+        reduceOk = false;
+        return;
+      }
       // 2) multi-axis on rank-2 (i.e. axes attr length > 1) — getAxis returns
       // a single uint32, but tt.reduce supports a single axis; reject if the
       // input shape couldn't possibly hold a multi-axis form. (The TableGen

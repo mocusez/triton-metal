@@ -578,3 +578,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// The rank-2 result of an INNER reduce carries a `#ttg.slice` encoding, not a
+// blocked tile, and both rank-2 specialisations derive ownership from a blocked
+// tile. The staged rank-N path declines it too (its rank-2 slice envelope is
+// the binary hypercube tl.topk leaves behind), so `tl.sum(tl.sum(x, axis=2),
+// axis=1)` has no lowering at all. Declining inside the conversion surfaces
+// only as an unnamed "failed to legalize operation 'tt.reduce'", after the
+// kernel signature has been rewritten — name it before conversion instead.
+#b3 = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+#s2 = #ttg.slice<{dim = 2, parent = #b3}>
+#s12 = #ttg.slice<{dim = 1, parent = #s2}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank3_double_slice_source(%o: !tt.ptr<f32>) {
+    %x = arith.constant dense<1.000000e+00> : tensor<2x4x8xf32, #b3>
+    %inner = "tt.reduce"(%x) <{axis = 2 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<2x4x8xf32, #b3>) -> tensor<2x4xf32, #s2>
+    // expected-error @+1 {{rank-2 reduce requires a blocked source tile}}
+    %outer = "tt.reduce"(%inner) <{axis = 1 : i32}> ({
+    ^bb0(%c: f32, %d: f32):
+      %t = arith.addf %c, %d : f32
+      tt.reduce.return %t : f32
+    }) : (tensor<2x4xf32, #s2>) -> tensor<2xf32, #s12>
+    tt.return
+  }
+}
