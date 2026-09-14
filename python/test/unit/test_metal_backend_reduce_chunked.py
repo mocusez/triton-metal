@@ -73,3 +73,127 @@ def test_reduce_chunked_axis1_f32(M, N):
     )
     expected = torch.sum(x.cpu(), dim=1).to(torch.float32)
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def reduce_sum_axis1_strided_kernel(
+    x_ptr,
+    out_ptr,
+    row_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    OP: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    x = tl.load(x_ptr + offs_m[:, None] * row_stride + offs_n[None, :])
+    if OP == "max":
+        r = tl.max(x, axis=1)
+    elif OP == "min":
+        r = tl.min(x, axis=1)
+    else:
+        r = tl.sum(x, axis=1)
+    tl.store(out_ptr + offs_m, r)
+
+
+@triton.jit
+def reduce_sum_axis1_program_kernel(
+    x_ptr,
+    out_ptr,
+    row_stride,
+    prog_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BASE_MODE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = tl.arange(0, BLOCK_N)
+    if BASE_MODE == "scalar":
+        rows = tl.arange(0, BLOCK_M)[:, None]
+        x = tl.load(x_ptr + pid * prog_stride + rows * row_stride
+                    + offs_n[None, :])
+    else:
+        rows = (pid * BLOCK_M + tl.arange(0, BLOCK_M))[:, None]
+        x = tl.load(x_ptr + rows * row_stride + offs_n[None, :])
+    s = tl.sum(x, axis=1)
+    tl.store(out_ptr + pid * BLOCK_M + tl.arange(0, BLOCK_M), s)
+
+
+@pytest.mark.parametrize(
+    "M, N, row_stride, num_warps, op",
+    [
+        # The row stride is where the real address lives. Reading it from the
+        # tile's own width instead reduces rows packed at stride N: row 0 is
+        # right and every later row comes from the wrong place.
+        (8, 128, 256, 1, "sum"),
+        (8, 128, 129, 1, "sum"),
+        (8, 128, 3, 1, "sum"),
+        (8, 128, 128, 1, "sum"),      # stride == N: the shape that always held
+        (4, 32, 64, 1, "max"),
+        (16, 64, 200, 2, "min"),
+        (8, 128, 256, 4, "sum"),
+        (64, 16, 40, 4, "sum"),
+    ],
+    ids=[
+        "stride_2n", "stride_n_plus_1", "stride_below_n", "stride_eq_n",
+        "max_stride_2n", "min_stride_odd", "warps4_stride_2n",
+        "tall_stride_below_n",
+    ],
+)
+def test_reduce_axis1_row_stride_matches_torch(M, N, row_stride, num_warps, op):
+    torch.manual_seed(0xC0FFEE)
+    extent = M * max(row_stride, N) + N
+    flat = torch.randn((extent,), dtype=torch.float32).contiguous()
+    rows = torch.arange(M)[:, None]
+    cols = torch.arange(N)[None, :]
+    tile = flat[rows * row_stride + cols]
+    if op == "max":
+        expected = tile.max(dim=1).values
+    elif op == "min":
+        expected = tile.min(dim=1).values
+    else:
+        expected = tile.sum(dim=1)
+    out = torch.zeros((M,), dtype=torch.float32).contiguous()
+    reduce_sum_axis1_strided_kernel[(1, 1, 1)](
+        flat, out, row_stride, BLOCK_M=M, BLOCK_N=N, OP=op,
+        num_warps=num_warps)
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "base_mode, programs, M, N, row_stride",
+    [
+        ("scalar", 3, 8, 64, 128),
+        ("folded", 3, 8, 64, 128),
+        ("scalar", 1, 16, 32, 100),
+        ("folded", 2, 16, 32, 100),
+    ],
+    ids=["scalar_base_3progs", "folded_base_3progs", "scalar_base_1prog",
+         "folded_base_2progs"],
+)
+def test_reduce_axis1_row_stride_multi_program(base_mode, programs, M, N,
+                                               row_stride):
+    """The program base and the row stride must both come from the chain.
+
+    `scalar` carries the program term as a scalar addptr; `folded` hides it in
+    the row tensor. Both are replayed from the load's own pointer chain now, so
+    neither needs the fabricated per-program term the fast path used.
+    """
+    torch.manual_seed(0x5EED)
+    prog_stride = M * row_stride
+    extent = programs * prog_stride + M * row_stride + N
+    flat = torch.randn((extent,), dtype=torch.float32).contiguous()
+    cols = torch.arange(N)[None, :]
+    expected = []
+    for pid in range(programs):
+        if base_mode == "scalar":
+            index = pid * prog_stride + torch.arange(M)[:, None] * row_stride
+        else:
+            index = (pid * M + torch.arange(M))[:, None] * row_stride
+        expected.append(flat[index + cols].sum(dim=1))
+    expected = torch.cat(expected)
+    out = torch.zeros((programs * M,), dtype=torch.float32).contiguous()
+    reduce_sum_axis1_program_kernel[(programs, 1, 1)](
+        flat, out, row_stride, prog_stride, BLOCK_M=M, BLOCK_N=N,
+        BASE_MODE=base_mode, num_warps=4)
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)

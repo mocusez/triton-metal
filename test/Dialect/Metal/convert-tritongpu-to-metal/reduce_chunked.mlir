@@ -60,3 +60,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.get_element {{.*}}memref<1024 x f32>
 // CHECK: metal.store
 // CHECK: metal.return
+
+// -----
+// The row stride comes from the load's own pointer chain, not from the tile's
+// width. This tile is 32x16 but its rows are `row_stride` apart at runtime, so
+// the per-row scan must multiply the row by the ARGUMENT. Taking the stride
+// from N instead reduces rows packed at 16: row 0 is right and every later row
+// comes from the wrong place, with no diagnostic.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice1 = #ttg.slice<{dim = 1, parent = #blocked}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_axis1_runtime_row_stride(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %row_stride: i32) {
+    %offs_m = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked1>
+    %r0 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #slice1>
+    %r1 = tt.expand_dims %r0 {axis = 1 : i32} : tensor<32xi32, #slice1> -> tensor<32x1xi32, #blocked>
+    %stride_splat = tt.splat %row_stride : i32 -> tensor<32x1xi32, #blocked>
+    %r2 = arith.muli %r1, %stride_splat : tensor<32x1xi32, #blocked>
+    %r3 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %r4 = tt.expand_dims %r3 {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked>
+    %r5 = tt.broadcast %r2 : tensor<32x1xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %r6 = tt.broadcast %r4 : tensor<1x16xi32, #blocked> -> tensor<32x16xi32, #blocked>
+    %r7 = arith.addi %r5, %r6 : tensor<32x16xi32, #blocked>
+    %sp = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<32x16x!tt.ptr<f32>, #blocked>
+    %ap = tt.addptr %sp, %r7 : tensor<32x16x!tt.ptr<f32>, #blocked>, tensor<32x16xi32, #blocked>
+    %x = tt.load %ap : tensor<32x16x!tt.ptr<f32>, #blocked>
+    %s = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %add = arith.addf %a, %b : f32
+      tt.reduce.return %add : f32
+    }) {axis = 1 : i32} : (tensor<32x16xf32, #blocked>) -> tensor<32xf32, #slice1>
+    %osp = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked1>
+    %oap = tt.addptr %osp, %offs_m : tensor<32x!tt.ptr<f32>, #blocked1>, tensor<32xi32, #blocked1>
+    %cv = ttg.convert_layout %s : tensor<32xf32, #slice1> -> tensor<32xf32, #blocked1>
+    tt.store %oap, %cv : tensor<32x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel reduce_axis1_runtime_row_stride
+// rowBuf is M = 32 elements, independent of N.
+// CHECK: metal.threadgroup_alloca : !metal.memref<32 x f32>
+// CHECK: [[STRIDE_RAW:%.*]] = metal.get_element %arg2
+// CHECK: [[STRIDE:%.*]] = builtin.unrealized_conversion_cast [[STRIDE_RAW]] : ui32 to i32
+// Row loop, then the per-row column scan.
+// CHECK: scf.for
+// CHECK: [[ROW:%.*]] = arith.addi
+// CHECK: scf.if
+// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// The row term multiplies the runtime stride, never the tile's own N.
+// CHECK: [[ROWBASE:%.*]] = arith.muli [[ROW]], [[STRIDE]] : i32
+// CHECK: [[ADDR:%.*]] = arith.addi [[ROWBASE]], %{{.*}} : i32
+// CHECK: [[ADDR_UI:%.*]] = builtin.unrealized_conversion_cast [[ADDR]] : i32 to ui32
+// CHECK: metal.get_element %{{.*}}{{\[}}[[ADDR_UI]]{{\]}}
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp

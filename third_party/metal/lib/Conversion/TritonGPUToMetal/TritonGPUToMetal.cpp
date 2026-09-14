@@ -11018,6 +11018,43 @@ static bool rank2AddPtrChainSupported(mlir::Value ptrVal, int depth) {
   return sawOffset;
 }
 
+// The MSL emitter inlines a single-use value AT ITS USE. A replayed address
+// that reads a scalar kernel argument (`tl.load(X + rows*stride + cols)` with a
+// runtime `stride`) would therefore re-load that argument from device memory on
+// every column of the row scan, where the fabricated `row * N` form it replaced
+// read nothing at all. Bind each such read once instead, so the per-element
+// cost of the replay is the multiply alone. Only reads defined OUTSIDE the scan
+// are marked; nothing that varies per row or column is touched.
+// 📏 On a 1024x256 f32 row sum the binding made no measurable difference
+// (0.055 against 0.056 ms/iter, inside run-to-run noise) — Apple's compiler
+// evidently keeps the value in a register regardless. This is hygiene, not a
+// measured win. The real cost of the replay on that shape is that a runtime
+// stride is a runtime multiply: 0.055 ms/iter against 0.028 for the same
+// kernel with a `tl.constexpr` stride, which the old form matched only by
+// multiplying by the tile width — i.e. by computing the wrong address.
+static void materializeScanInvariantReads(mlir::Value addr,
+                                          mlir::Operation *scan,
+                                          mlir::OpBuilder &builder) {
+  if (!addr || !scan)
+    return;
+  llvm::SmallVector<mlir::Value, 16> worklist{addr};
+  llvm::SmallPtrSet<mlir::Value, 16> seen;
+  while (!worklist.empty()) {
+    mlir::Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def)
+      continue;
+    if (!scan->isAncestor(def) && mlir::isa<GetElementOp>(def)) {
+      def->setAttr("metal.materialize", builder.getUnitAttr());
+      continue;
+    }
+    for (mlir::Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+}
+
 // Find a representative `tt.load` anywhere in a computed cone — used to derive
 // the per-program scalar offset and to validate the cone is device-rooted.
 static mlir::triton::LoadOp findFirstLoadInCone(mlir::Value v, int depth) {
@@ -16114,19 +16151,21 @@ struct ReduceLowering
     const bool loopCarriesState =
         (tileLoop && tileLoop.getNumRegionIterArgs() > 0) ||
         enclosedByStateLoop;
-    // Structural SCF conversion can fold a loop-varying scalar base into the
-    // load's tensor offset. In that form the scalar-offset walker below sees
-    // nothing and its historical `tgid*tpb*N` fallback drops both the trip and
-    // the real program stride. Replay the original pointer chain for direct
-    // loads in user loops; `evalAddPtrChainAt` already evaluates every scalar
-    // and tensor offset at the current logical (row, col).
-    const bool replayDirectAddress =
-        !computedCone && (loopVaryingAddr || loopCarriesState);
+    // Replay the original pointer chain for EVERY direct load, not only the
+    // ones in user loops. `rowBase` below is `row * N + scalarOff`: it takes
+    // the row stride from the TILE's own width, so a tile read out of a wider
+    // matrix (`tl.load(X + rows*stride + cols)` with `stride != N`) silently
+    // reduced rows packed at stride N instead — row 0 right, every later row
+    // from the wrong place. `evalAddPtrChainAt` evaluates every scalar and
+    // tensor offset of the chain at the current logical (row, col), which is
+    // where the real stride lives; it also subsumes the loop-varying case
+    // (a trip base folded into the tensor offset) that used to be its only
+    // caller.
+    const bool replayDirectAddress = !computedCone;
     if (replayDirectAddress &&
         !rank2AddPtrChainSupported(reprLoad.getPtr(), /*depth=*/0))
       return rewriter.notifyMatchFailure(
-          op, "rank-2 reduce: loop-varying direct-load address has an "
-              "unsupported producer");
+          op, "rank-2 reduce: direct-load address has an unsupported producer");
     // A loop with iter_args is rebuilt by SCF structural type conversion. The
     // row buffer therefore must live at function entry (below), not merely
     // immediately before the old loop: the replacement loop may otherwise be
@@ -16326,13 +16365,16 @@ struct ReduceLowering
               return evalRank2ConeAt(coneRoot, r, rowBase, colOff, rewriter,
                                      loc, /*depth=*/0);
             mlir::Value colIdx;
-            if (replayDirectAddress)
+            if (replayDirectAddress) {
               colIdx = evalAddPtrChainAt(reprLoad.getPtr(), r, rowBase, colOff,
                                          rewriter, loc, /*depth=*/0);
-            else
+              materializeScanInvariantReads(colIdx, rowFor.getOperation(),
+                                            rewriter);
+            } else {
               colIdx =
                   mlir::arith::AddIOp::create(rewriter, loc, rowBase, colOff)
                       .getResult();
+            }
             if (!colIdx)
               return {};
             mlir::Value colIdxUI32 = mlir::UnrealizedConversionCastOp::create(
@@ -36934,30 +36976,21 @@ struct ConvertTritonGPUToMetalPass
         reduceOk = false;
         return;
       }
-      // A direct rank-2 axis=1 load in a user loop replays its complete
-      // tt.addptr chain during the cooperative row scan. Mirror the pattern's
-      // dry run here, before applyFullConversion mutates the function, so an
-      // adjacent unsupported tensor-offset producer fails deterministically.
+      // A direct rank-2 axis=1 load replays its complete tt.addptr chain
+      // during the cooperative row scan — that chain is where the real row
+      // stride lives. Mirror the pattern's dry run here, before
+      // applyFullConversion mutates the function, so an adjacent unsupported
+      // tensor-offset producer fails deterministically.
       if (rtt.getRank() == 2 && axes == 1) {
         mlir::Value src = red.getSrcs().front();
         if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
           src = cvt.getSrc();
         if (auto load = src.getDefiningOp<mlir::triton::LoadOp>();
             load && !load.getMask()) {
-          bool loopVaryingAddr = false;
-          for (mlir::Operation *parent = red->getParentOp(); parent;
-               parent = parent->getParentOp()) {
-            if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(parent))
-              loopVaryingAddr |= readsLoopCarriedValue(src, loop);
-          }
-          auto tileLoop = findOutermostScfFor(red);
-          const bool loopCarriesState =
-              tileLoop && tileLoop.getNumRegionIterArgs() > 0;
-          if ((loopVaryingAddr || loopCarriesState) &&
-              !rank2AddPtrChainSupported(load.getPtr(), /*depth=*/0)) {
+          if (!rank2AddPtrChainSupported(load.getPtr(), /*depth=*/0)) {
             red.emitOpError(
-                "rank-2 axis=1 loop-varying direct-load address has an "
-                "unsupported producer");
+                "rank-2 axis=1 direct-load address has an unsupported "
+                "producer");
             reduceOk = false;
             return;
           }

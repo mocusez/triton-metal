@@ -263,7 +263,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %unsupported = arith.maxsi %offsets, %zero : tensor<32x16xi32, #blocked>
       %x_addr = tt.addptr %x_base, %unsupported : tensor<32x16x!tt.ptr<f32>, #blocked>, tensor<32x16xi32, #blocked>
       %x = tt.load %x_addr : tensor<32x16x!tt.ptr<f32>, #blocked>
-      // expected-error @+1 {{rank-2 axis=1 loop-varying direct-load address has an unsupported producer}}
+      // expected-error @+1 {{rank-2 axis=1 direct-load address has an unsupported producer}}
       %sum = "tt.reduce"(%x) ({
       ^bb0(%a: f32, %b: f32):
         %add = arith.addf %a, %b : f32

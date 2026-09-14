@@ -418,6 +418,13 @@ The current dependency-ordered priorities are:
    pointer chain, so `rows = base + offsets` followed by `tl.load(rows + cols)`
    addresses both terms. A chain carrying a level it cannot account for raises
    a named error before conversion rather than dropping that level's offset.
+   Rank-2 `axis=1` reductions over a direct load take their row stride from
+   that load's own pointer chain instead of the reduce tile's width. A tile read
+   out of a wider matrix — `tl.load(X + rows[:, None] * stride + cols[None, :])`
+   with `stride` other than `BLOCK_N` — now reduces the rows it names; it
+   previously reduced rows packed at `BLOCK_N`, matching only in row 0. Chains
+   with a producer the replay cannot evaluate raise a named error before
+   conversion.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
