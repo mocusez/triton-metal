@@ -436,8 +436,8 @@ The current dependency-ordered priorities are:
    Both rank-2 paths need a blocked source tile and the staged rank-N path
    covers only the binary hypercube shape, so the combination previously
    surfaced as an unnamed legalization failure.
-   A rank >= 3 reduction over a directly loaded tile works at any number of
-   elements per thread. Such a tile is addressed in thread-major order
+   A rank >= 3 reduction over a directly loaded tile, or over an elementwise
+   computation on one, works at any number of elements per thread. Such a tile is addressed in thread-major order
    (`localTid * elemPerThread + iv`), and its staged fold now indexes the
    scratch by that same order rather than by the layout's own, so one label
    serves the load, the publish and the fold. A layout that wraps into a second

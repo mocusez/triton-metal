@@ -3059,6 +3059,56 @@ static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
   return true;
 }
 
+// True when every per-element leaf of `v` is a `tt.load` of a tile with THIS
+// rank, reached only through ops that are elementwise in the tile's own
+// coordinates. Such a cone carries the addresses the loads were given, which
+// this backend emits thread-major — so the whole cone shares that labeling and
+// the staged scratch may be relabelled into it.
+//
+// Uniform leaves (a splat, a splat constant) carry no address and are fine.
+// Everything that MOVES data between coordinates — a reshape, a broadcast, an
+// expand_dims, another reduce — is not: the value at a coordinate then comes
+// from some other tile whose own labeling is a separate question. `tl.sort`'s
+// hypercube arrives through exactly such a reshape, which is why it keeps the
+// layout's own plan.
+static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
+                                        int depth = 0) {
+  if (depth > 16)
+    return false;
+  auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!vTy)
+    return true; // a scalar operand carries no per-element address
+  while (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    v = cvt.getSrc();
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
+    return loadTy && loadTy.getRank() == rank;
+  }
+  if (mlir::isa<mlir::triton::SplatOp>(def))
+    return true;
+  if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    return dense && dense.isSplat();
+  }
+  if (!mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+          def->getDialect()))
+    return false;
+  // Elementwise arith/math only: same-shape operands, one result.
+  if (def->getNumResults() != 1)
+    return false;
+  for (mlir::Value operand : def->getOperands()) {
+    if (auto opTy = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType()))
+      if (opTy.getShape() != vTy.getShape())
+        return false;
+    if (!coneIsThreadMajorLoadRooted(operand, rank, depth + 1))
+      return false;
+  }
+  return true;
+}
+
 // The emitter's OWN element labeling, written as a layout plan.
 //
 // `layoutFlatIndexIsThreadMajor` below answers whether a layout already agrees
@@ -14908,17 +14958,15 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   if (enc && srcTy.getRank() >= 3 &&
       !layoutFlatIndexIsThreadMajor(*srcIndexPlan) &&
       !layoutHasReplicatedOwners(*srcIndexPlan)) {
-    bool loadedAtThisRank = op->hasAttr(kRankNThreadMajorAttr);
-    if (!loadedAtThisRank) {
-      mlir::Value probe = op.getSrcs().front();
-      while (auto cvt =
-                 probe.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-        probe = cvt.getSrc();
-      if (auto load = probe.getDefiningOp<mlir::triton::LoadOp>())
-        if (auto loadTy =
-                mlir::dyn_cast<mlir::RankedTensorType>(load.getType()))
-          loadedAtThisRank = loadTy.getRank() == srcTy.getRank();
-    }
+    // ⚠️ Never a binary hypercube. `tl.sort`/`tl.topk` progressively reduce a
+    // tile whose every extent is 2, its values reach the stage through ops the
+    // cone walk below is willing to follow, and its ranges ARE emitted in
+    // layout space — relabelling those answered a different program in 13
+    // measured sort/topk cases.
+    bool loadedAtThisRank =
+        !binaryHypercube &&
+        (op->hasAttr(kRankNThreadMajorAttr) ||
+         coneIsThreadMajorLoadRooted(op.getSrcs().front(), srcTy.getRank()));
     if (loadedAtThisRank) {
       std::optional<LayoutIndexPlan> relabel = threadMajorLayoutPlan(
           srcTy.getShape(), srcIndexPlan->threadsPerBlock());

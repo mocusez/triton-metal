@@ -4659,3 +4659,101 @@ def test_reduce_rank3_multiband_matches_torch(d0, d1, d2, num_warps, axis):
     tile = x.reshape(d0, d1, d2)
     expected = tile.sum(dim=axis, keepdim=True).expand(d0, d1, d2).flatten()
     torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=1e-4)
+
+
+@triton.jit
+def _reduce_rank3_source_kernel(X, O, PLANE_STRIDE, ROW_STRIDE, BOUND, OTHER,
+                                D0: tl.constexpr, D1: tl.constexpr,
+                                D2: tl.constexpr, AXIS: tl.constexpr,
+                                MODE: tl.constexpr):
+    pid = tl.program_id(0)
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    if MODE == "strided":
+        off = i * PLANE_STRIDE + j * ROW_STRIDE + k
+    elif MODE == "multiprog":
+        off = pid * PLANE_STRIDE + i * D1 * D2 + j * D2 + k
+    else:
+        off = i * D1 * D2 + j * D2 + k
+    if MODE == "masked":
+        v = tl.load(X + off, mask=k < BOUND, other=OTHER)
+    else:
+        v = tl.load(X + off)
+    if MODE == "cone":
+        v = v * 2.0 + 1.0
+    elif MODE == "cone_exp":
+        v = tl.exp(v * 0.25)
+    if AXIS == 2:
+        r = tl.sum(v, axis=2)[:, :, None]
+    elif AXIS == 1:
+        r = tl.sum(v, axis=1)[:, None, :]
+    else:
+        r = tl.sum(v, axis=0)[None, :, :]
+    out = i * D1 * D2 + j * D2 + k
+    tl.store(O + pid * (D0 * D1 * D2) + out, r + 0.0 * v)
+
+
+@pytest.mark.parametrize(
+    "d0,d1,d2,num_warps,axis,mode",
+    [
+        # A computed cone reaches the fold through elementwise arith, so its
+        # values still carry the loads' thread-major addresses and the scratch
+        # has to be relabelled for them too. Missing that left every
+        # multi-band cone reducing the wrong group.
+        (4, 8, 16, 1, 2, "cone"),
+        (4, 8, 16, 1, 1, "cone"),
+        (4, 8, 16, 1, 0, "cone"),
+        (4, 4, 64, 2, 2, "cone_exp"),
+        # The address itself: a tile that is a strided sub-block of a larger
+        # array, a per-program base, and a masked load carrying `other`.
+        (4, 8, 16, 1, 2, "strided"),
+        (4, 8, 16, 1, 1, "strided"),
+        (2, 8, 32, 4, 0, "strided"),
+        (4, 8, 16, 1, 2, "multiprog"),
+        (4, 8, 16, 1, 2, "masked"),
+        (4, 8, 16, 2, 1, "masked"),
+    ],
+    ids=["cone_axis2", "cone_axis1", "cone_axis0", "cone_exp_axis2",
+         "strided_axis2", "strided_axis1", "strided_axis0_nw4",
+         "multiprog_axis2", "masked_axis2", "masked_axis1"],
+)
+def test_reduce_rank3_source_and_address_match_torch(d0, d1, d2, num_warps,
+                                                     axis, mode):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    plane_stride, row_stride = d1 * d2 * 3, d2 * 2
+    bound, other = max(1, d2 - 5), 5.0
+    programs = 3 if mode == "multiprog" else 1
+    extent = programs * plane_stride * d0 + d0 * plane_stride + d1 * row_stride \
+        + d2 + 64
+    x = ((torch.arange(extent) % 43).float() - 19.0) / 11.0
+    out = torch.empty(programs * d0 * d1 * d2, device="mps")
+    _reduce_rank3_source_kernel[(programs,)](
+        x.to("mps"), out, plane_stride, row_stride, bound, other, D0=d0, D1=d1,
+        D2=d2, AXIS=axis, MODE=mode, num_warps=num_warps)
+    torch.mps.synchronize()
+
+    i = torch.arange(d0)[:, None, None]
+    j = torch.arange(d1)[None, :, None]
+    k = torch.arange(d2)[None, None, :]
+    expected = []
+    for pid in range(programs):
+        if mode == "strided":
+            index = i * plane_stride + j * row_stride + k
+        elif mode == "multiprog":
+            index = pid * plane_stride + i * d1 * d2 + j * d2 + k
+        else:
+            index = i * d1 * d2 + j * d2 + k
+        tile = x[index]
+        if mode == "masked":
+            tile = torch.where(k < bound, tile, torch.full_like(tile, other))
+        if mode == "cone":
+            tile = tile * 2.0 + 1.0
+        elif mode == "cone_exp":
+            tile = torch.exp(tile * 0.25)
+        expected.append(
+            tile.sum(dim=axis, keepdim=True).expand(d0, d1, d2).flatten())
+    torch.testing.assert_close(out.cpu(), torch.cat(expected), atol=3e-3,
+                               rtol=1e-4)
