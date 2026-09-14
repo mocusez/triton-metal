@@ -486,6 +486,60 @@ def test_libdevice_binary_f32(which, reference):
 
 
 @triton.jit
+def _libdevice_pow_integer_exponent_kernel(x_ptr, exp_ptr, even_ptr, odd_ptr,
+                                           dynamic_ptr, float_ptr,
+                                           BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    e = tl.load(exp_ptr + offs)
+    tl.store(even_ptr + offs, libdevice.pow(v, 2))
+    tl.store(odd_ptr + offs, libdevice.pow(v, 3))
+    tl.store(dynamic_ptr + offs, libdevice.pow(v, e))
+    tl.store(float_ptr + offs, libdevice.pow(v, v))
+
+
+def test_libdevice_pow_f32_i32_preserves_integer_exponent_semantics():
+    x = torch.tensor(
+        [-3.0, -2.0, -1.5, -0.5, 0.0, 0.25, 1.5, 2.0,
+         -0.0, -0.0, -1.0, -1.0, -1.0, 1.0, -float("inf"), float("nan")],
+        dtype=torch.float32,
+    )
+    exponents = torch.tensor(
+        [2, 3, -1, -2, 0, 1, -3, 4, -3, 3, 16777217, -2147483648,
+         2147483647, -2147483648, 3, 0], dtype=torch.int32)
+    even = torch.empty_like(x, device="mps")
+    odd = torch.empty_like(x, device="mps")
+    dynamic = torch.empty_like(x, device="mps")
+    floating = torch.empty_like(x, device="mps")
+    _libdevice_pow_integer_exponent_kernel[(1,)](
+        x.to("mps"), exponents.to("mps"), even, odd, dynamic, floating,
+        BLOCK=x.numel()
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(even.cpu(), x * x, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(odd.cpu(), x * x * x, atol=0, rtol=0, equal_nan=True)
+    expected = torch.cat((torch.pow(x[:8], exponents[:8]), torch.tensor(
+        [-float("inf"), -0.0, -1.0, 1.0, -1.0, 1.0, -float("inf"), 1.0])))
+    torch.testing.assert_close(
+        dynamic.cpu(),
+        expected,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    assert torch.equal(torch.signbit(dynamic.cpu()), torch.signbit(expected))
+    assert torch.equal(torch.signbit(odd.cpu()[8:10]), torch.tensor([True, True]))
+
+    positive = x > 0
+    torch.testing.assert_close(
+        floating.cpu()[positive],
+        torch.pow(x[positive], x[positive]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@triton.jit
 def _libdevice_clz_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     tl.store(out_ptr + offs, libdevice.clz(tl.load(x_ptr + offs)))

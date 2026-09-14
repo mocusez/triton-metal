@@ -267,6 +267,29 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
                   "  return sign * y;\n"
                   "}\n\n";
       }
+      // Metal pow has a floating exponent and does not define integer-power
+      // behavior for negative bases. Keep the exponent integral throughout,
+      // including INT_MIN, and preserve the sign of zero for odd powers.
+      bool hasPowi = false;
+      m.walk([&](mlir::triton::metal::MathIntrinsicOp op) {
+        hasPowi |= op.getCallee() == "__triton_powi";
+      });
+      if (hasPowi)
+        output << "static inline float __triton_powi(float x, int n) {\n"
+                  "  if (n == 2) return x * x;\n"
+                  "  uint bits = as_type<uint>(x);\n"
+                  "  float base = as_type<float>(bits & 0x7fffffffu);\n"
+                  "  uint e = n < 0 ? 0u - uint(n) : uint(n);\n"
+                  "  float acc = 1.0f;\n"
+                  "  while (e != 0u) {\n"
+                  "    if (e & 1u) acc *= base;\n"
+                  "    base *= base;\n"
+                  "    e >>= 1u;\n"
+                  "  }\n"
+                  "  if (n < 0) acc = 1.0f / acc;\n"
+                  "  uint sign = (uint(n) & 1u) ? bits & 0x80000000u : 0u;\n"
+                  "  return as_type<float>(as_type<uint>(acc) | sign);\n"
+                  "}\n\n";
       // IEEE-754 maximum/minimum (`propagate_nan=tl.PropagateNan.ALL`). Both
       // the scalarized-tensor form (`metal.binary_exp` maxNanOp/minNanOp) and a
       // scalar `arith.maximumf`/`minimumf` that survived conversion call these,

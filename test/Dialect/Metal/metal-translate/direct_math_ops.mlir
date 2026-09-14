@@ -58,9 +58,29 @@ module {
       metal.store %bc, %b_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
       metal.return
     }
+
+    metal.kernel powi_helper address_space_device [false, false, true] {
+    ^bb0(%x_buf: !metal.memref<? x f32>, %n_buf: !metal.memref<? x si32>, %out: !metal.memref<? x f32>):
+      %tid = metal.thread_id "x" : ui32
+      %x = metal.get_element %x_buf[%tid] : (!metal.memref<? x f32>, ui32) -> f32
+      %n = metal.get_element %n_buf[%tid] : (!metal.memref<? x si32>, ui32) -> si32
+      %p = metal.math_intrinsic "__triton_powi"(%x, %n) : (f32, si32) -> f32
+      metal.store %p, %out[%tid] : f32, !metal.memref<? x f32>, ui32
+      metal.return
+    }
     metal.module_end
   }
 }
+
+
+// CHECK: static inline float __triton_powi(float x, int n)
+// CHECK: if (n == 2) return x * x
+// CHECK: uint bits = as_type<uint>(x)
+// CHECK: uint e = n < 0 ? 0u - uint(n) : uint(n)
+// CHECK: while (e != 0u)
+// CHECK: if (n < 0) acc = 1.0f / acc
+// CHECK: uint sign = (uint(n) & 1u) ? bits & 0x80000000u : 0u
+// CHECK: return as_type<float>(as_type<uint>(acc) | sign)
 
 // The two helpers are defined once, in the preamble, ahead of every kernel.
 // Both bodies are pinned, not just their signatures: the NaN guard, and the
@@ -100,3 +120,7 @@ module {
 // CHECK-NOT: bfloat(metal::fmin
 // bfloat must convert the promoted float result back.
 // CHECK: bfloat(metal::fmin(metal::fmax(
+
+// CHECK: kernel void powi_helper
+// CHECK: constant int32_t *
+// CHECK: __triton_powi({{.*}}, {{.*}})

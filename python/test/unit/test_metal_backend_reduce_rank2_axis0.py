@@ -590,6 +590,47 @@ def test_reduce_axis0_chained_cone(M, N, BM, BN):
     torch.testing.assert_close(out.cpu(), ref, atol=1e-5, rtol=1e-4)
 
 
+@triton.jit
+def _kmeans_assign_axis0_argmin(Points, Centers, IndexOut, N,
+                                K: tl.constexpr, BK: tl.constexpr,
+                                BN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    ks = tl.arange(0, BK)
+    mask = cols < N
+    px = tl.load(Points + cols * 2, mask=mask, other=0.0)
+    py = tl.load(Points + cols * 2 + 1, mask=mask, other=0.0)
+    cx = tl.load(Centers + ks * 2, mask=ks < K, other=0.0)
+    cy = tl.load(Centers + ks * 2 + 1, mask=ks < K, other=0.0)
+    dx = px[None, :] - cx[:, None]
+    dy = py[None, :] - cy[:, None]
+    dist = tl.where(ks[:, None] < K, dx * dx + dy * dy, float("inf"))
+    tl.store(IndexOut + cols, tl.argmin(dist, axis=0), mask=mask)
+
+
+@pytest.mark.parametrize("N, K", [(1, 1), (128, 4), (257, 3)])
+def test_reduce_axis0_argmin_computed_kmeans_tile(N, K):
+    torch.manual_seed(N * 29 + K)
+    points = torch.randn(N, 2, dtype=torch.float32, device="mps")
+    centers = torch.randn(K, 2, dtype=torch.float32, device="mps")
+    if K >= 3:
+        centers[2] = centers[0]
+        points[:7] = centers[0]
+    index_out = torch.empty(N, dtype=torch.int32, device="mps")
+
+    _kmeans_assign_axis0_argmin[(triton.cdiv(N, 128),)](
+        points, centers, index_out, N, K=K,
+        BK=triton.next_power_of_2(K), BN=128, num_warps=4
+    )
+    torch.mps.synchronize()
+
+    distances = ((points.cpu()[:, None, :] - centers.cpu()[None, :, :]) ** 2).sum(2)
+    expected_index = distances.argmin(dim=1)
+    torch.testing.assert_close(
+        index_out.cpu(), expected_index.to(torch.int32), atol=0, rtol=0
+    )
+
+
 # ---------------------------------------------------------------------------
 # More output columns than the threadgroup has threads (output E > 1).
 #

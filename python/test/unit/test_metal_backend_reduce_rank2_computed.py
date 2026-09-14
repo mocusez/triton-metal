@@ -620,3 +620,174 @@ def test_rank2_unary_math_cone_matches_torch(case, M, N):
     kernel[(1,)](x.to("mps"), out, M=M, N=N, num_warps=1)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), ref(x), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("N, K, iterations, ties", [
+    (1, 1, 1, False),
+    (128, 4, 1, False),
+    (257, 3, 3, False),
+    (513, 17, 4, False),
+    (129, 3, 2, True),
+])
+def test_kmeans_original_solve_centroids_and_labels(N, K, iterations, ties):
+    """Exercise the unchanged assignment/count/copy sequence against CPU Lloyd steps."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "metal_leet" / "hard-k_means_clustering.py"
+    spec = importlib.util.spec_from_file_location("leet_kmeans_clustering", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    generator = torch.Generator().manual_seed(2026 + K)
+    points = torch.randn((2, N), generator=generator)
+    centers = torch.randn((2, K), generator=generator)
+    if ties:
+        # Equal distance to centers 0 and 1, plus a permanently empty cluster.
+        points.zero_()
+        centers = torch.tensor([[-1.0, 1.0, 100.0], [0.0, 0.0, 100.0]])
+    expected_centers = centers.clone()
+    for _ in range(iterations):
+        distances = ((points[:, None, :] - expected_centers[:, :, None]) ** 2).sum(0)
+        expected_labels = distances.argmin(0)
+        for cluster in range(K):
+            selected = expected_labels == cluster
+            if selected.any():
+                expected_centers[:, cluster] = points[:, selected].mean(1)
+
+    initial_x = torch.full((K + 3,), 12345.0, device="mps")
+    initial_y = torch.full_like(initial_x, 12345.0)
+    initial_x[:K] = centers[0].to("mps")
+    initial_y[:K] = centers[1].to("mps")
+    final_x = torch.full_like(initial_x, 12345.0)
+    final_y = torch.full_like(initial_y, 12345.0)
+    # The source uses final_* as atomic accumulators on its first iteration.
+    final_x[:K] = 0
+    final_y[:K] = 0
+    labels = torch.full((N + 7,), -12345, dtype=torch.int32, device="mps")
+    module.solve(points[0].to("mps"), points[1].to("mps"), labels,
+                 initial_x, initial_y, final_x, final_y, N, K, iterations)
+    torch.mps.synchronize()
+    torch.testing.assert_close(labels[:N].cpu(), expected_labels.to(torch.int32), rtol=0, atol=0)
+    for initial, final, expected in zip((initial_x, initial_y), (final_x, final_y), expected_centers):
+        torch.testing.assert_close(final[:K].cpu(), expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(initial[:K].cpu(), expected, rtol=1e-4, atol=1e-5)
+        assert torch.all(initial[K:].cpu() == 12345)
+        assert torch.all(final[K:].cpu() == 12345)
+    assert torch.all(labels[N:].cpu() == -12345)
+
+
+@pytest.mark.parametrize("N, K", [(129, 1), (257, 3), (513, 17)])
+def test_kmeans_postprocess_loop_counts_and_empty_clusters(N, K):
+    """Count a comparison tile inside the source loop, then reset atomic sums."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "metal_leet" / "hard-k_means_clustering.py"
+    spec = importlib.util.spec_from_file_location("leet_kmeans_postprocess", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    labels = torch.arange(N, dtype=torch.int32) % max(K - 1, 1)
+    counts = torch.bincount(labels.long(), minlength=K).float()
+    initial_x = torch.full((K,), -99.0, device="mps")
+    initial_y = torch.full_like(initial_x, -99.0)
+    sum_x = (2.0 * counts).to("mps")
+    sum_y = (-3.0 * counts).to("mps")
+    module.postprocess_means[(1,)](
+        labels.to("mps"), initial_x, initial_y, sum_x, sum_y,
+        K, N, 128, triton.next_power_of_2(K),
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(initial_x.cpu(), torch.where(counts > 0, 2.0, -99.0), rtol=0, atol=0)
+    torch.testing.assert_close(initial_y.cpu(), torch.where(counts > 0, -3.0, -99.0), rtol=0, atol=0)
+    torch.testing.assert_close(sum_x.cpu(), torch.zeros(K), rtol=0, atol=0)
+    torch.testing.assert_close(sum_y.cpu(), torch.zeros(K), rtol=0, atol=0)
+
+
+@triton.jit
+def _affine_range_axis0_count_kernel(
+    labels_ptr,
+    counts_out,
+    trips_out,
+    k,
+    lo,
+    hi,
+    n,
+    START: tl.constexpr,
+    INC: tl.constexpr,
+    STEP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BK: tl.constexpr,
+):
+    off = tl.arange(START, START + BLOCK)
+    bins = tl.arange(0, BK)
+    counts = tl.zeros((BK,), tl.int32)
+    trips = tl.zeros((BK,), tl.int32)
+    for _ in range(lo, hi, STEP):
+        mask = (off >= 0) & (off < n)
+        idx = tl.load(labels_ptr + off, mask=mask, other=-1)
+        eq = (idx[:, None] == bins[None, :]).to(tl.int32)
+        counts += tl.sum(eq, axis=0)
+        trips += tl.full((BK,), 1, tl.int32)
+        off += INC
+    active = bins < k
+    tl.store(counts_out + bins, counts, mask=active)
+    tl.store(trips_out + bins, trips, mask=active)
+
+
+def _expected_affine_range_counts(labels, lo, hi, step, start, inc, block, k):
+    chunks = []
+    off = torch.arange(start, start + block, dtype=torch.int64)
+    for _ in range(lo, hi, step):
+        valid = (off >= 0) & (off < labels.numel())
+        chunks.append(off[valid])
+        off = off + inc
+    idx = torch.cat(chunks) if chunks else torch.empty((0,), dtype=torch.int64)
+    return torch.bincount(labels[idx].long(), minlength=k).to(torch.int32), len(chunks)
+
+
+@pytest.mark.parametrize(
+    "lo,hi,step,start,inc",
+    [
+        (5, 13, 2, 0, 128),
+        (3, 11, 2, 384, -128),
+    ],
+    ids=["nonzero_lb_step2", "negative_increment"],
+)
+def test_loop_carried_affine_range_prepass_axis0_count(lo, hi, step, start, inc):
+    block = 128
+    k = 5
+    bk = triton.next_power_of_2(k)
+    n = 401
+    labels_cpu = (torch.arange(n, dtype=torch.int32) * 3 + 1) % k
+    expected_counts, expected_trips = _expected_affine_range_counts(
+        labels_cpu, lo, hi, step, start, inc, block, k
+    )
+
+    labels = labels_cpu.to("mps")
+    counts_out = torch.full((bk,), -777, dtype=torch.int32, device="mps")
+    trips_out = torch.full((bk,), -888, dtype=torch.int32, device="mps")
+    _affine_range_axis0_count_kernel[(1,)](
+        labels,
+        counts_out,
+        trips_out,
+        k,
+        lo,
+        hi,
+        n,
+        START=start,
+        INC=inc,
+        STEP=step,
+        BLOCK=block,
+        BK=bk,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+
+    torch.testing.assert_close(counts_out[:k].cpu(), expected_counts, rtol=0, atol=0)
+    torch.testing.assert_close(
+        trips_out[:k].cpu(), torch.full((k,), expected_trips, dtype=torch.int32), rtol=0, atol=0
+    )
+    assert torch.all(counts_out[k:].cpu() == -777)
+    assert torch.all(trips_out[k:].cpu() == -888)

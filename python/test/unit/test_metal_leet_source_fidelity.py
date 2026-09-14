@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -121,7 +122,8 @@ def test_source_fidelity_manifest_is_complete():
     ]
 
     seen = []
-    for relative_list in [*classes.values(), manifest["fixture_only"]]:
+    supplemental = manifest.get("supplemental_sources", {})
+    for relative_list in [*classes.values(), manifest["fixture_only"], supplemental]:
         assert relative_list
         seen.extend(relative_list)
     assert len(seen) == len(set(seen))
@@ -133,6 +135,15 @@ def test_source_fidelity_manifest_is_complete():
     assert len(leet_mapped) == 87
     assert len(fixture_only) == 3
     assert leet_mapped.isdisjoint(fixture_only)
+
+
+def test_source_fidelity_supplemental_sources_match_hashes():
+    for relative, record in _manifest().get("supplemental_sources", {}).items():
+        fixture = (FIXTURES / relative).read_bytes()
+        assert hashlib.sha256(fixture).hexdigest() == record["sha256"], relative
+        source = SOURCE / relative
+        if source.is_file():
+            assert _rstrip_lines(source.read_bytes()) == fixture, relative
 
 
 def test_source_fidelity_matches_pinned_checkout_when_available():
@@ -149,8 +160,14 @@ def test_source_fidelity_matches_pinned_checkout_when_available():
     assert (SOURCE / "easy-matrx_copy.py").is_file()
     assert (SOURCE / "easy-matrx_copy.py").stat().st_size == 0
 
+    # Supplementary local inputs have separate hashes, not the historical
+    # commit's provenance. Audit the pinned corpus against its tracked files.
+    tracked = subprocess.check_output(
+        ["git", "-C", str(SOURCE), "ls-tree", "--name-only", "HEAD"], text=True,
+    ).splitlines()
     actual_sources = {
-        path.name for path in SOURCE.glob("*.py") if path.stat().st_size > 0
+        name for name in tracked
+        if name.endswith(".py") and (SOURCE / name).stat().st_size > 0
     }
     mapped_sources = {
         _source_path(manifest, relative)

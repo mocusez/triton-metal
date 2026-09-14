@@ -527,3 +527,39 @@ def test_map_elementwise_pack1_runtime(multi: bool):
         torch.testing.assert_close(out1.cpu(), (a - b).cpu(), atol=0, rtol=0)
     else:
         torch.testing.assert_close(out0.cpu(), (a * 3 + b).cpu(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("N, R", [(1, 0), (31, 1), (1024, 2), (1025, 3), (2053, 10), (65539, 20)])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint32])
+def test_rainbow_table_original_uint32_hash(N, R, dtype):
+    """The original 1024-wide FNV loop must preserve all 32 bits."""
+    import importlib.util
+    from pathlib import Path
+
+    import numpy as np
+
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires MPS")
+    path = Path(__file__).parent / "fixtures" / "metal_leet" / "easy-rainbow_table.py"
+    spec = importlib.util.spec_from_file_location("leet_rainbow_table", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    values = np.random.default_rng(123).integers(0, 2**32, size=N, dtype=np.uint32)
+    edges = np.array([0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF], dtype=np.uint32)
+    values[:min(N, len(edges))] = edges[:N]
+    expected = values.copy()
+    for _ in range(R):
+        hashed = np.full(N, 2166136261, dtype=np.uint32)
+        for byte_pos in range(4):
+            hashed = (hashed ^ ((expected >> (8 * byte_pos)) & 255)) * np.uint32(16777619)
+        expected = hashed
+    storage = values.view(np.int32) if dtype == torch.int32 else values
+    inp = torch.from_numpy(storage.copy()).to("mps")
+    # A tail canary also catches stores from masked lanes of the last block.
+    output = torch.full((N + 7,), 12345, dtype=dtype, device="mps")
+    module.solve(inp, output, N, R)
+    torch.mps.synchronize()
+    result = output.cpu().numpy().view(np.uint32)
+    np.testing.assert_array_equal(result[:N], expected)
+    np.testing.assert_array_equal(result[N:], 12345)

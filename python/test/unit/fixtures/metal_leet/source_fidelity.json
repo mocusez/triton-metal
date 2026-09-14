@@ -116,5 +116,15 @@
     "metal_specific_kernel_rewrite": [
       "medium-group-normalization.py"
     ]
+  },
+  "supplemental_sources": {
+    "easy-rainbow_table.py": {
+      "sha256": "3ea38f44fa87bb51fef8d88fd868a57cc313f7e0a1caf8ec89a34522b5509210",
+      "provenance": "User-supplied local source, absent from source_commit; trailing whitespace stripped."
+    },
+    "hard-k_means_clustering.py": {
+      "sha256": "25cce0a45524b70bb55b5a57592397529aa4a7f4c8ffca0a0325e25bfbbc4196",
+      "provenance": "User-supplied local source, absent from source_commit; trailing whitespace stripped."
+    }
   }
 }

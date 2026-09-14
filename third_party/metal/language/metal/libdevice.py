@@ -416,6 +416,8 @@ def fmod(arg0, arg1, _semantic=None):
 def pow(arg0, arg1, _semantic=None):
     return core.extern_elementwise(
         "", "", [arg0, arg1], {
+            (core.dtype("fp32"), core.dtype("int32")):
+                ("__metal_powi", core.dtype("fp32")),
             (core.dtype("fp32"), core.dtype("fp32")):
                 ("__metal_pow", core.dtype("fp32")),
         }, is_pure=True, _semantic=_semantic)

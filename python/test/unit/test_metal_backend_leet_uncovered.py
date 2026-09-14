@@ -65,7 +65,9 @@ STANDALONE_FIXTURES = {
 }
 
 TARGETED_FIXTURES = {
+    "easy-rainbow_table.py",
     "hard-bfs_shortest_path.py",
+    "hard-k_means_clustering.py",
     "hard-fast_fourier_transform.py",
     "hard-mult_head_attention.py",
     "hard-sliding_window_self_attention.py",
@@ -100,6 +102,7 @@ TARGETED_FIXTURES = {
 }
 
 TARGETED_TEST_MODULES = (
+    "test_metal_backend_int_arith.py",
     "test_metal_backend_atomic_add.py",
     "test_metal_backend_attention_with_sinks.py",
     "test_metal_backend_batch_normalization.py",

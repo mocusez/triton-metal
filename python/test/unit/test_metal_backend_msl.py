@@ -2050,6 +2050,26 @@ def test_i16_masked_load_and_store():
 
 
 @triton.jit
+def _tensor_pointer_bitcast_kernel(X, Bits, Roundtrip, N: tl.constexpr):
+    offsets = tl.arange(0, 128) + 1
+    bits = tl.load((X + offsets).to(tl.pointer_type(tl.int32)),
+                   mask=offsets < N, other=0)
+    tl.store(Bits + offsets, bits, mask=offsets < N)
+    tl.store((Roundtrip + offsets).to(tl.pointer_type(tl.int32)),
+             bits, mask=offsets < N)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tensor_pointer_reinterpretation_rejected_before_lowering(num_warps, capfd):
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _compile_to_msl(
+            _tensor_pointer_bitcast_kernel,
+            {"X": "*fp32", "Bits": "*i32", "Roundtrip": "*fp32"},
+            {"N": 97}, num_warps=num_warps)
+    assert "tensor pointer reinterpretation requires matching storage types" in capfd.readouterr().err
+
+
+@triton.jit
 def _bool_copy_kernel(x_ptr, o_ptr, N: tl.constexpr):
     i = tl.arange(0, N)
     tl.store(o_ptr + i, tl.load(x_ptr + i))

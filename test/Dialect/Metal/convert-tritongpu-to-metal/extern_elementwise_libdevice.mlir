@@ -51,6 +51,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  tt.func public @libdevice_powi(%x: !tt.ptr<f32>, %e: !tt.ptr<i32>, %o: !tt.ptr<f32>) {
+    %r = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %xp = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xp, %r : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %v = tt.load %xa : tensor<128x!tt.ptr<f32>, #blocked>
+    %ep = tt.splat %e : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %ea = tt.addptr %ep, %r : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    %n = tt.load %ea : tensor<128x!tt.ptr<i32>, #blocked>
+    %a = tt.extern_elementwise %v, %n {libname = "", libpath = "", pure = true, symbol = "__metal_powi"} : (tensor<128xf32, #blocked>, tensor<128xi32, #blocked>) -> tensor<128xf32, #blocked>
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %op, %r : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %a : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
   // erf is the one entry that does NOT become a math_intrinsic: MSL has no
   // erf, and `__triton_erff` is a polynomial the emitter writes into the module
   // preamble only when it sees a unary_exp erfOp node. A math_intrinsic naming
@@ -84,6 +99,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: builtin.unrealized_conversion_cast {{.*}} : i32 to ui32
 // CHECK: metal.math_intrinsic "metal::clz"
 // CHECK: builtin.unrealized_conversion_cast {{.*}} : ui32 to i32
+// CHECK: metal.return
+
+// CHECK-LABEL: metal.kernel libdevice_powi
+// CHECK: builtin.unrealized_conversion_cast {{.*}} : i32 to si32
+// CHECK: metal.math_intrinsic "__triton_powi"({{.*}}, {{.*}}) : (f32, si32) -> f32
 // CHECK: metal.return
 
 // CHECK-LABEL: metal.kernel libdevice_erf

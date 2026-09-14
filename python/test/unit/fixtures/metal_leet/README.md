@@ -9,10 +9,10 @@ These files are test inputs, not standalone pytest modules. Assertions and
 parameterization belong in `python/test/unit/test_metal_backend_*.py`; compiler
 IR regressions belong in `test/Dialect/Metal/`.
 
-Run `pixi run --frozen leet-all` from the repository root to audit all 90 Python
-fixtures and cover the 88 runnable workloads through their owned execution
+Run `pixi run --frozen leet-all` from the repository root to audit all 92 Python
+fixtures and cover the 90 runnable workloads through their owned execution
 paths. `test_metal_backend_leet_uncovered.py` owns the exhaustive inventory: 24
-standalone scripts, 34 interpreter-backed cases, and 32 targeted backend
+standalone scripts, 34 interpreter-backed cases, and 34 targeted backend
 regressions. Two interpreter cases are explicit skips because their recovered
 source is invalid on every backend.
 
@@ -41,3 +41,9 @@ host-only harness adaptations, fixture-only tutorials, and Metal-specific kernel
 rewrites are intentionally labelled. See
 [INCREMENTAL_RESEARCH.md](INCREMENTAL_RESEARCH.md) for the fixed commits,
 raw-source probes, performance evidence, and remaining follow-up work.
+
+`easy-rainbow_table.py` and `hard-k_means_clustering.py` are supplementary
+user-supplied sources absent from the historical pinned commit. Their normalized
+SHA-256 hashes are recorded separately in `supplemental_sources`; the kernels
+are unchanged. Existing integer-arithmetic and computed-reduction test modules
+compare their full `solve()` outputs with independent CPU references.

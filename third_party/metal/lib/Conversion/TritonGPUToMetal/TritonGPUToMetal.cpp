@@ -142,7 +142,12 @@ public:
   TritonGPUToMetalTypeConverter(mlir::MLIRContext *ctx) {
     addConversion([](mlir::Type t) -> std::optional<mlir::Type> { return t; });
 
-    addConversion([](mlir::RankedTensorType t) -> std::optional<mlir::Type> {
+    addConversion([ctx](mlir::RankedTensorType t) -> std::optional<mlir::Type> {
+      // Tensor addresses lower to a per-element offset; their device base is
+      // carried separately. Match AddPtrLowering's integer representation so
+      // consumers do not rematerialize the original tensor pointer.
+      if (mlir::isa<mlir::triton::PointerType>(t.getElementType()))
+        return mlir::IntegerType::get(ctx, 32);
       return t.getElementType();
     });
 
@@ -4410,6 +4415,9 @@ struct ArithConstantDenseLowering
 // it orders IEEE-754 values through signed/unsigned integer atomics. Pointer
 // bitcasts are represented as an unrealized memref view; the consuming atomic
 // resolves the original buffer and chooses the actual MSL atomic pointer type.
+static constexpr llvm::StringLiteral kTensorPointerOffsetOnly =
+    "metal.tensor_pointer_offset_only";
+
 struct BitcastLowering
     : public mlir::OpConversionPattern<mlir::triton::BitcastOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -4420,6 +4428,13 @@ struct BitcastLowering
     if (!resultTy)
       return rewriter.notifyMatchFailure(
           op, "bitcast: result type not convertible");
+
+    // Only the pre-analysis-proven storage-preserving and atomic address
+    // casts can forward their integer offset without a new device view.
+    if (op->hasAttr(kTensorPointerOffsetOnly)) {
+      rewriter.replaceOp(op, adaptor.getSrc());
+      return mlir::success();
+    }
 
     if (mlir::isa<MetalMemRefType>(resultTy)) {
       auto cast = mlir::UnrealizedConversionCastOp::create(
@@ -5886,6 +5901,7 @@ static std::optional<ExternSymbolInfo> metalExternSymbol(llvm::StringRef sym) {
       {"__metal_fdim", {"metal::fdim", 2}},
       {"__metal_fmod", {"metal::fmod", 2}},
       {"__metal_pow", {"metal::precise::pow", 2}},
+      {"__metal_powi", {"__triton_powi", 2}},
       {"__metal_powr", {"metal::precise::powr", 2}},
       {"__metal_nextafter", {"metal::nextafter", 2}},
       {"__metal_ldexp", {"metal::ldexp", 2}},
@@ -5955,10 +5971,13 @@ struct TritonExternElementwiseLowering
       auto intTy = mlir::dyn_cast<mlir::IntegerType>(value.getType());
       if (!intTy || !intTy.isSignless() || intTy.getWidth() == 1)
         return value;
-      auto unsignedTy = mlir::IntegerType::get(
-          rewriter.getContext(), intTy.getWidth(), mlir::IntegerType::Unsigned);
+      auto signedness = op.getSymbol() == "__metal_powi"
+                            ? mlir::IntegerType::Signed
+                            : mlir::IntegerType::Unsigned;
+      auto metalIntTy = mlir::IntegerType::get(rewriter.getContext(),
+                                               intTy.getWidth(), signedness);
       return mlir::UnrealizedConversionCastOp::create(
-                 rewriter, loc, mlir::TypeRange{unsignedTy},
+                 rewriter, loc, mlir::TypeRange{metalIntTy},
                  mlir::ValueRange{value})
           .getResult(0);
     };
@@ -7010,8 +7029,10 @@ static bool isCanonicalRank1ArgmaxReduce(mlir::triton::ReduceOp op) {
 // Match the two-source/two-result reducer emitted by
 // `tl.argmin(x, axis=1)`: values are f32, carried indices are i32, and ties
 // select the lower logical index.
-static bool isCanonicalRank2Axis1ArgminReduce(mlir::triton::ReduceOp op) {
-  if (op.getSrcs().size() != 2 || op->getNumResults() != 2 || op.getAxis() != 1)
+static bool isCanonicalRank2ArgminReduce(mlir::triton::ReduceOp op,
+                                         unsigned axis) {
+  if (op.getSrcs().size() != 2 || op->getNumResults() != 2 ||
+      op.getAxis() != axis)
     return false;
 
   auto valueTy =
@@ -7030,7 +7051,7 @@ static bool isCanonicalRank2Axis1ArgminReduce(mlir::triton::ReduceOp op) {
       valueTy.getShape() != indexTy.getShape() ||
       valueTy.getEncoding() != indexTy.getEncoding() ||
       resultValueTy.getShape() != resultIndexTy.getShape() ||
-      resultValueTy.getDimSize(0) != valueTy.getDimSize(0) ||
+      resultValueTy.getDimSize(0) != valueTy.getDimSize(1 - axis) ||
       !valueTy.getElementType().isF32() ||
       !indexTy.getElementType().isInteger(32) ||
       !resultValueTy.getElementType().isF32() ||
@@ -7085,6 +7106,192 @@ static bool isCanonicalRank2Axis1ArgminReduce(mlir::triton::ReduceOp op) {
          selectIndex.getFalseValue() == rhsIndex &&
          ret->getOperand(0) == selectValue.getResult() &&
          ret->getOperand(1) == selectIndex.getResult();
+}
+
+static bool isCanonicalRank2Axis1ArgminReduce(mlir::triton::ReduceOp op) {
+  return isCanonicalRank2ArgminReduce(op, 1);
+}
+
+static bool isCanonicalRank2Axis0ArgminReduce(mlir::triton::ReduceOp op) {
+  return isCanonicalRank2ArgminReduce(op, 0);
+}
+
+static bool
+canonicalRank2Axis0ArgminFitsAxis1Rewrite(mlir::triton::ReduceOp op) {
+  if (!isCanonicalRank2Axis0ArgminReduce(op))
+    return false;
+  auto valueTy = mlir::cast<mlir::RankedTensorType>(op.getSrcs()[0].getType());
+  auto blocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      valueTy.getEncoding());
+  if (!blocked)
+    return false;
+  int64_t tpb = 1;
+  for (int64_t threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (int64_t warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  int64_t rowsAfterTranspose = valueTy.getDimSize(1);
+  return tpb > 0 && rowsAfterTranspose > 0 && rowsAfterTranspose <= tpb &&
+         valueTy.getDimSize(0) > 0;
+}
+
+// Drop unused loop-carried rank-1 i32 affine ranges before conversion.
+// iter_arg %r = tt.make_range; yield %r + dense<INC> becomes a local body
+// value: make_range + splat(((iv - lb) /ui step) * INC).
+static mlir::LogicalResult
+preprocessLoopCarriedAffineRanges(mlir::ModuleOp moduleOp) {
+  auto isI32 = [](mlir::Type t) {
+    auto i = mlir::dyn_cast<mlir::IntegerType>(t);
+    return i && i.getWidth() == 32;
+  };
+  auto splatI32 = [&](mlir::Value v) -> std::optional<int32_t> {
+    auto c = v.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!c)
+      return std::nullopt;
+    auto d = mlir::dyn_cast<mlir::DenseElementsAttr>(c.getValue());
+    if (!d || !d.isSplat())
+      return std::nullopt;
+    auto a =
+        mlir::dyn_cast<mlir::IntegerAttr>(d.getSplatValue<mlir::Attribute>());
+    if (!a || !isI32(a.getType()))
+      return std::nullopt;
+    return static_cast<int32_t>(a.getInt());
+  };
+  llvm::SmallVector<mlir::scf::ForOp, 8> loops;
+  moduleOp.walk<mlir::WalkOrder::PostOrder>(
+      [&](mlir::scf::ForOp loop) { loops.push_back(loop); });
+  for (mlir::scf::ForOp loop : loops) {
+    if (!loop->getBlock() || loop.getNumRegionIterArgs() == 0 ||
+        !isI32(loop.getInductionVar().getType()) ||
+        !isI32(loop.getLowerBound().getType()) ||
+        !isI32(loop.getStep().getType()))
+      continue;
+    auto yield =
+        mlir::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != loop.getNumResults())
+      continue;
+    struct Drop {
+      unsigned idx;
+      mlir::triton::MakeRangeOp range;
+      int32_t inc;
+    };
+    llvm::SmallVector<Drop, 4> drops;
+    llvm::SmallVector<bool, 8> drop(loop.getNumRegionIterArgs(), false);
+    for (auto it : llvm::enumerate(loop.getRegionIterArgs())) {
+      unsigned i = it.index();
+      mlir::Value arg = it.value();
+      auto ty = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
+      auto initTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          loop.getInitArgs()[i].getType());
+      auto range =
+          loop.getInitArgs()[i].getDefiningOp<mlir::triton::MakeRangeOp>();
+      auto add = yield.getOperand(i).getDefiningOp<mlir::arith::AddIOp>();
+      if (!loop.getResult(i).use_empty() || !ty || !initTy || ty != initTy ||
+          ty.getRank() != 1 || !isI32(ty.getElementType()) || !range || !add ||
+          add->getBlock() != loop.getBody())
+        continue;
+      mlir::Value incVal;
+      if (add.getLhs() == arg)
+        incVal = add.getRhs();
+      else if (add.getRhs() == arg)
+        incVal = add.getLhs();
+      else
+        continue;
+      auto inc = splatI32(incVal);
+      if (!inc)
+        continue;
+      drop[i] = true;
+      drops.push_back({i, range, *inc});
+    }
+    if (drops.empty())
+      continue;
+    llvm::SmallVector<mlir::Value, 8> inits;
+    for (auto it : llvm::enumerate(loop.getInitArgs()))
+      if (!drop[it.index()])
+        inits.push_back(it.value());
+    mlir::OpBuilder b(loop);
+    auto repl = mlir::scf::ForOp::create(
+        b, loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(),
+        loop.getStep(), inits,
+        [&](mlir::OpBuilder &bb, mlir::Location loc, mlir::Value iv,
+            mlir::ValueRange args) {
+          mlir::IRMapping map;
+          map.map(loop.getInductionVar(), iv);
+          unsigned next = 0;
+          for (auto it : llvm::enumerate(loop.getRegionIterArgs()))
+            if (!drop[it.index()])
+              map.map(it.value(), args[next++]);
+          mlir::Value diff =
+              mlir::arith::SubIOp::create(bb, loc, iv, loop.getLowerBound());
+          mlir::Value trip =
+              mlir::arith::DivUIOp::create(bb, loc, diff, loop.getStep());
+          for (Drop &d : drops) {
+            auto ty = mlir::cast<mlir::RankedTensorType>(
+                loop.getRegionIterArg(d.idx).getType());
+            auto c = mlir::arith::ConstantOp::create(
+                bb, loc, bb.getI32IntegerAttr(d.inc));
+            mlir::Value delta =
+                mlir::arith::MulIOp::create(bb, loc, trip, c.getResult());
+            mlir::Value range = mlir::triton::MakeRangeOp::create(
+                bb, loc, ty, d.range.getStart(), d.range.getEnd());
+            mlir::Value splat =
+                mlir::triton::SplatOp::create(bb, loc, ty, delta);
+            map.map(
+                loop.getRegionIterArg(d.idx),
+                mlir::arith::AddIOp::create(bb, loc, range, splat).getResult());
+          }
+          for (mlir::Operation &op : loop.getBody()->without_terminator())
+            bb.clone(op, map);
+          llvm::SmallVector<mlir::Value, 8> outs;
+          for (auto it : llvm::enumerate(yield.getOperands()))
+            if (!drop[it.index()])
+              outs.push_back(map.lookupOrDefault(it.value()));
+          mlir::scf::YieldOp::create(bb, loc, outs);
+        });
+    repl->setAttrs(loop->getAttrs());
+    unsigned next = 0;
+    for (unsigned i = 0, e = loop.getNumResults(); i < e; ++i)
+      if (!drop[i])
+        loop.getResult(i).replaceAllUsesWith(repl.getResult(next++));
+    loop.erase();
+  }
+  return mlir::success();
+}
+
+// Canonical axis=0 argmin is equivalent to transposing its value/index tiles
+// and running the existing axis=1 argmin. Keep this as a pre-conversion
+// normalization so the conversion lowering still only inspects the op it
+// lowers; the existing axis=1 path owns computed-cone replay.
+static void rewriteCanonicalRank2Axis0Argmin(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp, 8> reduces;
+  moduleOp.walk([&](mlir::triton::ReduceOp op) {
+    if (canonicalRank2Axis0ArgminFitsAxis1Rewrite(op))
+      reduces.push_back(op);
+  });
+  for (auto op : reduces) {
+    mlir::OpBuilder builder(op);
+    llvm::SmallVector<mlir::Value, 2> transposed;
+    for (mlir::Value src : op.getSrcs())
+      transposed.push_back(
+          mlir::triton::TransOp::create(builder, op.getLoc(), src,
+                                        llvm::ArrayRef<int32_t>{1, 0})
+              .getResult());
+    auto newReduce =
+        mlir::triton::ReduceOp::create(builder, op.getLoc(), transposed, 1);
+    builder.cloneRegionBefore(op.getCombineOp(), newReduce.getCombineOp(),
+                              newReduce.getCombineOp().end());
+    for (auto [oldResult, newResult] :
+         llvm::zip(op.getResults(), newReduce.getResults())) {
+      mlir::Value replacement = newResult;
+      if (replacement.getType() != oldResult.getType())
+        replacement =
+            mlir::triton::gpu::ConvertLayoutOp::create(
+                builder, op.getLoc(), oldResult.getType(), replacement)
+                .getResult();
+      oldResult.replaceAllUsesWith(replacement);
+    }
+    op.erase();
+  }
 }
 
 // The geometry `lowerRank1ArgmaxReduce` can actually lower: one element per
@@ -10118,6 +10325,11 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
   if (depth > 24)
     return nullptr;
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
+  auto scalarEltOf = [](mlir::Type t) -> mlir::Type {
+    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(t))
+      return rtt.getElementType();
+    return t;
+  };
 
   // A staged [M,N] tile resolves to buf[r*N + n]. Checked FIRST so the walk
   // never descends into a loop-carried recurrence it cannot re-emit.
@@ -10245,6 +10457,53 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                     rewriter, loc, depth + 1);
     return x ? emitConeClonableUnary(def, x, rewriter, loc) : mlir::Value{};
   }
+  if (auto ext = mlir::dyn_cast<mlir::triton::ExternElementwiseOp>(def)) {
+    auto info = metalExternSymbol(ext.getSymbol());
+    if (!info || ext.getSrcs().size() != info->arity)
+      return {};
+    if (ext.getSymbol() == "__metal_erf")
+      return unary(ext.getSrcs()[0], UnaryExpOperator::erfOp);
+    llvm::SmallVector<mlir::Value, 3> args;
+    for (mlir::Value src : ext.getSrcs()) {
+      mlir::Value arg =
+          evalRank2ConeAt(src, rVal, rowBase, nVal, rewriter, loc, depth + 1);
+      if (!arg)
+        return {};
+      if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(arg.getType())) {
+        if (intTy.isSignless() && intTy.getWidth() != 1) {
+          auto signedness = ext.getSymbol() == "__metal_powi"
+                                ? mlir::IntegerType::Signed
+                                : mlir::IntegerType::Unsigned;
+          auto metalIntTy = mlir::IntegerType::get(
+              rewriter.getContext(), intTy.getWidth(), signedness);
+          arg = mlir::UnrealizedConversionCastOp::create(
+                    rewriter, loc, mlir::TypeRange{metalIntTy},
+                    mlir::ValueRange{arg})
+                    .getResult(0);
+        }
+      }
+      args.push_back(arg);
+    }
+    mlir::Type resultTy = ext.getType();
+    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(resultTy))
+      resultTy = rtt.getElementType();
+    mlir::Type callTy = resultTy;
+    if (auto resInt = mlir::dyn_cast<mlir::IntegerType>(resultTy))
+      if (resInt.isSignless() && resInt.getWidth() != 1)
+        callTy =
+            mlir::IntegerType::get(rewriter.getContext(), resInt.getWidth(),
+                                   mlir::IntegerType::Unsigned);
+    mlir::Value call =
+        MathIntrinsicOp::create(rewriter, loc, callTy,
+                                rewriter.getStringAttr(info->callee), args)
+            .getResult();
+    if (callTy != resultTy)
+      call = mlir::UnrealizedConversionCastOp::create(rewriter, loc,
+                                                      mlir::TypeRange{resultTy},
+                                                      mlir::ValueRange{call})
+                 .getResult(0);
+    return call;
+  }
 
   // Binary f32 arith → metal.binary_exp (recurse BOTH operands).
   auto binary = [&](mlir::Value lhs, mlir::Value rhs,
@@ -10304,6 +10563,10 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                     rewriter, loc, depth + 1);
     if (!c || !t || !f)
       return nullptr;
+    if (mlir::isa<mlir::IntegerType>(scalarEltOf(sel.getType()))) {
+      t = toSignlessInt(t, rewriter, loc);
+      f = toSignlessInt(f, rewriter, loc);
+    }
     return mlir::arith::SelectOp::create(rewriter, loc, c, t, f).getResult();
   }
   if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
@@ -10313,6 +10576,8 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                     loc, depth + 1);
     if (!a || !b)
       return nullptr;
+    a = toSignlessInt(a, rewriter, loc);
+    b = toSignlessInt(b, rewriter, loc);
     return mlir::arith::CmpIOp::create(rewriter, loc, cmp.getPredicate(), a, b)
         .getResult();
   }
@@ -10395,11 +10660,6 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
       return mlir::arith::ShRUIOp::create(rewriter, loc, a, b).getResult();
     });
 
-  auto scalarEltOf = [](mlir::Type t) -> mlir::Type {
-    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(t))
-      return rtt.getElementType();
-    return t;
-  };
   auto signlessEltOf = [&](mlir::Type t) -> mlir::Type {
     auto e = scalarEltOf(t);
     if (auto i = llvm::dyn_cast<mlir::IntegerType>(e))
@@ -11116,6 +11376,14 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank2ConeSupported(def->getOperand(0), depth + 1);
+  if (auto ext = mlir::dyn_cast<mlir::triton::ExternElementwiseOp>(def)) {
+    auto info = metalExternSymbol(ext.getSymbol());
+    if (!info || ext.getSrcs().size() != info->arity)
+      return false;
+    return llvm::all_of(ext.getSrcs(), [&](mlir::Value src) {
+      return rank2ConeSupported(src, depth + 1);
+    });
+  }
   // Keep in sync with the binary cases in `evalRank2ConeAt` — same trap the
   // rank-1 predicate documents: an op the evaluator handles but this list omits
   // is silently unreachable. arith.and/or were exactly that, so a cone whose
@@ -13496,12 +13764,6 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
   // exists to supply.
   llvm::DenseMap<mlir::Value, mlir::Value> stagedRank1;
   if (!loadOp) {
-    // i32 cones are NOT taken: `evalRank2ConeAt`'s load leaf yields the
-    // memref's ui32 storage type while the cone's own arith is signless i32, so
-    // the two would meet at a type mismatch. f32 has no such split.
-    if (!isF)
-      return rewriter.notifyMatchFailure(
-          op, "rank-2 axis0 reduce: computed cone is f32-only");
     int64_t BNforStaging = rtt.getDimSize(1);
     llvm::SmallVector<mlir::Value, 16> wl{src};
     llvm::SmallPtrSet<mlir::Value, 16> seen;
@@ -13697,10 +13959,11 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
     rewriter.setInsertionPointToStart(forOp.getBody());
     mlir::Value m = forOp.getInductionVar();
     mlir::Value acc = forOp.getRegionIterArgs()[0];
-    // The representative load's mask gates BOTH the address and the value, so a
-    // ragged M neither reads out of bounds nor contributes a real element.
+    // A direct load uses its mask to suppress padded rows. Computed cones
+    // replay each load's own mask at its logical index, including rank-1
+    // row loads; their masked fallback participates in the expression.
     mlir::Value maskBit;
-    if (maskV) {
+    if (maskV && !coneRoot) {
       maskBit = evalRank2ConeAt(maskV, m, dummyRowBase, nVal, rewriter, loc, 0);
       if (!maskBit)
         return rewriter.notifyMatchFailure(
@@ -34751,6 +35014,8 @@ static mlir::LogicalResult validateUnitAxisReduce(mlir::ModuleOp moduleOp) {
       return;
     if (srcTy.getDimSize(axis) != 1)
       return;
+    if (isCanonicalRank2Axis1ArgminReduce(op))
+      return;
     op.emitOpError("Metal backend: reduce over an axis of extent 1 is not "
                    "supported (source ")
         << srcTy << ", axis " << axis
@@ -35259,6 +35524,49 @@ static void preprocessBoolPointerBitcasts(mlir::ModuleOp moduleOp) {
     bitcast.getResult().replaceAllUsesWith(newBase);
     bitcast.erase();
   }
+}
+
+// Decide pointer-cast consumer support before conversion. Generic tensor
+// reinterpret loads/stores need device-view and alias handling that this
+// backend does not yet provide; accepting them as integer offset bitcasts
+// would silently turn bit reinterpretation into numeric conversion.
+static mlir::LogicalResult
+prepareTensorPointerBitcasts(mlir::ModuleOp moduleOp) {
+  bool valid = true;
+  moduleOp.walk([&](mlir::triton::BitcastOp bitcast) {
+    bitcast->removeAttr(kTensorPointerOffsetOnly);
+    auto srcTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getSrc().getType());
+    auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getType());
+    if (!srcTy || !dstTy)
+      return;
+    auto srcPtr =
+        mlir::dyn_cast<mlir::triton::PointerType>(srcTy.getElementType());
+    auto dstPtr =
+        mlir::dyn_cast<mlir::triton::PointerType>(dstTy.getElementType());
+    if (!srcPtr || !dstPtr)
+      return;
+    bool sameStorage = metalStorageElementType(srcPtr.getPointeeType()) ==
+                       metalStorageElementType(dstPtr.getPointeeType());
+    bool atomicOnly =
+        llvm::all_of(bitcast->getUsers(), [&](mlir::Operation *user) {
+          if (auto atomic = mlir::dyn_cast<mlir::triton::AtomicRMWOp>(user))
+            return atomic.getPtr() == bitcast.getResult();
+          if (auto atomic = mlir::dyn_cast<mlir::triton::AtomicCASOp>(user))
+            return atomic.getPtr() == bitcast.getResult();
+          return false;
+        });
+    if (sameStorage || atomicOnly) {
+      bitcast->setAttr(kTensorPointerOffsetOnly,
+                       mlir::UnitAttr::get(moduleOp.getContext()));
+      return;
+    }
+    bitcast.emitOpError(
+        "Metal backend: tensor pointer reinterpretation requires "
+        "matching storage types or exclusively atomic consumers");
+    valid = false;
+  });
+  return mlir::success(valid);
 }
 
 // Inline `tt.call` to a `noinline` callee.
@@ -35915,6 +36223,15 @@ struct ConvertTritonGPUToMetalPass
 
     preprocessInlineCalls(moduleOp);
     preprocessBoolPointerBitcasts(moduleOp);
+    if (mlir::failed(prepareTensorPointerBitcasts(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+    if (mlir::failed(preprocessLoopCarriedAffineRanges(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+    rewriteCanonicalRank2Axis0Argmin(moduleOp);
 
     // Answered here, once, while the rank-2 tensors are all still present —
     // before the validators, because whether a shuffle's operands are held per
@@ -36219,7 +36536,7 @@ struct ConvertTritonGPUToMetalPass
       // dedicated path except that it was written first.
       if (isCanonicalRank1ArgmaxReduce(red) && canonicalRank1ArgmaxFits(red))
         return;
-      // Canonical rank-2 axis=1 argmin is a paired f32-value/i32-index
+      // Canonical rank-2 axis=0/1 argmin is a paired f32-value/i32-index
       // reduction, so its first region op is a comparison rather than one of
       // the single-result combine ops admitted below.
       if (isCanonicalRank2Axis1ArgminReduce(red)) {
@@ -36268,7 +36585,7 @@ struct ConvertTritonGPUToMetalPass
           return;
         red.emitOpError(
             "multi-value tt.reduce is implemented for the canonical rank-1 "
-            "argmax and rank-2 axis=1 argmin pairs, and for a general tuple "
+            "argmax and rank-2 axis=0/1 argmin pairs, and for a general tuple "
             "combine over rank-1 blocked f32/i32 sources: ")
             << why << " (got " << red.getSrcs().size() << " operands)";
         reduceOk = false;
@@ -37019,6 +37336,8 @@ struct ConvertTritonGPUToMetalPass
     {
       bool tileOk = true;
       moduleOp.walk([&](mlir::triton::TransOp trans) {
+        if (trans->use_empty())
+          return;
         if (transIsFlatIdentity(trans))
           return;
         trans.emitOpError(
