@@ -425,6 +425,12 @@ The current dependency-ordered priorities are:
    previously reduced rows packed at `BLOCK_N`, matching only in row 0. Chains
    with a producer the replay cannot evaluate raise a named error before
    conversion.
+   A masked row of a rank-2 `axis=0` reduction contributes the load's `other`
+   value rather than the combine identity, matching Triton semantics and the
+   rank-1 path: a fully masked column of a `tl.max` returns `other`, not
+   `-inf`, and a partially masked column no longer drops those rows. A masked
+   load with no `other` still folds the combine identity, which is what keeps
+   that (unspecified) case deterministic.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

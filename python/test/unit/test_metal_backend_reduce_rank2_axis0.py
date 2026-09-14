@@ -852,3 +852,130 @@ def test_reduce_axis0_batch_norm_wide_columns(BM, BN, num_warps):
                                atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(dev.cpu().double(), want_dev, atol=1e-4,
                                rtol=1e-4)
+
+
+@triton.jit
+def _colreduce_masked_other_f32(In, Out, BOUND, OTHER,
+                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                MASK_AXIS: tl.constexpr, OP: tl.constexpr,
+                                HAS_OTHER: tl.constexpr):
+    rows = tl.arange(0, BLOCK_M)[:, None]
+    cols = tl.arange(0, BLOCK_N)[None, :]
+    if MASK_AXIS == 0:
+        m = rows < BOUND
+    else:
+        m = cols < BOUND
+    if HAS_OTHER:
+        v = tl.load(In + rows * BLOCK_N + cols, mask=m, other=OTHER)
+    else:
+        v = tl.load(In + rows * BLOCK_N + cols, mask=m)
+    if OP == "max":
+        r = tl.max(v, axis=0)
+    elif OP == "min":
+        r = tl.min(v, axis=0)
+    else:
+        r = tl.sum(v, axis=0)
+    tl.store(Out + tl.arange(0, BLOCK_N), r)
+
+
+@triton.jit
+def _colreduce_masked_other_i32(In, Out, BOUND,
+                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                OTHER: tl.constexpr, OP: tl.constexpr):
+    rows = tl.arange(0, BLOCK_M)[:, None]
+    cols = tl.arange(0, BLOCK_N)[None, :]
+    v = tl.load(In + rows * BLOCK_N + cols, mask=rows < BOUND, other=OTHER)
+    if OP == "max":
+        r = tl.max(v, axis=0)
+    elif OP == "min":
+        r = tl.min(v, axis=0)
+    else:
+        r = tl.sum(v, axis=0)
+    tl.store(Out + tl.arange(0, BLOCK_N), r)
+
+
+# A masked-off row contributes the load's `other`, not the combine identity.
+# `other` is deliberately away from every identity here: with 0.0 and a sum the
+# two coincide, which is exactly why the existing `_colsum` above (mask +
+# `other=0.`) cannot see the difference.
+@pytest.mark.parametrize(
+    "M, N, bound, mask_axis, op, other",
+    [
+        (4, 8, 2, 0, "max", 5.0),
+        (4, 8, 2, 0, "min", -5.0),
+        (4, 8, 2, 0, "sum", 3.0),
+        (4, 8, 5, 1, "max", 5.0),      # whole columns masked
+        (4, 8, 5, 1, "min", -5.0),
+        (4, 8, 5, 1, "sum", 3.0),
+        (32, 128, 7, 0, "max", 9.5),   # E_out == 1, four warps
+        (32, 128, 7, 0, "sum", -2.5),
+        (8, 256, 3, 0, "max", 4.25),   # more columns than threads
+        (8, 256, 3, 0, "sum", 1.75),
+    ],
+    ids=["rowmask_max", "rowmask_min", "rowmask_sum", "colmask_max",
+         "colmask_min", "colmask_sum", "wide_rowmask_max", "wide_rowmask_sum",
+         "eout_rowmask_max", "eout_rowmask_sum"],
+)
+def test_reduce_axis0_masked_other_matches_torch(M, N, bound, mask_axis, op,
+                                                 other):
+    torch.manual_seed(M * 31 + N + bound)
+    inp = torch.randn(M, N)
+    rows = torch.arange(M)[:, None]
+    cols = torch.arange(N)[None, :]
+    keep = (rows < bound) if mask_axis == 0 else (cols < bound)
+    tile = torch.where(keep, inp, torch.full((M, N), other))
+    ref = (tile.max(dim=0).values if op == "max" else
+           tile.min(dim=0).values if op == "min" else tile.sum(dim=0))
+    out = torch.empty(N, device="mps")
+    _colreduce_masked_other_f32[(1,)](
+        inp.to("mps"), out, bound, other, BLOCK_M=M, BLOCK_N=N,
+        MASK_AXIS=mask_axis, OP=op, HAS_OTHER=True, num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+# Without `other` the masked value is unspecified, so the backend drives it to
+# the combine identity to keep the result deterministic. Pin that rule too:
+# it is the only case the identity substitution is correct for.
+@pytest.mark.parametrize(
+    "op, identity",
+    [("max", float("-inf")), ("min", float("inf")), ("sum", 0.0)],
+    ids=["max_identity", "min_identity", "sum_identity"],
+)
+def test_reduce_axis0_masked_without_other_uses_identity(op, identity):
+    M, N, bound = 4, 8, 2
+    torch.manual_seed(7)
+    inp = torch.randn(M, N)
+    rows = torch.arange(M)[:, None]
+    tile = torch.where(rows < bound, inp, torch.full((M, N), identity))
+    ref = (tile.max(dim=0).values if op == "max" else
+           tile.min(dim=0).values if op == "min" else tile.sum(dim=0))
+    out = torch.empty(N, device="mps")
+    _colreduce_masked_other_f32[(1,)](
+        inp.to("mps"), out, bound, 0.0, BLOCK_M=M, BLOCK_N=N, MASK_AXIS=0,
+        OP=op, HAS_OTHER=False, num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "op, other",
+    [("max", 7), ("min", -7), ("sum", 3)],
+    ids=["i32_max", "i32_min", "i32_sum"],
+)
+def test_reduce_axis0_masked_other_i32(op, other):
+    M, N, bound = 4, 16, 2
+    torch.manual_seed(11)
+    inp = torch.randint(-50, 50, (M, N), dtype=torch.int32)
+    rows = torch.arange(M)[:, None]
+    tile = torch.where(rows < bound, inp, torch.full((M, N), other,
+                                                     dtype=torch.int32))
+    ref = (tile.max(dim=0).values if op == "max" else
+           tile.min(dim=0).values if op == "min" else
+           tile.sum(dim=0).to(torch.int32))
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colreduce_masked_other_i32[(1,)](
+        inp.to("mps"), out, bound, BLOCK_M=M, BLOCK_N=N, OTHER=other, OP=op,
+        num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref)

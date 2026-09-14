@@ -116,3 +116,99 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK:   %[[SCOL:[0-9]+]] = arith.addi %{{.*}}, %[[IV2]] : i32
 // CHECK:   %[[SIDX2:[0-9]+]] = builtin.unrealized_conversion_cast %[[SCOL]] : i32 to ui32
 // CHECK:   metal.store %[[SUM2]], %{{.*}}[%[[SIDX2]]]
+
+// -----
+// A masked-off row contributes the load's `other`, not the combine identity.
+// Folding the identity in instead answers a different program: a fully masked
+// column came back as -inf for a max, and a partially masked one silently
+// dropped those rows. Only a mask with NO `other` may take the identity — that
+// value is unspecified, and the identity is what makes the result
+// deterministic (the second module below pins that half of the rule).
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @colmax_masked_other(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>, %bound: i32, %other: f32) {
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows2 = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %cN = arith.constant dense<32> : tensor<8x1xi32, #blocked>
+    %rowoff = arith.muli %rows2, %cN : tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #slice0>
+    %cols2 = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #slice0> -> tensor<1x32xi32, #blocked>
+    %rowb = tt.broadcast %rowoff : tensor<8x1xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %colb = tt.broadcast %cols2 : tensor<1x32xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %offs = arith.addi %rowb, %colb : tensor<8x32xi32, #blocked>
+    %bsplat = tt.splat %bound : i32 -> tensor<8x1xi32, #blocked>
+    %rowok = arith.cmpi slt, %rows2, %bsplat : tensor<8x1xi32, #blocked>
+    %mask = tt.broadcast %rowok : tensor<8x1xi1, #blocked> -> tensor<8x32xi1, #blocked>
+    %osplat = tt.splat %other : f32 -> tensor<8x32xf32, #blocked>
+    %base = tt.splat %in : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+    %addr = tt.addptr %base, %offs : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+    %tile = tt.load %addr, %mask, %osplat : tensor<8x32x!tt.ptr<f32>, #blocked>
+    %red = "tt.reduce"(%tile) ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxnumf %a, %b : f32
+      tt.reduce.return %mx : f32
+    }) {axis = 0 : i32} : (tensor<8x32xf32, #blocked>) -> tensor<32xf32, #slice0>
+    %ocols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked1>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked1>
+    %oaddr = tt.addptr %obase, %ocols : tensor<32x!tt.ptr<f32>, #blocked1>, tensor<32xi32, #blocked1>
+    %cv = ttg.convert_layout %red : tensor<32xf32, #slice0> -> tensor<32xf32, #blocked1>
+    tt.store %oaddr, %cv : tensor<32x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel colmax_masked_other
+// The `other` kernel argument, read once.
+// CHECK: [[OTHER:%.*]] = metal.get_element %arg3
+// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// CHECK: [[KEEP:%.*]] = arith.cmpi slt
+// CHECK: metal.get_element %arg0
+// The masked row folds in `other`, NOT an -inf identity constant.
+// CHECK: arith.select [[KEEP]], %{{.*}}, [[OTHER]] : f32
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, maxOp
+// CHECK: scf.yield
+
+// -----
+// The other half of the rule: with no `other` on the load, the masked row does
+// take the combine identity, so a max folds -inf.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @colmax_masked_no_other(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>, %bound: i32) {
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows2 = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %cN = arith.constant dense<32> : tensor<8x1xi32, #blocked>
+    %rowoff = arith.muli %rows2, %cN : tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #slice0>
+    %cols2 = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #slice0> -> tensor<1x32xi32, #blocked>
+    %rowb = tt.broadcast %rowoff : tensor<8x1xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %colb = tt.broadcast %cols2 : tensor<1x32xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %offs = arith.addi %rowb, %colb : tensor<8x32xi32, #blocked>
+    %bsplat = tt.splat %bound : i32 -> tensor<8x1xi32, #blocked>
+    %rowok = arith.cmpi slt, %rows2, %bsplat : tensor<8x1xi32, #blocked>
+    %mask = tt.broadcast %rowok : tensor<8x1xi1, #blocked> -> tensor<8x32xi1, #blocked>
+    %base = tt.splat %in : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+    %addr = tt.addptr %base, %offs : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+    %tile = tt.load %addr, %mask : tensor<8x32x!tt.ptr<f32>, #blocked>
+    %red = "tt.reduce"(%tile) ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxnumf %a, %b : f32
+      tt.reduce.return %mx : f32
+    }) {axis = 0 : i32} : (tensor<8x32xf32, #blocked>) -> tensor<32xf32, #slice0>
+    %ocols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked1>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked1>
+    %oaddr = tt.addptr %obase, %ocols : tensor<32x!tt.ptr<f32>, #blocked1>, tensor<32xi32, #blocked1>
+    %cv = ttg.convert_layout %red : tensor<32xf32, #slice0> -> tensor<32xf32, #blocked1>
+    tt.store %oaddr, %cv : tensor<32x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel colmax_masked_no_other
+// CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (f32)
+// CHECK: [[KEEP2:%.*]] = arith.cmpi slt
+// CHECK: metal.get_element %arg0
+// CHECK: [[NEGINF:%.*]] = arith.constant 0xFF800000 : f32
+// CHECK: arith.select [[KEEP2]], %{{.*}}, [[NEGINF]] : f32
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, maxOp

@@ -14217,10 +14217,36 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
       v = mlir::UnrealizedConversionCastOp::create(
               rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{v})
               .getResult(0);
-    if (maskBit)
-      v = mlir::arith::SelectOp::create(rewriter, loc, maskBit, v,
-                                        makeIdentity())
+    if (maskBit) {
+      // What a masked-off row contributes is the load's `other`, not the
+      // combine identity. Triton carries `other` through everything downstream,
+      // so discarding it here answers a different program: a column whose rows
+      // are all masked came back as -inf for a max (the identity) instead of
+      // `other`, and a partially masked column dropped those rows entirely.
+      // Only a mask with NO `other` may take the identity — that value is
+      // unspecified, and the identity is what makes the masked reduce
+      // deterministic. Same rule the rank-1 chain path settled on; the cone
+      // evaluator applies it at its own load leaves, which is why `maskBit` is
+      // only set for the direct-load form here.
+      mlir::Value masked;
+      if (mlir::Value otherVal = loadOp.getOther()) {
+        masked =
+            evalRank2ConeAt(otherVal, m, dummyRowBase, nVal, rewriter, loc, 0);
+        if (!masked)
+          return rewriter.notifyMatchFailure(
+              op, "rank-2 axis0 reduce: masked load's other value not "
+                  "evaluable");
+        if (masked.getType() != v.getType())
+          masked = mlir::UnrealizedConversionCastOp::create(
+                       rewriter, loc, mlir::TypeRange{v.getType()},
+                       mlir::ValueRange{masked})
+                       .getResult(0);
+      } else {
+        masked = makeIdentity();
+      }
+      v = mlir::arith::SelectOp::create(rewriter, loc, maskBit, v, masked)
               .getResult();
+    }
     mlir::Value s = combineScalar(acc, v);
     mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{s});
   }
