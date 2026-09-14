@@ -142,3 +142,69 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// A rank-3 tile whose blocked layout WRAPS into a second register band: 512
+// elements over 32 threads at sizePerThread 4, so the layout's own flat index
+// and the `localTid * elemPerThread + iv` order the tile's ADDRESSES use are
+// different mappings. The staged scratch is relabelled into the address order,
+// so one label serves the load, the publish and the fold. Indexing the scratch
+// by the layout instead made the fold reduce a group the kernel never
+// addressed, silently, on every axis.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1, 4], threadsPerWarp = [1, 8, 4], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank3_multi_register_band(%X: !tt.ptr<f32>, %O: !tt.ptr<f32>) attributes {noinline = false} {
+    %cst = arith.constant dense<0.000000e+00> : tensor<4x8x16xf32, #blocked>
+    %off = arith.constant dense<8> : tensor<4x1x1xi32, #blocked>
+    %off_0 = arith.constant dense<16> : tensor<4x1x1xi32, #blocked>
+    %off_1 = arith.constant dense<16> : tensor<1x8x1xi32, #blocked>
+    %i = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #blocked}>}>>
+    %i_2 = tt.expand_dims %i {axis = 1 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #blocked}>}>> -> tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #blocked}>>
+    %i_3 = tt.expand_dims %i_2 {axis = 2 : i32} : tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #blocked}>> -> tensor<4x1x1xi32, #blocked>
+    %j = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #blocked}>}>>
+    %j_4 = tt.expand_dims %j {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #blocked}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #blocked}>>
+    %j_5 = tt.expand_dims %j_4 {axis = 2 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #blocked}>> -> tensor<1x8x1xi32, #blocked>
+    %k = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #blocked}>}>>
+    %k_6 = tt.expand_dims %k {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #blocked}>}>> -> tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %k_7 = tt.expand_dims %k_6 {axis = 1 : i32} : tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<1x1x16xi32, #blocked>
+    %off_8 = arith.muli %i_3, %off : tensor<4x1x1xi32, #blocked>
+    %off_9 = arith.muli %off_8, %off_0 : tensor<4x1x1xi32, #blocked>
+    %off_10 = arith.muli %j_5, %off_1 : tensor<1x8x1xi32, #blocked>
+    %off_11 = tt.broadcast %off_9 : tensor<4x1x1xi32, #blocked> -> tensor<4x8x1xi32, #blocked>
+    %off_12 = tt.broadcast %off_10 : tensor<1x8x1xi32, #blocked> -> tensor<4x8x1xi32, #blocked>
+    %off_13 = arith.addi %off_11, %off_12 : tensor<4x8x1xi32, #blocked>
+    %off_14 = tt.broadcast %off_13 : tensor<4x8x1xi32, #blocked> -> tensor<4x8x16xi32, #blocked>
+    %off_15 = tt.broadcast %k_7 : tensor<1x1x16xi32, #blocked> -> tensor<4x8x16xi32, #blocked>
+    %off_16 = arith.addi %off_14, %off_15 : tensor<4x8x16xi32, #blocked>
+    %v = tt.splat %X : !tt.ptr<f32> -> tensor<4x8x16x!tt.ptr<f32>, #blocked>
+    %v_17 = tt.addptr %v, %off_16 : tensor<4x8x16x!tt.ptr<f32>, #blocked>, tensor<4x8x16xi32, #blocked>
+    %v_18 = tt.load %v_17 : tensor<4x8x16x!tt.ptr<f32>, #blocked>
+    %0 = tt.splat %O : !tt.ptr<f32> -> tensor<4x8x16x!tt.ptr<f32>, #blocked>
+    %1 = tt.addptr %0, %off_16 : tensor<4x8x16x!tt.ptr<f32>, #blocked>, tensor<4x8x16xi32, #blocked>
+    %2 = "tt.reduce"(%v_18) <{axis = 2 : i32}> ({
+    ^bb0(%arg2: f32, %arg3: f32):
+      %7 = arith.addf %arg2, %arg3 : f32
+      tt.reduce.return %7 : f32
+    }) : (tensor<4x8x16xf32, #blocked>) -> tensor<4x8xf32, #ttg.slice<{dim = 2, parent = #blocked}>>
+    %3 = tt.expand_dims %2 {axis = 2 : i32} : tensor<4x8xf32, #ttg.slice<{dim = 2, parent = #blocked}>> -> tensor<4x8x1xf32, #blocked>
+    %4 = arith.mulf %v_18, %cst : tensor<4x8x16xf32, #blocked>
+    %5 = tt.broadcast %3 : tensor<4x8x1xf32, #blocked> -> tensor<4x8x16xf32, #blocked>
+    %6 = arith.addf %5, %4 : tensor<4x8x16xf32, #blocked>
+    tt.store %1, %6 : tensor<4x8x16x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel reduce_rank3_multi_register_band
+// CHECK: metal.threadgroup_alloca : !metal.memref<512 x f32>
+// The publish loop runs one trip per element per thread.
+// CHECK: scf.for [[IV:%.*]] = %{{.*}} to %{{.*}} step
+// The reduced axis (extent 16, row-major stride 1) occupies the LOW bits of the
+// label: bit b of the iteration contributes 1 << b, i.e. the label is
+// localTid*16 + iv. A layout-indexed scratch put iteration bits 2 and 3 on
+// dimension 0 instead, at stride 128.
+// CHECK: arith.shrsi [[IV]], %c3
+// CHECK: arith.muli %{{.*}}, %c8_i32
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp

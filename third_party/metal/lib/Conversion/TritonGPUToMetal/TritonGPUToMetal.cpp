@@ -302,6 +302,13 @@ static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
+// Set on a rank-N reduce whose staged scratch is relabelled into the emitter's
+// own thread-major order. The decision is made from the reduce's SOURCE, and
+// the phase pre-pass later replaces that source with a placeholder, so it has
+// to be recorded on the op: every later `planRankNReduce` of the same reduce
+// must reach the same answer or the publish and the fold disagree again.
+static constexpr llvm::StringLiteral kRankNThreadMajorAttr =
+    "metal.rank_n_thread_major";
 
 static constexpr int64_t kThreadgroupBudgetBytes = 32 * 1024;
 
@@ -3050,6 +3057,82 @@ static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
         (int64_t{1} << (plan.laneBits + bit)))
       return false;
   return true;
+}
+
+// The emitter's OWN element labeling, written as a layout plan.
+//
+// `layoutFlatIndexIsThreadMajor` below answers whether a layout already agrees
+// with it. When it does not, a staged path has a choice: refuse the tile, or
+// relabel — index the scratch by this plan instead of the layout's, so the
+// label the scratch uses is the one the addresses already use. The relabel is
+// sound because it is a bijection over [0, numElements) whose row-major
+// decomposition is the SAME one the address cone performs: element `p` is read
+// from the address of row-major position `p`, so a group that shares every
+// coordinate but the reduced one is a group of the elements the kernel meant.
+//
+// Only for tiles the kernel addresses thread-major. A hypercube whose ranges
+// were emitted in layout space must keep the layout's own plan.
+// Every extent must be a power of two, so each bit of the flat label falls in
+// exactly one dimension.
+static std::optional<LayoutIndexPlan>
+threadMajorLayoutPlan(llvm::ArrayRef<int64_t> shape, int64_t threadsPerBlock) {
+  if (threadsPerBlock <= 0 || (threadsPerBlock & (threadsPerBlock - 1)) != 0)
+    return std::nullopt;
+  int64_t numElements = 1;
+  for (int64_t extent : shape) {
+    if (extent <= 0 || (extent & (extent - 1)) != 0)
+      return std::nullopt;
+    numElements *= extent;
+  }
+  const int rank = static_cast<int>(shape.size());
+  if (rank == 0)
+    return std::nullopt;
+  LayoutIndexPlan plan;
+  plan.rowMajorStride.assign(rank, 1);
+  for (int d = rank - 2; d >= 0; --d)
+    plan.rowMajorStride[d] = plan.rowMajorStride[d + 1] * shape[d + 1];
+  plan.dimTerms.assign(rank, {});
+  const int64_t elemPerThread =
+      numElements >= threadsPerBlock ? numElements / threadsPerBlock : 1;
+  plan.elemPerThread = elemPerThread;
+  plan.registerBits = static_cast<int>(llvm::Log2_64(elemPerThread));
+  const int threadBits = static_cast<int>(llvm::Log2_64(threadsPerBlock));
+  plan.laneBits = std::min(threadBits, 5);
+  plan.warpBits = threadBits - plan.laneBits;
+  const int totalBits = static_cast<int>(llvm::Log2_64(numElements));
+  for (int bit = 0; bit < totalBits; ++bit) {
+    LayoutIndexPlan::Coord coord;
+    int coordBit;
+    if (bit < plan.registerBits) {
+      coord = LayoutIndexPlan::Register;
+      coordBit = bit;
+      plan.registerUsedMask |= 1u << coordBit;
+    } else if (bit - plan.registerBits < plan.laneBits) {
+      coord = LayoutIndexPlan::Lane;
+      coordBit = bit - plan.registerBits;
+      plan.laneUsedMask |= 1u << coordBit;
+    } else {
+      coord = LayoutIndexPlan::Warp;
+      coordBit = bit - plan.registerBits - plan.laneBits;
+      if (coordBit >= plan.warpBits)
+        return std::nullopt;
+      plan.warpUsedMask |= 1u << coordBit;
+    }
+    const int64_t weight = int64_t{1} << bit;
+    int dim = -1;
+    for (int d = 0; d < rank; ++d)
+      if (weight >= plan.rowMajorStride[d] &&
+          weight < plan.rowMajorStride[d] * shape[d]) {
+        dim = d;
+        break;
+      }
+    if (dim < 0)
+      return std::nullopt;
+    plan.dimTerms[dim].push_back(
+        {coord, coordBit,
+         static_cast<int32_t>(weight / plan.rowMajorStride[dim])});
+  }
+  return plan;
 }
 
 // Everything this backend emits outside the layout-indexed phase paths places
@@ -14726,6 +14809,9 @@ struct RankNReducePlan {
   int64_t numElements = 0;
   bool multiBand = false;
   bool exactLayoutScratch = false;
+  // The staged scratch is indexed by the emitter's thread-major label instead
+  // of the source layout's own, because that is what the tile's addresses use.
+  bool threadMajorRelabel = false;
   LayoutIndexPlan srcLayout;
   LayoutIndexPlan resultLayout;
 };
@@ -14811,21 +14897,36 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // never get that treatment. Until they do, refuse the shape rather than
   // answer a different program. Replicated owners are the topk hypercube,
   // which is narrower than the CTA and never multi-band.
-  // Narrowed to the shape that actually carries thread-major addresses: a tile
-  // the kernel LOADED at rank >= 3, whose per-axis ranges are slice-encoded
-  // `tt.expand_dims` and so never reach the layout-space range emission. A
-  // hypercube stage reduces a RESHAPE of a rank-1 blocked tile instead, whose
-  // range did reach it, and stays correct.
+  // A tile the kernel LOADED at rank >= 3 is addressed thread-major: its
+  // per-axis ranges are slice-encoded `tt.expand_dims` and never reach the
+  // layout-space range emission that `tl.sort`'s blocked rank-1 ranges do. Its
+  // staged scratch must therefore carry the SAME label, or the fold groups
+  // elements the kernel never addressed. Relabel the plan rather than refuse.
+  // A hypercube stage reduces a RESHAPE of a rank-1 blocked tile whose range
+  // DID reach that emission, so it keeps the layout's own plan.
+  bool threadMajorRelabel = false;
   if (enc && srcTy.getRank() >= 3 &&
       !layoutFlatIndexIsThreadMajor(*srcIndexPlan) &&
       !layoutHasReplicatedOwners(*srcIndexPlan)) {
-    mlir::Value probe = op.getSrcs().front();
-    while (auto cvt = probe.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-      probe = cvt.getSrc();
-    if (auto load = probe.getDefiningOp<mlir::triton::LoadOp>())
-      if (auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType()))
-        if (loadTy.getRank() == srcTy.getRank())
-          return std::nullopt;
+    bool loadedAtThisRank = op->hasAttr(kRankNThreadMajorAttr);
+    if (!loadedAtThisRank) {
+      mlir::Value probe = op.getSrcs().front();
+      while (auto cvt =
+                 probe.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        probe = cvt.getSrc();
+      if (auto load = probe.getDefiningOp<mlir::triton::LoadOp>())
+        if (auto loadTy =
+                mlir::dyn_cast<mlir::RankedTensorType>(load.getType()))
+          loadedAtThisRank = loadTy.getRank() == srcTy.getRank();
+    }
+    if (loadedAtThisRank) {
+      std::optional<LayoutIndexPlan> relabel = threadMajorLayoutPlan(
+          srcTy.getShape(), srcIndexPlan->threadsPerBlock());
+      if (!relabel)
+        return std::nullopt;
+      srcIndexPlan = std::move(relabel);
+      threadMajorRelabel = true;
+    }
   }
   const int axis = static_cast<int>(op.getAxis());
   if (axis < 0 || axis >= srcTy.getRank())
@@ -14850,6 +14951,7 @@ planRankNReduce(mlir::triton::ReduceOp op) {
       [&](RankNReducePlan plan) -> std::optional<RankNReducePlan> {
     plan.numElements = numElements;
     plan.multiBand = multiBand;
+    plan.threadMajorRelabel = threadMajorRelabel;
     plan.srcLayout = *srcIndexPlan;
     // Rank-3+ reductions can change the ownership mapping even when their
     // source happens to be physical localTid order. topk's first hypercube
@@ -14860,9 +14962,15 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     std::optional<LayoutIndexPlan> resultLayout;
     if (multiBand || plan.exactLayoutScratch) {
       if (auto resultTy = mlir::dyn_cast<mlir::RankedTensorType>(
-              op->getResult(0).getType()))
-        resultLayout = planLayoutIndex(resultTy);
-      else if (srcTy.getRank() == 1)
+              op->getResult(0).getType())) {
+        // The result is consumed by ops that address it thread-major too, so a
+        // relabelled source needs a relabelled result: one labeling per kernel.
+        resultLayout =
+            threadMajorRelabel
+                ? threadMajorLayoutPlan(resultTy.getShape(),
+                                        srcIndexPlan->threadsPerBlock())
+                : planLayoutIndex(resultTy);
+      } else if (srcTy.getRank() == 1)
         resultLayout = srcIndexPlan;
       if (!resultLayout)
         return std::nullopt;
@@ -15004,6 +15112,11 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
     std::optional<RankNReducePlan> plan = planRankNReduce(reduce);
     if (!plan)
       return;
+    // Record the relabel before this pass rewrites the reduce's operand into a
+    // placeholder, which would make the source test below it answer NO.
+    if (plan->threadMajorRelabel)
+      reduce->setAttr(kRankNThreadMajorAttr,
+                      mlir::UnitAttr::get(reduce.getContext()));
     plannedReduces.push_back(reduce);
     auto srcTy =
         mlir::cast<mlir::RankedTensorType>(reduce.getSrcs().front().getType());

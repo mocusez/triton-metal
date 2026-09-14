@@ -4630,60 +4630,32 @@ def test_reduce_rank3_single_band_matches_torch(d0, d1, d2, num_warps, axis):
 
 @pytest.mark.parametrize(
     "d0,d1,d2,num_warps,axis",
-    [(4, 8, 16, 1, 2), (4, 8, 16, 2, 1), (4, 4, 64, 4, 0)],
-    ids=["e16_axis2", "e8_axis1", "e8_axis0"],
+    [
+        (4, 8, 16, 1, 2), (4, 8, 16, 1, 1), (4, 8, 16, 1, 0),
+        (4, 8, 16, 2, 1), (4, 4, 64, 4, 0), (4, 4, 64, 1, 2),
+        (2, 8, 32, 1, 1),
+    ],
+    ids=["e16_axis2", "e16_axis1", "e16_axis0", "e8_axis1", "e8_axis0",
+         "e32_axis2", "e16_mid_axis1"],
 )
-def test_reduce_rank3_multiband_fails_without_crashing(d0, d1, d2, num_warps,
-                                                       axis, tmp_path):
-    """A layout that wraps into a second register band has two mappings.
+def test_reduce_rank3_multiband_matches_torch(d0, d1, d2, num_warps, axis):
+    """A layout that wraps into a second register band carries two labels.
 
-    The staged publish stores at the LAYOUT's flat index while the value it
-    stores is the element `localTid * elemPerThread + iv` names. Those coincide
-    only while the tile fits the CTA once; past that the fold reduced the wrong
-    group and returned a plausible number. Refused by name until the rank-3
-    address cone is emitted in layout space.
+    The staged scratch used to be indexed by the LAYOUT's flat index while the
+    value in it was the element `localTid * elemPerThread + iv` names, so the
+    fold reduced a group the kernel never addressed and returned a plausible
+    number. The scratch is now relabelled into that same thread-major order, so
+    one label serves the addresses, the publish and the fold.
     """
-    import os
-    import subprocess
-    import sys
-    import textwrap
-
-    script = tmp_path / "reduce_rank3_multiband.py"
-    script.write_text(textwrap.dedent(f"""
-        import importlib.util
-        import triton
-        from triton.compiler import ASTSource
-        from triton.backends.compiler import GPUTarget
-        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        target = GPUTarget("metal", 80, 32)
-        signature = {{"X": "*fp32", "O": "*fp32"}}
-
-        def compile_case(d0, d1, d2, axis, warps):
-            triton.compile(ASTSource(
-                module._reduce_rank3_axis_kernel,
-                signature=signature,
-                constexprs={{"D0": d0, "D1": d1, "D2": d2, "AXIS": axis}}),
-                target=target, options={{"num_warps": warps}})
-
-        for attempt in range(3):
-            try:
-                compile_case({d0}, {d1}, {d2}, {axis}, {num_warps})
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("multi-band rank-3 reduce compiled")
-        compile_case(2, 4, 4, 2, 1)
-        print("RECOVERED")
-    """))
-    result = subprocess.run([sys.executable, str(script)], capture_output=True,
-                            text=True, timeout=120,
-                            env={**os.environ,
-                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
-    output = result.stdout + result.stderr
-    needle = "one register band"
-    assert result.returncode == 0, output
-    assert output.count(needle) == 3
-    assert "RECOVERED" in output
-    assert "failed to legalize" not in output
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n = d0 * d1 * d2
+    x = ((torch.arange(n) % 43).float() - 19.0) / 11.0
+    out = torch.empty(n, device="mps")
+    _reduce_rank3_axis_kernel[(1,)](x.to("mps"), out, D0=d0, D1=d1, D2=d2,
+                                    AXIS=axis, num_warps=num_warps)
+    torch.mps.synchronize()
+    tile = x.reshape(d0, d1, d2)
+    expected = tile.sum(dim=axis, keepdim=True).expand(d0, d1, d2).flatten()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=1e-4)

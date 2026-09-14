@@ -607,31 +607,3 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
-
-// -----
-// A rank-3 blocked tile whose layout WRAPS into a second register band carries
-// two element mappings at once: the staged publish stores each value at the
-// LAYOUT's flat index, while the value itself is the element
-// `localTid * elemPerThread + iv` names — the order every other emitted op
-// uses. Those coincide only while the tile fits the CTA exactly once (here 512
-// elements over 32 threads at sizePerThread 4 does not), and past that the fold
-// reduced a group of elements it never addressed, with no diagnostic. Refused
-// until the rank-3 address cone is emitted in layout space the way
-// `MakeRangeLowering` already does for tl.sort's blocked rank-1 ranges.
-#b3 = #ttg.blocked<{sizePerThread = [1, 1, 4], threadsPerWarp = [1, 8, 4], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
-#s2 = #ttg.slice<{dim = 2, parent = #b3}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank3_multi_register_band(%x: !tt.ptr<f32>) {
-    %off = arith.constant dense<0> : tensor<4x8x16xi32, #b3>
-    %base = tt.splat %x : !tt.ptr<f32> -> tensor<4x8x16x!tt.ptr<f32>, #b3>
-    %addr = tt.addptr %base, %off : tensor<4x8x16x!tt.ptr<f32>, #b3>, tensor<4x8x16xi32, #b3>
-    %t = tt.load %addr : tensor<4x8x16x!tt.ptr<f32>, #b3>
-    // expected-error @+1 {{one register band}}
-    %r = "tt.reduce"(%t) <{axis = 2 : i32}> ({
-    ^bb0(%a: f32, %b: f32):
-      %s = arith.addf %a, %b : f32
-      tt.reduce.return %s : f32
-    }) : (tensor<4x8x16xf32, #b3>) -> tensor<4x8xf32, #s2>
-    tt.return
-  }
-}
