@@ -409,19 +409,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// The legacy rank-1 masked path only replays the canonical loop-offset
-// `offset < runtime_bound` predicate. A compound max mask must fail in the
-// preflight with the named reason instead of reaching conversion rollback.
+// The legacy rank-1 masked fold rebuilds only `cmpi slt(range, splat(N))` with
+// a splat-constant `other`. Everything else is handed to the general cone
+// evaluator instead of being refused (rank1_reduce_replayed_mask.mlir), so what
+// must still be named here is a mask the EVALUATOR cannot rebuild either: one
+// carried out of an `scf.for`, which is not in its op allowlist.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank1_masked_compound_max_deferred(%x_ptr: !tt.ptr<f32>, %n: i32, %row: i32) {
+  tt.func public @reduce_rank1_masked_loop_carried_deferred(%x_ptr: !tt.ptr<f32>, %n: i32) {
     %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
     %n_splat = tt.splat %n : i32 -> tensor<128xi32, #blocked>
     %col_ok = arith.cmpi slt, %offsets, %n_splat : tensor<128xi32, #blocked>
-    %zero_i32 = arith.constant 0 : i32
-    %row_ok_scalar = arith.cmpi sge, %row, %zero_i32 : i32
-    %row_ok = tt.splat %row_ok_scalar : i1 -> tensor<128xi1, #blocked>
-    %mask = arith.andi %col_ok, %row_ok : tensor<128xi1, #blocked>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %mask = scf.for %i = %c0 to %c2 step %c1 iter_args(%m = %col_ok) -> (tensor<128xi1, #blocked>) : i32 {
+      scf.yield %m : tensor<128xi1, #blocked>
+    }
     %other = arith.constant dense<0.0> : tensor<128xf32, #blocked>
     %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
     %x_addr = tt.addptr %x_splat, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>

@@ -3880,32 +3880,24 @@ def test_reduce_rank1_masked_geometry_unsupported_caps(
     assert "failed to legalize" not in err
 
 
+# Every mask spelling the legacy fold cannot rebuild is now replayed by the
+# general cone evaluator instead of being refused (their numbers are in
+# test_reduce_rank1_mask_shape_matches_torch below). What remains a rejection is
+# a rule that is not this path's: a masked load's `other` must be uniform across
+# lanes, which `tt.load` itself enforces. A mask the EVALUATOR cannot rebuild —
+# one carried by an scf.for — still fails preflight by name, pinned in
+# reduce_unsupported.mlir::@reduce_rank1_masked_loop_carried_deferred.
 @pytest.mark.parametrize(
     "mask_mode,other_mode,operation,needle",
     [
-        ("compound", "constant", "max",
-         "rank-1 reduce B2.3 masked: mask not cmpi slt"),
-        ("ge", "constant", "max",
-         "rank-1 reduce B2.3 masked: mask not cmpi slt"),
-        ("scaled_lhs", "constant", "max",
-         "rank-1 reduce B2.3 masked: mask lhs is neither"),
-        ("shifted_mismatch", "constant", "max",
-         "rank-1 reduce B2.3 masked: loop-offset mask does not match"),
-        ("tensor_rhs", "constant", "max",
-         "rank-1 reduce B2.3 masked: mask rhs is neither"),
-        ("canonical", "runtime", "sum",
-         "rank-1 reduce B2.3 masked: `other` not splat-constant"),
         ("canonical", "tensor", "sum",
+         "Metal backend: a masked tt.load's `other` must be uniform across lanes"),
+        ("compound", "tensor", "max",
          "Metal backend: a masked tt.load's `other` must be uniform across lanes"),
     ],
     ids=[
-        "compound_mask_max",
-        "ge_mask_max",
-        "scaled_lhs_mask_max",
-        "shifted_mask_mismatch_max",
-        "tensor_rhs_mask_max",
-        "runtime_other_sum",
         "tensor_other_sum",
+        "tensor_other_compound_mask_max",
     ],
 )
 def test_reduce_rank1_mask_shape_unsupported_fails_without_crashing(
@@ -4124,12 +4116,21 @@ def test_reduce_rank1_contiguous_masked_index_unsupported_fails_without_crashing
         "runtime_other_sum",
     ],
 )
-def test_reduce_rank1_mask_shape_single_band_matches_torch(
-        mask_mode, other_mode, operation, n, runtime_base, runtime_other):
+@pytest.mark.parametrize(
+    "block,num_warps",
+    [(32, 1), (128, 1), (256, 2)],
+    ids=["e1", "e4", "e4_w2"],
+)
+def test_reduce_rank1_mask_shape_matches_torch(
+        mask_mode, other_mode, operation, n, runtime_base, runtime_other,
+        block, num_warps):
+    # At one element per thread the band's converted scalar is read directly and
+    # none of the mask rules run; above it the source is replayed per element,
+    # which is where the legacy fold's `cmpi slt(range, splat)` envelope used to
+    # refuse everything below. The two geometries must agree.
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    block = 32
     x_extent = block + max(runtime_base, 0) + 8
     x = ((torch.arange(x_extent) % 23).float() - 7.0) / 5.0
     y = torch.full((block,), float(n), dtype=torch.float32)
@@ -4162,10 +4163,23 @@ def test_reduce_rank1_mask_shape_single_band_matches_torch(
     values = torch.where(mask, x[ptr_offsets], other)
     expected = values.max() if operation == "max" else values.sum()
     out = torch.empty((), device="mps")
-    _reduce_rank1_mask_shape_kernel[(1,)](
-        x.to("mps"), y.to("mps"), out, n, runtime_base, runtime_other,
-        BLOCK=block, MASK_MODE=mask_mode, OTHER_MODE=other_mode, OP=operation,
-        num_warps=1)
+
+    def launch():
+        _reduce_rank1_mask_shape_kernel[(1,)](
+            x.to("mps"), y.to("mps"), out, n, runtime_base, runtime_other,
+            BLOCK=block, MASK_MODE=mask_mode, OTHER_MODE=other_mode,
+            OP=operation, num_warps=num_warps)
+
+    if block > 32 and mask_mode == "tensor_rhs":
+        # The one mask cone the evaluator still cannot rebuild: this bound is
+        # an `arith.fptosi` of a loaded f32 tensor, which is in neither the
+        # evaluator nor its dry-run allowlist. Refused by name before
+        # conversion rather than replayed, and it must stay that way until both
+        # learn the cast together.
+        with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal"):
+            launch()
+        return
+    launch()
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
 

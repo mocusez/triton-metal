@@ -8248,6 +8248,13 @@ static Rank1ReduceSourcePath classifyRank1ReduceSource(
     return Rank1ReduceSourcePath::SingleLoadChain;
   llvm::StringRef maskFailure;
   if (mlir::failed(inspectRank1ReduceMask(load, maskPlan, maskFailure))) {
+    // Same reasoning as the address rule below, one axis over: the legacy fold
+    // rebuilds only `cmpi slt(range [+ base], splat(N))` with a splat-constant
+    // `other`, while the evaluator replays the mask and `other` cones per
+    // element like any other value. Every other predicate, compound mask, mask
+    // index and runtime `other` is exact there, so ask it before refusing.
+    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+      return takeRichCone();
     reason = maskFailure.str();
     return Rank1ReduceSourcePath::Unsupported;
   }

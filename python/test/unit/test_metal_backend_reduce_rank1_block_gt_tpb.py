@@ -224,3 +224,122 @@ def test_reduce_rank1_replayed_address_forms(form, op, block, num_warps):
     torch.testing.assert_close(
         out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
     )
+
+
+# ---------------------------------------------------------------------------
+# Replayed masks and `other` values at more than one element per thread.
+#
+# The legacy single-load fold rebuilds only `cmpi slt(range, splat(N))` with a
+# splat-constant `other`. Everything below is handed to the general cone
+# evaluator, which replays the mask and `other` cones per element like any other
+# value. `other` is 7.5 throughout, away from both the add identity (0) and the
+# max identity (-inf), so a dropped `other` cannot hide inside the combine.
+#
+# The adjacent rejections are a mask the evaluator cannot rebuild either
+# (reduce_unsupported.mlir::@reduce_rank1_masked_loop_carried_deferred) and a
+# per-lane `other`, which `tt.load` itself refuses.
+
+
+@triton.jit
+def _reduce_rank1_mask_form_kernel(
+    X,
+    MVEC,
+    O,
+    N,
+    K,
+    FILL,
+    BLOCK: tl.constexpr,
+    FORM: tl.constexpr,
+    OP: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    if FORM == "canonical":
+        values = tl.load(X + offs, mask=offs < N, other=7.5)
+    elif FORM == "sle":
+        values = tl.load(X + offs, mask=offs <= N, other=7.5)
+    elif FORM == "sgt":
+        values = tl.load(X + offs, mask=offs > N, other=7.5)
+    elif FORM == "ne":
+        values = tl.load(X + offs, mask=offs != N, other=7.5)
+    elif FORM == "band":
+        values = tl.load(X + offs, mask=(offs < N) & (offs >= K), other=7.5)
+    elif FORM == "either":
+        values = tl.load(X + offs, mask=(offs < K) | (offs >= N), other=7.5)
+    elif FORM == "shifted_index":
+        values = tl.load(X + offs, mask=(offs + 8) < N, other=7.5)
+    elif FORM == "strided_index":
+        values = tl.load(X + offs, mask=(offs * 2) < N, other=7.5)
+    elif FORM == "mask_from_memory":
+        values = tl.load(X + offs, mask=tl.load(MVEC + offs) != 0, other=7.5)
+    elif FORM == "runtime_other":
+        values = tl.load(X + offs, mask=offs < N, other=FILL)
+    else:  # computed_other
+        values = tl.load(X + offs, mask=offs < N, other=FILL * 2.0)
+    result = tl.max(values, axis=0) if OP == "max" else tl.sum(values, axis=0)
+    tl.store(O, result)
+
+
+_MASK_FORMS = [
+    "canonical",
+    "sle",
+    "sgt",
+    "ne",
+    "band",
+    "either",
+    "shifted_index",
+    "strided_index",
+    "mask_from_memory",
+    "runtime_other",
+    "computed_other",
+]
+
+
+def _mask_form_condition(form, idx, mvec, n, k):
+    if form == "canonical":
+        return idx < n
+    if form == "sle":
+        return idx <= n
+    if form == "sgt":
+        return idx > n
+    if form == "ne":
+        return idx != n
+    if form == "band":
+        return (idx < n) & (idx >= k)
+    if form == "either":
+        return (idx < k) | (idx >= n)
+    if form == "shifted_index":
+        return idx + 8 < n
+    if form == "strided_index":
+        return idx * 2 < n
+    if form == "mask_from_memory":
+        return mvec != 0
+    return idx < n
+
+
+@pytest.mark.parametrize("form", _MASK_FORMS)
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize(
+    "block,num_warps",
+    [(128, 1), (256, 2), (64, 2)],
+    ids=["e4", "e4_w2", "e1"],
+)
+def test_reduce_rank1_replayed_mask_forms(form, op, block, num_warps):
+    torch.manual_seed(0xB0A7)
+    n = block // 2 + 1
+    k = block // 4
+    fill = 7.5
+    x = torch.randn((block,), dtype=torch.float32).contiguous()
+    mvec = (torch.arange(block) % 3 != 0).to(torch.int32).contiguous()
+    out = torch.zeros((1,), dtype=torch.float32).contiguous()
+    _reduce_rank1_mask_form_kernel[(1, 1, 1)](
+        x, mvec, out, n, k, fill, BLOCK=block, FORM=form, OP=op,
+        num_warps=num_warps,
+    )
+    idx = torch.arange(block)
+    other = fill * 2.0 if form == "computed_other" else fill
+    cond = _mask_form_condition(form, idx, mvec.cpu(), n, k)
+    ref = torch.where(cond, x.cpu(), torch.full((block,), float(other)))
+    expected = ref.max() if op == "max" else ref.sum()
+    torch.testing.assert_close(
+        out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
+    )
