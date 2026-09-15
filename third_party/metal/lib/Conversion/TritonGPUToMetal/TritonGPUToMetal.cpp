@@ -22922,6 +22922,35 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
       return mlir::failure();
   }
 
+  // A non-zero accumulator init is emitted below as a `simdgroup_load` from
+  // the DESTINATION at the store's own origin, which is the right answer for
+  // exactly one shape: `acc = tl.load(p); ...; tl.store(p, acc)`, where the
+  // kernel accumulates in place. Any other init -- a C tile from a different
+  // buffer, a different offset, or a masked read -- would be answered with
+  // the destination's contents instead of its own, silently. Decide that here,
+  // before the emission below creates any replacement op, so an init this
+  // tier cannot express leaves the dot for a later one rather than leaving a
+  // half-written rewrite behind.
+  mlir::Value accInit = forOp.getInits()[accIdx];
+  bool accInitIsZero = false;
+  if (auto cst = accInit.getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto dense =
+            mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue())) {
+      if (dense.isSplat() && dense.getSplatValue<mlir::APFloat>().isZero())
+        accInitIsZero = true;
+    }
+  }
+  if (!accInitIsZero) {
+    mlir::Value peeled = accInit;
+    while (auto cvt =
+               peeled.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      peeled = cvt.getSrc();
+    auto accInitLoad = peeled.getDefiningOp<mlir::triton::LoadOp>();
+    if (!accInitLoad || accInitLoad.getMask() ||
+        accInitLoad.getPtr() != store.getPtr())
+      return mlir::failure();
+  }
+
   // Pull base origins/strides from the iter_arg INITS (which carry the
   // pid-driven address shapes built outside the loop).
   mlir::Value aPtrsInit = forOp.getInits()[aIdx];
@@ -23057,15 +23086,6 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   // is initialized this way (iter-8 root cause for K_TILES >= 2 cases).
   // Fall back to `simdgroup_load` from the C buffer at the tile's (row,
   // col) origin if the iter_arg init is anything else.
-  mlir::Value accInitOp = forOp.getInits()[accIdx];
-  bool accInitIsZero = false;
-  if (auto cst = accInitOp.getDefiningOp<mlir::arith::ConstantOp>()) {
-    if (auto dense =
-            mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue())) {
-      if (dense.isSplat() && dense.getSplatValue<mlir::APFloat>().isZero())
-        accInitIsZero = true;
-    }
-  }
   auto emitAccInit = [&](mlir::Value cTileRow,
                          mlir::Value cTileCol) -> mlir::Value {
     if (accInitIsZero)

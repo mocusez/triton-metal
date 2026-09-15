@@ -546,6 +546,18 @@ The current dependency-ordered priorities are:
    than reading a tile along a strided K. The block shape is measured against
    torch across the output-tile grid, the steps inside an iteration and the
    iteration count, at one and four warps.
+   A `tl.dot` accumulator that does not start from zero is now checked rather
+   than assumed. The unrolled tier emits such an init as a matrix load from the
+   destination at the store's own origin, which answers one shape -- a kernel
+   that accumulates in place -- and it used to accept any non-zero init, so a C
+   tile read from a different buffer was answered with whatever the output held.
+   The init must now be an unmasked load from the store's own pointer; anything
+   else, including two kernel arguments that happen to point at the same tensor,
+   is refused by name. Sweeping the reduction width across the other dot forms a
+   kernel can write -- a transposed B, a batched rank-3 dot, a fused
+   `alpha*(A@B) + beta*C` epilogue, two dots per iteration, and an f16 store --
+   found no further wrong answers: each is refused by name at every reduction
+   width, so none of them was dropping reduction columns either.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

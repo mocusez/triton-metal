@@ -3044,3 +3044,106 @@ def test_dot_block_shape_matches_torch(M, N, K, BM, BN, BK, num_warps, dtype_in)
                           num_warps=num_warps)
     tol = 1e-4 if dtype_in is torch.float32 else 2e-2
     torch.testing.assert_close(c, ref, atol=tol, rtol=tol)
+
+
+# ----------------------------------------------------------------------------
+# Accumulator init: in place against the destination, versus a separate C.
+#
+# A non-zero `acc` init is emitted as a `simdgroup_load` from the DESTINATION
+# at the store's own origin, which answers exactly one shape -- accumulate in
+# place, `acc = tl.load(p); ...; tl.store(p, acc)`. The tier used to accept any
+# non-zero init and answer it with the destination's contents, so a C tile read
+# from a different buffer was replaced by whatever the output held.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_acc_init_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    out_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
+):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    off = offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    acc = tl.load(c_ptr + off)
+    for _ in range(0, K_TILES):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    tl.store(out_ptr + off, acc)
+
+
+@triton.jit
+def dot_acc_in_place_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
+):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    off = offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    acc = tl.load(out_ptr + off)
+    for _ in range(0, K_TILES):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    tl.store(out_ptr + off, acc)
+
+
+@pytest.mark.parametrize("BK", [8, 16, 32])
+def test_dot_accumulate_in_place_matches_torch(BK):
+    M = N = 32
+    K = 64
+    torch.manual_seed(0xACC1)
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((K, N), dtype=torch.float32)
+    out = torch.randn((M, N), dtype=torch.float32)
+    ref = a @ b + out.clone()
+    dot_acc_in_place_kernel[(M // 16, N // 16)](
+        a, b, out, K, 1, N, 1, N, 1,
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=BK, K_TILES=K // BK,
+    )
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_dot_accumulator_from_other_buffer_is_named(capfd):
+    """A C tile that is not the destination must be refused, not substituted."""
+    M = N = 32
+    K = 64
+    torch.manual_seed(0xACC2)
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((K, N), dtype=torch.float32)
+    c = torch.randn((M, N), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    with pytest.raises(Exception):
+        dot_acc_init_kernel[(M // 16, N // 16)](
+            a, b, c, out, K, 1, N, 1, N, 1,
+            BLOCK_M=16, BLOCK_N=16, BLOCK_K=16, K_TILES=K // 16,
+        )
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
