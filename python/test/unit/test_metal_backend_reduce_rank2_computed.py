@@ -857,3 +857,79 @@ def test_rank3_reduce_rank2_store_matches_torch(shape, num_warps, axis):
         x, out, A=a, B=b, C=c, AXIS=axis, num_warps=num_warps)
     torch.testing.assert_close(out.reshape(expected.shape), expected,
                                atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_permuted_reduce_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                                  C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = tl.load(X + a * (B * C) + b * C + c)
+    s = tl.sum(tl.permute(v, (0, 2, 1)), axis=2)
+    r0 = tl.arange(0, A)[:, None]
+    r1 = tl.arange(0, C)[None, :]
+    tl.store(O + r0 * C + r1, s)
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps",
+    [((4, 8, 8), 1), ((8, 8, 8), 2), ((2, 4, 8), 1)],
+    ids=["4x8x8_w1", "8x8x8_w2", "2x4x8_w1"],
+)
+def test_rank3_permuted_reduce_is_rejected_not_wrong(shape, num_warps,
+                                                     tmp_path):
+    # The staged publish addresses each element by its position in the ORIGINAL
+    # tile and labels it by the tile's layout; a `tl.permute` in between breaks
+    # that pairing, and above one register band the fold summed a scattered set
+    # of elements. A stored `tl.permute` at rank >= 3 was already refused by
+    # name, so the reduced form is refused too rather than being right only
+    # where the two labellings happen to coincide.
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    a, b, c = shape
+    script = tmp_path / "rank3_permuted_reduce.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location(
+            "rank2_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+
+        for attempt in range(3):
+            try:
+                triton.compile(ASTSource(
+                    module._rank3_permuted_reduce_kernel,
+                    signature={{"X": "*fp32", "O": "*fp32"}},
+                    constexprs={{"A": {a}, "B": {b}, "C": {c}}}),
+                    target=target, options={{"num_warps": {num_warps}}})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a permuted rank-3 reduce compiled")
+        # The unpermuted neighbour is supported and stays so.
+        triton.compile(ASTSource(
+            module._rank3_reduce_rank2_store_kernel,
+            signature={{"X": "*fp32", "O": "*fp32"}},
+            constexprs={{"A": {a}, "B": {b}, "C": {c}, "AXIS": 1}}),
+            target=target, options={{"num_warps": {num_warps}}})
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "rank >= 3 reduce over a permuted tile is not implemented"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output

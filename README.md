@@ -417,8 +417,10 @@ The current dependency-ordered priorities are:
    that conversion used to publish by the result type's slice encoding instead
    of by the plan the reduce actually used, so each thread's sum landed in
    another element's slot above one register band. `tl.permute` followed by a
-   reduce is still wrong in the same regime and is the next slice; a stored
-   `tl.permute` is refused by name.
+   rank >= 3 reduce is refused by name, the way a stored `tl.permute` already
+   is: the staged publish addresses each element by its position in the original
+   tile and labels it by the tile's layout, and a permutation between the load
+   and the reduce breaks that pairing.
    The `tl.dot_scaled` matcher and the unsupported-op validator have been probed
    as whole families: every refusal they raise for a shape a kernel can express
    is named and raised before conversion, and the supported shapes — e4m3 and

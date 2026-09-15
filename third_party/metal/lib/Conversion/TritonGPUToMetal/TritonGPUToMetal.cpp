@@ -15082,6 +15082,33 @@ lowerRank2Axis1ArgminReduce(mlir::triton::ReduceOp op,
 // The pattern and the pre-pass both call this, so a shape the pattern would
 // decline is named by the pre-pass instead of reaching applyFullConversion with
 // no match — which kills the process rather than raising.
+// Does this reduce read a tile that a `tt.trans` (`tl.permute`) produced?
+// The staged publish takes each element's ADDRESS from its thread-major
+// position in the tile and its SLOT from the tile's layout, and a permutation
+// between the load and the reduce breaks that pairing: the address side is
+// still computed against the ORIGINAL coordinates while the slot side speaks
+// the permuted tile's. Above one register band the two diverge and the fold
+// sums a scattered set of elements -- measured wrong on 6 of 18 swept cells,
+// and right on the others only because the two labellings coincide there.
+// A rank >= 3 `tl.permute` whose result is STORED is already refused by name;
+// this is the one spelling that was accepted and wrong.
+static bool rankNReduceSourceIsPermuted(mlir::triton::ReduceOp op) {
+  mlir::Value src = op.getSrcs().front();
+  for (int depth = 0; depth < 8; ++depth) {
+    mlir::Operation *def = src.getDefiningOp();
+    if (!def)
+      return false;
+    if (mlir::isa<mlir::triton::TransOp>(def))
+      return true;
+    if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(def)) {
+      src = def->getOperand(0);
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 struct RankNReducePlan {
   TileInfo tile;
   mlir::triton::gpu::BlockedEncodingAttr enc;
@@ -37367,6 +37394,17 @@ struct ConvertTritonGPUToMetalPass
       // BEFORE the specialised row scanners' restrictions below, so a shape it
       // covers is not rejected for a path it never needed.
       const bool stagedFallback = planRankNReduce(red).has_value();
+      if (rtt && rtt.getRank() >= 3 && stagedFallback &&
+          rankNReduceSourceIsPermuted(red)) {
+        red.emitOpError(
+            "rank >= 3 reduce over a permuted tile is not implemented: the "
+            "staged publish addresses each element by its position in the "
+            "original tile and labels it by the permuted one, so a "
+            "tl.permute between the load and the reduce is refused, as a "
+            "stored tl.permute already is");
+        reduceOk = false;
+        return;
+      }
       if (rtt && rtt.getRank() >= 3) {
         if (stagedFallback)
           return;
