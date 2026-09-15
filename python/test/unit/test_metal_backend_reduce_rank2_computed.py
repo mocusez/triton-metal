@@ -933,3 +933,63 @@ def test_rank3_permuted_reduce_is_rejected_not_wrong(shape, num_warps,
     assert output.count(needle) == 3, output
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
+
+
+# The rank-3 defect above came from sweeping a producer only through the
+# consumer its implementation was built against. Sweeping every staged producer
+# through the consumers a user writes (store, one elementwise op, broadcast back,
+# consumed twice) found the rank-2 families clean across E = 1..16 --
+# `.omc/fuzz/consumer_shapes.py`, 132 cells, 123 OK and 9 named refusals for the
+# documented axis-extent limit. These pin the widest geometry of that sweep so
+# the blind spot cannot reopen one rank down.
+
+
+@triton.jit
+def _rank2_reduce_consumer_kernel(X, O, M: tl.constexpr, N: tl.constexpr,
+                                  AXIS: tl.constexpr, HOW: tl.constexpr):
+    r = tl.arange(0, M)[:, None]
+    c = tl.arange(0, N)[None, :]
+    v = tl.load(X + r * N + c)
+    s = tl.sum(v, axis=AXIS)
+    if HOW == "broadcast":
+        b = s[None, :] if AXIS == 0 else s[:, None]
+        tl.store(O + r * N + c, v - b)
+    elif HOW == "arith":
+        if AXIS == 0:
+            tl.store(O + tl.arange(0, N), s * 2.0 + 1.0)
+        else:
+            tl.store(O + tl.arange(0, M), s * 2.0 + 1.0)
+    else:
+        if AXIS == 0:
+            tl.store(O + tl.arange(0, N), s)
+        else:
+            tl.store(O + tl.arange(0, M), s)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("how", ["store", "arith", "broadcast"])
+@pytest.mark.parametrize(
+    "shape,num_warps",
+    [((16, 32), 1), ((32, 32), 2)],
+    ids=["16x32_w1_e16", "32x32_w2_e16"],
+)
+def test_rank2_reduce_consumer_shapes_match_torch(axis, how, shape, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    m, n = shape
+    torch.manual_seed(0x513E)
+    x = (torch.randn(m * n, dtype=torch.float32) * 0.1).contiguous()
+    xm = x.reshape(m, n)
+    s = xm.sum(axis)
+    if how == "broadcast":
+        expected = xm - (s[None, :] if axis == 0 else s[:, None])
+    elif how == "arith":
+        expected = s * 2.0 + 1.0
+    else:
+        expected = s
+    out = torch.zeros(expected.numel(), dtype=torch.float32).contiguous()
+    _rank2_reduce_consumer_kernel[(1, 1, 1)](
+        x, out, M=m, N=n, AXIS=axis, HOW=how, num_warps=num_warps)
+    torch.testing.assert_close(out.reshape(expected.shape), expected,
+                               atol=2e-3, rtol=2e-3)
