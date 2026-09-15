@@ -22936,10 +22936,35 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   // Locate the store consuming the for's accumulator result.
   if (!forOp.getResult(accIdx).hasOneUse())
     return mlir::failure();
-  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
-      *forOp.getResult(accIdx).getUsers().begin());
+  // A matmul that writes a narrower element than its f32 accumulator puts one
+  // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
+  // `arith.truncf`, and the layout convert an f32 accumulator loses to an
+  // earlier pass survives here because it hangs off the truncation. Only a
+  // MASKED store can carry the narrowing: it stages through an f32 threadgroup
+  // slot and casts on the element write, while the unmasked path would need a
+  // Metal overload writing an f32 matrix into a half buffer, which does not
+  // exist.
+  mlir::Operation *accUser = *forOp.getResult(accIdx).getUsers().begin();
+  mlir::arith::TruncFOp narrowing;
+  mlir::triton::gpu::ConvertLayoutOp narrowCvt;
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
+    if (!trunc.getResult().hasOneUse())
+      return mlir::failure();
+    narrowing = trunc;
+    accUser = *trunc.getResult().getUsers().begin();
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(accUser)) {
+      if (!cvt.getResult().hasOneUse())
+        return mlir::failure();
+      narrowCvt = cvt;
+      accUser = *cvt.getResult().getUsers().begin();
+    }
+  }
+  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(accUser);
   if (!store)
     return mlir::failure();
+  if (narrowing && !store.getMask())
+    return mlir::failure();
+
   // AC2: allow a masked store of the canonical 2D form. If the mask doesn't
   // decompose into the (offs_m < M) & (offs_n < N) pattern, bail to preserve
   // correctness — other mask shapes are out of scope for this AC.
@@ -23110,7 +23135,12 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
 
   mlir::Value aBuf = bridgePtrToMemref(builder, loc, aPtr, elemTy);
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
-  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
+  mlir::Type cElemTy = elemTy;
+  if (narrowing)
+    if (auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(
+            store.getValue().getType()))
+      cElemTy = vTy.getElementType();
+  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, cElemTy);
   mlir::Value aRowExt = emitExtentUi32(builder, loc, ui32, aLoadExt.mExtent);
   mlir::Value aColExt = emitExtentUi32(builder, loc, ui32, aLoadExt.nExtent);
   mlir::Value bRowExt = emitExtentUi32(builder, loc, ui32, bLoadExt.mExtent);
@@ -23335,9 +23365,14 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     }
   }
 
-  // Erase originals.
+  // Erase originals. The narrowing convert chain sits between the loop and the
+  // store and holds the loop's result, so it has to go before the loop does.
   recordMatrixWarpDownselection(dot, requestedWarps, activeWarps);
   store.erase();
+  if (narrowCvt)
+    narrowCvt.erase();
+  if (narrowing)
+    narrowing.erase();
   forOp.erase();
   return mlir::success();
 }
@@ -23634,9 +23669,36 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
 
   if (!forOp.getResult(accIdx).hasOneUse())
     return mlir::failure();
-  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
-      *forOp.getResult(accIdx).getUsers().begin());
+  // A matmul that writes a narrower element than its f32 accumulator puts one
+  // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
+  // `arith.truncf`, and the layout convert an f32 accumulator loses to an
+  // earlier pass survives here because it hangs off the truncation. The
+  // recompute tier next door already steps through both; this one did not, so
+  // the canonical fp16 matmul -- the tutorial's own kernel, which advances its
+  // pointers -- matched no tier at all and was refused by name. Only a MASKED
+  // store can carry the narrowing: it stages through an f32 threadgroup slot
+  // and casts on the element write, while the unmasked path would need a Metal
+  // overload writing an f32 matrix into a half buffer, which does not exist.
+  mlir::Operation *accUser =
+      *forOp.getResult(accIdx).getUsers().begin();
+  mlir::arith::TruncFOp narrowing;
+  mlir::triton::gpu::ConvertLayoutOp narrowCvt;
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
+    if (!trunc.getResult().hasOneUse())
+      return mlir::failure();
+    narrowing = trunc;
+    accUser = *trunc.getResult().getUsers().begin();
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(accUser)) {
+      if (!cvt.getResult().hasOneUse())
+        return mlir::failure();
+      narrowCvt = cvt;
+      accUser = *cvt.getResult().getUsers().begin();
+    }
+  }
+  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(accUser);
   if (!store)
+    return mlir::failure();
+  if (narrowing && !store.getMask())
     return mlir::failure();
   MaskExtents maskExtents;
   if (store.getMask()) {
@@ -23785,7 +23847,14 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
                                       cBaseOffset.value);
   mlir::Value aBuf = bridgePtrToMemref(builder, loc, aPtr, elemTy);
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
-  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
+  // The destination carries the STORE's element type, narrower than the
+  // accumulator whenever a convert was stepped through above.
+  mlir::Type cElemTy = elemTy;
+  if (narrowing)
+    if (auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(
+            store.getValue().getType()))
+      cElemTy = vTy.getElementType();
+  mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, cElemTy);
 
   auto toUi32 = [&](mlir::OpBuilder &b, mlir::Value v) -> mlir::Value {
     if (v.getType() == ui32)
@@ -23963,6 +24032,11 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
 
   recordMatrixWarpDownselection(dot, requestedWarps, activeWarps);
   store.erase();
+  // The narrowing convert chain holds the loop's result; erase it first.
+  if (narrowCvt)
+    narrowCvt.erase();
+  if (narrowing)
+    narrowing.erase();
   forOp.erase();
   return mlir::success();
 }

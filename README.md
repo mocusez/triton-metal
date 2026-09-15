@@ -596,6 +596,19 @@ The current dependency-ordered priorities are:
    that claims a real transpose also addresses its operands by origins alone
    and cannot honour a scalar base offset on any of the three buffers, so it
    now declines one instead of writing, and reading, at the buffer's origin.
+   The canonical fp16 matmul compiles. Writing an `f16` result puts a dtype
+   convert, and the layout convert that hangs off it, between the accumulation
+   loop and the store. The tier that recomputes its addresses each iteration
+   stepped through that pair; the two that advance their pointers -- which is
+   what the tutorial's own kernel does, and every kernel copied from it -- did
+   not, so an fp16 matmul with a flat swizzled grid matched no tier at all and
+   was refused by name at every block shape and warp count. Both now step
+   through it, bridge the destination with the store's element type, and erase
+   the convert chain with the loop it belonged to. The narrowing still requires
+   a masked store, which stages through an f32 slot and casts on the element
+   write; an unmasked one would need a Metal overload that does not exist. A
+   64x64 block at a single warp stays refused, over the accumulator register
+   budget.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

@@ -3467,3 +3467,78 @@ def test_dot_transposed_b_strided_dense_axis_is_named(capfd, real_trans):
     with pytest.raises(Exception):
         _run_transposed_b(real_trans=real_trans, use_off=False, sbk=2)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# The form every Triton matmul is actually written in: a flat grid with
+# group-ordered swizzling, pointer advance, masked loads and a masked store.
+#
+# Writing an f16 result puts an `arith.truncf` (plus the layout convert that
+# hangs off it) between the loop and the store. The recompute tier stepped
+# through that pair; the pointer-advance tiers did not, so the tutorial's own
+# fp16 kernel matched no tier and was refused by name at every block shape.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_swizzled_grid_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BM + tl.arange(0, BM)) % M
+    offs_bn = (pid_n * BN + tl.arange(0, BN)) % N
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_am[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] * N + offs_bn[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, tl.cdiv(K, BK)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - kk * BK, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - kk * BK, other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BK
+        b_ptrs += BK * N
+    offs_cm = pid_m * BM + tl.arange(0, BM)
+    offs_cn = pid_n * BN + tl.arange(0, BN)
+    tl.store(c_ptr + offs_cm[:, None] * N + offs_cn[None, :],
+             acc.to(c_ptr.dtype.element_ty),
+             mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+
+
+@pytest.mark.parametrize("group_m", [1, 8], ids=["row_major", "grouped"])
+@pytest.mark.parametrize("BK", [16, 32])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16], ids=["f32", "f16"]
+)
+@pytest.mark.parametrize(
+    "M,N,K", [pytest.param(128, 128, 128, id="exact"),
+              pytest.param(100, 132, 96, id="ragged")]
+)
+def test_dot_swizzled_grid_matches_torch(M, N, K, dtype, BK, group_m):
+    torch.manual_seed(0x5017)
+    a = torch.randn((M, K), dtype=dtype)
+    b = torch.randn((K, N), dtype=dtype)
+    out = torch.zeros((M, N), dtype=dtype)
+    grid = (triton.cdiv(M, 32) * triton.cdiv(N, 32),)
+    dot_swizzled_grid_kernel[grid](
+        a, b, out, M, N, K, BM=32, BN=32, BK=BK, GROUP_M=group_m,
+        num_warps=1,
+    )
+    ref = a.float() @ b.float()
+    tol = 3e-3 if dtype is torch.float32 else 3e-1
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
