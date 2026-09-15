@@ -2821,3 +2821,81 @@ def test_batched_dot_matches_torch(BATCH, M, N, K):
     _batched_dot_kernel[(1,)](a.to("mps"), b.to("mps"), c, BATCH, M, N, K)
     torch.mps.synchronize()
     torch.testing.assert_close(c.cpu(), torch.bmm(a, b), atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _direct_dot_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    m = tl.arange(0, M)[:, None]
+    n = tl.arange(0, N)[None, :]
+    a = tl.load(A + m * K + tl.arange(0, K)[None, :])
+    b = tl.load(B + tl.arange(0, K)[:, None] * N + n)
+    tl.store(C + m * N + n, tl.dot(a, b))
+
+
+@pytest.mark.parametrize(
+    "M, N, num_warps",
+    [
+        # E == 2: the output tile needs a second register band, so the tile
+        # loop runs twice and the two labellings of an element stop agreeing.
+        (8, 16, 2),
+        (8, 32, 4),
+        (16, 8, 2),
+        (16, 16, 4),
+        (16, 32, 8),
+        (32, 8, 4),
+        (32, 16, 8),
+        (64, 8, 8),
+        # E == 1 and E == 4 controls: the loop vanishes or the bands line up,
+        # and these were already exact before the fix.
+        (16, 16, 8),
+        (32, 32, 4),
+    ],
+)
+def test_direct_dot_multi_register_band_matches_torch(M, N, num_warps):
+    """A loop-free unmasked single-tile dot whose result needs two register bands.
+
+    The SIMD-group path publishes the whole result tile into threadgroup scratch
+    and every thread reads its own element back by ABSOLUTE element number. The
+    scratch read took that number from the dot's own blocked encoding while the
+    store address was decomposed from a same-shaped sibling encoding left behind
+    by a folded `ttg.convert_layout` — `tid * E + iv` against `tid + iv * T`.
+    Both are bijections over the tile, so an elementwise kernel cancels the
+    difference and only this scratch exposes it: every E == 2 shape was wrong,
+    every E == 1 shape exact.
+    """
+    K = 32
+    torch.manual_seed(M * 1000 + N)
+    a = torch.rand(M, K, dtype=torch.float32) * 2 - 1
+    b = torch.rand(K, N, dtype=torch.float32) * 2 - 1
+    c = torch.zeros(M * N, dtype=torch.float32, device="mps")
+    _direct_dot_kernel[(1,)](
+        a.to("mps"), b.to("mps"), c, M=M, N=N, K=K, num_warps=num_warps
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(
+        c.cpu().reshape(M, N), a @ b, atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("num_warps", [2, 4])
+@pytest.mark.parametrize("K", [8, 16, 32])
+def test_direct_dot_8x8_reduction_longer_than_one_simdgroup_tile(K, num_warps):
+    """An 8x8 result whose reduction is longer than the 8x8 matrix unit.
+
+    `rewriteSingleDot`'s single-iteration path emits exactly one
+    `simdgroup_multiply_accumulate` and no K loop, and it gated only on the
+    RESULT shape. An 8x32 by a 32x8 also produces an 8x8 result: it computed
+    k in [0, 8) and read the 8x32 operand with the hardcoded row stride 8.
+    K == 8 is the only reduction this path may claim.
+    """
+    torch.manual_seed(K * 31 + num_warps)
+    a = torch.rand(8, K, dtype=torch.float32) * 2 - 1
+    b = torch.rand(K, 8, dtype=torch.float32) * 2 - 1
+    c = torch.zeros(64, dtype=torch.float32, device="mps")
+    _direct_dot_kernel[(1,)](
+        a.to("mps"), b.to("mps"), c, M=8, N=8, K=K, num_warps=num_warps
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(
+        c.cpu().reshape(8, 8), a @ b, atol=1e-4, rtol=1e-4
+    )

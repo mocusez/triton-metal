@@ -327,6 +327,18 @@ being approximated with a racy load/modify/store sequence.
   result layout conversion; mismatched A/B/output batch bounds fail closed.
   Mixed-format loop payloads, dynamic or masked loops, non-contiguous/dynamic
   scale batch strides, and arbitrary layout combinations remain unsupported.
+  A direct, loop-free single-tile dot is exact at any number of elements per
+  thread. Its SIMD-group path publishes the result tile into threadgroup
+  scratch and reads each element back by absolute element number, so the
+  address cone and the value must be labelled alike; a folded result layout
+  conversion used to leave a same-shaped sibling encoding behind, and every
+  output tile needing a second register band was wrong. An 8x8 result whose
+  reduction is longer than one 8x8 matrix tile now takes the tier that carries
+  a K loop instead of the single-accumulate path, which had computed only the
+  first 8 of K.
+  A loop-free dot over operands that are sub-tiles of a WIDER buffer is a known
+  remaining gap at M, N >= 16: it can return wrong numbers rather than failing
+  closed, and whether it does depends on what ran before it.
 - **Launching requires PyTorch MPS.** Triton's normal on-disk cache stores the
   terminal MSL text, while `torch.mps.compile_shader` returns only an in-process
   shader library/callable and exposes no public `.metallib` or PSO handle. The

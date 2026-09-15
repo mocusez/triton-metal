@@ -2756,6 +2756,49 @@ emitTileAxisCoord(mlir::Operation *op, const TileInfo &tile,
                                     loc);
 }
 
+// Take the per-thread arrangement from the encoding this range actually
+// carries, not from whichever same-shaped tensor the module-wide answer picked.
+//
+// `findLargestRank2Tile` answers by element COUNT. When a kernel holds two
+// rank-2 tensors of the SAME shape under different blocked encodings it can
+// hand back the one this range does not belong to: rank, shape and thread
+// count all agree and only `sizePerThread` differs — `[1, 1]` against `[1, 2]`
+// — which is precisely the bit `emitTileFlatIndex` reads to choose between
+// `tid + iv*T` and `tid*E + iv`. A `ttg.convert_layout` folded between a dot
+// and its store leaves exactly that pair behind.
+//
+// Both forms are bijections over the same tile, so an address cone decomposed
+// under one and a value labelled under the other still cover every element and
+// elementwise code cancels the difference. Only a buffer indexed by ABSOLUTE
+// element number can tell them apart, and the SIMD-group dot publishes its
+// result tile into one: it read `scratch[tid*E + iv]` while the store sent it
+// to the address for element `tid + iv*T`. Garbage at E == 2, exact at E == 1
+// where the tile loop vanishes and the two collapse.
+//
+// Rebuilding from `parent` keeps the divisor, the order and the per-thread
+// arrangement on one tensor. In the overwhelming majority — a kernel with a
+// single rank-2 blocked layout — `parent` IS that tensor's encoding and this
+// returns `tile` unchanged.
+static TileInfo
+retileFromRangeParent(const TileInfo &tile,
+                      mlir::triton::gpu::BlockedEncodingAttr parent) {
+  auto sizePerThread = parent.getSizePerThread();
+  if (sizePerThread.size() != tile.shape.size())
+    return tile;
+  int64_t tpb = 1;
+  for (auto t : parent.getThreadsPerWarp())
+    tpb *= t;
+  for (auto w : parent.getWarpsPerCTA())
+    tpb *= w;
+  // A parent that does not describe this tile's thread count is not the
+  // encoding this range is laid out under; leave the module-wide answer alone.
+  if (tpb != tile.threadsPerBlock)
+    return tile;
+  TileInfo out = tile;
+  out.contiguous = llvm::any_of(sizePerThread, [](auto s) { return s > 1; });
+  return out;
+}
+
 // Largest non-pointer rank-`rank` blocked tensor in the module — the tile whose
 // geometry every op of that rank shares. Mirrors the rank-2 walk; the rank-3
 // broadcast path had its own copy of this loop.
@@ -3686,7 +3729,8 @@ struct MakeRangeLowering
               return mlir::success();
             }
             rewriter.replaceOp(
-                op, emitTileAxisCoord(op, *tile, parent, axis, rewriter, loc));
+                op, emitTileAxisCoord(op, retileFromRangeParent(*tile, parent),
+                                      parent, axis, rewriter, loc));
             return mlir::success();
           }
         }
@@ -26984,8 +27028,15 @@ static bool sdDotEligible(mlir::triton::DotOp dot) {
     return false;
   if (M % 8 != 0 || N % 8 != 0)
     return false;
-  if (M == 8 && N == 8)
-    return false;
+  // An 8x8 result is `rewriteSingleDot`'s shape -- but only when the REDUCTION
+  // is a single 8-long tile too, which is what makes it one
+  // `simdgroup_multiply_accumulate` with no K loop. `tl.dot` of an 8x32 by a
+  // 32x8 also produces an 8x8 result and needs the loop, so it belongs here.
+  if (M == 8 && N == 8) {
+    auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
+    if (!aTy || aTy.getRank() != 2 || aTy.getShape()[1] <= 8)
+      return false;
+  }
   return true;
 }
 
@@ -28512,6 +28563,21 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
     return;
   auto shape = resTy.getShape();
   if (shape.size() != 2 || shape[0] != 8 || shape[1] != 8)
+    return;
+  // ...and the reduction must be 8 long, because this path emits exactly ONE
+  // `simdgroup_multiply_accumulate` and no K loop. The result shape says
+  // nothing about K: `tl.dot` of an 8x32 by a 32x8 also produces 8x8, and this
+  // path computed only k in [0, 8) of it while the 8x32 operand's row stride
+  // fell back to the hardcoded 8 warned about below. Both wrong, no
+  // diagnostic. Every other output shape already leaves through a tier that
+  // carries a K loop; an 8x8 result is the one shape that reaches here.
+  auto aOperandTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
+  auto bOperandTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(dot.getB().getType());
+  if (!aOperandTy || aOperandTy.getRank() != 2 || aOperandTy.getShape()[1] != 8)
+    return;
+  if (!bOperandTy || bOperandTy.getRank() != 2 || bOperandTy.getShape()[0] != 8)
     return;
 
   auto aLoad = dot.getA().getDefiningOp<mlir::triton::LoadOp>();
