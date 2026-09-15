@@ -445,6 +445,10 @@ The current dependency-ordered priorities are:
    kernel never addressed. `tl.sort` and `tl.topk` keep the layout's own
    indexing — their ranges are emitted in layout space, so for them the two
    already agree.
+   That fold is measured across every combine the backend recognizes, not only
+   `add`: the arithmetic, extremum, bitwise and replayed-region forms over f32,
+   i32 and f16, and masked loads whose `other` is deliberately away from the
+   combine's identity, so a dropped `other` cannot hide inside it.
    Tiles of rank >= 4 are refused by name before conversion: their per-axis
    ranges have no per-element index, so the whole tile is unsupported, not only
    a reduction over it. A rank-3 reduction over a tile accumulated by an

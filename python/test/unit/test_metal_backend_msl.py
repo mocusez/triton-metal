@@ -4875,3 +4875,139 @@ def test_reduce_rank4_and_loop_carried_fail_without_crashing(
     assert output.count(needle) >= 3, output
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
+
+
+@triton.jit
+def _rank3_mul(a, b):
+    return a * b
+
+
+@triton.jit
+def _rank3_and(a, b):
+    return a & b
+
+
+@triton.jit
+def _rank3_xor(a, b):
+    return a ^ b
+
+
+@triton.jit
+def _rank3_larger_square(a, b):
+    return tl.where(a * a > b * b, a, b)
+
+
+@triton.jit
+def _reduce_rank3_combine_kernel(X, O, BOUND, OTHER, D0: tl.constexpr,
+                                 D1: tl.constexpr, D2: tl.constexpr,
+                                 AXIS: tl.constexpr, OP: tl.constexpr,
+                                 MASKED: tl.constexpr):
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    off = i * D1 * D2 + j * D2 + k
+    if MASKED:
+        v = tl.load(X + off, mask=k < BOUND, other=OTHER)
+    else:
+        v = tl.load(X + off)
+    if OP == "max":
+        r = tl.max(v, axis=AXIS)
+    elif OP == "min":
+        r = tl.min(v, axis=AXIS)
+    elif OP == "prod":
+        r = tl.reduce(v, AXIS, _rank3_mul)
+    elif OP == "and":
+        r = tl.reduce(v, AXIS, _rank3_and)
+    elif OP == "xor":
+        r = tl.reduce(v, AXIS, _rank3_xor)
+    elif OP == "custom":
+        r = tl.reduce(v, AXIS, _rank3_larger_square)
+    else:
+        r = tl.sum(v, axis=AXIS)
+    if AXIS == 2:
+        rb = r[:, :, None]
+    elif AXIS == 1:
+        rb = r[:, None, :]
+    else:
+        rb = r[None, :, :]
+    tl.store(O + off, rb + v * 0)
+
+
+def _rank3_combine_reference(torch, tile, axis, op):
+    if op == "sum":
+        return tile.sum(axis)
+    if op == "max":
+        return tile.amax(axis)
+    if op == "min":
+        return tile.amin(axis)
+    if op == "prod":
+        return tile.prod(axis)
+    moved = tile.movedim(axis, -1)
+    acc = moved[..., 0].clone()
+    for step in range(1, moved.shape[-1]):
+        nxt = moved[..., step]
+        if op == "and":
+            acc = acc & nxt
+        elif op == "xor":
+            acc = acc ^ nxt
+        else:
+            acc = torch.where(acc * acc > nxt * nxt, acc, nxt)
+    return acc
+
+
+@pytest.mark.parametrize(
+    "d0,d1,d2,num_warps,axis,op,dtype,masked",
+    [
+        # The staged path only ever had `add` under test. Every other combine,
+        # in the multi-band regime the scratch relabel governs.
+        (4, 8, 16, 1, 2, "prod", "f32", False),
+        (4, 8, 16, 1, 1, "min", "f32", False),
+        (4, 8, 16, 1, 0, "custom", "f32", False),
+        (4, 4, 64, 1, 2, "max", "f32", False),
+        (4, 8, 16, 1, 2, "xor", "i32", False),
+        (4, 8, 16, 1, 1, "and", "i32", False),
+        (4, 8, 16, 4, 0, "prod", "i32", False),
+        (8, 4, 4, 1, 2, "custom", "f32", False),
+        # A masked lane's `other`, deliberately away from every identity: with
+        # 0 and a sum, a dropped `other` is invisible.
+        (4, 8, 16, 1, 2, "max", "f32", True),
+        (4, 8, 16, 1, 1, "prod", "f32", True),
+        (4, 8, 16, 4, 0, "min", "f32", True),
+    ],
+    ids=["prod_axis2", "min_axis1", "custom_axis0", "max_wide", "xor_i32",
+         "and_i32", "prod_i32_nw4", "custom_single_band", "masked_max",
+         "masked_prod", "masked_min_nw4"],
+)
+def test_reduce_rank3_combines_match_torch(d0, d1, d2, num_warps, axis, op,
+                                           dtype, masked):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n = d0 * d1 * d2
+    if dtype == "i32":
+        if op in ("and", "xor"):
+            x = (torch.arange(n) * 2654435761 % 4096).to(torch.int32)
+        else:
+            x = ((torch.arange(n) % 3) - 1).to(torch.int32)
+    else:
+        base = ((torch.arange(n) % 43).float() - 19.0) / 11.0
+        x = 1.0 + base * 0.03 if op == "prod" else base
+    bound = max(1, d2 - 5)
+    other = {"max": 7.5, "min": -7.5, "prod": 1.5, "sum": 3.25}.get(op, 0.0)
+
+    out = torch.empty(n, dtype=x.dtype, device="mps")
+    _reduce_rank3_combine_kernel[(1,)](
+        x.to("mps"), out, bound, other, D0=d0, D1=d1, D2=d2, AXIS=axis, OP=op,
+        MASKED=masked, num_warps=num_warps)
+    torch.mps.synchronize()
+
+    tile = x.reshape(d0, d1, d2)
+    if masked:
+        keep = torch.arange(d2)[None, None, :] < bound
+        tile = torch.where(keep, tile, torch.full((d0, d1, d2), other))
+    expected = _rank3_combine_reference(torch, tile, axis, op)
+    expected = expected.unsqueeze(axis).expand(d0, d1, d2).flatten()
+    if dtype == "i32":
+        assert torch.equal(out.cpu(), expected)
+    else:
+        torch.testing.assert_close(out.cpu(), expected, atol=3e-3, rtol=1e-3)
