@@ -26007,10 +26007,17 @@ static ScalarDotOp sdCreateScalarDot(
   // fine -- its address is replayed from the store's own arithmetic -- so only
   // the operands are asked here. Scaled and weighted forms carry their own
   // packing and are left alone rather than refused on an untested assumption.
-  if (!scaleInfo && !weightLoad && !transposeA && !transposeB &&
-      (!simdgroupTileIsContiguous(aLoad.getPtr()) ||
-       !simdgroupTileIsContiguous(bLoad.getPtr())))
-    return {};
+  // Ask each operand separately. A transposed operand is staged the other way
+  // round, so the axis that must be dense is not the tile's own inner one and
+  // the question is left alone -- but that is a fact about THAT operand. Asking
+  // them together let a transposed B excuse a strided A, which is how an A
+  // whose reduction axis advanced by two still reached the reduction.
+  if (!scaleInfo && !weightLoad) {
+    if (!transposeA && !simdgroupTileIsContiguous(aLoad.getPtr()))
+      return {};
+    if (!transposeB && !simdgroupTileIsContiguous(bLoad.getPtr()))
+      return {};
+  }
 
   // Origins (pid*BLOCK) from the store's contributions — the output row/col
   // origins equal A's row origin and B's col origin respectively.
@@ -27832,9 +27839,46 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   if (!allowStoreConsumer && reachesStore(afterRes))
     return mlir::failure();
 
+  // Collapsing the loop means naming the reduction's length, and with no
+  // extent the op falls back to A's ROW stride. That is the same length only
+  // when A IS the whole matrix; for a tile taken from a wider one the row
+  // stride overshoots K and the reduction runs off the end of the tile into
+  // whatever the buffer holds next -- an exact answer on a contiguous A, and
+  // silently wrong on a sub-block, which is the shape no probe had handed it.
+  //
+  // A loop that recomputes its addresses from the induction variable knows the
+  // length: it is the loop's own upper bound, in elements, provided the loop
+  // starts at zero and steps by one tile of K. A pointer-advance loop carries
+  // its operands as iter_args instead and keeps the old behaviour, which no
+  // measurement has contradicted.
+  mlir::Value reductionExtent;
+  {
+    auto ptrIsLoopCarried = [&](mlir::Value ptr) {
+      auto blockArg = mlir::dyn_cast_if_present<mlir::BlockArgument>(ptr);
+      return blockArg && blockArg.getOwner() == forOp.getBody() &&
+             blockArg.getArgNumber() > 0;
+    };
+    auto constantOf = [](mlir::Value v) -> std::optional<int64_t> {
+      auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+      if (!cst)
+        return std::nullopt;
+      if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+        return intAttr.getInt();
+      return std::nullopt;
+    };
+    auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(aLoad.getType());
+    auto lower = constantOf(forOp.getLowerBound());
+    auto step = constantOf(forOp.getStep());
+    if (aTy && aTy.getRank() == 2 && lower && *lower == 0 && step &&
+        *step == aTy.getShape()[1] &&
+        !ptrIsLoopCarried(aLoad.getPtr()) && !ptrIsLoopCarried(bLoad.getPtr()))
+      reductionExtent = forOp.getUpperBound();
+  }
+
   mlir::Value cInit = forOp.getInitArgs()[0];
   if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
-                       resultTensorTy, {}, {}, {}, /*transposeA=*/false,
+                       resultTensorTy, {}, {}, reductionExtent,
+                       /*transposeA=*/false,
                        /*scaleInfo=*/nullptr,
                        sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();

@@ -579,6 +579,14 @@ The current dependency-ordered priorities are:
    so every tile went to the buffer's origin instead. The masked epilogue's
    column extent moves with the origin, so a partial tile still compares
    against the same bound.
+   A K loop that recomputes its addresses from the induction variable now takes
+   its reduction length from the loop's own upper bound rather than from A's row
+   stride. Collapsing such a loop into one reduction means naming that length,
+   and the row stride is the same number only when A is the whole matrix; for a
+   tile taken from a wider one it overshoots and the reduction ran past the end
+   of the tile into whatever the buffer held next. Each operand is also asked
+   about its own inner-axis contiguity separately, since a transposed B used to
+   excuse a strided A.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

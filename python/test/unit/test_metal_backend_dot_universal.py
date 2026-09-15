@@ -3304,3 +3304,80 @@ def test_dot_destination_base_offset_matches_torch(BK, runtime_k):
     outside = big_o.clone()
     outside[R0:R0 + M, C0:C0 + N] = 0.0
     assert outside.abs().max().item() == 0.0
+
+
+# ----------------------------------------------------------------------------
+# A recompute K-loop over a sub-block of a wider A.
+#
+# Collapsing such a loop into one scalar dot means naming the reduction's
+# length, and with no extent the op fell back to A's ROW stride. That is the
+# same length only when A IS the whole matrix; for a tile taken from a wider
+# one the row stride overshoots K and the reduction ran off the end of the tile
+# into whatever the buffer held next. The loop's own upper bound is the answer
+# whenever it starts at zero, steps by one K tile, and recomputes its addresses
+# from the induction variable.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_recompute_loop_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    lda,
+    sak,
+    ldb,
+    ldc,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    REAL_TRANS: tl.constexpr,
+):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * lda + ok[None, :] * sak,
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        if REAL_TRANS:
+            bnk = tl.load(b_ptr + on[:, None] * ldb + ok[None, :],
+                          mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+            acc = tl.dot(av, tl.trans(bnk), acc)
+        else:
+            bv = tl.load(b_ptr + on[None, :] * ldb + ok[:, None],
+                         mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+            acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * ldc + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def _run_recompute(*, sak, real_trans, pad=24, size=64, BK=16):
+    torch.manual_seed(0xA1DA)
+    M = N = K = size
+    lda, ldb, ldc = sak * K + pad, K + pad, N + pad
+    big_a = torch.randn((M, lda), dtype=torch.float32)
+    big_b = torch.randn((N, ldb), dtype=torch.float32)
+    big_c = torch.zeros((M, ldc), dtype=torch.float32)
+    a = big_a[:, 0:sak * K:sak]
+    bnk = big_b[:, 0:K]
+    dot_recompute_loop_kernel[(1, 1)](
+        big_a, big_b, big_c, M, N, K, lda, sak, ldb, ldc,
+        BM=M, BN=N, BK=BK, REAL_TRANS=real_trans, num_warps=1,
+    )
+    return big_c[:, 0:N], a @ bnk.t()
+
+
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_recompute_loop_over_wide_a_matches_torch(real_trans):
+    got, ref = _run_recompute(sak=1, real_trans=real_trans)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_recompute_loop_strided_a_is_named(capfd, real_trans):
+    """A's reduction axis is asked about even when B is transposed."""
+    with pytest.raises(Exception):
+        _run_recompute(sak=2, real_trans=real_trans)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
