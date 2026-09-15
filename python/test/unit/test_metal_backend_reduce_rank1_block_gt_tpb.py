@@ -343,3 +343,80 @@ def test_reduce_rank1_replayed_mask_forms(form, op, block, num_warps):
     torch.testing.assert_close(
         out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
     )
+
+
+# ---------------------------------------------------------------------------
+# Float-to-int casts inside a replayed cone.
+#
+# `evalRank1ValueAt` has always rebuilt int->float (`sitofp`, `uitofp`) and every
+# width cast, but not the float->int direction, and neither did its dry-run
+# predicate `rank1ConeSupported` nor the index pair
+# (`indexConeSupported` / `scalarizeConeAtIndex`). Above one element per thread
+# that refused `tl.load(Y + o).to(tl.int32)` wherever it appeared: as the reduced
+# value, as a mask bound, and as a gather index. At one element per thread the
+# band's converted scalar is read directly, so all three have always worked
+# there — which is the control each case is checked against.
+
+
+@triton.jit
+def _reduce_rank1_fptosi_kernel(
+    X,
+    Y,
+    O,
+    BLOCK: tl.constexpr,
+    FORM: tl.constexpr,
+    OP: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    if FORM == "value":
+        v = tl.load(X + offs).to(tl.int32).to(tl.float32)
+    elif FORM == "value_unsigned":
+        v = tl.load(Y + offs).to(tl.uint32).to(tl.float32)
+    elif FORM == "value_arith":
+        v = ((tl.load(X + offs) * 4.0).to(tl.int32) + 1).to(tl.float32)
+    elif FORM == "mask_bound":
+        v = tl.load(X + offs, mask=offs < tl.load(Y + offs).to(tl.int32),
+                    other=7.5)
+    else:  # address: the gather index lives in a float buffer
+        v = tl.load(X + tl.load(Y + offs).to(tl.int32))
+    result = tl.max(v, axis=0) if OP == "max" else tl.sum(v, axis=0)
+    tl.store(O, result)
+
+
+_FPTOSI_FORMS = ["value", "value_unsigned", "value_arith", "mask_bound",
+                 "address"]
+
+
+@pytest.mark.parametrize("form", _FPTOSI_FORMS)
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize(
+    "block,num_warps",
+    [(128, 1), (256, 2), (64, 2)],
+    ids=["e4", "e4_w2", "e1"],
+)
+def test_reduce_rank1_replayed_float_to_int_cone(form, op, block, num_warps):
+    torch.manual_seed(0x5EED)
+    x = (torch.randn((block,), dtype=torch.float32) * 3.0).contiguous()
+    # Non-negative and inside the tile so the same tensor serves as a bound, an
+    # unsigned value and an index.
+    y = ((torch.arange(block, dtype=torch.float32) % 17) + 0.25).contiguous()
+    out = torch.zeros((1,), dtype=torch.float32).contiguous()
+    _reduce_rank1_fptosi_kernel[(1, 1, 1)](
+        x, y, out, BLOCK=block, FORM=form, OP=op, num_warps=num_warps,
+    )
+    idx = torch.arange(block)
+    yi = y.cpu().to(torch.int32)
+    if form == "value":
+        ref = x.cpu().to(torch.int32).float()
+    elif form == "value_unsigned":
+        ref = yi.float()
+    elif form == "value_arith":
+        ref = ((x.cpu() * 4.0).to(torch.int32) + 1).float()
+    elif form == "mask_bound":
+        ref = torch.where(idx < yi, x.cpu(), torch.full((block,), 7.5))
+    else:
+        ref = x.cpu()[yi.to(torch.int64)]
+    expected = ref.max() if op == "max" else ref.sum()
+    torch.testing.assert_close(
+        out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
+    )

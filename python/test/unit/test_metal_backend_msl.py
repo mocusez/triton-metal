@@ -4170,15 +4170,10 @@ def test_reduce_rank1_mask_shape_matches_torch(
             BLOCK=block, MASK_MODE=mask_mode, OTHER_MODE=other_mode,
             OP=operation, num_warps=num_warps)
 
-    if block > 32 and mask_mode == "tensor_rhs":
-        # The one mask cone the evaluator still cannot rebuild: this bound is
-        # an `arith.fptosi` of a loaded f32 tensor, which is in neither the
-        # evaluator nor its dry-run allowlist. Refused by name before
-        # conversion rather than replayed, and it must stay that way until both
-        # learn the cast together.
-        with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal"):
-            launch()
-        return
+    # `tensor_rhs` spells its bound as an `arith.fptosi` of a loaded f32 tensor.
+    # That cast was the last mask cone the evaluator could not rebuild, and it
+    # was refused above one element per thread until the evaluator and its
+    # dry-run predicate learned it together.
     launch()
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)

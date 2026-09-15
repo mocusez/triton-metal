@@ -8796,6 +8796,13 @@ static mlir::LogicalResult lowerRank1Reduce(
     // an accumulator `acc`, emit the masked/unmasked load + Wall 11 chain and
     // return combine(acc, elt). Loop-invariant addressing state captured by
     // ref.
+    // `rank1ConeSupported` is the dry run for `evalRank1ValueAt`, and the two
+    // are separate switches over the same ops: when they drift, the evaluator
+    // returns null for a cone the preflight admitted. Folding the accumulator
+    // unchanged there is a SILENT WRONG ANSWER -- an all-masked-looking result,
+    // the identity -- which is how a float-to-int index reached a reduce as
+    // `sum = 0` instead of a diagnostic. Record it and fail the pattern.
+    bool coneEmissionFailed = false;
     auto buildPartial = [&](mlir::Value kFlatI32,
                             mlir::Value acc) -> mlir::Value {
       // Wall 14 cyclic-tile decomposition lifted to runtime arith:
@@ -8836,8 +8843,10 @@ static mlir::LogicalResult lowerRank1Reduce(
       // was validated by rank1ConeSupported up front, so a null here is a bug.
       if (richCone) {
         mlir::Value elt = evalRank1ValueAt(reduceSrc, idxI32, rewriter, loc, 0);
-        if (!elt)
+        if (!elt) {
+          coneEmissionFailed = true;
           return acc;
+        }
         if (elt.getType() != storeTy)
           elt = mlir::UnrealizedConversionCastOp::create(
                     rewriter, loc, mlir::TypeRange{storeTy},
@@ -8975,6 +8984,20 @@ static mlir::LogicalResult lowerRank1Reduce(
       }
       mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange(newAccs));
     }
+
+    if (coneEmissionFailed)
+      // NOT a notifyMatchFailure: measured, declining here takes the process
+      // down with SIGSEGV 2 of 2, because this is inside `applyFullConversion`
+      // and the fold has already been emitted -- the rollback-corruption site.
+      // A fatal error with a name is the honest floor for a state that is a
+      // compiler bug by construction: the preflight ran the same predicate
+      // before conversion, so reaching here means the predicate and the
+      // evaluator disagree and the shape needs adding to `evalRank1ValueAt`
+      // (or removing from `rank1ConeSupported`), not handling at runtime.
+      llvm::report_fatal_error(
+          "triton-metal: rank-1 reduce cone passed rank1ConeSupported but "
+          "evalRank1ValueAt could not rebuild it at an element index; the dry "
+          "run and the evaluator have drifted apart");
 
     // Balanced tree-combine of the K accumulator results into one scalar.
     llvm::SmallVector<mlir::Value, 8> parts(forOp.getResults().begin(),
@@ -9235,7 +9258,8 @@ scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
   // these nodes; when it reaches the label load's own pointer offset, that
   // simpler cone recurses back here and terminates at make_range/scalars.
   if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                mlir::arith::TruncIOp>(def))
+                mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+                mlir::arith::FPToUIOp>(def))
     return evalRank1ValueAt(v, idx, rewriter, loc, depth + 1);
   if (mlir::isa<mlir::triton::LoadOp>(def)) {
     mlir::Value loaded = evalRank1ValueAt(v, idx, rewriter, loc, depth + 1);
@@ -9838,7 +9862,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
              mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp,
              mlir::arith::SIToFPOp, mlir::arith::UIToFPOp, mlir::arith::ExtFOp,
              mlir::arith::TruncFOp, mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-             mlir::arith::TruncIOp, mlir::math::AbsFOp, mlir::arith::AddFOp,
+             mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+             mlir::arith::FPToUIOp, mlir::math::AbsFOp, mlir::arith::AddFOp,
              mlir::arith::SubFOp, mlir::arith::MulFOp, mlir::arith::DivFOp,
              mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
              mlir::arith::MinimumFOp, mlir::arith::MinNumFOp,
@@ -10296,6 +10321,29 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return mlir::arith::TruncIOp::create(rewriter, loc,
                                          signlessEltOf(trunc.getType()),
                                          toSignlessInt(x, rewriter, loc))
+        .getResult();
+  }
+  // float -> int. The int -> float direction above has always been here; this
+  // is its mirror, and `tl.load(Y + o).to(tl.int32)` is how a kernel spells a
+  // bound, an index or a quantized value read out of a float buffer. The
+  // operand is already a float, so unlike the integer casts it needs no
+  // signless bridge; the result does, since `arith` rejects a `ui32` result.
+  if (auto f2s = mlir::dyn_cast<mlir::arith::FPToSIOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(f2s.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::FPToSIOp::create(rewriter, loc,
+                                         signlessEltOf(f2s.getType()), x)
+        .getResult();
+  }
+  if (auto f2u = mlir::dyn_cast<mlir::arith::FPToUIOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(f2u.getIn(), idxVal, rewriter, loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::FPToUIOp::create(rewriter, loc,
+                                         signlessEltOf(f2u.getType()), x)
         .getResult();
   }
 
@@ -11414,9 +11462,12 @@ static bool indexConeSupported(mlir::Value v, int depth,
     return dense && dense.isSplat();
   }
   if (mlir::isa<mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                mlir::arith::TruncIOp>(def))
+                mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+                mlir::arith::FPToUIOp>(def))
     // The scalarizer delegates the whole cast to the general evaluator, which
-    // can replay more producers than the index-only arithmetic above it.
+    // can replay more producers than the index-only arithmetic above it. A
+    // float->int index is how a kernel spells a gather whose indices live in a
+    // float buffer.
     return rank1ConeSupported(v, depth + 1, deferAggregateLeaves);
   if (mlir::isa<mlir::triton::LoadOp>(def))
     return rank1ConeSupported(v, depth + 1, deferAggregateLeaves);
@@ -11464,7 +11515,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
     if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
                   mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                   mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                  mlir::arith::TruncIOp>(def) ||
+                  mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+                  mlir::arith::FPToUIOp>(def) ||
         coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
       return rank1ConeSupported(def->getOperand(0), depth + 1,
                                 deferAggregateLeaves);
@@ -11585,10 +11637,12 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
     return rank1ConeSupported(s.getIn(), depth + 1, deferAggregateLeaves);
   if (auto s = mlir::dyn_cast<mlir::arith::UIToFPOp>(def))
     return rank1ConeSupported(s.getIn(), depth + 1, deferAggregateLeaves);
-  // Integer width casts mirror the corresponding cases in evalRank1ValueAt.
+  // Integer width casts and both directions between int and float mirror the
+  // corresponding cases in evalRank1ValueAt.
   if (mlir::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                 mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                mlir::arith::TruncIOp>(def))
+                mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+                mlir::arith::FPToUIOp>(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1,
                               deferAggregateLeaves);
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))

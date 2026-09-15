@@ -428,10 +428,14 @@ The current dependency-ordered priorities are:
    every other predicate, compound mask, mask index read from memory or derived
    from an aggregate, and runtime or computed `other` is handed to the general
    cone evaluator rather than refused, by the same shared predicate the address
-   rules use. A mask neither can rebuild — one carried out of an `scf.for`, or a
-   bound that is an `arith.fptosi` of a loaded tensor — still raises a named
-   error, and `tt.load`'s own rule that a masked load's `other` be uniform
-   across lanes is unchanged. Single-band, computed-cone, and contiguous
+   rules use. A mask neither can rebuild — one carried out of an `scf.for` —
+   still raises a named error, and `tt.load`'s own rule that a masked load's
+   `other` be uniform across lanes is unchanged. Float-to-int casts are replayed
+   wherever they appear in a cone: as the reduced value, as a mask bound, or as
+   a gather index read out of a float buffer. If a cone ever passes the dry-run
+   predicate that the evaluator cannot rebuild, the fold now aborts with a named
+   compiler error instead of folding the combine identity, which read as an
+   all-masked result. Single-band, computed-cone, and contiguous
    masked-sum paths retain their own support rules.
    The single-load-chain path also checks that its load address is a contiguous
    range plus scalar pointer offsets or the base from its matching mask. An
