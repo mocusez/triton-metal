@@ -571,6 +571,14 @@ The current dependency-ordered priorities are:
    strided destination because it replays the store's own arithmetic.
    Transposed operands are staged the other way round and keep their existing
    behaviour rather than being refused on an untested assumption.
+   A matmul whose destination carries a scalar base offset -- a program
+   writing its tile into a slice of a larger buffer, `tl.store(out + base +
+   tile, ...)` -- now lands where the kernel asked. The operand sides have
+   always folded such a base into the column they address, because a matrix
+   access adds the column unscaled; the store's base was read and then dropped,
+   so every tile went to the buffer's origin instead. The masked epilogue's
+   column extent moves with the origin, so a partial tile still compares
+   against the same bound.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

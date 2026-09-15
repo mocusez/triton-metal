@@ -23004,7 +23004,13 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     return mlir::failure();
   ScalarBaseOffset aBaseOffset = extractScalarBaseOffset(aPtrsInit);
   ScalarBaseOffset bBaseOffset = extractScalarBaseOffset(bPtrsInit);
-  if (!aBaseOffset.valid || !bBaseOffset.valid)
+  // The destination carries a scalar base the same way the operands do --
+  // `tl.store(out_ptr + base + tile, ...)`, which is how a program writes
+  // into a slice of a larger buffer. A and B fold theirs into the column
+  // they address; the store's was never read at all, so such a kernel wrote
+  // its tile at the buffer's origin instead of at its own.
+  ScalarBaseOffset cBaseOffset = extractScalarBaseOffset(store.getPtr());
+  if (!aBaseOffset.valid || !bBaseOffset.valid || !cBaseOffset.valid)
     return mlir::failure();
 
   mlir::Value aPtr = unwrapPtrToKernelArg(aPtrsInit);
@@ -23094,6 +23100,13 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   mlir::Value bBaseColVal = emitOriginOperand(builder, loc, ui32, bBaseCol);
   mlir::Value cRowOrigin = emitOriginOperand(builder, loc, ui32, cOrig.row);
   mlir::Value cColOrigin = emitOriginOperand(builder, loc, ui32, cOrig.col);
+  // A flat element base added to the COLUMN reproduces `base + row *
+  // stride + col`, because the column is the one coordinate a simdgroup
+  // access adds unscaled. The masked epilogue compares against the column
+  // extent, so that extent moves by the same amount and the comparison is
+  // unchanged -- the same bookkeeping B already does for its own base.
+  cColOrigin = addScalarElementOffset(builder, loc, ui32, cColOrigin,
+                                      cBaseOffset.value);
 
   mlir::Value aBuf = bridgePtrToMemref(builder, loc, aPtr, elemTy);
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
@@ -23143,7 +23156,9 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
       nExtent = mlir::arith::AddIOp::create(builder, loc, cOrig.col, nExtent)
                     .getResult();
     partialExtents.push_back(emitExtentUi32(builder, loc, ui32, mExtent));
-    partialExtents.push_back(emitExtentUi32(builder, loc, ui32, nExtent));
+    partialExtents.push_back(addScalarElementOffset(
+        builder, loc, ui32, emitExtentUi32(builder, loc, ui32, nExtent),
+        cBaseOffset.value));
   }
   if (!multiTile) {
     // Legacy single-tile chain (Bucket A) — bit-identical to pre-AC4.
@@ -23199,7 +23214,9 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
         nExtent = mlir::arith::AddIOp::create(builder, loc, cOrig.col, nExtent)
                       .getResult();
       partialExtents.push_back(emitExtentUi32(builder, loc, ui32, mExtent));
-      partialExtents.push_back(emitExtentUi32(builder, loc, ui32, nExtent));
+      partialExtents.push_back(addScalarElementOffset(
+          builder, loc, ui32, emitExtentUi32(builder, loc, ui32, nExtent),
+          cBaseOffset.value));
     }
     mlir::Value widxI32, warpMI32, warpNI32, widxUi32Hoisted;
     if (multiWarp) {
@@ -23684,7 +23701,8 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
     return mlir::failure();
   ScalarBaseOffset aBaseOffset = extractScalarBaseOffset(aPtrsInit);
   ScalarBaseOffset bBaseOffset = extractScalarBaseOffset(bPtrsInit);
-  if (!aBaseOffset.valid || !bBaseOffset.valid)
+  ScalarBaseOffset cBaseOffset = extractScalarBaseOffset(store.getPtr());
+  if (!aBaseOffset.valid || !bBaseOffset.valid || !cBaseOffset.valid)
     return mlir::failure();
 
   // Accumulator init must be dense<0.0> (the canonical `acc = tl.zeros(...)`).
@@ -23758,6 +23776,11 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
                                          bBaseOffset.value);
   mlir::Value cRowOrigin = emitOriginOperand(builder, loc, ui32, cOrig.row);
   mlir::Value cColOrigin = emitOriginOperand(builder, loc, ui32, cOrig.col);
+  // Same bookkeeping as the statically unrolled tier: the destination's
+  // flat scalar base folds into the column, which a simdgroup access adds
+  // unscaled, and the masked epilogue's column extent moves with it.
+  cColOrigin = addScalarElementOffset(builder, loc, ui32, cColOrigin,
+                                      cBaseOffset.value);
   mlir::Value aBuf = bridgePtrToMemref(builder, loc, aPtr, elemTy);
   mlir::Value bBuf = bridgePtrToMemref(builder, loc, bPtr, elemTy);
   mlir::Value cBuf = bridgePtrToMemref(builder, loc, cPtr, elemTy);
@@ -23920,7 +23943,9 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
                     .getResult();
     }
     partialExtents.push_back(emitExtentUi32(builder, loc, ui32, mExtent));
-    partialExtents.push_back(emitExtentUi32(builder, loc, ui32, nExtent));
+    partialExtents.push_back(addScalarElementOffset(
+        builder, loc, ui32, emitExtentUi32(builder, loc, ui32, nExtent),
+        cBaseOffset.value));
   }
   for (int mi = 0; mi < mPerWarp; ++mi) {
     for (int ni = 0; ni < nPerWarp; ++ni) {

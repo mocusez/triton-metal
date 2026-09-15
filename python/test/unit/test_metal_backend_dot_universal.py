@@ -3225,3 +3225,82 @@ def test_dot_non_unit_inner_stride_is_named(capfd, sak, sbn, transpose_out):
     with pytest.raises(Exception):
         _run_strided(pad=24, sak=sak, sbn=sbn, transpose_out=transpose_out)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# A scalar base offset on the destination: `tl.store(out + base + tile, ...)`,
+# which is how a program writes its tile into a slice of a larger buffer. A and
+# B always folded their own scalar base into the column they address; the
+# store's was read and then dropped, so the tile landed at the buffer's origin.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_base_offset_kernel(
+    a_ptr,
+    b_ptr,
+    o_ptr,
+    a_off,
+    b_off,
+    o_off,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bk,
+    stride_om,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
+    RUNTIME_K: tl.constexpr,
+):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + a_off + offs_m[:, None] * stride_am + offs_k[None, :]
+    b_ptrs = b_ptr + b_off + offs_k[:, None] * stride_bk + offs_n[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if RUNTIME_K:
+        for kk in range(0, K, BLOCK_K):
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) &
+                        (offs_k[None, :] < K - kk), other=0.0)
+            b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - kk) &
+                        (offs_n[None, :] < N), other=0.0)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * stride_bk
+    else:
+        for _ in range(0, K_TILES):
+            acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * stride_bk
+    o_ptrs = o_ptr + o_off + offs_m[:, None] * stride_om + offs_n[None, :]
+    if RUNTIME_K:
+        tl.store(o_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    else:
+        tl.store(o_ptrs, acc)
+
+
+@pytest.mark.parametrize("runtime_k", [False, True], ids=["static_k", "runtime_k"])
+@pytest.mark.parametrize("BK", [8, 16, 32])
+def test_dot_destination_base_offset_matches_torch(BK, runtime_k):
+    M = N = K = 32
+    R0, C0, PAD = 5, 3, 24
+    torch.manual_seed(0xB45E)
+    lda, ldb, ldo = K + PAD, N + PAD, N + PAD
+    big_a = torch.randn((R0 + M, lda), dtype=torch.float32)
+    big_b = torch.randn((R0 + K, ldb), dtype=torch.float32)
+    big_o = torch.zeros((R0 + M, ldo), dtype=torch.float32)
+    a = big_a[R0:R0 + M, C0:C0 + K]
+    b = big_b[R0:R0 + K, C0:C0 + N]
+    dot_base_offset_kernel[(M // 16, N // 16)](
+        big_a, big_b, big_o, R0 * lda + C0, R0 * ldb + C0, R0 * ldo + C0,
+        M, N, K, lda, ldb, ldo,
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=BK, K_TILES=K // BK,
+        RUNTIME_K=runtime_k,
+    )
+    torch.testing.assert_close(big_o[R0:R0 + M, C0:C0 + N], a @ b,
+                               atol=1e-4, rtol=1e-4)
+    # A tile written at the wrong origin lands outside its sub-block.
+    outside = big_o.clone()
+    outside[R0:R0 + M, C0:C0 + N] = 0.0
+    assert outside.abs().max().item() == 0.0
