@@ -336,6 +336,12 @@ being approximated with a racy load/modify/store sequence.
   reduction is longer than one 8x8 matrix tile now takes the tier that carries
   a K loop instead of the single-accumulate path, which had computed only the
   first 8 of K.
+  A direct 8x8 dot is covered at every warp count. At one warp a 64-element
+  tile does not fit 32 threads one element each, so Triton gives the dot and
+  the store different blocked encodings and converts between them; the
+  single-accumulate path now looks through that conversion, which it may
+  because it writes the tile by explicit (row, column, stride) origins rather
+  than by a per-thread element index.
   A loop-free dot whose operands are sub-tiles of a WIDER buffer is covered:
   its reduction length is the tile's own K rather than A's row stride, and a
   compile-time row stride is read from the tile's own address arithmetic rather

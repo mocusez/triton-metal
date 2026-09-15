@@ -2877,7 +2877,7 @@ def test_direct_dot_multi_register_band_matches_torch(M, N, num_warps):
     )
 
 
-@pytest.mark.parametrize("num_warps", [2, 4])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
 @pytest.mark.parametrize("K", [8, 16, 32])
 def test_direct_dot_8x8_reduction_longer_than_one_simdgroup_tile(K, num_warps):
     """An 8x8 result whose reduction is longer than the 8x8 matrix unit.
@@ -2887,6 +2887,12 @@ def test_direct_dot_8x8_reduction_longer_than_one_simdgroup_tile(K, num_warps):
     RESULT shape. An 8x32 by a 32x8 also produces an 8x8 result: it computed
     k in [0, 8) and read the 8x32 operand with the hardcoded row stride 8.
     K == 8 is the only reduction this path may claim.
+
+    `num_warps == 1` is here because the whole 8x8 shape was refused by name at
+    one warp: 32 threads cannot cover a 64-element tile one element each, so
+    Triton gives the dot a `#blocked` the store does not share and converts
+    between them, and the single-iteration path was looking for a `tt.store`
+    where a `ttg.convert_layout` stood.
     """
     torch.manual_seed(K * 31 + num_warps)
     a = torch.rand(8, K, dtype=torch.float32) * 2 - 1
@@ -2923,7 +2929,7 @@ def _subtile_dot_runtime_kernel(A, B, C, sa, sb, sc, M: tl.constexpr,
 
 
 @pytest.mark.parametrize("runtime_strides", [False, True])
-@pytest.mark.parametrize("num_warps", [2, 4])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
 @pytest.mark.parametrize(
     "M, N, K, pad",
     [

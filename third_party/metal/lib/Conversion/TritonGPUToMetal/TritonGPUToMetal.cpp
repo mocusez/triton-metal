@@ -28684,11 +28684,33 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (aLoad.getMask() || bLoad.getMask())
     return;
 
-  // Result must feed a single tt.store.
+  // Result must feed a single tt.store, possibly through a layout conversion.
+  //
+  // At ONE warp Triton gives the dot a `#blocked` the store does not share —
+  // `sizePerThread = [1, 1]` on a 4x8 thread grid against `[1, 2]` on an 8x4
+  // one, because 32 threads cannot cover a 64-element tile one element each —
+  // and converts between them. `preprocessDotCvtChains` peels the C-side
+  // conversion only for the LOOP chain (`dot -> yield -> for -> cvt -> store`),
+  // so the standalone one reached here with a `ttg.convert_layout` where a
+  // `tt.store` was expected and the whole 8x8 shape fell out of every tier's
+  // envelope at `num_warps = 1` while working at 2 and 4.
+  //
+  // The conversion has no consequence for THIS path: the tile is written by
+  // `simdgroup_store` with explicit (row, column, stride) origins taken from
+  // the STORE's own pointer, never through a per-thread element index, so the
+  // two encodings cannot disagree about where an element goes.
   if (!dot.getResult().hasOneUse())
     return;
-  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(
-      *dot.getResult().getUsers().begin());
+  mlir::Operation *resultUser = *dot.getResult().getUsers().begin();
+  mlir::triton::gpu::ConvertLayoutOp resultCvt;
+  if (auto cvt =
+          mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(resultUser)) {
+    if (!cvt->hasOneUse())
+      return;
+    resultCvt = cvt;
+    resultUser = *cvt->getUsers().begin();
+  }
+  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(resultUser);
   if (!store)
     return;
   // AC2: allow masked stores of the canonical 2D form. If the mask doesn't
@@ -28829,6 +28851,8 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   // (typically arith.constant dense<0.0>) becomes dead and is cleaned up
   // by the existing dead-arith pass below.
   store.erase();
+  if (resultCvt)
+    resultCvt.erase();
   dot.erase();
   if (aLoad.use_empty())
     aLoad.erase();
