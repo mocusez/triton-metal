@@ -8133,11 +8133,29 @@ static mlir::LogicalResult inspectRank1ReduceMask(mlir::triton::LoadOp loadOp,
   return mlir::success();
 }
 
+// The base of a load's pointer chain, recognised in both worlds the address
+// walk below runs in. Before conversion it is a `tt.func` pointer argument;
+// inside `lowerRank1Reduce` the body has already been spliced into a
+// `metal.kernel`, so the same base is that kernel's memref argument. A walk
+// that knows only the first form answers "not addressable" for every kernel in
+// the second.
+static bool isKernelBaseArgument(mlir::BlockArgument arg) {
+  mlir::Block *owner = arg.getOwner();
+  if (!owner || !owner->isEntryBlock())
+    return false;
+  mlir::Operation *parent = owner->getParentOp();
+  if (auto func = mlir::dyn_cast_or_null<mlir::triton::FuncOp>(parent))
+    return mlir::isa<mlir::triton::PointerType>(arg.getType());
+  return mlir::isa_and_nonnull<KernelOp>(parent);
+}
+
 // The legacy fold reconstructs one contiguous tensor offset, an optional base
-// from the canonical mask, and scalar addptr offsets. Check that these are ALL
-// the address terms before conversion; otherwise a valid strided/repeated load
-// silently becomes a different contiguous load. Keep this cross-operation
-// analysis in preflight, not in the lowering.
+// from the canonical mask, and scalar addptr offsets. This answers whether
+// those are ALL the address terms; otherwise that fold would turn a valid
+// strided/repeated load into a different contiguous one. Both the preflight and
+// `classifyRank1ReduceSource` ask it, so the two cannot disagree about which
+// loads the legacy fold may claim -- and a load it may not is handed to the
+// general evaluator rather than refused.
 static bool rank1ReduceAddressSupported(mlir::triton::LoadOp load,
                                         const Rank1ReduceMaskPlan &maskPlan) {
   auto ptrAdd = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
@@ -8152,12 +8170,8 @@ static bool rank1ReduceAddressSupported(mlir::triton::LoadOp load,
   }
   mlir::Value cur = ptrAdd.getPtr();
   while (cur) {
-    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
-      auto func =
-          mlir::dyn_cast<mlir::triton::FuncOp>(arg.getOwner()->getParentOp());
-      return func && arg.getOwner() == &func.getBody().front() &&
-             mlir::isa<mlir::triton::PointerType>(arg.getType());
-    }
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(cur))
+      return isKernelBaseArgument(arg);
     if (auto add = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
       if (mlir::isa<mlir::RankedTensorType>(add.getOffset().getType()))
         return false;
@@ -8171,6 +8185,83 @@ static bool rank1ReduceAddressSupported(mlir::triton::LoadOp load,
     }
   }
   return false;
+}
+
+// A rank-1 reduce REPLAYS its source when the tile holds more logical elements
+// than the CTA has threads: each thread then rebuilds several elements from the
+// source cone. A single-band tile is read from its own converted scalar and
+// needs no address at all, which is why the address rules below apply only
+// above this line.
+static bool rank1ReduceReplaysSource(mlir::RankedTensorType rtt) {
+  auto blocked =
+      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+          rtt.getEncoding());
+  if (!blocked || rtt.getRank() != 1 || rtt.isDynamicDim(0))
+    return false;
+  int64_t tpb = 1;
+  for (unsigned threads : blocked.getThreadsPerWarp())
+    tpb *= threads;
+  for (unsigned warps : blocked.getWarpsPerCTA())
+    tpb *= warps;
+  return tpb > 0 && rtt.getDimSize(0) > tpb;
+}
+
+// Which of the two source paths claims a rank-1 reduce. The Wall-11 single-load
+// walker is asked first because it emits one addressed scalar load per element.
+// When that walker claims a chain whose ADDRESS it cannot rebuild, the general
+// per-element cone evaluator is asked before refusing: `evalRank1ValueAt` walks
+// the same pointer chain level by level and re-derives each element's address
+// from it, so a stride, a repeated index, a gathered index or a shift written
+// in index space -- none of which the specialized path can spell, since it
+// requires the outer offset to be a bare `tt.make_range` -- are replayed rather
+// than rejected. Widening here rather than adding a second refusal is what the
+// evidence supports: the same addresses under one elementwise operation already
+// take the evaluator and are exact, and at one element per thread the legacy
+// path never replays an address at all, so those spellings have always worked.
+// Preflight and lowering must agree about which path claims a reduce, so both
+// decide here; only a source neither path can replay is refused.
+enum class Rank1ReduceSourcePath { SingleLoadChain, RichCone, Unsupported };
+
+static Rank1ReduceSourcePath classifyRank1ReduceSource(
+    mlir::Value reduceSrc, mlir::Operation *reduceOp,
+    mlir::DominanceInfo &dominance, bool inspectMask,
+    bool requireReplayableAddress, bool deferAggregateLeaves,
+    llvm::SmallVectorImpl<Wall11ChainStep> &chain, mlir::triton::LoadOp &load,
+    Rank1ReduceMaskPlan &maskPlan, std::string &reason) {
+  auto takeRichCone = [&]() {
+    // The evaluator re-derives everything from the cone, so hand back nothing
+    // from the abandoned single-load walk: a stale chain, load or mask plan
+    // would otherwise describe a path this reduce is no longer taking.
+    chain.clear();
+    load = nullptr;
+    maskPlan = Rank1ReduceMaskPlan{};
+    return Rank1ReduceSourcePath::RichCone;
+  };
+  if (mlir::failed(walkBackThroughElementwiseChain(
+          reduceSrc, /*depth=*/0, chain, load, reduceOp, dominance, reason))) {
+    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+      return takeRichCone();
+    reason = "rank-1 reduce cannot replay its source: " + reason;
+    return Rank1ReduceSourcePath::Unsupported;
+  }
+  if (!inspectMask)
+    return Rank1ReduceSourcePath::SingleLoadChain;
+  llvm::StringRef maskFailure;
+  if (mlir::failed(inspectRank1ReduceMask(load, maskPlan, maskFailure))) {
+    reason = maskFailure.str();
+    return Rank1ReduceSourcePath::Unsupported;
+  }
+  if (requireReplayableAddress && !rank1ReduceAddressSupported(load, maskPlan)) {
+    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+      return takeRichCone();
+    reason = "rank-1 reduce address cannot be replayed by the "
+             "single-load-chain path nor by the general cone evaluator; "
+             "requires a contiguous range with scalar pointer offsets, the "
+             "matching canonical mask base, or an index expression the "
+             "evaluator can rebuild";
+    return Rank1ReduceSourcePath::Unsupported;
+  }
+  return Rank1ReduceSourcePath::SingleLoadChain;
 }
 
 static mlir::LogicalResult lowerRank1Reduce(
@@ -8554,18 +8645,20 @@ static mlir::LogicalResult lowerRank1Reduce(
     // a clean notifyMatchFailure rather than a mid-emission abort.
     bool richCone = false;
     std::string replayFailure;
-    if (mlir::failed(walkBackThroughElementwiseChain(
-            reduceSrc, /*depth=*/0, chain, loadOp, op, dominance,
-            replayFailure))) {
-      if (!rank1ConeSupported(reduceSrc, 0))
-        return rewriter.notifyMatchFailure(op, replayFailure);
-      richCone = true;
-    }
     Rank1ReduceMaskPlan maskPlan;
-    llvm::StringRef maskFailure;
-    if (!richCone &&
-        mlir::failed(inspectRank1ReduceMask(loadOp, maskPlan, maskFailure)))
-      return rewriter.notifyMatchFailure(op, maskFailure);
+    switch (classifyRank1ReduceSource(
+        reduceSrc, op, dominance, /*inspectMask=*/true,
+        /*requireReplayableAddress=*/rank1ReduceReplaysSource(rtt),
+        /*deferAggregateLeaves=*/false, chain, loadOp, maskPlan,
+        replayFailure)) {
+    case Rank1ReduceSourcePath::Unsupported:
+      return rewriter.notifyMatchFailure(op, replayFailure);
+    case Rank1ReduceSourcePath::RichCone:
+      richCone = true;
+      break;
+    case Rank1ReduceSourcePath::SingleLoadChain:
+      break;
+    }
     mlir::Value maskBoundN = maskPlan.bound; // null for unmasked loads
     if (maskPlan.constantBound)
       maskBoundN =
@@ -37544,35 +37637,21 @@ struct ConvertTritonGPUToMetalPass
           mlir::DominanceInfo dominance(red->getParentOp());
           llvm::SmallVector<Wall11ChainStep, 4> chain;
           mlir::triton::LoadOp load;
+          Rank1ReduceMaskPlan maskPlan;
           std::string reason;
-          if (mlir::failed(walkBackThroughElementwiseChain(
-                  src, 0, chain, load, red, dominance, reason))) {
-            if (!rank1ConeSupported(src, 0, /*deferAggregateLeaves=*/true)) {
-              red.emitOpError("rank-1 reduce cannot replay its source: ")
-                  << reason;
-              reduceOk = false;
-              return;
-            }
-          } else if (!contiguousMasked) {
-            // Mirror the selected legacy path, not the richer evaluator's
-            // envelope. A matching contiguous masked sum uses its own mask
-            // inspection and must retain that specialization.
-            Rank1ReduceMaskPlan maskPlan;
-            llvm::StringRef maskFailure;
-            if (mlir::failed(
-                    inspectRank1ReduceMask(load, maskPlan, maskFailure))) {
-              red.emitOpError(maskFailure);
-              reduceOk = false;
-              return;
-            }
-            if (!rank1ReduceAddressSupported(load, maskPlan)) {
-              red.emitOpError(
-                  "rank-1 reduce address cannot be replayed by the "
-                  "single-load-chain path; requires a contiguous range with "
-                  "scalar pointer offsets or the matching canonical mask base");
-              reduceOk = false;
-              return;
-            }
+          // A matching contiguous masked sum keeps its own specialization,
+          // which inspects its own mask and index cones; ask only whether the
+          // source can be replayed at all. Every other reduce here is above one
+          // element per thread, so it is classified with the same call the
+          // lowering makes.
+          if (classifyRank1ReduceSource(
+                  src, red, dominance, /*inspectMask=*/!contiguousMasked,
+                  /*requireReplayableAddress=*/!contiguousMasked,
+                  /*deferAggregateLeaves=*/true, chain, load, maskPlan,
+                  reason) == Rank1ReduceSourcePath::Unsupported) {
+            red.emitOpError(reason);
+            reduceOk = false;
+            return;
           }
         }
       }

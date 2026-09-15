@@ -3633,6 +3633,12 @@ def _reduce_rank1_address_shape_kernel(X, Y, O, RUNTIME_BASE,
         strided = tl.load(X + offsets * RUNTIME_BASE)
         contiguous = tl.load(X + offsets)
         values = tl.where(offsets % 2 == 0, strided, contiguous)
+    elif ADDRESS_MODE == "bitand":
+        # Bitwise index arithmetic is outside `indexConeSupported`, so neither
+        # the single-load walker nor the general evaluator can rebuild this
+        # address. It is the adjacent rejection for the replayed forms above.
+        ptr_offsets = offsets & RUNTIME_BASE
+        values = tl.load(X + ptr_offsets)
     else:
         values = tl.load(X + offsets)
 
@@ -3956,24 +3962,21 @@ def test_reduce_rank1_mask_shape_unsupported_fails_without_crashing(
 @pytest.mark.parametrize(
     "address_mode,operation,value_mode",
     [
-        ("runtime_stride", "sum", "plain"),
-        ("constant_stride", "max", "plain"),
-        ("modulo", "sum", "plain"),
-        ("gather", "max", "plain"),
-        ("shifted_tensor", "sum", "plain"),
-        ("runtime_stride", "max", "chain"),
+        ("bitand", "sum", "plain"),
+        ("bitand", "max", "chain"),
     ],
     ids=[
-        "runtime_stride_sum",
-        "constant_stride_max",
-        "modulo_sum",
-        "gather_max",
-        "shifted_tensor_sum",
-        "runtime_stride_chain_max",
+        "bitand_sum",
+        "bitand_chain_max",
     ],
 )
 def test_reduce_rank1_address_shape_unsupported_fails_without_crashing(
         address_mode, operation, value_mode, tmp_path):
+    # Strided, repeated, gathered and index-space-shifted addresses are replayed
+    # by the general cone evaluator (see
+    # test_metal_backend_reduce_rank1_block_gt_tpb.py for their numbers); what
+    # must still be refused before conversion is an index NEITHER path can
+    # rebuild, three times in a row, leaving the process able to compile after.
     import os
     import subprocess
     import sys
@@ -4016,7 +4019,8 @@ def test_reduce_rank1_address_shape_unsupported_fails_without_crashing(
                             env={**os.environ,
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     output = result.stdout + result.stderr
-    needle = "rank-1 reduce address cannot be replayed by the single-load-chain path"
+    needle = ("rank-1 reduce address cannot be replayed by the "
+              "single-load-chain path nor by the general cone evaluator")
     assert result.returncode == 0, output
     assert output.count(needle) == 3
     assert "RECOVERED" in output

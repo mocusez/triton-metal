@@ -437,61 +437,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// The legacy single-load-chain rank-1 reduce replays addresses as a contiguous
-// logical range plus scalar pointer offsets. A tensor stride in the load offset
-// must be rejected before the direct load-chain path silently reads `offsets`.
+// A rank-1 reduce above one element per thread replays its source. The legacy
+// single-load walker rebuilds only a contiguous range plus scalar pointer
+// offsets; a stride, a repeated index, a gathered index or a shift written in
+// index space is handed to the general cone evaluator instead of being refused.
+// An index that EVALUATOR cannot rebuild either -- bitwise arithmetic is
+// outside `indexConeSupported` -- must still be named before conversion rather
+// than reaching a partially emitted fold.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank1_strided_address_deferred(%x_ptr: !tt.ptr<f32>, %stride: i32) {
+  tt.func public @reduce_rank1_bitand_address_deferred(%x_ptr: !tt.ptr<f32>, %k: i32) {
     %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
-    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked>
-    %strided = arith.muli %offsets, %stride_splat : tensor<128xi32, #blocked>
+    %k_splat = tt.splat %k : i32 -> tensor<128xi32, #blocked>
+    %wrapped = arith.andi %offsets, %k_splat : tensor<128xi32, #blocked>
     %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
-    %x_addr = tt.addptr %x_splat, %strided : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x_addr = tt.addptr %x_splat, %wrapped : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
     %x = tt.load %x_addr : tensor<128x!tt.ptr<f32>, #blocked>
-    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
-    %r = "tt.reduce"(%x) ({
-    ^bb0(%a: f32, %b: f32):
-      %s = arith.addf %a, %b : f32
-      tt.reduce.return %s : f32
-    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
-    tt.return
-  }
-}
-
-// -----
-// Looking only at the outer addptr is not enough: this spells a contiguous
-// outer range on top of an inner tensor offset, which the legacy path would
-// otherwise drop when it accumulates only scalar base terms.
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank1_nested_tensor_address_deferred(%x_ptr: !tt.ptr<f32>, %stride: i32) {
-    %offsets = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
-    %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked>
-    %inner_offsets = arith.muli %offsets, %stride_splat : tensor<128xi32, #blocked>
-    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
-    %inner_addr = tt.addptr %x_splat, %inner_offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
-    %x_addr = tt.addptr %inner_addr, %offsets : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
-    %x = tt.load %x_addr : tensor<128x!tt.ptr<f32>, #blocked>
-    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
-    %r = "tt.reduce"(%x) ({
-    ^bb0(%a: f32, %b: f32):
-      %s = arith.addf %a, %b : f32
-      tt.reduce.return %s : f32
-    }) {axis = 0 : i32} : (tensor<128xf32, #blocked>) -> f32
-    tt.return
-  }
-}
-
-// -----
-// A bare splat pointer has no per-element addptr offset for the legacy address
-// replay formula.
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank1_bare_splat_address_deferred(%x_ptr: !tt.ptr<f32>) {
-    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
-    %x = tt.load %x_splat : tensor<128x!tt.ptr<f32>, #blocked>
-    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path}}
+    // expected-error @+1 {{rank-1 reduce address cannot be replayed by the single-load-chain path nor by the general cone evaluator}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32

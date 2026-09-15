@@ -100,3 +100,127 @@ def test_reduce_max_rank1_f32_block_gt_tpb(N, BLOCK):
     torch.testing.assert_close(
         out[0].item(), expected.item(), atol=1e-5, rtol=1e-5
     )
+
+
+# ---------------------------------------------------------------------------
+# Replayed source addresses at more than one element per thread.
+#
+# Above one element per thread the reduce rebuilds each element's address. The
+# single-load walker can only spell a contiguous range plus scalar pointer
+# offsets; every other spelling below is handed to the general per-element cone
+# evaluator, which walks the same pointer chain. At one element per thread none
+# of this runs — the band's converted scalar is read directly — so each form is
+# also checked there as the control that the two geometries agree.
+#
+# The adjacent rejection (an index neither path can rebuild) is
+# test_metal_backend_msl.py::test_reduce_rank1_address_shape_unsupported_fails_without_crashing.
+
+
+@triton.jit
+def _reduce_rank1_address_form_kernel(
+    X,
+    IDX,
+    O,
+    STRIDE,
+    N,
+    BLOCK: tl.constexpr,
+    FORM: tl.constexpr,
+    OP: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    if FORM == "contiguous":
+        values = tl.load(X + offs)
+    elif FORM == "runtime_stride":
+        values = tl.load(X + offs * STRIDE)
+    elif FORM == "constant_stride":
+        values = tl.load(X + offs * 3)
+    elif FORM == "modulo":
+        values = tl.load(X + offs % 8)
+    elif FORM == "index_shift":
+        values = tl.load(X + (offs + 8))
+    elif FORM == "reversed":
+        values = tl.load(X + (BLOCK - 1 - offs))
+    elif FORM == "gather":
+        values = tl.load(X + tl.load(IDX + offs))
+    elif FORM == "nested_levels":
+        base = X + offs * STRIDE
+        values = tl.load(base + offs)
+    elif FORM == "masked_shift":
+        values = tl.load(X + (offs + 8), mask=offs < N, other=0.0)
+    elif FORM == "masked_shift_other":
+        # `other` deliberately away from both monoid identities: 0.0 is add's
+        # and -inf is max's, so either one would hide a dropped `other`.
+        values = tl.load(X + (offs + 8), mask=offs < N, other=7.5)
+    else:  # splat_base: every lane reads the same element
+        values = tl.load(X + (offs - offs))
+    result = tl.max(values, axis=0) if OP == "max" else tl.sum(values, axis=0)
+    tl.store(O, result)
+
+
+_ADDRESS_FORMS = [
+    "contiguous",
+    "runtime_stride",
+    "constant_stride",
+    "modulo",
+    "index_shift",
+    "reversed",
+    "gather",
+    "nested_levels",
+    "masked_shift",
+    "masked_shift_other",
+    "splat_base",
+]
+
+
+def _address_form_reference(form, x, idx, stride, n, block):
+    if form == "contiguous":
+        return x[:block]
+    if form == "runtime_stride":
+        return x[: block * stride : stride]
+    if form == "constant_stride":
+        return x[: block * 3 : 3]
+    if form == "modulo":
+        return x[:8].repeat(block // 8)
+    if form == "index_shift":
+        return x[8 : 8 + block]
+    if form == "reversed":
+        return x[:block].flip(0)
+    if form == "gather":
+        return x[idx.long()]
+    if form == "nested_levels":
+        return x[(torch.arange(block) * stride + torch.arange(block)).long()]
+    if form == "masked_shift":
+        shifted = x[8 : 8 + block].clone()
+        shifted[n:] = 0.0
+        return shifted
+    if form == "masked_shift_other":
+        shifted = x[8 : 8 + block].clone()
+        shifted[n:] = 7.5
+        return shifted
+    return x[:1].repeat(block)
+
+
+@pytest.mark.parametrize("form", _ADDRESS_FORMS)
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize(
+    "block,num_warps",
+    [(128, 1), (256, 2), (64, 2)],
+    ids=["e4", "e4_w2", "e1"],
+)
+def test_reduce_rank1_replayed_address_forms(form, op, block, num_warps):
+    torch.manual_seed(0xA11CE)
+    stride = 3
+    n = block - block // 4
+    # Long enough for every stride/shift above to stay inside the tensor.
+    x = torch.randn((block * (stride + 2),), dtype=torch.float32).contiguous()
+    idx = torch.randperm(block).to(torch.int32).contiguous()
+    out = torch.zeros((1,), dtype=torch.float32).contiguous()
+    _reduce_rank1_address_form_kernel[(1, 1, 1)](
+        x, idx, out, stride, n, BLOCK=block, FORM=form, OP=op,
+        num_warps=num_warps,
+    )
+    ref = _address_form_reference(form, x.cpu(), idx.cpu(), stride, n, block)
+    expected = ref.max() if op == "max" else ref.sum()
+    torch.testing.assert_close(
+        out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
+    )

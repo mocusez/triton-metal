@@ -428,9 +428,17 @@ The current dependency-ordered priorities are:
    named error. Single-band, computed-cone, and contiguous masked-sum paths
    retain their own support rules.
    The single-load-chain path also checks that its load address is a contiguous
-   range plus scalar pointer offsets or the base from its matching mask.
-   Strided, repeated, and other unsupported tensor offsets raise a named error
-   before conversion instead of silently reading contiguous elements.
+   range plus scalar pointer offsets or the base from its matching mask. An
+   address it cannot rebuild is no longer refused outright: strided, repeated,
+   gathered, reversed, and index-space-shifted offsets, including a chunk loop
+   written as `tl.load(X + i * BLOCK + tl.arange(0, BLOCK))`, are handed to the
+   general per-element cone evaluator, which walks the same pointer chain level
+   by level. Preflight and lowering choose between the two paths with one shared
+   predicate, so a source neither can replay — bitwise index arithmetic, for
+   instance — still raises a named error before conversion instead of silently
+   reading contiguous elements. At one element per thread none of this runs: the
+   band's converted scalar is read directly, which is why those spellings always
+   worked there.
    The masked f32-sum specialization separately validates both load and mask
    index expressions, including its one-element-per-thread boundary. Index
    expressions it cannot replay now fail before conversion; supported integer
