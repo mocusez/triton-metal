@@ -411,6 +411,12 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   A rank-2 `axis=1` reduce over a computed cone is implemented for f32 only,
+   and the preflight now asks the lowering's own question instead of listing the
+   combines it covers. `tl.sum` over an i8 or i16 tile is the ordinary kernel
+   that reached the gap: Triton promotes it to an i32 add over an `arith.extsi`
+   cone, which the old list of i32 product/extrema/bitwise combines did not
+   mention, so it declined during conversion instead of before it.
    The `tl.cumsum` / `tl.associative_scan` envelope has been probed shape by
    shape and its reachable refusals pinned: f16 and i64 scans, more than
    sixty-four elements per thread, an axis of extent above sixty-four on a

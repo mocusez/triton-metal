@@ -37772,40 +37772,28 @@ struct ConvertTritonGPUToMetalPass
           return;
         }
       }
-      // Rank-2 axis=1 i32 product/extrema deliberately reuse the direct device
-      // load row scanner. Unlike f32, their computed-cone path is not
-      // implemented. Reject that adjacent shape before dialect conversion
-      // mutates the function, so it fails deterministically instead of
-      // reaching failed-conversion teardown.
-      if (rtt.getRank() == 2 && axes == 1 &&
-          (combineName == "arith.muli" || combineName == "arith.maxsi" ||
-           combineName == "arith.minsi" || combineName == "arith.andi" ||
-           combineName == "arith.ori" || combineName == "arith.xori")) {
-        mlir::Value src = red.getSrcs().front();
-        if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-          src = cvt.getSrc();
-        auto load = src.getDefiningOp<mlir::triton::LoadOp>();
-        if ((!load || load.getMask()) && !stagedFallback) {
-          red.emitOpError(
-              "rank-2 axis=1 i32 product/max/min/bitwise requires a direct "
-              "unmasked tt.load");
-          reduceOk = false;
-          return;
-        }
-      }
-      // Half rides the same direct-load row scan; its computed-cone path is
-      // not implemented (see the isHalf gate in ReduceLowering). Reject here so
-      // the shape fails with this message instead of a bare "failed to
-      // legalize" out of dialect conversion.
+      // Rank-2 axis=1 rides the direct device-load row scanner for every
+      // element type but f32: `evalRank2ConeAt` rebuilds a computed cone in the
+      // cone's own types and only f32 is implemented, so the LOWERING declines
+      // exactly `!isF32 || isHalf`. Ask the same question here, where refusing
+      // is catchable and named.
+      // ⚠️ This used to be spelled as two lists -- i32's product, extrema and
+      // bitwise combines, and f16/bf16 -- which left `arith.addi` out: an
+      // ordinary `tl.sum` over an i8 or i16 tile, which Triton promotes to an
+      // i32 add over an `arith.extsi` cone, sailed past the validator and
+      // declined INSIDE the conversion, taking the process down (SIGSEGV on
+      // every run, occasionally SIGABRT). Mirror the gate instead of listing
+      // the combines it covers.
       if (rtt.getRank() == 2 && axes == 1 && combineEltTy &&
-          (combineEltTy.isF16() || combineEltTy.isBF16())) {
+          !combineEltTy.isF32()) {
         mlir::Value src = red.getSrcs().front();
         if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
           src = cvt.getSrc();
         auto load = src.getDefiningOp<mlir::triton::LoadOp>();
         if ((!load || load.getMask()) && !stagedFallback) {
           red.emitOpError(
-              "rank-2 axis=1 f16/bf16 reduce requires a direct unmasked "
+              "rank-2 axis=1 reduce over a computed cone is implemented for "
+              "f32 only; other element types require a direct unmasked "
               "tt.load");
           reduceOk = false;
           return;

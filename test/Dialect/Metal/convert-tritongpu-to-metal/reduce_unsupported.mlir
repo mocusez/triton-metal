@@ -99,7 +99,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_muli(%x_ptr: !tt.ptr<i32>) {
     %x = arith.constant dense<0> : tensor<16x32xi32, #blocked>
-    // expected-error @+1 {{rank-2 axis=1 i32 product/max/min/bitwise requires a direct unmasked tt.load}}
+    // expected-error @+1 {{rank-2 axis=1 reduce over a computed cone is implemented for f32 only}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: i32, %b: i32):
       %m = arith.muli %a, %b : i32
@@ -126,7 +126,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %x = tt.load %ap : tensor<32x16x!tt.ptr<i32>, #blocked>
     %one = arith.constant dense<1> : tensor<32x16xi32, #blocked>
     %computed = arith.addi %x, %one : tensor<32x16xi32, #blocked>
-    // expected-error @+1 {{rank-2 axis=1 i32 product/max/min/bitwise requires a direct unmasked tt.load}}
+    // expected-error @+1 {{rank-2 axis=1 reduce over a computed cone is implemented for f32 only}}
     %r = "tt.reduce"(%computed) ({
     ^bb0(%a: i32, %b: i32):
       %m = arith.maxsi %a, %b : i32
@@ -145,7 +145,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_f16(%x_ptr: !tt.ptr<f16>) {
     %x = arith.constant dense<0.0> : tensor<16x32xf16, #blocked>
-    // expected-error @+1 {{rank-2 axis=1 f16/bf16 reduce requires a direct unmasked tt.load}}
+    // expected-error @+1 {{rank-2 axis=1 reduce over a computed cone is implemented for f32 only}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f16, %b: f16):
       %s = arith.addf %a, %b : f16

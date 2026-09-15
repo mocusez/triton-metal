@@ -3606,6 +3606,18 @@ def _reduce_rank1_mask_shape_kernel(X, Y, O, N, RUNTIME_BASE, RUNTIME_OTHER,
 
 
 @triton.jit
+def _reduce_rank2_axis1_narrow_int_kernel(X, O, M: tl.constexpr,
+                                          N: tl.constexpr):
+    # Triton promotes an i8 or i16 sum to i32 over an `arith.extsi` cone, so the
+    # source of this reduce is a COMPUTED cone rather than a direct load -- the
+    # shape the rank-2 row scanner implements for f32 only.
+    r = tl.arange(0, M)[:, None]
+    c = tl.arange(0, N)[None, :]
+    v = tl.load(X + r * N + c)
+    tl.store(O + tl.arange(0, M), tl.sum(v, axis=1))
+
+
+@triton.jit
 def _scan_envelope_kernel(X, O, BLOCK: tl.constexpr, FORM: tl.constexpr):
     o = tl.arange(0, BLOCK)
     v = tl.load(X + o)
@@ -5227,6 +5239,62 @@ def test_scan_envelope_unsupported_fails_without_crashing(form, needle,
                             env={**os.environ,
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize("dtype", ["*i8", "*i16"], ids=["i8", "i16"])
+def test_reduce_rank2_axis1_narrow_int_is_rejected_not_crashed(dtype,
+                                                               tmp_path):
+    # `tl.sum(x, axis=1)` over an i8 or i16 tile used to pass the validator and
+    # decline INSIDE the conversion, which killed the process: SIGSEGV on every
+    # run and occasionally SIGABRT. The validator listed the combines it covered
+    # (i32 product, extrema, bitwise; f16/bf16) and `arith.addi` was not among
+    # them, while the lowering declines every non-f32 computed cone. The
+    # validator now asks the lowering's own question.
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "reduce_narrow_int.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+
+        for attempt in range(3):
+            try:
+                triton.compile(ASTSource(
+                    module._reduce_rank2_axis1_narrow_int_kernel,
+                    signature={{"X": {dtype!r}, "O": "*i32"}},
+                    constexprs={{"M": 8, "N": 32}}),
+                    target=target, options={{"num_warps": 1}})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a narrow-int rank-2 axis=1 sum compiled")
+        # The f32 neighbour is a computed cone too, and it is supported.
+        triton.compile(ASTSource(
+            module._reduce_rank2_axis1_narrow_int_kernel,
+            signature={{"X": "*fp32", "O": "*fp32"}},
+            constexprs={{"M": 8, "N": 32}}),
+            target=target, options={{"num_warps": 1}})
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "rank-2 axis=1 reduce over a computed cone is implemented for f32 only"
     assert result.returncode == 0, output
     assert output.count(needle) == 3, output
     assert "RECOVERED" in output
