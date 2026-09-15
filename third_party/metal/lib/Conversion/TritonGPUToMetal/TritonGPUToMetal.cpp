@@ -7695,6 +7695,50 @@ static bool rank1TupleSlotTypeSupported(mlir::Type ty) {
 // shape one accepts the other cannot reject -- the pair used to disagree by
 // construction: the validator mirrored `matchAndRewrite`'s bail-out line by
 // hand.
+// A cone that has to be REPLAYED per element must answer the same way before
+// and after conversion, and a tensor-yielding `scf.if` does not: before, the
+// evaluator can recurse into both yields; after, conversion has rewritten the
+// op and its results are no longer tensors, so there is nothing left to
+// recurse into. `rank1ConeSupported` therefore said yes to the validator and no
+// to the pattern, and a decline inside `applyFullConversion` is the
+// rollback-corruption site -- measured as SIGSEGV on every run for the tuple
+// forms and an intermittent {SIGABRT, SIGTRAP, exit 1} for the plain rank-1
+// one. Refuse it at both times instead, so the refusal happens before
+// conversion where it is catchable and named.
+//
+// This is deliberately narrow: at one element per thread nothing is replayed --
+// the band's converted scalar is read directly -- and those kernels never ask
+// this question, so `tl.where`-style uniform branches keep working there.
+static bool coneHasTensorYieldingIf(mlir::Value v, int depth = 0) {
+  if (depth > 24)
+    return false;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::scf::IfOp>(def) &&
+      mlir::isa<mlir::RankedTensorType>(v.getType()))
+    return true;
+  // Stop where `rank1ConeSupported` stops. An aggregate result is a LEAF for
+  // the replay -- it becomes a buffer read, and whatever produced it is not
+  // re-derived -- so walking into it would refuse cones for an `scf.if` the
+  // evaluator never touches. Stopping here also keeps this walk independent of
+  // conversion-time state, which is the whole point of the predicate.
+  if (mlir::isa<mlir::triton::ReduceOp, mlir::triton::ScanOp>(def))
+    return false;
+  for (mlir::Value operand : def->getOperands())
+    if (coneHasTensorYieldingIf(operand, depth + 1))
+      return true;
+  return false;
+}
+
+// The replay-stable form of `rank1ConeSupported`, for the callers whose
+// geometry means the cone is rebuilt element by element.
+static bool coneReplayableAcrossConversion(mlir::Value v,
+                                           bool deferAggregateLeaves = false) {
+  return rank1ConeSupported(v, 0, deferAggregateLeaves) &&
+         !coneHasTensorYieldingIf(v);
+}
+
 static bool rank1MultiValueReduceSupported(mlir::triton::ReduceOp op,
                                            llvm::StringRef *why = nullptr) {
   auto no = [&](const char *reason) {
@@ -7742,7 +7786,7 @@ static bool rank1MultiValueReduceSupported(mlir::triton::ReduceOp op,
       return no("a general tuple reduce is implemented up to sixty-four "
                 "elements per thread");
     for (mlir::Value src : op.getSrcs())
-      if (!rank1ConeSupported(src, 0))
+      if (!coneReplayableAcrossConversion(src))
         return no("a general tuple reduce above one element per thread has to "
                   "re-derive each source at a logical position, and one of "
                   "them is not a re-emittable cone");
@@ -8239,7 +8283,7 @@ static Rank1ReduceSourcePath classifyRank1ReduceSource(
   };
   if (mlir::failed(walkBackThroughElementwiseChain(
           reduceSrc, /*depth=*/0, chain, load, reduceOp, dominance, reason))) {
-    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+    if (coneReplayableAcrossConversion(reduceSrc, deferAggregateLeaves))
       return takeRichCone();
     reason = "rank-1 reduce cannot replay its source: " + reason;
     return Rank1ReduceSourcePath::Unsupported;
@@ -8253,13 +8297,13 @@ static Rank1ReduceSourcePath classifyRank1ReduceSource(
     // `other`, while the evaluator replays the mask and `other` cones per
     // element like any other value. Every other predicate, compound mask, mask
     // index and runtime `other` is exact there, so ask it before refusing.
-    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+    if (coneReplayableAcrossConversion(reduceSrc, deferAggregateLeaves))
       return takeRichCone();
     reason = maskFailure.str();
     return Rank1ReduceSourcePath::Unsupported;
   }
   if (requireReplayableAddress && !rank1ReduceAddressSupported(load, maskPlan)) {
-    if (rank1ConeSupported(reduceSrc, 0, deferAggregateLeaves))
+    if (coneReplayableAcrossConversion(reduceSrc, deferAggregateLeaves))
       return takeRichCone();
     reason = "rank-1 reduce address cannot be replayed by the "
              "single-load-chain path nor by the general cone evaluator; "
@@ -12811,7 +12855,7 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
                 "threadgroup slot per position per value plus one per thread, "
                 "and this block does not fit the threadgroup budget");
     for (mlir::Value src : op.getSrcs())
-      if (!rank1ConeSupported(src, 0))
+      if (!coneReplayableAcrossConversion(src))
         return no("a general tuple scan above one element per thread has to "
                   "re-derive each source at a logical position, and one of "
                   "them is not a re-emittable cone");

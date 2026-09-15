@@ -3606,6 +3606,31 @@ def _reduce_rank1_mask_shape_kernel(X, Y, O, N, RUNTIME_BASE, RUNTIME_OTHER,
 
 
 @triton.jit
+def _argmax_tuple_combine(a_val, a_idx, b_val, b_idx):
+    gt = a_val > b_val
+    return tl.where(gt, a_val, b_val), tl.where(gt, a_idx, b_idx)
+
+
+@triton.jit
+def _replayed_cone_through_if_kernel(X, Y, O, S, BLOCK: tl.constexpr,
+                                     FORM: tl.constexpr):
+    # The source arrives through an `scf.if` with a uniform condition. Above one
+    # element per thread every one of these forms has to re-derive it per
+    # element, which conversion makes impossible: it rewrites the `scf.if` and
+    # its results stop being tensors.
+    o = tl.arange(0, BLOCK)
+    v = tl.load(X + o) if S > 0.0 else tl.load(Y + o)
+    if FORM == "tuple_reduce":
+        val, pos = tl.reduce((v, o), 0, _argmax_tuple_combine)
+        tl.store(O, val + pos.to(tl.float32) * 0.0)
+    elif FORM == "tuple_scan":
+        val, pos = tl.associative_scan((v, o), 0, _argmax_tuple_combine)
+        tl.store(O + o, val)
+    else:
+        tl.store(O, tl.max(v, axis=0))
+
+
+@triton.jit
 def _reduce_rank1_address_shape_kernel(X, Y, O, RUNTIME_BASE,
                                        BLOCK: tl.constexpr,
                                        OP: tl.constexpr,
@@ -5024,3 +5049,70 @@ def test_reduce_rank3_combines_match_torch(d0, d1, d2, num_warps, axis, op,
         assert torch.equal(out.cpu(), expected)
     else:
         torch.testing.assert_close(out.cpu(), expected, atol=3e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "form,needle",
+    [
+        ("tuple_reduce",
+         "multi-value tt.reduce is implemented for the canonical rank-1 argmax"),
+        ("tuple_scan",
+         "tl.associative_scan carrying more than one value is implemented"),
+        ("rank1_reduce", "rank-1 reduce cannot replay its source"),
+    ],
+    ids=["tuple_reduce", "tuple_scan", "rank1_reduce"],
+)
+def test_replayed_cone_through_if_is_rejected_not_crashed(form, needle,
+                                                          tmp_path):
+    # A cone that has to be replayed per element and passes through an `scf.if`
+    # used to pass the pre-conversion validator and then be declined by the
+    # pattern, because the same predicate answers differently once the `scf.if`
+    # has been converted. That decline is inside `applyFullConversion`: it took
+    # the process down with SIGSEGV every run for the two tuple forms and an
+    # intermittent SIGABRT/SIGTRAP for the plain rank-1 one. The refusal now
+    # happens before conversion, so it is catchable, named, and repeatable --
+    # and the same kernel at ONE element per thread still compiles afterwards,
+    # which is both the control and the proof that the context survived.
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "replayed_cone_through_if.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+        signature = {{"X": "*fp32", "Y": "*fp32", "O": "*fp32", "S": "fp32"}}
+
+        def compile_case(block, num_warps):
+            triton.compile(ASTSource(
+                module._replayed_cone_through_if_kernel,
+                signature=signature,
+                constexprs={{"BLOCK": block, "FORM": {form!r}}}),
+                target=target, options={{"num_warps": num_warps}})
+
+        for attempt in range(3):
+            try:
+                compile_case(128, 1)     # four elements per thread
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a replayed scf.if cone compiled")
+        compile_case(64, 2)              # one element per thread: supported
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output

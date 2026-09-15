@@ -411,6 +411,14 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   A source cone that must be replayed per element and passes through an
+   `scf.if` is refused before conversion. Such a cone reads as replayable
+   before conversion and unrecognisable after it, because the `scf.if` is
+   rewritten and its results stop being tensors, so the validator used to accept
+   what the pattern then declined — a decline inside the conversion, which takes
+   the process down. The general tuple reduce, the general tuple scan and the
+   canonical rank-1 reduce now answer that question the same way at both times.
+   At one element per thread nothing is replayed and such kernels still compile.
    A function whose full-tile exchange phases cannot carry a value across the
    split joined the preflight set on 2026-09-08. That rejection used to be
    emitted from the function lowering, long after the body had been moved into
