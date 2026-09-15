@@ -22674,7 +22674,7 @@ static mlir::Value sdResolveLoopCarriedPtrInit(mlir::Value ptr);
 // multiply at all, which is what Triton leaves behind once a unit stride has
 // been specialized to a constant. Declining hands the dot to the post-tier
 // diagnostic, which names it.
-static bool simdgroupTileIsContiguous(mlir::Value ptr) {
+static bool simdgroupTileIsContiguous(mlir::Value ptr, int axis = 1) {
   if (!ptr)
     return false;
   // Inside a pointer-advance loop the operand pointer is the loop's iter_arg,
@@ -22682,7 +22682,7 @@ static bool simdgroupTileIsContiguous(mlir::Value ptr) {
   // every stride reads as unit. Ask the init chain the loop carries, which is
   // where the address arithmetic actually lives.
   ptr = sdResolveLoopCarriedPtrInit(ptr);
-  mlir::Value stride = findAxisStride(ptr, /*axis=*/1);
+  mlir::Value stride = findAxisStride(ptr, axis);
   if (!stride)
     return true;
   auto constant = getScalarIntegerConstant(stride);
@@ -23729,11 +23729,13 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   // the correct simdgroup-load stride.
   mlir::Value bBaseCol =
       findOriginScalarInPtrChain(bPtrsInit, /*targetAxis=*/bTransposed ? 0 : 1);
-  // A transposed operand is staged the other way round, so the axis that must
-  // be dense is not the tile's own axis 1. Ask only about the operands read
-  // straight; the transposed staging keeps the behaviour the suite pins.
+  // Axis 1 of the LOADED tile is the dense one either way here: a normal B
+  // loads [K, N] and its axis 1 is N, a `tt.trans`-ed B loads [N, K] and its
+  // axis 1 is K, and in both cases that is the axis the buffer is contiguous
+  // along. The blanket transposed-operand exemption was wider than the fact
+  // behind it and let a strided transposed B through.
   if (!simdgroupTileIsContiguous(loadA.getPtr()) ||
-      (!bTransposed && !simdgroupTileIsContiguous(loadB.getPtr())) ||
+      !simdgroupTileIsContiguous(loadB.getPtr()) ||
       !simdgroupTileIsContiguous(store.getPtr()))
     return mlir::failure();
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
@@ -24355,13 +24357,27 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   }
   mlir::Value aBaseRow = findOriginScalarInPtrChain(loadA.getPtr(), /*axis=*/0);
   mlir::Value bNOrigin = findOriginScalarInPtrChain(loadB.getPtr(), bNAxis);
-  // A transposed operand is staged the other way round, so the axis that must
-  // be dense is not the tile's own axis 1. Ask only about the operands read
-  // straight; the transposed staging keeps the behaviour the suite pins.
+  // Axis 1 of the LOADED tile is the dense one either way here: a normal B
+  // loads [K, N] and its axis 1 is N, a `tt.trans`-ed B loads [N, K] and its
+  // axis 1 is K, and in both cases that is the axis the buffer is contiguous
+  // along. The blanket transposed-operand exemption was wider than the fact
+  // behind it and let a strided transposed B through.
   if (!simdgroupTileIsContiguous(loadA.getPtr()) ||
-      (!bTransposed && !simdgroupTileIsContiguous(loadB.getPtr())) ||
+      !simdgroupTileIsContiguous(loadB.getPtr()) ||
       !simdgroupTileIsContiguous(store.getPtr()))
     return mlir::failure();
+  // This tier addresses A, B and the destination by (row, column) origins
+  // alone and never applies a scalar base: `tl.store(out + base + tile, ...)`
+  // wrote, and `tl.load(a + base + tile)` read, at the buffer's origin. The
+  // pointer-advance tiers fold such a base into the column they address;
+  // doing the same here is a widening, not a correction, so refuse a base
+  // this tier cannot honour rather than drop it.
+  for (mlir::Value ptr :
+       {loadA.getPtr(), loadB.getPtr(), store.getPtr()}) {
+    ScalarBaseOffset base = extractScalarBaseOffset(ptr);
+    if (!base.valid || (base.value && !isNumericZero(base.value)))
+      return mlir::failure();
+  }
 
   mlir::OpBuilder builder(forOp);
   auto loc = forOp.getLoc();
@@ -24641,15 +24657,28 @@ tryRuntimeKLoopRecomputeMultiDot(mlir::scf::ForOp forOp) {
       return mlir::failure();
     accs[i] = {dot, loadB, bT, store};
   }
-  // A transposed operand is staged the other way round, so the axis that must
-  // be dense is not the tile's own axis 1. Ask only about the operands read
-  // straight; the transposed staging keeps the behaviour the suite pins.
+  // Axis 1 of the LOADED tile is the dense one either way here: a normal B
+  // loads [K, N] and its axis 1 is N, a `tt.trans`-ed B loads [N, K] and its
+  // axis 1 is K, and in both cases that is the axis the buffer is contiguous
+  // along. The blanket transposed-operand exemption was wider than the fact
+  // behind it and let a strided transposed B through.
   if (!simdgroupTileIsContiguous(sharedA.getPtr()))
     return mlir::failure();
   for (auto &acc : accs)
-    if ((!acc.bTransposed && !simdgroupTileIsContiguous(acc.loadB.getPtr())) ||
+    if (!simdgroupTileIsContiguous(acc.loadB.getPtr()) ||
         !simdgroupTileIsContiguous(acc.store.getPtr()))
       return mlir::failure();
+  {
+    ScalarBaseOffset base = extractScalarBaseOffset(sharedA.getPtr());
+    if (!base.valid || (base.value && !isNumericZero(base.value)))
+      return mlir::failure();
+    for (auto &acc : accs)
+      for (mlir::Value ptr : {acc.loadB.getPtr(), acc.store.getPtr()}) {
+        ScalarBaseOffset b = extractScalarBaseOffset(ptr);
+        if (!b.valid || (b.value && !isNumericZero(b.value)))
+          return mlir::failure();
+      }
+  }
 
   // ---- Emit ----
   mlir::OpBuilder builder(forOp);
@@ -26015,7 +26044,33 @@ static ScalarDotOp sdCreateScalarDot(
   if (!scaleInfo && !weightLoad) {
     if (!transposeA && !simdgroupTileIsContiguous(aLoad.getPtr()))
       return {};
-    if (!transposeB && !simdgroupTileIsContiguous(bLoad.getPtr()))
+    // A transposed B comes in two spellings and they need OPPOSITE axes. A
+    // real `tt.trans` loads an [N, K] tile, so K -- the dense axis of an
+    // [N, K] buffer -- is its axis 1, the same axis a straight B is asked
+    // about. An address-only transpose loads a [K, N] tile out of that same
+    // buffer, and there the dense axis is 0. `sdConeCrossesTranspose` reports
+    // both as transposed and cannot separate them; the load's own consumer
+    // can, because only the first spelling has a `tt.trans` to consume it.
+    // (The tile's shape would say the same thing, but not when BK equals N.)
+    int bDenseAxis = 1;
+    if (transposeB) {
+      std::function<bool(mlir::Value, int)> feedsTranspose =
+          [&](mlir::Value v, int depth) -> bool {
+        if (depth > 4)
+          return false;
+        for (mlir::Operation *user : v.getUsers()) {
+          if (mlir::isa<mlir::triton::TransOp>(user))
+            return true;
+          if (auto cvt =
+                  mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user))
+            if (feedsTranspose(cvt.getResult(), depth + 1))
+              return true;
+        }
+        return false;
+      };
+      bDenseAxis = feedsTranspose(bLoad.getResult(), 0) ? 1 : 0;
+    }
+    if (!simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis))
       return {};
   }
 

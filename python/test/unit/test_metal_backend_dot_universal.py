@@ -3381,3 +3381,89 @@ def test_dot_recompute_loop_strided_a_is_named(capfd, real_trans):
     with pytest.raises(Exception):
         _run_recompute(sak=2, real_trans=real_trans)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# A transposed B: the two spellings need opposite dense axes.
+#
+# A real `tt.trans` loads an [N, K] tile, so K -- the axis an [N, K] buffer is
+# contiguous along -- is its axis 1. An address-only transpose loads a [K, N]
+# tile out of the same buffer and its dense axis is 0. Both report as
+# "transposed", so the check has to pick the axis from the load's own consumer.
+# The tier that claims a real `tt.trans` also addresses its operands by origins
+# alone and cannot honour a scalar base offset at all.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_transposed_b_address_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_off,
+    b_off,
+    c_off,
+    M,
+    N,
+    K,
+    lda,
+    ldb,
+    sbk,
+    ldc,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    REAL_TRANS: tl.constexpr,
+    USE_OFF: tl.constexpr,
+):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    if not USE_OFF:
+        a_off = 0
+        b_off = 0
+        c_off = 0
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + a_off + om[:, None] * lda + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        if REAL_TRANS:
+            bnk = tl.load(b_ptr + b_off + on[:, None] * ldb + ok[None, :] * sbk,
+                          mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+            acc = tl.dot(av, tl.trans(bnk), acc)
+        else:
+            bv = tl.load(b_ptr + b_off + on[None, :] * ldb + ok[:, None] * sbk,
+                         mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+            acc += tl.dot(av, bv)
+    tl.store(c_ptr + c_off + om[:, None] * ldc + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def _run_transposed_b(*, real_trans, use_off, sbk=1, pad=24, off=(5, 3)):
+    M, N, K, BK = 32, 64, 128, 16
+    r0, c0 = off if use_off else (0, 0)
+    lda, ldb, ldc = K + pad, sbk * K + pad, N + pad
+    torch.manual_seed(0x7B05)
+    big_a = torch.randn((r0 + M, lda), dtype=torch.float32)
+    big_b = torch.randn((r0 + N, ldb), dtype=torch.float32)
+    big_c = torch.zeros((r0 + M, ldc), dtype=torch.float32)
+    a = big_a[r0:r0 + M, c0:c0 + K]
+    bnk = big_b[r0:r0 + N, c0:c0 + sbk * K:sbk]
+    dot_transposed_b_address_kernel[(1, 1)](
+        big_a, big_b, big_c, r0 * lda + c0, r0 * ldb + c0, r0 * ldc + c0,
+        M, N, K, lda, ldb, sbk, ldc, BM=M, BN=N, BK=BK,
+        REAL_TRANS=real_trans, USE_OFF=use_off, num_warps=1,
+    )
+    return big_c[r0:r0 + M, c0:c0 + N], a @ bnk.t()
+
+
+@pytest.mark.parametrize("use_off", [False, True], ids=["no_base", "base"])
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_transposed_b_address_matches_torch(real_trans, use_off):
+    got, ref = _run_transposed_b(real_trans=real_trans, use_off=use_off)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_transposed_b_strided_dense_axis_is_named(capfd, real_trans):
+    with pytest.raises(Exception):
+        _run_transposed_b(real_trans=real_trans, use_off=False, sbk=2)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err

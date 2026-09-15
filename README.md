@@ -587,6 +587,15 @@ The current dependency-ordered priorities are:
    of the tile into whatever the buffer held next. Each operand is also asked
    about its own inner-axis contiguity separately, since a transposed B used to
    excuse a strided A.
+   A transposed B is asked about the right axis. The two spellings need
+   opposite ones: a real `tl.trans` loads an `[N, K]` tile, so the axis its
+   buffer is contiguous along is the tile's axis 1, while a transpose written
+   into the address arithmetic loads a `[K, N]` tile whose dense axis is 0.
+   Both look transposed to the matcher, so the axis is chosen by the load's own
+   consumer -- only the first spelling has a transpose to consume it. The tier
+   that claims a real transpose also addresses its operands by origins alone
+   and cannot honour a scalar base offset on any of the three buffers, so it
+   now declines one instead of writing, and reading, at the buffer's origin.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
