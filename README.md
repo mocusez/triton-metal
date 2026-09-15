@@ -609,6 +609,18 @@ The current dependency-ordered priorities are:
    write; an unmasked one would need a Metal overload that does not exist. A
    64x64 block at a single warp stays refused, over the accumulator register
    budget.
+   The runtime-bound matmul asks once, before its reduction loop, whether the
+   tiles this program touches lie wholly inside its operands, and gives the
+   interior case a loop whose staged loads carry no bounds at all. Staging an
+   operand behind a runtime test costs about a third of the kernel's time: a
+   predicated device read cannot be hoisted out of the staging loop, and the
+   reduction loop cannot be pipelined across it. Hoisting the test to once per
+   tile inside the loop changes nothing, which is how the cost was identified
+   as the predication rather than the comparisons. The question is answered by
+   the block origins and the extents, all loop-invariant and uniform across the
+   threadgroup, so the branch is safe where a staged load brackets itself with
+   a threadgroup barrier. A partial block, or a reduction that is not a
+   multiple of the matrix unit's eight, takes the predicated loop as before.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

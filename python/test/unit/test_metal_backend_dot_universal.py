@@ -3527,7 +3527,10 @@ def dot_swizzled_grid_kernel(
 )
 @pytest.mark.parametrize(
     "M,N,K", [pytest.param(128, 128, 128, id="exact"),
-              pytest.param(100, 132, 96, id="ragged")]
+              pytest.param(100, 132, 96, id="ragged"),
+              # K not a multiple of the 8-wide reduction step, so the interior
+              # branch below must decline and the predicated loop must run.
+              pytest.param(100, 132, 100, id="ragged_k")]
 )
 def test_dot_swizzled_grid_matches_torch(M, N, K, dtype, BK, group_m):
     torch.manual_seed(0x5017)

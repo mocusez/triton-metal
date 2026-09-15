@@ -23960,47 +23960,79 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
                                             builder.getI32IntegerAttr(8));
   mlir::Value ub = loopElementUpper; // runtime total K (i32)
 
-  auto loop = mlir::scf::ForOp::create(
-      builder, loc, c0.getResult(), ub, c8.getResult(),
-      mlir::ValueRange{initAccs},
-      [&](mlir::OpBuilder &b, mlir::Location l, mlir::Value iv,
-          mlir::ValueRange args) {
-        mlir::Value kUi32 = toUi32(b, iv); // K-axis offset = induction var
-        mlir::Value aKUi32 =
-            addScalarElementOffset(b, l, ui32, kUi32, aBaseOffset.value);
-        mlir::Value bKUi32 =
-            bTransposed
-                ? addScalarElementOffset(b, l, ui32, kUi32, bBaseOffset.value)
-                : kUi32;
-        llvm::SmallVector<mlir::Value> aTiles;
-        llvm::SmallVector<mlir::Value> bTiles;
-        for (int mi = 0; mi < mPerWarp; ++mi)
-          aTiles.push_back(emitStagedLoad(
-              b, l, matTy, aBuf, aRowTiles[mi], aKUi32, strideAVal,
-              /*transposed=*/false, aRowExt, aColExt, widx));
-        for (int ni = 0; ni < nPerWarp; ++ni) {
-          if (bTransposed)
-            bTiles.push_back(emitStagedLoad(
-                b, l, matTy, bBuf, bColTiles[ni], bKUi32, strideBVal,
-                /*transposed=*/true, bRowExt, bColExt, widx));
-          else
-            bTiles.push_back(emitStagedLoad(
-                b, l, matTy, bBuf, kUi32, bColTiles[ni], strideBVal,
-                /*transposed=*/false, bRowExt, bColExt, widx));
-        }
-        llvm::SmallVector<mlir::Value> newAccs;
-        for (int mi = 0; mi < mPerWarp; ++mi) {
+  // Staging an operand tile behind a runtime bounds test costs 1.29x-1.42x on
+  // a 1024-cubed fp16 product, measured against the same kernel with unmasked
+  // operand loads, ranges disjoint. The two emitted kernels are otherwise
+  // identical -- same barriers, same staging, same simdgroup loads -- so the
+  // cost is the predication itself: a conditional device read cannot be
+  // hoisted out of the staging loop, and the K loop cannot be pipelined across
+  // it. Hoisting the test to once per tile inside the loop buys nothing
+  // (measured); the branch has to leave the loop entirely.
+  //
+  // It can. Whether the tiles this program touches are wholly inside the
+  // operands is decided by the block origins and the extents, all of them
+  // loop-invariant and uniform across the threadgroup -- which matters,
+  // because a staged load that is not per-warp brackets itself with a
+  // threadgroup barrier and every warp must reach the same one. So ask once,
+  // before the loop, and give the interior case a loop whose loads carry no
+  // extents at all.
+  auto buildKLoop = [&](mlir::OpBuilder &b, mlir::Location l,
+                        bool masked) -> mlir::scf::ForOp {
+    mlir::Value aRow = masked ? aRowExt : mlir::Value();
+    mlir::Value aCol = masked ? aColExt : mlir::Value();
+    mlir::Value bRow = masked ? bRowExt : mlir::Value();
+    mlir::Value bCol = masked ? bColExt : mlir::Value();
+    return mlir::scf::ForOp::create(
+        b, l, c0.getResult(), ub, c8.getResult(), mlir::ValueRange{initAccs},
+        [&](mlir::OpBuilder &nb, mlir::Location nl, mlir::Value iv,
+            mlir::ValueRange args) {
+          mlir::Value kUi32 = toUi32(nb, iv); // K-axis offset = induction var
+          mlir::Value aKUi32 =
+              addScalarElementOffset(nb, nl, ui32, kUi32, aBaseOffset.value);
+          mlir::Value bKUi32 =
+              bTransposed ? addScalarElementOffset(nb, nl, ui32, kUi32,
+                                                   bBaseOffset.value)
+                          : kUi32;
+          llvm::SmallVector<mlir::Value> aTiles;
+          llvm::SmallVector<mlir::Value> bTiles;
+          for (int mi = 0; mi < mPerWarp; ++mi)
+            aTiles.push_back(emitStagedLoad(
+                nb, nl, matTy, aBuf, aRowTiles[mi], aKUi32, strideAVal,
+                /*transposed=*/false, aRow, aCol, widx));
           for (int ni = 0; ni < nPerWarp; ++ni) {
-            int idx = mi * nPerWarp + ni;
-            newAccs.push_back(
-                SimdgroupMultiplyAccumulateOp::create(b, l, matTy, args[idx],
-                                                      aTiles[mi], bTiles[ni])
-                    .getResult());
+            if (bTransposed)
+              bTiles.push_back(emitStagedLoad(
+                  nb, nl, matTy, bBuf, bColTiles[ni], bKUi32, strideBVal,
+                  /*transposed=*/true, bRow, bCol, widx));
+            else
+              bTiles.push_back(emitStagedLoad(
+                  nb, nl, matTy, bBuf, kUi32, bColTiles[ni], strideBVal,
+                  /*transposed=*/false, bRow, bCol, widx));
           }
-        }
-        mlir::scf::YieldOp::create(b, l, newAccs);
-      });
+          llvm::SmallVector<mlir::Value> newAccs;
+          for (int mi = 0; mi < mPerWarp; ++mi) {
+            for (int ni = 0; ni < nPerWarp; ++ni) {
+              int idx = mi * nPerWarp + ni;
+              newAccs.push_back(SimdgroupMultiplyAccumulateOp::create(
+                                    nb, nl, matTy, args[idx], aTiles[mi],
+                                    bTiles[ni])
+                                    .getResult());
+            }
+          }
+          mlir::scf::YieldOp::create(nb, nl, newAccs);
+        });
+  };
 
+  // The duplicate body doubles the emitted kernel, and a large unrolled matrix
+  // kernel has killed Apple's shader compiler before, so keep the second copy
+  // for the tile counts where the win was measured.
+  const bool splitInterior =
+      aRowExt && aColExt && bRowExt && bColExt && mPerWarp * nPerWarp <= 16;
+
+  // The stores go inside each branch rather than the accumulators coming out
+  // of it: the emitter has no C declaration for a simdgroup matrix crossing an
+  // `scf.if` result, and duplicating four stores is cheaper than teaching it
+  // one. Everything they address is loop-invariant and already built above.
   llvm::SmallVector<mlir::Value, 2> partialExtents;
   if (maskExtents.mExtent && maskExtents.nExtent) {
     mlir::Value mExtent = maskExtents.mExtent;
@@ -24018,16 +24050,88 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
         builder, loc, ui32, emitExtentUi32(builder, loc, ui32, nExtent),
         cBaseOffset.value));
   }
-  for (int mi = 0; mi < mPerWarp; ++mi) {
-    for (int ni = 0; ni < nPerWarp; ++ni) {
-      int idx = mi * nPerWarp + ni;
-      SimdgroupStoreOp::create(
-          builder, loc, loop.getResult(idx), cBuf, cRowTiles[mi], cColTiles[ni],
-          strideCVal, partialExtents,
-          (activeWarps > 1 && !partialExtents.empty())
-              ? mlir::ValueRange{widx}
-              : mlir::ValueRange{});
+  auto emitStores = [&](mlir::OpBuilder &b, mlir::Location l,
+                        mlir::ValueRange accs) {
+    for (int mi = 0; mi < mPerWarp; ++mi) {
+      for (int ni = 0; ni < nPerWarp; ++ni) {
+        int idx = mi * nPerWarp + ni;
+        SimdgroupStoreOp::create(
+            b, l, accs[idx], cBuf, cRowTiles[mi], cColTiles[ni], strideCVal,
+            partialExtents,
+            (activeWarps > 1 && !partialExtents.empty())
+                ? mlir::ValueRange{widx}
+                : mlir::ValueRange{});
+      }
     }
+  };
+
+  if (splitInterior) {
+    auto i32Ty = builder.getIntegerType(32);
+    auto asI32 = [&](mlir::Value v) -> mlir::Value {
+      if (v.getType() == i32Ty)
+        return v;
+      return mlir::UnrealizedConversionCastOp::create(
+                 builder, loc, mlir::TypeRange{i32Ty}, mlir::ValueRange{v})
+          .getResult(0);
+    };
+    auto cst = [&](int64_t v) {
+      return mlir::arith::ConstantOp::create(builder, loc,
+                                             builder.getI32IntegerAttr(v))
+          .getResult();
+    };
+    auto ule = [&](mlir::Value lhs, mlir::Value rhs) {
+      return mlir::arith::CmpIOp::create(builder, loc,
+                                         mlir::arith::CmpIPredicate::ule,
+                                         asI32(lhs), asI32(rhs))
+          .getResult();
+    };
+    mlir::Value blockRowEnd = mlir::arith::AddIOp::create(
+                                  builder, loc, asI32(aBaseRowVal),
+                                  cst(mTiles * 8))
+                                  .getResult();
+    mlir::Value blockColEnd = mlir::arith::AddIOp::create(
+                                  builder, loc, asI32(bBaseColVal),
+                                  cst(nTiles * 8))
+                                  .getResult();
+    // Every K step covers [k, k + 8) for k in [0, ub), so the whole reduction
+    // stays inside both K extents exactly when `ub` is a multiple of 8 and no
+    // larger than either of them.
+    mlir::Value kAligned =
+        mlir::arith::CmpIOp::create(
+            builder, loc, mlir::arith::CmpIPredicate::eq,
+            mlir::arith::RemUIOp::create(builder, loc, asI32(ub), cst(8))
+                .getResult(),
+            cst(0))
+            .getResult();
+    mlir::Value interior = mlir::arith::AndIOp::create(
+                               builder, loc, ule(blockRowEnd, aRowExt),
+                               ule(blockColEnd, bColExt))
+                               .getResult();
+    interior = mlir::arith::AndIOp::create(builder, loc, interior, kAligned)
+                   .getResult();
+    interior = mlir::arith::AndIOp::create(builder, loc, interior,
+                                           ule(asI32(ub), asI32(aColExt)))
+                   .getResult();
+    interior = mlir::arith::AndIOp::create(builder, loc, interior,
+                                           ule(asI32(ub), asI32(bRowExt)))
+                   .getResult();
+    auto ifOp = mlir::scf::IfOp::create(builder, loc, interior,
+                                        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(ifOp.thenBlock());
+      auto inner = buildKLoop(builder, loc, /*masked=*/false);
+      emitStores(builder, loc, inner.getResults());
+    }
+    {
+      mlir::OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(ifOp.elseBlock());
+      auto inner = buildKLoop(builder, loc, /*masked=*/true);
+      emitStores(builder, loc, inner.getResults());
+    }
+  } else {
+    auto loop = buildKLoop(builder, loc, /*masked=*/true);
+    emitStores(builder, loc, loop.getResults());
   }
 
   recordMatrixWarpDownselection(dot, requestedWarps, activeWarps);
