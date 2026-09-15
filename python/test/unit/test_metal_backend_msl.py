@@ -3606,6 +3606,26 @@ def _reduce_rank1_mask_shape_kernel(X, Y, O, N, RUNTIME_BASE, RUNTIME_OTHER,
 
 
 @triton.jit
+def _scan_envelope_kernel(X, O, BLOCK: tl.constexpr, FORM: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    v = tl.load(X + o)
+    if FORM == "tuple":
+        val, pos = tl.associative_scan((v, o), 0, _argmax_tuple_combine)
+        tl.store(O + o, val)
+    else:
+        tl.store(O + o, tl.cumsum(v, axis=0))
+
+
+@triton.jit
+def _scan_envelope_rank2_kernel(X, O, M: tl.constexpr, N: tl.constexpr,
+                                AXIS: tl.constexpr):
+    r = tl.arange(0, M)[:, None]
+    c = tl.arange(0, N)[None, :]
+    v = tl.load(X + r * N + c)
+    tl.store(O + r * N + c, tl.cumsum(v, axis=AXIS))
+
+
+@triton.jit
 def _argmax_tuple_combine(a_val, a_idx, b_val, b_idx):
     gt = a_val > b_val
     return tl.where(gt, a_val, b_val), tl.where(gt, a_idx, b_idx)
@@ -5105,6 +5125,101 @@ def test_replayed_cone_through_if_is_rejected_not_crashed(form, needle,
             else:
                 raise AssertionError("a replayed scf.if cone compiled")
         compile_case(64, 2)              # one element per thread: supported
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+# `validateScanSupport` carries ten fail-closed diagnostics, none of which had a
+# fixture. Probing them first (`.omc/fuzz/scan_envelope.py`, 20 shapes) sorted
+# them into what a user can actually reach and what nothing can express: a
+# non-power-of-two thread block is refused by the Triton frontend
+# ("num_warps must be a power of 2"), and an empty or non-tpb-multiple tile
+# cannot be spelled because `tl.arange` requires a power-of-two extent. Those
+# stay unpinned on purpose. These six are reachable, and each is checked for the
+# property that matters more than the wording: three refusals in a row leave the
+# process able to compile.
+@pytest.mark.parametrize(
+    "form,needle",
+    [
+        ("f16", "scan is implemented for f32 and i32 only"),
+        ("i64", "scan is implemented for f32 and i32 only"),
+        ("e128", "rank-1 scan requires a power-of-two 1..64 elements per thread"),
+        ("rank2_wide_axis1",
+         "rank >= 2 scan is implemented for a blocked tile"),
+        ("rank2_wide_axis0",
+         "rank >= 2 scan is implemented for a blocked tile"),
+        ("tuple_f16",
+         "tl.associative_scan carrying more than one value is implemented"),
+        ("tuple_e128",
+         "tl.associative_scan carrying more than one value is implemented"),
+    ],
+    ids=["f16", "i64", "e128", "rank2_wide_axis1", "rank2_wide_axis0",
+         "tuple_f16", "tuple_e128"],
+)
+def test_scan_envelope_unsupported_fails_without_crashing(form, needle,
+                                                          tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    cases = {
+        "f16": ("_scan_envelope_kernel", '{"X": "*fp16", "O": "*fp16"}',
+                '{"BLOCK": 128, "FORM": "plain"}', 1),
+        "i64": ("_scan_envelope_kernel", '{"X": "*i64", "O": "*i64"}',
+                '{"BLOCK": 128, "FORM": "plain"}', 1),
+        "e128": ("_scan_envelope_kernel", '{"X": "*fp32", "O": "*fp32"}',
+                 '{"BLOCK": 4096, "FORM": "plain"}', 1),
+        "rank2_wide_axis1": ("_scan_envelope_rank2_kernel",
+                             '{"X": "*fp32", "O": "*fp32"}',
+                             '{"M": 4, "N": 128, "AXIS": 1}', 1),
+        "rank2_wide_axis0": ("_scan_envelope_rank2_kernel",
+                             '{"X": "*fp32", "O": "*fp32"}',
+                             '{"M": 128, "N": 4, "AXIS": 0}', 1),
+        "tuple_f16": ("_scan_envelope_kernel", '{"X": "*fp16", "O": "*fp16"}',
+                      '{"BLOCK": 128, "FORM": "tuple"}', 1),
+        "tuple_e128": ("_scan_envelope_kernel", '{"X": "*fp32", "O": "*fp32"}',
+                       '{"BLOCK": 4096, "FORM": "tuple"}', 1),
+    }
+    kernel, signature, constexprs, num_warps = cases[form]
+
+    script = tmp_path / "scan_envelope.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+
+        for attempt in range(3):
+            try:
+                triton.compile(ASTSource(
+                    getattr(module, {kernel!r}),
+                    signature={signature},
+                    constexprs={constexprs}),
+                    target=target, options={{"num_warps": {num_warps}}})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("an unsupported scan compiled")
+        # The supported neighbour, in the same process.
+        triton.compile(ASTSource(
+            module._scan_envelope_kernel,
+            signature={{"X": "*fp32", "O": "*fp32"}},
+            constexprs={{"BLOCK": 128, "FORM": "plain"}}),
+            target=target, options={{"num_warps": 1}})
         print("RECOVERED")
     """))
     result = subprocess.run([sys.executable, str(script)], capture_output=True,

@@ -411,6 +411,15 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   The `tl.cumsum` / `tl.associative_scan` envelope has been probed shape by
+   shape and its reachable refusals pinned: f16 and i64 scans, more than
+   sixty-four elements per thread, an axis of extent above sixty-four on a
+   rank >= 2 scan, and the tuple forms of the last two. A bf16 scan works
+   because Triton widens it to f32 before the backend sees it. The rest of that
+   validator's diagnostics cannot be reached by any kernel: the frontend refuses
+   a non-power-of-two `num_warps` and a `tl.arange` that is empty or not a power
+   of two, and the rank >= 2 branch answers before the axis and rank checks
+   below it.
    A source cone that must be replayed per element and passes through an
    `scf.if` is refused before conversion. Such a cone reads as replayable
    before conversion and unrecognisable after it, because the `scf.if` is
