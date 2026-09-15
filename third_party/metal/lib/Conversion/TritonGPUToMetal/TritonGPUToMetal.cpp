@@ -30068,6 +30068,19 @@ static bool planTileExchange(mlir::Operation *exchange,
     return false;
   std::optional<LayoutIndexPlan> srcPlan = planLayoutIndex(srcRtt);
   std::optional<LayoutIndexPlan> dstPlan = planLayoutIndex(dstRtt);
+  // ⚠️ A staged rank-N reduce may RELABEL its result so that its fold and its
+  // own addressing agree (`threadMajorLayoutPlan`). The value reaching this
+  // exchange is then laid out under THAT plan, not under its type's `#ttg.slice`
+  // encoding, so publishing by the encoding puts each thread's sum in another
+  // element's slot -- silently, and only where the two labellings differ, which
+  // is why a rank-3 reduce stored as rank 2 was exact up to one register band
+  // and scattered above it. Ask the producer, the way every other consumer of a
+  // relabelled tile does.
+  if (auto producer = mlir::dyn_cast_or_null<mlir::triton::ReduceOp>(
+          source.getDefiningOp()))
+    if (auto producerPlan = planRankNReduce(producer);
+        producerPlan && producerPlan->resultLayout.threadsPerBlock() > 1)
+      srcPlan = producerPlan->resultLayout;
   if (!srcPlan || !dstPlan)
     return false;
   if (isBroadcast) {

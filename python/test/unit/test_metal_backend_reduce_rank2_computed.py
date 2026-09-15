@@ -791,3 +791,69 @@ def test_loop_carried_affine_range_prepass_axis0_count(lo, hi, step, start, inc)
     )
     assert torch.all(counts_out[k:].cpu() == -777)
     assert torch.all(trips_out[k:].cpu() == -888)
+
+
+# ---------------------------------------------------------------------------
+# A rank-3 reduce whose rank-2 result is STORED directly.
+#
+# The staged rank-N reduce may relabel its result so that its fold and its own
+# addressing agree. The `ttg.convert_layout` between that result and a rank-2
+# store becomes a tile exchange, and the exchange used to publish by the result
+# TYPE's `#ttg.slice` encoding instead of by the plan the producer actually
+# used -- so each thread's sum landed in another element's slot. It was exact
+# while the reduced axis stayed inside one register band, which is every shape
+# the earlier sweeps had, because they all consumed the result by broadcasting
+# it back to rank 3 instead of storing it.
+
+
+@triton.jit
+def _rank3_reduce_rank2_store_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                                     C: tl.constexpr, AXIS: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = tl.load(X + a * (B * C) + b * C + c)
+    s = tl.sum(v, axis=AXIS)
+    if AXIS == 0:
+        r0 = tl.arange(0, B)[:, None]
+        r1 = tl.arange(0, C)[None, :]
+        tl.store(O + r0 * C + r1, s)
+    elif AXIS == 1:
+        r0 = tl.arange(0, A)[:, None]
+        r1 = tl.arange(0, C)[None, :]
+        tl.store(O + r0 * C + r1, s)
+    else:
+        r0 = tl.arange(0, A)[:, None]
+        r1 = tl.arange(0, B)[None, :]
+        tl.store(O + r0 * B + r1, s)
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps",
+    [
+        ((4, 8, 8), 1),      # eight elements per thread: the smallest failure
+        ((4, 8, 16), 1),     # sixteen
+        ((4, 8, 16), 2),     # eight, reached with two warps
+        ((8, 8, 8), 1),
+        ((8, 8, 8), 2),
+        ((2, 8, 16), 1),
+        ((2, 4, 8), 1),      # four: correct before the fix, still correct
+        ((4, 4, 4), 2),      # one element per thread: the control
+    ],
+    ids=["4x8x8_w1", "4x8x16_w1", "4x8x16_w2", "8x8x8_w1", "8x8x8_w2",
+         "2x8x16_w1", "2x4x8_w1_control", "4x4x4_w2_control"],
+)
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_rank3_reduce_rank2_store_matches_torch(shape, num_warps, axis):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    a, b, c = shape
+    torch.manual_seed(0xC0DE)
+    x = torch.randn(a * b * c, dtype=torch.float32).contiguous()
+    expected = x.reshape(a, b, c).sum(axis)
+    out = torch.zeros(expected.numel(), dtype=torch.float32).contiguous()
+    _rank3_reduce_rank2_store_kernel[(1, 1, 1)](
+        x, out, A=a, B=b, C=c, AXIS=axis, num_warps=num_warps)
+    torch.testing.assert_close(out.reshape(expected.shape), expected,
+                               atol=2e-3, rtol=2e-3)

@@ -411,6 +411,14 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   A rank >= 3 reduce whose rank-2 result is stored directly now agrees with the
+   layout conversion that carries it there. The staged reduce may relabel its
+   result so that its fold and its addressing agree, and the exchange behind
+   that conversion used to publish by the result type's slice encoding instead
+   of by the plan the reduce actually used, so each thread's sum landed in
+   another element's slot above one register band. `tl.permute` followed by a
+   reduce is still wrong in the same regime and is the next slice; a stored
+   `tl.permute` is refused by name.
    The `tl.dot_scaled` matcher and the unsupported-op validator have been probed
    as whole families: every refusal they raise for a shape a kernel can express
    is named and raised before conversion, and the supported shapes — e4m3 and
