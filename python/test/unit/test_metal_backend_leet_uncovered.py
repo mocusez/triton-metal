@@ -234,6 +234,25 @@ def _(dev):
             torch.zeros(M, K, device=dev), M, N, K), [2]
 
 
+@_case("hard-all_pairs_shortest_paths")
+def _(dev):
+    # Floyd-Warshall. Its `k` column and `k` row are addressed with a UNIFORM
+    # axis (`tl.full((BLOCK_N,), k, tl.int32)[None, :]`), which Triton folds
+    # into a `tt.broadcast` of a BLOCK x 1 pointer tensor — the shape that used
+    # to exit 139 rather than report anything. See
+    # `test_metal_backend_address_root.py`.
+    #
+    # N is deliberately not a multiple of BLOCK_N (64), so the tile masks. Edge
+    # weights are all finite: a missing edge would be `inf`, and the
+    # interpreter comparison below subtracts the two runs, where `inf - inf` is
+    # `nan` and would fail on every backend.
+    N = 24
+    g = torch.Generator().manual_seed(0)
+    w = (torch.rand(N, N, generator=g) * 10.0 + 1.0)
+    w.fill_diagonal_(0.0)
+    return (w.to(dev), torch.zeros(N, N, device=dev), N), [1]
+
+
 @_case("hard-causal_self-Attention")
 def _(dev):
     M, d = 64, 32

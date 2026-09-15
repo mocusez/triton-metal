@@ -48,7 +48,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %out = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<16x!tt.ptr<i32>, #blocked>
     %cmps = tt.splat %cmp : i32 -> tensor<16xi32, #blocked>
     %values = tt.splat %value : i32 -> tensor<16xi32, #blocked>
-    // expected-error @+1 {{Metal backend: atomic_cas tensor address must be a tt.addptr tile}}
+    // expected-error @+1 {{Metal backend: atomic_cas expects a tt.addptr feeding ptr}}
     %old = tt.atomic_cas acq_rel, gpu, %out, %cmps, %values : (tensor<16x!tt.ptr<i32>, #blocked>, tensor<16xi32, #blocked>, tensor<16xi32, #blocked>) -> tensor<16xi32, #blocked>
     tt.return
   }

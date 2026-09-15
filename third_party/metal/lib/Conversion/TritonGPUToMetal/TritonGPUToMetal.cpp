@@ -17517,6 +17517,144 @@ static mlir::Value peelPointerBitcasts(mlir::Value ptr) {
   return ptr;
 }
 
+//===----------------------------------------------------------------------===//
+// The tensor-address envelope, asked in ONE place.
+//
+// `tt.load`, `tt.store`, `tt.atomic_rmw` and `tt.atomic_cas` each kept their
+// own copy of "what a tensor address may look like", and the copies had already
+// drifted: `AtomicCasLowering` refuses a splat pointer `AtomicRmwLowering`
+// accepts, and the store side refuses a slice-encoded tile the load side
+// admits. Every one of those copies declines with `notifyMatchFailure` INSIDE
+// `applyFullConversion`, and this backend does not survive that — the failed
+// conversion's rollback leaves the module unverifiable and the process dies on
+// the way out, so the author sees SIGSEGV (or SIGABRT, intermittently) instead
+// of a diagnostic. The verbatim Floyd-Warshall kernel exits 139 this way.
+//
+// So the STRUCTURAL half of the envelope — everything decidable from the
+// original IR without a rewriter — lives here, and both
+// `validateTensorAddressSupport` (pre-conversion, catchable) and the patterns
+// ask it. Same discipline as `maskedLoadOtherIsUniform` and
+// `unsupportedHistogramReason`: one predicate, so the validator and the pattern
+// cannot disagree about which shapes are supported.
+//
+// The half that NEEDS the rewriter — `findBaseMemref`, which resolves the block
+// argument's memref through the conversion remap — stays in the patterns.
+//===----------------------------------------------------------------------===//
+enum class AddressOpKind { Load, Store, AtomicRmw, AtomicCas };
+
+static llvm::StringRef addressOpMnemonic(AddressOpKind kind) {
+  switch (kind) {
+  case AddressOpKind::Load:
+    return "tt.load";
+  case AddressOpKind::Store:
+    return "tt.store";
+  case AddressOpKind::AtomicRmw:
+    return "atomic_rmw";
+  case AddressOpKind::AtomicCas:
+    return "atomic_cas";
+  }
+  return "tensor memory op";
+}
+
+// The address value the patterns actually test, after the peels they perform.
+// Bitcasts always (a torch.bool access arrives as `ptr<i1>` bitcast to
+// `ptr<i8>`); plus, on the store side, a rank-1 shape-preserving
+// `ttg.convert_layout` over a `tt.addptr` — `StoreLowering` /
+// `MaskedStoreLowering` re-read the store through the source layout.
+//
+// The store patterns take that cvt path only when the VALUE also lands in the
+// source layout, which this cannot check without the conversion remap. Peeling
+// unconditionally here is the conservative direction: the validator admits a
+// shape the pattern might still decline, never the reverse.
+//
+// `tt.broadcast` of a POINTER tensor is peeled too. Triton emits it whenever an
+// axis of a tile's address is uniform: the address is built at the lower rank
+// (BLOCK x 1, or 1 x BLOCK) and broadcast to the tile. Nothing downstream needs
+// re-deriving for it, because the offset it carries was already emitted under
+// the CONSUMER's encoding — the `tt.make_range` beneath it has a
+// `#ttg.slice<{parent = <the tile's blocked layout>}>` encoding, so its
+// converted scalar is "my row (or column) index in the parent tile" and
+// `expand_dims` / `broadcast` are genuine identities over it. `BroadcastLowering`
+// passes a pointer broadcast through unchanged (its exchange planner gates on
+// `isIntOrFloat`, which a `!tt.ptr` element type is not), and `findBaseMemref`
+// has always walked through `tt.broadcast` to reach the block argument.
+//
+// ⚠️ That reasoning is what `sweeps/s_bcast_ptr.py` exists to falsify. Widening
+// a predicate without its emitter has produced a silent wrong answer in this
+// backend before; the sweep is the proof obligation, not the argument above.
+static mlir::Value tensorAddressRoot(mlir::Value ptr, AddressOpKind kind) {
+  if (kind == AddressOpKind::Store) {
+    if (auto cvt = ptr.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+      auto srcRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+      auto dstRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getResult().getType());
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 &&
+          srcRtt.getShape() == dstRtt.getShape() &&
+          cvt.getSrc().getDefiningOp<mlir::triton::AddPtrOp>())
+        ptr = cvt.getSrc();
+    }
+  }
+  ptr = peelPointerBitcasts(ptr);
+  while (auto bcast = ptr.getDefiningOp<mlir::triton::BroadcastOp>())
+    ptr = peelPointerBitcasts(bcast.getSrc());
+  return ptr;
+}
+
+// `std::nullopt` when this backend can lower `ptr` as the address of a `kind`
+// access. Otherwise the reason, phrased for the kernel author. Scalar (non
+// tensor) pointers are out of scope here — they have their own patterns — and
+// report as supported.
+static std::optional<std::string>
+unsupportedTensorAddressReason(mlir::Value ptr, AddressOpKind kind) {
+  if (!mlir::isa<mlir::RankedTensorType>(ptr.getType()))
+    return std::nullopt;
+
+  mlir::Value addressRoot = tensorAddressRoot(ptr, kind);
+  const bool isAddPtr =
+      addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() != nullptr;
+  auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
+  // Every kind but CAS also accepts a uniform splat pointer: a BLOCK=1 tile, or
+  // a tile whose offsets all folded to zero, arrives with no addptr left to
+  // read an index from. `AtomicCasLowering` derives its index from the addptr
+  // tile only.
+  const bool splatOk = kind != AddressOpKind::AtomicCas;
+
+  if (!isAddPtr && !(splatOk && splatPtr)) {
+    std::string msg = addressOpMnemonic(kind).str() + " expects a tt.addptr";
+    if (splatOk)
+      msg += " or a splat scalar ptr";
+    msg += " feeding ptr";
+    // Name the shape the author actually wrote. Triton folds an axis whose
+    // address contribution is uniform and hands the access a `tt.broadcast` of
+    // a lower-rank pointer tensor, which reads nothing like the source line.
+    if (addressRoot.getDefiningOp<mlir::triton::BroadcastOp>())
+      msg += "; this one broadcasts a lower-rank pointer tensor, which Triton "
+             "emits when one axis of a tile's address is uniform (e.g. "
+             "`tl.full((BLOCK,), k, tl.int32)[None, :]`) — load that axis as a "
+             "rank-1 tile and broadcast the VALUE instead";
+    return msg;
+  }
+
+  // Deliberately NOT checked here: anything a pattern other than the four
+  // load/store ones might claim.
+  //
+  //  * Tile geometry. `tileFromTensor` rejects a `#ttg.slice`-encoded store
+  //    tile, but such a store is not necessarily StoreLowering's — a reduce's
+  //    rank-1 summary store carries the slice encoding of the reduce it came
+  //    from, and a staged-transpose store carries the transposed one.
+  //  * The wide-splat store race. `validateUnsupportedOpsRejected` already
+  //    names the UNMASKED case, and the masked case is deliberately exempt: a
+  //    mask that picks one lane makes the shape well defined, which is how
+  //    `medium-linear_recurrence.py` writes its per-chunk summary
+  //    (`chunk_a_ptr + chunk_idx + offs * 0`, `mask=last`) and why a
+  //    scan-summary path claims it.
+  //
+  // This predicate answers only the question every one of the four asks first,
+  // and it is the one that crashes.
+  return std::nullopt;
+}
+
 struct LoadLowering : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
@@ -17532,9 +17670,11 @@ struct LoadLowering : public mlir::OpConversionPattern<mlir::triton::LoadOp> {
     // `tl.arange(0, 1) * stride` is constant 0 and the addptr disappears.
     mlir::Value addressRoot = peelPointerBitcasts(op.getPtr());
     auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
-    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
-      return rewriter.notifyMatchFailure(
-          op, "tt.load expects a tt.addptr or a splat scalar ptr feeding ptr");
+    // Shared with `validateTensorAddressSupport`, which refuses this shape
+    // before conversion; reaching here means the two have drifted apart.
+    if (auto why =
+            unsupportedTensorAddressReason(op.getPtr(), AddressOpKind::Load))
+      return rewriter.notifyMatchFailure(op, *why);
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -17992,9 +18132,10 @@ struct MaskedLoadLowering
     // splat still carries the program offset.
     mlir::Value addressRoot = peelPointerBitcasts(op.getPtr());
     auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
-    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
-      return rewriter.notifyMatchFailure(
-          op, "tt.load expects a tt.addptr or a splat scalar ptr feeding ptr");
+    // Shared with `validateTensorAddressSupport`; see LoadLowering.
+    if (auto why =
+            unsupportedTensorAddressReason(op.getPtr(), AddressOpKind::Load))
+      return rewriter.notifyMatchFailure(op, *why);
     mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -18349,9 +18490,11 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
     // `tt.store(tt.bitcast(tt.addptr(...)), ...)`.
     storePtr = peelPointerBitcasts(storePtr);
     auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
-    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
-      return rewriter.notifyMatchFailure(
-          op, "tt.store expects a tt.addptr or a splat scalar ptr feeding ptr");
+    // Shared with `validateTensorAddressSupport`; see the envelope comment
+    // above `unsupportedTensorAddressReason`.
+    if (auto why =
+            unsupportedTensorAddressReason(op.getPtr(), AddressOpKind::Store))
+      return rewriter.notifyMatchFailure(op, *why);
     mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -18723,10 +18866,11 @@ struct AtomicRmwLowering
       // than rejected, with the per-lane index degenerating to the scalar
       // offset below the splat.
       auto splatPtr = addressRoot.getDefiningOp<mlir::triton::SplatOp>();
-      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
-        return rewriter.notifyMatchFailure(
-            op, "atomic_rmw: tensor form expects tt.addptr or a splat scalar "
-                "ptr (optionally bitcast) feeding ptr");
+      // Shared with `validateAtomicRmwSupport`; see the envelope comment above
+      // `unsupportedTensorAddressReason`.
+      if (auto why = unsupportedTensorAddressReason(op.getPtr(),
+                                                    AddressOpKind::AtomicRmw))
+        return rewriter.notifyMatchFailure(op, *why);
       mlir::Value memref = findBaseMemref(op.getPtr(), rewriter);
       if (!memref)
         return rewriter.notifyMatchFailure(
@@ -19062,9 +19206,11 @@ struct AtomicCasLowering
       while (auto bitcast =
                  addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
         addressRoot = bitcast.getSrc();
-      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>())
-        return rewriter.notifyMatchFailure(
-            op, "atomic_cas: tensor form expects tt.addptr feeding ptr");
+      // Shared with `validateAtomicCasSupport`; see the envelope comment above
+      // `unsupportedTensorAddressReason`.
+      if (auto why = unsupportedTensorAddressReason(op.getPtr(),
+                                                    AddressOpKind::AtomicCas))
+        return rewriter.notifyMatchFailure(op, *why);
       auto tile = tileFromTensor(op.getPtr().getType());
       if (!tile)
         return rewriter.notifyMatchFailure(
@@ -19493,9 +19639,10 @@ struct MaskedStoreLowering
     // `tt.store(tt.bitcast(tt.addptr(...)), ...)`.
     storePtr = peelPointerBitcasts(storePtr);
     auto splatPtr = storePtr.getDefiningOp<mlir::triton::SplatOp>();
-    if (!storePtr.getDefiningOp<mlir::triton::AddPtrOp>() && !splatPtr)
-      return rewriter.notifyMatchFailure(
-          op, "tt.store expects a tt.addptr or a splat scalar ptr feeding ptr");
+    // Shared with `validateTensorAddressSupport`; see StoreLowering.
+    if (auto why =
+            unsupportedTensorAddressReason(op.getPtr(), AddressOpKind::Store))
+      return rewriter.notifyMatchFailure(op, *why);
     mlir::Value memref = findBaseMemref(storePtr, rewriter);
     if (!memref)
       return rewriter.notifyMatchFailure(op,
@@ -35413,14 +35560,9 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
       // and an unmatched op is a PROCESS KILL in this pass rather than an
       // error — the failed conversion's rollback dies. Name the shape here so
       // the author gets a diagnostic and a usable process.
-      mlir::Value addressRoot = op.getPtr();
-      while (auto bitcast =
-                 addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
-        addressRoot = bitcast.getSrc();
-      if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>() &&
-          !addressRoot.getDefiningOp<mlir::triton::SplatOp>()) {
-        reject("atomic tensor address must be a tt.addptr tile or a splat "
-               "scalar pointer");
+      if (auto why = unsupportedTensorAddressReason(
+              op.getPtr(), AddressOpKind::AtomicRmw)) {
+        reject(*why);
         return;
       }
     }
@@ -35556,11 +35698,9 @@ static mlir::LogicalResult validateAtomicCasSupport(mlir::ModuleOp moduleOp) {
     // `tt.addptr` tile. Reject other tensor-pointer roots before dialect
     // conversion mutates the function; otherwise the pattern's match failure
     // reaches failed-conversion teardown instead of producing a useful error.
-    mlir::Value addressRoot = op.getPtr();
-    while (auto bitcast = addressRoot.getDefiningOp<mlir::triton::BitcastOp>())
-      addressRoot = bitcast.getSrc();
-    if (!addressRoot.getDefiningOp<mlir::triton::AddPtrOp>()) {
-      reject("atomic_cas tensor address must be a tt.addptr tile");
+    if (auto why = unsupportedTensorAddressReason(op.getPtr(),
+                                                  AddressOpKind::AtomicCas)) {
+      reject(*why);
       return;
     }
   });
@@ -37557,6 +37697,36 @@ annotateResourceAwareMatrixLaunch(mlir::ModuleOp moduleOp) {
   return mlir::success();
 }
 
+// Pre-conversion mirror of the tensor-address envelope for `tt.load` and
+// `tt.store`, sharing `unsupportedTensorAddressReason` with the four patterns
+// so the two cannot drift. The atomics already had their own mirrors
+// (`validateAtomicRmwSupport` / `validateAtomicCasSupport`), now routed through
+// the same predicate; loads and stores had none, which is why the family had 16
+// in-conversion decline sites against 6 catchable ones and why the verbatim
+// Floyd-Warshall kernel exits 139 instead of reporting anything.
+//
+// ⚠️ MUST run after every whole-kernel matcher. A matmul or attention matcher
+// replaces the loads and stores it claims, so an address this envelope refuses
+// may never reach a load/store pattern at all. Same ordering rule the
+// convert-layout classifier and the terminal `tt.dot` gate already follow.
+static mlir::LogicalResult
+validateTensorAddressSupport(mlir::ModuleOp moduleOp) {
+  bool ok = true;
+  auto check = [&](mlir::Operation *op, mlir::Value ptr, AddressOpKind kind) {
+    if (auto why = unsupportedTensorAddressReason(ptr, kind)) {
+      op->emitOpError("Metal backend: ") << *why;
+      ok = false;
+    }
+  };
+  moduleOp.walk([&](mlir::Operation *op) {
+    if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(op))
+      check(op, load.getPtr(), AddressOpKind::Load);
+    else if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(op))
+      check(op, store.getPtr(), AddressOpKind::Store);
+  });
+  return mlir::success(ok);
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -38883,6 +39053,16 @@ struct ConvertTritonGPUToMetalPass
         signalPassFailure();
         return;
       }
+    }
+
+    // Every whole-kernel matcher has run, so a surviving tt.load / tt.store is
+    // one a load/store pattern will have to claim. Ask the shared address
+    // envelope now, while a diagnostic is still possible: these patterns
+    // decline with `notifyMatchFailure` inside `applyFullConversion`, and the
+    // failed conversion's rollback kills the process instead of reporting.
+    if (mlir::failed(validateTensorAddressSupport(moduleOp))) {
+      signalPassFailure();
+      return;
     }
 
     // Scalar CAS/RMW old-value broadcast scratch. This must be hoisted before

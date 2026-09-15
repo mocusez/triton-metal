@@ -122,6 +122,10 @@
       "sha256": "3ea38f44fa87bb51fef8d88fd868a57cc313f7e0a1caf8ec89a34522b5509210",
       "provenance": "User-supplied local source, absent from source_commit; trailing whitespace stripped."
     },
+    "hard-all_pairs_shortest_paths.py": {
+      "sha256": "c47c400c6cf7d4bcac9644297dd8432be992b891ab1f875e29a97e88e09ad0b9",
+      "provenance": "User-supplied local source, absent from source_commit; trailing whitespace stripped."
+    },
     "hard-k_means_clustering.py": {
       "sha256": "25cce0a45524b70bb55b5a57592397529aa4a7f4c8ffca0a0325e25bfbbc4196",
       "provenance": "User-supplied local source, absent from source_commit; trailing whitespace stripped."
