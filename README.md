@@ -533,6 +533,19 @@ The current dependency-ordered priorities are:
    a reduction over it. A rank-3 reduction over a tile accumulated by an
    enclosing loop is likewise refused by name; it previously failed the pass
    with no diagnostic at all.
+   The canonical tiled matmul is now exact at every block shape, not only at
+   an 8-wide reduction. One `simdgroup_multiply_accumulate` consumes an 8-wide
+   slice of K, and the unrolled pointer-advance loop emitted one per K-loop
+   ITERATION, so a `BLOCK_K` above 8 silently dropped every reduction column
+   but the first eight of each tile. It is exact at `BLOCK_K == 8` and exact
+   when the whole reduction is one tile, which is the shape the suite and the
+   perf report both used, so the accumulation the tutorials write -- `acc =
+   tl.dot(a, b, acc)` over several `BLOCK_K = 16` or wider tiles -- returned
+   wrong values in f32 and f16 alike. The loop now steps K by 8 inside each
+   iteration, and the tier requires A's reduction axis to be contiguous rather
+   than reading a tile along a strided K. The block shape is measured against
+   torch across the output-tile grid, the steps inside an iteration and the
+   iteration count, at one and four warps.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

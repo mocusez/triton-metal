@@ -22879,6 +22879,31 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   const int64_t mTiles = shape[0] / 8;
   const int64_t nTiles = shape[1] / 8;
 
+  // The reduction axis is tiled by 8 as well: one `simdgroup_multiply_
+  // accumulate` consumes an 8-wide slice of K, so a BLOCK_K wider than 8
+  // needs BLOCK_K/8 of them per loop iteration. Emitting one per ITERATION
+  // (which is what this unroll did before) silently dropped every K column
+  // except the first eight of each tile -- exact at BLOCK_K == 8, wrong at
+  // every wider block. BLOCK_K comes from the operand tile shapes, not from
+  // the pointer bump, so it is independent of the strides.
+  auto aOperandTy = mlir::dyn_cast<mlir::RankedTensorType>(loadA.getType());
+  auto bOperandTy = mlir::dyn_cast<mlir::RankedTensorType>(loadB.getType());
+  if (!aOperandTy || !bOperandTy || aOperandTy.getRank() != 2 ||
+      bOperandTy.getRank() != 2)
+    return mlir::failure();
+  const int64_t blockK = aOperandTy.getShape()[1];
+  if (blockK != bOperandTy.getShape()[0] || blockK < 8 || blockK % 8 != 0)
+    return mlir::failure();
+  const int64_t kSteps = blockK / 8;
+  // `BK` is the A pointer bump in ELEMENTS (BLOCK_K * stride_ak); the K
+  // origins handed to the staged loads below are COLUMNS. A simdgroup load
+  // reads `buf[(row + i) * stride + col + j]`, so it can only express a
+  // reduction axis that is contiguous. Requiring the bump to equal the
+  // column count is exactly `stride_ak == 1`; anything else belongs to the
+  // scalar tier rather than to a tile read along a strided K.
+  if (BK != blockK)
+    return mlir::failure();
+
   // Locate the store consuming the for's accumulator result.
   if (!forOp.getResult(accIdx).hasOneUse())
     return mlir::failure();
@@ -23070,20 +23095,22 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     // Legacy single-tile chain (Bucket A) — bit-identical to pre-AC4.
     mlir::Value acc = emitAccInit(cRowOrigin, cColOrigin);
     for (int64_t i = 0; i < N; ++i) {
-      auto kOffset = ConstantOp::create(builder, loc,
-                                        builder.getIntegerAttr(ui32, i * BK));
-      mlir::Value aColIter = addScalarElementOffset(
-          builder, loc, ui32, kOffset.getResult(), aBaseOffset.value);
-      mlir::Value bRowIter = kOffset.getResult();
-      mlir::Value aTile = emitStagedLoad(
-          builder, loc, matTy, aBuf, aBaseRowVal, aColIter, strideAVal,
-          /*transposed=*/false, aRowExt, aColExt, mlir::Value());
-      mlir::Value bTile = emitStagedLoad(
-          builder, loc, matTy, bBuf, bRowIter, bBaseColVal, strideBVal,
-          /*transposed=*/false, bRowExt, bColExt, mlir::Value());
-      auto ma = SimdgroupMultiplyAccumulateOp::create(builder, loc, matTy, acc,
-                                                      aTile, bTile);
-      acc = ma.getResult();
+      for (int64_t kStep = 0; kStep < kSteps; ++kStep) {
+        auto kOffset = ConstantOp::create(
+            builder, loc, builder.getIntegerAttr(ui32, i * BK + kStep * 8));
+        mlir::Value aColIter = addScalarElementOffset(
+            builder, loc, ui32, kOffset.getResult(), aBaseOffset.value);
+        mlir::Value bRowIter = kOffset.getResult();
+        mlir::Value aTile = emitStagedLoad(
+            builder, loc, matTy, aBuf, aBaseRowVal, aColIter, strideAVal,
+            /*transposed=*/false, aRowExt, aColExt, mlir::Value());
+        mlir::Value bTile = emitStagedLoad(
+            builder, loc, matTy, bBuf, bRowIter, bBaseColVal, strideBVal,
+            /*transposed=*/false, bRowExt, bColExt, mlir::Value());
+        auto ma = SimdgroupMultiplyAccumulateOp::create(builder, loc, matTy,
+                                                        acc, aTile, bTile);
+        acc = ma.getResult();
+      }
     }
     // Final store. AC2: attach `partial_extents = [m_extent, n_extent]`
     // operands when the tt.store had a (offs_m < M) & (offs_n < N) mask so
@@ -23209,20 +23236,23 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
         // K-loop unrolled. For multi-warp, attach the hoisted ui32 widx to
         // every staged load so each warp uses its own staging slice.
         for (int64_t i = 0; i < N; ++i) {
-          auto kOffset = ConstantOp::create(
-              builder, loc, builder.getIntegerAttr(ui32, i * BK));
-          mlir::Value kVal = kOffset.getResult();
-          mlir::Value aKVal = addScalarElementOffset(builder, loc, ui32, kVal,
-                                                     aBaseOffset.value);
-          mlir::Value aTile = emitStagedLoad(
-              builder, loc, matTy, aBuf, aTileRow, aKVal, strideAVal,
-              /*transposed=*/false, aRowExt, aColExt, widxUi32Hoisted);
-          mlir::Value bTile = emitStagedLoad(
-              builder, loc, matTy, bBuf, kVal, bTileCol, strideBVal,
-              /*transposed=*/false, bRowExt, bColExt, widxUi32Hoisted);
-          auto ma = SimdgroupMultiplyAccumulateOp::create(builder, loc, matTy,
-                                                          acc, aTile, bTile);
-          acc = ma.getResult();
+          for (int64_t kStep = 0; kStep < kSteps; ++kStep) {
+            auto kOffset = ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(ui32, i * BK + kStep * 8));
+            mlir::Value kVal = kOffset.getResult();
+            mlir::Value aKVal = addScalarElementOffset(
+                builder, loc, ui32, kVal, aBaseOffset.value);
+            mlir::Value aTile = emitStagedLoad(
+                builder, loc, matTy, aBuf, aTileRow, aKVal, strideAVal,
+                /*transposed=*/false, aRowExt, aColExt, widxUi32Hoisted);
+            mlir::Value bTile = emitStagedLoad(
+                builder, loc, matTy, bBuf, kVal, bTileCol, strideBVal,
+                /*transposed=*/false, bRowExt, bColExt, widxUi32Hoisted);
+            auto ma = SimdgroupMultiplyAccumulateOp::create(
+                builder, loc, matTy, acc, aTile, bTile);
+            acc = ma.getResult();
+          }
         }
 
         SimdgroupStoreOp::create(builder, loc, acc, cBuf, cTileRow, cTileCol,

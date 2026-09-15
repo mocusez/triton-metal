@@ -2976,3 +2976,71 @@ def test_subtile_dot_wider_leading_dimension(M, N, K, pad, num_warps,
     torch.mps.synchronize()
     got = c.cpu().reshape(M, ldc)[:, :N]
     torch.testing.assert_close(got, a[:, :K] @ b[:, :N], atol=1e-4, rtol=1e-4)
+
+
+# ----------------------------------------------------------------------------
+# Block-shape sweep: BLOCK_K wider than the 8x8 matrix unit.
+#
+# Every test above pins BLOCK_M = BLOCK_N = BLOCK_K = 8, which is exactly the
+# shape at which one `simdgroup_multiply_accumulate` per K-loop iteration is
+# the whole reduction. At a wider BLOCK_K each iteration needs BLOCK_K/8 of
+# them; emitting one silently dropped every K column but the first eight of
+# each tile, so the canonical matmul returned wrong values at every block
+# people actually tune to. Sweep the three axes that decide the emitted
+# chain -- BLOCK_M/BLOCK_N (the output tile grid), BLOCK_K (the steps inside
+# one iteration), and K_TILES (the iterations) -- against torch.
+# ----------------------------------------------------------------------------
+def _run_blocked(M, N, K, BM, BN, BK, *, dtype_in, num_warps, seed=0x5EED):
+    torch.manual_seed(seed)
+    a = torch.randn((M, K), dtype=dtype_in).contiguous()
+    b = torch.randn((K, N), dtype=dtype_in).contiguous()
+    c = torch.zeros((M, N), dtype=torch.float32).contiguous()
+    dot_universal_kernel[(M // BM, N // BN)](
+        a,
+        b,
+        c,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        BLOCK_K=BK,
+        K_TILES=K // BK,
+        num_warps=num_warps,
+    )
+    return c, a.float() @ b.float()
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize(
+    "M,N,K,BM,BN,BK",
+    [
+        # BLOCK_K == 8 controls: one K step per iteration is the whole tile.
+        pytest.param(32, 32, 32, 8, 8, 8, id="bk8_ktiles4"),
+        pytest.param(32, 32, 32, 16, 16, 8, id="bk8_tile16"),
+        # One K tile, wide BLOCK_K: the reduction is entirely intra-iteration.
+        pytest.param(32, 32, 16, 16, 16, 16, id="bk16_ktiles1"),
+        pytest.param(32, 32, 32, 16, 16, 32, id="bk32_ktiles1"),
+        # Wide BLOCK_K *and* several K tiles -- the combination that was wrong.
+        # The 8x8 output tile takes the single-tile emission branch, the rest
+        # take the per-warp multi-tile one; both had to step K by 8.
+        pytest.param(8, 8, 32, 8, 8, 16, id="bk16_tile8_ktiles2"),
+        pytest.param(32, 32, 32, 16, 16, 16, id="bk16_ktiles2"),
+        pytest.param(64, 64, 64, 16, 16, 16, id="bk16_ktiles4"),
+        pytest.param(32, 32, 64, 32, 32, 32, id="bk32_ktiles2"),
+        pytest.param(64, 64, 64, 32, 32, 16, id="bk16_tile32_ktiles4"),
+        # Non-square output tile, so the M and N grids differ from each other.
+        pytest.param(32, 64, 32, 16, 32, 16, id="bk16_tile16x32"),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype_in", [torch.float32, torch.float16], ids=["f32", "f16"]
+)
+def test_dot_block_shape_matches_torch(M, N, K, BM, BN, BK, num_warps, dtype_in):
+    c, ref = _run_blocked(M, N, K, BM, BN, BK, dtype_in=dtype_in,
+                          num_warps=num_warps)
+    tol = 1e-4 if dtype_in is torch.float32 else 2e-2
+    torch.testing.assert_close(c, ref, atol=tol, rtol=tol)
