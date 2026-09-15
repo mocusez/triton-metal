@@ -25566,7 +25566,8 @@ static ScalarDotOp sdCreateScalarDot(
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
     mlir::Value reductionStart = {}, mlir::Value reductionExtent = {},
     bool transposeA = false, const SdScaleInfo *scaleInfo = nullptr,
-    bool transposeB = false, bool inferPhysicalStrides = false) {
+    bool transposeB = false, bool inferPhysicalStrides = false,
+    mlir::Value standaloneTileK = {}) {
   // Strides: A/B leading-dim (row) multiplier. For ordinary contiguous
   // row-major inputs the A row stride equals the (masked) K extent, so it is
   // also the default reduction trip count. The weighted-Gram path supplies a
@@ -25806,8 +25807,68 @@ static ScalarDotOp sdCreateScalarDot(
   mlir::Value innerStrideB =
       emitAxisStride(bPhysicalColStride, {}, std::nullopt,
                      /*defaultConstant=*/1);
-  mlir::Value reductionExtentUi32 =
-      reductionExtent ? toUi32(reductionExtent) : strideA;
+  // A STANDALONE dot's reduction is bounded by TWO facts, and neither one alone
+  // is the answer.
+  //   * It cannot be longer than the tile's own K — `stride_a` alone was the
+  //     historical default, right whenever the tile IS the whole matrix and out
+  //     of range for a tile that is a sub-block of a wider one (`A + m*lda + k`
+  //     with `lda > K` then reduced over `lda`, past the end of BOTH operands).
+  //   * It cannot run past the end of one A row — the tile's K alone is wrong
+  //     for a RAGGED reduction, which Triton spells as a tile WIDER than K plus
+  //     `mask = (k < K)`; the staged load substitutes this extent FOR that mask
+  //     instead of honouring it, so a full-tile extent reads the rows past the
+  //     end of A rather than the zeros `other` promises.
+  // Take the smaller. The K-LOOP callers pass their own extent and are
+  // untouched; there the whole reduction really is one A row.
+  mlir::Value reductionExtentUi32;
+  if (reductionExtent) {
+    reductionExtentUi32 = toUi32(reductionExtent);
+  } else if (standaloneTileK) {
+    // Fold when both are known, which is the common shape — otherwise every
+    // standalone dot would carry a `min(64, 8)` into the emitted MSL.
+    auto constExtent = [](mlir::Value v) -> std::optional<int64_t> {
+      while (auto cast = v.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast.getInputs().size() != 1)
+          break;
+        v = cast.getInputs()[0];
+      }
+      // `IntegerAttr::getInt` asserts on a non-signless type, and the Metal
+      // constant this compares against is ui32. Read the APInt instead.
+      auto asInt = [](mlir::Attribute a) -> std::optional<int64_t> {
+        auto ia = mlir::dyn_cast<mlir::IntegerAttr>(a);
+        if (!ia)
+          return std::nullopt;
+        auto ty = mlir::dyn_cast<mlir::IntegerType>(ia.getType());
+        if (ty && ty.isUnsigned())
+          return static_cast<int64_t>(ia.getValue().getZExtValue());
+        return ia.getValue().getSExtValue();
+      };
+      if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>())
+        return asInt(c.getValue());
+      if (auto c = v.getDefiningOp<ConstantOp>())
+        return asInt(c.getValue());
+      return std::nullopt;
+    };
+    auto kConst = constExtent(standaloneTileK);
+    auto strideConst = constExtent(strideA);
+    if (kConst && strideConst) {
+      reductionExtentUi32 = emitConstUi32(std::min(*kConst, *strideConst));
+    } else {
+      auto i32 = builder.getI32Type();
+      auto toI32 = [&](mlir::Value v) -> mlir::Value {
+        if (v.getType() == i32)
+          return v;
+        return mlir::UnrealizedConversionCastOp::create(builder, loc, i32, v)
+            .getResult(0);
+      };
+      reductionExtentUi32 =
+          toUi32(mlir::arith::MinSIOp::create(builder, loc, toI32(strideA),
+                                              toI32(standaloneTileK))
+                     .getResult());
+    }
+  } else {
+    reductionExtentUi32 = strideA;
+  }
   mlir::Value reductionStartUi32 =
       reductionStart ? toUi32(reductionStart) : emitConstUi32(0);
   llvm::SmallVector<mlir::Value, 4> outputIndices;
@@ -26027,12 +26088,12 @@ static ScalarDotOp sdEmitScalarDot(
     mlir::RankedTensorType resultTensorTy, mlir::triton::LoadOp weightLoad = {},
     mlir::Value reductionStart = {}, mlir::Value reductionExtent = {},
     bool transposeA = false, const SdScaleInfo *scaleInfo = nullptr,
-    bool transposeB = false) {
+    bool transposeB = false, mlir::Value standaloneTileK = {}) {
   auto scalarDot =
       sdCreateScalarDot(insertBefore, aLoad, bLoad, cInit, replaceTarget,
                         resultTensorTy, weightLoad, reductionStart,
                         reductionExtent, transposeA, scaleInfo, transposeB,
-                        /*inferPhysicalStrides=*/false);
+                        /*inferPhysicalStrides=*/false, standaloneTileK);
   if (!scalarDot)
     return {};
   replaceTarget.replaceAllUsesWith(scalarDot.getResult());
@@ -27057,11 +27118,29 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
 
   auto cvtA = dot.getA().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
   auto cvtB = dot.getB().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
-  if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
-                       resultTensorTy, {}, {}, {}, /*transposeA=*/false,
-                       /*scaleInfo=*/nullptr,
-                       sdConeCrossesTranspose(dot.getB())))
+  // Hand the tile's own K to the extent rule below. Out-of-range READS are what
+  // the old `stride_a`-only default produced for a sub-block of a wider buffer,
+  // and they depended on what the allocator had left behind — exact in a fresh
+  // process, wrong once any other kernel had run, stable for a given order.
+  auto aOperandTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
+  if (!aOperandTy || aOperandTy.getRank() < 2)
     return mlir::failure();
+  mlir::OpBuilder kBuilder(dot);
+  auto staticK = mlir::arith::ConstantOp::create(
+      kBuilder, dot.getLoc(),
+      kBuilder.getI32IntegerAttr(
+          static_cast<int32_t>(aOperandTy.getShape().back())));
+  if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
+                       resultTensorTy, {}, {}, {},
+                       /*transposeA=*/false,
+                       /*scaleInfo=*/nullptr,
+                       sdConeCrossesTranspose(dot.getB()),
+                       staticK.getResult())) {
+    // The dot stays for another tier; leave no dead constant behind for it.
+    staticK.erase();
+    return mlir::failure();
+  }
 
   if (resCvt)
     resCvt.erase();
@@ -28530,6 +28609,24 @@ static bool dotBAddressIsTransposed(mlir::triton::DotOp dot) {
   return colStride && *colStride > 1;
 }
 
+// The constexpr twin of `findStrideSplatSourceInPtrChain`.
+//
+// That walk accepts only a `tt.splat` of an i32 kernel argument, so a tile
+// whose row stride is a COMPILE-TIME constant finds nothing:
+// `tl.load(A + m*64 + k)` folds to
+// `arith.muli(expand_dims(range), dense<64>)`, and `emitStrideOperand`
+// then falls back to the hardcoded 8 that its own comment warns about. That is
+// right only when the leading dimension happens to BE 8, so a tile which is a
+// sub-block of a wider matrix read the wrong rows and returned wrong numbers
+// with no diagnostic. `sdSplitPtr` already separates the row contribution from
+// the column one, so this asks the same question `sdCreateScalarDot` asks.
+static std::optional<int64_t> findConstRowStrideInPtrChain(mlir::Value ptr) {
+  SdPtrParts parts = sdSplitPtr(ptr);
+  if (!parts.rowContrib)
+    return std::nullopt;
+  return sdConstStride(parts.rowContrib);
+}
+
 static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (dotBAddressIsTransposed(dot))
     return;
@@ -28650,12 +28747,21 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   // for these shapes, which `emitStrideOperand` falls back to `metal.constant
   // 8`. For (M,N,K) where N != 8 or M != 8, that hardcoded 8 silently
   // miscompiles. Walk the full chain instead.
-  mlir::Value strideAVal = emitStrideOperand(
-      builder, loc, ui32, findStrideSplatSourceInPtrChain(aLoad.getPtr()));
-  mlir::Value strideBVal = emitStrideOperand(
-      builder, loc, ui32, findStrideSplatSourceInPtrChain(bLoad.getPtr()));
-  mlir::Value strideCVal = emitStrideOperand(
-      builder, loc, ui32, findStrideSplatSourceInPtrChain(store.getPtr()));
+  // Runtime stride first; a constexpr one second; only then the historical
+  // constant-8 fallback, which is a guess and is wrong for any leading
+  // dimension that is not 8.
+  auto rowStrideOperand = [&](mlir::Value ptr) -> mlir::Value {
+    if (mlir::Value dynamic = findStrideSplatSourceInPtrChain(ptr))
+      return emitStrideOperand(builder, loc, ui32, dynamic);
+    if (auto constant = findConstRowStrideInPtrChain(ptr))
+      return ConstantOp::create(builder, loc,
+                                builder.getIntegerAttr(ui32, *constant))
+          .getResult();
+    return emitStrideOperand(builder, loc, ui32, mlir::Value());
+  };
+  mlir::Value strideAVal = rowStrideOperand(aLoad.getPtr());
+  mlir::Value strideBVal = rowStrideOperand(bLoad.getPtr());
+  mlir::Value strideCVal = rowStrideOperand(store.getPtr());
   mlir::Value aRowOrigin = emitOriginOperand(builder, loc, ui32, aOrig.row);
   mlir::Value aColOrigin = emitOriginOperand(builder, loc, ui32, aOrig.col);
   mlir::Value bRowOrigin = emitOriginOperand(builder, loc, ui32, bOrig.row);

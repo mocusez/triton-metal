@@ -2899,3 +2899,74 @@ def test_direct_dot_8x8_reduction_longer_than_one_simdgroup_tile(K, num_warps):
     torch.testing.assert_close(
         c.cpu().reshape(8, 8), a @ b, atol=1e-4, rtol=1e-4
     )
+
+
+@triton.jit
+def _subtile_dot_const_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr,
+                              K: tl.constexpr, LDA: tl.constexpr,
+                              LDB: tl.constexpr, LDC: tl.constexpr):
+    m = tl.arange(0, M)[:, None]
+    n = tl.arange(0, N)[None, :]
+    a = tl.load(A + m * LDA + tl.arange(0, K)[None, :])
+    b = tl.load(B + tl.arange(0, K)[:, None] * LDB + n)
+    tl.store(C + m * LDC + n, tl.dot(a, b))
+
+
+@triton.jit
+def _subtile_dot_runtime_kernel(A, B, C, sa, sb, sc, M: tl.constexpr,
+                                N: tl.constexpr, K: tl.constexpr):
+    m = tl.arange(0, M)[:, None]
+    n = tl.arange(0, N)[None, :]
+    a = tl.load(A + m * sa + tl.arange(0, K)[None, :])
+    b = tl.load(B + tl.arange(0, K)[:, None] * sb + n)
+    tl.store(C + m * sc + n, tl.dot(a, b))
+
+
+@pytest.mark.parametrize("runtime_strides", [False, True])
+@pytest.mark.parametrize("num_warps", [2, 4])
+@pytest.mark.parametrize(
+    "M, N, K, pad",
+    [
+        (8, 8, 8, 56),
+        (8, 8, 32, 24),
+        (16, 16, 8, 48),
+        (16, 16, 32, 8),
+        (32, 16, 16, 24),
+        (16, 32, 16, 48),
+        (32, 32, 32, 8),
+        # pad == 0 is the contiguous control: the leading dimension IS the
+        # tile width, which is the one case the old guesses got right.
+        (16, 16, 16, 0),
+    ],
+)
+def test_subtile_dot_wider_leading_dimension(M, N, K, pad, num_warps,
+                                             runtime_strides):
+    """Operands that are sub-blocks of a wider matrix.
+
+    Two separate guesses used to stand in for facts the IR carries. The
+    reduction length came from `stride_a`, which equals K only when A's rows sit
+    exactly K apart, so `A + m*lda + k` with `lda > K` reduced over `lda` and
+    walked off the end of BOTH operands. And the 8x8 tier read its row stride as
+    a hardcoded 8 whenever the stride was a compile-time constant rather than a
+    kernel argument. Both were out-of-range READS, so the answer depended on
+    whatever the allocator had left behind: exact in a fresh process, wrong once
+    any other kernel had run, and stable for a given order.
+    """
+    lda, ldb, ldc = K + pad, N + pad, N + pad
+    torch.manual_seed(M * 10007 + N * 101 + K + pad)
+    a = torch.rand(M, lda, dtype=torch.float32) * 2 - 1
+    b = torch.rand(K, ldb, dtype=torch.float32) * 2 - 1
+    c = torch.zeros(M * ldc, dtype=torch.float32, device="mps")
+    if runtime_strides:
+        _subtile_dot_runtime_kernel[(1,)](
+            a.to("mps"), b.to("mps"), c, lda, ldb, ldc,
+            M=M, N=N, K=K, num_warps=num_warps
+        )
+    else:
+        _subtile_dot_const_kernel[(1,)](
+            a.to("mps"), b.to("mps"), c, M=M, N=N, K=K,
+            LDA=lda, LDB=ldb, LDC=ldc, num_warps=num_warps
+        )
+    torch.mps.synchronize()
+    got = c.cpu().reshape(M, ldc)[:, :N]
+    torch.testing.assert_close(got, a[:, :K] @ b[:, :N], atol=1e-4, rtol=1e-4)
