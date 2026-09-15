@@ -22660,6 +22660,35 @@ static void recordMatrixWarpDownselection(mlir::triton::DotOp dot,
 }
 
 static bool isNumericZero(mlir::Value value);
+static mlir::Value findAxisStride(mlir::Value ptr, int axis);
+static std::optional<int64_t> getScalarIntegerConstant(mlir::Value value);
+static mlir::Value sdResolveLoopCarriedPtrInit(mlir::Value ptr);
+
+// A `metal.simdgroup_load` / `metal.simdgroup_store` addresses its 8x8 tile as
+// `buf[(row + i) * stride + col + j]`: the ROW axis carries a stride, the
+// inner axis advances one element at a time. Every tier that lowers a `tt.dot`
+// to the matrix unit can therefore only speak about an operand or a result
+// whose inner axis is contiguous, and no tier checked it -- a strided inner
+// axis was read, or written, as if it were dense. `findAxisStride` returns the
+// axis-1 multiplier's splat source, and null when that axis carries no
+// multiply at all, which is what Triton leaves behind once a unit stride has
+// been specialized to a constant. Declining hands the dot to the post-tier
+// diagnostic, which names it.
+static bool simdgroupTileIsContiguous(mlir::Value ptr) {
+  if (!ptr)
+    return false;
+  // Inside a pointer-advance loop the operand pointer is the loop's iter_arg,
+  // a block argument with no defining op: walking it finds nothing at all and
+  // every stride reads as unit. Ask the init chain the loop carries, which is
+  // where the address arithmetic actually lives.
+  ptr = sdResolveLoopCarriedPtrInit(ptr);
+  mlir::Value stride = findAxisStride(ptr, /*axis=*/1);
+  if (!stride)
+    return true;
+  auto constant = getScalarIntegerConstant(stride);
+  return constant && *constant == 1;
+}
+
 static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
                                              mlir::scf::ForOp loop,
                                              int64_t bk = -1);
@@ -22921,6 +22950,11 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     if (!maskExtents.mExtent || !maskExtents.nExtent)
       return mlir::failure();
   }
+
+  if (!simdgroupTileIsContiguous(loadA.getPtr()) ||
+      !simdgroupTileIsContiguous(loadB.getPtr()) ||
+      !simdgroupTileIsContiguous(store.getPtr()))
+    return mlir::failure();
 
   // A non-zero accumulator init is emitted below as a `simdgroup_load` from
   // the DESTINATION at the store's own origin, which is the right answer for
@@ -23677,6 +23711,13 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   // the correct simdgroup-load stride.
   mlir::Value bBaseCol =
       findOriginScalarInPtrChain(bPtrsInit, /*targetAxis=*/bTransposed ? 0 : 1);
+  // A transposed operand is staged the other way round, so the axis that must
+  // be dense is not the tile's own axis 1. Ask only about the operands read
+  // straight; the transposed staging keeps the behaviour the suite pins.
+  if (!simdgroupTileIsContiguous(loadA.getPtr()) ||
+      (!bTransposed && !simdgroupTileIsContiguous(loadB.getPtr())) ||
+      !simdgroupTileIsContiguous(store.getPtr()))
+    return mlir::failure();
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);
   if (!aBaseRow && !aLoadExt.mIndex)
     aBaseRow = cOrig.row;
@@ -24289,6 +24330,13 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   }
   mlir::Value aBaseRow = findOriginScalarInPtrChain(loadA.getPtr(), /*axis=*/0);
   mlir::Value bNOrigin = findOriginScalarInPtrChain(loadB.getPtr(), bNAxis);
+  // A transposed operand is staged the other way round, so the axis that must
+  // be dense is not the tile's own axis 1. Ask only about the operands read
+  // straight; the transposed staging keeps the behaviour the suite pins.
+  if (!simdgroupTileIsContiguous(loadA.getPtr()) ||
+      (!bTransposed && !simdgroupTileIsContiguous(loadB.getPtr())) ||
+      !simdgroupTileIsContiguous(store.getPtr()))
+    return mlir::failure();
 
   mlir::OpBuilder builder(forOp);
   auto loc = forOp.getLoc();
@@ -24568,6 +24616,15 @@ tryRuntimeKLoopRecomputeMultiDot(mlir::scf::ForOp forOp) {
       return mlir::failure();
     accs[i] = {dot, loadB, bT, store};
   }
+  // A transposed operand is staged the other way round, so the axis that must
+  // be dense is not the tile's own axis 1. Ask only about the operands read
+  // straight; the transposed staging keeps the behaviour the suite pins.
+  if (!simdgroupTileIsContiguous(sharedA.getPtr()))
+    return mlir::failure();
+  for (auto &acc : accs)
+    if ((!acc.bTransposed && !simdgroupTileIsContiguous(acc.loadB.getPtr())) ||
+        !simdgroupTileIsContiguous(acc.store.getPtr()))
+      return mlir::failure();
 
   // ---- Emit ----
   mlir::OpBuilder builder(forOp);
@@ -25232,6 +25289,10 @@ static mlir::LogicalResult tryUnrollKLoopDot(mlir::triton::DotOp dot) {
   } else {
     return mlir::failure();
   }
+  if (!simdgroupTileIsContiguous(aLoad.getPtr()) ||
+      !simdgroupTileIsContiguous(bLoad.getPtr()) ||
+      !simdgroupTileIsContiguous(store.getPtr()))
+    return mlir::failure();
 
   // Emit IR before the scf.for.
   mlir::OpBuilder builder(forOp);
@@ -25912,6 +25973,20 @@ static ScalarDotOp sdCreateScalarDot(
   if (!aTy || !bTy)
     return {};
 
+  // Both of this op's paths -- the SIMD-group tiles and the per-thread scalar
+  // reduction -- advance an operand's inner axis one element at a time: the
+  // inner stride below is inferred from the layout and otherwise defaults to
+  // one, and no caller ever passes a dynamic one. An A whose K advances by two
+  // (a tile taken from every other column of a wider matrix) or a B whose N
+  // does is therefore read as if it were dense, silently. The output side is
+  // fine -- its address is replayed from the store's own arithmetic -- so only
+  // the operands are asked here. Scaled and weighted forms carry their own
+  // packing and are left alone rather than refused on an untested assumption.
+  if (!scaleInfo && !weightLoad && !transposeA && !transposeB &&
+      (!simdgroupTileIsContiguous(aLoad.getPtr()) ||
+       !simdgroupTileIsContiguous(bLoad.getPtr())))
+    return {};
+
   // Origins (pid*BLOCK) from the store's contributions — the output row/col
   // origins equal A's row origin and B's col origin respectively.
   auto store = sdFindStore(replaceTarget);
@@ -26068,8 +26143,20 @@ static ScalarDotOp sdCreateScalarDot(
     return !stride ||
            (!stride->dynamic && stride->constant && *stride->constant == 1);
   };
+  // The physical-stride inference answers this for the layouts it can read,
+  // but it says nothing about a strided ADDRESS -- an A whose K advances by
+  // two, a B whose N does, or a destination written with a non-unit column
+  // stride. The SIMD-group path below reads and writes 8x8 tiles with
+  // `simdgroup_load`/`simdgroup_store`, which address the inner axis one
+  // element at a time, so each of those was computed against a dense tile and
+  // silently wrong. Ask the pointers as well, and leave a tile this path
+  // cannot address to the per-thread scalar reduction, which re-derives every
+  // address and is exact at any stride.
   const bool unitInnerStrides = isUnitPhysicalStride(aPhysicalColStride) &&
-                                isUnitPhysicalStride(bPhysicalColStride);
+                                isUnitPhysicalStride(bPhysicalColStride) &&
+                                aLoad && simdgroupTileIsContiguous(aLoad.getPtr()) &&
+                                bLoad && simdgroupTileIsContiguous(bLoad.getPtr()) &&
+                                (!store || simdgroupTileIsContiguous(store.getPtr()));
   mlir::Value strideA =
       emitAxisStride(aPhysicalRowStride, strideADynamic, strideAOpt,
                      /*defaultConstant=*/1);
@@ -29004,6 +29091,10 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   mlir::Value aPtr = unwrapPtrToKernelArg(aLoad.getPtr());
   mlir::Value bPtr = unwrapPtrToKernelArg(bLoad.getPtr());
   mlir::Value cPtr = unwrapPtrToKernelArg(store.getPtr());
+  if (!simdgroupTileIsContiguous(aLoad.getPtr()) ||
+      !simdgroupTileIsContiguous(bLoad.getPtr()) ||
+      !simdgroupTileIsContiguous(store.getPtr()))
+    return;
   OriginPair aOrig = extractOriginPair<mlir::triton::LoadOp>(aLoad);
   OriginPair bOrig = extractOriginPair<mlir::triton::LoadOp>(bLoad);
   OriginPair cOrig = extractOriginPair<mlir::triton::StoreOp>(store);

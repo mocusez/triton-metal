@@ -558,6 +558,19 @@ The current dependency-ordered priorities are:
    `alpha*(A@B) + beta*C` epilogue, two dots per iteration, and an f16 store --
    found no further wrong answers: each is refused by name at every reduction
    width, so none of them was dropping reduction columns either.
+   Every matmul tier now checks that the tiles it addresses are contiguous
+   along their inner axis. A matrix load or store reads
+   `buf[(row + i) * stride + col + j]`: the row axis carries a stride, so a
+   sub-block of a wider matrix works and is covered, but the inner axis
+   advances one element at a time and cannot express a stride. No tier asked,
+   so an A whose reduction axis advanced by two, a B whose column axis did, and
+   a result written with a non-unit column stride were each computed against a
+   dense tile and answered wrongly, in the unrolled, runtime-bound and
+   standalone tiers alike. They are refused by name now, except where the
+   per-thread scalar reduction can still answer them, which it does for a
+   strided destination because it replays the store's own arithmetic.
+   Transposed operands are staged the other way round and keep their existing
+   behaviour rather than being refused on an untested assumption.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

@@ -3147,3 +3147,81 @@ def test_dot_accumulator_from_other_buffer_is_named(capfd):
             BLOCK_M=16, BLOCK_N=16, BLOCK_K=16, K_TILES=K // 16,
         )
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# Inner-axis contiguity: a simdgroup load or store reads
+# `buf[(row + i) * stride + col + j]`, so the tile's inner axis advances one
+# element at a time. A wider ROW stride is fine -- that is a sub-block of a
+# larger matrix, and the stride operand says so. A non-unit INNER stride is not
+# expressible, and every tier used to compute against it as if it were dense.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_strided_address_kernel(
+    a_ptr,
+    b_ptr,
+    o_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_TILES: tl.constexpr,
+):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K_TILES):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    tl.store(o_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+             acc)
+
+
+def _run_strided(*, pad, sak, sbn, transpose_out, BK=16, M=32, N=32, K=64):
+    torch.manual_seed(0x5721)
+    lda, ldb = sak * K + pad, sbn * N + pad
+    big_a = torch.randn((M, lda), dtype=torch.float32)
+    big_b = torch.randn((K, ldb), dtype=torch.float32)
+    a = big_a[:, 0:sak * K:sak]
+    b = big_b[:, 0:sbn * N:sbn]
+    if transpose_out:
+        out = torch.zeros((N, M), dtype=torch.float32)
+        som, son = 1, M
+    else:
+        out = torch.zeros((M, N), dtype=torch.float32)
+        som, son = N, 1
+    dot_strided_address_kernel[(M // 16, N // 16)](
+        big_a, big_b, out, lda, sak, ldb, sbn, som, son,
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=BK, K_TILES=K // BK,
+    )
+    got = out.t() if transpose_out else out
+    return got, a.float() @ b.float()
+
+
+def test_dot_wide_row_strides_match_torch():
+    """A sub-block of a wider matrix: the row stride carries it, the tiers work."""
+    got, ref = _run_strided(pad=24, sak=1, sbn=1, transpose_out=False)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "sak,sbn,transpose_out",
+    [
+        pytest.param(2, 1, False, id="strided_a_k"),
+        pytest.param(1, 2, False, id="strided_b_n"),
+        pytest.param(1, 1, True, id="strided_output_column"),
+    ],
+)
+def test_dot_non_unit_inner_stride_is_named(capfd, sak, sbn, transpose_out):
+    with pytest.raises(Exception):
+        _run_strided(pad=24, sak=sak, sbn=sbn, transpose_out=transpose_out)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
