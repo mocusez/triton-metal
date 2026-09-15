@@ -3606,6 +3606,39 @@ def _reduce_rank1_mask_shape_kernel(X, Y, O, N, RUNTIME_BASE, RUNTIME_OTHER,
 
 
 @triton.jit
+def _gather_envelope_kernel(X, IDX, O, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    tl.store(O + o, tl.gather(tl.load(X + o), tl.load(IDX + o), 0))
+
+
+@triton.jit
+def _splat_store_kernel(X, O, BLOCK: tl.constexpr):
+    o = tl.arange(0, BLOCK)
+    # Every element of the tile lands on one address: a race, not a store.
+    tl.store(O + tl.zeros((BLOCK,), tl.int32), tl.load(X + o))
+
+
+@triton.jit
+def _dot_scaled_envelope_kernel(A, B, AS, BS, C, M: tl.constexpr,
+                                N: tl.constexpr, K: tl.constexpr,
+                                FORM: tl.constexpr):
+    m = tl.arange(0, M)
+    n = tl.arange(0, N)
+    kk = tl.arange(0, K)
+    if FORM == "computed_a":
+        a = tl.load(A + m[:, None] * K + kk[None, :]) ^ 1
+    else:
+        a = tl.load(A + m[:, None] * K + kk[None, :])
+    b = tl.load(B + kk[:, None] * N + n[None, :])
+    r = tl.dot_scaled(a, tl.load(AS + m[:, None]), "e4m3",
+                      b, tl.load(BS + n[:, None]), "e4m3", fast_math=False)
+    if FORM == "epilogue":
+        tl.store(C + m[:, None] * N + n[None, :], r * 0.5)
+    else:
+        tl.store(C + m[:, None] * N + n[None, :], r)
+
+
+@triton.jit
 def _reduce_rank2_axis1_narrow_int_kernel(X, O, M: tl.constexpr,
                                           N: tl.constexpr):
     # Triton promotes an i8 or i16 sum to i32 over an `arith.extsi` cone, so the
@@ -5295,6 +5328,92 @@ def test_reduce_rank2_axis1_narrow_int_is_rejected_not_crashed(dtype,
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     output = result.stdout + result.stderr
     needle = "rank-2 axis=1 reduce over a computed cone is implemented for f32 only"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+# The `tl.dot_scaled` matcher and the unsupported-op validator were probed as
+# whole families (`.omc/fuzz/scaled_dot_and_unsupported.py`, 16 kernels):
+# 10 named refusals, 6 supported shapes exact, no wrong answers and no signals.
+# Four of the ten refusals already had fixtures. These five did not, and each is
+# reachable from an ordinary kernel.
+@pytest.mark.parametrize(
+    "case,needle",
+    [
+        ("gather_e128", "rank-1 gather requires a power-of-two 1..64 elements"),
+        ("splat_store", "an unmasked store through a uniform"),
+        ("sd_unaligned_m", "requires static M/N multiples of 8"),
+        ("sd_computed_a", "requires direct matrix loads"),
+        ("sd_epilogue", "an epilogue between the dot and the store"),
+    ],
+    ids=["gather_e128", "splat_store", "sd_unaligned_m", "sd_computed_a",
+         "sd_epilogue"],
+)
+def test_scaled_dot_and_unsupported_op_refusals(case, needle, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    cases = {
+        "gather_e128": ("_gather_envelope_kernel",
+                        '{"X": "*fp32", "IDX": "*i32", "O": "*fp32"}',
+                        '{"BLOCK": 4096}'),
+        "splat_store": ("_splat_store_kernel",
+                        '{"X": "*fp32", "O": "*fp32"}', '{"BLOCK": 64}'),
+        "sd_unaligned_m": ("_dot_scaled_envelope_kernel",
+                           '{"A": "*u8", "B": "*u8", "AS": "*u8", "BS": "*u8",'
+                           ' "C": "*fp32"}',
+                           '{"M": 4, "N": 16, "K": 32, "FORM": "plain"}'),
+        "sd_computed_a": ("_dot_scaled_envelope_kernel",
+                          '{"A": "*u8", "B": "*u8", "AS": "*u8", "BS": "*u8",'
+                          ' "C": "*fp32"}',
+                          '{"M": 16, "N": 16, "K": 32, "FORM": "computed_a"}'),
+        "sd_epilogue": ("_dot_scaled_envelope_kernel",
+                        '{"A": "*u8", "B": "*u8", "AS": "*u8", "BS": "*u8",'
+                        ' "C": "*fp32"}',
+                        '{"M": 16, "N": 16, "K": 32, "FORM": "epilogue"}'),
+    }
+    kernel, signature, constexprs = cases[case]
+
+    script = tmp_path / "scaled_dot_refusal.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 80, 32)
+
+        for attempt in range(3):
+            try:
+                triton.compile(ASTSource(
+                    getattr(module, {kernel!r}),
+                    signature={signature},
+                    constexprs={constexprs}),
+                    target=target, options={{"num_warps": 1}})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("an unsupported shape compiled")
+        # A supported scaled dot in the same process.
+        triton.compile(ASTSource(
+            module._dot_scaled_envelope_kernel,
+            signature={{"A": "*u8", "B": "*u8", "AS": "*u8", "BS": "*u8",
+                       "C": "*fp32"}},
+            constexprs={{"M": 16, "N": 16, "K": 32, "FORM": "plain"}}),
+            target=target, options={{"num_warps": 1}})
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert output.count(needle) == 3, output
     assert "RECOVERED" in output

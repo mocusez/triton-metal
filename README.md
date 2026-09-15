@@ -411,6 +411,13 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
+   The `tl.dot_scaled` matcher and the unsupported-op validator have been probed
+   as whole families: every refusal they raise for a shape a kernel can express
+   is named and raised before conversion, and the supported shapes — e4m3 and
+   mixed e5m2 scaled dots, an f32/fp8 round trip, `tl.device_print`, a tensor
+   `tl.atomic_add`, `tl.join`/`tl.split` at one element per thread — compile and
+   match torch. A scaled dot needs M and N to be multiples of 8, direct matrix
+   loads, and a store its result reaches directly.
    A rank-2 `axis=1` reduce over a computed cone is implemented for f32 only,
    and the preflight now asks the lowering's own question instead of listing the
    combines it covers. `tl.sum` over an i8 or i16 tile is the ordinary kernel
