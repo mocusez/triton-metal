@@ -192,15 +192,19 @@ def test_sliding_window_attention_over_budget_uses_chunked_mma():
 
     compiled = _solve(Q, K, V, out, M, d, window_size)
 
-    # BM=16 has two useful 8-row tiles, so the source's four-warp request is
-    # capped at two SIMD-groups by the shared emitter/launcher schedule.
-    assert getattr(compiled.metadata, "threads_per_group", None) == 64
+    # BM=16 has two 8-row tiles, but a SIMD-group owns an 8x8 OUTPUT tile of a
+    # dot, not an 8-row band, and this kernel's dots have several column tiles
+    # each. The shared emitter/launcher schedule distributes the (row, column)
+    # PAIRS, so the source's four-warp request is honoured in full; capping at
+    # the row tiles alone used to leave two of the four with nothing to run,
+    # and measured 1.6x slower on a bm=16 causal kernel at 1024 keys.
+    assert getattr(compiled.metadata, "threads_per_group", None) == 128
     msl = compiled.asm["metal"]
     if isinstance(msl, bytes):
         msl = msl.decode()
     assert "simdgroup_index_in_threadgroup" in msl
     assert "uint _fa_warp = sgid" in msl
-    assert "mi += 2u" in msl
+    assert "_fa_t += 4u" in msl
     assert msl.count("simdgroup_multiply_accumulate") >= 2
 
     expected = _reference(Q, K, V, M, d, window_size)
@@ -221,9 +225,25 @@ def test_sliding_window_attention_chunked_mma_preserves_q_out_alias():
     torch.testing.assert_close(Q.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-def test_sliding_window_attention_too_wide_keeps_scalar_floor():
-    """A full BM*BD output accumulator that cannot fit still falls back."""
-    M, d, window_size = 16, 512, 4
+@pytest.mark.parametrize("d, on_mma", [(512, True), (2048, False)],
+                         ids=["row-blocked", "past-even-eight-rows"])
+def test_sliding_window_attention_wide_head_boundary(d, on_mma):
+    """Where the output accumulator stops fitting -- and that the op stays total.
+
+    The chunked MMA body holds a `rows x bd` output accumulator across the whole
+    key sweep. At `bm * bd >= 8192` that is Apple's entire 32 KiB threadgroup
+    budget, and this test used to pin the consequence: fall to the scalar floor.
+    The schedule now blocks the query ROWS instead, so d=512 at BM=16 carries 8
+    rows a pass and keeps both matmuls on the matrix unit -- which is the point,
+    because the floor measured 108-243x slower on the shapes it claimed.
+
+    The floor has not gone away, it has moved: once even EIGHT rows of `bd` plus
+    a minimal (key, d_head, out_d) blocking will not fit, there is nothing left
+    to shrink. d=2048 is past that, and it must still COMPILE and still be
+    RIGHT -- that totality is what this test was really protecting and is why
+    both ends are checked here rather than only the new one.
+    """
+    M, window_size = 16, 4
     torch.manual_seed(0xFA11)
     Q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
     K = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
@@ -232,12 +252,16 @@ def test_sliding_window_attention_too_wide_keeps_scalar_floor():
 
     compiled = _solve(Q, K, V, out, M, d, window_size)
 
-    assert getattr(compiled.metadata, "threads_per_group", None) == 32
     msl = compiled.asm["metal"]
     if isinstance(msl, bytes):
         msl = msl.decode()
-    assert "metal.fused_attention (per-key, region score transform)" in msl
-    assert "simdgroup_index_in_threadgroup" not in msl
+    if on_mma:
+        assert "simdgroup_multiply_accumulate" in msl
+        assert "_fa_rb" in msl, "no row-block pass at a shape that needs one"
+    else:
+        assert getattr(compiled.metadata, "threads_per_group", None) == 32
+        assert "metal.fused_attention (per-key, region score transform)" in msl
+        assert "simdgroup_index_in_threadgroup" not in msl
     expected = _reference(Q, K, V, M, d, window_size)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 

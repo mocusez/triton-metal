@@ -3083,10 +3083,122 @@ ModuleTranslation::emitAttentionBackwardGradientRegion_(
   return {"v" + std::to_string(pIdx), "v" + std::to_string(dsIdx)};
 }
 
+// Does the score region provably contribute NOTHING for a key ABOVE its row?
+//
+// A causal kernel puts its mask INSIDE the region -- `where(row >= key, s,
+// -inf)` -- and leaves its key LOOP over the whole range. The emitter
+// reproduces the source's own loop bound, so it sweeps every key block, and for
+// the upper half of them every score is the region's false arm: under an online
+// softmax a -inf logit becomes exactly zero weight and leaves the running
+// (max, sum, accumulator) untouched, and under `norm = none` a zero weight adds
+// nothing. Those blocks are dead work, not a contribution -- half the matrix
+// work AND half the global traffic. Measured on the corpus causal kernel by
+// pruning the bound in the SOURCE instead, which is the same thing the emitter
+// would do: 1.38-1.67x at M=2048, bit-identical answers.
+//
+// The proof obligation is narrow and purely structural. The yielded value must
+// be a `select` whose FALSE arm is the inert value for this norm, and whose
+// condition is an AND-chain with `row >= key` (or `row > key`, or the mirrored
+// `key <= row` / `key < row`) among its conjuncts. One false conjunct falsifies
+// the whole condition, so a key above its row takes the false arm whatever the
+// rest of the chain says -- which is exactly why the other conjuncts need not
+// be understood. Anything else answers false and nothing is pruned.
+static bool
+fusedAttentionKeysAboveRowAreInert(mlir::triton::metal::FusedAttentionOp op) {
+  // One phase only. The region takes `phase` as an argument, so a multi-phase
+  // op may be causal in one phase and not in another, while the bound below is
+  // emitted per phase from a single answer.
+  if (op.getNumPhases() > 1)
+    return false;
+  mlir::Block &body = op.getScore().front();
+  // (score, row, key, phase, params...)
+  if (body.getNumArguments() < 3)
+    return false;
+  mlir::Value row = body.getArgument(1), key = body.getArgument(2);
+  auto yield =
+      mlir::dyn_cast<mlir::triton::metal::ScoreYieldOp>(body.getTerminator());
+  if (!yield)
+    return false;
+  auto sel = yield.getValue().getDefiningOp<mlir::arith::SelectOp>();
+  if (!sel)
+    return false;
+
+  const bool softmax =
+      op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
+  auto constantFloat = [](mlir::Value v) -> std::optional<llvm::APFloat> {
+    if (auto c = v.getDefiningOp<mlir::triton::metal::ConstantOp>())
+      if (auto f = mlir::dyn_cast<mlir::FloatAttr>(c.getValue()))
+        return f.getValue();
+    if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto f = mlir::dyn_cast<mlir::FloatAttr>(c.getValue()))
+        return f.getValue();
+    return std::nullopt;
+  };
+  std::optional<llvm::APFloat> falseArm = constantFloat(sel.getFalseValue());
+  if (!falseArm)
+    return false;
+  if (softmax) {
+    if (!falseArm->isInfinity() || !falseArm->isNegative())
+      return false;
+  } else if (!falseArm->isZero()) {
+    return false;
+  }
+
+  // `key > row` falsifies this comparison, whichever way round it is written.
+  auto rulesOutKeyAboveRow = [&](mlir::Value v) {
+    if (auto b = v.getDefiningOp<mlir::triton::metal::BinaryExpOp>()) {
+      auto kind = b.getBinaryOperator();
+      if ((kind == mlir::triton::metal::BinaryExpOperator::geOp ||
+           kind == mlir::triton::metal::BinaryExpOperator::gtOp) &&
+          b.getLhs() == row && b.getRhs() == key)
+        return true;
+      if ((kind == mlir::triton::metal::BinaryExpOperator::leOp ||
+           kind == mlir::triton::metal::BinaryExpOperator::ltOp) &&
+          b.getLhs() == key && b.getRhs() == row)
+        return true;
+    }
+    if (auto c = v.getDefiningOp<mlir::arith::CmpIOp>()) {
+      auto pred = c.getPredicate();
+      if ((pred == mlir::arith::CmpIPredicate::sge ||
+           pred == mlir::arith::CmpIPredicate::sgt) &&
+          c.getLhs() == row && c.getRhs() == key)
+        return true;
+      if ((pred == mlir::arith::CmpIPredicate::sle ||
+           pred == mlir::arith::CmpIPredicate::slt) &&
+          c.getLhs() == key && c.getRhs() == row)
+        return true;
+    }
+    return false;
+  };
+
+  // Walk the AND-chain. A bounded worklist rather than recursion: the region is
+  // author-supplied and a cycle here would hang the compiler.
+  llvm::SmallVector<mlir::Value, 8> work{sel.getCondition()};
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  while (!work.empty()) {
+    mlir::Value v = work.pop_back_val();
+    if (rulesOutKeyAboveRow(v))
+      return true;
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    bool isAnd = false;
+    if (auto b = mlir::dyn_cast<mlir::triton::metal::BinaryExpOp>(def))
+      isAnd = b.getBinaryOperator() ==
+              mlir::triton::metal::BinaryExpOperator::andOp;
+    else if (mlir::isa<mlir::arith::AndIOp>(def))
+      isAnd = true;
+    if (!isAnd)
+      continue;
+    work.append(def->operand_begin(), def->operand_end());
+  }
+  return false;
+}
+
 std::pair<std::string, std::string> ModuleTranslation::emitKeyBoundsRegion_(
     mlir::triton::metal::FusedAttentionOp op, llvm::StringRef blkExpr,
     llvm::StringRef phaseExpr, llvm::StringRef mExpr, llvm::StringRef nExpr,
-    llvm::StringRef ind) {
+    llvm::StringRef ind, int64_t rowSpan) {
   mlir::Block &body = op.getKeyBounds().front();
   auto &os = _output;
   // Each key phase re-emits the region. Clear the previous pass's let-bindings
@@ -3142,6 +3254,14 @@ std::pair<std::string, std::string> ModuleTranslation::emitKeyBoundsRegion_(
   // inside its own block, so the names do not collide across phases.
   std::string beg = one(yield.getStart(), "_fa_kbeg");
   std::string end = one(yield.getEnd(), "_fa_kend");
+  if (fusedAttentionKeysAboveRowAreInert(op)) {
+    // Every key from `rowoff + bm` up is above EVERY row this program owns, so
+    // the whole of each such key block takes the region's false arm. Dropping
+    // them changes no answer; it removes blocks that contribute nothing. All
+    // three bodies declare `_fa_rowoff` before reaching here.
+    os << ind << "_fa_kend = min(_fa_kend, _fa_rowoff + " << rowSpan
+       << "u);\n";
+  }
   return {beg, end};
 }
 
@@ -3160,44 +3280,89 @@ mlir::triton::metal::getFusedAttentionSchedule(FusedAttentionOp op) {
   if (!mmaEnvelope)
     return {/*useMma=*/false, /*chunked=*/false, /*numWarps=*/1,
             /*threadsPerGroup=*/32, /*blockK=*/0, /*blockDHead=*/0,
-            /*blockOutD=*/0};
+            /*blockOutD=*/0, /*blockRows=*/0};
 
-  // Each SIMD-group owns complete 8-row QK/PV tiles.  More SIMD-groups than
-  // row tiles cannot execute additional matrix work, so cap the launch instead
-  // of reproducing the source's otherwise-idle warps.
+  // A SIMD-group owns a complete 8x8 OUTPUT tile of a dot, and each dot of a
+  // key block has `rowTiles * colTiles` of them: QK^T over the key tiles, PV
+  // over the feature tiles. Distributing those PAIRS is what lets a kernel
+  // with a small `bm` use more than `bm/8` SIMD-groups -- the corpus kernels
+  // pick bm = 16, which under the old row-tile-only cap left six of eight
+  // requested warps with nothing to run, and measured 1.9x slower than the
+  // same work at bm = 64 with all eight busy. Requests above the pair count
+  // are still capped, so no SIMD-group is launched without a tile.
   const int sourceWarps = std::max(1, mlir::triton::gpu::lookupNumWarps(op));
-  const int rowTiles = static_cast<int>(BM / 8);
-  const int numWarps = std::max(1, std::min(sourceWarps, rowTiles));
-  if (fullNeed <= 8192)
+  const int64_t rowTiles = BM / 8;
+  auto warpsFor = [&](int64_t pairTiles) {
+    return std::max<int>(1, std::min<int64_t>(sourceWarps, pairTiles));
+  };
+  if (fullNeed <= 8192) {
+    // Both dots run in the same threadgroup, so the launch has to serve the
+    // wider of the two.
+    const int numWarps =
+        warpsFor(std::max(rowTiles * (BN / 8), rowTiles * (BD / 8)));
     return {/*useMma=*/true, /*chunked=*/false, numWarps, numWarps * 32,
-            static_cast<int>(BN), static_cast<int>(BD), static_cast<int>(BD)};
+            static_cast<int>(BN), static_cast<int>(BD), static_cast<int>(BD),
+            static_cast<int>(BM)};
+  }
 
-  const int64_t state = op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * BM : 0;
+  // The O accumulator is `rows * bd` and has to survive the whole key sweep, so
+  // at `bm * bd >= 8192` it fills the budget on its own and NO blocking of
+  // (key, d_head, out_d) can fit. That dropped the op onto the scalar floor --
+  // silently, and measured 108x slower at bm=64/d_head=128 (the shape a Llama
+  // block is written in) and 243x at bm=64/d_head=256.
+  //
+  // So make the ROW BLOCK the outer axis of the search: a program walks its
+  // `bm` rows in several passes, each carrying `rows` of them through a
+  // complete key sweep. Unlike chunking the OUTPUT features -- the other way to
+  // shrink that accumulator -- this recomputes NOTHING, because a row block
+  // needs its own scores anyway: two passes of `bm/2` do exactly the work one
+  // pass of `bm` does. It costs one more read of K and V per program, which is
+  // the traffic a kernel written with the smaller `bm` would have had anyway.
+  //
+  // 🔑 The largest admissible row block wins, so every shape that fits today
+  // keeps `rows == bm` and emits byte-identical MSL.
   const int initK = static_cast<int>(std::min<int64_t>(BN, 32));
   const int initD = static_cast<int>(std::min<int64_t>(BD, 32));
   const int initO = static_cast<int>(std::min<int64_t>(BD, 32));
-  int bestK = 0, bestD = 0, bestO = 0, bestWork = -1;
-  for (int bk = initK; bk >= 8; bk -= 8)
-    for (int dk = initD; dk >= 8; dk -= 8)
-      for (int bo = initO; bo >= 8; bo -= 8) {
-        const int64_t need =
-            BM * BD + BM * dk + dk * bk + bk * bo + BM * bk + state;
-        if (need > 8192)
-          continue;
-        const int work = bk * dk * bo;
-        if (work > bestWork) {
-          bestK = bk;
-          bestD = dk;
-          bestO = bo;
-          bestWork = work;
+  int64_t bestRB = 0;
+  int bestK = 0, bestD = 0, bestO = 0;
+  for (int64_t rows = BM; rows >= 8 && bestRB == 0; rows -= 8) {
+    // A whole number of passes: a ragged last one would run rows belonging to
+    // the next program.
+    if (BM % rows)
+      continue;
+    const int64_t state =
+        op.getNorm() == AttnNorm::OnlineSoftmax ? 2 * rows : 0;
+    int64_t bestWork = -1;
+    for (int bk = initK; bk >= 8; bk -= 8)
+      for (int dk = initD; dk >= 8; dk -= 8)
+        for (int bo = initO; bo >= 8; bo -= 8) {
+          const int64_t need =
+              rows * BD + rows * dk + dk * bk + bk * bo + rows * bk + state;
+          if (need > 8192)
+            continue;
+          const int64_t work = static_cast<int64_t>(bk) * dk * bo;
+          if (work > bestWork) {
+            bestK = bk;
+            bestD = dk;
+            bestO = bo;
+            bestWork = work;
+          }
         }
-      }
-  if (bestWork < 0)
+    if (bestWork >= 0)
+      bestRB = rows;
+  }
+  if (bestRB == 0)
     return {/*useMma=*/false, /*chunked=*/false, /*numWarps=*/1,
             /*threadsPerGroup=*/32, /*blockK=*/0, /*blockDHead=*/0,
-            /*blockOutD=*/0};
+            /*blockOutD=*/0, /*blockRows=*/0};
+  // The chunked body's tile counts come from the blocking it just chose, over
+  // the rows it carries at once rather than over all of `bm`.
+  const int64_t chunkRowTiles = bestRB / 8;
+  const int numWarps = warpsFor(
+      std::max(chunkRowTiles * (bestK / 8), chunkRowTiles * (bestO / 8)));
   return {/*useMma=*/true, /*chunked=*/true, numWarps, numWarps * 32, bestK,
-          bestD, bestO};
+          bestD, bestO, static_cast<int>(bestRB)};
 }
 
 // Simdgroup body: both matmuls on the matrix unit, with the score transform
@@ -3288,6 +3453,59 @@ void ModuleTranslation::emitFusedAttentionMma_(
   const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
 
   auto &os = _output;
+  // How many lanes cooperate on ONE query row in the score pass below.
+  //
+  // That pass sits between the two dots and was the only phase that did not
+  // scale with the warp count: one query row per THREAD means it runs on
+  // `min(BM, threadsPerGroup)` threads however many are launched. Decomposing
+  // the measured warp scaling as `T(w) = S + P/w` over three independent arm
+  // pairs put `S` at 67-84% of the runtime at eight warps, and `S` fell as BM
+  // rose -- the signature of a phase whose parallelism is BM, not the
+  // threadgroup.
+  //
+  // So spend the threads the pass would otherwise leave idle as LANES on each
+  // row, and keep every row in flight that was in flight before. Giving a whole
+  // SIMD-group to each row instead is measurably worse whenever a SIMD-group
+  // ends up with many rows: it trades row parallelism for lane parallelism and
+  // pays two cross-lane reductions per row (measured 0.72x at BM=64 with one
+  // warp, against 1.60x at BM=16 with eight).
+  //
+  // A power of two, so the reduction is an XOR shuffle inside each aligned
+  // lane block, and never more than a SIMD-group. `lanesPerRow == 1` degenerates
+  // to exactly the one-row-per-thread form, reduction included -- which is why
+  // this is one code path and not two.
+  int lanesPerRow = 1;
+  while (lanesPerRow < 32 &&
+         static_cast<int64_t>(lanesPerRow) * 2 * BM <= threadsPerGroup)
+    lanesPerRow *= 2;
+  // Two lanes per row is a measured LOSS: one shuffle pair buys only a halved
+  // column loop, and the reduction latency is the larger of the two. Every arm
+  // that came out slower across a 36-arm sweep was exactly this case
+  // (0.93-0.97x), and every arm with four or more lanes came out faster
+  // (1.14-1.66x). So skip it and stay on the one-row-per-thread form.
+  if (lanesPerRow == 2)
+    lanesPerRow = 1;
+  const int rowsAtOnce = threadsPerGroup / lanesPerRow;
+  // Spell the degenerate split plainly rather than emitting `% 1u` / `/ 1u`:
+  // a reader of the MSL should be able to see one-row-per-thread as itself.
+  const std::string laneExpr =
+      lanesPerRow == 1 ? "0u"
+                       : "_fa_tid % " + std::to_string(lanesPerRow) + "u";
+  const std::string rowStart =
+      lanesPerRow == 1 ? "_fa_tid"
+                       : "_fa_tid / " + std::to_string(lanesPerRow) + "u";
+  // Emit-time unrolled segmented reduction over one row's lane block.
+  auto laneReduce = [&](llvm::StringRef var, llvm::StringRef combine,
+                        llvm::StringRef ind) {
+    for (int off = lanesPerRow / 2; off > 0; off >>= 1)
+      os << ind << var << " = " << combine << "(" << var
+         << ", simd_shuffle_xor(" << var << ", (ushort)" << off << "));\n";
+  };
+  auto laneSum = [&](llvm::StringRef var, llvm::StringRef ind) {
+    for (int off = lanesPerRow / 2; off > 0; off >>= 1)
+      os << ind << var << " += simd_shuffle_xor(" << var << ", (ushort)" << off
+         << ");\n";
+  };
   os << "\n  // ---- metal.fused_attention (simdgroup dots, region score "
         "transform) ----\n";
   os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
@@ -3357,8 +3575,9 @@ void ModuleTranslation::emitFusedAttentionMma_(
   os << "      _fa_obuf[c] = 0.0f;\n";
   os << "    }\n";
   if (softmax)
-    os << "    if (_fa_tid < " << S(BM)
-       << "u) { _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f; }\n";
+    os << "    for (uint q = _fa_tid; q < " << S(BM) << "u; q += "
+       << threadsPerGroup
+       << "u) { _fa_rmax[q] = -INFINITY; _fa_rsum[q] = 0.0f; }\n";
   os << "  }\n";
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
   // The key range this program sweeps, computed by the op's key-bounds region.
@@ -3372,7 +3591,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "  {\n";
     auto [_fa_kbeg, _fa_kend] =
         emitKeyBoundsRegion_(op, "(int)tgid.x", P, "(int)_fa_M",
-                             "(int)_fa_N", "  ");
+                             "(int)_fa_N", "  ", BM);
     os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
        << "; kb += " << S(BN) << "u) {\n";
     if (featureTiled) {
@@ -3411,9 +3630,16 @@ void ModuleTranslation::emitFusedAttentionMma_(
       os << "      }\n";
       os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       os << "      if (_fa_active) {\n";
-      os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-         << "u; mi += " << numWarps << "u)\n";
-      os << "        for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+      // One flattened (row tile, key tile) index per SIMD-group: a serial
+      // column loop nested under a warp-strided row loop caps the useful warps
+      // at `bm/8` however many the source asked for. The ROW tile is the fast
+      // axis of the flattening, so while the warps fit in the row tiles each
+      // one gets exactly the tiles it got before -- the extra warps are added
+      // alongside rather than reshuffling the ones that were already busy.
+      os << "        for (uint _fa_t = _fa_warp; _fa_t < " << S(mT * nT)
+         << "u; _fa_t += " << numWarps << "u) {\n";
+      os << "          uint mi = _fa_t % " << S(mT) << "u; uint ni = _fa_t / "
+         << S(mT) << "u;\n";
       // The zero constructor and in-place MAC are both required on Apple family
       // 9. Only later chunks reload the partial score tile.
       os << "          simdgroup_float8x8 acc(0.0f);\n";
@@ -3457,9 +3683,10 @@ void ModuleTranslation::emitFusedAttentionMma_(
       os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
       // Dot 1: S = Q @ K^T, straight into the staged S tile.
       os << "    if (_fa_active) {\n";
-      os << "      for (uint mi = _fa_warp; mi < " << S(mT)
-         << "u; mi += " << numWarps << "u)\n";
-      os << "      for (uint ni = 0; ni < " << S(nT) << "u; ++ni) {\n";
+      os << "      for (uint _fa_t = _fa_warp; _fa_t < " << S(mT * nT)
+         << "u; _fa_t += " << numWarps << "u) {\n";
+      os << "        uint mi = _fa_t % " << S(mT) << "u; uint ni = _fa_t / "
+         << S(mT) << "u;\n";
       os << "        simdgroup_float8x8 acc(0.0f);\n";
       os << "        for (uint ki = 0; ki < " << S(dT) << "u; ++ki) {\n";
       os << "          simdgroup_float8x8 a, b;\n";
@@ -3480,11 +3707,18 @@ void ModuleTranslation::emitFusedAttentionMma_(
     // result back over the S tile, so the softmax passes below re-read it instead
     // of re-evaluating the region.
     os << "    if (_fa_active) {\n";
-    os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-    // `q < BM` FIRST: every per-row buffer is sized by BM and `row < M` does not
-    // imply it when BM < 32.
-    os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
-    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+    // `lanesPerRow` lanes per query row; see the derivation where it is
+    // computed. Each lane owns the same `kk` set in every loop below, so no
+    // lane reads a cell another wrote -- only the two ROW REDUCTIONS cross
+    // lanes, and they stay inside one aligned lane block. The row loop is a
+    // LOOP, not a bound: BM can exceed the threadgroup width outright.
+    os << "      uint _fa_rl = " << laneExpr << ";\n";
+    os << "      for (uint q = " << rowStart << "; q < " << S(BM)
+       << "u; q += " << rowsAtOnce << "u) {\n";
+    os << "      uint row = _fa_rowoff + q;\n";
+    os << "      if (row < _fa_M) {\n";
+    os << "        for (uint kk = _fa_rl; kk < " << S(BN) << "u; kk += "
+       << lanesPerRow << "u) {\n";
     os << "          uint _fa_key = kb + kk;\n";
     os << "          if (_fa_key < " << _fa_kend << ") {\n";
     {
@@ -3501,42 +3735,57 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "          }\n";
     os << "        }\n";
     if (softmax) {
-      os << "        float m_cur = -INFINITY;\n";
-      os << "        for (uint kk = 0; kk < " << S(BN)
-         << "u; ++kk) m_cur = max(m_cur, _fa_pbuf[q*" << S(BN) << "u + kk]);\n";
+      // Each lane maxes over the cells it just wrote, then the SIMD-group
+      // combines. No barrier before this: the index sets are identical.
+      os << "        float m_part = -INFINITY;\n";
+      os << "        for (uint kk = _fa_rl; kk < " << S(BN) << "u; kk += "
+         << lanesPerRow << "u) m_part = max(m_part, _fa_pbuf[q*" << S(BN)
+         << "u + kk]);\n";
+      laneReduce("m_part", "max", "        ");
+      os << "        float m_cur = m_part;\n";
       os << "        float m_old = _fa_rmax[q];\n";
       os << "        float m_new = max(m_old, m_cur);\n";
       // Both guards keep -inf minus -inf (= NaN) out of the running state: the
       // first for a block where every key was masked, the second per key.
       os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
          << "(m_old - m_new);\n";
-      os << "        float denom = 0.0f;\n";
-      os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) {\n";
+      os << "        float d_part = 0.0f;\n";
+      os << "        for (uint kk = _fa_rl; kk < " << S(BN) << "u; kk += "
+         << lanesPerRow << "u) {\n";
       os << "          float l = _fa_pbuf[q*" << S(BN) << "u + kk];\n";
       os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
          << E << "(l - m_new);\n";
-      os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; denom += p;\n";
+      os << "          _fa_pbuf[q*" << S(BN) << "u + kk] = p; d_part += p;\n";
       os << "        }\n";
-      os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
-      os << "        _fa_rmax[q] = m_new;\n";
+      laneSum("d_part", "        ");
+      os << "        float denom = d_part;\n";
+      // The running state is ONE slot per row, so the block's first lane writes
+      // it. Every lane read `_fa_rmax[q]` as `m_old` above and the shuffle
+      // chain between the two is the rendezvous; at `lanesPerRow == 1` reader
+      // and writer are the same lane.
+      os << "        if (_fa_rl == 0u) { _fa_rsum[q] = _fa_rsum[q]*scaler + "
+            "denom; _fa_rmax[q] = m_new; }\n";
       if (featureTiled)
-        os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
-           << S(BD) << "u + d] *= scaler;\n";
+        os << "        for (uint d = _fa_rl; d < _fa_out_d; d += " << lanesPerRow
+           << "u) _fa_obuf[q*" << S(BD) << "u + d] *= scaler;\n";
       else
-        os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
-           << S(BD) << "u + d] *= scaler;\n";
+        os << "        for (uint d = _fa_rl; d < " << S(BD) << "u; d += "
+           << lanesPerRow << "u) _fa_obuf[q*" << S(BD)
+           << "u + d] *= scaler;\n";
     }
-    os << "      } else if (q < " << S(BM) << "u) {\n";
-    os << "        for (uint kk = 0; kk < " << S(BN) << "u; ++kk) _fa_pbuf[q*"
-       << S(BN) << "u + kk] = 0.0f;\n";
+    os << "      } else {\n";
+    os << "        for (uint kk = _fa_rl; kk < " << S(BN) << "u; kk += "
+       << lanesPerRow << "u) _fa_pbuf[q*" << S(BN) << "u + kk] = 0.0f;\n";
+    os << "      }\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     // Dot 2: O_tile = P @ V.
     os << "    if (_fa_active) {\n";
-    os << "      for (uint mi = _fa_warp; mi < " << S(mT)
-       << "u; mi += " << numWarps << "u)\n";
-    os << "      for (uint di = 0; di < " << S(dT) << "u; ++di) {\n";
+    os << "      for (uint _fa_t = _fa_warp; _fa_t < " << S(mT * dT)
+       << "u; _fa_t += " << numWarps << "u) {\n";
+    os << "        uint mi = _fa_t % " << S(mT) << "u; uint di = _fa_t / "
+       << S(mT) << "u;\n";
     os << "        simdgroup_float8x8 acc(0.0f);\n";
     os << "        for (uint ki = 0; ki < " << S(nT) << "u; ++ki) {\n";
     os << "          simdgroup_float8x8 a, b;\n";
@@ -3559,8 +3808,11 @@ void ModuleTranslation::emitFusedAttentionMma_(
     os << "  }\n";
   }
   os << "  if (_fa_active) {\n";
-  os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  // Strided: the store is per query row, and BM may exceed the threadgroup.
+  os << "    for (uint q = _fa_tid; q < " << S(BM) << "u; q += "
+     << threadsPerGroup << "u) {\n";
+  os << "    uint row = _fa_rowoff + q;\n";
+  os << "    if (row < _fa_M) {\n";
   if (softmax) {
     os << "      float denom = _fa_rsum[q];\n";
     if (op.getSafeDenominatorOne())
@@ -3584,6 +3836,7 @@ void ModuleTranslation::emitFusedAttentionMma_(
        << S(BD) << "u + d];\n";
   }
   os << "    }\n";
+  os << "    }\n";
   os << "  }\n";
   os << "  }";
 }
@@ -3598,9 +3851,16 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
       op.getNorm() == mlir::triton::metal::AttnNorm::OnlineSoftmax;
   const bool featureTiled = op.getFeatureTiled();
   const bool kFeatureMajor = op.getKFeatureMajor();
-  const int64_t SZ_Q = BM * DK, SZ_KT = DK * BK, SZ_V = BK * BO,
-                SZ_S = BM * BK, SZ_O = BM * BD;
-  const int64_t mT = BM / 8, kT = BK / 8, dT = DK / 8, oT = BO / 8;
+  // Query rows carried at once. `bm` unless the O accumulator alone would not
+  // fit the threadgroup budget, in which case a program walks its rows in
+  // `bm / RB` passes, each one a complete key sweep -- see the schedule for why
+  // the ROW block is the axis that gets chunked and not the output features.
+  // Every shape that fits today keeps `RB == bm` and emits what it emitted
+  // before, wrapper loop included (there is none).
+  const int64_t RB = schedule.blockRows;
+  const int64_t SZ_Q = RB * DK, SZ_KT = DK * BK, SZ_V = BK * BO,
+                SZ_S = RB * BK, SZ_O = RB * BD;
+  const int64_t mT = RB / 8, kT = BK / 8, dT = DK / 8, oT = BO / 8;
   const int numWarps = schedule.numWarps;
   const int threadsPerGroup = schedule.threadsPerGroup;
 
@@ -3671,6 +3931,40 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
   const char *E = op.getSoftmaxNaturalExp() ? "exp" : "exp2";
 
   auto &os = _output;
+  // Lanes per query row for the score pass; the derivation is in
+  // `emitFusedAttentionMma_`, where the same split is computed. Kept local to
+  // each emitter because `threadsPerGroup` differs between the two schedules.
+  int lanesPerRow = 1;
+  while (lanesPerRow < 32 &&
+         static_cast<int64_t>(lanesPerRow) * 2 * RB <= threadsPerGroup)
+    lanesPerRow *= 2;
+  // Two lanes per row is a measured LOSS: one shuffle pair buys only a halved
+  // column loop, and the reduction latency is the larger of the two. Every arm
+  // that came out slower across a 36-arm sweep was exactly this case
+  // (0.93-0.97x), and every arm with four or more lanes came out faster
+  // (1.14-1.66x). So skip it and stay on the one-row-per-thread form.
+  if (lanesPerRow == 2)
+    lanesPerRow = 1;
+  const int rowsAtOnce = threadsPerGroup / lanesPerRow;
+  // Spell the degenerate split plainly rather than emitting `% 1u` / `/ 1u`:
+  // a reader of the MSL should be able to see one-row-per-thread as itself.
+  const std::string laneExpr =
+      lanesPerRow == 1 ? "0u"
+                       : "_fa_tid % " + std::to_string(lanesPerRow) + "u";
+  const std::string rowStart =
+      lanesPerRow == 1 ? "_fa_tid"
+                       : "_fa_tid / " + std::to_string(lanesPerRow) + "u";
+  auto laneReduce = [&](llvm::StringRef var, llvm::StringRef combine,
+                        llvm::StringRef ind) {
+    for (int off = lanesPerRow / 2; off > 0; off >>= 1)
+      os << ind << var << " = " << combine << "(" << var
+         << ", simd_shuffle_xor(" << var << ", (ushort)" << off << "));\n";
+  };
+  auto laneSum = [&](llvm::StringRef var, llvm::StringRef ind) {
+    for (int off = lanesPerRow / 2; off > 0; off >>= 1)
+      os << ind << var << " += simd_shuffle_xor(" << var << ", (ushort)" << off
+         << ");\n";
+  };
   os << "\n  // ---- metal.fused_attention (chunked simdgroup dots, region "
         "score transform) ----\n";
   os << "  threadgroup float _fa_qbuf[" << S(SZ_Q) << "];\n";
@@ -3682,8 +3976,8 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
   // would overwrite data that a later QK/PV chunk still has to read.
   os << "  threadgroup float _fa_obuf[" << S(SZ_O) << "];\n";
   if (softmax) {
-    os << "  threadgroup float _fa_rmax[" << S(BM) << "];\n";
-    os << "  threadgroup float _fa_rsum[" << S(BM) << "];\n";
+    os << "  threadgroup float _fa_rmax[" << S(RB) << "];\n";
+    os << "  threadgroup float _fa_rsum[" << S(RB) << "];\n";
   }
   os << "  {\n";
   os << "  uint _fa_tid = ltid.x;\n";
@@ -3723,13 +4017,20 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
   if (featureTiled)
     os << "  uint _fa_out_d = (_fa_col < _fa_dh) ? min(" << S(BD)
        << "u, _fa_dh - _fa_col) : 0u;\n";
-  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u;\n";
+  // The row-block pass. Emitted only when it does something: at `RB == bm` the
+  // body is byte-identical to what it was before row blocking existed.
+  if (RB < BM)
+    os << "  for (uint _fa_rb = 0u; _fa_rb < " << S(BM) << "u; _fa_rb += "
+       << S(RB) << "u) {\n";
+  os << "  uint _fa_rowoff = tgid.x * " << S(BM) << "u"
+     << (RB < BM ? " + _fa_rb" : "") << ";\n";
   os << "  if (_fa_active) {\n";
   os << "    for (uint c = _fa_tid; c < " << S(SZ_O) << "u; c += "
      << threadsPerGroup << "u) _fa_obuf[c] = 0.0f;\n";
   if (softmax)
-    os << "    if (_fa_tid < " << S(BM)
-       << "u) { _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f; }\n";
+    os << "    for (uint q = _fa_tid; q < " << S(RB) << "u; q += "
+       << threadsPerGroup
+       << "u) { _fa_rmax[q] = -INFINITY; _fa_rsum[q] = 0.0f; }\n";
   os << "  }\n";
   os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 
@@ -3751,7 +4052,7 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "  {\n";
     auto [_fa_kbeg, _fa_kend] =
         emitKeyBoundsRegion_(op, "(int)tgid.x", P, "(int)_fa_M",
-                             "(int)_fa_N", "  ");
+                             "(int)_fa_N", "  ", RB);
     os << "  for (uint kb = " << _fa_kbeg << "; kb < " << _fa_kend
        << "; kb += " << S(BK) << "u) {\n";
     os << "    for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += " << S(DK)
@@ -3785,9 +4086,10 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "      }\n";
     os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     os << "      if (_fa_active) {\n";
-    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-       << "u; mi += " << numWarps << "u)\n";
-    os << "        for (uint ni = 0; ni < " << S(kT) << "u; ++ni) {\n";
+    os << "        for (uint _fa_t = _fa_warp; _fa_t < " << S(mT * kT)
+       << "u; _fa_t += " << numWarps << "u) {\n";
+    os << "          uint mi = _fa_t % " << S(mT) << "u; uint ni = _fa_t / "
+       << S(mT) << "u;\n";
     os << "          simdgroup_float8x8 acc(0.0f);\n";
     os << "          if (_fa_dc != 0u) simdgroup_load(acc, "
           "&_fa_sbuf[(mi*8u)*"
@@ -3808,9 +4110,15 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "    }\n";
 
     os << "    if (_fa_active) {\n";
-    os << "      uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-    os << "      if (q < " << S(BM) << "u && row < _fa_M) {\n";
-    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+    // `lanesPerRow` lanes per query row, exactly as in the full-tile body;
+    // the derivation and the lane-ownership argument are written out there.
+    os << "      uint _fa_rl = " << laneExpr << ";\n";
+    os << "      for (uint q = " << rowStart << "; q < " << S(RB)
+       << "u; q += " << rowsAtOnce << "u) {\n";
+    os << "      uint row = _fa_rowoff + q;\n";
+    os << "      if (row < _fa_M) {\n";
+    os << "        for (uint kk = _fa_rl; kk < " << S(BK) << "u; kk += "
+       << lanesPerRow << "u) {\n";
     os << "          uint _fa_key = kb + kk;\n";
     os << "          if (_fa_key < " << _fa_kend << ") {\n";
     {
@@ -3825,33 +4133,40 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "          }\n";
     os << "        }\n";
     if (softmax) {
-      os << "        float m_cur = -INFINITY;\n";
-      os << "        for (uint kk = 0; kk < " << S(BK)
-         << "u; ++kk) m_cur = max(m_cur, _fa_sbuf[q*" << S(BK)
+      os << "        float m_part = -INFINITY;\n";
+      os << "        for (uint kk = _fa_rl; kk < " << S(BK) << "u; kk += "
+         << lanesPerRow << "u) m_part = max(m_part, _fa_sbuf[q*" << S(BK)
          << "u + kk]);\n";
+      laneReduce("m_part", "max", "        ");
+      os << "        float m_cur = m_part;\n";
       os << "        float m_old = _fa_rmax[q];\n";
       os << "        float m_new = max(m_old, m_cur);\n";
       os << "        float scaler = (m_old == m_new) ? 1.0f : " << E
          << "(m_old - m_new);\n";
-      os << "        float denom = 0.0f;\n";
-      os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) {\n";
+      os << "        float d_part = 0.0f;\n";
+      os << "        for (uint kk = _fa_rl; kk < " << S(BK) << "u; kk += "
+         << lanesPerRow << "u) {\n";
       os << "          float l = _fa_sbuf[q*" << S(BK) << "u + kk];\n";
       os << "          float p = (l == -INFINITY || m_new == -INFINITY) ? 0.0f : "
          << E << "(l - m_new);\n";
-      os << "          _fa_sbuf[q*" << S(BK) << "u + kk] = p; denom += p;\n";
+      os << "          _fa_sbuf[q*" << S(BK) << "u + kk] = p; d_part += p;\n";
       os << "        }\n";
-      os << "        _fa_rsum[q] = _fa_rsum[q]*scaler + denom;\n";
-      os << "        _fa_rmax[q] = m_new;\n";
+      laneSum("d_part", "        ");
+      os << "        float denom = d_part;\n";
+      os << "        if (_fa_rl == 0u) { _fa_rsum[q] = _fa_rsum[q]*scaler + "
+            "denom; _fa_rmax[q] = m_new; }\n";
       if (featureTiled)
-        os << "        for (uint d = 0; d < _fa_out_d; ++d) _fa_obuf[q*"
-           << S(BD) << "u + d] *= scaler;\n";
+        os << "        for (uint d = _fa_rl; d < _fa_out_d; d += " << lanesPerRow
+           << "u) _fa_obuf[q*" << S(BD) << "u + d] *= scaler;\n";
       else
-        os << "        for (uint d = 0; d < " << S(BD) << "u; ++d) _fa_obuf[q*"
-           << S(BD) << "u + d] *= scaler;\n";
+        os << "        for (uint d = _fa_rl; d < " << S(BD) << "u; d += "
+           << lanesPerRow << "u) _fa_obuf[q*" << S(BD)
+           << "u + d] *= scaler;\n";
     }
-    os << "      } else if (q < " << S(BM) << "u) {\n";
-    os << "        for (uint kk = 0; kk < " << S(BK) << "u; ++kk) _fa_sbuf[q*"
-       << S(BK) << "u + kk] = 0.0f;\n";
+    os << "      } else {\n";
+    os << "        for (uint kk = _fa_rl; kk < " << S(BK) << "u; kk += "
+       << lanesPerRow << "u) _fa_sbuf[q*" << S(BK) << "u + kk] = 0.0f;\n";
+    os << "      }\n";
     os << "      }\n";
     os << "    }\n";
     os << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -3875,9 +4190,10 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "      }\n";
     os << "      threadgroup_barrier(mem_flags::mem_threadgroup);\n";
     os << "      if (_fa_active) {\n";
-    os << "        for (uint mi = _fa_warp; mi < " << S(mT)
-       << "u; mi += " << numWarps << "u)\n";
-    os << "        for (uint oi = 0; oi < " << S(oT) << "u; ++oi) {\n";
+    os << "        for (uint _fa_t = _fa_warp; _fa_t < " << S(mT * oT)
+       << "u; _fa_t += " << numWarps << "u) {\n";
+    os << "          uint mi = _fa_t % " << S(mT) << "u; uint oi = _fa_t / "
+       << S(mT) << "u;\n";
     os << "          if (_fa_oc + oi*8u < " << S(BD) << "u) {\n";
     os << "          simdgroup_float8x8 acc;\n";
     os << "          simdgroup_load(acc, &_fa_obuf[(mi*8u)*" << S(BD)
@@ -3901,8 +4217,11 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
     os << "  }\n";
   }
   os << "  if (_fa_active) {\n";
-  os << "    uint q = _fa_tid; uint row = _fa_rowoff + q;\n";
-  os << "    if (q < " << S(BM) << "u && row < _fa_M) {\n";
+  // Strided: the store is per query row, and BM may exceed the threadgroup.
+  os << "    for (uint q = _fa_tid; q < " << S(RB) << "u; q += "
+     << threadsPerGroup << "u) {\n";
+  os << "    uint row = _fa_rowoff + q;\n";
+  os << "    if (row < _fa_M) {\n";
   if (softmax) {
     os << "      float denom = _fa_rsum[q];\n";
     if (op.getSafeDenominatorOne())
@@ -3926,7 +4245,18 @@ void ModuleTranslation::emitFusedAttentionMmaChunked_(
        << S(BD) << "u + d];\n";
   }
   os << "    }\n";
+  os << "    }\n";
   os << "  }\n";
+  if (RB < BM) {
+    // The pass's epilogue READS `_fa_obuf` and the running state; the next
+    // pass's first act is to zero them. Without a barrier on the back edge
+    // that is a write-after-read race across the whole threadgroup, and it
+    // measured as a wrong answer on every row-blocked shape. Outside the
+    // `_fa_active` guard, because a barrier some threads do not reach is
+    // undefined.
+    os << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    os << "  }\n";
+  }
   os << "  }";
 }
 
@@ -4146,7 +4476,7 @@ void ModuleTranslation::emitFusedAttentionScalar_(
     os << "        {\n";
     auto [kbeg, kend] = emitKeyBoundsRegion_(op, "(int)tgid.x", P + " /*phase*/",
                                              "(int)_fa_M", "(int)_fa_N",
-                                             "        ");
+                                             "        ", BM);
   os << "        for (uint _fa_key = " << kbeg << "; _fa_key < " << kend
      << "; ++_fa_key) {\n";
   os << "          float _fa_a = 0.0f;\n";

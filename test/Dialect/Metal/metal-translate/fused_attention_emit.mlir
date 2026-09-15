@@ -198,7 +198,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // The d_head chunk loop is what the blocking search buys: S contracts over the
 // FULL d_head while only a chunk of Q and K^T is staged at a time.
 // CHECK: for (uint _fa_dc = 0u; _fa_dc < _fa_dh; _fa_dc += {{[0-9]+}}u)
-// CHECK: for (uint mi = _fa_warp; mi < 8u; mi += 4u)
+// A SIMD-group owns one 8x8 OUTPUT tile, so the warp-distributed loop walks
+// (row tile, key tile) PAIRS -- eight row tiles by two key tiles here. Walking
+// the row tiles alone capped the useful SIMD-groups at bm/8 however many the
+// source asked for, which is what left a bm = 16 kernel with two busy warps.
+// CHECK: for (uint _fa_t = _fa_warp; _fa_t < 16u; _fa_t += 4u)
 // CHECK: simdgroup_multiply_accumulate
 // --- the region, emitted inline as let-bindings over the staged S tile: the
 // row and key indices are both in hand there, which is what lets one emitter
@@ -237,8 +241,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // The ranges below are deliberately not multiples of the bn of 32: phase 0 is
 // the eight-key sink block and phase 1 is everything after it.
 // CHECK-LABEL: kernel void sinks_kernel
-// The running state is initialized ONCE, before either phase.
-// CHECK: _fa_rmax[_fa_tid] = -INFINITY; _fa_rsum[_fa_tid] = 0.0f;
+// The running state is initialized ONCE, before either phase. The per-row
+// passes STRIDE by the threadgroup width rather than merely being bounded by
+// bm: `threads_per_group` is `min(num_warps, bm/8) * 32`, which can be smaller
+// than bm, and a bound is not a loop.
+// CHECK: for (uint q = _fa_tid; q < 32u; q += 128u) { _fa_rmax[q] = -INFINITY; _fa_rsum[q] = 0.0f; }
 // CHECK: // --- key phase 0 ---
 // Each phase computes its own bounds from the region and sweeps its own key
 // blocks on the matrix unit; the names do not collide because each phase is
@@ -251,7 +258,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: for (uint kb = _fa_kbeg; kb < _fa_kend; kb += 32u)
 // CHECK: simdgroup_multiply_accumulate
 // The state is NOT re-initialized between phases.
-// CHECK-NOT: _fa_rmax[_fa_tid] = -INFINITY
+// CHECK-NOT: _fa_rmax[q] = -INFINITY
 
 // --- softmax kernel: same op and same region, but its working set
 // (3*32*16 + 2*16*32 + 2*32*32 + 2*32 = 4672 floats) fits Apple's 8192, so the
@@ -267,16 +274,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: uint _fa_warp = sgid;
 // CHECK: bool _fa_active = _fa_tid < 128u;
 // CHECK: for (uint c = _fa_tid; c < 512u; c += 128u)
-// CHECK: for (uint mi = _fa_warp; mi < 4u; mi += 4u)
+// QK^T: four row tiles by four key tiles.
+// CHECK: for (uint _fa_t = _fa_warp; _fa_t < 16u; _fa_t += 4u)
 // CHECK: simdgroup_multiply_accumulate
-// the region, inlined over the staged score tile
-// CHECK: uint q = _fa_tid; uint row = _fa_rowoff + q;
+// The region, inlined over the staged score tile. This pass is per query ROW
+// and does not scale with the warp count, so the threads it would otherwise
+// leave idle become LANES on each row: four here (128 threads, 32 rows), with
+// the key loop strided by four and the two row reductions done as XOR shuffles
+// inside each aligned four-lane block. `lanesPerRow == 1` degenerates to the
+// one-row-per-thread form, which is why there is one emitted shape and not two
+// -- `rows_exceed_threadgroup.mlir` pins that end of it.
+// CHECK: uint _fa_rl = _fa_tid % 4u;
+// CHECK-NEXT: for (uint q = _fa_tid / 4u; q < 32u; q += 32u) {
+// CHECK-NEXT: uint row = _fa_rowoff + q;
 // CHECK: = _fa_sbuf[q*32u + kk];
 // CHECK: _fa_pbuf[q*32u + kk] =
 // running state + rescale + epilogue divide
+// CHECK: m_part = max(m_part, simd_shuffle_xor(m_part, (ushort)2));
+// CHECK-NEXT: m_part = max(m_part, simd_shuffle_xor(m_part, (ushort)1));
 // CHECK: float m_new = max(m_old, m_cur)
-// CHECK: _fa_rsum[q] = _fa_rsum[q]*scaler + denom
-// CHECK: for (uint mi = _fa_warp; mi < 4u; mi += 4u)
+// CHECK: d_part += simd_shuffle_xor(d_part, (ushort)2);
+// CHECK-NEXT: d_part += simd_shuffle_xor(d_part, (ushort)1);
+// One slot of running state per row, so one lane of the block writes it.
+// CHECK: if (_fa_rl == 0u) { _fa_rsum[q] = _fa_rsum[q]*scaler + denom
+// PV: the same four row tiles by TWO feature tiles -- a different pair count
+// in the same kernel, which is why the launch takes the wider of the two.
+// CHECK: for (uint _fa_t = _fa_warp; _fa_t < 8u; _fa_t += 4u)
 // CHECK: simdgroup_multiply_accumulate
 // CHECK: / denom
 

@@ -30,6 +30,13 @@ struct FusedAttentionSchedule {
   int blockK;
   int blockDHead;
   int blockOutD;
+  // Query rows the chunked body carries at once. Equal to `bm` whenever the
+  // working set fits, which is every shape that already worked; smaller when
+  // the O accumulator alone would not fit, in which case a program walks its
+  // `bm` rows in several passes, each a complete key sweep. Without it
+  // `bm * bd >= 8192` falls off the matrix unit entirely -- measured 108x at
+  // bm=64/d=128 and 243x at bm=64/d=256.
+  int blockRows;
 };
 
 // One source of truth for the fused-attention body and launch geometry.  The
@@ -223,10 +230,13 @@ private:
   // Emits the op's key-bounds region for one phase and returns the two names
   // holding the half-open key range `[start, end)` that phase sweeps.
   std::pair<std::string, std::string>
+  // `rowSpan` is how many query rows the caller's program owns AT ONCE; a
+  // causal region lets the key sweep stop at `_fa_rowoff + rowSpan`, and the
+  // chunked body's row block makes that tighter than `bm`.
   emitKeyBoundsRegion_(mlir::triton::metal::FusedAttentionOp op,
                        llvm::StringRef blkExpr, llvm::StringRef phaseExpr,
                        llvm::StringRef mExpr, llvm::StringRef nExpr,
-                       llvm::StringRef ind);
+                       llvm::StringRef ind, int64_t rowSpan);
   void emitCausal_(mlir::triton::metal::SdpaOp op);
   void emitBoolMask_(mlir::triton::metal::SdpaOp op);
   void emitFloatMask_(mlir::triton::metal::SdpaOp op);

@@ -24,6 +24,7 @@ BD is the unpadded path. N covers block-aligned, masked-tail, and ragged cases.
 from __future__ import annotations
 
 import importlib.util
+import re
 import types
 from pathlib import Path
 
@@ -189,6 +190,137 @@ def _gqa_reference(Q, K, V, num_q_heads, num_kv_heads):
         K.cpu().repeat_interleave(groups, dim=0),
         V.cpu().repeat_interleave(groups, dim=0),
     )
+
+
+@triton.jit
+def _mask_only_causal_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr, M, d,
+    BM: tl.constexpr, BD: tl.constexpr, BN: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    """Causality in the MASK, key loop over the WHOLE range.
+
+    The shape `fixtures/metal_leet/hard-causal_self-Attention.py` is written in,
+    and the one the causal key-range pruning exists for: the source gives the
+    emitter no causal loop bound to reproduce, so without the pruning every
+    program sweeps every key block and throws half of them away.
+    """
+    pid = tl.program_id(0)
+    qo = pid * BM + tl.arange(0, BM)
+    qm = qo < M
+    co = tl.arange(0, BD)
+    cm = co < d
+    qs = tl.load(q_ptr + qo[:, None] * d + co[None, :],
+                 mask=qm[:, None] & cm[None, :], other=0.0)
+    scale = 1 / tl.sqrt(d.to(tl.float32))
+    smax = tl.full([BM], float("-inf"), dtype=tl.float32)
+    ssum = tl.zeros([BM], dtype=tl.float32)
+    acc = tl.zeros([BM, BD], dtype=tl.float32)
+    for start in tl.range(0, M, BN):
+        so = start + tl.arange(0, BN)
+        sm = so < M
+        sp = so[:, None] * d + co[None, :]
+        ks = tl.load(k_ptr + sp, mask=sm[:, None] & cm[None, :], other=0.0)
+        vs = tl.load(v_ptr + sp, mask=sm[:, None] & cm[None, :], other=0.0)
+        a = tl.dot(qs, tl.trans(ks)) * scale
+        if CAUSAL:
+            ok = (qo[:, None] >= so[None, :]) & sm[None, :]
+        else:
+            ok = qm[:, None] & sm[None, :]
+        a = tl.where(ok, a, float("-inf"))
+        nm = tl.maximum(smax, tl.max(a, axis=1))
+        alpha = tl.exp(smax - nm)
+        smax = nm
+        a = tl.exp(a - nm[:, None])
+        ssum = tl.fma(ssum, alpha, tl.sum(a, axis=1))
+        acc = tl.fma(acc, alpha[:, None], tl.dot(a, vs))
+    acc = acc / ssum[:, None]
+    tl.store(o_ptr + qo[:, None] * d + co[None, :], acc,
+             mask=qm[:, None] & cm[None, :])
+
+
+@pytest.mark.parametrize("M", [64, 100], ids=["aligned", "ragged"])
+def test_causal_mask_prunes_the_key_sweep(M):
+    """A mask-only causal kernel stops at the diagonal, and is still exact.
+
+    The emitter reproduces the SOURCE's key loop bound, which here is the whole
+    range: causality lives in the `tl.where`. Every key block above the diagonal
+    then produces nothing but -inf logits, which the online softmax turns into
+    exactly zero weight, leaving the running (max, sum, accumulator) untouched.
+    `fusedAttentionKeysAboveRowAreInert` recognises that structurally and the
+    key range is clamped to `rowoff + bm` -- half the matrix work and half the
+    global traffic (measured 1.38-1.67x on the corpus kernel at M=2048).
+
+    The non-causal arm is the CONTROL, and it is the one that matters: the same
+    kernel without the `row >= key` conjunct must keep the full sweep, because
+    pruning it would silently drop real keys. The numeric check is against
+    `scaled_dot_product_attention`, which does not share the backend's idea of
+    the mask.
+    """
+    d, BM, BN = 32, 32, 32
+    torch.manual_seed(0xCA5)
+    q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    k = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    v = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    clamp = f"_fa_kend = min(_fa_kend, _fa_rowoff + {BM}u);"
+
+    for causal in (True, False):
+        out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
+        compiled = _mask_only_causal_kernel[(triton.cdiv(M, BM),)](
+            q, k, v, out, M, d, BM, max(16, d), BN, causal, num_warps=4)
+        torch.mps.synchronize()
+        msl = compiled.asm["metal"]
+        if isinstance(msl, bytes):
+            msl = msl.decode()
+        assert "metal.fused_attention" in msl
+        assert (clamp in msl) is causal, (
+            f"causal={causal}: clamp {'missing' if causal else 'applied'}")
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.cpu().double(), k.cpu().double(), v.cpu().double(),
+            is_causal=causal).float()
+        torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("BM, d", [(64, 128), (32, 256), (64, 256)],
+                         ids=["llama-shape", "wide-32", "wide-64"])
+def test_large_head_dim_stays_on_the_matrix_unit(BM, d):
+    """`bm * bd >= 8192` must not fall off the matrix unit.
+
+    The chunked MMA body holds a `bm x bd` output accumulator across the whole
+    key sweep, and at these shapes that is Apple's entire 32 KiB threadgroup
+    budget -- nothing else fits beside it, no blocking is admissible, and the op
+    used to take the scalar correctness floor. Silently, and measured 108x
+    slower at (64, 128) and 243x at (64, 256).
+
+    The schedule carries `blockRows` of the program's rows at a time instead, so
+    the accumulator is a fraction of the budget and both matmuls stay on the
+    matrix unit. Asserted on the MECHANISM -- the presence of simdgroup MMA and
+    of the row-block pass -- because the failure mode is a correct answer that
+    is two orders of magnitude slow, which no numeric check can see.
+    """
+    M, BN = 128, 32
+    torch.manual_seed(0xB16)
+    q = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    k = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    v = torch.randn(M, d, dtype=torch.float32, device="mps").contiguous()
+    out = torch.zeros(M, d, dtype=torch.float32, device="mps").contiguous()
+
+    compiled = _mask_only_causal_kernel[(triton.cdiv(M, BM),)](
+        q, k, v, out, M, d, BM, d, BN, True, num_warps=8)
+    torch.mps.synchronize()
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "simdgroup_multiply_accumulate" in msl, "fell to the scalar floor"
+    assert "_fa_rb" in msl, "no row-block pass at a shape that needs one"
+    # The accumulator is what row blocking shrinks, so check it shrank.
+    obuf = int(re.search(r"_fa_obuf\[(\d+)\]", msl).group(1))
+    assert obuf < BM * d and obuf <= 8192, f"_fa_obuf[{obuf}] for bm*bd={BM*d}"
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.cpu().double(), k.cpu().double(), v.cpu().double(),
+        is_causal=True).float()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
 @triton.jit
@@ -629,7 +761,11 @@ def test_leet_alibi_attention_chunked_mma_feature_tile():
         alibi, Q, K, V, out, M, N, d, alpha, block_d=128)
     torch.mps.synchronize()
 
-    assert getattr(compiled.metadata, "threads_per_group", None) == 64
+    # This kernel has BM = 16 -- two row tiles -- but its dots have several
+    # column tiles each, and a SIMD-group owns one 8x8 output TILE, not one
+    # 8-row band. Capping at the row tiles left half the requested warps with
+    # nothing to run; the launch is the tile-PAIR count now, 4 SIMD-groups.
+    assert getattr(compiled.metadata, "threads_per_group", None) == 128
     msl = compiled.asm["metal"]
     if isinstance(msl, bytes):
         msl = msl.decode()
@@ -640,20 +776,35 @@ def test_leet_alibi_attention_chunked_mma_feature_tile():
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("block_n", [16, 32])
+@pytest.mark.parametrize("block_n", [16, 32, 64])
 def test_flash_attention_uses_multiwarp_schedule(block_n):
-    """The fused MMA body launches one SIMD-group per useful 8-row tile.
+    """The fused MMA body launches one SIMD-group per useful 8x8 OUTPUT tile.
 
-    BM=16/32 have two/four row tiles. Requests for fewer warps are honoured;
-    larger requests are capped at the row-tile count so no SIMD-group is
-    launched without a QK/PV tile. The compiler reports the exact schedule
-    through `threads_per_group`, which the driver prefers over the source
-    `num_warps * 32`.
+    A SIMD-group owns a complete output tile of a dot, and a key block has
+    `rowTiles * colTiles` of them per dot. The schedule caps the launch at that
+    PAIR count, so no SIMD-group starts without a tile, and honours any smaller
+    request. It used to cap at the row tiles alone, which meant a kernel with
+    BM = 16 could never use more than two SIMD-groups however many it asked
+    for -- and BM = 16 is what the corpus kernels pick.
 
     Asserted on the MECHANISM rather than on a timing: a perf regression here
     is silent and a wall-clock assertion in a test suite is a flake generator.
+    The assertions below deliberately do NOT recompute the scheduler (BM = 64
+    here takes the chunked body, whose tile counts come from a search); they
+    check the emitted MSL against the `threads_per_group` the compiler reports,
+    and they check the two properties that are the contract.
+
+    BM=64 is also where honouring a SMALL request broke. `threads_per_group`
+    can be smaller than BM -- one warp at BM = 64 is 32 threads for 64 query
+    rows -- and the score transform, the online softmax and the epilogue store
+    are each one query row per thread. They read `q = _fa_tid` under a `q < BM`
+    BOUND, which is not a loop, so rows 32..63 were never transformed, never
+    normalised and never stored, and the kernel answered silently wrong (9.2e-01
+    against `scaled_dot_product_attention`). Every other cooperative pass in
+    that emitter already strides by `threads_per_group`; these did not.
     """
     N, d_model, h = 128, 64, 4
+    row_tiles = block_n // 8
     torch.manual_seed(0xF1)
     Q = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
     K = torch.randn(N, d_model, dtype=torch.float32, device="mps").contiguous()
@@ -664,17 +815,73 @@ def test_flash_attention_uses_multiwarp_schedule(block_n):
         compiled = mha_kernel[(triton.cdiv(N, block_n), h)](
             Q, K, V, out, N, d_model, h, block_n, max(16, d_model // h),
             num_warps=num_warps)
-        expected_warps = min(num_warps, block_n // 8)
-        assert getattr(compiled.metadata, "threads_per_group", None) == expected_warps * 32
+        tpg = getattr(compiled.metadata, "threads_per_group", None)
+        assert tpg is not None and tpg % 32 == 0
+        warps = tpg // 32
         msl = compiled.asm["metal"]
         if isinstance(msl, bytes):
             msl = msl.decode()
-        if expected_warps > 1:
+
+        # Never more SIMD-groups than the source asked for ...
+        assert warps <= num_warps, f"{warps} warps for a num_warps={num_warps} kernel"
+        # ... and never fewer than the row tiles alone would have given: this
+        # schedule only ever ADDS warps to the ones that were already busy.
+        assert warps >= min(num_warps, row_tiles)
+
+        if warps > 1:
             assert "simdgroup_index_in_threadgroup" in msl
             assert "uint _fa_warp = sgid" in msl
         else:
             assert "uint _fa_warp = 0u" in msl
-        assert f"mi += {expected_warps}u" in msl
+
+        # Each MMA loop walks TILE PAIRS -- its trip count is the row tiles
+        # times that dot's column tiles -- and strides by the warp count.
+        loops = re.findall(r"_fa_t < (\d+)u; _fa_t \+= (\d+)u", msl)
+        assert loops, "no warp-distributed MMA tile loop emitted"
+        for pairs, stride in loops:
+            pairs, stride = int(pairs), int(stride)
+            assert stride == warps, f"tile loop strides {stride}, {warps} warps"
+            assert pairs % row_tiles == 0, (
+                f"tile loop trip count {pairs} is not a multiple of the "
+                f"{row_tiles} row tiles, so it is not a pair count")
+            assert warps <= max(int(p) for p, _ in loops), "a warp with no tile"
+
+        # The score transform + online softmax splits each query row across
+        # `lanesPerRow` lanes, so the threads the pass would otherwise leave
+        # idle do something. Assert the INVARIANTS rather than recomputing the
+        # split: it is chosen from `threads_per_group` and BM, and a test that
+        # re-derived it would just restate the emitter.
+        lane = re.search(r"uint _fa_rl = (?:0u|_fa_tid % (\d+)u);", msl)
+        assert lane, "the score pass emitted no lane split"
+        lanes = int(lane.group(1)) if lane.group(1) else 1
+        assert lanes in (1, 4, 8, 16, 32), f"lanesPerRow={lanes}"
+        start = "_fa_tid" if lanes == 1 else f"_fa_tid / {lanes}u"
+        rowloop = re.search(
+            rf"for \(uint q = {re.escape(start)}; q < {block_n}u; q \+= (\d+)u\)", msl)
+        assert rowloop, f"no row loop for lanesPerRow={lanes}"
+        rows_at_once = int(rowloop.group(1))
+        # Every launched thread lands on exactly one (row, lane) slot, and no
+        # row is skipped: the loop starts below its own stride.
+        assert rows_at_once * lanes == tpg, (
+            f"{rows_at_once} rows x {lanes} lanes != {tpg} threads")
+        # The two row reductions are XOR shuffles inside each aligned lane
+        # block -- log2(lanes) steps each, and none at all when lanes == 1.
+        steps = max(0, lanes.bit_length() - 1)
+        assert msl.count("simd_shuffle_xor(m_part") == steps
+        assert msl.count("simd_shuffle_xor(d_part") == steps
+        # One slot of running state per row, so one lane of the block writes it.
+        assert "if (_fa_rl == 0u) { _fa_rsum[q]" in msl
+
+        # The running-state init and the epilogue store are the other two per
+        # query row passes, and they must STRIDE by the threadgroup width, not
+        # merely be bounded by BM. At `lanesPerRow == 1` the score pass above
+        # degenerates to the same spelling, so it joins the count.
+        stride = f"for (uint q = _fa_tid; q < {block_n}u; q += {tpg}u)"
+        want = 3 if lanes == 1 else 2
+        assert msl.count(stride) == want, (
+            f"expected {want} thread-strided per-row passes at "
+            f"lanesPerRow={lanes}, found {msl.count(stride)}")
+
         # The schedule must not change what the kernel computes.
         torch.mps.synchronize()
         torch.testing.assert_close(out.cpu(), _reference(Q, K, V, N, d_model, h),
