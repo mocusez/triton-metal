@@ -494,6 +494,182 @@ def test_dot_dynamic_k_recompute_transposed_b(M, N, K):
     torch.testing.assert_close(c.cpu(), torch.matmul(x, w.t()), atol=1e-4, rtol=1e-4)
 
 
+# --- W2b: single-dot recompute, masked/unmasked, normal/transposed B ----------
+@triton.jit
+def recompute_matmul_kernel(
+    x_ptr, b_ptr, c_ptr, M, N, K,
+    sxm, sxk, sbk, sbn, scm, scn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    TRANS_B: tl.constexpr, MASKED: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        x_ptrs = x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk
+        if TRANS_B:
+            b_ptrs = b_ptr + offs_n[:, None] * sbn + offs_k[None, :] * sbk
+        else:
+            b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+        if MASKED:
+            x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+            x = tl.load(x_ptrs, mask=x_mask, other=0.0)
+            if TRANS_B:
+                b_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            else:
+                b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        else:
+            x = tl.load(x_ptrs)
+            b = tl.load(b_ptrs)
+        if TRANS_B:
+            acc = tl.dot(x, tl.trans(b), acc, allow_tf32=False)
+        else:
+            acc = tl.dot(x, b, acc, allow_tf32=False)
+    c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
+    if MASKED:
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptrs, acc, mask=c_mask)
+    else:
+        tl.store(c_ptrs, acc)
+
+
+_RECOMPUTE_DTYPES = [
+    pytest.param(torch.float32, id="f32"),
+    pytest.param(torch.float16, id="f16"),
+    pytest.param(torch.bfloat16, id="bf16"),
+]
+
+
+def _recompute_single_dot_cases():
+    cases = []
+    for trans_b in (False, True):
+        for num_warps in (1, 4):
+            block = 16 if num_warps == 1 else 64
+            cases.append(pytest.param(
+                trans_b, False, num_warps, block, block, block, block, 16,
+                id=f"{'transB' if trans_b else 'normalB'}_exact_w{num_warps}",
+            ))
+            cases.append(pytest.param(
+                trans_b, True, num_warps, block, block, block, block, 24,
+                id=f"{'transB' if trans_b else 'normalB'}_masked_exact_w{num_warps}",
+            ))
+            cases.append(pytest.param(
+                trans_b, True, num_warps, block, block, block - 3,
+                block - 5, 23,
+                id=f"{'transB' if trans_b else 'normalB'}_ragged_w{num_warps}",
+            ))
+            cases.append(pytest.param(
+                trans_b, True, num_warps, block, block // 2, block - 1,
+                block // 2 - 3, 29,
+                id=f"{'transB' if trans_b else 'normalB'}_narrow_w{num_warps}",
+            ))
+            cases.append(pytest.param(
+                trans_b, True, num_warps, block, block, block + 3,
+                block + 5, 40,
+                id=f"{'transB' if trans_b else 'normalB'}_mixed_tiles_w{num_warps}",
+            ))
+    return cases
+
+
+def _make_recompute_inputs(M, N, K, dtype, trans_b):
+    torch.manual_seed(0x5EED + M * 17 + N * 3 + K + int(trans_b))
+    x_cpu = torch.randn((M, K), dtype=torch.float32).to(dtype).contiguous()
+    if trans_b:
+        b_cpu = torch.randn((N, K), dtype=torch.float32).to(dtype).contiguous()
+        ref_b = b_cpu.float().t()
+    else:
+        b_cpu = torch.randn((K, N), dtype=torch.float32).to(dtype).contiguous()
+        ref_b = b_cpu.float()
+    return x_cpu.to("mps"), b_cpu.to("mps"), x_cpu.float() @ ref_b
+
+
+@pytest.mark.parametrize("dtype", _RECOMPUTE_DTYPES)
+@pytest.mark.parametrize(
+    "trans_b,masked,num_warps,BLOCK_M,BLOCK_N,M,N,K",
+    _recompute_single_dot_cases(),
+)
+def test_dot_dynamic_k_recompute_single_dot_regression(
+        dtype, trans_b, masked, num_warps, BLOCK_M, BLOCK_N, M, N, K):
+    """Single-dot recompute covers masked/unmasked normal B and real tl.trans(B)."""
+    x, b, expected = _make_recompute_inputs(M, N, K, dtype, trans_b)
+    sentinel = -256.0
+    out_m = triton.cdiv(M, BLOCK_M) * BLOCK_M
+    out_n = triton.cdiv(N, BLOCK_N) * BLOCK_N
+    c = torch.full((out_m, out_n), sentinel, dtype=dtype,
+                   device="mps").contiguous()
+    b_stride_k = b.stride(1) if trans_b else b.stride(0)
+    b_stride_n = b.stride(0) if trans_b else b.stride(1)
+    recompute_matmul_kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))](
+        x, b, c, M, N, K,
+        x.stride(0), x.stride(1), b_stride_k, b_stride_n,
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=8, TRANS_B=trans_b,
+        MASKED=masked, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+
+    actual = c[:M, :N].cpu().float()
+    assert actual.isfinite().all()
+    atol = {torch.float32: 2e-4, torch.float16: 2e-2, torch.bfloat16: 1e-1}[dtype]
+    rtol = 2e-4 if dtype is torch.float32 else 5e-3
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    if masked:
+        sentinel_value = torch.tensor(sentinel, dtype=dtype).item()
+        assert torch.all(c[M:, :].cpu() == sentinel_value)
+        assert torch.all(c[:, N:].cpu() == sentinel_value)
+
+
+def _compile_recompute_matmul(trans_b, masked, num_warps, block_m, block_n,
+                              M, N, K, c_dtype=torch.float32):
+    x = torch.empty((M, K), dtype=torch.float16, device="mps")
+    b_shape = (N, K) if trans_b else (K, N)
+    b = torch.empty(b_shape, dtype=torch.float16, device="mps")
+    c = torch.empty((triton.cdiv(M, block_m) * block_m,
+                     triton.cdiv(N, block_n) * block_n),
+                    dtype=c_dtype, device="mps")
+    b_stride_k = b.stride(1) if trans_b else b.stride(0)
+    b_stride_n = b.stride(0) if trans_b else b.stride(1)
+    return _metal_text(recompute_matmul_kernel.warmup(
+        x, b, c, M, N, K,
+        x.stride(0), x.stride(1), b_stride_k, b_stride_n,
+        c.stride(0), c.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=8, TRANS_B=trans_b,
+        MASKED=masked, grid=(triton.cdiv(M, block_m), triton.cdiv(N, block_n)),
+        num_warps=num_warps,
+    ))
+
+
+@pytest.mark.parametrize(
+    "trans_b,num_warps,block_m,block_n,M,N,K,split",
+    [
+        pytest.param(False, 4, 64, 64, 67, 69, 40, True, id="normalB_split"),
+        pytest.param(True, 4, 64, 64, 67, 69, 40, True, id="transB_split"),
+        # Thirty-two accumulators fit the existing lowering, but duplicating
+        # its body exceeds the sixteen-accumulator code-growth budget.
+        pytest.param(False, 1, 32, 64, 35, 69, 40, False, id="normalB_budget"),
+        pytest.param(True, 1, 32, 64, 35, 69, 40, False, id="transB_budget"),
+    ],
+)
+def test_dot_dynamic_k_recompute_single_dot_msl_shape(
+        trans_b, num_warps, block_m, block_n, M, N, K, split):
+    plain = _compile_recompute_matmul(
+        trans_b, False, num_warps, block_m, block_n, M, N, K)
+    masked = _compile_recompute_matmul(
+        trans_b, True, num_warps, block_m, block_n, M, N, K)
+    plain_mma = plain.count("simdgroup_multiply_accumulate")
+    masked_mma = masked.count("simdgroup_multiply_accumulate")
+    assert plain_mma > 0
+    assert masked_mma == (2 if split else 1) * plain_mma
+    assert "threadgroup float _sgstore_shared" not in plain
+    assert "threadgroup float _sgstore_shared" in masked
+    assert "if (gi <" in masked
+
+
 # --- W2b: multi-accumulator loop (two dots sharing x) — LoRA's inner loop -----
 # Two independent matmuls that share the A operand `x` and carry two
 # accumulators through one K-loop, each stored after the loop. This is the
@@ -677,6 +853,40 @@ def test_metal_lora_linear_verbatim(batch, d_in, d_out, rank):
     torch.testing.assert_close(out.cpu(), ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("batch,d_in,d_out,rank", [
+    (64, 128, 128, 16),
+    (100, 200, 300, 8),
+    (96, 128, 256, 15),
+    (129, 129, 257, 15),
+])
+def test_metal_lora_linear_verbatim_masked_canary(batch, d_in, d_out, rank):
+    """Verbatim swizzled LoRA keeps boundary stores masked for padded outputs."""
+    scale = 0.5
+    torch.manual_seed(0x10A + batch + d_in * 3 + d_out * 5 + rank)
+    x = torch.randn(batch, d_in, dtype=torch.float32).contiguous()
+    W = torch.randn(d_out, d_in, dtype=torch.float32).contiguous()
+    A = torch.randn(rank, d_in, dtype=torch.float32).contiguous()
+    B = torch.randn(d_out, rank, dtype=torch.float32).contiguous()
+    BM, BN, BK = 64, 128, 32
+    BR = max(16, triton.next_power_of_2(rank))
+    sentinel = -768.0
+    out = torch.full((triton.cdiv(batch, BM) * BM,
+                      triton.cdiv(d_out, BN) * BN),
+                     sentinel, dtype=torch.float32).contiguous()
+    grid = (triton.cdiv(batch, BM) * triton.cdiv(d_out, BN),)
+    lora_verbatim_kernel[grid](
+        x, W, A, B, out, batch, d_out, d_in, rank, scale,
+        x.stride(0), x.stride(1), W.stride(0), W.stride(1),
+        A.stride(0), A.stride(1), B.stride(0), B.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=BK, BLOCK_SIZE_R=BR,
+        GROUP_SIZE=4)
+    ref = x @ W.t() + scale * ((x @ A.t()) @ B.t())
+    torch.testing.assert_close(out[:batch, :d_out].cpu(), ref, atol=1e-2, rtol=1e-2)
+    assert torch.all(out[batch:, :].cpu() == sentinel)
+    assert torch.all(out[:, d_out:].cpu() == sentinel)
+
+
 @pytest.mark.parametrize("BM,BN,BR,nw", [(32, 32, 8, 4), (64, 64, 16, 4),
                                          (64, 128, 16, 8)])
 def test_dot_dynamic_k_fused_lora_multiwarp(BM, BN, BR, nw):
@@ -761,7 +971,8 @@ def fused_lora_masked_kernel(
     x_ptr, w_ptr, a_ptr, b_ptr, o_ptr, M, N, K, R, scale,
     sxm, sxk, swn, swk, sar, sak, sbn, sbr, som, son,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_R: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_K: tl.constexpr, TRANS_W: tl.constexpr = True,
+    TRANS_A: tl.constexpr = True,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -773,13 +984,23 @@ def fused_lora_masked_kernel(
     for k in range(0, K, BLOCK_K):
         offs_k = k + tl.arange(0, BLOCK_K)
         mx = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        mw = (offs_n[:, None] < N) & (offs_k[None, :] < K)
-        ma = (offs_r[:, None] < R) & (offs_k[None, :] < K)
         x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk, mask=mx, other=0.0)
-        w = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk, mask=mw, other=0.0)
-        a = tl.load(a_ptr + offs_r[:, None] * sar + offs_k[None, :] * sak, mask=ma, other=0.0)
-        acc0 = tl.dot(x, tl.trans(w), acc0, allow_tf32=False)
-        acc1 = tl.dot(x, tl.trans(a), acc1, allow_tf32=False)
+        if TRANS_W:
+            mw = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+            w = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk, mask=mw, other=0.0)
+            acc0 = tl.dot(x, tl.trans(w), acc0, allow_tf32=False)
+        else:
+            mw = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+            w = tl.load(w_ptr + offs_k[:, None] * swn + offs_n[None, :] * swk, mask=mw, other=0.0)
+            acc0 = tl.dot(x, w, acc0, allow_tf32=False)
+        if TRANS_A:
+            ma = (offs_r[:, None] < R) & (offs_k[None, :] < K)
+            a = tl.load(a_ptr + offs_r[:, None] * sar + offs_k[None, :] * sak, mask=ma, other=0.0)
+            acc1 = tl.dot(x, tl.trans(a), acc1, allow_tf32=False)
+        else:
+            ma = (offs_k[:, None] < K) & (offs_r[None, :] < R)
+            a = tl.load(a_ptr + offs_k[:, None] * sar + offs_r[None, :] * sak, mask=ma, other=0.0)
+            acc1 = tl.dot(x, a, acc1, allow_tf32=False)
     mb = (offs_n[:, None] < N) & (offs_r[None, :] < R)
     b = tl.load(b_ptr + offs_n[:, None] * sbn + offs_r[None, :] * sbr, mask=mb, other=0.0)
     acc0 += scale * tl.dot(acc1, tl.trans(b), allow_tf32=False)
@@ -807,6 +1028,151 @@ def test_dot_dynamic_k_fused_lora_masked(M, N, R, K):
     )
     ref = x @ w.t() + scale * ((x @ a.t()) @ b.t())
     torch.testing.assert_close(o.cpu(), ref, atol=1e-3, rtol=1e-3)
+
+
+def _lora_seed(M, N, K, R, trans_w, trans_a):
+    return 0x10A + M * 13 + N * 7 + K * 3 + R + int(trans_w) * 5 + int(trans_a)
+
+
+def _make_masked_lora_inputs(M, N, K, R, trans_w, trans_a):
+    torch.manual_seed(_lora_seed(M, N, K, R, trans_w, trans_a))
+    x_cpu = torch.randn((M, K), dtype=torch.float32).contiguous()
+    if trans_w:
+        w_cpu = torch.randn((N, K), dtype=torch.float32).contiguous()
+        ref_w = w_cpu.t()
+    else:
+        w_cpu = torch.randn((K, N), dtype=torch.float32).contiguous()
+        ref_w = w_cpu
+    if trans_a:
+        a_cpu = torch.randn((R, K), dtype=torch.float32).contiguous()
+        ref_a = a_cpu.t()
+    else:
+        a_cpu = torch.randn((K, R), dtype=torch.float32).contiguous()
+        ref_a = a_cpu
+    b_cpu = torch.randn((N, R), dtype=torch.float32).contiguous()
+    ref = x_cpu @ ref_w + 0.5 * ((x_cpu @ ref_a) @ b_cpu.t())
+    return (x_cpu.to("mps"), w_cpu.to("mps"), a_cpu.to("mps"),
+            b_cpu.to("mps"), ref)
+
+
+def _run_masked_lora_case(M, N, K, R, BM, BN, BK, BR, num_warps,
+                          trans_w=True, trans_a=True):
+    x, w, a, b, ref = _make_masked_lora_inputs(M, N, K, R, trans_w, trans_a)
+    sentinel = -512.0
+    out_m = triton.cdiv(M, BM) * BM
+    out_n = triton.cdiv(N, BN) * BN
+    o = torch.full((out_m, out_n), sentinel, dtype=torch.float32,
+                   device="mps").contiguous()
+    fused_lora_masked_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        x, w, a, b, o, M, N, K, R, 0.5,
+        x.stride(0), x.stride(1), w.stride(0), w.stride(1),
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        o.stride(0), o.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_R=BR, BLOCK_K=BK,
+        TRANS_W=trans_w, TRANS_A=trans_a, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(o[:M, :N].cpu(), ref, atol=1e-2, rtol=1e-2)
+    assert torch.all(o[M:, :].cpu() == sentinel)
+    assert torch.all(o[:, N:].cpu() == sentinel)
+
+
+_FUSED_LORA_INTERIOR_NUMERIC_CASES = [
+    pytest.param(64, 128, 128, 16, 64, 128, 32, 16, 4, True, True,
+                 id="actual64x128_br16_w4_full"),
+    pytest.param(100, 200, 96, 16, 64, 128, 32, 16, 4, True, True,
+                 id="actual_mixed_full_boundary"),
+    pytest.param(64, 128, 100, 16, 64, 128, 32, 16, 4, True, True,
+                 id="actual_ragged_k"),
+    pytest.param(63, 128, 128, 16, 64, 128, 32, 16, 4, True, True,
+                 id="actual_ragged_m"),
+    pytest.param(64, 127, 128, 16, 64, 128, 32, 16, 4, True, True,
+                 id="actual_ragged_n"),
+    pytest.param(64, 128, 128, 15, 64, 128, 32, 16, 4, True, True,
+                 id="actual_padded_r15"),
+    pytest.param(64, 128, 128, 8, 64, 128, 32, 16, 4, True, True,
+                 id="actual_padded_r8"),
+    pytest.param(16, 64, 64, 16, 16, 64, 16, 16, 1, True, True,
+                 id="smaller1warp_full"),
+    pytest.param(15, 61, 64, 16, 16, 64, 16, 16, 1, True, True,
+                 id="smaller1warp_ragged_mn"),
+    pytest.param(16, 64, 70, 16, 16, 64, 16, 16, 1, True, True,
+                 id="smaller1warp_ragged_k"),
+    pytest.param(16, 64, 64, 15, 16, 64, 16, 16, 1, True, True,
+                 id="smaller1warp_padded_r"),
+    pytest.param(16, 64, 64, 16, 16, 64, 16, 16, 1, False, True,
+                 id="normal_w_trans_a"),
+    pytest.param(16, 64, 64, 16, 16, 64, 16, 16, 1, True, False,
+                 id="trans_w_normal_a"),
+    pytest.param(16, 64, 64, 16, 16, 64, 16, 16, 1, False, False,
+                 id="normal_w_normal_a"),
+    pytest.param(23, 91, 83, 15, 16, 64, 16, 16, 1, False, False,
+                 id="normal_operands_all_ragged"),
+    pytest.param(96, 256, 128, 16, 64, 128, 32, 16, 4, True, True,
+                 id="mixed_full_and_m_boundary"),
+    pytest.param(128, 192, 128, 16, 64, 128, 32, 16, 4, True, True,
+                 id="mixed_full_and_n_boundary"),
+    pytest.param(65, 129, 129, 15, 64, 128, 32, 16, 4, True, True,
+                 id="actual_all_boundary"),
+]
+
+
+@pytest.mark.parametrize(
+    "M,N,K,R,BM,BN,BK,BR,num_warps,trans_w,trans_a",
+    _FUSED_LORA_INTERIOR_NUMERIC_CASES,
+)
+def test_dot_dynamic_k_fused_lora_masked_interior_split_regression(
+        M, N, K, R, BM, BN, BK, BR, num_warps, trans_w, trans_a):
+    _run_masked_lora_case(M, N, K, R, BM, BN, BK, BR, num_warps,
+                          trans_w=trans_w, trans_a=trans_a)
+
+
+def _compile_fused_lora_masked(M, N, K, R, BM, BN, BK, BR, num_warps,
+                               trans_w=True, trans_a=True):
+    x = torch.empty((M, K), dtype=torch.float32, device="mps")
+    w_shape = (N, K) if trans_w else (K, N)
+    a_shape = (R, K) if trans_a else (K, R)
+    w = torch.empty(w_shape, dtype=torch.float32, device="mps")
+    a = torch.empty(a_shape, dtype=torch.float32, device="mps")
+    b = torch.empty((N, R), dtype=torch.float32, device="mps")
+    o = torch.empty((triton.cdiv(M, BM) * BM,
+                     triton.cdiv(N, BN) * BN),
+                    dtype=torch.float32, device="mps")
+    return _metal_text(fused_lora_masked_kernel.warmup(
+        x, w, a, b, o, M, N, K, R, 0.5,
+        x.stride(0), x.stride(1), w.stride(0), w.stride(1),
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        o.stride(0), o.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_R=BR, BLOCK_K=BK,
+        TRANS_W=trans_w, TRANS_A=trans_a,
+        grid=(triton.cdiv(M, BM), triton.cdiv(N, BN)),
+        num_warps=num_warps,
+    ))
+
+
+@pytest.mark.parametrize(
+    "M,N,K,R,BM,BN,BK,BR,num_warps,split,per_branch_mma,stores_per_branch",
+    [
+        pytest.param(64, 128, 128, 16, 64, 128, 32, 16, 4, True, 100, 32,
+                     id="actual64x128_br16_w4_budget100_splits"),
+        pytest.param(16, 64, 64, 16, 16, 64, 16, 16, 1, True, 52, 16,
+                     id="smaller1warp_under_budget_splits"),
+        pytest.param(32, 64, 64, 16, 32, 64, 16, 16, 1, False, 104, 32,
+                     id="onewarp_budget104_does_not_split"),
+        pytest.param(64, 128, 100, 16, 64, 128, 32, 16, 4, True, 100, 32,
+                     id="ragged_k_still_emits_runtime_split"),
+    ],
+)
+def test_dot_dynamic_k_fused_lora_masked_interior_split_msl_shape(
+        M, N, K, R, BM, BN, BK, BR, num_warps, split, per_branch_mma,
+        stores_per_branch):
+    metal = _compile_fused_lora_masked(M, N, K, R, BM, BN, BK, BR, num_warps)
+    assert metal.count("simdgroup_multiply_accumulate") == (
+        2 if split else 1) * per_branch_mma
+    assert metal.count(" = _fstore_base") == (
+        2 if split else 1) * stores_per_branch
+    if split:
+        assert "if (" in metal
 
 
 # --- Weighted Gram matrix: verbatim Hessian kernel from

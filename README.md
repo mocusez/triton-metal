@@ -621,6 +621,19 @@ The current dependency-ordered priorities are:
    threadgroup, so the branch is safe where a staged load brackets itself with
    a threadgroup barrier. A partial block, or a reduction that is not a
    multiple of the matrix unit's eight, takes the predicated loop as before.
+   This also covers single-dot loops that rebuild their addresses from the K
+   induction variable, including a transposed B loaded as `[N, K]`. The
+   duplicated body is limited to sixteen accumulator tiles per warp. The
+   `--recompute` mode of `python/test/microbenchmark/metal_matmul_canonical.py`
+   measures masked and unmasked forms against a CPU numerical reference.
+   The separate fused LoRA lowering also splits its three K-loop operand loads
+   into an unmasked interior path and the original masked fallback. It checks
+   M/N/rank and K bounds for every operand, retaining the epilogue and output
+   masks in both paths. A padded rank or partial tile keeps the masked loop.
+   Duplication is capped at 100 emitted MMA operations per original body,
+   including the epilogue; this covers the 64x128/BR16/four-warp fixture.
+   `--lora` benchmarks plain/masked forms and the owned verbatim fixture, with
+   CPU reference checks before and after timing.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
