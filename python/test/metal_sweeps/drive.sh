@@ -40,6 +40,7 @@ echo "results: $outdir/$name.results"
 sort -u $outdir/$name.results 2>/dev/null | grep -c "^WRONG" | sed 's/^/WRONG answers (unique): /'
 sort -u $outdir/$name.results 2>/dev/null | grep "^WRONG" | head -20
 sort -u $outdir/$name.results 2>/dev/null | grep -c "^REJECT" | sed 's/^/rejections (unique): /'
+grep "^SUMMARY" $outdir/$name.results 2>/dev/null || echo "SUMMARY: none -- the sweep never reached the end"
 echo "CRASHED cases: ${#crashed[@]}"
 for c in $crashed; do echo "  CRASH $c"; done
 # A crashed cell is a P0 gap: the decline is in the wrong place.

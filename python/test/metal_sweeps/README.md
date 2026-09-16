@@ -59,6 +59,30 @@ gaps.
 is what distinguishes "my kernel is wrong" from "the backend is wrong", and it
 settled the transposed-B bug in one run.
 
+⚠️ **An oracle nobody checked is a guess.** A hand-written `torch` reference for
+a kernel you did not write is a second implementation of it, and a misread one
+either reports a correct backend as wrong or — worse — agrees with a wrong
+backend because both made the same mistake. When the reference is written from
+reading a kernel rather than from the mathematical definition, diff it against
+`TRITON_INTERPRET=1` at a few shapes FIRST and keep that check next to the
+sweep (`tools/check_attn_variant_refs.py`). Mirror what the kernel COMPUTES,
+including any range its loop fails to cover; a reference written to the
+kernel's intent files the kernel's own bugs as backend bugs.
+
+⚠️ **A differential sweep says nothing about which path ran.** "960 cells, 0
+wrong" is compatible with every cell having been declined into a fallback. The
+Metal emitters name their own bodies in the generated MSL, so census it
+(`tools/attn_variant_bodies.py`) and read the sweep's verdict as a statement
+about specific bodies. ⚠️ Census on the SELF-NAMING comment, not on which
+temporaries look unique: `_fa_kbase`, `_fa_dc` and `_fa_col` are emitted by all
+three fused-attention bodies, and a census keyed on them labels everything
+chunked.
+
+⚠️ **A correct answer that is 100x slow is invisible here.** No oracle can see
+body selection, so the guard for it is a pytest asserting the MECHANISM
+(`simdgroup_multiply_accumulate`, `_fa_rb`) at the shape where the cliff is —
+not a sweep.
+
 ## Where the bugs are
 
 **Degenerate runtime extents, above all `N == 1`.** Triton specializes an
@@ -90,6 +114,19 @@ launch at `min(num_warps, BM/8) * 32` and nothing raises it back to `BM`.
 the discriminator is a RELATION between the two, and every cell where the source
 asked for enough warps hides it. In that family only `BM = 64, num_warps = 1`
 was wrong; `BM = 64` at 2, 4 and 8 warps were all exact.
+
+**A kernel family swept through ONE member.** `metal.fused_attention` emits one
+body with a schedule in front of it, and every kernel it claims runs that body —
+but the sweeps covered two shapes of kernel, a causal one and a plain one. The
+five corpus kernels that reach it by other routes (`s_attn_variants.py`: a
+symmetric band, sinks + a window over one softmax state,
+a finite additive bias, a second grid axis choosing the K/V head, and one with
+no softmax at all) were covered at the ONE block shape each `solve()` hardcodes,
+which is the shape most likely to have been tried while the emitter was
+written. They came back clean at 960 cells — but "clean" was not knowable
+before the run, and the axes that matter are the same three every time: block
+extent against `num_warps`, `d_head` against the threadgroup budget, and a
+ragged tail.
 
 ⚠️ **Ordering primitives must be fed a permutation.** `tl.sort`, `tl.topk` and
 anything built on them return the correct prefix of ALREADY SORTED input even

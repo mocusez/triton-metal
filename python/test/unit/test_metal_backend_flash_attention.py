@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import types
 from pathlib import Path
 
@@ -1825,3 +1826,56 @@ def test_softmax_attention_backward(M, N, d, force_chunk_rows, force_scalar,
     torch.testing.assert_close(dQ.cpu(), q_cpu.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(dK.cpu(), k_cpu.grad, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(dV.cpu(), v_cpu.grad, atol=1e-5, rtol=1e-5)
+
+
+_VARIANT_SWEEP = None
+
+
+def _corpus_attention_variants():
+    """The five corpus attention kernels, as `s_attn_variants.py` launches them.
+
+    Imported rather than re-spelled here. That sweep already owns one launch
+    per kernel, and two copies of one launch is the shape this backend's silent
+    wrong answers keep arriving in. It asks whether the answers are RIGHT; the
+    test below asks which BODY produced them, which no numeric check can see.
+    """
+    global _VARIANT_SWEEP
+    if _VARIANT_SWEEP is None:
+        sweeps = Path(__file__).resolve().parents[1] / "metal_sweeps" / "sweeps"
+        sys.path.insert(0, str(sweeps))
+        import s_attn_variants
+
+        _VARIANT_SWEEP = s_attn_variants
+    return _VARIANT_SWEEP
+
+
+@pytest.mark.parametrize("variant", ["sliding", "sinks", "alibi", "gqa", "decay"])
+def test_corpus_attention_variants_stay_on_the_matrix_unit(variant):
+    """Every corpus attention kernel must still take an MMA body at the cliff.
+
+    `bm * bd >= 8192` is Apple's entire 32 KiB threadgroup budget for the O
+    accumulator alone. Before the schedule learned to walk the program's rows in
+    blocks, the op answered that shape on the scalar correctness floor --
+    correctly, and measured 108-243x slower. A differential sweep cannot see
+    that failure, and `leet-all` runs each of these kernels at the ONE block
+    shape its own `solve()` hardcodes, which is not this one.
+
+    Five kernels reach the fused-attention emitter by five different routes: a
+    symmetric band, two score regions over one softmax state, a finite additive
+    bias with a second reduction over d, a second grid axis choosing the K/V
+    head, and one with no softmax at all. They share a body, so they share this
+    cliff.
+    """
+    variants = _corpus_attention_variants()
+    mk_in, launch, _ref, mk_out = variants.VARIANTS[variant]
+    M, d, BM, BN = 128, 128, 64, 64
+    torch.manual_seed(0xC0FFEE)
+    host = mk_in(M, d)
+    dev = [x.to("mps") for x in host]
+    out = mk_out(M, d) if mk_out else torch.zeros(M, d, device="mps")
+    compiled = launch(dev, out, M, d, BM, BN, d, 4)
+    torch.mps.synchronize()
+    msl = _metal_text(compiled)
+    assert "metal.fused_attention" in msl, f"{variant} no longer matches the fused op"
+    assert "simdgroup_multiply_accumulate" in msl, f"{variant} took the scalar floor"
+    assert "_fa_rb" in msl, f"{variant}: no row-block pass at bm*bd = {BM * d}"

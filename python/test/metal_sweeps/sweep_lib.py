@@ -80,8 +80,16 @@ class Sweep:
 
     def finish(self):
         os.path.exists(self.progress) and os.remove(self.progress)
-        print(f"[{self.name}] ok={self.ok} WRONG={self.wrong} rejected={self.rejected}",
-              flush=True)
+        # Put the cell count in the RESULTS file, not only on stdout. Only a
+        # WRONG or a REJECT writes a line, so a sweep that finds nothing leaves
+        # an EMPTY results file -- which reads exactly like a sweep that never
+        # ran, and `drive.sh` discards stdout. "0 wrong answers" is only
+        # evidence when it comes with the number of cells that produced it.
+        line = (f"SUMMARY\t{self.name}\tok={self.ok}\tWRONG={self.wrong}"
+                f"\trejected={self.rejected}\tskipped={len(self.skip)}")
+        with open(self.results, "a") as f:
+            f.write(line + "\n")
+        print(line, flush=True)
 
 
 if __name__ == "__main__":
