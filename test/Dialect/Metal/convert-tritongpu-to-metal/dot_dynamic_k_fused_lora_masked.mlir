@@ -7,8 +7,8 @@
 // partial extents.
 //
 // Acceptance: no tt.dot/tt.trans/convert_layout; the masked K-loop is split
-// by a result-free scf.if into an unmasked interior loop and a masked fallback
-// loop; epilogue/output masks still fold through fused stores.
+// by result-free uniform branches into fully unmasked, X/W-only unmasked,
+// and fully masked loops; epilogue/output masks still fold through fused stores.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -124,11 +124,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK-NOT: convert_layout
 // CHECK-NOT: scf.if {{.*}} ->
 // CHECK: scf.if {{.*}} {
+// CHECK-NOT: scf.if {{.*}} ->
+// CHECK: scf.if {{.*}} {
 // CHECK: scf.for
 // CHECK-NOT: metal.simdgroup_load_device_staged_masked
 // CHECK-COUNT-3: metal.simdgroup_load_device_staged{{[[:space:]]}}
 // CHECK: metal.simdgroup_multiply_accumulate
 // CHECK-NOT: metal.simdgroup_load_device_staged_masked
+// CHECK: scf.yield
+// CHECK: metal.simdgroup_load_device_staged_masked
+// CHECK: metal.simdgroup_fused_store
+// CHECK: } else {
+// CHECK: scf.for
+// CHECK-COUNT-2: metal.simdgroup_load_device_staged{{[[:space:]]}}
+// CHECK-NOT: metal.simdgroup_load_device_staged{{[[:space:]]}}
+// CHECK: metal.simdgroup_load_device_staged_masked
+// CHECK-NOT: metal.simdgroup_load_device_staged
+// CHECK: metal.simdgroup_multiply_accumulate
 // CHECK: scf.yield
 // CHECK: metal.simdgroup_load_device_staged_masked
 // CHECK: metal.simdgroup_fused_store

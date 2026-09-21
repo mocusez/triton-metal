@@ -626,14 +626,17 @@ The current dependency-ordered priorities are:
    duplicated body is limited to sixteen accumulator tiles per warp. The
    `--recompute` mode of `python/test/microbenchmark/metal_matmul_canonical.py`
    measures masked and unmasked forms against a CPU numerical reference.
-   The separate fused LoRA lowering also splits its three K-loop operand loads
-   into an unmasked interior path and the original masked fallback. It checks
-   M/N/rank and K bounds for every operand, retaining the epilogue and output
-   masks in both paths. A padded rank or partial tile keeps the masked loop.
-   Duplication is capped at 100 emitted MMA operations per original body,
-   including the epilogue; this covers the 64x128/BR16/four-warp fixture.
-   `--lora` benchmarks plain/masked forms and the owned verbatim fixture, with
-   CPU reference checks before and after timing.
+   The separate fused LoRA lowering checks X/W and adapter A bounds
+   independently. Full interior tiles use an unmasked K loop; padded adapter
+   ranks use an interior loop with only A still masked. Partial X/W tiles or
+   partial eight-element K steps use the fully masked fallback. All three
+   paths retain epilogue and output masks and use threadgroup-uniform
+   conditions. Duplication is capped at 100 emitted MMA operations per
+   original body including the epilogue (300 across the three paths); larger
+   bodies keep the original masked loop. This covers the
+   64x128/BR16/four-warp fixture. `--lora` benchmarks plain/masked forms and
+   the owned verbatim fixture; `--lora-padded` adds padded ranks 8/15 with a
+   full-rank 16 control. Both check CPU references before and after timing.
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and

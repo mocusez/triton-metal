@@ -17,6 +17,7 @@ Usage:  pixi run --frozen python python/test/microbenchmark/metal_matmul_canonic
         with normal and transposed B, emitting one JSON record per arm.
         Add --lora to compare plain/masked fused LoRA and the owned verbatim
         fixture, emitting one JSON record per arm.
+        Add --lora-padded for ranks 8/15 plus a full-rank 16 control.
         METAL_PERF_SETTLE=0 ... to skip the cool-down when the machine is
         already known idle.
 """
@@ -203,20 +204,24 @@ def _fused_lora(x_ptr, w_ptr, a_ptr, b_ptr, out_ptr, M, N, K, R, scale,
         tl.store(out_ptr + m[:, None] * N + n[None, :], acc0)
 
 
-def lora_main():
+def lora_main(padded=False):
     fixture = Path(__file__).resolve().parents[1] / "unit/fixtures/metal_leet/medium-lora_linear.py"
     spec = importlib.util.spec_from_file_location("_metal_lora_benchmark_fixture", fixture)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     torch.manual_seed(23)
-    for M, N, K, R in ((256, 1024, 1024, 16), (1024, 1024, 1024, 16)):
+    shapes = ([(1024, 1024, 1024, rank) for rank in (8, 15, 16)] if padded
+              else [(256, 1024, 1024, 16), (1024, 1024, 1024, 16)])
+    for M, N, K, R in shapes:
         cpu = [torch.randn(shape, dtype=torch.float32)
                for shape in ((M, K), (N, K), (R, K), (N, R))]
         x, w, a, b = [tensor.to("mps") for tensor in cpu]
         ref = cpu[0] @ cpu[1].t() + 0.5 * ((cpu[0] @ cpu[2].t()) @ cpu[3].t())
         for bm, bn, br, nw in ((32, 32, 16, 4), (64, 64, 16, 4), (64, 128, 16, 4)):
-            for form in ("plain", "masked", "verbatim"):
+            # Plain loads are valid only when every rank lane exists.
+            forms = ("masked", "verbatim") if R < br else ("plain", "masked", "verbatim")
+            for form in forms:
                 out = torch.empty((M, N), dtype=torch.float32, device="mps")
                 grid = (triton.cdiv(M, bm), triton.cdiv(N, bn))
 
@@ -278,19 +283,19 @@ def timed(fn, ref, out):
     return samples, ok
 
 
-def main(recompute=False, lora=False):
+def main(recompute=False, lora=False, lora_padded=False):
     # Never measure within a minute of a suite run; this script is usually
     # started right after one. Run-to-run spread within ONE build is ~10% on
     # this machine, which is larger than many changes worth making, and two
     # readings taken on a busy machine have already been quoted wrongly.
     time.sleep(float(os.environ.get("METAL_PERF_SETTLE", "75")))
-    if recompute or lora:
-        benchmark = lora_main if lora else recompute_main
+    if recompute or lora or lora_padded:
+        benchmark = (lambda: lora_main(padded=lora_padded)) if lora or lora_padded else recompute_main
         if "TRITON_CACHE_DIR" in os.environ:
             benchmark()
         else:
             # A fresh run must compile its own sources after a backend rebuild.
-            prefix = "triton-lora-" if lora else "triton-recompute-"
+            prefix = "triton-lora-" if lora or lora_padded else "triton-recompute-"
             with tempfile.TemporaryDirectory(prefix=prefix) as cache_dir:
                 os.environ["TRITON_CACHE_DIR"] = cache_dir
                 try:
@@ -350,5 +355,7 @@ if __name__ == "__main__":
                        help="compare masked/plain recompute kernels and report JSONL")
     modes.add_argument("--lora", action="store_true",
                        help="compare plain/masked/verbatim fused LoRA kernels and report JSONL")
+    modes.add_argument("--lora-padded", action="store_true",
+                       help="benchmark padded LoRA ranks with full-rank controls")
     args = parser.parse_args()
-    main(recompute=args.recompute, lora=args.lora)
+    main(recompute=args.recompute, lora=args.lora, lora_padded=args.lora_padded)

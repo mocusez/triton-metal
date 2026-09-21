@@ -1114,6 +1114,26 @@ _FUSED_LORA_INTERIOR_NUMERIC_CASES = [
                  id="mixed_full_and_n_boundary"),
     pytest.param(65, 129, 129, 15, 64, 128, 32, 16, 4, True, True,
                  id="actual_all_boundary"),
+    pytest.param(96, 256, 128, 15, 64, 128, 32, 16, 4, True, True,
+                 id="padded_r15_interior_m_boundary"),
+    pytest.param(128, 192, 128, 8, 64, 128, 32, 16, 4, False, True,
+                 id="padded_r8_interior_n_boundary_normal_w"),
+    pytest.param(100, 200, 100, 15, 64, 128, 32, 16, 4, True, False,
+                 id="padded_r15_interior_mnk_boundary_normal_a"),
+    pytest.param(64, 128, 128, 15, 64, 128, 32, 16, 4, True, False,
+                 id="padded_r15_interior_normal_a"),
+    pytest.param(100, 200, 129, 8, 64, 128, 32, 16, 4, False, False,
+                 id="padded_r8_interior_mnk_boundary_normal_operands"),
+    pytest.param(23, 128, 64, 3, 16, 64, 16, 16, 1, True, True,
+                 id="small_padded_r3_interior_m_boundary"),
+    pytest.param(32, 91, 70, 7, 16, 64, 16, 16, 1, False, True,
+                 id="small_padded_r7_interior_nk_boundary_normal_w"),
+    pytest.param(23, 91, 83, 8, 16, 64, 16, 16, 1, True, False,
+                 id="small_padded_r8_interior_mnk_boundary_normal_a"),
+    pytest.param(23, 91, 65, 3, 16, 64, 16, 16, 1, False, False,
+                 id="small_padded_r3_interior_mnk_boundary_normal_operands"),
+    pytest.param(32, 64, 64, 8, 16, 64, 16, 16, 1, False, False,
+                 id="small_padded_r8_interior_normal_operands"),
 ]
 
 
@@ -1161,16 +1181,26 @@ def _compile_fused_lora_masked(M, N, K, R, BM, BN, BK, BR, num_warps,
                      id="onewarp_budget104_does_not_split"),
         pytest.param(64, 128, 100, 16, 64, 128, 32, 16, 4, True, 100, 32,
                      id="ragged_k_still_emits_runtime_split"),
+        pytest.param(64, 128, 128, 15, 64, 128, 32, 16, 4, True, 100, 32,
+                     id="padded_r15_budget100_splits"),
+        pytest.param(16, 64, 64, 8, 16, 64, 16, 16, 1, True, 52, 16,
+                     id="padded_r8_under_budget_splits"),
+        pytest.param(32, 64, 64, 15, 32, 64, 16, 16, 1, False, 104, 32,
+                     id="padded_r15_budget104_does_not_split"),
+        pytest.param(64, 128, 100, 15, 64, 128, 32, 16, 4, True, 100, 32,
+                     id="padded_r15_ragged_k_still_emits_runtime_split"),
     ],
 )
 def test_dot_dynamic_k_fused_lora_masked_interior_split_msl_shape(
         M, N, K, R, BM, BN, BK, BR, num_warps, split, per_branch_mma,
         stores_per_branch):
     metal = _compile_fused_lora_masked(M, N, K, R, BM, BN, BK, BR, num_warps)
-    assert metal.count("simdgroup_multiply_accumulate") == (
-        2 if split else 1) * per_branch_mma
-    assert metal.count(" = _fstore_base") == (
-        2 if split else 1) * stores_per_branch
+    # Full-rank interior, padded-rank interior, and masked boundary paths each
+    # retain one K loop; over-budget kernels keep only the masked path.
+    branches = 3 if split else 1
+    assert metal.count("for (int v") == branches
+    assert metal.count("simdgroup_multiply_accumulate") == branches * per_branch_mma
+    assert metal.count(" = _fstore_base") == branches * stores_per_branch
     if split:
         assert "if (" in metal
 

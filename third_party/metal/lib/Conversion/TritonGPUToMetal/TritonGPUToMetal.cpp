@@ -25524,13 +25524,15 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
                                             builder.getI32IntegerAttr(8));
   mlir::Value ub = forOp.getUpperBound();
 
-  auto buildKLoop = [&](bool masked) {
+  auto buildKLoop = [&](bool masked, bool maskAdapter) {
     mlir::Value aRowBound = masked ? aRowExt : mlir::Value();
     mlir::Value aColBound = masked ? aColExt : mlir::Value();
     mlir::Value bRowBound[2], bColBound[2];
     for (unsigned i = 0; i < 2; ++i) {
-      bRowBound[i] = masked ? bRExt[i] : mlir::Value();
-      bColBound[i] = masked ? bCExt[i] : mlir::Value();
+      const bool keepMask =
+          masked || (maskAdapter && static_cast<int>(i) == accDotIdx);
+      bRowBound[i] = keepMask ? bRExt[i] : mlir::Value();
+      bColBound[i] = keepMask ? bCExt[i] : mlir::Value();
     }
     return mlir::scf::ForOp::create(
         builder, loc, c0.getResult(), ub, c8.getResult(), inits,
@@ -25638,14 +25640,15 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
     }
   };
 
-  // Remove K-loop load predication only for a whole interior program. The
-  // predicate uses block origins, never the per-warp tile offsets, so all
-  // threads agree at the staged-load barriers. A padded adapter rank keeps
-  // the masked path, as do partial M/N tiles and partial 8-element K steps.
+  // Use block origins, never per-warp offsets, for uniform staged-load
+  // barriers. Interior X/W tiles can be unmasked even for a padded adapter:
+  // keep its bounds in a separate fast loop. Preserve the fully unmasked
+  // loop for full-rank inputs; keeping adapter masks there regresses them.
   // Keep epilogue B/output masks: their extents are independent of the loop's.
   // Matrix values cannot cross an scf.if result, so consume them in each arm.
   // Bound duplication by the full emitted MMA count, including the epilogue;
   // 100 is the measured 64x128/BR16/four-warp fixture (36 + 64 MMAs).
+  // Three paths therefore emit at most 300 MMAs in total.
   const int emittedMMAs = mPerWarp * (NT + RT + NT * RT);
   const bool splitInterior = aRowExt && aColExt && bRExt[0] && bCExt[0] &&
                              bRExt[1] && bCExt[1] && emittedMMAs <= 100;
@@ -25678,27 +25681,48 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
                     .getResult(),
                 c0.getResult())
                 .getResult());
-    for (unsigned i = 0; i < 2; ++i) {
-      mlir::Value nExtent = bTr[i] ? bRExt[i] : bCExt[i];
-      mlir::Value kExtent = bTr[i] ? bCExt[i] : bRExt[i];
-      const int tiles = static_cast<int>(i) == accBaseIdx ? NT : RT;
-      require(ule(tileOrigin(bNScalar[i], tiles), nExtent));
-      require(ule(ub, kExtent));
-    }
+    mlir::Value nExtent =
+        bTr[accBaseIdx] ? bRExt[accBaseIdx] : bCExt[accBaseIdx];
+    mlir::Value kExtent =
+        bTr[accBaseIdx] ? bCExt[accBaseIdx] : bRExt[accBaseIdx];
+    require(ule(tileOrigin(bNScalar[accBaseIdx], NT), nExtent));
+    require(ule(ub, kExtent));
     auto ifOp = mlir::scf::IfOp::create(builder, loc, interior,
                                         /*withElseRegion=*/true);
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(ifOp.thenBlock());
-      emitEpilogue(buildKLoop(/*masked=*/false).getResults());
+      mlir::Value rankExtent =
+          bTr[accDotIdx] ? bRExt[accDotIdx] : bCExt[accDotIdx];
+      mlir::Value kExtent =
+          bTr[accDotIdx] ? bCExt[accDotIdx] : bRExt[accDotIdx];
+      auto adapterInterior = mlir::arith::AndIOp::create(
+          builder, loc, ule(tileOrigin(bNScalar[accDotIdx], RT), rankExtent),
+          ule(ub, kExtent));
+      auto adapterIf = mlir::scf::IfOp::create(
+          builder, loc, adapterInterior.getResult(), /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard adapterGuard(builder);
+        builder.setInsertionPointToStart(adapterIf.thenBlock());
+        emitEpilogue(
+            buildKLoop(/*masked=*/false, /*maskAdapter=*/false).getResults());
+      }
+      {
+        mlir::OpBuilder::InsertionGuard adapterGuard(builder);
+        builder.setInsertionPointToStart(adapterIf.elseBlock());
+        emitEpilogue(
+            buildKLoop(/*masked=*/false, /*maskAdapter=*/true).getResults());
+      }
     }
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(ifOp.elseBlock());
-      emitEpilogue(buildKLoop(/*masked=*/true).getResults());
+      emitEpilogue(
+          buildKLoop(/*masked=*/true, /*maskAdapter=*/true).getResults());
     }
   } else {
-    emitEpilogue(buildKLoop(/*masked=*/true).getResults());
+    emitEpilogue(
+        buildKLoop(/*masked=*/true, /*maskAdapter=*/true).getResults());
   }
 
   // Erase the old epilogue chain (store, any convert_layouts, addf, mulf, dot3,
