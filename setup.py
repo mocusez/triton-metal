@@ -523,8 +523,17 @@ def get_exclude_package_data():
         }),
     )
     for package, root, included in dynamic_roots:
-        excluded[package] = [f"{path.name}/*" for path in Path(root).iterdir()
-                             if path.is_dir() and path.name not in included]
+        # `add_link_to_backends` is what creates these roots, and it has not run
+        # yet the first time setup.py is invoked on a fresh clone:
+        # `python/triton/tools/extra` is generated and gitignored, so it does
+        # not exist at all. Iterating it raised FileNotFoundError here, before
+        # the build could even configure -- a chicken and egg that every clean
+        # checkout hits. Nothing is linked yet, so there is nothing to exclude.
+        root_path = Path(root)
+        excluded[package] = [
+            f"{path.name}/*" for path in root_path.iterdir()
+            if path.is_dir() and path.name not in included
+        ] if root_path.is_dir() else []
 
     if not check_env_flag("TRITON_BUILD_PROTON", "ON"):
         excluded["triton"] = ["profiler/*"]
