@@ -1852,3 +1852,137 @@ def test_linear_attention_matcher_rejects_adjacent_warp_shape(
         assert "convert-tritongpu-to-metal failed" in str(error)
     else:
         assert marker not in metal
+
+
+@triton.jit
+def fused_lora_wrapped_kernel(
+    x_ptr, w_ptr, a_ptr, b_ptr, o_ptr, M, N, K, R, scale,
+    sxm, sxk, swn, swk, sar, sak, sbn, sbr, som, son,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr, WRAP_MODE: tl.constexpr, WRAP: tl.constexpr,
+):
+    """The fused-LoRA shape with a `%` on X's row index, address only.
+
+    The store and every mask keep the unwrapped index, so `offs_m < M` still
+    guards the axis. `tail` divides by the runtime bound the mask itself uses,
+    the way tutorial 03 does; `unrelated` divides by something else.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, BLOCK_R)
+    if WRAP_MODE == "tail":
+        src_m = offs_m % M
+    elif WRAP_MODE == "unrelated":
+        src_m = offs_m % WRAP
+    else:
+        src_m = offs_m
+    acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mx = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        x = tl.load(x_ptr + src_m[:, None] * sxm + offs_k[None, :] * sxk,
+                    mask=mx, other=0.0)
+        mw = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        w = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk,
+                    mask=mw, other=0.0)
+        acc0 = tl.dot(x, tl.trans(w), acc0, allow_tf32=False)
+        ma = (offs_r[:, None] < R) & (offs_k[None, :] < K)
+        a = tl.load(a_ptr + offs_r[:, None] * sar + offs_k[None, :] * sak,
+                    mask=ma, other=0.0)
+        acc1 = tl.dot(x, tl.trans(a), acc1, allow_tf32=False)
+    mb = (offs_n[:, None] < N) & (offs_r[None, :] < R)
+    b = tl.load(b_ptr + offs_n[:, None] * sbn + offs_r[None, :] * sbr,
+                mask=mb, other=0.0)
+    acc0 += scale * tl.dot(acc1, tl.trans(b), allow_tf32=False)
+    my = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(o_ptr + offs_m[:, None] * som + offs_n[None, :] * son, acc0,
+             mask=my)
+
+
+_LORA_WRAP_M, _LORA_WRAP_N, _LORA_WRAP_K, _LORA_WRAP_R = 128, 128, 64, 16
+_LORA_WRAP_BM, _LORA_WRAP_BN, _LORA_WRAP_BK, _LORA_WRAP_BR = 64, 128, 32, 16
+
+
+def _run_fused_lora_wrapped(mode, wrap=7):
+    M, N, K, R = _LORA_WRAP_M, _LORA_WRAP_N, _LORA_WRAP_K, _LORA_WRAP_R
+    BM, BN, BK, BR = (_LORA_WRAP_BM, _LORA_WRAP_BN, _LORA_WRAP_BK,
+                      _LORA_WRAP_BR)
+    torch.manual_seed(0x10B)
+    x = torch.randn((M, K), dtype=torch.float32)
+    w = torch.randn((N, K), dtype=torch.float32)
+    a = torch.randn((R, K), dtype=torch.float32)
+    b = torch.randn((N, R), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    fused_lora_wrapped_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        x.to("mps"), w.to("mps"), a.to("mps"), b.to("mps"), out,
+        M, N, K, R, 0.5, K, 1, K, 1, K, 1, R, 1, N, 1,
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_R=BR, BLOCK_K=BK,
+        WRAP_MODE=mode, WRAP=wrap, num_warps=4)
+    torch.mps.synchronize()
+
+    def lora(rows):
+        xe = x[rows]
+        return xe @ w.t() + 0.5 * ((xe @ a.t()) @ b.t())
+
+    want = lora(torch.arange(M))
+    # What a lost row origin produces: every program reads the first block.
+    origin_lost = lora(torch.arange(M) % BM)
+    return out.cpu(), want, origin_lost
+
+
+def test_dot_dynamic_k_fused_lora_tail_wrap_keeps_its_row_origin():
+    """A tail wrap must not cost the LoRA tier its `pid_m * BLOCK_M`.
+
+    The tier rebuilds each operand address from an origin and a stride, and
+    the origin walk had no `arith.remsi` case, so a wrapped index fell back to
+    a literal 0 and every program read the first BLOCK_M rows. Dropping the
+    wrap is sound -- its divisor is the extent guarding the axis -- but
+    dropping the origin with it never is. Needs more than one M block: at one
+    program the origin is 0 anyway and the defect is invisible.
+    """
+    got, want, origin_lost = _run_fused_lora_wrapped("tail")
+    assert not torch.allclose(want, origin_lost, atol=1e-2), (
+        "the references coincide, so this cell cannot discriminate")
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+def test_dot_dynamic_k_fused_lora_tail_wrap_stays_on_its_tier():
+    """The answer cannot say which tier ran; the emitted body can.
+
+    `metal.scalar_dot` would also be correct, just far slower, so the census
+    is that the tail-wrapped kernel emits exactly what the unwrapped one does:
+    same tier, origin kept, wrap dropped.
+    """
+    def compile_mode(mode):
+        M, N, K, R = _LORA_WRAP_M, _LORA_WRAP_N, _LORA_WRAP_K, _LORA_WRAP_R
+        BM, BN, BK, BR = (_LORA_WRAP_BM, _LORA_WRAP_BN, _LORA_WRAP_BK,
+                          _LORA_WRAP_BR)
+        x = torch.empty((M, K), dtype=torch.float32, device="mps")
+        w = torch.empty((N, K), dtype=torch.float32, device="mps")
+        a = torch.empty((R, K), dtype=torch.float32, device="mps")
+        b = torch.empty((N, R), dtype=torch.float32, device="mps")
+        o = torch.empty((M, N), dtype=torch.float32, device="mps")
+        return _metal_text(fused_lora_wrapped_kernel.warmup(
+            x, w, a, b, o, M, N, K, R, 0.5, K, 1, K, 1, K, 1, R, 1, N, 1,
+            BLOCK_M=BM, BLOCK_N=BN, BLOCK_R=BR, BLOCK_K=BK,
+            WRAP_MODE=mode, WRAP=7,
+            grid=(triton.cdiv(M, BM), triton.cdiv(N, BN)), num_warps=4))
+
+    assert compile_mode("tail") == compile_mode("none")
+
+
+def test_dot_dynamic_k_fused_lora_unrelated_modulo_is_named(capfd):
+    """A `%` this tier cannot prove must be refused, not dropped.
+
+    The multi-dot matchers run in pass 1 of `preprocessDotChains`, which the
+    pass-2 wrap gate never reached. Measured before the gate: `n % 7` on any
+    of the four operands answered bit-identically to the remainder being
+    absent. The dot falls through to a tier that can spell the remainder, or
+    is refused by name -- either is acceptable, a wrong answer is not.
+    """
+    with pytest.raises(Exception):
+        _run_fused_lora_wrapped("unrelated")
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err

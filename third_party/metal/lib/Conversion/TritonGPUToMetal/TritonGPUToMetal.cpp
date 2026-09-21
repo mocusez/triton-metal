@@ -22241,9 +22241,26 @@ static std::optional<int> logicalMatrixAxisFromSlice(mlir::Value v) {
 // Look for `tt.splat(arith.muli(tt.get_program_id, arith.constant))` within
 // a contribution chain. Returns the `arith.muli` result on match, null
 // Value otherwise.
-static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0) {
+// `throughWrap` lets the walk cross an `arith.remsi`/`remui` on the index.
+// It is OPT-IN, and only a caller that has already PROVEN the divisor may pass
+// it. Measured with it off: an operand index written `(pid*BM + i) % d` has no
+// case here, so the search returns null and `emitOriginOperand` substitutes a
+// literal 0 -- the fused LoRA tier then read the FIRST block's rows in every
+// program. That makes even the tail wrap `% M`, which is sound to DROP, a
+// silent wrong answer, because dropping the origin with it never is. The
+// callers that extract a STORE's origin deliberately do not pass this: a null
+// origin makes those tiers decline, which is the safe answer for a shape
+// nothing has proven.
+static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0,
+                                               bool throughWrap = false) {
   if (depth > 8 || !v)
     return mlir::Value();
+  if (throughWrap) {
+    if (auto rem = v.getDefiningOp<mlir::arith::RemSIOp>())
+      return findPidOriginInContribution(rem.getLhs(), depth + 1, throughWrap);
+    if (auto rem = v.getDefiningOp<mlir::arith::RemUIOp>())
+      return findPidOriginInContribution(rem.getLhs(), depth + 1, throughWrap);
+  }
   if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
     auto src = splat.getSrc();
     if (auto muli = src.getDefiningOp<mlir::arith::MulIOp>()) {
@@ -22259,24 +22276,26 @@ static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0) {
     return mlir::Value();
   }
   if (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
-    return findPidOriginInContribution(bc.getSrc(), depth + 1);
+    return findPidOriginInContribution(bc.getSrc(), depth + 1, throughWrap);
   if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-    return findPidOriginInContribution(cvt.getSrc(), depth + 1);
+    return findPidOriginInContribution(cvt.getSrc(), depth + 1, throughWrap);
   if (auto ed = v.getDefiningOp<mlir::triton::ExpandDimsOp>())
-    return findPidOriginInContribution(ed.getSrc(), depth + 1);
+    return findPidOriginInContribution(ed.getSrc(), depth + 1, throughWrap);
   if (auto ext = v.getDefiningOp<mlir::arith::ExtSIOp>())
-    return findPidOriginInContribution(ext.getIn(), depth + 1);
+    return findPidOriginInContribution(ext.getIn(), depth + 1, throughWrap);
   if (auto ext = v.getDefiningOp<mlir::arith::ExtUIOp>())
-    return findPidOriginInContribution(ext.getIn(), depth + 1);
+    return findPidOriginInContribution(ext.getIn(), depth + 1, throughWrap);
   if (auto addi = v.getDefiningOp<mlir::arith::AddIOp>()) {
-    if (auto s = findPidOriginInContribution(addi.getLhs(), depth + 1))
+    if (auto s = findPidOriginInContribution(addi.getLhs(), depth + 1,
+                                             throughWrap))
       return s;
-    return findPidOriginInContribution(addi.getRhs(), depth + 1);
+    return findPidOriginInContribution(addi.getRhs(), depth + 1, throughWrap);
   }
   if (auto muli = v.getDefiningOp<mlir::arith::MulIOp>()) {
-    if (auto s = findPidOriginInContribution(muli.getLhs(), depth + 1))
+    if (auto s = findPidOriginInContribution(muli.getLhs(), depth + 1,
+                                             throughWrap))
       return s;
-    return findPidOriginInContribution(muli.getRhs(), depth + 1);
+    return findPidOriginInContribution(muli.getRhs(), depth + 1, throughWrap);
   }
   return mlir::Value();
 }
@@ -22285,7 +22304,8 @@ static mlir::Value findPidOriginInContribution(mlir::Value v, int depth = 0) {
 // from an addptr.offset chain. Walks the arith.addi tree to find the
 // contribution branch whose expand_dims.axis = (1 - targetAxis), then
 // pulls the pid*BLOCK scalar from that branch.
-static mlir::Value findOriginScalar(mlir::Value addptrOffset, int targetAxis) {
+static mlir::Value findOriginScalar(mlir::Value addptrOffset, int targetAxis,
+                                    bool throughWrap = false) {
   std::function<mlir::Value(mlir::Value)> walk =
       [&](mlir::Value v) -> mlir::Value {
     if (!v)
@@ -22297,7 +22317,7 @@ static mlir::Value findOriginScalar(mlir::Value addptrOffset, int targetAxis) {
     }
     auto axis = findExpandDimsAxis(v);
     if (axis.has_value() && (1 - *axis) == targetAxis)
-      return findPidOriginInContribution(v);
+      return findPidOriginInContribution(v, /*depth=*/0, throughWrap);
     return mlir::Value();
   };
   return walk(addptrOffset);
@@ -22328,10 +22348,12 @@ static mlir::Value emitOriginOperand(mlir::OpBuilder &builder,
 // caller then falls back to `metal.constant 0 : ui32` so every (pid_m, pid_n)
 // threadgroup loads/stores at the same tile origin (Matmul-track iter-8
 // rootcause for `test_dot_f32_8x8[16-16-16]`).
-static mlir::Value findOriginScalarInPtrChain(mlir::Value ptr, int targetAxis) {
+static mlir::Value findOriginScalarInPtrChain(mlir::Value ptr, int targetAxis,
+                                              bool throughWrap = false) {
   for (int depth = 0; depth < 8 && ptr; ++depth) {
     if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
-      if (auto r = findOriginScalar(addptr.getOffset(), targetAxis))
+      if (auto r =
+              findOriginScalar(addptr.getOffset(), targetAxis, throughWrap))
         return r;
       ptr = addptr.getPtr();
       continue;
@@ -25588,7 +25610,12 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
       builder, loc, unwrapPtrToKernelArg(sharedA.getPtr()), elemTy);
   mlir::Value strideAVal = emitStrideOperand(
       builder, loc, ui32, findAxisStride(sharedA.getPtr(), 0));
-  mlir::Value aRowScalar = findOriginScalarInPtrChain(sharedA.getPtr(), 0);
+  // Every operand's wrap has been proven by the pass-1 gate before this
+  // matcher runs, so crossing it to reach the origin is sound here -- and
+  // necessary: without it a wrapped index loses `pid_m * BLOCK_M` and every
+  // program reads the first block.
+  mlir::Value aRowScalar =
+      findOriginScalarInPtrChain(sharedA.getPtr(), 0, /*throughWrap=*/true);
   mlir::Value aRowExt, aColExt;
   std::tie(aRowExt, aColExt) = extentsFor(sharedA);
 
@@ -25602,7 +25629,8 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
         builder, loc, unwrapPtrToKernelArg(accDots[i].loadB.getPtr()), elemTy);
     strideBVal[i] = emitStrideOperand(
         builder, loc, ui32, findAxisStride(accDots[i].loadB.getPtr(), 0));
-    bNScalar[i] = findOriginScalarInPtrChain(accDots[i].loadB.getPtr(), bNAxis);
+    bNScalar[i] = findOriginScalarInPtrChain(accDots[i].loadB.getPtr(), bNAxis,
+                                            /*throughWrap=*/true);
     std::tie(bRExt[i], bCExt[i]) = extentsFor(accDots[i].loadB);
   }
 
@@ -25698,7 +25726,9 @@ static mlir::LogicalResult tryFusedLoRAEpilogue(mlir::scf::ForOp forOp) {
   mlir::Value strideB3Val =
       emitStrideOperand(builder, loc, ui32, findAxisStride(loadB3.getPtr(), 0));
   int b3NAxis = b3T ? 0 : 1;
-  mlir::Value b3NScalar = findOriginScalarInPtrChain(loadB3.getPtr(), b3NAxis);
+  mlir::Value b3NScalar =
+      findOriginScalarInPtrChain(loadB3.getPtr(), b3NAxis,
+                                 /*throughWrap=*/true);
   mlir::Value b3RExt, b3CExt;
   std::tie(b3RExt, b3CExt) = extentsFor(loadB3);
 
@@ -30323,7 +30353,10 @@ static mlir::triton::StoreOp sdFindStoreThroughLoop(mlir::triton::DotOp dot) {
 static bool sdFastTierWrapsAreProven(mlir::triton::DotOp dot) {
   auto aLoad = sdPeelToLoad(dot.getA());
   auto bLoad = sdPeelToLoad(dot.getB());
-  if (!aLoad || !bLoad)
+  // Ask about whichever operands ARE loads. Bailing out unless both were left
+  // the fused LoRA epilogue's third dot -- an accumulator times a loaded,
+  // transposed B -- completely unasked, and that operand's wrap was dropped.
+  if (!aLoad && !bLoad)
     return true;
   MaskExtents ext;
   if (auto store = sdFindStoreThroughLoop(dot))
@@ -30352,16 +30385,20 @@ static bool sdFastTierWrapsAreProven(mlir::triton::DotOp dot) {
     return proven(fold->wrapDivisor, guard);
   };
 
-  mlir::Value aPtr = sdResolveLoopCarriedPtrInit(aLoad.getPtr());
-  // A's tile is [M, K]; only M is guarded, by the store's row extent.
-  if (!axisOk(aPtr, 0, ext.mExtent) || !axisOk(aPtr, 1, mlir::Value()))
-    return false;
-  // A real `tt.trans` loads [N, K], so N is axis 0 there and axis 1 otherwise.
-  const bool bTrans = sdConeCrossesTranspose(dot.getB());
-  mlir::Value bPtr = sdResolveLoopCarriedPtrInit(bLoad.getPtr());
-  if (!axisOk(bPtr, bTrans ? 0 : 1, ext.nExtent) ||
-      !axisOk(bPtr, bTrans ? 1 : 0, mlir::Value()))
-    return false;
+  if (aLoad) {
+    mlir::Value aPtr = sdResolveLoopCarriedPtrInit(aLoad.getPtr());
+    // A's tile is [M, K]; only M is guarded, by the store's row extent.
+    if (!axisOk(aPtr, 0, ext.mExtent) || !axisOk(aPtr, 1, mlir::Value()))
+      return false;
+  }
+  if (bLoad) {
+    // A real `tt.trans` loads [N, K], so N is axis 0 there, axis 1 otherwise.
+    const bool bTrans = sdConeCrossesTranspose(dot.getB());
+    mlir::Value bPtr = sdResolveLoopCarriedPtrInit(bLoad.getPtr());
+    if (!axisOk(bPtr, bTrans ? 0 : 1, ext.nExtent) ||
+        !axisOk(bPtr, bTrans ? 1 : 0, mlir::Value()))
+      return false;
+  }
   return true;
 }
 
@@ -30818,6 +30855,36 @@ static void preprocessDotChains(mlir::ModuleOp moduleOp) {
   for (auto forOp : loopOrder) {
     if (dotCount[forOp.getOperation()] < 2)
       continue; // single-dot → pass 2
+    // The multi-dot matchers rebuild every operand address from an origin and
+    // a stride, exactly as the pass-2 tiers do, so they drop a `%` the same
+    // way -- and `sdFastTierWrapsAreProven` gates `rewriteSingleDot`, which is
+    // PASS 2. Measured before this gate: all four operands of the fused LoRA
+    // shape answered bit-identically to an unrelated `% 7` being absent. Ask
+    // the same question here, and let an unproven wrap fall through to pass 2
+    // and then to `metal.scalar_dot`, which spells the remainder exactly.
+    llvm::SmallVector<mlir::triton::DotOp> loopDots;
+    forOp.walk([&](mlir::triton::DotOp d) { loopDots.push_back(d); });
+    // The fused LoRA epilogue also consumes a dot AFTER the loop, reached
+    // through the scale-and-add on a loop result, so the walk alone misses it.
+    llvm::SmallVector<mlir::Operation *> wl;
+    llvm::SmallPtrSet<mlir::Operation *, 8> seenUse;
+    for (auto res : forOp.getResults())
+      for (auto *u : res.getUsers())
+        wl.push_back(u);
+    while (!wl.empty()) {
+      auto *u = wl.pop_back_val();
+      if (!seenUse.insert(u).second)
+        continue;
+      if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(u)) {
+        loopDots.push_back(d);
+        continue;
+      }
+      for (auto r : u->getResults())
+        for (auto *uu : r.getUsers())
+          wl.push_back(uu);
+    }
+    if (!llvm::all_of(loopDots, sdFastTierWrapsAreProven))
+      continue;
     if (mlir::succeeded(tryFusedLoRAEpilogue(forOp)))
       continue;
     (void)tryRuntimeKLoopRecomputeMultiDot(forOp);
