@@ -1998,7 +1998,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        Optional<Metal_MemRefType>:$weight_buf,
                        Variadic<UI32>:$partial_extents,
                        Variadic<Metal_MemRefType>:$scale_bufs,
-                       Variadic<UI32>:$scale_params);
+                       Variadic<UI32>:$scale_params,
+                       Variadic<AnyType>:$index_captures);
 
   let results = (outs AnyType:$result);
 
@@ -2006,9 +2007,17 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
   // an im2col gather, where the row origin and the reduction offset are each
   // an arbitrary cone of their index -- cannot be rebuilt from the strides
   // above. Such an operand carries its index function here instead: one block
-  // taking the tile's two GLOBAL axis indices (A: row, k; B: k, col) and
-  // yielding the logical element index with `metal.yield`. A region is empty
-  // when the operand's address folds, which is the ordinary case.
+  // taking the tile's two GLOBAL axis indices (A: row, k; B: k, col), then one
+  // argument per entry of `index_captures`, and yielding the logical element
+  // index with `metal.scalar_dot_index_yield`. A region is empty when the
+  // operand's address folds, which is the ordinary case.
+  //
+  // A cone that needs a RUNTIME scalar -- a stride passed as a kernel argument
+  // -- names it through `index_captures` rather than by referring to it across
+  // the region boundary. The captures are ordinary operands, so the conversion
+  // rewrites them like any other and the region never holds a value the
+  // surrounding function has since replaced. Both regions index the one shared
+  // capture list.
   let regions = (region AnyRegion:$a_index, AnyRegion:$b_index);
 
   let assemblyFormat = "$a_buf `,` $b_buf `offset` `[` $a_base_offset `,`"
@@ -2024,6 +2033,7 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        " (`partial` `[` $partial_extents^ `]`)?"
                        " (`scales` `[` $scale_bufs^ `]` `params` `[`"
                        " $scale_params `]`)?"
+                       " (`captures` `[` $index_captures^ `]`)?"
                        " attr-dict `:` functional-type(operands, results)"
                        " (`a_index` $a_index^)? (`b_index` $b_index^)?";
 }

@@ -3376,11 +3376,15 @@ def test_dot_recompute_loop_over_wide_a_matches_torch(real_trans):
 
 
 @pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
-def test_dot_recompute_loop_strided_a_is_named(capfd, real_trans):
-    """A's reduction axis is asked about even when B is transposed."""
-    with pytest.raises(Exception):
-        _run_recompute(sak=2, real_trans=real_trans)
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+def test_dot_recompute_loop_strided_a_matches_torch(real_trans):
+    """A's reduction axis is asked about even when B is transposed.
+
+    The stride here is a RUNTIME argument, which the index region names through
+    an `index_captures` operand rather than by reaching across the region
+    boundary for it -- so the address is computed rather than refused.
+    """
+    got, ref = _run_recompute(sak=2, real_trans=real_trans)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
 
 
 # ----------------------------------------------------------------------------
@@ -3468,25 +3472,24 @@ def dot_runtime_strided_inner_kernel(
              mask=(om[:, None] < M) & (on[None, :] < N))
 
 
-def test_dot_runtime_inner_stride_is_named(capfd):
-    """A RUNTIME inner stride still refuses.
+def test_dot_runtime_inner_stride_matches_torch():
+    """A RUNTIME inner stride is CAPTURED, not refused.
 
-    The index region is deliberately self-contained -- every leaf is the axis
-    index or a constexpr constant -- so it references nothing the conversion
-    could invalidate underneath it. A runtime multiplier has no such spelling
-    and is refused rather than carried.
+    The region stays self-contained -- it never reaches across its own boundary
+    for a value the conversion may have replaced -- by naming the scalar as an
+    `index_captures` operand and binding it to a block argument. The op's other
+    operands are rewritten the same way, so nothing special keeps it valid.
     """
     M = N = K = 32
     lda, ldb = 2 * K + 8, K + 8
     big_a = torch.randn((M, lda), dtype=torch.float32)
     big_b = torch.randn((N, ldb), dtype=torch.float32)
     out = torch.zeros((M, N), dtype=torch.float32)
-    with pytest.raises(Exception):
-        dot_runtime_strided_inner_kernel[(1, 1)](
-            big_a, big_b, out, M, N, K, lda, 2, ldb, BM=M, BN=N, BK=16,
-            num_warps=1,
-        )
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+    dot_runtime_strided_inner_kernel[(1, 1)](
+        big_a, big_b, out, M, N, K, lda, 2, ldb, BM=M, BN=N, BK=16, num_warps=1,
+    )
+    torch.testing.assert_close(out, big_a[:, 0:2 * K:2] @ big_b[:, :K].t(),
+                               atol=2e-3, rtol=2e-3)
 
 
 def test_dot_unit_inner_stride_spelled_before_expand_matches_torch():
@@ -3648,6 +3651,50 @@ def test_dot_tail_wrapped_rows_matches_torch():
     torch.testing.assert_close(out, a @ b.t(), atol=2e-3, rtol=2e-3)
 
 
+@triton.jit
+def dot_unrelated_wrap_kernel(
+    a_ptr, b_ptr, o_ptr, M, N, K: tl.constexpr, WRAP: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """`m % 7`, with 7 unrelated to the extent: a genuine gather, not a wrap."""
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    src = om % WRAP
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + src[:, None] * K + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * K + ok[:, None],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(o_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def test_dot_unrelated_modulo_is_not_treated_as_a_tail_wrap():
+    """A remainder whose divisor is not the guarding extent must not be dropped.
+
+    The tail wrap is droppable because the store mask removes exactly the lanes
+    it would have moved. `m % 7` moves lanes the mask keeps, so dropping it
+    answers `A[m]` -- which measured bit-identical to the modulo simply being
+    gone. The divisor is now proven against the mask's extent, and a divisor
+    that fails that proof takes the index region, which spells the remainder.
+    """
+    M = N = K = 32
+    WRAP = 7
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((N, K), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    dot_unrelated_wrap_kernel[(1, 1)](
+        a, b, out, M, N, K, WRAP, BM=M, BN=N, BK=16, num_warps=1,
+    )
+    wrapped = a[torch.arange(M) % WRAP]
+    torch.testing.assert_close(out, wrapped @ b.t(), atol=2e-3, rtol=2e-3)
+    # And it is genuinely different from the answer a dropped modulo gives.
+    assert not torch.allclose(out, a @ b.t(), atol=2e-3, rtol=2e-3)
+
+
 # ----------------------------------------------------------------------------
 # A transposed B: the two spellings need opposite dense axes.
 #
@@ -3727,10 +3774,21 @@ def test_dot_transposed_b_address_matches_torch(real_trans, use_off):
     torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
 
 
-@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
-def test_dot_transposed_b_strided_dense_axis_is_named(capfd, real_trans):
+def test_dot_transposed_b_address_strided_dense_axis_matches_torch():
+    """An ADDRESS-only transposed B keeps its tile axes, so a region fits it."""
+    got, ref = _run_transposed_b(real_trans=False, use_off=False, sbk=2)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+def test_dot_real_trans_b_strided_dense_axis_is_named(capfd):
+    """A real `tt.trans` still refuses.
+
+    The region's two block arguments are the TILE's axes, and a `tt.trans`
+    consumer swaps them -- so the axes the lowering would bind are not the axes
+    the region was built against. Refused rather than guessed at.
+    """
     with pytest.raises(Exception):
-        _run_transposed_b(real_trans=real_trans, use_off=False, sbk=2)
+        _run_transposed_b(real_trans=True, use_off=False, sbk=2)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
 
 

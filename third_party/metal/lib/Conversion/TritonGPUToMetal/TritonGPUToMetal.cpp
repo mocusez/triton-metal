@@ -26161,7 +26161,8 @@ static mlir::Value sdSplatScalarSource(mlir::Value v) {
 struct SdAxisFold {
   mlir::Value dynamicScale;  // a `tt.splat` of a runtime scalar, if any
   int64_t constantScale = 1; // the product of the constexpr multipliers
-  bool wraps = false;        // a tail-wrap `% extent` the rebuild drops
+  bool wraps = false;        // a `% extent` the rebuild would drop
+  mlir::Value wrapDivisor;   // ... and what it divides by, so it can be proven
 };
 
 // Uniform along the axis means "does not vary with the axis index", and the
@@ -26244,6 +26245,7 @@ static std::optional<SdAxisFold> sdFoldAxis(mlir::Value v, int64_t extent,
     if (!inner || inner->wraps)
       return std::nullopt;
     inner->wraps = true;
+    inner->wrapDivisor = rem.getRhs();
     return inner;
   }
   if (auto rem = v.getDefiningOp<mlir::arith::RemUIOp>()) {
@@ -26253,6 +26255,7 @@ static std::optional<SdAxisFold> sdFoldAxis(mlir::Value v, int64_t extent,
     if (!inner || inner->wraps)
       return std::nullopt;
     inner->wraps = true;
+    inner->wrapDivisor = rem.getRhs();
     return inner;
   }
   auto range = v.getDefiningOp<mlir::triton::MakeRangeOp>();
@@ -26313,11 +26316,33 @@ static bool sdIsAxisIndexSubtree(mlir::Value v, int64_t extent, int depth = 0) {
 // that is neither the axis nor a constant, and on any op with no scalar
 // spelling here. `memo` keeps a shared subexpression (the k cone names `k`
 // four times) from being rebuilt once per use.
+// Scalars the cone needs from the enclosing function. Each becomes a block
+// argument and an operand of the op, so the conversion rewrites it like any
+// other operand instead of the region holding a value the surrounding function
+// has since replaced.
+struct SdConeCaptures {
+  mlir::Block *block = nullptr;
+  llvm::SmallVector<mlir::Value, 2> values;
+  llvm::DenseMap<mlir::Value, mlir::Value> arg;
+
+  // Null when the scalar cannot be captured, which refuses the cone.
+  mlir::Value argFor(mlir::Value scalar, mlir::Location loc) {
+    if (!scalar || !scalar.getType().isInteger(32))
+      return {};
+    if (auto hit = arg.find(scalar); hit != arg.end())
+      return hit->second;
+    mlir::Value a = block->addArgument(scalar.getType(), loc);
+    arg[scalar] = a;
+    values.push_back(scalar);
+    return a;
+  }
+};
+
 static mlir::Value
 sdScalarizeSelfContainedCone(mlir::OpBuilder &builder, mlir::Location loc,
                              mlir::Value v, int64_t extent, mlir::Value axisIdx,
                              llvm::DenseMap<mlir::Value, mlir::Value> &memo,
-                             int depth = 0) {
+                             SdConeCaptures &captures, int depth = 0) {
   if (!v || depth > 24)
     return {};
   if (auto hit = memo.find(v); hit != memo.end())
@@ -26342,12 +26367,15 @@ sdScalarizeSelfContainedCone(mlir::OpBuilder &builder, mlir::Location loc,
                 mlir::arith::ExtSIOp, mlir::arith::ExtUIOp,
                 mlir::arith::TruncIOp>(def))
     return remember(sdScalarizeSelfContainedCone(
-        builder, loc, def->getOperand(0), extent, axisIdx, memo, depth + 1));
+        builder, loc, def->getOperand(0), extent, axisIdx, memo, captures,
+        depth + 1));
   auto binary = [&](auto make) -> mlir::Value {
     mlir::Value l = sdScalarizeSelfContainedCone(
-        builder, loc, def->getOperand(0), extent, axisIdx, memo, depth + 1);
+        builder, loc, def->getOperand(0), extent, axisIdx, memo, captures,
+        depth + 1);
     mlir::Value r = sdScalarizeSelfContainedCone(
-        builder, loc, def->getOperand(1), extent, axisIdx, memo, depth + 1);
+        builder, loc, def->getOperand(1), extent, axisIdx, memo, captures,
+        depth + 1);
     if (!l || !r)
       return {};
     return make(l, r);
@@ -26373,6 +26401,11 @@ sdScalarizeSelfContainedCone(mlir::OpBuilder &builder, mlir::Location loc,
   SD_SCALAR_BINOP(MinSIOp)
   SD_SCALAR_BINOP(MaxSIOp)
 #undef SD_SCALAR_BINOP
+  // A uniform value the cone needs but cannot spell as a constant: a stride
+  // passed as a kernel argument. Capture it rather than refuse, and rather than
+  // reach across the region boundary for it.
+  if (mlir::Value scalar = sdSplatScalarSource(v))
+    return remember(captures.argFor(scalar, loc));
   return {};
 }
 
@@ -26384,7 +26417,8 @@ sdScalarizeSelfContainedCone(mlir::OpBuilder &builder, mlir::Location loc,
 static mlir::LogicalResult
 sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
                              mlir::RankedTensorType tileTy, mlir::Location loc,
-                             mlir::MLIRContext *ctx) {
+                             mlir::MLIRContext *ctx,
+                             llvm::SmallVectorImpl<mlir::Value> &captures) {
   if (!tileTy || tileTy.getRank() < 2)
     return mlir::failure();
   SdPtrParts parts = sdSplitPtr(ptr);
@@ -26401,6 +26435,8 @@ sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
   builder.setInsertionPointToStart(body);
   mlir::Value axis0 = body->getArgument(0);
   mlir::Value axis1 = body->getArgument(1);
+  SdConeCaptures captured;
+  captured.block = body;
 
   mlir::Value total;
   auto addTerm = [&](mlir::Value term) {
@@ -26411,7 +26447,7 @@ sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
   llvm::DenseMap<mlir::Value, mlir::Value> rowMemo, colMemo;
   if (parts.rowContrib) {
     mlir::Value rowTerm = sdScalarizeSelfContainedCone(
-        builder, loc, parts.rowContrib, rows, axis0, rowMemo);
+        builder, loc, parts.rowContrib, rows, axis0, rowMemo, captured);
     if (!rowTerm) {
       region.getBlocks().clear();
       return mlir::failure();
@@ -26420,7 +26456,7 @@ sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
   }
   if (parts.colContrib) {
     mlir::Value colTerm = sdScalarizeSelfContainedCone(
-        builder, loc, parts.colContrib, cols, axis1, colMemo);
+        builder, loc, parts.colContrib, cols, axis1, colMemo, captured);
     if (!colTerm) {
       region.getBlocks().clear();
       return mlir::failure();
@@ -26434,6 +26470,7 @@ sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
   // The op carries the buffer's scalar base offsets separately, so the region
   // yields only the tile-relative index and the two cannot double count.
   ScalarDotIndexYieldOp::create(builder, loc, total);
+  captures.append(captured.values.begin(), captured.values.end());
   return mlir::success();
 }
 
@@ -26456,12 +26493,28 @@ static std::optional<SdAxisFold> sdFoldPtrAxis(mlir::Value ptr, int axis) {
 
 // Both axes of an operand must fold, and the one the emitter advances one
 // element at a time must fold with stride one.
-static bool sdOperandAddressIsRebuildable(mlir::Value ptr, int denseAxis) {
+// `looseWrapDivisor` reports a `%` on the axis the rebuild does NOT advance
+// element by element, which it would DROP. That is sound for the tail wrap
+// `(pid*BM + i) % M` -- every lane whose wrapped index differs is masked out at
+// the store -- and a silent wrong answer for any other divisor, which is a
+// genuine gather: `m % 7` was answered with row `m`. The caller proves the
+// divisor against the extent that actually guards the axis, and routes the rest
+// to an index region, which spells the remainder exactly.
+static bool sdOperandAddressIsRebuildable(mlir::Value ptr, int denseAxis,
+                                          mlir::Value *looseWrapDivisor
+                                          = nullptr) {
   auto rowFold = sdFoldPtrAxis(ptr, 0);
   auto colFold = sdFoldPtrAxis(ptr, 1);
   if (!rowFold || !colFold)
     return false;
   const SdAxisFold &dense = denseAxis == 0 ? *rowFold : *colFold;
+  const SdAxisFold &loose = denseAxis == 0 ? *colFold : *rowFold;
+  // A fold that records a wrap always records its divisor. The caller reads a
+  // null divisor as "no wrap at all", so refuse rather than let one through.
+  if (loose.wraps && !loose.wrapDivisor)
+    return false;
+  if (looseWrapDivisor && loose.wraps)
+    *looseWrapDivisor = loose.wrapDivisor;
   return !dense.dynamicScale && dense.constantScale == 1 && !dense.wraps;
 }
 
@@ -26744,6 +26797,9 @@ sdMakeAvailableBefore(mlir::Value v, mlir::Operation *insertBefore,
 static std::optional<SdAxisStride>
 sdCanonicalScaleBatchStride(mlir::Value ptr, mlir::RankedTensorType scaleTy);
 
+// Defined with the scale helpers below; the wrap proof needs it here.
+static bool sdAreSameMaskExtent(mlir::Value lhs, mlir::Value rhs);
+
 static ScalarDotOp sdCreateScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
@@ -26844,6 +26900,11 @@ static ScalarDotOp sdCreateScalarDot(
   // arguments are the TILE's axes, and a real `tt.trans` consumer swaps them.
   bool aIndexRegion = false;
   bool bIndexRegion = false;
+  // A `%` on the axis the rebuild does not advance is only sound as the TAIL
+  // WRAP. Keep the divisors here and prove them once the store's mask extents
+  // are known, a few blocks below.
+  mlir::Value aLooseWrapDivisor, bLooseWrapDivisor;
+  int bLooseAxis = 0;
   if (!scaleInfo && !weightLoad) {
     if (!transposeA && !simdgroupTileIsContiguous(aLoad.getPtr()))
       aIndexRegion = true;
@@ -26858,7 +26919,7 @@ static ScalarDotOp sdCreateScalarDot(
     if (!transposeA &&
         !sdOperandAddressIsRebuildable(sdResolveLoopCarriedPtrInit(
                                            aLoad.getPtr()),
-                                       /*denseAxis=*/1))
+                                       /*denseAxis=*/1, &aLooseWrapDivisor))
       aIndexRegion = true;
     // A transposed B comes in two spellings and they need OPPOSITE axes. A
     // real `tt.trans` loads an [N, K] tile, so K -- the dense axis of an
@@ -26890,8 +26951,10 @@ static ScalarDotOp sdCreateScalarDot(
       bIndexRegion = true;
     if (!transposeB &&
         !sdOperandAddressIsRebuildable(
-            sdResolveLoopCarriedPtrInit(bLoad.getPtr()), bDenseAxis))
+            sdResolveLoopCarriedPtrInit(bLoad.getPtr()), bDenseAxis,
+            &bLooseWrapDivisor))
       bIndexRegion = true;
+    bLooseAxis = bDenseAxis == 0 ? 1 : 0;
     // A transposed operand is still refused on the old terms: it has no region
     // to fall back to.
     if (transposeB && (!simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis) ||
@@ -26936,6 +26999,37 @@ static ScalarDotOp sdCreateScalarDot(
             static_cast<bool>(batchOriginScalar) &&
         !hasScaledLocalBatchCoordinate)
       return {};
+  }
+
+  // Prove each carried wrap against the extent that actually guards its axis.
+  // `(pid*BM + i) % M` is the tail wrap: the rebuild drops it and the store
+  // mask's `partial_extents` masks out exactly the lanes it would have moved.
+  // `m % 7` is not -- dropping it reads row `m`, which measured 800 of 1024
+  // elements wrong against an answer bit-identical to the modulo simply being
+  // gone. An unproven wrap is not refused: the index region spells a remainder
+  // exactly, so it is computed rather than dropped.
+  //
+  // Only A's ROW axis and B's COLUMN axis have a guarding extent at all; a wrap
+  // on either operand's K axis has none, and goes to a region.
+  {
+    // The divisor sits in the pointer cone as `tt.splat(M)` while the mask's
+    // extent is the scalar `M` itself, so comparing them as they stand never
+    // matches -- and an unproven tail wrap is routed to a region, which then
+    // refuses the runtime divisor. Peel both to their scalar source first.
+    auto peel = [](mlir::Value v) {
+      mlir::Value scalar = sdSplatScalarSource(v);
+      return scalar ? scalar : v;
+    };
+    auto proven = [&](mlir::Value divisor, mlir::Value extent) {
+      return divisor && extent &&
+             (sdAreSameMaskExtent(divisor, extent) ||
+              sdAreSameMaskExtent(peel(divisor), peel(extent)));
+    };
+    if (aLooseWrapDivisor && !proven(aLooseWrapDivisor, maskExtents.mExtent))
+      aIndexRegion = true;
+    if (bLooseWrapDivisor &&
+        !(bLooseAxis == 1 && proven(bLooseWrapDivisor, maskExtents.nExtent)))
+      bIndexRegion = true;
   }
 
   mlir::OpBuilder builder(insertBefore);
@@ -27312,25 +27406,35 @@ static ScalarDotOp sdCreateScalarDot(
       aBatchOffset, bBatchOffset, batchOrigin, rowOrigin, colOrigin, strideA,
       strideB, innerStrideA, innerStrideB, reductionStartUi32,
       reductionExtentUi32, cInit, outputIndices, weightBuf, partialExtents,
-      scaleBufs, scaleParams);
+      scaleBufs, scaleParams, /*index_captures=*/mlir::ValueRange{});
   // Populate the carried index regions. Failure here is the refusal the gate
   // above deferred: the walk that decides and the walk that builds are one, so
   // a cone can never be accepted by a predicate the emitter cannot honour.
   if (aIndexRegion || bIndexRegion) {
     auto aTileTy = mlir::dyn_cast<mlir::RankedTensorType>(aLoad.getType());
     auto bTileTy = mlir::dyn_cast<mlir::RankedTensorType>(bLoad.getType());
-    const bool built =
-        (!aIndexRegion ||
-         mlir::succeeded(sdPopulateOperandIndexRegion(
-             scalarDot.getAIndex(), sdResolveLoopCarriedPtrInit(aLoad.getPtr()),
-             aTileTy, loc, builder.getContext()))) &&
-        (!bIndexRegion ||
-         mlir::succeeded(sdPopulateOperandIndexRegion(
-             scalarDot.getBIndex(), sdResolveLoopCarriedPtrInit(bLoad.getPtr()),
-             bTileTy, loc, builder.getContext())));
+    // One shared operand list, split at A's share: each region's block takes
+    // its own captures after the two axis indices, so the lowering binds
+    // `captures.take_front(aCount)` to A and the rest to B.
+    llvm::SmallVector<mlir::Value, 4> captures;
+    bool built = true;
+    if (aIndexRegion)
+      built = mlir::succeeded(sdPopulateOperandIndexRegion(
+          scalarDot.getAIndex(), sdResolveLoopCarriedPtrInit(aLoad.getPtr()),
+          aTileTy, loc, builder.getContext(), captures));
+    int64_t aCaptureCount = static_cast<int64_t>(captures.size());
+    if (built && bIndexRegion)
+      built = mlir::succeeded(sdPopulateOperandIndexRegion(
+          scalarDot.getBIndex(), sdResolveLoopCarriedPtrInit(bLoad.getPtr()),
+          bTileTy, loc, builder.getContext(), captures));
     if (!built) {
       scalarDot.erase();
       return {};
+    }
+    if (!captures.empty()) {
+      scalarDot.getIndexCapturesMutable().assign(captures);
+      scalarDot->setAttr("metal.a_index_captures",
+                         builder.getI64IntegerAttr(aCaptureCount));
     }
   }
   if (scaleInfo) {
@@ -29798,12 +29902,22 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         // from strides that cannot spell it. The region is self-contained
         // scalar arithmetic, so inlining it is a clone with its two block
         // arguments bound to the loop's own scalars.
+        auto allCaptures = adaptor.getIndexCaptures();
+        int64_t aCaptureCount = 0;
+        if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
+                "metal.a_index_captures"))
+          aCaptureCount = attr.getInt();
         auto inlineIndexRegion = [&](mlir::Region &region, mlir::Value axis0,
-                                     mlir::Value axis1) -> mlir::Value {
+                                     mlir::Value axis1,
+                                     mlir::ValueRange captures) -> mlir::Value {
           mlir::Block &blk = region.front();
           mlir::IRMapping map;
           map.map(blk.getArgument(0), axis0);
           map.map(blk.getArgument(1), axis1);
+          // The captures follow the two axis indices, in the order the region
+          // builder appended them to the shared operand list.
+          for (unsigned i = 0; i < captures.size(); ++i)
+            map.map(blk.getArgument(2 + i), toI32(captures[i]));
           for (mlir::Operation &inner : blk.without_terminator())
             b.clone(inner, map);
           auto yielded =
@@ -29815,7 +29929,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         // dimension; scale lookup below continues to use logical M/N/K.
         mlir::Value aLogicalIdx;
         if (!op.getAIndex().empty()) {
-          aLogicalIdx = inlineIndexRegion(op.getAIndex(), gRow, k);
+          aLogicalIdx = inlineIndexRegion(
+              op.getAIndex(), gRow, k, allCaptures.take_front(aCaptureCount));
         } else if (op->hasAttr("transpose_a")) {
           aLogicalIdx =
               mlir::arith::AddIOp::create(
@@ -29851,7 +29966,8 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         if (!op.getBIndex().empty()) {
           // B's tile is [K, N], so its axis-0 index is k and its axis-1 index
           // is the column.
-          bLogicalIdx = inlineIndexRegion(op.getBIndex(), k, gCol);
+          bLogicalIdx = inlineIndexRegion(
+              op.getBIndex(), k, gCol, allCaptures.drop_front(aCaptureCount));
         } else if (op->hasAttr("transpose_b")) {
           bLogicalIdx =
               mlir::arith::AddIOp::create(
