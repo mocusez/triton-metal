@@ -1,4 +1,7 @@
 // RUN: split-file %s %t
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %t/supported_fma.mlir | FileCheck %s --check-prefix=FMA
+// RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_fma.mlir 2>&1 | FileCheck %s --check-prefix=SOURCE
+// RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_if.mlir 2>&1 | FileCheck %s --check-prefix=SOURCE
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %t/supported.mlir | FileCheck %s
 // RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_scalar.mlir 2>&1 | FileCheck %s --check-prefix=BAD
 //
@@ -136,3 +139,85 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // BAD: loop-carried tl.gather recurrence contains a scalar or tensor cone that cannot be replayed safely
+
+//--- supported_fma.mlir
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @supported_fma(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
+    %one = arith.constant dense<1.0> : tensor<128xf32, #blocked>
+    %r = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %xp = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xp, %r : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %v = tt.load %xa : tensor<128x!tt.ptr<f32>, #blocked>
+    %src = math.fma %v, %v, %one : tensor<128xf32, #blocked>
+    %ixp = tt.splat %ix : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %ixa = tt.addptr %ixp, %r : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    %i = tt.load %ixa : tensor<128x!tt.ptr<i32>, #blocked>
+    %g = tt.gather %src[%i] {axis = 0 : i32} : (tensor<128xf32, #blocked>, tensor<128xi32, #blocked>) -> tensor<128xf32, #blocked>
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %op, %r : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %oa, %g : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+//--- unsupported_fma.mlir
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @unsupported_fma(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
+    %one = arith.constant dense<1.0> : tensor<256xf32, #blocked>
+    %r = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %xp = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xp, %r : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %v = tt.load %xa : tensor<256x!tt.ptr<f32>, #blocked>
+    %src = math.fma %v, %v, %one : tensor<256xf32, #blocked>
+    %ixp = tt.splat %ix : !tt.ptr<i32> -> tensor<256x!tt.ptr<i32>, #blocked>
+    %ixa = tt.addptr %ixp, %r : tensor<256x!tt.ptr<i32>, #blocked>, tensor<256xi32, #blocked>
+    %i = tt.load %ixa : tensor<256x!tt.ptr<i32>, #blocked>
+    %g = tt.gather %src[%i] {axis = 0 : i32} : (tensor<256xf32, #blocked>, tensor<256xi32, #blocked>) -> tensor<256xf32, #blocked>
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %op, %r : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %oa, %g : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+//--- unsupported_if.mlir
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @unsupported_if(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
+    %one = arith.constant dense<1.0> : tensor<256xf32, #blocked>
+    %r = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %xp = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %xa = tt.addptr %xp, %r : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %v = tt.load %xa : tensor<256x!tt.ptr<f32>, #blocked>
+    %src = scf.if %flag -> tensor<256xf32, #blocked> {
+      %plus = arith.addf %v, %one : tensor<256xf32, #blocked>
+      scf.yield %plus : tensor<256xf32, #blocked>
+    } else {
+      %square = arith.mulf %v, %v : tensor<256xf32, #blocked>
+      scf.yield %square : tensor<256xf32, #blocked>
+    }
+    %ixp = tt.splat %ix : !tt.ptr<i32> -> tensor<256x!tt.ptr<i32>, #blocked>
+    %ixa = tt.addptr %ixp, %r : tensor<256x!tt.ptr<i32>, #blocked>, tensor<256xi32, #blocked>
+    %i = tt.load %ixa : tensor<256x!tt.ptr<i32>, #blocked>
+    %g = tt.gather %src[%i] {axis = 0 : i32} : (tensor<256xf32, #blocked>, tensor<256xi32, #blocked>) -> tensor<256xf32, #blocked>
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %op, %r : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %oa, %g : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// A source that cannot be replayed is still supported by single-band staging.
+// FMA-LABEL: metal.kernel supported_fma
+// FMA: %[[VALUE:.*]] = metal.fma
+// FMA: %[[SCRATCH:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
+// FMA: metal.barrier
+// FMA: metal.store %[[VALUE]], %[[SCRATCH]][
+// FMA: metal.barrier
+// FMA: metal.tg_load_indexed %[[SCRATCH]][
+// FMA: metal.return
+
+// SOURCE: Metal backend: rank-1 gather cannot replay its source across conversion
+// SOURCE-NOT: failed to legalize

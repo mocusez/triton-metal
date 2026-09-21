@@ -1203,6 +1203,127 @@ def _gather_computed_source_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr)
     tl.store(out_ptr + offs, tl.gather(v, tl.load(idx_ptr + offs), axis=0))
 
 
+@triton.jit(do_not_specialize=["flag"])
+def _gather_source_replay_kernel(x_ptr, idx_ptr, out_ptr, flag,
+                                 BLOCK: tl.constexpr, MODE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    if MODE == "fma":
+        x = tl.fma(x, x, 1.0)
+    elif MODE == "rem":
+        x = x % 3.0
+    elif MODE == "div":
+        x = tl.div_rn(x, 3.0)
+    elif MODE == "if":
+        if flag:
+            x = x + 1.0
+        else:
+            x = x * 2.0
+    elif MODE == "select":
+        x = tl.where(x < 0.0, x * 2.0, x + 1.0)
+    elif MODE == "scan":
+        x = tl.cumsum(x)
+    else:
+        x = x * 2.0 + 1.0
+    tl.store(out_ptr + offs, tl.gather(x, tl.load(idx_ptr + offs), axis=0))
+
+
+@pytest.mark.parametrize("mode", ["fma", "rem", "div", "if"])
+def test_gather_rank1_source_replay_is_rejected_not_crashed(mode, tmp_path):
+    """A declined multi-element source must leave compilation recoverable."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "gather_source_replay.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(block, mode):
+            return triton.compile(ASTSource(
+                module._gather_source_replay_kernel,
+                signature={{"x_ptr": "*fp32", "idx_ptr": "*i32",
+                           "out_ptr": "*fp32", "flag": "i32"}},
+                constexprs={{"BLOCK": block, "MODE": mode}}),
+                target=target, options={{"num_warps": 4}})
+
+        for attempt in range(3):
+            try:
+                compile_case(256, {mode!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported gather source compiled")
+        # These shapes stage the already computed value without replaying it.
+        compile_case(32, {mode!r})
+        compile_case(128, {mode!r})
+        # Multiple elements per thread remain supported for replayable cones.
+        compile_case(256, "select")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "Metal backend: rank-1 gather cannot replay its source across conversion"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@pytest.mark.parametrize(
+    "block,num_warps,mode,flag",
+    [
+        pytest.param(block, 4, mode, flag, id=f"b{block}_{mode}_flag{flag}")
+        for block in (32, 128)
+        for mode, flag in (("fma", 1), ("rem", 1), ("div", 1), ("if", 0), ("if", 1))
+    ] + [
+        pytest.param(256, num_warps, mode, 1, id=f"b256_{mode}_w{num_warps}")
+        for num_warps in (1, 4)
+        for mode in ("select", "arithmetic", "scan")
+    ],
+)
+def test_gather_rank1_source_replay_supported_numeric(block, num_warps, mode, flag):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.arange(block, dtype=torch.float32) - block // 2) * 0.125
+    idx = torch.roll(torch.arange(block - 1, -1, -1), 17).to(torch.int32)
+    if mode == "fma":
+        source = x * x + 1.0
+    elif mode == "rem":
+        source = torch.fmod(x, 3.0)
+    elif mode == "div":
+        source = x / 3.0
+    elif mode == "if":
+        source = x + 1.0 if flag else x * 2.0
+    elif mode == "select":
+        source = torch.where(x < 0.0, x * 2.0, x + 1.0)
+    elif mode == "scan":
+        source = torch.cumsum(x, dim=0)
+    else:
+        source = x * 2.0 + 1.0
+    sentinel = -4321.0
+    out = torch.full((block + 8,), sentinel, dtype=torch.float32, device="mps")
+    _gather_source_replay_kernel[(1,)](
+        x.to("mps"), idx.to("mps"), out, flag,
+        BLOCK=block, MODE=mode, num_warps=num_warps)
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[:block], source[idx.long()], atol=1e-6, rtol=1e-6)
+    assert torch.all(actual[block:] == sentinel)
+
+
 @triton.jit
 def _gather_loop_carried_i32_kernel(x_ptr, idx_ptr, out_ptr, steps,
                                     BLOCK: tl.constexpr):

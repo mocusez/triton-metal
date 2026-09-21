@@ -402,6 +402,14 @@ The current dependency-ordered priorities are:
    memory accesses inside the branches. Carry integer offsets through while
    and for loops and access the bound buffers inside their regions. Recognized
    pointer-advance matmul loops retain their specialized lowering.
+   Rank-1 gathers with multiple elements per thread now reject source expressions
+   that cannot be replayed before conversion starts. This includes fused
+   multiply-add, floating remainder, precise division and tensor results from
+   runtime branches. With f32 payloads, these forms still work when the source
+   tile has at most one element per thread; supported loop-carried gather
+   recurrences retain their materialized path. Rejection leaves the compiler
+   usable for subsequent kernels instead of terminating the process during
+   conversion cleanup.
    Non-f32 FMA and the f32-only unary math operations also fail in preflight
    with type diagnostics; explicitly convert operands to f32 to use them.
    Numeric casts with f64 operands or results also have named diagnostics.

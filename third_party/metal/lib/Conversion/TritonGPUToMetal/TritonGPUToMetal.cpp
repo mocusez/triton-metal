@@ -39923,6 +39923,34 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    // Multi-band gathers replay their source at arbitrary logical positions.
+    // The early gather validator checks geometry, but cannot check the source
+    // until loop-carried recurrences have been selected: their tensor block
+    // arguments become materialized buffers rather than replayed expressions.
+    // Keep this before function/SCF conversion, where an unsupported source
+    // still produces a named error instead of failing conversion rollback.
+    bool gatherSourcesOk = true;
+    moduleOp.walk([&](mlir::triton::GatherOp gather) {
+      if (planStagedGather(gather) ||
+          loopCarriedGathers.contains(gather->getParentOp()))
+        return;
+      // Aggregate leaves have their own materialization checks. The stable
+      // predicate also excludes tensor-yielding scf.if, whose tensor producer
+      // chain is lost when structural conversion scalarizes its results.
+      if (coneReplayableAcrossConversion(gather.getSrc(),
+                                        /*deferAggregateLeaves=*/true))
+        return;
+      gather.emitOpError(
+          "Metal backend: rank-1 gather cannot replay its source across "
+          "conversion; use a replayable source expression or a tile with at "
+          "most one element per thread");
+      gatherSourcesOk = false;
+    });
+    if (!gatherSourcesOk) {
+      signalPassFailure();
+      return;
+    }
+
     // Identify scalar statistics recurrences while the original top-level
     // SCF structure and tensor reduce cones are still intact. FuncOpLowering
     // consumes these operation identities when it builds the output tile loop.
