@@ -1324,6 +1324,176 @@ def test_gather_rank1_source_replay_supported_numeric(block, num_warps, mode, fl
     assert torch.all(actual[block:] == sentinel)
 
 
+@triton.jit(do_not_specialize=["flag"])
+def _histogram_replay_preflight_kernel(out_ptr, flag,
+                                       BLOCK: tl.constexpr,
+                                       BINS: tl.constexpr,
+                                       MODE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    src = offs % BINS
+    mask = offs >= 0
+    if MODE == "source_if":
+        if flag:
+            src = src + 1
+        else:
+            src = src
+        hist = tl.histogram(src, BINS)
+    elif MODE == "mask_if":
+        if flag:
+            mask = src < (BINS // 2)
+        else:
+            mask = src >= (BINS // 2)
+        hist = tl.histogram(src, BINS, mask=mask)
+    else:
+        hist = tl.histogram(src, BINS, mask=mask)
+    tl.store(out_ptr + tl.arange(0, BINS), hist)
+
+
+@pytest.mark.parametrize("mode", ["source_if", "mask_if"])
+def test_histogram_tensor_if_replay_is_rejected_not_crashed(mode, tmp_path):
+    """A declined tensor-yielding histogram cone must leave compilation usable."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "histogram_replay_preflight.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(block, mode):
+            return triton.compile(ASTSource(
+                module._histogram_replay_preflight_kernel,
+                signature={{"out_ptr": "*i32", "flag": "i32"}},
+                constexprs={{"BLOCK": block, "BINS": 16, "MODE": mode}}),
+                target=target, options={{"num_warps": 4}})
+
+        for block in (32, 128, 256):
+            try:
+                compile_case(block, {mode!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported histogram cone compiled")
+        for attempt in range(3):
+            try:
+                compile_case(256, {mode!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported histogram cone compiled")
+        compile_case(256, "plain")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    if mode == "source_if":
+        needle = "Metal backend: tt.histogram source cone is not rank-1 evaluable"
+    else:
+        needle = "Metal backend: tt.histogram mask cone is not rank-1 i1 evaluable"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 6, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@triton.jit(do_not_specialize=["flag"])
+def _histogram_replay_supported_kernel(x_ptr, mask_ptr, out_ptr, flag,
+                                       BLOCK: tl.constexpr,
+                                       BINS: tl.constexpr,
+                                       MODE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    src = tl.load(x_ptr + offs)
+    base_mask = tl.load(mask_ptr + offs)
+    if MODE == "scalar_if":
+        if flag:
+            shift = 0
+        else:
+            shift = 1
+        src = src + shift
+        hist = tl.histogram(src, BINS, mask=base_mask)
+        tl.store(out_ptr + tl.arange(0, BINS), hist)
+    elif MODE == "where_source":
+        src = tl.where((offs % 2) == flag, src + 1, src)
+        hist = tl.histogram(src, BINS, mask=base_mask)
+        tl.store(out_ptr + tl.arange(0, BINS), hist)
+    elif MODE == "where_mask":
+        if flag:
+            divisor = 3
+        else:
+            divisor = 5
+        extra = (offs % divisor) != 0
+        mask = base_mask & tl.where((src >= 0) & (src < BINS), extra, base_mask)
+        hist = tl.histogram(src, BINS, mask=mask)
+        tl.store(out_ptr + tl.arange(0, BINS), hist)
+    else:
+        if flag:
+            src = src + 0
+            mask = base_mask & ((offs % 2) == 0)
+            hist = tl.histogram(src, BINS, mask=mask)
+            tl.store(out_ptr + tl.arange(0, BINS), hist)
+        else:
+            src = src + 1
+            mask = base_mask & ((offs % 2) == 1)
+            hist = tl.histogram(src, BINS, mask=mask)
+            tl.store(out_ptr + tl.arange(0, BINS), hist)
+
+
+@pytest.mark.parametrize(
+    "block,mode,flag",
+    [
+        pytest.param(block, mode, flag, id=f"b{block}_{mode}_flag{flag}")
+        for block in (32, 128, 256)
+        for mode in ("scalar_if", "where_source", "where_mask", "inner_if")
+        for flag in (0, 1)
+    ],
+)
+def test_histogram_replay_supported_numeric(block, mode, flag):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    bins = 16
+    arange = torch.arange(block, dtype=torch.int32)
+    x = (arange % (bins + 3)) - 2
+    base_mask = (arange % 4) != 1
+    if mode == "scalar_if":
+        source = x if flag else x + 1
+        mask = base_mask
+    elif mode == "where_source":
+        source = torch.where((arange % 2) == flag, x + 1, x)
+        mask = base_mask
+    elif mode == "where_mask":
+        source = x
+        extra = (arange % (3 if flag else 5)) != 0
+        in_range = (source >= 0) & (source < bins)
+        mask = base_mask & torch.where(in_range, extra, base_mask)
+    else:
+        source = x if flag else x + 1
+        mask = base_mask & ((arange % 2) == (0 if flag else 1))
+    valid = mask & (source >= 0) & (source < bins)
+    expected = torch.bincount(source[valid].to(torch.int64), minlength=bins)[:bins]
+    sentinel = -777
+    out = torch.full((bins + 4,), sentinel, dtype=torch.int32, device="mps")
+    _histogram_replay_supported_kernel[(1,)](
+        x.to("mps"), base_mask.to("mps"), out, flag,
+        BLOCK=block, BINS=bins, MODE=mode, num_warps=4)
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[:bins].to(torch.int64), expected,
+                               atol=0, rtol=0)
+    assert torch.all(actual[bins:] == sentinel)
+
+
 @triton.jit
 def _gather_loop_carried_i32_kernel(x_ptr, idx_ptr, out_ptr, steps,
                                     BLOCK: tl.constexpr):

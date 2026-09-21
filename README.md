@@ -410,6 +410,10 @@ The current dependency-ordered priorities are:
    recurrences retain their materialized path. Rejection leaves the compiler
    usable for subsequent kernels instead of terminating the process during
    conversion cleanup.
+   Histogram source and mask expressions also reject tensor-valued runtime
+   branch results before conversion, including small tiles: histogram always
+   replays its inputs. Scalar branch results and elementwise selects remain
+   supported.
    Non-f32 FMA and the f32-only unary math operations also fail in preflight
    with type diagnostics; explicitly convert operands to f32 to use them.
    Numeric casts with f64 operands or results also have named diagnostics.

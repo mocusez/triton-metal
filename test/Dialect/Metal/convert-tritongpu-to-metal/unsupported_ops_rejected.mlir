@@ -683,6 +683,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Histogram replays its source even when the tile is smaller than the CTA.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_histogram_tensor_if_source(%flag: i1) {
+    %r = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #blocked>
+    %one = arith.constant dense<1> : tensor<32xi32, #blocked>
+    %src = scf.if %flag -> tensor<32xi32, #blocked> {
+      %plus = arith.addi %r, %one : tensor<32xi32, #blocked>
+      scf.yield %plus : tensor<32xi32, #blocked>
+    } else {
+      scf.yield %r : tensor<32xi32, #blocked>
+    }
+    // expected-error @+1 {{Metal backend: tt.histogram source cone is not rank-1 evaluable}}
+    %hist = tt.histogram %src : tensor<32xi32, #blocked> -> tensor<16xi32, #blocked>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_histogram_tensor_if_mask(%flag: i1) {
+    %r = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %four = arith.constant dense<4> : tensor<256xi32, #blocked>
+    %mask = scf.if %flag -> tensor<256xi1, #blocked> {
+      %lt = arith.cmpi slt, %r, %four : tensor<256xi32, #blocked>
+      scf.yield %lt : tensor<256xi1, #blocked>
+    } else {
+      %ge = arith.cmpi sge, %r, %four : tensor<256xi32, #blocked>
+      scf.yield %ge : tensor<256xi1, #blocked>
+    }
+    // expected-error @+1 {{Metal backend: tt.histogram mask cone is not rank-1 i1 evaluable}}
+    %hist = tt.histogram %r, %mask : tensor<256xi32, #blocked> -> tensor<16xi32, #blocked>
+    tt.print "hist: " {hex = false, isSigned = array<i32: 1>} : %hist : tensor<16xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // A `#ttg.linear` `tt.make_range` USED to be refused here, because
 // MakeRangeLowering could only decompose a blocked layout (rank-1), a
 // slice-of-blocked (rank-2) or a slice-of-slice-of-blocked (rank-3), and

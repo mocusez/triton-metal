@@ -10682,9 +10682,12 @@ unsupportedHistogramReason(mlir::triton::HistogramOp op) {
   auto dstTile = tileFromTensor(dstTy);
   if (!dstTile || dstTile->rank != 1)
     return "tt.histogram requires a blocked result layout";
-  if (!rank1ConeSupported(op.getSrc(), 0))
+  // Histogram replays every source element even for sub-threadgroup tiles.
+  // Tensor-yielding branches lose their source chains during SCF conversion,
+  // so the shared preflight/lowering predicate must be conversion-stable.
+  if (!coneReplayableAcrossConversion(op.getSrc()))
     return "tt.histogram source cone is not rank-1 evaluable";
-  if (op.getMask() && !rank1ConeSupported(op.getMask(), 0))
+  if (op.getMask() && !coneReplayableAcrossConversion(op.getMask()))
     return "tt.histogram mask cone is not rank-1 i1 evaluable";
   return {};
 }
