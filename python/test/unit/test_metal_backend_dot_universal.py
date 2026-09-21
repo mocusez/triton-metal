@@ -3384,6 +3384,271 @@ def test_dot_recompute_loop_strided_a_is_named(capfd, real_trans):
 
 
 # ----------------------------------------------------------------------------
+# Does the operand's axis FOLD to `origin + i * stride`?
+#
+# `ScalarDotLowering` does not replay an operand's address, it REBUILDS one as
+# `gRow*stride_a + k*a_inner_stride`. The contiguity guard above asks whether
+# the axis carries a multiply it recognises -- a `tt.splat` of a runtime scalar
+# sitting outside the `expand_dims` -- and reads "no multiply found" as "stride
+# one". Three other spellings of a non-contiguous axis carry no such multiply
+# and were rebuilt as dense, silently:
+#
+#   * a constexpr stride, which Triton materializes as `arith.constant dense<2>`
+#     rather than a splat, in either spelling;
+#   * a runtime stride multiplied BEFORE the `expand_dims`;
+#   * an axis that is an arbitrary cone of its index -- an im2col gather, where
+#     neither the row origin nor the reduction offset is affine at all. That is
+#     what a vision-transformer patch embedding writes, and every element of its
+#     answer was wrong.
+#
+# The question is whether the axis folds, not whether the author wrote a splat.
+# ----------------------------------------------------------------------------
+@triton.jit
+def dot_const_strided_inner_kernel(
+    a_ptr, b_ptr, o_ptr, M, N, K,
+    lda: tl.constexpr, sak: tl.constexpr, ldb: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    MUL_BEFORE_EXPAND: tl.constexpr,
+):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        if MUL_BEFORE_EXPAND:
+            av = tl.load(a_ptr + om[:, None] * lda + (ok * sak)[None, :],
+                         mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        else:
+            av = tl.load(a_ptr + om[:, None] * lda + ok[None, :] * sak,
+                         mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * ldb + ok[:, None],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(o_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+@pytest.mark.parametrize("mul_before_expand", [False, True],
+                         ids=["scaled_range", "scaled_before_expand"])
+def test_dot_constexpr_inner_stride_matches_torch(mul_before_expand):
+    """A constexpr inner stride carries no splat, and was read as dense.
+
+    The operand now CARRIES its index function rather than being rebuilt from a
+    stride that cannot spell it, so both spellings compute instead of refusing.
+    """
+    M = N = K = 32
+    lda, ldb = 2 * K + 8, K + 8
+    big_a = torch.randn((M, lda), dtype=torch.float32)
+    big_b = torch.randn((N, ldb), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    dot_const_strided_inner_kernel[(1, 1)](
+        big_a, big_b, out, M, N, K, lda, 2, ldb,
+        BM=M, BN=N, BK=16, MUL_BEFORE_EXPAND=mul_before_expand, num_warps=1,
+    )
+    torch.testing.assert_close(out, big_a[:, 0:2 * K:2] @ big_b[:, :K].t(),
+                               atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def dot_runtime_strided_inner_kernel(
+    a_ptr, b_ptr, o_ptr, M, N, K, lda, sak, ldb,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * lda + ok[None, :] * sak,
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * ldb + ok[:, None],
+                     mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(o_ptr + om[:, None] * N + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def test_dot_runtime_inner_stride_is_named(capfd):
+    """A RUNTIME inner stride still refuses.
+
+    The index region is deliberately self-contained -- every leaf is the axis
+    index or a constexpr constant -- so it references nothing the conversion
+    could invalidate underneath it. A runtime multiplier has no such spelling
+    and is refused rather than carried.
+    """
+    M = N = K = 32
+    lda, ldb = 2 * K + 8, K + 8
+    big_a = torch.randn((M, lda), dtype=torch.float32)
+    big_b = torch.randn((N, ldb), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    with pytest.raises(Exception):
+        dot_runtime_strided_inner_kernel[(1, 1)](
+            big_a, big_b, out, M, N, K, lda, 2, ldb, BM=M, BN=N, BK=16,
+            num_warps=1,
+        )
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+def test_dot_unit_inner_stride_spelled_before_expand_matches_torch():
+    """The same spelling at stride one still folds, and still computes."""
+    M = N = K = 32
+    lda, ldb = K + 8, K + 8
+    big_a = torch.randn((M, lda), dtype=torch.float32)
+    big_b = torch.randn((N, ldb), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    dot_const_strided_inner_kernel[(1, 1)](
+        big_a, big_b, out, M, N, K, lda, 1, ldb,
+        BM=M, BN=N, BK=16, MUL_BEFORE_EXPAND=True, num_warps=1,
+    )
+    torch.testing.assert_close(out, big_a[:, :K] @ big_b[:, :K].t(),
+                               atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def dot_im2col_gather_kernel(
+    img_ptr, w_ptr, o_ptr, M, D,
+    C: tl.constexpr, H: tl.constexpr, W: tl.constexpr, P: tl.constexpr,
+    GH: tl.constexpr, GW: tl.constexpr, K: tl.constexpr,
+    BM: tl.constexpr, BD: tl.constexpr, BK: tl.constexpr,
+):
+    """A patch-embedding A operand: neither axis is affine in its index."""
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    d = tl.program_id(1) * BD + tl.arange(0, BD)
+    base = ((m // (GH * GW)) * (C * H * W)
+            + ((m % (GH * GW)) // GW) * (P * W)
+            + ((m % (GH * GW)) % GW) * P)
+    acc = tl.zeros((BM, BD), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        k = kk + tl.arange(0, BK)
+        delta = (k // (P * P)) * (H * W) + ((k // P) % P) * W + k % P
+        a = tl.load(img_ptr + base[:, None] + delta[None, :],
+                    mask=(m[:, None] < M) & (k[None, :] < K), other=0.0)
+        w = tl.load(w_ptr + d[None, :] * K + k[:, None],
+                    mask=(k[:, None] < K) & (d[None, :] < D), other=0.0)
+        acc = tl.dot(a, w, acc, input_precision="ieee")
+    tl.store(o_ptr + m[:, None] * D + d[None, :], acc,
+             mask=(m[:, None] < M) & (d[None, :] < D))
+
+
+def _im2col_reference(img, weight, C, H, W, P):
+    GH, GW = H // P, W // P
+    flat = (img.reshape(1, C, GH, P, GW, P).permute(0, 2, 4, 1, 3, 5)
+            .reshape(GH * GW, C * P * P))
+    return flat.float() @ weight.float().t()
+
+
+@pytest.mark.parametrize("C,H,W,P,D,BK", [
+    pytest.param(3, 32, 32, 16, 64, 32, id="rgb_p16"),
+    pytest.param(1, 28, 28, 7, 64, 64, id="gray_p7_bk_over_k"),
+])
+def test_dot_im2col_gather_operand_matches_torch(C, H, W, P, D, BK):
+    """The patch-embedding operand: neither axis is affine in its index.
+
+    `gray_p7_bk_over_k` is the shape that got away once the region existed:
+    `BK > K` collapses the K loop to one trip, Triton folds the loop, and the
+    reduction length fell back to `min(stride_a, tile_K)` -- but a gather's
+    `stride_a` is only whatever constant its row cone happened to name.
+    """
+    GH, GW = H // P, W // P
+    M, K = GH * GW, C * P * P
+    img = torch.randn((1, C, H, W), dtype=torch.float32)
+    weight = torch.randn((D, K), dtype=torch.float32)
+    out = torch.zeros((M, D), dtype=torch.float32)
+    dot_im2col_gather_kernel[(1, 1)](
+        img, weight, out, M, D, C, H, W, P, GH, GW, K,
+        BM=32, BD=D, BK=BK, num_warps=4,
+    )
+    torch.testing.assert_close(out, _im2col_reference(img, weight, C, H, W, P),
+                               atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def dot_im2col_advance_kernel(
+    img_ptr, w_ptr, o_ptr, M, D,
+    C: tl.constexpr, H: tl.constexpr, W: tl.constexpr, P: tl.constexpr,
+    GH: tl.constexpr, GW: tl.constexpr, K: tl.constexpr,
+    BM: tl.constexpr, BD: tl.constexpr, BK: tl.constexpr,
+):
+    """A gather carried by a POINTER-ADVANCE loop, with no mask anywhere."""
+    m = tl.arange(0, BM)
+    d = tl.arange(0, BD)
+    base = ((m // (GH * GW)) * (C * H * W)
+            + ((m % (GH * GW)) // GW) * (P * W)
+            + ((m % (GH * GW)) % GW) * P)
+    k0 = tl.arange(0, BK)
+    delta = (k0 // (P * P)) * (H * W) + ((k0 // P) % P) * W + k0 % P
+    a_ptrs = img_ptr + base[:, None] + delta[None, :]
+    b_ptrs = w_ptr + d[None, :] * K + k0[:, None]
+    acc = tl.zeros((BM, BD), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BK)):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc,
+                     input_precision="ieee")
+        a_ptrs += BK
+        b_ptrs += BK
+    tl.store(o_ptr + m[:, None] * D + d[None, :], acc,
+             mask=(m[:, None] < M) & (d[None, :] < D))
+
+
+def test_dot_im2col_gather_pointer_advance_is_named(capfd):
+    """No loop rule and no mask means no exact reduction length: refuse.
+
+    A carried index region removes `stride_a` as a length, so the only exact
+    answer left is the one the load's own mask states. Without it the op is
+    refused rather than reduced over a guess.
+    """
+    C, H, W, P, D = 3, 32, 32, 16, 64
+    GH, GW = H // P, W // P
+    M, K = GH * GW, C * P * P
+    img = torch.randn((1, C, H, W), dtype=torch.float32)
+    weight = torch.randn((D, K), dtype=torch.float32)
+    out = torch.zeros((M, D), dtype=torch.float32)
+    with pytest.raises(Exception):
+        dot_im2col_advance_kernel[(1, 1)](
+            img, weight, out, M, D, C, H, W, P, GH, GW, K,
+            BM=32, BD=D, BK=32, num_warps=4,
+        )
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+@triton.jit
+def dot_tail_wrapped_rows_kernel(
+    a_ptr, b_ptr, o_ptr, M, N, K,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """`(pid*BM + i) % M`: the tail wrap tutorial 03 writes on the row axis."""
+    om = (tl.program_id(0) * BM + tl.arange(0, BM)) % M
+    on = (tl.program_id(1) * BN + tl.arange(0, BN)) % N
+    oc_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    oc_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * K + ok[None, :],
+                     mask=ok[None, :] < K, other=0.0)
+        bv = tl.load(b_ptr + on[None, :] * K + ok[:, None],
+                     mask=ok[:, None] < K, other=0.0)
+        acc += tl.dot(av, bv)
+    tl.store(o_ptr + oc_m[:, None] * N + oc_n[None, :], acc,
+             mask=(oc_m[:, None] < M) & (oc_n[None, :] < N))
+
+
+def test_dot_tail_wrapped_rows_matches_torch():
+    """The wrap is dropped by the rebuild and guarded by the store mask.
+
+    It must keep compiling: it is what the most-copied Triton matmul writes.
+    """
+    M, N, K = 48, 48, 32
+    BM = BN = 32
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((N, K), dtype=torch.float32)
+    out = torch.zeros((M, N), dtype=torch.float32)
+    dot_tail_wrapped_rows_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        a, b, out, M, N, K, BM=BM, BN=BN, BK=16, num_warps=1,
+    )
+    torch.testing.assert_close(out, a @ b.t(), atol=2e-3, rtol=2e-3)
+
+
+# ----------------------------------------------------------------------------
 # A transposed B: the two spellings need opposite dense axes.
 #
 # A real `tt.trans` loads an [N, K] tile, so K -- the axis an [N, K] buffer is

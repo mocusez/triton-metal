@@ -1173,6 +1173,21 @@ def SdpaOp : Metal_Op<"sdpa"> {
 // FusedAttentionOp
 //===----------------------------------------------------------------------===//
 
+def ScalarDotIndexYieldOp : Metal_Op<"scalar_dot_index_yield",
+                                     [Pure, Terminator,
+                                      HasParent<"ScalarDotOp">]> {
+  let summary = "Terminator of a metal.scalar_dot operand index region";
+  let description = [{
+    Yields the operand's logical element index for one (axis-0, axis-1) pair,
+    as a signless i32. The parent op carries the buffer's scalar base offsets
+    separately, so this is the tile-relative index only.
+  }];
+
+  let arguments = (ins I32:$index);
+
+  let assemblyFormat = "$index attr-dict `:` type($index)";
+}
+
 def ScoreYieldOp : Metal_Op<"score_yield", [Pure, Terminator,
                                             HasParent<"FusedAttentionOp">]> {
   let summary = "Terminator of a metal.fused_attention score-transform region";
@@ -1987,6 +2002,15 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
 
   let results = (outs AnyType:$result);
 
+  // An operand whose source address does NOT fold to `origin + i*stride` --
+  // an im2col gather, where the row origin and the reduction offset are each
+  // an arbitrary cone of their index -- cannot be rebuilt from the strides
+  // above. Such an operand carries its index function here instead: one block
+  // taking the tile's two GLOBAL axis indices (A: row, k; B: k, col) and
+  // yielding the logical element index with `metal.yield`. A region is empty
+  // when the operand's address folds, which is the ordinary case.
+  let regions = (region AnyRegion:$a_index, AnyRegion:$b_index);
+
   let assemblyFormat = "$a_buf `,` $b_buf `offset` `[` $a_base_offset `,`"
                        "$b_base_offset `]` `batch_offset` `[` $a_batch_offset"
                        " `,` $b_batch_offset `]` `origin` `[` $batch_origin"
@@ -2000,7 +2024,8 @@ def ScalarDotOp : Metal_Op<"scalar_dot", [AttrSizedOperandSegments]> {
                        " (`partial` `[` $partial_extents^ `]`)?"
                        " (`scales` `[` $scale_bufs^ `]` `params` `[`"
                        " $scale_params `]`)?"
-                       " attr-dict `:` functional-type(operands, results)";
+                       " attr-dict `:` functional-type(operands, results)"
+                       " (`a_index` $a_index^)? (`b_index` $b_index^)?";
 }
 
 #endif // METAL_OPS
