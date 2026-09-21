@@ -3792,6 +3792,93 @@ def test_dot_real_trans_b_strided_dense_axis_is_named(capfd):
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
 
 
+@triton.jit
+def dot_transposed_b_wrap_kernel(
+    a_ptr, b_ptr, c_ptr, M, N, K, lda, ldb, ldc, WRAP: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    REAL_TRANS: tl.constexpr, TAIL: tl.constexpr,
+):
+    """A `%` on a transposed B's loose axis, which is N in both spellings."""
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    # The wrapped index reaches B's ADDRESS only. The store and every mask keep
+    # the unwrapped one, so `on < N` is still what guards the axis.
+    #
+    # The tail case divides by the RUNTIME `N` the mask itself uses, the way
+    # tutorial 03 writes it. A constexpr that merely equals N is a different
+    # value and would not be proven, which would refuse a legal kernel.
+    if TAIL:
+        bsrc = on % N
+    else:
+        bsrc = on % WRAP
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        ok = kk + tl.arange(0, BK)
+        av = tl.load(a_ptr + om[:, None] * lda + ok[None, :],
+                     mask=(om[:, None] < M) & (ok[None, :] < K), other=0.0)
+        if REAL_TRANS:
+            bnk = tl.load(b_ptr + bsrc[:, None] * ldb + ok[None, :],
+                          mask=(on[:, None] < N) & (ok[None, :] < K), other=0.0)
+            acc = tl.dot(av, tl.trans(bnk), acc)
+        else:
+            bv = tl.load(b_ptr + bsrc[None, :] * ldb + ok[:, None],
+                         mask=(ok[:, None] < K) & (on[None, :] < N), other=0.0)
+            acc += tl.dot(av, bv)
+    tl.store(c_ptr + om[:, None] * ldc + on[None, :], acc,
+             mask=(om[:, None] < M) & (on[None, :] < N))
+
+
+def _run_transposed_b_wrap(*, real_trans, tail, wrap=7, N=64):
+    BM, BN, BK, M, K, pad = 32, 64, 16, 32, 128, 24
+    lda = ldb = K + pad
+    ldc = BN + pad
+    torch.manual_seed(0x7B05)
+    # B gets its full BN rows: a DROPPED modulo has to read valid memory, or the
+    # two candidate answers differ by NaN rather than by the thing under test.
+    big_a = torch.randn((BM, lda), dtype=torch.float32)
+    big_b = torch.randn((BN, ldb), dtype=torch.float32)
+    big_c = torch.zeros((BM, ldc), dtype=torch.float32)
+    dot_transposed_b_wrap_kernel[(1, 1)](
+        big_a, big_b, big_c, M, N, K, lda, ldb, ldc, wrap,
+        BM=BM, BN=BN, BK=BK, REAL_TRANS=real_trans, TAIL=tail, num_warps=1,
+    )
+    a, bnk = big_a[:M, :K], big_b[:, :K]
+    gathered = bnk[torch.arange(N) % (N if tail else wrap)]
+    return big_c[:M, :N], a @ gathered.t(), a @ bnk[:N].t()
+
+
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_transposed_b_unrelated_modulo_is_named(capfd, real_trans):
+    """A `%` a transposed B cannot prove must be refused, not dropped.
+
+    Every tier rebuilds the address from an origin and a stride, so all of them
+    DROP the remainder. That is sound only for the tail wrap, whose divisor is
+    the extent guarding the axis. `n % 7` moves columns the mask keeps, and both
+    spellings answered with column `n` -- bit-identical to the remainder being
+    absent. A transposed operand has no index region to fall back to (the
+    region's block arguments are the TILE's axes and `tt.trans` swaps them), so
+    the correct outcome here is a named refusal rather than a computation.
+    """
+    with pytest.raises(Exception):
+        _run_transposed_b_wrap(real_trans=real_trans, tail=False)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
+def test_dot_transposed_b_tail_wrapped_cols_matches_torch(real_trans):
+    """The tail wrap on a transposed B must still be claimed.
+
+    This is a guard-rail against the proof being too STRICT, not too loose: the
+    wrapped and unwrapped answers are identical here by construction, so it says
+    nothing about whether the remainder was computed or dropped. What it catches
+    is the proof failing on a shape tutorial 03 writes, which would refuse a
+    legal kernel. Whether the FAST tier still claims it is a question only the
+    emitted MSL answers -- see the probe under `.omx/plans`.
+    """
+    got, ref, _ = _run_transposed_b_wrap(real_trans=real_trans, tail=True, N=40)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
 # ----------------------------------------------------------------------------
 # The form every Triton matmul is actually written in: a flat grid with
 # group-ordered swizzling, pointer advance, masked loads and a masked store.

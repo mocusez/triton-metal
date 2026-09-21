@@ -27003,7 +27003,7 @@ static ScalarDotOp sdCreateScalarDot(
   // A `%` on the axis the rebuild does not advance is only sound as the TAIL
   // WRAP. Keep the divisors here and prove them once the store's mask extents
   // are known, a few blocks below.
-  mlir::Value aLooseWrapDivisor, bLooseWrapDivisor;
+  mlir::Value aLooseWrapDivisor, bLooseWrapDivisor, bTransposedWrapDivisor;
   int bLooseAxis = 0;
   if (!scaleInfo && !weightLoad) {
     if (!transposeA && !simdgroupTileIsContiguous(aLoad.getPtr()))
@@ -27056,11 +27056,17 @@ static ScalarDotOp sdCreateScalarDot(
       bIndexRegion = true;
     bLooseAxis = bDenseAxis == 0 ? 1 : 0;
     // A transposed operand is still refused on the old terms: it has no region
-    // to fall back to.
-    if (transposeB && (!simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis) ||
-                       !sdOperandAddressIsRebuildable(
-                           sdResolveLoopCarriedPtrInit(bLoad.getPtr()),
-                           bDenseAxis)))
+    // to fall back to. Its `%` needs the same proof as a straight B's, and the
+    // axis to prove it against is N in BOTH spellings -- a real `tt.trans`
+    // loads [N, K] so its dense axis is 1 and N is axis 0, an address-only
+    // transpose loads [K, N] so its dense axis is 0 and N is axis 1. Measured
+    // before this was added: `n % 7` on either spelling answered with column
+    // `n`, bit-identical to the remainder simply being absent.
+    if (transposeB &&
+        (!simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis) ||
+         !sdOperandAddressIsRebuildable(
+             sdResolveLoopCarriedPtrInit(bLoad.getPtr()), bDenseAxis,
+             &bTransposedWrapDivisor)))
       return {};
   }
 
@@ -27130,6 +27136,12 @@ static ScalarDotOp sdCreateScalarDot(
     if (bLooseWrapDivisor &&
         !(bLooseAxis == 1 && proven(bLooseWrapDivisor, maskExtents.nExtent)))
       bIndexRegion = true;
+    // A transposed B cannot carry a region -- the block arguments are the
+    // TILE's axes and a `tt.trans` consumer swaps them -- so an unproven wrap
+    // here is a NAMED REFUSAL, not a widening.
+    if (bTransposedWrapDivisor &&
+        !proven(bTransposedWrapDivisor, maskExtents.nExtent))
+      return {};
   }
 
   mlir::OpBuilder builder(insertBefore);
@@ -30252,8 +30264,84 @@ static std::optional<int64_t> findConstRowStrideInPtrChain(mlir::Value ptr) {
   return sdConstStride(parts.rowContrib);
 }
 
+// The dot's store, which may sit outside the K loop the dot lives in.
+static mlir::triton::StoreOp sdFindStoreThroughLoop(mlir::triton::DotOp dot) {
+  if (auto st = sdFindStore(dot.getResult()))
+    return st;
+  auto forOp = dot->getParentOfType<mlir::scf::ForOp>();
+  if (!forOp)
+    return nullptr;
+  for (auto res : forOp.getResults())
+    if (auto st = sdFindStore(res))
+      return st;
+  return nullptr;
+}
+
+// Every tier below rebuilds an operand address from an origin and a stride, and
+// a `%` on an index has no place in that form -- so all of them DROP it. That
+// is sound for exactly one shape, the tail wrap `(pid*BM + i) % M`, which
+// tutorial 03 writes so the edge tile's rows stay in bounds without an M mask:
+// the store mask discards precisely the lanes the remainder would have moved.
+// For any other divisor it is a silent wrong answer. Measured before this gate
+// existed: `n % 7` on a `tt.trans`-ed B was answered with column `n`, bit
+// identical to the remainder simply being absent.
+//
+// `metal.scalar_dot` proves its own wraps and can spell an unproven one exactly
+// in an index region. These tiers cannot, so an unproven wrap DECLINES here and
+// the dot falls through to that fallback rather than being answered wrongly.
+//
+// This asks ONLY about the remainder. An axis that does not fold at all is left
+// alone: widening these tiers' address model is a separate question with its
+// own measurement, and refusing it here would decline kernels they handle today.
+static bool sdFastTierWrapsAreProven(mlir::triton::DotOp dot) {
+  auto aLoad = sdPeelToLoad(dot.getA());
+  auto bLoad = sdPeelToLoad(dot.getB());
+  if (!aLoad || !bLoad)
+    return true;
+  MaskExtents ext;
+  if (auto store = sdFindStoreThroughLoop(dot))
+    if (store.getMask())
+      ext = extractMaskExtents(store.getMask(), /*allowDenseSplatBounds=*/true);
+
+  // The divisor sits in the pointer cone as `tt.splat(M)` while the mask's
+  // extent is the scalar `M`, so peel both before comparing -- see the same
+  // proof in `sdCreateScalarDot`, where not peeling routed the tail wrap itself
+  // away and stopped the most-copied Triton matmul compiling.
+  auto peel = [](mlir::Value v) {
+    mlir::Value scalar = sdSplatScalarSource(v);
+    return scalar ? scalar : v;
+  };
+  auto proven = [&](mlir::Value divisor, mlir::Value extent) {
+    return divisor && extent &&
+           (sdAreSameMaskExtent(divisor, extent) ||
+            sdAreSameMaskExtent(peel(divisor), peel(extent)));
+  };
+  // `guard` is null for an axis nothing bounds -- either operand's K axis --
+  // where any wrap is unprovable by construction.
+  auto axisOk = [&](mlir::Value ptr, int axis, mlir::Value guard) {
+    auto fold = sdFoldPtrAxis(ptr, axis);
+    if (!fold || !fold->wraps)
+      return true;
+    return proven(fold->wrapDivisor, guard);
+  };
+
+  mlir::Value aPtr = sdResolveLoopCarriedPtrInit(aLoad.getPtr());
+  // A's tile is [M, K]; only M is guarded, by the store's row extent.
+  if (!axisOk(aPtr, 0, ext.mExtent) || !axisOk(aPtr, 1, mlir::Value()))
+    return false;
+  // A real `tt.trans` loads [N, K], so N is axis 0 there and axis 1 otherwise.
+  const bool bTrans = sdConeCrossesTranspose(dot.getB());
+  mlir::Value bPtr = sdResolveLoopCarriedPtrInit(bLoad.getPtr());
+  if (!axisOk(bPtr, bTrans ? 0 : 1, ext.nExtent) ||
+      !axisOk(bPtr, bTrans ? 1 : 0, mlir::Value()))
+    return false;
+  return true;
+}
+
 static void rewriteSingleDot(mlir::triton::DotOp dot) {
   if (dotBAddressIsTransposed(dot))
+    return;
+  if (!sdFastTierWrapsAreProven(dot))
     return;
   // Matmul track session 4c-3: try canonical 3-iter_arg unroll first
   // (real Triton matmul shape with a_ptrs/b_ptrs/acc iter_args).
