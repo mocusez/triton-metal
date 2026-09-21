@@ -39909,6 +39909,38 @@ struct ConvertTritonGPUToMetalPass
       return;
     }
 
+    // Single-value rank-1 scans replay padded/multi-band inputs and inputs
+    // inside an if. Check after source normalization (notably
+    // flattenUniformScanInputScfIf) and whole-kernel matching, but before
+    // structural conversion can erase tensor producer chains. The early
+    // validateScanSupport has already checked their geometry and combine.
+    bool scanSourcesOk = true;
+    moduleOp.walk([&](mlir::triton::ScanOp scan) {
+      if (scan.getSrcs().size() != 1)
+        return;
+      auto type = mlir::dyn_cast<mlir::RankedTensorType>(scan.getType(0));
+      auto tile = type ? tileFromTensor(type) : std::nullopt;
+      if (!tile || tile->rank != 1)
+        return;
+      if (type.getNumElements() == tile->threadsPerBlock &&
+          !underDivergentControlFlow(scan))
+        return; // ScanLowering consumes the converted scalar directly.
+      // Aggregate results become buffer reads; their own passes validate
+      // materialization. The lowering still requires registered buffers.
+      if (coneReplayableAcrossConversion(scan.getSrcs().front(),
+                                        /*deferAggregateLeaves=*/true))
+        return;
+      scan.emitOpError(
+          "Metal backend: rank-1 scan cannot replay its source across "
+          "conversion; use a replayable source expression or a full "
+          "one-element-per-thread tile outside conditional control flow");
+      scanSourcesOk = false;
+    });
+    if (!scanSourcesOk) {
+      signalPassFailure();
+      return;
+    }
+
     // Inc 2.5 rank-2: stage loop-carried [M,N] reduce tiles in threadgroup
     // memory. Must run pre-conversion — the SCF structural conversion rebuilds
     // the loop with per-thread scalar iter_args and detaches the original body

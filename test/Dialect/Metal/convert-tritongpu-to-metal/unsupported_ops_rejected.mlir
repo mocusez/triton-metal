@@ -952,3 +952,70 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Padded scans replay every input; a scalarized FMA cannot supply that replay.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_scan_fma_padded(%input: !tt.ptr<f32>) {
+    %off = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #blocked>
+    %base = tt.splat %input : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    %x = tt.load %ptr : tensor<32x!tt.ptr<f32>, #blocked>
+    %src = math.fma %x, %x, %x : tensor<32xf32, #blocked>
+    // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
+    %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<32xf32, #blocked>) -> tensor<32xf32, #blocked>
+    tt.print "scan: " {hex = false, isSigned = array<i32: 1>} : %scan : tensor<32xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_scan_fma_multiband(%input: !tt.ptr<f32>) {
+    %off = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %base = tt.splat %input : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %x = tt.load %ptr : tensor<256x!tt.ptr<f32>, #blocked>
+    %src = math.fma %x, %x, %x : tensor<256xf32, #blocked>
+    // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
+    %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.print "scan: " {hex = false, isSigned = array<i32: 1>} : %scan : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// An enclosing uniform if also disables the exact-thread-count direct input.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_scan_fma_inside_if(%input: !tt.ptr<f32>, %flag: i1) {
+    scf.if %flag {
+      %off = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #blocked>
+      %base = tt.splat %input : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+      %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+      %x = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
+      %src = math.fma %x, %x, %x : tensor<128xf32, #blocked>
+      // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
+      %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+      tt.print "scan: " {hex = false, isSigned = array<i32: 1>} : %scan : tensor<128xf32, #blocked>
+    }
+    tt.return
+  }
+}

@@ -1494,6 +1494,234 @@ def test_histogram_replay_supported_numeric(block, mode, flag):
     assert torch.all(actual[bins:] == sentinel)
 
 
+@triton.jit(do_not_specialize=["flag"])
+def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
+                                  BLOCK: tl.constexpr, MODE: tl.constexpr,
+                                  REVERSE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    if MODE == "fma":
+        x = tl.fma(x, x, 1.0)
+        y = tl.cumsum(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "rem":
+        x = x % 3.0
+        y = tl.cumsum(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "div":
+        x = tl.div_rn(x, 3.0)
+        y = tl.cumsum(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "nested_if":
+        if flag:
+            x = tl.fma(x, x, 1.0)
+            y = tl.cumsum(x, 0, reverse=REVERSE)
+            tl.store(out_ptr + offs, y)
+        else:
+            x = x + 1.0
+            y = tl.cumsum(x, 0, reverse=REVERSE)
+            tl.store(out_ptr + offs, y)
+    else:
+        x = x * 2.0 + 1.0
+        y = tl.cumsum(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+
+
+@pytest.mark.parametrize(
+    "block,mode",
+    [
+        pytest.param(block, mode, id=f"b{block}_{mode}")
+        for block in (32, 256)
+        for mode in ("fma", "rem", "div")
+    ] + [
+        pytest.param(128, "nested_if", id="b128_nested_if"),
+    ],
+)
+def test_scan_rank1_source_replay_is_rejected_not_crashed(block, mode, tmp_path):
+    """A declined scan source must report the preflight diagnostic and recover."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "scan_source_preflight.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(block, mode):
+            return triton.compile(ASTSource(
+                module._scan_source_preflight_kernel,
+                signature={{"x_ptr": "*fp32", "out_ptr": "*fp32",
+                           "flag": "i32"}},
+                constexprs={{"BLOCK": block, "MODE": mode,
+                            "REVERSE": False}}),
+                target=target, options={{"num_warps": 4}})
+
+        for attempt in range(3):
+            try:
+                compile_case({block}, {mode!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported scan source compiled")
+        compile_case(128, "arithmetic")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = "Metal backend: rank-1 scan cannot replay its source across conversion"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+@triton.jit(do_not_specialize=["flag"])
+def _scan_rank1_source_supported_kernel(x_ptr, out_ptr, flag,
+                                        BLOCK: tl.constexpr,
+                                        MODE: tl.constexpr,
+                                        REVERSE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    if MODE == "fma":
+        src = tl.fma(x, x, 1.0)
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "rem":
+        src = x % 3.0
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "div":
+        src = tl.div_rn(x, 3.0)
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "tensor_if":
+        if flag:
+            src = x + 1.0
+        else:
+            src = x * 2.0
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "select":
+        src = tl.where((offs % 2) == flag, x + 1.0, x * 2.0)
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "scan_chain":
+        first = tl.cumsum(x, 0, reverse=REVERSE)
+        y = tl.cumsum(first, 0, reverse=not REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "cumprod":
+        y = tl.cumprod(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+    elif MODE == "inside_if":
+        if flag:
+            src = x + 1.0
+            y = tl.cumsum(src, 0, reverse=REVERSE)
+            tl.store(out_ptr + offs, y)
+        else:
+            src = x * 2.0
+            y = tl.cumsum(src, 0, reverse=REVERSE)
+            tl.store(out_ptr + offs, y)
+    else:
+        src = x * 2.0 + 1.0
+        y = tl.cumsum(src, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
+
+
+@pytest.mark.parametrize(
+    "block,mode,flag,reverse",
+    [
+        pytest.param(128, mode, 1, reverse,
+                     id=f"b128_exact_{mode}_rev{int(reverse)}")
+        for mode in ("fma", "rem", "div")
+        for reverse in (False, True)
+    ] + [
+        pytest.param(block, "tensor_if", flag, reverse,
+                     id=f"b{block}_tensor_if_flag{flag}_rev{int(reverse)}")
+        for block in (32, 128, 256)
+        for flag in (0, 1)
+        for reverse in (False, True)
+    ] + [
+        pytest.param(block, mode, flag, reverse,
+                     id=f"b{block}_{mode}_flag{flag}_rev{int(reverse)}")
+        for block in (32, 256)
+        for mode in ("select",)
+        for flag in (0, 1)
+        for reverse in (False, True)
+    ] + [
+        pytest.param(block, "arithmetic", 1, reverse,
+                     id=f"b{block}_arithmetic_rev{int(reverse)}")
+        for block in (32, 256)
+        for reverse in (False, True)
+    ] + [
+        pytest.param(block, "scan_chain", 1, reverse,
+                     id=f"b{block}_scan_chain_rev{int(reverse)}")
+        for block in (128, 256)
+        for reverse in (False, True)
+    ] + [
+        pytest.param(block, "cumprod", 1, False,
+                     id=f"b{block}_cumprod")
+        for block in (128, 256)
+    ] + [
+        pytest.param(128, "inside_if", flag, reverse,
+                     id=f"b128_inside_if_flag{flag}_rev{int(reverse)}")
+        for flag in (0, 1)
+        for reverse in (False, True)
+    ],
+)
+def test_scan_rank1_source_replay_supported_numeric(block, mode, flag, reverse):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    if mode == "cumprod":
+        x = 1.0 + (torch.arange(block, dtype=torch.float32) % 5) * 0.001
+    else:
+        x = (torch.arange(block, dtype=torch.float32) - block // 2) * 0.03125
+    if mode == "fma":
+        source = x * x + 1.0
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    elif mode == "rem":
+        source = torch.fmod(x, 3.0)
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    elif mode == "div":
+        source = x / 3.0
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    elif mode in ("tensor_if", "inside_if"):
+        source = x + 1.0 if flag else x * 2.0
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    elif mode == "select":
+        arange = torch.arange(block, dtype=torch.int32)
+        source = torch.where((arange % 2) == flag, x + 1.0, x * 2.0)
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    elif mode == "scan_chain":
+        first = x.flip(0).cumsum(0).flip(0) if reverse else x.cumsum(0)
+        expected = first.cumsum(0) if reverse else first.flip(0).cumsum(0).flip(0)
+    elif mode == "cumprod":
+        expected = x.flip(0).cumprod(0).flip(0) if reverse else x.cumprod(0)
+    else:
+        source = x * 2.0 + 1.0
+        expected = source.flip(0).cumsum(0).flip(0) if reverse else source.cumsum(0)
+    sentinel = -9876.0
+    out = torch.full((block + 8,), sentinel, dtype=torch.float32, device="mps")
+    _scan_rank1_source_supported_kernel[(1,)](
+        x.to("mps"), out, flag, BLOCK=block, MODE=mode,
+        REVERSE=reverse, num_warps=4)
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[:block], expected, atol=1e-5, rtol=1e-5)
+    assert torch.all(actual[block:] == sentinel)
+
+
 @triton.jit
 def _gather_loop_carried_i32_kernel(x_ptr, idx_ptr, out_ptr, steps,
                                     BLOCK: tl.constexpr):

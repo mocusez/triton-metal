@@ -367,6 +367,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
+// A full one-element-per-thread scan consumes the scalarized FMA directly.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_fma_exact_thread_count(%input: !tt.ptr<f32>, %output: !tt.ptr<f32>) {
+    %off = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #blocked>
+    %base = tt.splat %input : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %x = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
+    %src = math.fma %x, %x, %x : tensor<128xf32, #blocked>
+    %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    %out = tt.splat %output : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %dst = tt.addptr %out, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %dst, %scan : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_fma_exact_thread_count
+// CHECK-NOT: tt.scan
+// CHECK: %[[FMA:.*]] = metal.fma
+// CHECK-NOT: tt.scan
+// CHECK: metal.store %[[FMA]],
+// CHECK: metal.threadgroup_prefix_sum {{.*}} {block = 128 : i64, tpb = 128 : i64}
+// CHECK-NOT: tt.scan
+
+// -----
+
 // Rank-2 staged scan above one element per thread: BLOCK=64 with tpb=32, so
 // every thread publishes two logical tile positions before reading axis
 // prefixes from the completed tile.

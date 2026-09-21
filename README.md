@@ -463,6 +463,12 @@ The current dependency-ordered priorities are:
    the process down. The general tuple reduce, the general tuple scan and the
    canonical rank-1 reduce now answer that question the same way at both times.
    At one element per thread nothing is replayed and such kernels still compile.
+   Single-value rank-1 scans also check source replay before conversion for
+   padded tiles, multiple elements per thread, and scans inside conditional
+   control flow. Unsupported FMA, floating remainder and precise-division
+   sources receive a named diagnostic. The full one-element-per-thread path
+   outside conditionals remains supported. Direct uniform tensor branches
+   already normalized to selects by the scan pre-pass remain supported too.
    A function whose full-tile exchange phases cannot carry a value across the
    split joined the preflight set on 2026-09-08. That rejection used to be
    emitted from the function lowering, long after the body had been moved into
