@@ -5937,3 +5937,193 @@ def test_scaled_dot_and_unsupported_op_refusals(case, needle, tmp_path):
     assert output.count(needle) == 3, output
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
+
+
+@triton.jit
+def _affine_scan_combine(a, x, b, y):
+    return a * b, b * x + y
+
+
+@triton.jit
+def _segmented_scan_combine(a, x, b, y):
+    return tl.where(y, b, a + b), x | y
+
+
+@triton.jit(do_not_specialize=["flag"])
+def _canonical_tuple_scan_kernel(x_ptr, y_ptr, out_ptr, aux_ptr, flag,
+                                 BLOCK: tl.constexpr, MODE: tl.constexpr,
+                                 KIND: tl.constexpr, REVERSE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    if MODE == "fma":
+        z = tl.fma(x, x, 1.0)
+    elif MODE == "rem":
+        z = x % 3.0
+    elif MODE == "div":
+        z = tl.div_rn(x, 3.0)
+    elif MODE == "tensor_if":
+        if flag:
+            z = x + 1.0
+        else:
+            z = x * 2.0
+    else:
+        z = x * 2.0 + 1.0
+    if KIND == "affine":
+        u, v = tl.associative_scan((z, y), 0, _affine_scan_combine,
+                                   reverse=REVERSE)
+        tl.store(out_ptr + offs, u)
+        tl.store(aux_ptr + offs, v)
+    else:
+        u, v = tl.associative_scan((z, y > 0.0), 0, _segmented_scan_combine,
+                                   reverse=REVERSE)
+        tl.store(out_ptr + offs, u)
+        tl.store(aux_ptr + offs, v.to(tl.float32))
+
+
+# BLOCK 256 over four warps is two elements per thread, which the general
+# tuple scan replays as well, so nothing can take it; the segmented form
+# carries an i1 the general tuple scan has no slot for at any block size.
+@pytest.mark.parametrize(
+    "block,kind,mode",
+    [(256, "affine", "fma"), (256, "affine", "tensor_if"),
+     (128, "segmented", "fma"), (32, "segmented", "tensor_if")],
+)
+def test_canonical_tuple_scan_unreplayable_source_is_rejected_not_crashed(
+        block, kind, mode, tmp_path):
+    """The canonical affine and segmented scans replay both of their sources.
+
+    `validateScanSupport` returns early for these two forms because they have
+    their own lowerings, so nothing asked about the source, and the lowering's
+    own question was asked from inside `applyFullConversion` -- the rollback
+    site. A sweep of BLOCK x source x form measured 41 of 60 cells killing the
+    process (29 SIGSEGV, 6 SIGTRAP, 6 SIGABRT) and named only 7.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "canonical_tuple_scan_preflight.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(block, kind, mode):
+            return triton.compile(ASTSource(
+                module._canonical_tuple_scan_kernel,
+                signature={{"x_ptr": "*fp32", "y_ptr": "*fp32",
+                           "out_ptr": "*fp32", "aux_ptr": "*fp32",
+                           "flag": "i32"}},
+                constexprs={{"BLOCK": block, "MODE": mode, "KIND": kind,
+                            "REVERSE": False}}),
+                target=target, options={{"num_warps": 4}})
+
+        for attempt in range(3):
+            try:
+                compile_case({block}, {kind!r}, {mode!r})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("unsupported tuple scan source compiled")
+        compile_case(128, {kind!r}, "arithmetic")
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=180,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = ("Metal backend: a canonical tuple scan replays each source at a "
+              "logical position")
+    assert result.returncode == 0, output
+    assert output.count(needle) == 3, output
+    assert "RECOVERED" in output
+    assert "failed to legalize" not in output
+
+
+def _affine_scan_reference(a, b, reverse):
+    """The inclusive affine scan, one combine at a time, in float64."""
+    import torch
+
+    a = a.to(torch.float64)
+    b = b.to(torch.float64)
+    ua, ub = torch.empty_like(a), torch.empty_like(b)
+    carry_a = carry_b = None
+    for i in (range(a.numel() - 1, -1, -1) if reverse else range(a.numel())):
+        if carry_a is None:
+            carry_a, carry_b = a[i].clone(), b[i].clone()
+        else:
+            # combine(carry, element): the carry's range comes first, and the
+            # combine is not commutative, so this order is the answer.
+            carry_a, carry_b = carry_a * a[i], a[i] * carry_b + b[i]
+        ua[i], ub[i] = carry_a, carry_b
+    return ua, ub
+
+
+@pytest.mark.parametrize("block", [32, 128])
+@pytest.mark.parametrize("mode", ["fma", "rem", "div", "tensor_if"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_canonical_affine_scan_unreplayable_source_is_exact(block, mode,
+                                                            reverse):
+    """At one element per thread the general tuple scan takes these over.
+
+    It reads the converted scalars instead of replaying the source, so a
+    source the dedicated primitive cannot rebuild is computed rather than
+    refused. The answer is what matters: turning a crash into a wrong answer
+    would be worse than the crash.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    flag = 1
+    # The affine monoid MULTIPLIES the first slot across the whole tile, so
+    # keep every source near zero: at BLOCK 128 a factor of 1.05 each is 1e2.
+    scale = 0.3 if block == 32 else 0.02
+    x = torch.linspace(-scale, scale, block, dtype=torch.float32)
+    y = torch.linspace(-0.5, 0.5, block, dtype=torch.float32)
+    if mode == "fma":
+        z = x * x + 1.0
+    elif mode == "rem":
+        z = torch.fmod(x, 3.0)  # Triton's float `%` is fmod, not remainder
+    elif mode == "div":
+        z = x / 3.0
+    else:
+        z = x + 1.0 if flag else x * 2.0
+    expected_u, expected_v = _affine_scan_reference(z, y, reverse)
+    sentinel = -4321.0
+    out = torch.full((block + 8,), sentinel, dtype=torch.float32, device="mps")
+    aux = torch.full((block + 8,), sentinel, dtype=torch.float32, device="mps")
+    _canonical_tuple_scan_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, aux, flag, BLOCK=block, MODE=mode,
+        KIND="affine", REVERSE=reverse, num_warps=4)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu()[:block], expected_u.float(),
+                               atol=1e-4, rtol=2e-3)
+    torch.testing.assert_close(aux.cpu()[:block], expected_v.float(),
+                               atol=1e-4, rtol=2e-3)
+    assert torch.all(out.cpu()[block:] == sentinel)
+    assert torch.all(aux.cpu()[block:] == sentinel)
+
+
+@pytest.mark.parametrize(
+    "mode,claimed", [("arithmetic", True), ("fma", False)])
+def test_canonical_affine_scan_tier_census(mode, claimed):
+    """Which tier ran is not visible in the answer; census the emitted body.
+
+    Both tiers compute the same inclusive affine scan, so only the presence of
+    the dedicated primitive separates them. A replayable source must keep it.
+    """
+    msl = _compile_to_msl(
+        _canonical_tuple_scan_kernel,
+        {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32",
+         "aux_ptr": "*fp32", "flag": "i32"},
+        {"BLOCK": 128, "MODE": mode, "KIND": "affine", "REVERSE": False},
+        num_warps=4)
+    assert ("metal.threadgroup_affine_prefix_scan" in msl) is claimed, msl[:400]

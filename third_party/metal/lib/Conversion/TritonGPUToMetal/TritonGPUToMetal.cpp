@@ -12171,6 +12171,26 @@ static bool isCanonicalAffineScan(mlir::triton::ScanOp op) {
          });
 }
 
+// Both canonical tuple lowerings rebuild their sources at a logical position
+// with `evalRank1ValueAt` -- at every tile size, including one element per
+// thread -- and they ask `rank1ConeSupported` from inside the conversion.
+// That is the wrong question at the wrong time. Wrong question: a tensor
+// yielded by a uniform `scf.if` passes it before conversion and is gone after,
+// because the structural conversion scalarizes the `scf.if` results. Wrong
+// time: declining from inside `applyFullConversion` is the rollback-corruption
+// site, `FuncOpLowering` having already rewritten the signature and moved the
+// body. Measured on the source sweep before this gate existed: of 60 cells
+// (BLOCK 32/128/256 x {arithmetic, fma, remf, precise div, tensor `scf.if`} x
+// {affine, segmented} x which side of the tuple carries it), 41 killed the
+// process -- 29 SIGSEGV, 6 SIGTRAP, 6 SIGABRT -- 7 were named, and every one
+// of the 12 that compiled was an `arithmetic` control.
+static bool canonicalTupleScanSourcesReplayable(mlir::triton::ScanOp op) {
+  for (mlir::Value src : op.getSrcs())
+    if (!coneReplayableAcrossConversion(src))
+      return false;
+  return true;
+}
+
 // Lower the canonical segmented-sum scan through two in-place threadgroup
 // buffers. At BLOCK=4096 this costs one f32 buffer plus one i1 buffer instead
 // of the four input/output buffers a direct generalisation of cumsum would use;
@@ -12210,7 +12230,8 @@ static mlir::LogicalResult lowerCanonicalSegmentedSumScan(
 
   mlir::Value valueInput = op.getSrcs()[0];
   mlir::Value flagInput = op.getSrcs()[1];
-  if (!rank1ConeSupported(valueInput, 0) || !rank1ConeSupported(flagInput, 0))
+  if (!coneReplayableAcrossConversion(valueInput) ||
+      !coneReplayableAcrossConversion(flagInput))
     return rewriter.notifyMatchFailure(
         op, "segmented scan: input cone unsupported");
 
@@ -12381,7 +12402,8 @@ lowerCanonicalAffineScan(mlir::triton::ScanOp op,
 
   mlir::Value aInput = op.getSrcs()[0];
   mlir::Value xInput = op.getSrcs()[1];
-  if (!rank1ConeSupported(aInput, 0) || !rank1ConeSupported(xInput, 0))
+  if (!coneReplayableAcrossConversion(aInput) ||
+      !coneReplayableAcrossConversion(xInput))
     return rewriter.notifyMatchFailure(op,
                                        "affine scan: input cone unsupported");
 
@@ -13496,9 +13518,14 @@ struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
   matchAndRewrite(mlir::triton::ScanOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    if (isCanonicalSegmentedSumScan(op))
+    // A canonical form whose sources this tier cannot replay is NOT claimed
+    // here. It falls through to the general lockstep tuple scan below, which
+    // at one element per thread consumes the converted scalars and replays
+    // nothing at all. What neither tier can take is refused before conversion,
+    // beside the single-value rank-1 scan check.
+    if (isCanonicalSegmentedSumScan(op) && canonicalTupleScanSourcesReplayable(op))
       return lowerCanonicalSegmentedSumScan(op, scanBufs, rewriter);
-    if (isCanonicalAffineScan(op))
+    if (isCanonicalAffineScan(op) && canonicalTupleScanSourcesReplayable(op))
       return lowerCanonicalAffineScan(op, scanBufs, rewriter);
     // Any other scan carrying more than one value: the general lockstep tuple
     // scan, whose envelope the pre-conversion validator asks about with the
@@ -37438,7 +37465,11 @@ validateRankNTupleScanScratchBudget(mlir::ModuleOp moduleOp) {
     // These other scan paths allocate during conversion rather than in the
     // pre-passes. Include them when they share a function with a new tuple.
     func.walk([&](mlir::triton::ScanOp scan) {
-      if (isCanonicalSegmentedSumScan(scan) || isCanonicalAffineScan(scan))
+      // A canonical form keeps its own two buffers only while it claims the
+      // op; one that falls through to the general tuple scan spends that
+      // tier's slots and is counted below.
+      if ((isCanonicalSegmentedSumScan(scan) || isCanonicalAffineScan(scan)) &&
+          canonicalTupleScanSourcesReplayable(scan))
         return;
       if (rank1MultiValueScanSupported(scan)) {
         auto type = mlir::cast<mlir::RankedTensorType>(
@@ -40004,8 +40035,28 @@ struct ConvertTritonGPUToMetalPass
     // validateScanSupport has already checked their geometry and combine.
     bool scanSourcesOk = true;
     moduleOp.walk([&](mlir::triton::ScanOp scan) {
-      if (scan.getSrcs().size() != 1)
+      if (scan.getSrcs().size() != 1) {
+        // The canonical affine and segmented-sum tuple forms replay BOTH of
+        // their sources at a logical position, at every tile size, and
+        // `validateScanSupport` returns early for them because they have
+        // their own lowerings -- so this is the only place that asks. Refuse
+        // only what the general tuple scan cannot take instead: at one
+        // element per thread it reads the converted scalars, so an affine
+        // scan over an unreplayable source compiles there.
+        if (!isCanonicalSegmentedSumScan(scan) && !isCanonicalAffineScan(scan))
+          return;
+        if (canonicalTupleScanSourcesReplayable(scan) ||
+            rank1MultiValueScanSupported(scan))
+          return;
+        scan.emitOpError(
+            "Metal backend: a canonical tuple scan replays each source at a "
+            "logical position and cannot replay this one across conversion, "
+            "and the general tuple scan does not cover this shape; use a "
+            "replayable source expression, or keep the tile at one element "
+            "per thread with f32/i32 values");
+        scanSourcesOk = false;
         return;
+      }
       auto type = mlir::dyn_cast<mlir::RankedTensorType>(scan.getType(0));
       auto tile = type ? tileFromTensor(type) : std::nullopt;
       if (!tile || tile->rank != 1)

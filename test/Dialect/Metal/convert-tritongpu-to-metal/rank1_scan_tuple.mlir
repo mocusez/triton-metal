@@ -461,3 +461,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.tg_load_indexed %[[L1]][
 // CHECK: metal.scan_band_loop
 // CHECK-NOT: tt.scan
+
+// -----
+
+// A canonical AFFINE scan whose source the dedicated primitive cannot replay.
+// That primitive rebuilds both sources at a logical position, and `math.fma`
+// is not in the replay table; before this, it declined from inside the
+// conversion and took the process down. At one element per thread the general
+// tuple scan needs no replay at all -- it reads the converted scalars -- so
+// the op falls through to it rather than being refused. The census is the
+// ABSENCE of the primitive: a numeric test cannot tell the two apart, both
+// being correct inclusive affine scans.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_affine_fma_source_falls_through(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+    %off = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %base = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %v = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
+    %a = math.fma %v, %v, %v : tensor<128xf32, #blocked>
+    %r:2 = "tt.scan"(%a, %v) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%la: f32, %lx: f32, %ra: f32, %rx: f32):
+      %ca = arith.mulf %la, %ra : f32
+      %cm = arith.mulf %ra, %lx : f32
+      %cx = arith.addf %cm, %rx : f32
+      tt.scan.return %ca, %cx : f32, f32
+    }) : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>)
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %op_0 = tt.addptr %op, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %op_0, %r#1 : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_affine_fma_source_falls_through
+// CHECK-NOT: metal.threadgroup_affine_prefix_scan
+// CHECK: %[[Z:.*]] = metal.fma
+// CHECK: %[[BUFA:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: %[[BUFX:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: metal.barrier
+// CHECK: metal.store %[[Z]], %[[BUFA]]
+// CHECK: metal.barrier
+// CHECK-NOT: metal.threadgroup_affine_prefix_scan
+// CHECK-NOT: tt.scan

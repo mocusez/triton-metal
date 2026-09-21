@@ -100,3 +100,59 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// The two canonical tuple forms -- affine and segmented-sum -- replay BOTH of
+// their sources at a logical position, at every tile size, and their own
+// validator returns early for them because they have dedicated lowerings.
+// `math.fma` is not in the replay table, so before this check the pattern
+// declined from inside the conversion and the process died: 41 of 60 probe
+// cells over BLOCK x source x form, 29 of them SIGSEGV. Two elements per
+// thread put this beyond the general tuple scan as well, so it is refused.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_affine_unreplayable_source_multi_element(%x: !tt.ptr<f32>) {
+    %off = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
+    %base = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %v = tt.load %ptr : tensor<256x!tt.ptr<f32>, #blocked>
+    %a = math.fma %v, %v, %v : tensor<256xf32, #blocked>
+    // expected-error @+1 {{a canonical tuple scan replays each source at a logical position}}
+    %r:2 = "tt.scan"(%a, %v) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%la: f32, %lx: f32, %ra: f32, %rx: f32):
+      %ca = arith.mulf %la, %ra : f32
+      %cm = arith.mulf %ra, %lx : f32
+      %cx = arith.addf %cm, %rx : f32
+      tt.scan.return %ca, %cx : f32, f32
+    }) : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>)
+    tt.store %ptr, %r#1 : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+// The segmented form carries an i1 flag, which the general tuple scan does not
+// hold (it stores f32 and i32 slots), so it cannot take this one over at any
+// tile size -- one element per thread included.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_segmented_unreplayable_source(%x: !tt.ptr<f32>) {
+    %off = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %base = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %v = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
+    %val = math.fma %v, %v, %v : tensor<128xf32, #blocked>
+    %zero = arith.constant dense<0.0> : tensor<128xf32, #blocked>
+    %flag = arith.cmpf ogt, %v, %zero : tensor<128xf32, #blocked>
+    // expected-error @+1 {{a canonical tuple scan replays each source at a logical position}}
+    %r:2 = "tt.scan"(%val, %flag) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%lv: f32, %lf: i1, %rv: f32, %rf: i1):
+      %sum = arith.addf %lv, %rv : f32
+      %sel = arith.select %rf, %rv, %sum : f32
+      %orf = arith.ori %lf, %rf : i1
+      tt.scan.return %sel, %orf : f32, i1
+    }) : (tensor<128xf32, #blocked>, tensor<128xi1, #blocked>) -> (tensor<128xf32, #blocked>, tensor<128xi1, #blocked>)
+    tt.store %ptr, %r#0 : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
