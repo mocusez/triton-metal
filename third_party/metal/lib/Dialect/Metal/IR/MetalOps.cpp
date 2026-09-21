@@ -13,6 +13,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 using namespace mlir::triton::metal;
 
@@ -2147,6 +2148,43 @@ llvm::LogicalResult SimdgroupLoadDeviceStagedMaskedOp::verify() {
            << "warp_index must be empty (single-warp / bit-identical) or "
               "exactly 1 value (per-warp staged-load); got "
            << widx.size();
+  return mlir::success();
+}
+
+llvm::LogicalResult SimdgroupLoadDeviceStagedBatchOp::verify() {
+  const size_t count = getMatrices().size();
+  if (count < 2 || getMemrefs().size() != count ||
+      getOriginRows().size() != count || getOriginCols().size() != count ||
+      getStrides().size() != count || getTransposed().size() != count)
+    return emitOpError()
+           << "requires at least two tiles and equal operand, result, and "
+              "transposition counts";
+  for (auto matrix : getMatrices()) {
+    auto type = llvm::cast<MetalSimdgroupMatrixType>(matrix.getType());
+    if (!type.getElem().isF16() || type.getRows() != 8 || type.getCols() != 8)
+      return emitOpError() << "requires 8x8 f16 matrix results";
+  }
+  for (auto memref : getMemrefs())
+    if (!llvm::cast<MetalMemRefType>(memref.getType()).getType().isF16())
+      return emitOpError() << "requires f16 input buffers";
+  if (!getWarpIndex().getDefiningOp<SimdgroupIndexOp>())
+    return emitOpError()
+           << "warp_index must be defined by metal.simdgroup_index";
+  if (!getScratch().getDefiningOp<ThreadgroupAllocaOp>() ||
+      !getScratch().hasOneUse())
+    return emitOpError()
+           << "requires a private, single-use threadgroup allocation";
+  auto numWarps = mlir::triton::gpu::maybeLookupNumWarps(getOperation());
+  if (!numWarps || *numWarps < 1)
+    return emitOpError() << "requires a positive ttg.num-warps";
+  // Bound before multiplying, including malformed IR with a huge warp count.
+  if (count > 64 || static_cast<size_t>(*numWarps) > 64 / count)
+    return emitOpError() << "batch scratch exceeds 8192 bytes";
+  auto scratchType = llvm::cast<MetalMemRefType>(getScratch().getType());
+  if (!scratchType.getType().isF16() ||
+      scratchType.getSize() != static_cast<int64_t>(*numWarps * count * 64))
+    return emitOpError()
+           << "scratch must contain num_warps * tile_count * 64 f16 elements";
   return mlir::success();
 }
 

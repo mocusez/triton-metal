@@ -23970,6 +23970,29 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
       return mlir::failure();
   }
 
+  // The batch adds scratch beyond the legacy operand/store slots. Restrict
+  // it to a standalone matmul: no unrelated aggregate, exchange, nested loop,
+  // or already allocated shared storage may compete for that budget.
+  auto func = forOp->getParentOfType<mlir::triton::FuncOp>();
+  bool standaloneMatmul = func && func.getBody().hasOneBlock() &&
+                          forOp->getBlock() == &func.getBody().front();
+  if (standaloneMatmul) {
+    for (mlir::Operation &op : func.getBody().front()) {
+      if (&op == forOp.getOperation() || &op == store.getOperation() ||
+          &op == narrowing.getOperation() || &op == narrowCvt.getOperation())
+        continue;
+      if (op.getNumRegions() == 0 &&
+          (op.getName().getDialectNamespace() == "arith" ||
+           mlir::isa<mlir::triton::ReturnOp, mlir::triton::GetProgramIdOp,
+                     mlir::triton::GetNumProgramsOp, mlir::triton::MakeRangeOp,
+                     mlir::triton::SplatOp, mlir::triton::BroadcastOp,
+                     mlir::triton::ExpandDimsOp, mlir::triton::AddPtrOp>(op)))
+        continue;
+      standaloneMatmul = false;
+      break;
+    }
+  }
+
   mlir::OpBuilder builder(forOp);
   auto loc = forOp.getLoc();
   auto ctx = builder.getContext();
@@ -24123,6 +24146,32 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   // threadgroup barrier and every warp must reach the same one. So ask once,
   // before the loop, and give the interior case a loop whose loads carry no
   // extents at all.
+  const bool splitInterior =
+      aRowExt && aColExt && bRowExt && bColExt && mPerWarp * nPerWarp <= 16;
+  // Batch only proven interior fp16 operands. Disjoint per-warp slots let all
+  // copies share two fences, while the MMA accumulators remain f32. Keep this
+  // measured path bounded to 8 KiB, with one batch allocation per kernel.
+  const int batchTiles = mPerWarp + nPerWarp;
+  const bool batchInterior = splitInterior && widx && standaloneMatmul &&
+                             activeWarps == requestedWarps &&
+                             canDownselectMatrixWarps(dot) &&
+                             mlir::cast<mlir::RankedTensorType>(loadA.getType())
+                                 .getElementType()
+                                 .isF16() &&
+                             mlir::cast<mlir::RankedTensorType>(loadB.getType())
+                                 .getElementType()
+                                 .isF16() &&
+                             activeWarps * batchTiles * 64 * 2 <= 8192;
+  mlir::Value batchScratch, batchA, batchB;
+  auto operandMatTy =
+      MetalSimdgroupMatrixType::get(ctx, 8, 8, builder.getF16Type());
+  if (batchInterior) {
+    auto scratchTy = MetalMemRefType::get(ctx, builder.getF16Type(),
+                                          activeWarps * batchTiles * 64);
+    batchScratch = ThreadgroupAllocaOp::create(builder, loc, scratchTy);
+    batchA = bridgePtrToMemref(builder, loc, aPtr, builder.getF16Type());
+    batchB = bridgePtrToMemref(builder, loc, bPtr, builder.getF16Type());
+  }
   auto buildKLoop = [&](mlir::OpBuilder &b, mlir::Location l,
                         bool masked) -> mlir::scf::ForOp {
     mlir::Value aRow = masked ? aRowExt : mlir::Value();
@@ -24142,19 +24191,46 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
                           : kUi32;
           llvm::SmallVector<mlir::Value> aTiles;
           llvm::SmallVector<mlir::Value> bTiles;
-          for (int mi = 0; mi < mPerWarp; ++mi)
-            aTiles.push_back(emitStagedLoad(
-                nb, nl, matTy, aBuf, aRowTiles[mi], aKUi32, strideAVal,
-                /*transposed=*/false, aRow, aCol, widx));
-          for (int ni = 0; ni < nPerWarp; ++ni) {
-            if (bTransposed)
-              bTiles.push_back(emitStagedLoad(
-                  nb, nl, matTy, bBuf, bColTiles[ni], bKUi32, strideBVal,
-                  /*transposed=*/true, bRow, bCol, widx));
-            else
-              bTiles.push_back(emitStagedLoad(
-                  nb, nl, matTy, bBuf, kUi32, bColTiles[ni], strideBVal,
-                  /*transposed=*/false, bRow, bCol, widx));
+          if (!masked && batchInterior) {
+            llvm::SmallVector<mlir::Value> buffers, rows, cols, strides;
+            llvm::SmallVector<bool> transposed;
+            for (int mi = 0; mi < mPerWarp; ++mi) {
+              buffers.push_back(batchA);
+              rows.push_back(aRowTiles[mi]);
+              cols.push_back(aKUi32);
+              strides.push_back(strideAVal);
+              transposed.push_back(false);
+            }
+            for (int ni = 0; ni < nPerWarp; ++ni) {
+              buffers.push_back(batchB);
+              rows.push_back(bTransposed ? bColTiles[ni] : kUi32);
+              cols.push_back(bTransposed ? bKUi32 : bColTiles[ni]);
+              strides.push_back(strideBVal);
+              transposed.push_back(bTransposed);
+            }
+            llvm::SmallVector<mlir::Type> types(batchTiles, operandMatTy);
+            auto batch = SimdgroupLoadDeviceStagedBatchOp::create(
+                nb, nl, types, batchScratch, buffers, rows, cols, strides, widx,
+                nb.getDenseBoolArrayAttr(transposed));
+            aTiles.append(batch.getResults().begin(),
+                          batch.getResults().begin() + mPerWarp);
+            bTiles.append(batch.getResults().begin() + mPerWarp,
+                          batch.getResults().end());
+          } else {
+            for (int mi = 0; mi < mPerWarp; ++mi)
+              aTiles.push_back(emitStagedLoad(
+                  nb, nl, matTy, aBuf, aRowTiles[mi], aKUi32, strideAVal,
+                  /*transposed=*/false, aRow, aCol, widx));
+            for (int ni = 0; ni < nPerWarp; ++ni) {
+              if (bTransposed)
+                bTiles.push_back(emitStagedLoad(
+                    nb, nl, matTy, bBuf, bColTiles[ni], bKUi32, strideBVal,
+                    /*transposed=*/true, bRow, bCol, widx));
+              else
+                bTiles.push_back(emitStagedLoad(
+                    nb, nl, matTy, bBuf, kUi32, bColTiles[ni], strideBVal,
+                    /*transposed=*/false, bRow, bCol, widx));
+            }
           }
           llvm::SmallVector<mlir::Value> newAccs;
           for (int mi = 0; mi < mPerWarp; ++mi) {
@@ -24173,9 +24249,6 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   // The duplicate body doubles the emitted kernel, and a large unrolled matrix
   // kernel has killed Apple's shader compiler before, so keep the second copy
   // for the tile counts where the win was measured.
-  const bool splitInterior =
-      aRowExt && aColExt && bRowExt && bColExt && mPerWarp * nPerWarp <= 16;
-
   // The stores go inside each branch rather than the accumulators coming out
   // of it: the emitter has no C declaration for a simdgroup matrix crossing an
   // `scf.if` result, and duplicating four stores is cheaper than teaching it

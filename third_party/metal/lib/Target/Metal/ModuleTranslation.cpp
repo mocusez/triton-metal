@@ -486,6 +486,7 @@ void ModuleTranslation::translateKernels() {
       _stageBufferAllPerWarp = false;
       _sgstoreScratchDeclared = false;
       _sgstoreScratchPerWarp = false;
+      _sgstoreScratchAllPerWarp = false;
       _fstoreScratchDeclared = false;
       translateKernel(kernelOp);
       _output << "\n\n";
@@ -641,16 +642,14 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
       .Case<mlir::triton::metal::AllocaOp,
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
-            mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp,
+            mlir::triton::metal::TgStoreIndexedOp, mlir::triton::metal::StoreOp,
             mlir::triton::metal::ContiguousVectorAddOp,
-            mlir::triton::metal::AtomicCasOp,
-            mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::AtomicCasOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
-            mlir::triton::metal::IfOp,
-            mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
+            mlir::triton::metal::IfOp, mlir::triton::metal::WhileOp,
+            mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
             mlir::triton::metal::Int4WeightOnlyMatmulOp,
             mlir::triton::metal::Int8QuantizedMatmulOp,
@@ -659,27 +658,27 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::SoftmaxAttentionBackwardPreOp,
             mlir::triton::metal::SoftmaxAttentionBackwardDqOp,
             mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp,
-            mlir::triton::metal::ReduceOp,
-            mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
-            mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::FusedAttentionOp,
+            mlir::triton::metal::ReduceOp, mlir::triton::metal::ArgmaxOp,
+            mlir::triton::metal::SoftmaxOp, mlir::triton::metal::LogsumexpOp,
+            mlir::triton::metal::SdpaOp, mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
-            mlir::triton::metal::SimdgroupFusedStoreOp,
-            mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
+            mlir::triton::metal::SimdgroupFusedStoreOp, mlir::scf::IfOp,
+            mlir::scf::ForOp, mlir::scf::WhileOp,
             mlir::triton::metal::DebugRecordOp,
-            mlir::triton::metal::Fp8ConvertOp,
-            mlir::scf::ConditionOp>(
+            mlir::triton::metal::Fp8ConvertOp, mlir::scf::ConditionOp>(
           [&](auto &op) { printable = true; })
-      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
-        // do nothing
-        printable = false;
-      })
+      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>(
+          [&](auto &op) {
+            // do nothing
+            printable = false;
+          })
       .Case<mlir::scf::YieldOp>([&](auto &op) {
         // Yielding into a result-bearing `scf.if` produces assignment
         // statements to the temp vars pre-declared before the `if`. Yields in
@@ -707,16 +706,14 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
       .Case<mlir::triton::metal::AllocaOp,
             mlir::triton::metal::ThreadgroupAllocaOp,
             mlir::triton::metal::BarrierOp,
-            mlir::triton::metal::TgStoreIndexedOp,
-            mlir::triton::metal::StoreOp,
+            mlir::triton::metal::TgStoreIndexedOp, mlir::triton::metal::StoreOp,
             mlir::triton::metal::ContiguousVectorAddOp,
-            mlir::triton::metal::AtomicCasOp,
-            mlir::triton::metal::AtomicRmwOp,
+            mlir::triton::metal::AtomicCasOp, mlir::triton::metal::AtomicRmwOp,
             mlir::triton::metal::ThreadgroupPrefixSumOp,
             mlir::triton::metal::ThreadgroupSegmentedPrefixSumOp,
             mlir::triton::metal::ThreadgroupAffinePrefixScanOp,
-            mlir::triton::metal::IfOp,
-            mlir::triton::metal::WhileOp, mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
+            mlir::triton::metal::IfOp, mlir::triton::metal::WhileOp,
+            mlir::triton::metal::MatmulOp, mlir::triton::metal::GemvOp,
             mlir::triton::metal::QmvOp, mlir::triton::metal::QmmOp,
             mlir::triton::metal::Int4WeightOnlyMatmulOp,
             mlir::triton::metal::Int8QuantizedMatmulOp,
@@ -725,14 +722,14 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::SoftmaxAttentionBackwardPreOp,
             mlir::triton::metal::SoftmaxAttentionBackwardDqOp,
             mlir::triton::metal::SoftmaxAttentionBackwardDkdvOp,
-            mlir::triton::metal::ReduceOp,
-            mlir::triton::metal::ArgmaxOp, mlir::triton::metal::SoftmaxOp,
-            mlir::triton::metal::LogsumexpOp, mlir::triton::metal::SdpaOp,
-            mlir::triton::metal::FusedAttentionOp,
+            mlir::triton::metal::ReduceOp, mlir::triton::metal::ArgmaxOp,
+            mlir::triton::metal::SoftmaxOp, mlir::triton::metal::LogsumexpOp,
+            mlir::triton::metal::SdpaOp, mlir::triton::metal::FusedAttentionOp,
             mlir::triton::metal::RmsNormOp, mlir::triton::metal::ReturnOp,
             mlir::triton::metal::SimdgroupMatrixZeroOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
+            mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
             mlir::triton::metal::SimdgroupStoreOp,
@@ -741,13 +738,15 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
           [&](auto &op) { translate(op); })
       .Case<mlir::scf::IfOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ForOp>([&](auto &op) { translate(op); })
-      .Case<mlir::triton::metal::DebugRecordOp>([&](auto &op) { translate(op); })
+      .Case<mlir::triton::metal::DebugRecordOp>(
+          [&](auto &op) { translate(op); })
       .Case<mlir::scf::WhileOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::ConditionOp>([&](auto &op) { translate(op); })
       .Case<mlir::scf::YieldOp>([&](auto &op) { translate(op); })
-      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>([&](auto &op) {
-        // do nothing;
-      })
+      .Case<mlir::triton::metal::YieldWhileOp, mlir::triton::metal::YieldOp>(
+          [&](auto &op) {
+            // do nothing;
+          })
       .Default([&](Operation *) {
         if (opInst->use_empty()) {
           translateValue(opInst);
@@ -1734,6 +1733,69 @@ void ModuleTranslation::translate(
   printDelim();
 }
 
+void ModuleTranslation::translate(
+    mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp op) {
+  const unsigned count = op.getMatrices().size();
+  auto emitSlot = [&](unsigned tile, llvm::StringRef element) {
+    translateVarName(op.getScratch());
+    _output << "[(";
+    translateVarName(op.getWarpIndex());
+    _output << " * " << count << "u + " << tile << "u) * 64u + " << element
+            << "]";
+  };
+  auto nextLine = [&]() {
+    _output << "\n";
+    indent();
+  };
+  // Each SIMD-group owns all of its slots. This first fence protects the
+  // previous iteration's matrix reads before any slot is overwritten.
+  _output << "simdgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  for (unsigned tile = 0; tile < count; ++tile) {
+    nextLine();
+    _output << "for (uint c = (id.x & 31u); c < 64u; c += 32u) {";
+    {
+      INDENT();
+      nextLine();
+      _output << "uint si = c / 8u;";
+      nextLine();
+      _output << "uint sj = c % 8u;";
+      nextLine();
+      emitSlot(tile, op.getTransposed()[tile] ? "sj * 8u + si" : "c");
+      _output << " = ";
+      translateVarName(op.getMemrefs()[tile]);
+      _output << "[(";
+      translateValueOrVarName(op.getOriginRows()[tile]);
+      _output << " + si) * ";
+      translateValueOrVarName(op.getStrides()[tile]);
+      _output << " + ";
+      translateValueOrVarName(op.getOriginCols()[tile]);
+      _output << " + sj]";
+      printDelim();
+    }
+    nextLine();
+    _output << "}";
+  }
+  nextLine();
+  _output << "simdgroup_barrier(mem_flags::mem_threadgroup)";
+  printDelim();
+  for (unsigned tile = 0; tile < count; ++tile) {
+    nextLine();
+    auto result = op.getMatrices()[tile];
+    emitSimdgroupMatrixType(
+        _output, llvm::cast<MetalSimdgroupMatrixType>(result.getType()));
+    unsigned id = _varCount++;
+    _output << " v" << id;
+    printDelim();
+    nextLine();
+    _output << "simdgroup_load(v" << id << ", &";
+    emitSlot(tile, "0u");
+    _output << ", 8)";
+    printDelim();
+    _buffers[result.getAsOpaquePointer()] = id;
+  }
+}
+
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupLoadOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
@@ -1826,11 +1888,13 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
   // AC2 partial-tile path: when the optional `m_extent`/`n_extent` UI32
   // operands are present, emit a two-stage epilogue mirroring
   // SimdgroupLoadDeviceStagedOp:
-  //   1. simdgroup_store into per-threadgroup scratch
-  //   2. threadgroup_barrier(mem_flags::mem_threadgroup)
+  //   1. fence scratch reuse, then simdgroup_store into shared scratch
+  //   2. publish scratch writes with a mem_threadgroup barrier
   //   3. coop-loop that scalar-copies only the lanes whose `(gi, gj)`
   //      global coordinates satisfy `gi < m_extent && gj < n_extent` back
   //      to the destination memref.
+  // Both fences use SIMD-group scope only when kernel resource analysis proves
+  // that all scratch users access their own warp slice.
   // Apple's simdgroup_store has no per-lane mask; this is the documented
   // masked-tail pattern from Apple's matmul samples.
   auto partialExtents = op.getPartialExtents();
@@ -1851,7 +1915,9 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
       }
     };
 
-    _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+    _output << (perWarp && _sgstoreScratchAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
     printDelim();
     _output << "\n";
     indent();
@@ -1863,7 +1929,9 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {
     printDelim();
     _output << "\n";
     indent();
-    _output << "threadgroup_barrier(mem_flags::mem_threadgroup)";
+    _output << (perWarp && _sgstoreScratchAllPerWarp
+                    ? "simdgroup_barrier(mem_flags::mem_threadgroup)"
+                    : "threadgroup_barrier(mem_flags::mem_threadgroup)");
     printDelim();
     _output << "\n";
     indent();
@@ -8482,6 +8550,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
       if (!_sgstoreScratchDeclared) {
         mlir::triton::metal::SimdgroupStoreOp firstStore;
         bool spw = false;
+        bool allPerWarp = true;
         kernelOp.walk([&](mlir::triton::metal::SimdgroupStoreOp op) {
           if (op.getPartialExtents().size() != 2)
             return mlir::WalkResult::advance();
@@ -8489,6 +8558,10 @@ void ModuleTranslation::translate(mlir::Region &region) {
             firstStore = op;
           if (!op.getWarpIndex().empty())
             spw = true;
+          if (op.getWarpIndex().size() != 1 ||
+              !op.getWarpIndex()[0]
+                   .getDefiningOp<mlir::triton::metal::SimdgroupIndexOp>())
+            allPerWarp = false;
           return mlir::WalkResult::advance();
         });
         if (firstStore) {
@@ -8505,6 +8578,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
           printDelim();
           _sgstoreScratchDeclared = true;
           _sgstoreScratchPerWarp = spw;
+          _sgstoreScratchAllPerWarp = spw && allPerWarp;
         }
       }
     }

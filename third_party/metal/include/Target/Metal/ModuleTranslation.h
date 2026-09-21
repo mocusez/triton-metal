@@ -136,6 +136,9 @@ private:
   bool _stageBufferAllPerWarp = false;
   bool _sgstoreScratchDeclared = false;
   bool _sgstoreScratchPerWarp = false;
+  // Every masked store must select its own SIMD-group's scratch slice.
+  // Unindexed or otherwise indexed users can alias another group's slice.
+  bool _sgstoreScratchAllPerWarp = false;
   bool _fstoreScratchDeclared = false;
   // Set by a translator that has emitted an `op.emitError()` and cannot produce
   // correct MSL. `translateModule` turns it into a `failure()` so the compile
@@ -282,6 +285,7 @@ private:
   void translate(mlir::triton::metal::SimdgroupMatrixZeroOp op);
   void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedOp op);
   void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp op);
+  void translate(mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp op);
   void translate(mlir::triton::metal::SimdgroupLoadOp op);
   void translate(mlir::triton::metal::SimdgroupMultiplyAccumulateOp op);
   void translate(mlir::triton::metal::SimdgroupStoreOp op);

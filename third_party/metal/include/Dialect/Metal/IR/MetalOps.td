@@ -1793,6 +1793,35 @@ def SimdgroupLoadDeviceStagedMaskedOp
   let hasVerifier = 1;
 }
 
+def SimdgroupLoadDeviceStagedBatchOp
+    : Metal_Op<"simdgroup_load_device_staged_batch", [AttrSizedOperandSegments]> {
+  let summary = "Stage independent half matrix operands with shared synchronization";
+  let description = [{
+    Copies two or more unmasked 8x8 half tiles into disjoint per-SIMD-group
+    scratch slots, then loads their matrix fragments. One SIMD-group barrier
+    protects scratch reuse before all copies and one publishes all copies
+    before the matrix loads. Scratch is a private threadgroup allocation with
+    exactly one use and num_warps * tile_count * 64 half elements (at most
+    8192 bytes). The warp index must be metal.simdgroup_index. Each transposed
+    flag swaps that tile's scratch coordinates without changing its device
+    address. This op has memory effects and must not be speculated or CSE'd.
+  }];
+  let arguments = (ins Metal_MemRefType:$scratch,
+                       Variadic<Metal_MemRefType>:$memrefs,
+                       Variadic<UI32>:$origin_rows,
+                       Variadic<UI32>:$origin_cols,
+                       Variadic<UI32>:$strides,
+                       UI32:$warp_index,
+                       DenseBoolArrayAttr:$transposed);
+  let results = (outs Variadic<Metal_SimdgroupMatrixType>:$matrices);
+  let assemblyFormat = "$scratch `buffers` `[` $memrefs `]`"
+                       " `rows` `[` $origin_rows `]`"
+                       " `cols` `[` $origin_cols `]`"
+                       " `strides` `[` $strides `]` `warp` $warp_index"
+                       " attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def SimdgroupIndexOp : Metal_Op<"simdgroup_index", [Pure]> {
   let summary = "Threadgroup-local SIMD-group (warp) index";
   let description = [{

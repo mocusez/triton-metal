@@ -17,6 +17,7 @@ an 8x8 program grid. See `metal-lora-linear-fix-plan.md` (W2a).
 from __future__ import annotations
 
 import importlib.util
+import re
 import types
 from pathlib import Path
 
@@ -451,6 +452,185 @@ def test_dot_dynamic_k_masked_multitile_normal_b_ragged(
     torch.testing.assert_close(actual, a_cpu @ b_cpu, atol=1e-3, rtol=1e-3)
     assert torch.all(c_guard[M:, :].cpu() == sentinel)
     assert torch.all(c_guard[:, N:].cpu() == sentinel)
+
+
+@triton.jit
+def canonical_batched_matmul_kernel(
+    a_ptr, b_ptr, c_ptr, M, N, K, b_off,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    TRANS_B: tl.constexpr, EXTRA_STORE: tl.constexpr = False,
+):
+    # The flat, grouped grid and pointer advances match the canonical matmul.
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    group = pid // (8 * num_n)
+    first_m = group * 8
+    group_m = tl.minimum(num_m - first_m, 8)
+    pid_m = first_m + (pid % (8 * num_n)) % group_m
+    pid_n = (pid % (8 * num_n)) // group_m
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ks = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + rows[:, None] * stride_am + ks[None, :] * stride_ak
+    if TRANS_B:
+        b_ptrs = b_ptr + b_off + cols[:, None] * stride_bn + ks[None, :] * stride_bk
+    else:
+        b_ptrs = b_ptr + b_off + ks[:, None] * stride_bk + cols[None, :] * stride_bn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, (rows[:, None] < M) & (ks[None, :] < K - k0), other=0.)
+        if TRANS_B:
+            b = tl.load(b_ptrs, (cols[:, None] < N) & (ks[None, :] < K - k0), other=0.)
+            acc = tl.dot(a, tl.trans(b), acc, allow_tf32=False)
+        else:
+            b = tl.load(b_ptrs, (ks[:, None] < K - k0) & (cols[None, :] < N), other=0.)
+            acc = tl.dot(a, b, acc, allow_tf32=False)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    tl.store(c_ptr + rows[:, None] * stride_cm + cols[None, :],
+             acc.to(c_ptr.dtype.element_ty),
+             (rows[:, None] < M) & (cols[None, :] < N))
+    if EXTRA_STORE:
+        tl.store(c_ptr + M * stride_cm, 0.0, mask=pid == 0)
+
+
+@pytest.mark.parametrize("trans_b", [False, True], ids=["normalB", "transB"])
+@pytest.mark.parametrize(
+    "dtype,M,N,K,block_m,block_n,num_warps",
+    [
+        pytest.param(torch.float16, 64, 64, 64, 64, 64, 4, id="interior_w4"),
+        pytest.param(torch.float16, 64, 64, 128, 64, 64, 8, id="interior_w8"),
+        pytest.param(torch.float16, 32, 32, 64, 32, 32, 1, id="singlewarp"),
+        pytest.param(torch.float16, 63, 64, 64, 64, 64, 4, id="partial_m"),
+        pytest.param(torch.float16, 64, 61, 64, 64, 64, 4, id="partial_n"),
+        pytest.param(torch.float16, 64, 64, 47, 64, 64, 4, id="partial_k"),
+        pytest.param(torch.float16, 67, 69, 64, 64, 64, 4, id="interior_and_boundary"),
+        pytest.param(torch.float16, 67, 69, 47, 64, 64, 8, id="all_tails"),
+        pytest.param(torch.float16, 8, 7, 5, 32, 32, 4, id="small_tails"),
+        pytest.param(torch.float16, 64, 128, 64, 64, 128, 4, id="accumulator_budget"),
+        pytest.param(torch.float16, 8, 512, 64, 8, 512, 8, id="scratch_budget"),
+        pytest.param(torch.float16, 289, 67, 40, 32, 32, 4, id="partial_swizzle_group"),
+        pytest.param(torch.float32, 67, 69, 64, 64, 64, 4, id="fp32_control"),
+        pytest.param(torch.bfloat16, 67, 69, 64, 64, 64, 8, id="bf16_control"),
+    ],
+)
+def test_dot_dynamic_k_canonical_batched_staging(
+        trans_b, dtype, M, N, K, block_m, block_n, num_warps):
+    """Interior staging preserves tails, operand offsets and repeated launches."""
+    torch.manual_seed(0xBA7C + M + N + K)
+    a_cpu = torch.randn((M, K), dtype=dtype)
+    b_offset = 13
+    b_storage_cpu = torch.randn((b_offset + N * K,), dtype=dtype)
+    b_cpu = b_storage_cpu[b_offset:].view((N, K) if trans_b else (K, N))
+    a, b_storage = a_cpu.to("mps"), b_storage_cpu.to("mps")
+    # Preserve fp32 output for the controls so accidental half narrowing is
+    # exposed by the numeric check; fp16 cases exercise the canonical cast.
+    output_dtype = torch.float16 if dtype == torch.float16 else torch.float32
+    sentinel = -4320.0
+    c = torch.full((triton.cdiv(M, block_m) * block_m + 1,
+                    triton.cdiv(N, block_n) * block_n + 8),
+                   sentinel, dtype=output_dtype, device="mps")
+    expected = a_cpu.float() @ (b_cpu.t() if trans_b else b_cpu).float()
+    expected = expected.to(output_dtype)
+    for _ in range(3):
+        c.fill_(sentinel)
+        canonical_batched_matmul_kernel[(triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)](
+            a, b_storage, c, M, N, K, b_offset,
+            K, 1, 1 if trans_b else N, K if trans_b else 1, c.stride(0),
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=32,
+            TRANS_B=trans_b, num_warps=num_warps,
+        )
+        actual = c.cpu()
+        atol = 2e-2 if dtype == torch.float16 else 2e-4
+        rtol = 1e-3 if dtype == torch.float16 else 2e-4
+        torch.testing.assert_close(actual[:M, :N], expected, atol=atol, rtol=rtol)
+        assert torch.all(actual[M:, :] == sentinel)
+        assert torch.all(actual[:, N:] == sentinel)
+
+
+@pytest.mark.parametrize(
+    "a_value,b_value,K,expected_value",
+    [
+        pytest.param(2**-24, 1024.0, 1024, 0.0625, id="half_subnormal_input"),
+        pytest.param(65504.0, 0.5, 64, 2096128.0, id="float_accumulator_range"),
+    ],
+)
+def test_dot_dynamic_k_canonical_batched_staging_precision(
+        a_value, b_value, K, expected_value):
+    a_cpu = torch.full((64, K), a_value, dtype=torch.float16)
+    b_cpu = torch.full((K, 64), b_value, dtype=torch.float16)
+    expected = a_cpu.float() @ b_cpu.float()
+    assert torch.all(expected == expected_value)
+    a, b = a_cpu.to("mps"), b_cpu.to("mps")
+    c = torch.empty((64, 64), dtype=torch.float32, device="mps")
+    canonical_batched_matmul_kernel[(1,)](
+        a, b, c, 64, 64, K, 0, K, 1, 64, 1, 64,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, TRANS_B=False, num_warps=4,
+    )
+    torch.testing.assert_close(c.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,trans_b,block_m,block_n,num_warps,batched,extra_store",
+    [
+        pytest.param(torch.float16, False, 64, 64, 4, True, False, id="fp16_normal"),
+        pytest.param(torch.float16, True, 64, 64, 4, True, False, id="fp16_transposed"),
+        pytest.param(torch.float16, False, 64, 64, 8, True, False, id="fp16_eight_warps"),
+        pytest.param(torch.float32, False, 64, 64, 4, False, False, id="fp32_no_narrowing"),
+        pytest.param(torch.bfloat16, True, 64, 64, 4, False, False, id="bf16_no_narrowing"),
+        pytest.param(torch.float16, False, 32, 32, 1, False, False, id="singlewarp"),
+        pytest.param(torch.float16, False, 64, 128, 4, False, False, id="accumulator_budget"),
+        pytest.param(torch.float16, False, 8, 512, 8, False, False, id="scratch_budget"),
+        pytest.param(torch.float16, False, 64, 64, 16, False, False, id="downselected_warps"),
+        pytest.param(torch.float16, False, 64, 64, 4, False, True, id="compound_kernel"),
+    ],
+)
+def test_dot_dynamic_k_canonical_batched_staging_msl_shape(
+        dtype, trans_b, block_m, block_n, num_warps, batched, extra_store):
+    M, N, K = block_m + 3, block_n + 5, 64
+    a = torch.empty((M, K), dtype=dtype, device="mps")
+    b = torch.empty((N, K) if trans_b else (K, N), dtype=dtype, device="mps")
+    c = torch.empty((M + 1, N), dtype=torch.float32, device="mps")
+    metal = _metal_text(canonical_batched_matmul_kernel.warmup(
+        a, b, c, M, N, K, 0,
+        K, 1, 1 if trans_b else N, K if trans_b else 1, N,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=32, TRANS_B=trans_b,
+        EXTRA_STORE=extra_store,
+        grid=(triton.cdiv(M, block_m) * triton.cdiv(N, block_n),),
+        num_warps=num_warps,
+    ))
+    assert "simdgroup_float8x8" in metal
+    assert ("simdgroup_half8x8" in metal) == batched
+    scratch = re.findall(r"threadgroup half \w+\[(\d+)\]", metal)
+    assert bool(scratch) == batched
+    if not batched:
+        return
+    assert len(scratch) == 1
+    assert int(scratch[0]) * 2 <= 8192
+    # Find the interior K loop by its half operands and MMA, excluding the
+    # nested scalar copy loops. Its entire batch shares exactly two fences.
+    interior_loops = []
+    for match in re.finditer(r"for\s*\([^\n]+\)\s*\{", metal):
+        start = match.end()
+        depth = 1
+        end = start
+        while depth:
+            depth += (metal[end] == "{") - (metal[end] == "}")
+            end += 1
+        body = metal[start:end - 1]
+        if "simdgroup_half8x8" in body and "simdgroup_multiply_accumulate" in body:
+            interior_loops.append(body)
+    assert len(interior_loops) == 1
+    interior = interior_loops[0]
+    assert interior.count("simdgroup_barrier(mem_flags::mem_threadgroup)") == 2
+    assert "threadgroup_barrier" not in interior
+    before_load, after_load = interior.split("simdgroup_load(", 1)
+    assert before_load.count("simdgroup_barrier") == 2
+    assert "simdgroup_barrier" not in after_load
+    # The boundary loop retains its float staging and predicated loads.
+    assert "threadgroup float" in metal
 
 
 # --- W2b: recompute-from-IV loop shape (medium-lora_linear.py's inner loop) ---

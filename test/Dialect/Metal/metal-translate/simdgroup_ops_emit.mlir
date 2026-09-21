@@ -68,9 +68,9 @@ module {
 // CHECK: return
 // CHECK: kernel void simdgroup_partial_warp_store
 // CHECK: threadgroup float _sgstore_shared
-// CHECK: threadgroup_barrier(mem_flags::mem_threadgroup)
+// CHECK: simdgroup_barrier(mem_flags::mem_threadgroup)
 // CHECK: simdgroup_store(v{{[0-9]+}}, &_sgstore_shared[sgid][0], 8)
-// CHECK: threadgroup_barrier(mem_flags::mem_threadgroup)
+// CHECK: simdgroup_barrier(mem_flags::mem_threadgroup)
 // CHECK: if (gi < {{.*}} && gj < {{.*}}) {
 // CHECK: _sgstore_shared[sgid][c]
 // CHECK: kernel void simdgroup_partial_store_second_kernel

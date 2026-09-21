@@ -18,6 +18,10 @@ Usage:  pixi run --frozen python python/test/microbenchmark/metal_matmul_canonic
         Add --lora to compare plain/masked fused LoRA and the owned verbatim
         fixture, emitting one JSON record per arm.
         Add --lora-padded for ranks 8/15 plus a full-rank 16 control.
+        Add --canonical-report for CPU-verified canonical/PyTorch JSONL results,
+        optionally with --dump-dir PATH to save each canonical arm's MSL.
+        Add --reference-msl-dir PATH to pair direct shader timings against
+        sources saved by an earlier --canonical-report --dump-dir run.
         METAL_PERF_SETTLE=0 ... to skip the cool-down when the machine is
         already known idle.
 """
@@ -26,6 +30,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import statistics
 import sys
 import tempfile
@@ -84,6 +89,149 @@ ARMS = [(bm, bn, bk, nw, gm)
 
 BATCH = 20
 SAMPLES = 5
+
+
+def canonical_report_main(dump_dir=None, reference_msl_dir=None):
+    torch.manual_seed(0)
+    metadata = {
+        "mode": "canonical", "dtype": "fp16", "torch": str(torch.__version__),
+        "macos": platform.mac_ver()[0], "machine": platform.machine(),
+        "batch": BATCH, "warmup": 5,
+    }
+    if dump_dir is not None:
+        dump_dir = Path(dump_dir)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+    if reference_msl_dir is not None:
+        reference_msl_dir = Path(reference_msl_dir)
+        if dump_dir is not None and dump_dir.resolve() == reference_msl_dir.resolve():
+            raise ValueError("--dump-dir must differ from --reference-msl-dir to preserve reference sources")
+
+    def verify(out, ref, record, phase):
+        actual = out.cpu().float()
+        try:
+            torch.testing.assert_close(actual, ref, atol=0.1, rtol=0.01)
+        except AssertionError as exc:
+            print(json.dumps({**record, "status": "numerical_failure",
+                              "phase": phase, "error": str(exc)}), flush=True)
+            raise
+        return (actual - ref).abs().max().item()
+
+    def measure(fn, out, ref, record):
+        verify(out, ref, record, "before_timing")
+        for _ in range(5):
+            fn()
+        torch.mps.synchronize()
+        samples = []
+        for _ in range(SAMPLES):
+            start = time.perf_counter()
+            for _ in range(BATCH):
+                fn()
+            torch.mps.synchronize()
+            samples.append((time.perf_counter() - start) / BATCH * 1e3)
+        max_error = verify(out, ref, record, "after_timing")
+        return {"status": "ok", "median_ms": statistics.median(samples),
+                "min_ms": min(samples), "max_ms": max(samples),
+                "samples_ms": samples, "max_error": max_error}
+
+    tiles = [(32, 32, 32, 4), (64, 64, 32, 4), (64, 64, 64, 4),
+             (64, 64, 32, 8), (64, 64, 64, 8), (128, 64, 32, 4)]
+    for M, N, K in SHAPES:
+        a = torch.randn(M, K, dtype=torch.float16, device="mps")
+        b = torch.randn(K, N, dtype=torch.float16, device="mps")
+        ref = a.cpu().float() @ b.cpu().float()
+        out = torch.empty((M, N), dtype=torch.float16, device="mps")
+        record = {**metadata, "shape": [M, N, K], "arm": "torch.matmul"}
+
+        def torch_arm():
+            torch.matmul(a, b, out=out)
+
+        torch_arm()
+        torch.mps.synchronize()
+        base = measure(torch_arm, out, ref, record)
+        print(json.dumps({**record, **base}), flush=True)
+        for bm, bn, bk, nw in tiles:
+            record = {**metadata, "shape": [M, N, K], "arm": "triton",
+                      "tile": [bm, bn, bk, nw], "group_m": 8}
+            out = torch.empty((M, N), dtype=torch.float16, device="mps")
+            grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+
+            def arm():
+                return _canonical_matmul[grid](
+                    a, b, out, M, N, K, BM=bm, BN=bn, BK=bk,
+                    GROUP_M=8, num_warps=nw)
+
+            try:
+                compiled = arm()
+                torch.mps.synchronize()
+            except Exception as exc:
+                optional = (bm, bn, bk, nw) == (128, 64, 32, 4)
+                print(json.dumps({**record, "status": "refused" if optional else "compile_error",
+                                  "error": str(exc)}), flush=True)
+                if optional:
+                    continue
+                raise
+            metal = compiled.asm["metal"]
+            if isinstance(metal, bytes):
+                metal = metal.decode("utf-8")
+            record.update({
+                "source_bytes": len(metal.encode("utf-8")),
+                "mma": metal.count("simdgroup_multiply_accumulate"),
+                "simdgroup_load": metal.count("simdgroup_load("),
+                "simdgroup_store": metal.count("simdgroup_store("),
+                "threadgroup_barrier": metal.count("threadgroup_barrier("),
+                "simdgroup_barrier": metal.count("simdgroup_barrier("),
+            })
+            source_name = f"canonical-{M}x{N}x{K}-{bm}x{bn}x{bk}-w{nw}.metal"
+            if dump_dir is not None:
+                source_path = dump_dir / source_name
+                source_path.write_text(metal)
+                record["source_path"] = str(source_path)
+            assert record["mma"] > 0, "canonical benchmark must use SIMD-group matrix multiplication"
+            result = measure(arm, out, ref, record)
+            if reference_msl_dir is not None:
+                reference_path = reference_msl_dir / source_name
+                reference_metal = reference_path.read_text()
+                assert compiled.metadata.num_warps == nw, "paired launch requires matching warp geometry"
+                group_size = getattr(compiled.metadata, "threads_per_group", None) or nw * 32
+                assert group_size == nw * 32, "paired launch requires canonical threadgroup geometry"
+                # Compile both saved sources through the same direct-shader API;
+                # neither side includes Triton's Python dispatch overhead.
+                libraries = [torch.mps.compile_shader(source) for source in (reference_metal, metal)]
+                shaders = [getattr(library, compiled.name) for library in libraries]
+                outputs = [torch.empty_like(out), torch.empty_like(out)]
+                labels = ("reference", "candidate")
+
+                def direct_launch(shader, target):
+                    shader(a, b, target, M, N, K,
+                           threads=(grid[0] * group_size, 1, 1),
+                           group_size=(group_size, 1, 1))
+
+                for index in range(2):
+                    direct_launch(shaders[index], outputs[index])
+                    torch.mps.synchronize()
+                    verify(outputs[index], ref, record, f"paired_{labels[index]}_before_timing")
+                    for _ in range(5):
+                        direct_launch(shaders[index], outputs[index])
+                    torch.mps.synchronize()
+                paired_samples = [[], []]
+                for sample in range(SAMPLES):
+                    # Reverse the pair on alternate rounds to reduce order bias.
+                    for index in ((0, 1) if sample % 2 == 0 else (1, 0)):
+                        start = time.perf_counter()
+                        for _ in range(BATCH):
+                            direct_launch(shaders[index], outputs[index])
+                        torch.mps.synchronize()
+                        paired_samples[index].append((time.perf_counter() - start) / BATCH * 1e3)
+                for index in range(2):
+                    result[f"paired_{labels[index]}_max_error"] = verify(
+                        outputs[index], ref, record, f"paired_{labels[index]}_after_timing")
+                    result[f"paired_{labels[index]}_samples_ms"] = paired_samples[index]
+                    result[f"paired_{labels[index]}_ms"] = statistics.median(paired_samples[index])
+                result["paired_speedup"] = result["paired_reference_ms"] / result["paired_candidate_ms"]
+                result["paired_sources_identical"] = reference_metal == metal
+                result["paired_reference_source_path"] = str(reference_path)
+            print(json.dumps({**record, **result,
+                              "vs_torch": result["median_ms"] / base["median_ms"]}), flush=True)
 
 
 @triton.jit
@@ -283,19 +431,24 @@ def timed(fn, ref, out):
     return samples, ok
 
 
-def main(recompute=False, lora=False, lora_padded=False):
+def main(recompute=False, lora=False, lora_padded=False, canonical_report=False, dump_dir=None,
+         reference_msl_dir=None):
     # Never measure within a minute of a suite run; this script is usually
     # started right after one. Run-to-run spread within ONE build is ~10% on
     # this machine, which is larger than many changes worth making, and two
     # readings taken on a busy machine have already been quoted wrongly.
     time.sleep(float(os.environ.get("METAL_PERF_SETTLE", "75")))
-    if recompute or lora or lora_padded:
-        benchmark = (lambda: lora_main(padded=lora_padded)) if lora or lora_padded else recompute_main
+    if recompute or lora or lora_padded or canonical_report:
+        if canonical_report:
+            benchmark = lambda: canonical_report_main(dump_dir=dump_dir, reference_msl_dir=reference_msl_dir)
+        else:
+            benchmark = (lambda: lora_main(padded=lora_padded)) if lora or lora_padded else recompute_main
         if "TRITON_CACHE_DIR" in os.environ:
             benchmark()
         else:
             # A fresh run must compile its own sources after a backend rebuild.
-            prefix = "triton-lora-" if lora or lora_padded else "triton-recompute-"
+            prefix = ("triton-canonical-" if canonical_report else
+                      "triton-lora-" if lora or lora_padded else "triton-recompute-")
             with tempfile.TemporaryDirectory(prefix=prefix) as cache_dir:
                 os.environ["TRITON_CACHE_DIR"] = cache_dir
                 try:
@@ -357,5 +510,17 @@ if __name__ == "__main__":
                        help="compare plain/masked/verbatim fused LoRA kernels and report JSONL")
     modes.add_argument("--lora-padded", action="store_true",
                        help="benchmark padded LoRA ranks with full-rank controls")
+    modes.add_argument("--canonical-report", action="store_true",
+                       help="report CPU-verified canonical and PyTorch matmul timings as JSONL")
+    parser.add_argument("--dump-dir", type=Path,
+                        help="save canonical-report MSL sources in this directory")
+    parser.add_argument("--reference-msl-dir", type=Path,
+                        help="pair canonical direct-shader timings with MSL sources from an earlier --dump-dir run")
     args = parser.parse_args()
-    main(recompute=args.recompute, lora=args.lora, lora_padded=args.lora_padded)
+    if args.dump_dir is not None and not args.canonical_report:
+        parser.error("--dump-dir requires --canonical-report")
+    if args.reference_msl_dir is not None and not args.canonical_report:
+        parser.error("--reference-msl-dir requires --canonical-report")
+    main(recompute=args.recompute, lora=args.lora, lora_padded=args.lora_padded,
+         canonical_report=args.canonical_report, dump_dir=args.dump_dir,
+         reference_msl_dir=args.reference_msl_dir)

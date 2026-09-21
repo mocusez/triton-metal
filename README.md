@@ -623,8 +623,22 @@ The current dependency-ordered priorities are:
    multiple of the matrix unit's eight, takes the predicated loop as before.
    This also covers single-dot loops that rebuild their addresses from the K
    induction variable, including a transposed B loaded as `[N, K]`. The
-   duplicated body is limited to sixteen accumulator tiles per warp. The
-   `--recompute` mode of `python/test/microbenchmark/metal_matmul_canonical.py`
+   duplicated body is limited to sixteen accumulator tiles per warp.
+   The standalone pointer-advance fp16 path batches the interior operand copies
+   into disjoint per-warp slots, keeping half inputs and float accumulators.
+   Two SIMD-group fences protect the whole batch instead of each 8x8 operand.
+   The extra scratch is capped at 8 KiB; compound kernels, downselected
+   launches, and larger tiles retain the existing path. Boundary loads keep
+   their masks. Masked matrix stores also use SIMD-group fences when every
+   user of their scratch has a proven private warp slice; mixed users retain
+   threadgroup fences. `--canonical-report --dump-dir <path>` records CPU-checked
+   PyTorch comparisons and generated MSL; `--reference-msl-dir <baseline-path>`
+   adds interleaved comparisons with archived baseline shaders.
+   Two paired runs on Apple M4 (macOS 26.4, PyTorch 2.10.0) measured
+   1.23–1.27x acceleration for 1024³ fp16, 64x64 tiles and four warps.
+   End-to-end Triton latency remains about 2.1x that of preallocated
+   `torch.matmul`; this does not establish parity with PyTorch.
+   The `--recompute` mode of `python/test/microbenchmark/metal_matmul_canonical.py`
    measures masked and unmasked forms against a CPU numerical reference.
    The separate fused LoRA lowering checks X/W and adapter A bounds
    independently. Full interior tiles use an unmasked K loop; padded adapter

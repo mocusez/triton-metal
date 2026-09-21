@@ -13,6 +13,7 @@ add_mlir_dialect_library(MLIRTritonMetal
   MLIRFuncDialect
   MLIRMemRefDialect
   MLIRSCFDialect
+  TritonGPUIR
 )
 
 # LLVM 22→23 drift: many `builder.create<OpTy>(...)` calls in the copied
