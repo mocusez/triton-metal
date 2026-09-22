@@ -1,6 +1,6 @@
 // RUN: split-file %s %t
-// RUN: triton-metal-opt --convert-tritongpu-to-metal %t/supported_fma.mlir | FileCheck %s --check-prefix=FMA
-// RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_fma.mlir 2>&1 | FileCheck %s --check-prefix=SOURCE
+// RUN: triton-metal-opt --convert-tritongpu-to-metal %t/supported_staged_source.mlir | FileCheck %s --check-prefix=FMA
+// RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_staged_source.mlir 2>&1 | FileCheck %s --check-prefix=SOURCE
 // RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_if.mlir 2>&1 | FileCheck %s --check-prefix=SOURCE
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %t/supported.mlir | FileCheck %s
 // RUN: not triton-metal-opt --convert-tritongpu-to-metal %t/unsupported_scalar.mlir 2>&1 | FileCheck %s --check-prefix=BAD
@@ -140,16 +140,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // BAD: loop-carried tl.gather recurrence contains a scalar or tensor cone that cannot be replayed safely
 
-//--- supported_fma.mlir
+//--- supported_staged_source.mlir
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @supported_fma(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
+  tt.func public @supported_staged_source(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
     %one = arith.constant dense<1.0> : tensor<128xf32, #blocked>
     %r = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
     %xp = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
     %xa = tt.addptr %xp, %r : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
     %v = tt.load %xa : tensor<128x!tt.ptr<f32>, #blocked>
-    %src = math.fma %v, %v, %one : tensor<128xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %src_i = arith.fptosi %v : tensor<128xf32, #blocked> to tensor<128xi32, #blocked>
+    %src_c = arith.constant dense<3> : tensor<128xi32, #blocked>
+    %src_m = arith.maxsi %src_i, %src_c : tensor<128xi32, #blocked>
+    %src = arith.sitofp %src_m : tensor<128xi32, #blocked> to tensor<128xf32, #blocked>
     %ixp = tt.splat %ix : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
     %ixa = tt.addptr %ixp, %r : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
     %i = tt.load %ixa : tensor<128x!tt.ptr<i32>, #blocked>
@@ -161,16 +167,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-//--- unsupported_fma.mlir
+//--- unsupported_staged_source.mlir
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @unsupported_fma(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
+  tt.func public @unsupported_staged_source(%x: !tt.ptr<f32>, %ix: !tt.ptr<i32>, %o: !tt.ptr<f32>, %flag: i1) {
     %one = arith.constant dense<1.0> : tensor<256xf32, #blocked>
     %r = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
     %xp = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
     %xa = tt.addptr %xp, %r : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
     %v = tt.load %xa : tensor<256x!tt.ptr<f32>, #blocked>
-    %src = math.fma %v, %v, %one : tensor<256xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %src_i = arith.fptosi %v : tensor<256xf32, #blocked> to tensor<256xi32, #blocked>
+    %src_c = arith.constant dense<3> : tensor<256xi32, #blocked>
+    %src_m = arith.maxsi %src_i, %src_c : tensor<256xi32, #blocked>
+    %src = arith.sitofp %src_m : tensor<256xi32, #blocked> to tensor<256xf32, #blocked>
     %ixp = tt.splat %ix : !tt.ptr<i32> -> tensor<256x!tt.ptr<i32>, #blocked>
     %ixa = tt.addptr %ixp, %r : tensor<256x!tt.ptr<i32>, #blocked>, tensor<256xi32, #blocked>
     %i = tt.load %ixa : tensor<256x!tt.ptr<i32>, #blocked>
@@ -210,8 +222,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // A source that cannot be replayed is still supported by single-band staging.
-// FMA-LABEL: metal.kernel supported_fma
-// FMA: %[[VALUE:.*]] = metal.fma
+// FMA-LABEL: metal.kernel supported_staged_source
+// FMA: %[[VALUE:.*]] = arith.sitofp
 // FMA: %[[SCRATCH:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
 // FMA: metal.barrier
 // FMA: metal.store %[[VALUE]], %[[SCRATCH]][

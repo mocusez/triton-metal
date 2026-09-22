@@ -6502,6 +6502,22 @@ coneMathIntrinsicSymbol(mlir::Operation *def) {
   return std::nullopt;
 }
 
+// Cone producers with a TERNARY Metal emission. `math.fma` must stay FUSED: a
+// multiply plus an add rounds twice and would disagree with the elementwise
+// path on the same expression, which `direct_math_ops.mlir` already pins with
+// a `CHECK-NOT` on that split. Building `metal.fma` is what keeps them equal --
+// it translates to one `metal::precise::fma(a, b, c)` call.
+//
+// No width gate, and this is the THIRD distinct reason among these tables, so
+// it was measured rather than inherited. The precise ops are refused by the
+// frontend on f16; a f16 `%` is promoted there to f32. A f16 `math.fma`
+// reaches the backend UNCHANGED -- and is refused before conversion by
+// `validateUnsupportedOpsRejected`, which shares this exact envelope. The cone
+// therefore only ever sees the f32 form, by a different mechanism again.
+static bool coneFusedTernaryOp(mlir::Operation *def) {
+  return mlir::isa_and_nonnull<mlir::math::FmaOp>(def);
+}
+
 // Element types `math.absf` has an exact Metal emission for.
 static bool metalAbsFTypeSupported(mlir::Type ty) {
   if (auto rtt = mlir::dyn_cast_or_null<mlir::RankedTensorType>(ty))
@@ -10011,7 +10027,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
              mlir::arith::CmpFOp>(scalarDef) &&
          !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef) &&
          !conePreciseBinaryOperator(scalarDef) &&
-         !coneMathIntrinsicSymbol(scalarDef))) {
+         !coneMathIntrinsicSymbol(scalarDef) &&
+         !coneFusedTernaryOp(scalarDef))) {
       // Ops inside the old loop are erased and can never be reused. Prefix ops
       // were already validated by the pre-conversion dry run; after function
       // conversion some of their supported constants/casts may be represented
@@ -10358,6 +10375,18 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return MathIntrinsicOp::create(rewriter, loc, a.getType(),
                                    rewriter.getStringAttr(*sym),
                                    mlir::ValueRange{a, b})
+        .getResult();
+  }
+  if (coneFusedTernaryOp(def)) {
+    mlir::Value a =
+        evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank1ValueAt(def->getOperand(1), idxVal, rewriter, loc, depth + 1);
+    mlir::Value c =
+        evalRank1ValueAt(def->getOperand(2), idxVal, rewriter, loc, depth + 1);
+    if (!a || !b || !c)
+      return nullptr;
+    return mlir::triton::metal::FmaOp::create(rewriter, loc, a, b, c)
         .getResult();
   }
   // Float extrema. The operand's NaN policy decides the operator, so a replayed
@@ -11177,6 +11206,18 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                    mlir::ValueRange{a, b})
         .getResult();
   }
+  if (coneFusedTernaryOp(def)) {
+    mlir::Value a = evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    mlir::Value b = evalRank2ConeAt(def->getOperand(1), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    mlir::Value c = evalRank2ConeAt(def->getOperand(2), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    if (!a || !b || !c)
+      return nullptr;
+    return mlir::triton::metal::FmaOp::create(rewriter, loc, a, b, c)
+        .getResult();
+  }
   // Float extrema; same NaN-policy dispatch as the rank-1 cone evaluator.
   if (auto extremum = floatExtremumOperator(def))
     return binary(def->getOperand(0), def->getOperand(1), *extremum);
@@ -11852,6 +11893,13 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
                               deferAggregateLeaves) &&
            rank1ConeSupported(def->getOperand(1), depth + 1,
                               deferAggregateLeaves);
+  if (coneFusedTernaryOp(def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(2), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank1ConeSupported(def->getOperand(0), depth + 1,
@@ -12123,6 +12171,10 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   if (coneMathIntrinsicSymbol(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
            rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
+  if (coneFusedTernaryOp(def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(2), depth + 1, preflight);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank2ConeSupported(def->getOperand(0), depth + 1, preflight);

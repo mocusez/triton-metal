@@ -1228,9 +1228,10 @@ def _gather_source_replay_kernel(x_ptr, idx_ptr, out_ptr, flag,
     tl.store(out_ptr + offs, tl.gather(x, tl.load(idx_ptr + offs), axis=0))
 
 
-# "div" and "rem" left this list as the cone tables learned tt.precise_divf and
-# arith.remf.
-@pytest.mark.parametrize("mode", ["fma", "if"])
+# div, rem and fma each left this list as the cone tables learned them. What
+# remains is structural: a tensor-yielding `scf.if` is not a producer the
+# evaluator can be taught, so it stays refused however wide the tables get.
+@pytest.mark.parametrize("mode", ["if"])
 def test_gather_rank1_source_replay_is_rejected_not_crashed(mode, tmp_path):
     """A declined multi-element source must leave compilation recoverable."""
     import os
@@ -1514,9 +1515,13 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
         x = tl.div_rn(x, 3.0)
         y = tl.cumsum(x, 0, reverse=REVERSE)
         tl.store(out_ptr + offs, y)
+    elif MODE == "clamp":
+        x = tl.clamp(x, 0.5, 1.5)
+        y = tl.cumsum(x, 0, reverse=REVERSE)
+        tl.store(out_ptr + offs, y)
     elif MODE == "nested_if":
         if flag:
-            x = tl.fma(x, x, 1.0)
+            x = tl.clamp(x, 0.5, 1.5)
             y = tl.cumsum(x, 0, reverse=REVERSE)
             tl.store(out_ptr + offs, y)
         else:
@@ -1534,9 +1539,9 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
     [
         pytest.param(block, mode, id=f"b{block}_{mode}")
         for block in (32, 256)
-        # "div" and "rem" left as the cone tables learned tt.precise_divf
-        # and arith.remf.
-        for mode in ("fma",)
+        # div, rem and fma left as the cone tables learned them; `tt.clampf`
+        # carries a NaN policy and is still outside the evaluator.
+        for mode in ("clamp",)
     ] + [
         pytest.param(128, "nested_if", id="b128_nested_if"),
     ],
@@ -3997,10 +4002,11 @@ def _reduce_replay_loop_kernel(X, Y, O, BLOCK: tl.constexpr,
         tl.store(O, result)
 
 
-# sqrt_rn and div_rn moved out when the cone tables learned them; they are
-# covered as SUPPORTED below, at more than one element per thread.
-@pytest.mark.parametrize("operation", ["fma", "clamp",
-                                       "loop_result", "loop_iter_arg"])
+# sqrt_rn, div_rn and fma moved out as the cone tables learned them; they are
+# covered as SUPPORTED below, at more than one element per thread. `clamp` and
+# the two loop forms remain: the first needs a NaN policy, the others are
+# structurally not cones.
+@pytest.mark.parametrize("operation", ["clamp", "loop_result", "loop_iter_arg"])
 @pytest.mark.parametrize("num_warps,wrapped,reduction", [(1, False, "sum"), (4, True, "max")])
 def test_reduce_rank1_unreplayable_source_fails_without_crashing(
         operation, num_warps, wrapped, reduction, tmp_path):
@@ -5992,8 +5998,10 @@ def _canonical_tuple_scan_kernel(x_ptr, y_ptr, out_ptr, aux_ptr, flag,
 # carries an i1 the general tuple scan has no slot for at any block size.
 @pytest.mark.parametrize(
     "block,kind,mode",
-    [(256, "affine", "fma"), (256, "affine", "tensor_if"),
-     (128, "segmented", "fma"), (32, "segmented", "tensor_if")],
+    # The fma cells left when the cone tables learned `math.fma`. What remains
+    # is the tensor-yielding `scf.if`, which is structural rather than a
+    # producer the evaluator could be taught.
+    [(256, "affine", "tensor_if"), (32, "segmented", "tensor_if")],
 )
 def test_canonical_tuple_scan_unreplayable_source_is_rejected_not_crashed(
         block, kind, mode, tmp_path):
@@ -6120,7 +6128,10 @@ def test_canonical_affine_scan_unreplayable_source_is_exact(block, mode,
 
 @pytest.mark.parametrize(
     "mode,claimed",
-    [("arithmetic", True), ("fma", False), ("div", True), ("rem", True)])
+    # `fma` read False until the cone tables learned `math.fma`: the canonical
+    # tier could not rebuild that source and the scan fell through to the
+    # general lockstep one. It is True for the same reason the others are.
+    [("arithmetic", True), ("fma", True), ("div", True), ("rem", True)])
 def test_canonical_affine_scan_tier_census(mode, claimed):
     """Which tier ran is not visible in the answer; census the emitted body.
 
@@ -6247,7 +6258,6 @@ def test_prefix_negation_matches_torch(form, block):
 # divrn/sqrtrn were here until the cone tables learned the precise ops; the
 # remaining three still have no cone emission, so they still name themselves.
 _RANK1_CULPRITS = [
-    ("fma", "math.fma"),
     ("clamp", "tt.clampf"),
 ]
 
@@ -6350,6 +6360,8 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         v = tl.sqrt_rn(x * x + 1.0)
     elif FORM == "rem":
         v = x % y
+    elif FORM == "fma":
+        v = tl.fma(x, y, x)
     else:
         v = tl.div_rn(x, y)
     if SITE == "reduce":
@@ -6362,7 +6374,7 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         tl.store(Op + tl.arange(0, BINS), tl.histogram(v.to(tl.int32), BINS))
 
 
-@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem"])
+@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem", "fma"])
 @pytest.mark.parametrize("site", ["reduce", "scan", "gather", "histogram"])
 # 128 is one element per thread, where nothing is replayed and these always
 # worked; 256 is two, which is what this slice opened. Histogram replays at
@@ -6381,6 +6393,8 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
         v = torch.sqrt(x * x + 1.0)
     elif form == "rem":
         v = torch.fmod(x, y)
+    elif form == "fma":
+        v = x * y + x
     else:
         v = x / y
     if site == "reduce":

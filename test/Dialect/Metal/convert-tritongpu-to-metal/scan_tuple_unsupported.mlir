@@ -116,7 +116,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %base = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
     %v = tt.load %ptr : tensor<256x!tt.ptr<f32>, #blocked>
-    %a = math.fma %v, %v, %v : tensor<256xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %a_i = arith.fptosi %v : tensor<256xf32, #blocked> to tensor<256xi32, #blocked>
+    %a_c = arith.constant dense<3> : tensor<256xi32, #blocked>
+    %a_m = arith.maxsi %a_i, %a_c : tensor<256xi32, #blocked>
+    %a = arith.sitofp %a_m : tensor<256xi32, #blocked> to tensor<256xf32, #blocked>
     // expected-error @+1 {{a canonical tuple scan replays each source at a logical position}}
     %r:2 = "tt.scan"(%a, %v) <{axis = 0 : i32, reverse = false}> ({
     ^bb0(%la: f32, %lx: f32, %ra: f32, %rx: f32):
@@ -141,7 +147,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %base = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
     %v = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
-    %val = math.fma %v, %v, %v : tensor<128xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %val_i = arith.fptosi %v : tensor<128xf32, #blocked> to tensor<128xi32, #blocked>
+    %val_c = arith.constant dense<3> : tensor<128xi32, #blocked>
+    %val_m = arith.maxsi %val_i, %val_c : tensor<128xi32, #blocked>
+    %val = arith.sitofp %val_m : tensor<128xi32, #blocked> to tensor<128xf32, #blocked>
     %zero = arith.constant dense<0.0> : tensor<128xf32, #blocked>
     %flag = arith.cmpf ogt, %v, %zero : tensor<128xf32, #blocked>
     // expected-error @+1 {{a canonical tuple scan replays each source at a logical position}}

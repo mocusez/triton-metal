@@ -474,12 +474,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // being correct inclusive affine scans.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scan_affine_fma_source_falls_through(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  tt.func public @scan_affine_unreplayable_source_falls_through(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
     %off = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
     %base = tt.splat %x : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
     %v = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
-    %a = math.fma %v, %v, %v : tensor<128xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %a_i = arith.fptosi %v : tensor<128xf32, #blocked> to tensor<128xi32, #blocked>
+    %a_c = arith.constant dense<3> : tensor<128xi32, #blocked>
+    %a_m = arith.maxsi %a_i, %a_c : tensor<128xi32, #blocked>
+    %a = arith.sitofp %a_m : tensor<128xi32, #blocked> to tensor<128xf32, #blocked>
     %r:2 = "tt.scan"(%a, %v) <{axis = 0 : i32, reverse = false}> ({
     ^bb0(%la: f32, %lx: f32, %ra: f32, %rx: f32):
       %ca = arith.mulf %la, %ra : f32
@@ -494,9 +500,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// CHECK-LABEL: metal.kernel scan_affine_fma_source_falls_through
+// CHECK-LABEL: metal.kernel scan_affine_unreplayable_source_falls_through
 // CHECK-NOT: metal.threadgroup_affine_prefix_scan
-// CHECK: %[[Z:.*]] = metal.fma
+// CHECK: %[[Z:.*]] = arith.sitofp
 // CHECK: %[[BUFA:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
 // CHECK: %[[BUFX:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
 // CHECK: metal.barrier

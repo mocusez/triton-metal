@@ -606,7 +606,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %y_10 = tt.broadcast %y_9 : tensor<8x1x!tt.ptr<f32>, #blocked> -> tensor<8x32x!tt.ptr<f32>, #blocked>
     %y_11 = tt.addptr %y_10, %x_6 : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
     %y_12 = tt.load %y_11 : tensor<8x32x!tt.ptr<f32>, #blocked>
-    %v = math.fma %x_8, %y_12, %x_8 : tensor<8x32xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %v_i = arith.fptosi %x_8 : tensor<8x32xf32, #blocked> to tensor<8x32xi32, #blocked>
+    %v_c = arith.constant dense<3> : tensor<8x32xi32, #blocked>
+    %v_m = arith.maxsi %v_i, %v_c : tensor<8x32xi32, #blocked>
+    %v = arith.sitofp %v_m : tensor<8x32xi32, #blocked> to tensor<8x32xf32, #blocked>
     // expected-error @+1 {{rank-2 reduce cannot replay its computed source cone}}
     %s = "tt.reduce"(%v) <{axis = 1 : i32}> ({
     ^bb0(%s_13: f32, %s_14: f32):

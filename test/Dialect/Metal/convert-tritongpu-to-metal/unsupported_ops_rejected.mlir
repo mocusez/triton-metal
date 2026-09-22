@@ -963,7 +963,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %base = tt.splat %input : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
     %x = tt.load %ptr : tensor<32x!tt.ptr<f32>, #blocked>
-    %src = math.fma %x, %x, %x : tensor<32xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %src_i = arith.fptosi %x : tensor<32xf32, #blocked> to tensor<32xi32, #blocked>
+    %src_c = arith.constant dense<3> : tensor<32xi32, #blocked>
+    %src_m = arith.maxsi %src_i, %src_c : tensor<32xi32, #blocked>
+    %src = arith.sitofp %src_m : tensor<32xi32, #blocked> to tensor<32xf32, #blocked>
     // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
     %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
     ^bb0(%lhs: f32, %rhs: f32):
@@ -984,7 +990,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %base = tt.splat %input : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
     %x = tt.load %ptr : tensor<256x!tt.ptr<f32>, #blocked>
-    %src = math.fma %x, %x, %x : tensor<256xf32, #blocked>
+    // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+    // the widening path, unlike the `math.fma` that used to sit here, so this
+    // fixture does not need revisiting each time the tables learn another op.
+    %src_i = arith.fptosi %x : tensor<256xf32, #blocked> to tensor<256xi32, #blocked>
+    %src_c = arith.constant dense<3> : tensor<256xi32, #blocked>
+    %src_m = arith.maxsi %src_i, %src_c : tensor<256xi32, #blocked>
+    %src = arith.sitofp %src_m : tensor<256xi32, #blocked> to tensor<256xf32, #blocked>
     // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
     %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
     ^bb0(%lhs: f32, %rhs: f32):
@@ -1007,7 +1019,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %base = tt.splat %input : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
       %ptr = tt.addptr %base, %off : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
       %x = tt.load %ptr : tensor<128x!tt.ptr<f32>, #blocked>
-      %src = math.fma %x, %x, %x : tensor<128xf32, #blocked>
+      // `arith.maxsi` stands in for "a producer no cone replays". It is not on
+      // the widening path, unlike the `math.fma` that used to sit here, so this
+      // fixture does not need revisiting each time the tables learn another op.
+      %src_i = arith.fptosi %x : tensor<128xf32, #blocked> to tensor<128xi32, #blocked>
+      %src_c = arith.constant dense<3> : tensor<128xi32, #blocked>
+      %src_m = arith.maxsi %src_i, %src_c : tensor<128xi32, #blocked>
+      %src = arith.sitofp %src_m : tensor<128xi32, #blocked> to tensor<128xf32, #blocked>
       // expected-error @+1 {{Metal backend: rank-1 scan cannot replay its source across conversion}}
       %scan = "tt.scan"(%src) <{axis = 0 : i32, reverse = false}> ({
       ^bb0(%lhs: f32, %rhs: f32):
