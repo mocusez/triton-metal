@@ -1986,3 +1986,76 @@ def test_dot_dynamic_k_fused_lora_unrelated_modulo_is_named(capfd):
     with pytest.raises(Exception):
         _run_fused_lora_wrapped("unrelated")
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+@triton.jit
+def multidot_recompute_wrap_kernel(
+    x_ptr, w_ptr, a_ptr, o0_ptr, o1_ptr, M, N, K,
+    sxm, sxk, swn, swk, sar, sak, so0, so1,
+    WRAP_MODE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Two accumulators sharing one unmasked A load: the multi-dot recompute
+    tier's own shape (8x8 tiles, unmasked stores, one warp, runtime K)."""
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    src_m = offs_m % M if WRAP_MODE == "tail" else offs_m
+    acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + src_m[:, None] * sxm + offs_k[None, :] * sxk)
+        w = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk)
+        a = tl.load(a_ptr + offs_n[:, None] * sar + offs_k[None, :] * sak)
+        acc0 = tl.dot(x, tl.trans(w), acc0, allow_tf32=False)
+        acc1 = tl.dot(x, tl.trans(a), acc1, allow_tf32=False)
+    tl.store(o0_ptr + offs_m[:, None] * so0 + offs_n[None, :], acc0)
+    tl.store(o1_ptr + offs_m[:, None] * so1 + offs_n[None, :], acc1)
+
+
+def _run_multidot_recompute(mode):
+    M, N, K, BM, BN, BK = 16, 8, 16, 8, 8, 8   # two programs of BM
+    torch.manual_seed(0x20C)
+    x = torch.randn((M, K), dtype=torch.float32)
+    w = torch.randn((N, K), dtype=torch.float32)
+    a = torch.randn((N, K), dtype=torch.float32)
+    o0 = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    o1 = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    multidot_recompute_wrap_kernel[(triton.cdiv(M, BM),)](
+        x.to("mps"), w.to("mps"), a.to("mps"), o0, o1, M, N, K,
+        K, 1, K, 1, K, 1, N, N, WRAP_MODE=mode,
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, num_warps=1)
+    torch.mps.synchronize()
+    want = (x @ w.t(), x @ a.t())
+    first_block = x[torch.arange(M) % BM]
+    origin_lost = (first_block @ w.t(), first_block @ a.t())
+    return (o0.cpu(), o1.cpu()), want, origin_lost
+
+
+def test_dot_dynamic_k_multidot_recompute_control_is_exact():
+    """The unwrapped kernel must keep working, and the cell must discriminate.
+
+    Which tier answers is censused at the MLIR level in
+    `.omx/plans/dot-address-gather-probes/multidot_recompute_wrap.py`
+    (`scalar_dot=0 mma=2 loops=1 stagedA=3` -- one loop, one shared A).
+    """
+    got, want, origin_lost = _run_multidot_recompute("none")
+    assert not all(torch.allclose(w_, l_, atol=1e-2)
+                   for w_, l_ in zip(want, origin_lost)), (
+        "the references coincide, so this cell cannot discriminate")
+    for g, w_ in zip(got, want):
+        torch.testing.assert_close(g, w_, atol=2e-3, rtol=2e-3)
+
+
+def test_dot_dynamic_k_multidot_recompute_wrap_is_named():
+    """A `%` on this tier's shared A index is refused, not answered wrongly.
+
+    This tier rebuilds each address from an origin and a stride and its store
+    is UNMASKED by its own envelope -- so there are no extents to prove a
+    divisor against, not even for a tail wrap. Measured one commit before the
+    pass-1 gate: both a tail wrap and an unrelated divisor stayed on this tier
+    and returned the FIRST block's rows for every program.
+    """
+    with pytest.raises(Exception):
+        _run_multidot_recompute("tail")
