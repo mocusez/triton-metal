@@ -10814,7 +10814,8 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
                                      mlir::ConversionPatternRewriter &rewriter,
                                      mlir::Location loc, int depth);
 static bool rank2AddPtrChainSupported(mlir::Value ptrVal, int depth);
-static bool rank2ConeSupported(mlir::Value v, int depth);
+static bool rank2ConeSupported(mlir::Value v, int depth,
+                               bool preflight = false);
 
 //===----------------------------------------------------------------------===//
 // Wall 17 (Case C): rank-2 axis=1 reduce over a COMPUTED tile.
@@ -11909,7 +11910,16 @@ preprocessLoopCarriedGathers(mlir::ModuleOp moduleOp,
 // Predicate mirroring `evalRank2ConeAt`'s accepted producers. Run BEFORE the
 // reduce loop emits anything so an unsupported cone yields a clean
 // notifyMatchFailure instead of relying on conversion rollback.
-static bool rank2ConeSupported(mlir::Value v, int depth) {
+//
+// `preflight` asks the same question before conversion, where the staging
+// globals do not exist yet. It is OPTIMISTIC about everything the pattern can
+// still turn into a leaf -- a block argument, a loop-carried [M,N] tile, the
+// rank-1 source under a `tt.expand_dims` that `collectStagingLeaves` stages at
+// M <= tpb via `getRemappedValue` -- because refusing a shape the pattern
+// would have accepted is worse than missing one it would not. What it still
+// answers false for is a PRODUCER no tier re-emits at any tile size, which is
+// what the preflight caller exists to name.
+static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   if (depth > 24)
     return false;
   // A staged [M,N] tile is a leaf: it reads out of threadgroup memory, so the
@@ -11924,37 +11934,42 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
   }
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
-    return false;
+    // A block argument is a loop-carried value the pattern may still stage.
+    return preflight;
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
     if (!load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>())
       return false;
-    if (load.getMask() && !rank2ConeSupported(load.getMask(), depth + 1))
+    if (load.getMask() && !rank2ConeSupported(load.getMask(), depth + 1, preflight))
       return false;
-    if (load.getOther() && !rank2ConeSupported(load.getOther(), depth + 1))
+    if (load.getOther() && !rank2ConeSupported(load.getOther(), depth + 1, preflight))
       return false;
     return true;
   }
   if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
-    return rank2ConeSupported(bc.getSrc(), depth + 1);
+    return rank2ConeSupported(bc.getSrc(), depth + 1, preflight);
   if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
     auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
-    return srcRtt && srcRtt.getRank() == 1 &&
-           rank1ConeSupported(ed.getSrc(), depth + 1);
+    if (!srcRtt || srcRtt.getRank() != 1)
+      return false;
+    // The per-row leaf under an expand_dims is exactly what Inc 2.5 stages,
+    // and `rank1ConeSupported` only says yes to it once `g_stagedLeaves` is
+    // populated -- which happens during conversion. Do not descend here.
+    return preflight || rank1ConeSupported(ed.getSrc(), depth + 1);
   }
   if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return rank2ConeSupported(def->getOperand(0), depth + 1);
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
-    return rank2ConeSupported(def->getOperand(0), depth + 1);
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
-           rank2ConeSupported(def->getOperand(0), depth + 1);
+           rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (auto ext = mlir::dyn_cast<mlir::triton::ExternElementwiseOp>(def)) {
     auto info = metalExternSymbol(ext.getSymbol());
     if (!info || ext.getSrcs().size() != info->arity)
       return false;
     return llvm::all_of(ext.getSrcs(), [&](mlir::Value src) {
-      return rank2ConeSupported(src, depth + 1);
+      return rank2ConeSupported(src, depth + 1, preflight);
     });
   }
   // Keep in sync with the binary cases in `evalRank2ConeAt` — same trap the
@@ -11972,17 +11987,17 @@ static bool rank2ConeSupported(mlir::Value v, int depth) {
                 mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
                 mlir::arith::ShRUIOp, mlir::arith::CmpIOp, mlir::arith::CmpFOp>(
           def))
-    return rank2ConeSupported(def->getOperand(0), depth + 1) &&
-           rank2ConeSupported(def->getOperand(1), depth + 1);
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
   if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
                 mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                 mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
                 mlir::arith::TruncIOp, mlir::triton::TransOp>(def))
-    return rank2ConeSupported(def->getOperand(0), depth + 1);
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
-    return rank2ConeSupported(sel.getCondition(), depth + 1) &&
-           rank2ConeSupported(sel.getTrueValue(), depth + 1) &&
-           rank2ConeSupported(sel.getFalseValue(), depth + 1);
+    return rank2ConeSupported(sel.getCondition(), depth + 1, preflight) &&
+           rank2ConeSupported(sel.getTrueValue(), depth + 1, preflight) &&
+           rank2ConeSupported(sel.getFalseValue(), depth + 1, preflight);
   return false;
 }
 
@@ -39055,6 +39070,48 @@ struct ConvertTritonGPUToMetalPass
             "tl.sum(tl.sum(x, axis=2), axis=1)) has no lowering");
         reduceOk = false;
         return;
+      }
+
+      // The rank-2 computed-cone path replays its source per (row, column)
+      // with `evalRank2ConeAt`, and the pattern asks `rank2ConeSupported`
+      // about it from INSIDE `applyFullConversion` -- the rollback-corruption
+      // site. A producer in neither the evaluator nor its predicate therefore
+      // took the process down instead of being diagnosed: `tl.fma`, a float
+      // remainder, `tl.div_rn`, `tl.sqrt_rn`, `tl.clamp` and a float-to-int
+      // cast all died on a signal, on BOTH axes, at two elements per thread
+      // and again at M > tpb, with the signal varying between SIGABRT, SIGBUS
+      // and SIGSEGV across runs of the same kernel.
+      //
+      // `stagedFallback` is what keeps this narrow, and it is not an
+      // approximation: at one element per thread the staged rank-N path claims
+      // the reduce and replays NOTHING -- it publishes each thread's scalar and
+      // reads it back -- so every one of those producers is exact there and
+      // must not be refused. Only when that path declines is the cone actually
+      // replayed.
+      if (rtt && rtt.getRank() == 2 && !stagedFallback &&
+          red.getSrcs().size() == 1 && rtt.getElementType().isF32() &&
+          mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              rtt.getEncoding())) {
+        mlir::Value reduceSrc = red.getSrcs().front();
+        if (auto cvt =
+                reduceSrc.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+          reduceSrc = cvt.getSrc();
+        // The pattern takes its direct-load path for an UNMASKED load only;
+        // anything else is replayed as a computed cone.
+        auto loadOp = reduceSrc.getDefiningOp<mlir::triton::LoadOp>();
+        if ((!loadOp || loadOp.getMask()) &&
+            !rank2ConeSupported(reduceSrc, 0, /*preflight=*/true)) {
+          red.emitOpError(
+              "Metal backend: rank-2 reduce cannot replay its computed source "
+              "cone across conversion; the source contains a producer this "
+              "backend does not re-emit per element (tl.fma, a float "
+              "remainder, tl.div_rn, tl.sqrt_rn, tl.clamp and float-to-int "
+              "casts are outside the cone evaluator). Reduce a plain load, or "
+              "size the tile so one element per thread makes the staged path "
+              "applicable");
+          reduceOk = false;
+          return;
+        }
       }
       // 2) multi-axis on rank-2 (i.e. axes attr length > 1) — getAxis returns
       // a single uint32, but tt.reduce supports a single axis; reject if the

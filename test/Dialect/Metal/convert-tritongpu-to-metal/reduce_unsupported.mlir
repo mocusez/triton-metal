@@ -573,3 +573,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// The rank-2 computed-cone path replays its source per (row, column) with
+// `evalRank2ConeAt`, and `math.fma` is in neither that evaluator nor its
+// predicate. The pattern's gate sits inside `applyFullConversion`, so this was
+// a process kill -- SIGABRT, SIGBUS or SIGSEGV, varying between runs of the
+// same kernel -- rather than a diagnostic, on both axes.
+//
+// Two elements per thread (8x32 over 128 threads) is what makes the cone
+// actually replay: at one element per thread the staged rank-N path claims the
+// reduce, replays nothing, and this same source compiles and is exact.
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @rank2_reduce_cone_fma(%Xp: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %Yp: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %O: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %cst = arith.constant dense<32> : tensor<8x1xi32, #blocked>
+    %r = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #blocked1>
+    %r_0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %r_1 = tt.expand_dims %r_0 {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %c = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %c_2 = tt.expand_dims %c {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+    %x = arith.muli %r_1, %cst : tensor<8x1xi32, #blocked>
+    %x_3 = tt.splat %Xp : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #blocked>
+    %x_4 = tt.addptr %x_3, %x : tensor<8x1x!tt.ptr<f32>, #blocked>, tensor<8x1xi32, #blocked>
+    %x_5 = tt.broadcast %x_4 : tensor<8x1x!tt.ptr<f32>, #blocked> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+    %x_6 = tt.broadcast %c_2 : tensor<1x32xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %x_7 = tt.addptr %x_5, %x_6 : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+    %x_8 = tt.load %x_7 : tensor<8x32x!tt.ptr<f32>, #blocked>
+    %y = tt.splat %Yp : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #blocked>
+    %y_9 = tt.addptr %y, %x : tensor<8x1x!tt.ptr<f32>, #blocked>, tensor<8x1xi32, #blocked>
+    %y_10 = tt.broadcast %y_9 : tensor<8x1x!tt.ptr<f32>, #blocked> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+    %y_11 = tt.addptr %y_10, %x_6 : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+    %y_12 = tt.load %y_11 : tensor<8x32x!tt.ptr<f32>, #blocked>
+    %v = math.fma %x_8, %y_12, %x_8 : tensor<8x32xf32, #blocked>
+    // expected-error @+1 {{rank-2 reduce cannot replay its computed source cone}}
+    %s = "tt.reduce"(%v) <{axis = 1 : i32}> ({
+    ^bb0(%s_13: f32, %s_14: f32):
+      %s_15 = arith.addf %s_13, %s_14 : f32
+      tt.reduce.return %s_15 : f32
+    }) : (tensor<8x32xf32, #blocked>) -> tensor<8xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %0 = tt.splat %O : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>, #blocked1>
+    %1 = tt.addptr %0, %r : tensor<8x!tt.ptr<f32>, #blocked1>, tensor<8xi32, #blocked1>
+    %2 = ttg.convert_layout %s : tensor<8xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8xf32, #blocked1>
+    tt.store %1, %2 : tensor<8x!tt.ptr<f32>, #blocked1>
+    tt.return
+  }
+}

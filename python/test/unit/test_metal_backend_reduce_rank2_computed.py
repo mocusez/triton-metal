@@ -993,3 +993,150 @@ def test_rank2_reduce_consumer_shapes_match_torch(axis, how, shape, num_warps):
         x, out, M=m, N=n, AXIS=axis, HOW=how, num_warps=num_warps)
     torch.testing.assert_close(out.reshape(expected.shape), expected,
                                atol=2e-3, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# Producers the cone evaluator does not re-emit.
+#
+# The computed-cone path replays its source per (row, column), and the
+# pattern's gate -- `rank2ConeSupported` -- runs inside `applyFullConversion`.
+# A producer in neither the evaluator nor that predicate therefore killed the
+# process instead of being diagnosed: `tl.fma`, a float remainder, `tl.div_rn`,
+# `tl.sqrt_rn`, `tl.clamp` and a float-to-int cast died on a signal on BOTH
+# axes, and the signal varied (SIGABRT / SIGBUS / SIGSEGV) between runs of one
+# unchanged kernel.
+#
+# The number of elements per thread is the axis, not the op. At one element per
+# thread the staged rank-N path claims the reduce and replays NOTHING -- it
+# publishes each thread's own scalar and reads it back -- so all six producers
+# are exact there. The refusal must not touch that, which is what the second
+# test below guards.
+# ---------------------------------------------------------------------------
+
+_CONE_FORMS = ["fma", "remf", "divrn", "sqrtrn", "clamp", "cast_i32"]
+
+
+@triton.jit
+def _rank2_cone_producer_kernel(Xp, Yp, O, M: tl.constexpr, N: tl.constexpr,
+                                AXIS: tl.constexpr, OUT: tl.constexpr,
+                                FORM: tl.constexpr):
+    r = tl.arange(0, M)[:, None]
+    c = tl.arange(0, N)[None, :]
+    x = tl.load(Xp + r * N + c)
+    y = tl.load(Yp + r * N + c)
+    if FORM == "fma":
+        v = tl.fma(x, y, x)
+    elif FORM == "remf":
+        v = x % y
+    elif FORM == "divrn":
+        v = tl.div_rn(x, y)
+    elif FORM == "sqrtrn":
+        v = tl.sqrt_rn(x * x + 1.0)
+    elif FORM == "clamp":
+        v = tl.clamp(x, 0.5, 1.5)
+    else:
+        v = (x * 4.0).to(tl.int32).to(tl.float32)
+    tl.store(O + tl.arange(0, OUT), tl.sum(v, axis=AXIS))
+
+
+def _cone_reference(form, xm, ym):
+    return {
+        "fma": lambda: xm * ym + xm,
+        "remf": lambda: torch.fmod(xm, ym),
+        "divrn": lambda: xm / ym,
+        "sqrtrn": lambda: torch.sqrt(xm * xm + 1.0),
+        "clamp": lambda: torch.clamp(xm, 0.5, 1.5),
+        "cast_i32": lambda: (xm * 4.0).to(torch.int32).to(torch.float32),
+    }[form]()
+
+
+def _run_cone_producer(form, axis, m, n):
+    torch.manual_seed(0xC0DE + m * 31 + n)
+    x = (torch.rand(m * n, dtype=torch.float32) + 1.0).contiguous()
+    y = (torch.rand(m * n, dtype=torch.float32) + 1.0).contiguous()
+    out_len = m if axis == 1 else n
+    out = torch.zeros(out_len, dtype=torch.float32, device="mps")
+    _rank2_cone_producer_kernel[(1,)](
+        x.to("mps"), y.to("mps"), out, M=m, N=n, AXIS=axis, OUT=out_len,
+        FORM=form, num_warps=4)
+    return out, x.reshape(m, n), y.reshape(m, n)
+
+
+@pytest.mark.parametrize("form", _CONE_FORMS)
+def test_rank2_cone_unreplayable_producer_is_refused(form, tmp_path):
+    """Refused before conversion, and compilation stays recoverable.
+
+    A child process, compile-only, because none of the three things that matter
+    are visible to an in-process `pytest.raises`: the named reason is an MLIR
+    diagnostic on stderr (the Python exception carries only the generic
+    "convert-tritongpu-to-metal failed" wrapper), a crash arrives as a signal
+    rather than an exception, and "the interpreter still works afterwards" can
+    only be shown by compiling again in the same process.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    script = tmp_path / f"rank2_cone_{form}.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location(
+            "rank2_cone_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(m, n, axis):
+            out_len = m if axis == 1 else n
+            return triton.compile(ASTSource(
+                module._rank2_cone_producer_kernel,
+                signature={{"Xp": "*fp32", "Yp": "*fp32", "O": "*fp32"}},
+                constexprs={{"M": m, "N": n, "AXIS": axis, "OUT": out_len,
+                            "FORM": {form!r}}}),
+                target=target, options={{"num_warps": 4}})
+
+        # Two elements per thread, and M above the threadgroup, on both axes.
+        for m, n, axis in ((8, 32, 0), (8, 32, 1), (256, 8, 0), (256, 8, 1)):
+            try:
+                compile_case(m, n, axis)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"unreplayable cone compiled: {{m}}x{{n}}")
+        # One element per thread: the staged path owns these and replays
+        # nothing, so they must still compile after four refusals.
+        compile_case(8, 16, 0)
+        compile_case(8, 16, 1)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=300,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    needle = ("Metal backend: rank-2 reduce cannot replay its computed source "
+              "cone")
+    assert result.returncode == 0, output
+    assert output.count(needle) == 4, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("form", _CONE_FORMS)
+def test_rank2_cone_producer_runs_at_one_element_per_thread(form, axis):
+    """The staged path owns this shape and replays nothing -- do not refuse it.
+
+    This is the guard on the refusal above: every one of these producers is
+    exact at 8x16 over 128 threads, and a preflight that asked the cone
+    question without asking the staged path first would take all twelve away.
+    """
+    out, xm, ym = _run_cone_producer(form, axis, 8, 16)
+    torch.mps.synchronize()
+    expected = _cone_reference(form, xm, ym).sum(dim=1 if axis == 1 else 0)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
