@@ -2059,3 +2059,140 @@ def test_dot_dynamic_k_multidot_recompute_wrap_is_named():
     """
     with pytest.raises(Exception):
         _run_multidot_recompute("tail")
+
+
+# ---------------------------------------------------------------------------
+# The two ways a user writes a K-axis mask.
+#
+#   tl.load(p, mask=offs_k < K - k * BK)        the tutorial-03 spelling
+#   tl.load(p, mask=(offs_k + k * BK) < K)      the same thing rearranged
+#
+# Triton keeps whichever was written, and the preflight recognised only the
+# first: the second moves the loop's own term to the INDEX side of the compare,
+# where the cone check that asks "is this mask about this pointer" stopped
+# seeing the pointer's coordinate. So an ordinary masked runtime-K matmul was
+# refused by name for being spelled the other way round. Found by probing the
+# three unpinned canonical-dot diagnostics.
+#
+# The census is the point of the first test: both spellings must reach the SAME
+# emitted kernel, not merely both be correct. A widened predicate whose emitter
+# falls back to the scalar tier would pass a numeric check while buying nothing.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def k_mask_spelling_kernel(A, B, C, M, N, K, BM: tl.constexpr,
+                           BN: tl.constexpr, BK: tl.constexpr,
+                           SPELL: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    a_ptr = A + offs_m[:, None] * K + offs_k[None, :]
+    b_ptr = B + offs_k[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        if SPELL == 0:
+            a = tl.load(a_ptr, mask=offs_k[None, :] < K - k * BK, other=0.0)
+            b = tl.load(b_ptr, mask=offs_k[:, None] < K - k * BK, other=0.0)
+        elif SPELL == 1:
+            a = tl.load(a_ptr, mask=(offs_k[None, :] + k * BK) < K, other=0.0)
+            b = tl.load(b_ptr, mask=(offs_k[:, None] + k * BK) < K, other=0.0)
+        else:
+            # A shifted index: NOT the same program, and not the pointer's own
+            # coordinate either. The peeling must not reach this one.
+            a = tl.load(a_ptr, mask=(offs_k[None, :] + 1) < K, other=0.0)
+            b = tl.load(b_ptr, mask=(offs_k[:, None] + 1) < K, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptr += BK
+        b_ptr += BK * N
+    tl.store(C + offs_m[:, None] * N + offs_n[None, :], acc,
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def _run_mask_spelling(spell, M=48, N=48, K=40, BM=32, BN=32, BK=16,
+                       num_warps=4):
+    torch.manual_seed(0x5A1)
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((K, N), dtype=torch.float32)
+    c = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    handle = k_mask_spelling_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        a.to("mps"), b.to("mps"), c, M, N, K, BM, BN, BK, spell,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    return c.cpu(), a @ b, handle
+
+
+def _emitted_metal(handle):
+    msl = handle.asm["metal"]
+    return msl.decode() if isinstance(msl, bytes) else str(msl)
+
+
+@pytest.mark.parametrize("spell", [0, 1], ids=["k_minus_iv", "iv_plus_offs"])
+def test_dot_dynamic_k_masked_accepts_both_mask_spellings(spell):
+    got, want, _ = _run_mask_spelling(spell)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+def test_dot_dynamic_k_mask_spellings_emit_the_same_kernel():
+    """The census: byte-identical MSL, and the matrix unit in both.
+
+    Numbers alone would not show that the rearranged spelling reaches the
+    canonical simdgroup tier rather than a correct-but-scalar fallback.
+    """
+    _, _, tutorial = _run_mask_spelling(0)
+    _, _, rearranged = _run_mask_spelling(1)
+    first, second = _emitted_metal(tutorial), _emitted_metal(rearranged)
+    assert first.count("simdgroup_multiply") > 0, first[:400]
+    assert first == second, (
+        f"spellings diverge: {first.count('simdgroup_multiply')} vs "
+        f"{second.count('simdgroup_multiply')} simdgroup_multiply")
+
+
+def test_dot_dynamic_k_shifted_mask_index_is_named(capfd):
+    """The guard on the peeling: only an induction term comes off.
+
+    `offs_k + 1` is a different program AND not the pointer's coordinate, so it
+    must stay refused -- otherwise the widening would have accepted a mask that
+    is about something else.
+    """
+    with pytest.raises(Exception):
+        _run_mask_spelling(2)
+    reason = "".join(capfd.readouterr())
+    assert "masked runtime-K multi-tile canonical dot requires" in reason
+
+
+@triton.jit
+def diagonal_output_mask_kernel(A, B, C, M, N, K, BM: tl.constexpr,
+                                BN: tl.constexpr, BK: tl.constexpr):
+    offs_m = tl.arange(0, BM)
+    offs_n = tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    a_ptr = A + offs_m[:, None] * K + offs_k[None, :]
+    b_ptr = B + offs_k[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        a = tl.load(a_ptr, mask=offs_k[None, :] < K - k * BK, other=0.0)
+        b = tl.load(b_ptr, mask=offs_k[:, None] < K - k * BK, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptr += BK
+        b_ptr += BK * N
+    # A TRIANGULAR store mask: no pair of extents describes it.
+    tl.store(C + offs_m[:, None] * N + offs_n[None, :], acc,
+             mask=(offs_m[:, None] + offs_n[None, :]) < N)
+
+
+def test_dot_dynamic_k_diagonal_output_mask_is_named(capfd):
+    """Reachable, and refused rather than answered with a rectangle."""
+    M = N = 32
+    K = 64
+    torch.manual_seed(0x5A2)
+    a = torch.randn((M, K), dtype=torch.float32).to("mps")
+    b = torch.randn((K, N), dtype=torch.float32).to("mps")
+    c = torch.zeros((M, N), dtype=torch.float32, device="mps")
+    with pytest.raises(Exception):
+        diagonal_output_mask_kernel[(1, 1)](a, b, c, M, N, K, M, N, 16,
+                                           num_warps=4)
+    reason = "".join(capfd.readouterr())
+    assert "requires a rectangular output mask" in reason

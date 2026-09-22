@@ -24040,6 +24040,48 @@ static mlir::Value normalizeRuntimeKLoopUpper(mlir::scf::ForOp loop,
 // induction variable as the staged-load origin, so its extent must be the
 // global K bound.  Accept only the exact canonical forms; widening equivalent
 // arithmetic here would make the zero-fill proof depend on cross-op algebra.
+// The SAME K-axis mask, written the two ways a user writes it:
+//
+//   tl.load(p, mask=offs_k < K - k * BK)        the tutorial-03 spelling
+//   tl.load(p, mask=(offs_k + k * BK) < K)      the same thing rearranged
+//
+// Triton keeps whichever was written. `normalizeCanonicalKExtent` already
+// recognises the first on the EXTENT side; the second moves the loop's own term
+// to the INDEX side, where the cone check then fails to see the pointer's
+// coordinate and the whole masked runtime-K matmul is refused by name. Peel
+// that one addend -- only an induction term, and only for this check, which
+// asks whether the mask is about this pointer at all. The emitted predicate
+// comes from the normalized extent either way, so the two spellings reach the
+// same code.
+static mlir::Value peelLoopInductionAddend(mlir::Value index,
+                                           mlir::scf::ForOp loop, int64_t bk) {
+  if (!index || !loop)
+    return index;
+  auto add = index.getDefiningOp<mlir::arith::AddIOp>();
+  if (!add)
+    return index;
+  auto isInductionTerm = [&](mlir::Value value) {
+    for (int guard = 0; guard < 8; ++guard) {
+      if (auto splat = value.getDefiningOp<mlir::triton::SplatOp>())
+        value = splat.getSrc();
+      else if (auto bcast = value.getDefiningOp<mlir::triton::BroadcastOp>())
+        value = bcast.getSrc();
+      else if (auto expand = value.getDefiningOp<mlir::triton::ExpandDimsOp>())
+        value = expand.getSrc();
+      else
+        break;
+    }
+    if (value == loop.getInductionVar())
+      return true;
+    return bk > 0 && isValueTimesConstant(value, loop.getInductionVar(), bk);
+  };
+  if (isInductionTerm(add.getRhs()))
+    return add.getLhs();
+  if (isInductionTerm(add.getLhs()))
+    return add.getRhs();
+  return index;
+}
+
 static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
                                              mlir::scf::ForOp loop,
                                              int64_t bk) {
@@ -24279,18 +24321,23 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   if (!aPtrsInit.getDefiningOp<mlir::triton::AddPtrOp>() ||
       !bPtrsInit.getDefiningOp<mlir::triton::AddPtrOp>())
     return mlir::failure();
-  auto maskMatchesInit = [](mlir::triton::LoadOp load,
-                            const MaskExtents &extents, mlir::Value init) {
+  // Same question, same peeling as the preflight: the two ways of writing a
+  // K-axis mask put the loop's term on opposite sides, and this check is only
+  // asking whether the mask belongs to this pointer.
+  auto maskMatchesInit = [&](mlir::triton::LoadOp load,
+                             const MaskExtents &extents, mlir::Value init) {
     if (!load.getMask())
       return true;
     bool checkedAnyAxis = false;
     if (extents.mIndex) {
-      if (!valueConeContains(init, extents.mIndex))
+      if (!valueConeContains(
+              init, peelLoopInductionAddend(extents.mIndex, forOp, BK)))
         return false;
       checkedAnyAxis = true;
     }
     if (extents.nIndex) {
-      if (!valueConeContains(init, extents.nIndex))
+      if (!valueConeContains(
+              init, peelLoopInductionAddend(extents.nIndex, forOp, BK)))
         return false;
       checkedAnyAxis = true;
     }
@@ -37194,12 +37241,16 @@ static bool supportsCanonicalRuntimeMaskedMultiTilePreflight(
       return false;
     bool checkedAnyAxis = false;
     if (extents.mIndex) {
-      if (!valueConeContains(init, extents.mIndex))
+      if (!valueConeContains(init,
+                             peelLoopInductionAddend(extents.mIndex, loop,
+                                                     *bkOpt)))
         return false;
       checkedAnyAxis = true;
     }
     if (extents.nIndex) {
-      if (!valueConeContains(init, extents.nIndex))
+      if (!valueConeContains(init,
+                             peelLoopInductionAddend(extents.nIndex, loop,
+                                                     *bkOpt)))
         return false;
       checkedAnyAxis = true;
     }
