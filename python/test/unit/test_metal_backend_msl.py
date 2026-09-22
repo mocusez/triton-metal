@@ -6127,3 +6127,96 @@ def test_canonical_affine_scan_tier_census(mode, claimed):
         {"BLOCK": 128, "MODE": mode, "KIND": "affine", "REVERSE": False},
         num_warps=4)
     assert ("metal.threadgroup_affine_prefix_scan" in msl) is claimed, msl[:400]
+
+
+# ---------------------------------------------------------------------------
+# Prefix negation over a binary expression.
+#
+# `metal.binary_exp` brackets its OPERANDS but not ITSELF: it emits
+# `(lhs) OP (rhs)`. Every other context that embeds an expression supplies its
+# own brackets -- a call's `(`, an index's `[`, the right-hand side of an
+# assignment -- so the omission is invisible there. A prefix operator supplies
+# none: `arith.negf` emits `(-X)`, and with X unbracketed the minus binds to
+# the LEFT operand alone, so `-(a - b)` computes `-a - b`.
+#
+# `-(a * b)` and `-(a / b)` stay correct BY ACCIDENT, because negation commutes
+# with multiplication. A probe built from products therefore proves nothing;
+# the sum and difference forms are the only discriminating ones, and
+# `tl.sigmoid(a - b)` reaches the same defect through the `exp(-x)` in its
+# expansion.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _prefix_negation_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr,
+                            FORM: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    if FORM == "neg_sub":
+        v = -(x - y)
+    elif FORM == "neg_add":
+        v = -(x + y)
+    elif FORM == "neg_mul":
+        v = -(x * y)
+    elif FORM == "neg_div":
+        v = -(x / y)
+    elif FORM == "exp_neg_sub":
+        v = tl.exp(-(x - y))
+    else:
+        v = tl.sigmoid(x - y)
+    tl.store(out_ptr + offs, v)
+
+
+def _compile_prefix_negation(form, block=128):
+    return _compile_to_msl(
+        _prefix_negation_kernel,
+        {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32"},
+        {"BLOCK": block, "FORM": form},
+        num_warps=4)
+
+
+# `(-` followed by a single bracketed term and then an infix +/- is the defect
+# spelled out: the minus has taken the left operand and left the right one
+# outside. A correct emission puts a `(` directly after the minus.
+_MINUS_BINDS_LEFT = re.compile(r"\(-\([^()]*\)\s*[-+]\s")
+
+
+@pytest.mark.parametrize("form", ["neg_sub", "neg_add", "exp_neg_sub",
+                                  "sigmoid_sub"])
+def test_prefix_negation_brackets_its_whole_operand(form):
+    """Compile-only: the minus must not bind to the left operand alone."""
+    msl = _compile_prefix_negation(form)
+    hit = _MINUS_BINDS_LEFT.search(msl)
+    assert hit is None, (
+        f"prefix minus bound to the left operand only: {hit.group(0)!r}\n"
+        f"--- MSL ---\n{msl}\n" if hit else "")
+
+
+@pytest.mark.parametrize("block", [128, 256])
+@pytest.mark.parametrize("form", ["neg_sub", "neg_add", "neg_mul", "neg_div",
+                                  "exp_neg_sub", "sigmoid_sub"])
+def test_prefix_negation_matches_torch(form, block):
+    """Runtime: the four reachable forms, plus the two accidentally-correct
+    controls that must not regress."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires an MPS-enabled PyTorch")
+    torch.manual_seed(0x5EED + block)
+    # Away from zero and from each other, so a dropped sign cannot coincide
+    # with the right answer.
+    x = torch.rand(block, dtype=torch.float32) + 1.0
+    y = torch.rand(block, dtype=torch.float32) + 1.0
+    out = torch.zeros(block, dtype=torch.float32, device="mps")
+    _prefix_negation_kernel[(1,)](x.to("mps"), y.to("mps"), out,
+                                  BLOCK=block, FORM=form, num_warps=4)
+    torch.mps.synchronize()
+    expected = {
+        "neg_sub": lambda: -(x - y),
+        "neg_add": lambda: -(x + y),
+        "neg_mul": lambda: -(x * y),
+        "neg_div": lambda: -(x / y),
+        "exp_neg_sub": lambda: torch.exp(-(x - y)),
+        "sigmoid_sub": lambda: torch.sigmoid(x - y),
+    }[form]()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)

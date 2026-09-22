@@ -68,6 +68,24 @@ module {
       metal.store %p, %out[%tid] : f32, !metal.memref<? x f32>, ui32
       metal.return
     }
+    // A prefix operator is the one context that does not bracket the expression
+    // it embeds, so it is the one that can be broken by `metal.binary_exp`
+    // bracketing only its operands. Both spellings of the prefix minus are
+    // pinned, and each sum is used once so the translator inlines it rather
+    // than naming a temp (a named temp would hide the defect).
+    metal.kernel prefix_minus_over_binary address_space_device [false, false, true, true] {
+    ^bb0(%a_buf: !metal.memref<? x f32>, %b_buf: !metal.memref<? x f32>, %neg_out: !metal.memref<? x f32>, %minus_out: !metal.memref<? x f32>):
+      %tid = metal.thread_id "x" : ui32
+      %a = metal.get_element %a_buf[%tid] : (!metal.memref<? x f32>, ui32) -> f32
+      %b = metal.get_element %b_buf[%tid] : (!metal.memref<? x f32>, ui32) -> f32
+      %diff = metal.binary_exp %a, %b, subOp : (f32, f32) -> f32
+      %negated = arith.negf %diff : f32
+      metal.store %negated, %neg_out[%tid] : f32, !metal.memref<? x f32>, ui32
+      %sum = metal.binary_exp %a, %b, addOp : (f32, f32) -> f32
+      %minus = metal.unary_exp %sum, minusOp : (f32) -> f32
+      metal.store %minus, %minus_out[%tid] : f32, !metal.memref<? x f32>, ui32
+      metal.return
+    }
     metal.module_end
   }
 }
@@ -124,3 +142,10 @@ module {
 // CHECK: kernel void powi_helper
 // CHECK: constant int32_t *
 // CHECK: __triton_powi({{.*}}, {{.*}})
+
+// CHECK: kernel void prefix_minus_over_binary
+// Both prefix spellings must bracket the WHOLE operand. Binding the minus to
+// the left operand alone turns `-(a - b)` into `-a - b`, which is a wrong
+// answer for every sum and difference and right by accident for products.
+// CHECK: = (-((v{{[0-9]+}}) - (v{{[0-9]+}})));
+// CHECK: = (-((v{{[0-9]+}}) + (v{{[0-9]+}})));

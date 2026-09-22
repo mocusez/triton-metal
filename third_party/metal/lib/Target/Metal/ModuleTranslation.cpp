@@ -9160,9 +9160,19 @@ void ModuleTranslation::translateValue(Operation *opInst) {
           // hitting the translateValue default on the whole op.
           translateValueOrVarName(v);
         };
-        _output << "(-";
+        // Bracket the OPERAND, not just the expression. `metal.binary_exp`
+        // emits `(lhs) OP (rhs)` -- it brackets its operands but not itself --
+        // and a prefix minus placed directly in front of that binds to the
+        // LEFT operand alone, so `-(a - b)` would emit as `-a - b`. Every
+        // other context that embeds an expression brings its own brackets (a
+        // call's `(`, an index's `[`, an assignment); a prefix operator is the
+        // one that must bring them itself. Redundant for a simple operand,
+        // always safe. `-(a * b)` survived the omission because negation
+        // commutes with multiplication, which is why only sums and differences
+        // ever showed it.
+        _output << "(-(";
         emit(op.getOperand());
-        _output << ")";
+        _output << "))";
       })
       .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
         // Scalar tl.floor survives TritonGPU-to-Metal conversion unchanged.
@@ -9479,15 +9489,19 @@ void ModuleTranslation::translate(mlir::triton::metal::UnaryExpOp op) {
 
   using OP = mlir::triton::metal::UnaryExpOperator;
   switch (op.getUnaryOperator()) {
+  // Both prefix cases bracket their operand, for the reason spelled out on the
+  // `arith.negf` case: `metal.binary_exp` does not bracket itself, so a bare
+  // prefix binds to its left operand alone. Every other case below is a
+  // function call, whose own parentheses already do this.
   case OP::minusOp:
-    _output << "(-";
+    _output << "(-(";
     translateArgument();
-    _output << ")";
+    _output << "))";
     break;
   case OP::notOp:
-    _output << "(!";
+    _output << "(!(";
     translateArgument();
-    _output << ")";
+    _output << "))";
     break;
   case OP::expOp:
     _output << "metal::precise::exp(";
