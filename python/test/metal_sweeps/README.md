@@ -190,3 +190,68 @@ sys.exit(P.main())
 
 `REPEAT=30 pixi run --frozen python sweeps/probe_foo.py <tag>` re-runs one probe
 to settle an intermittent verdict; a `KILLER` in any repeat wins.
+
+## Auditing named diagnostics
+
+`audit_diagnostics.py` answers "which fail-closed refusals does a test hold in
+place, and which are free to rot". It counts NAMED diagnostics -- the ones that
+end compilation with a reason -- not `notifyMatchFailure`, of which the
+conversion pass has ~275 and almost all mean "this pattern does not apply, try
+the next one".
+
+    pixi run --frozen python python/test/metal_sweeps/audit_diagnostics.py
+    pixi run --frozen python python/test/metal_sweeps/audit_diagnostics.py --list atomic
+
+Two things it encodes, each of which cost a round:
+
+**Not every `reject(...)` emits.** `walkBackThroughElementwiseChain` has a
+local lambda of that name that only writes a `reason` string, and the rank-1
+reduce message is built from the cone predicate's failure point rather than
+from that string, so those never reach a user. Counting them inflates the total
+by about a third.
+
+**Unpinned is not reachable, and the gap is large.** A diagnostic can be
+unreachable because the Triton frontend refuses the shape first, or because an
+earlier and more specific diagnostic shadows it. Measured on the eight unpinned
+`atomic` diagnostics with thirteen probes: ZERO were reachable. Four shapes
+were refused by the frontend (`atomic_add does not support int16`, f64/f16/u8
+likewise), three were shadowed by a more specific message (bf16 fadd, 64-bit
+integer add, signed min/max), and a non-blocked tensor target could not be
+produced at all -- `tl.trans`, `tl.reshape` and a reduce result all normalise
+to a blocked encoding before the atomic sees them. Pinning any of those would
+have filled the suite with shapes a user cannot write.
+
+So: probe first, pin second. A diagnostic that no probe can reach is defensive
+depth, and the useful record is that it was measured, not a test asserting a
+shape nobody can express.
+
+## What a sweep's CONTROL arm is for
+
+`sweeps/s_reduce_consumers.py` asks what a rank-N reduce's result may become:
+flattened by `tl.reshape`, broadcast back on the same axis, broadcast back on
+another one, stored at rank 2, with a scan in the same function. It carries a
+control arm for every question it asks, and three of them paid for themselves
+in one run:
+
+**The source arm said the story was wrong.** The first reading was "a rank-3
+tile built by reshaping a rank-1 load is the broken one". Sweeping the source
+as an AXIS instead of assuming it showed the directly-loaded rank-3 tile wrong
+in exactly the same cells -- so the source discriminates nothing and the
+consumer does.
+
+**The rank-3-address store arm said which half to refuse.** The same broadcast
+is exact in all 108 of its cells when stored through a rank-3 address and wrong
+in 24 when flattened first, so the refusal is about the flatten.
+
+**The no-scan arm said the phase was the discriminator**, not the republish:
+the identical kernel without `tl.cumsum` is exact in all 15 of its cells.
+
+A sweep without those arms would have produced one big refusal covering all of
+it, and three wrong sentences in the commit message.
+
+## Which compile path a probe used is an axis too
+
+`triton.compile(ASTSource(...))` and the JIT give some shapes DIFFERENT
+layouts. A refusal test written against `ASTSource` compiled every kernel the
+JIT refuses -- it was measuring the other side of the envelope. State the path,
+and for anything about layout use the one a user takes.

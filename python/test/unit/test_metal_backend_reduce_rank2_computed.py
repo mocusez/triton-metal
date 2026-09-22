@@ -1171,3 +1171,377 @@ def test_rank2_cone_precise_producer_is_replayed(form, axis, shape):
     torch.mps.synchronize()
     expected = _cone_reference(form, xm, ym).sum(dim=1 if axis == 1 else 0)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+# --------------------------------------------------------------------------
+# What a rank-3 reduce's result may BECOME.
+#
+# `63d45af467` fixed the rank-2 STORE consumer of this producer, and the
+# section above says why it was missed: the sweep that had cleared the family
+# only ever broadcast the result back to rank 3. One consumer further out finds
+# the same blind spot again -- `python/test/metal_sweeps/sweeps/s_reduce_consumers.py`
+# swept consumer x source x axis x shape x warps, 714 cells, and 213 of them
+# were silently wrong:
+#
+#   flat        `tl.reshape(tl.sum(v, ax), (n,))` + rank-1 store, wrong at
+#               E >= 8. Fixed: the walk that decides whether the reshape needs
+#               an exchange was asking the result TYPE's layout while a staged
+#               rank-N reduce publishes under a thread-major RELABEL.
+#   crossaxis   the result expanded along an axis the reduce did not remove
+#               (`tl.sum(v, 0)[:, None, :]`), wrong at EVERY E. Fixed below
+#               E = 8 -- `ttg.convert_layout` between two `#ttg.slice`
+#               encodings of one parent is not a relabel, and was being
+#               forwarded as one, which answered with the SAME-axis broadcast.
+#   scanmix     a column-reduce republished into a tile in a function that also
+#               stages a `tl.scan`, wrong from E >= 2.
+#
+# The source did NOT discriminate: a rank-3 tile reshaped from a rank-1 load and
+# one loaded directly at rank 3 were wrong in exactly the same cells, which is
+# why both spellings are only worth one parametrization here.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _rank3_reduce_flat_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                              C: tl.constexpr, AXIS: tl.constexpr,
+                              OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = tl.load(X + a * (B * C) + b * C + c)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(tl.sum(v, AXIS), (OUT,)))
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize(
+    "shape,num_warps",
+    [
+        ((2, 4, 4), 1),      # one element per thread: correct before the fix
+        ((4, 4, 4), 1),      # two
+        ((2, 2, 8), 1),      # one
+        ((4, 8, 8), 1),      # eight: the smallest failure
+        ((8, 8, 8), 1),      # sixteen
+        ((8, 8, 8), 2),      # eight, reached with two warps
+        ((4, 4, 16), 1),     # eight, a different shape
+    ],
+    ids=["2x4x4_w1_e1", "4x4x4_w1_e2", "2x2x8_w1_e1", "4x8x8_w1_e8",
+         "8x8x8_w1_e16", "8x8x8_w2_e8", "4x4x16_w1_e8"],
+)
+def test_rank3_reduce_flattened_to_rank1_matches_torch(shape, num_warps, axis):
+    """The `tl.sort`/`tl.topk` hypercube spelling: reduce, flatten, store.
+
+    Before the fix the E >= 8 cells answered with another element's sum -- 24
+    of the sweep's cells, every axis, both tile sources.
+    """
+    a, b, c = shape
+    torch.manual_seed(0xC0DE + a * 97 + b * 13 + c)
+    x = torch.randn(a * b * c, dtype=torch.float32).contiguous()
+    expected = x.reshape(a, b, c).sum(axis).reshape(-1)
+    out = torch.zeros(expected.numel(), dtype=torch.float32, device="mps")
+    _rank3_reduce_flat_kernel[(1,)](x.to("mps"), out, A=a, B=b, C=c, AXIS=axis,
+                                    OUT=expected.numel(), num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_reduce_cross_axis_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                                    C: tl.constexpr, AXIS: tl.constexpr,
+                                    D0: tl.constexpr, D1: tl.constexpr,
+                                    D2: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = tl.load(X + a * (B * C) + b * C + c)
+    back = tl.sum(v, AXIS)[:, None, :] + tl.zeros((D0, D1, D2), tl.float32)
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    tl.store(O + i * (D1 * D2) + j * D2 + k, back)
+
+
+def _cross_axis_dest(shape, axis):
+    keep = [d for n, d in enumerate(shape) if n != axis]
+    return keep[0], shape[axis], keep[1]
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps,axis",
+    [
+        ((2, 4, 4), 1, 0), ((2, 4, 4), 1, 2),      # one element per thread
+        ((2, 2, 8), 4, 0), ((2, 2, 8), 4, 2),
+        ((4, 4, 4), 2, 0), ((4, 4, 4), 2, 2),
+        ((4, 4, 4), 1, 0),                          # two, axis 0
+        ((4, 8, 8), 2, 0), ((4, 4, 16), 2, 0),      # four, axis 0
+        ((8, 8, 8), 4, 0),
+    ],
+    ids=["2x4x4_w1_ax0_e1", "2x4x4_w1_ax2_e1", "2x2x8_w4_ax0_e1",
+         "2x2x8_w4_ax2_e1", "4x4x4_w2_ax0_e1", "4x4x4_w2_ax2_e1",
+         "4x4x4_w1_ax0_e2", "4x8x8_w2_ax0_e4", "4x4x16_w2_ax0_e4",
+         "8x8x8_w4_ax0_e4"],
+)
+def test_rank3_reduce_cross_axis_broadcast_matches_torch(shape, num_warps,
+                                                         axis):
+    """`tl.sum(v, 0)[:, None, :]` -- the missing extent put back elsewhere.
+
+    Wrong at EVERY elements-per-thread before the fix, including one, because
+    the `slice<dim=0> -> slice<dim=1>` conversion TTGIR asks for was forwarded
+    as a relabel and the kernel answered with `s[:, :, None]` instead. Axis 1
+    is excluded on purpose: for this spelling it IS the same axis, so it is the
+    control the other tests below use.
+    """
+    a, b, c = shape
+    dest = _cross_axis_dest(shape, axis)
+    torch.manual_seed(0xBEEF + a * 31 + b * 7 + c)
+    x = torch.randn(a * b * c, dtype=torch.float32).contiguous()
+    expected = (x.reshape(a, b, c).sum(axis)[:, None, :]
+                .expand(*dest).reshape(-1).contiguous())
+    out = torch.zeros(a * b * c, dtype=torch.float32, device="mps")
+    _rank3_reduce_cross_axis_kernel[(1,)](
+        x.to("mps"), out, A=a, B=b, C=c, AXIS=axis,
+        D0=dest[0], D1=dest[1], D2=dest[2], num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_reduce_bcast_flat_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                                    C: tl.constexpr, AXIS: tl.constexpr):
+    f = tl.arange(0, A * B * C)
+    v = tl.reshape(tl.load(X + f), (A, B, C))
+    back = tl.sum(v, AXIS)[:, None, :] + tl.zeros((A, B, C), tl.float32)
+    tl.store(O + f, tl.reshape(back, (A * B * C,)))
+
+
+def _refusal_child(tmp_path, name, body, timeout=300):
+    """Run the kernel in a child, through the JIT.
+
+    Two reasons, and the second cost a round of red tests. The named reason is
+    an MLIR diagnostic on stderr that an in-process `pytest.raises` never sees.
+    And `triton.compile(ASTSource(...))` is NOT the same path: it hands some
+    shapes a different layout than the JIT does -- the first version of these
+    tests compiled every refused kernel happily -- so a test about a layout
+    envelope has to say which path it used, and use the one a user takes.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    script = tmp_path / f"{name}.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import torch
+        import triton
+        spec = importlib.util.spec_from_file_location(
+            "reduce_consumer_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    """) + textwrap.dedent(body))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=timeout,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    return result, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps", [((4, 8, 8), 1), ((8, 8, 8), 1), ((8, 8, 8), 2)],
+    ids=["4x8x8_w1_e8", "8x8x8_w1_e16", "8x8x8_w2_e8"],
+)
+def test_rank3_reduce_broadcast_flattened_is_refused(shape, num_warps,
+                                                     tmp_path):
+    """Above one register band the relabel has already travelled through the
+    broadcast, and flattening reads the element the TYPE names. Refused, and
+    the same broadcast stored through a rank-3 address stays supported -- that
+    arm is exact in all 108 of its sweep cells, which is why this refusal is
+    about the flatten and not about the broadcast."""
+    a, b, c = shape
+    result, output = _refusal_child(tmp_path, "rank3_bcast_flat", f"""
+        n = {a} * {b} * {c}
+        x = torch.zeros(n, device="mps")
+        o = torch.zeros(n, device="mps")
+        for attempt in range(2):
+            try:
+                module._rank3_reduce_bcast_flat_kernel[(1,)](
+                    x, o, A={a}, B={b}, C={c}, AXIS=1,
+                    num_warps={num_warps})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a flattened rank-3 broadcast compiled")
+        # The neighbour that keeps a rank-3 address is supported and stays so.
+        y = torch.zeros(64, device="mps")
+        module._rank3_reduce_cross_axis_kernel[(1,)](
+            y, torch.zeros(64, device="mps"), A=4, B=4, C=4, AXIS=1,
+            D0=4, D1=4, D2=4, num_warps=1)
+        print("RECOVERED")
+    """)
+    needle = ("this tl.reshape flattens a tile built from a rank-N reduce "
+              "that published its result under a thread-major relabel")
+    assert result.returncode == 0, output
+    assert output.count(needle) == 2, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps", [((4, 8, 8), 1), ((8, 8, 8), 1)],
+    ids=["4x8x8_w1_e8", "8x8x8_w1_e16"],
+)
+def test_rank3_reduce_cross_axis_broadcast_is_refused_above_one_band(
+        shape, num_warps, tmp_path):
+    """The exchange that repairs the cross-axis conversion indexes its buffer
+    by element and lets each half ask its own layout, so it can repair a pair
+    whose threads own the same NUMBER of elements. Above one register band
+    these two slices do not, and the refusal says exactly that; below it the
+    same kernel compiles and is exact (the test above)."""
+    a, b, c = shape
+    dest = _cross_axis_dest(shape, 0)
+    result, output = _refusal_child(tmp_path, "rank3_cross_axis", f"""
+        n = {a} * {b} * {c}
+        x = torch.zeros(n, device="mps")
+        try:
+            module._rank3_reduce_cross_axis_kernel[(1,)](
+                x, torch.zeros(n, device="mps"), A={a}, B={b}, C={c}, AXIS=0,
+                D0={dest[0]}, D1={dest[1]}, D2={dest[2]},
+                num_warps={num_warps})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a cross-axis broadcast compiled above a band")
+        # Two elements per thread on the same axis is inside the envelope.
+        y = torch.zeros(64, device="mps")
+        module._rank3_reduce_cross_axis_kernel[(1,)](
+            y, torch.zeros(64, device="mps"), A=4, B=4, C=4, AXIS=0,
+            D0=4, D1=4, D2=4, num_warps=1)
+        print("RECOVERED")
+    """)
+    needle = ("this slice-to-slice ttg.convert_layout changes how many "
+              "elements a thread owns")
+    assert result.returncode == 0, output
+    assert output.count(needle) == 1, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
+
+
+@triton.jit
+def _column_reduce_scan_kernel(X, O, M: tl.constexpr, N: tl.constexpr,
+                               WITH_SCAN: tl.constexpr):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    v = tl.load(X + i[:, None] * N + j[None, :])
+    back = tl.sum(v, 0)[None, :] + tl.zeros((M, N), tl.float32)
+    if WITH_SCAN:
+        out = tl.cumsum(v, 1) + back
+    else:
+        out = v + back
+    tl.store(O + i[:, None] * N + j[None, :], out)
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps", [((8, 8), 1), ((16, 16), 1), ((16, 32), 4)],
+    ids=["8x8_w1_e2", "16x16_w1_e8", "16x32_w4_e4"],
+)
+def test_column_reduce_republished_beside_a_scan_is_refused(shape, num_warps,
+                                                            tmp_path):
+    """The republish writes the column sums to a threadgroup slot and reads
+    them back after a barrier. Once a staged `tl.scan` splits the body into
+    phases that slot reads back as ZERO, so the kernel returned the scan alone
+    -- measured on 13 cells from E >= 2, while the identical kernel WITHOUT the
+    scan is exact in all 15 of its own."""
+    m, n = shape
+    result, output = _refusal_child(tmp_path, "colreduce_scan", f"""
+        x = torch.zeros({m} * {n}, device="mps")
+        o = torch.zeros({m} * {n}, device="mps")
+        try:
+            module._column_reduce_scan_kernel[(1,)](
+                x, o, M={m}, N={n}, WITH_SCAN=True, num_warps={num_warps})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a republished column reduce compiled beside a scan")
+        module._column_reduce_scan_kernel[(1,)](
+            x, o, M={m}, N={n}, WITH_SCAN=False, num_warps={num_warps})
+        print("RECOVERED")
+    """)
+    needle = ("a column-reduce republished into a tile cannot share a function "
+              "with a staged tl.scan")
+    assert result.returncode == 0, output
+    assert output.count(needle) == 1, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
+
+
+@pytest.mark.parametrize(
+    "shape,num_warps", [((8, 8), 1), ((16, 16), 1), ((16, 32), 4)],
+    ids=["8x8_w1", "16x16_w1", "16x32_w4"],
+)
+def test_column_reduce_without_a_scan_still_matches_torch(shape, num_warps):
+    """The guard on the refusal above: the republish itself is not the
+    problem, sharing a function with a staged scan is."""
+    m, n = shape
+    torch.manual_seed(0x5CA1 + m * 17 + n)
+    x = torch.randn(m * n, dtype=torch.float32).reshape(m, n).contiguous()
+    expected = x + x.sum(0)[None, :]
+    out = torch.zeros(m, n, dtype=torch.float32, device="mps")
+    _column_reduce_scan_kernel[(1,)](x.to("mps"), out, M=m, N=n,
+                                     WITH_SCAN=False, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank2_axis1_argmin_kernel(X, O, M: tl.constexpr, N: tl.constexpr):
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    tl.store(O + i, tl.argmin(tl.load(X + i[:, None] * N + j[None, :]), axis=1))
+
+
+@pytest.mark.parametrize(
+    "m,num_warps", [(64, 1), (128, 1), (256, 4)],
+    ids=["M64_w1", "M128_w1", "M256_w4"],
+)
+def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps,
+                                                             tmp_path):
+    """One row per thread is the whole envelope of this lowering, and more rows
+    than threads is the shape a user reaches it with. Found by probing the
+    named diagnostics no test pinned -- it is reachable, unlike every one of
+    the eight `atomic` diagnostics probed in the round before."""
+    result, output = _refusal_child(tmp_path, "argmin_rows", f"""
+        x = torch.zeros({m} * 8, device="mps")
+        o = torch.zeros({m}, dtype=torch.int32, device="mps")
+        try:
+            module._rank2_axis1_argmin_kernel[(1,)](
+                x, o, M={m}, N=8, num_warps={num_warps})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("argmin compiled with more rows than threads")
+        # Exactly one row per thread is the supported edge and stays so.
+        rows = 32 * {num_warps}
+        module._rank2_axis1_argmin_kernel[(1,)](
+            torch.zeros(rows * 8, device="mps"),
+            torch.zeros(rows, dtype=torch.int32, device="mps"),
+            M=rows, N=8, num_warps={num_warps})
+        print("RECOVERED")
+    """)
+    needle = "rank-2 axis=1 argmin requires blocked 0 < M <= tpb and N > 0"
+    assert result.returncode == 0, output
+    assert output.count(needle) == 1, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_rank2_axis1_argmin_at_one_row_per_thread_matches_torch(num_warps):
+    """The guard on the refusal above."""
+    m, n = 32 * num_warps, 8
+    torch.manual_seed(0xA6E1 + num_warps)
+    x = torch.randn(m, n, dtype=torch.float32).contiguous()
+    out = torch.zeros(m, dtype=torch.int32, device="mps")
+    _rank2_axis1_argmin_kernel[(1,)](x.to("mps"), out, M=m, N=n,
+                                     num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.argmin(dim=1).to(torch.int32))

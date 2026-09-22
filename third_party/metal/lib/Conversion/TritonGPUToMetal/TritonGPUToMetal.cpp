@@ -4175,6 +4175,12 @@ isContiguousSliceToBlockedStoreIdentity(mlir::triton::gpu::ConvertLayoutOp op) {
   return sawStore;
 }
 
+// The plan a VALUE is laid out under, which is its type's plan unless a staged
+// rank-N reduce relabelled its result. Defined next to `planTileExchange`,
+// declared here because every scheduler that decides whether an exchange is
+// NEEDED has to ask the same question the scheduler itself asks.
+static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value);
+
 static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
   auto dstRtt =
@@ -4240,6 +4246,40 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
       if (coneHasLayoutDependentLeaf(
               op.getSrc(), [&](mlir::Attribute e) { return e == srcEnc; }))
         return false;
+    }
+    // Slice on BOTH sides. The premise above -- that a slice encoding is a
+    // pure index/broadcast relabel -- holds only while the two slices put the
+    // same logical element in every physical slot, and two slices of one
+    // parent that drop DIFFERENT axes do not. `tl.sum(v, 2)[:, None, :]` is
+    // exactly that shape: Triton reduces along axis 2 and expands along axis
+    // 1, so TTGIR asks for `slice<dim = 2> -> slice<dim = 1>` of the same
+    // parent, same shape, same element type -- and forwarding it answered with
+    // the SAME-axis broadcast, `s[:, :, None]`, at every elements-per-thread,
+    // for both rank-3 tile sources and both store forms.
+    //
+    // Asking the plans is what separates the two: a genuine relabel still
+    // passes here, and one that moves data between lanes falls through to the
+    // exchange scheduler, which stages it properly or names a refusal. Both
+    // readers of this predicate need the answer -- the pre-conversion
+    // validator skips whatever it calls an identity, and `Path 2` of
+    // `ConvertLayoutLowering` forwards it -- which is why the fix belongs in
+    // the predicate and not in either caller.
+    if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            srcRtt.getEncoding()) &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            dstRtt.getEncoding())) {
+      if (srcRtt.getShape() != dstRtt.getShape())
+        return false;
+      auto srcPlan = exchangeSourcePlan(op.getSrc());
+      auto dstPlan = planLayoutIndex(dstRtt);
+      if (!srcPlan || !dstPlan ||
+          !layoutIndexPlansEquivalent(*srcPlan, *dstPlan))
+        return false;
+      // Same-plan slices stay a relabel, which is the shortcut this
+      // predicate exists for. What the exchange can then do with the rest is
+      // the validator's question, not this one: it stages the pairs whose
+      // threads own the same NUMBER of elements and refuses the others by
+      // name.
     }
     return true;
   }
@@ -31950,6 +31990,27 @@ static bool normalizeConsumerSideBlockedDivergentCvt(
 // second. Values needed on both sides are recomputed in the second, which is
 // only sound because the partition admits pure ops (and `tt.load`, a read that
 // is idempotent) — anything else and this declines.
+// ⚠️ A staged rank-N reduce may RELABEL its result so that its fold and its own
+// addressing agree (`threadMajorLayoutPlan`). The value it produces is then laid
+// out under THAT plan, not under its type's `#ttg.slice` encoding. The two
+// agree at one element per thread and diverge above it, which is why this
+// family keeps reappearing with an `E >= 8` boundary: a rank-3 reduce stored as
+// rank 2 (`63d45af467`), and then the same reduce RESHAPED to rank 1 or
+// broadcast back into a tile, which reach their scheduler through a different
+// walk and were still asking the type.
+static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value) {
+  auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+  if (!rtt)
+    return std::nullopt;
+  std::optional<LayoutIndexPlan> plan = planLayoutIndex(rtt);
+  if (auto producer =
+          mlir::dyn_cast_or_null<mlir::triton::ReduceOp>(value.getDefiningOp()))
+    if (auto producerPlan = planRankNReduce(producer);
+        producerPlan && producerPlan->resultLayout.threadsPerBlock() > 1)
+      plan = producerPlan->resultLayout;
+  return plan;
+}
+
 static bool planTileExchange(mlir::Operation *exchange,
                              bool allowGeneralPhase = false) {
   mlir::Value source;
@@ -31978,21 +32039,8 @@ static bool planTileExchange(mlir::Operation *exchange,
   if ((!isReshape && !isBroadcast && srcRtt.getShape() != dstRtt.getShape()) ||
       (isReshape && srcRtt.getNumElements() != dstRtt.getNumElements()))
     return false;
-  std::optional<LayoutIndexPlan> srcPlan = planLayoutIndex(srcRtt);
+  std::optional<LayoutIndexPlan> srcPlan = exchangeSourcePlan(source);
   std::optional<LayoutIndexPlan> dstPlan = planLayoutIndex(dstRtt);
-  // ⚠️ A staged rank-N reduce may RELABEL its result so that its fold and its
-  // own addressing agree (`threadMajorLayoutPlan`). The value reaching this
-  // exchange is then laid out under THAT plan, not under its type's `#ttg.slice`
-  // encoding, so publishing by the encoding puts each thread's sum in another
-  // element's slot -- silently, and only where the two labellings differ, which
-  // is why a rank-3 reduce stored as rank 2 was exact up to one register band
-  // and scattered above it. Ask the producer, the way every other consumer of a
-  // relabelled tile does.
-  if (auto producer = mlir::dyn_cast_or_null<mlir::triton::ReduceOp>(
-          source.getDefiningOp()))
-    if (auto producerPlan = planRankNReduce(producer);
-        producerPlan && producerPlan->resultLayout.threadsPerBlock() > 1)
-      srcPlan = producerPlan->resultLayout;
   if (!srcPlan || !dstPlan)
     return false;
   if (isBroadcast) {
@@ -40090,7 +40138,13 @@ struct ConvertTritonGPUToMetalPass
            !mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
                dstTy.getEncoding())))
         return;
-      auto srcPlan = planLayoutIndex(srcTy);
+      // Ask the VALUE, not the type: a staged rank-N reduce relabels its
+      // result, and this walk is what decides whether the reshape needs an
+      // exchange at all. Measured: 24 cells of `tl.reshape(tl.sum(v, ax),
+      // (n,))` go from a named refusal to a correct answer with this, and the
+      // same substitution in the broadcast walk next door moved nothing, so it
+      // is not there.
+      auto srcPlan = exchangeSourcePlan(reshape.getSrc());
       auto dstPlan = planLayoutIndex(dstTy);
       if (srcPlan && dstPlan &&
           !layoutFlatIndexPlansEquivalent(*srcPlan, *dstPlan))
@@ -40199,6 +40253,40 @@ struct ConvertTritonGPUToMetalPass
     // publish then read, which is the only way to move more than one element
     // per thread across lanes. Anything it declines keeps the refusal.
     for (auto cvt : outOfEnvelope) {
+      // A slice-to-slice pair needs the FULL-TILE phase, not the local
+      // publish/read: the two encodings can move an element between register
+      // bands, and a local exchange runs both halves inside one band loop, so
+      // the reader asks for an element that band has not published. Measured:
+      // with the local phase these cells are exact to E = 4 and wrong from
+      // E = 8 (16 cells); the reshape carrier next door already asks for the
+      // full-tile phase unconditionally, which is why IT is exact at E = 16.
+      auto srcRtt =
+          mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+      auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+      const bool sliceToSlice =
+          srcRtt && dstRtt &&
+          mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+              srcRtt.getEncoding()) &&
+          mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+              dstRtt.getEncoding());
+      if (sliceToSlice) {
+        // Two slices of one parent can also disagree on how many elements a
+        // thread owns. The exchange indexes the buffer by element and each
+        // half asks its OWN layout, so a pair that agrees on the count is
+        // repairable; a pair that does not needs a different trip count on
+        // each side, which this exchange does not give it.
+        auto srcPlan = exchangeSourcePlan(cvt.getSrc());
+        auto dstPlan = planLayoutIndex(dstRtt);
+        if (srcPlan && dstPlan &&
+            srcPlan->elemPerThread != dstPlan->elemPerThread) {
+          cvt.emitOpError(
+              "Metal backend: this slice-to-slice ttg.convert_layout changes "
+              "how many elements a thread owns, which the exact-layout "
+              "exchange cannot repair");
+          cvtOk = false;
+          continue;
+        }
+      }
       if (planTileExchange(
               cvt.getOperation(),
               /*allowGeneralPhase=*/functionHasRankNPhase(cvt.getOperation())))
@@ -40213,6 +40301,128 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+    // Three shapes where a rank-N reduce's result reaches a consumer that
+    // reads it under the result TYPE's layout while the VALUE is in the
+    // thread-major relabel the staged reduce published it in. Every one is a
+    // silent wrong answer above one register band, and each was measured by
+    // `python/test/metal_sweeps/sweeps/s_reduce_consumers.py` (714 cells over
+    // consumer x source x axis x shape x warps) rather than argued:
+    //
+    //   flatten   the result broadcast back into a tile and then flattened by
+    //             `tl.reshape` for a rank-1 store -- 32 cells, E >= 8, while
+    //             the SAME broadcast stored through a rank-3 address is exact
+    //             in all 108 of its cells, which is why this refusal is about
+    //             the flatten and not about the broadcast
+    //   crossaxis the result expanded along an axis OTHER than the one the
+    //             reduce removed (`tl.sum(v, 0)[:, None, :]`) -- 16 cells,
+    //             E >= 8. Below that band the exchange now handles it (see the
+    //             slice-to-slice guard in `isScalarIdentityConvert`); above it
+    //             the relabel has already propagated past the `tt.expand_dims`
+    //             and no single exchange carries it
+    //   scanmix   a column-reduce republished into a tile in a function that
+    //             also stages a `tl.scan` -- 13 cells from E >= 2. The
+    //             republish reads its threadgroup slot as zero once the scan's
+    //             phases split the body; the identical kernel WITHOUT the scan
+    //             is exact in all 15 of its cells
+    //
+    // Refusing is the fail-closed half of this round: repairing them needs the
+    // relabel to travel WITH the value through `tt.expand_dims`/`tt.broadcast`,
+    // which is the P2.1 layout item, and a bridge that republished every
+    // relabelled reduce was measured to break the rank-3-address store that is
+    // correct today (108 cells green -> 24 wrong), so it is not a shortcut.
+    {
+      auto reduceIsRelabelled = [](mlir::triton::ReduceOp reduce) {
+        if (reduce->getNumResults() != 1)
+          return false;
+        auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(
+            reduce->getResult(0).getType());
+        if (!rtt)
+          return false;
+        auto typePlan = planLayoutIndex(rtt);
+        auto valuePlan = exchangeSourcePlan(reduce->getResult(0));
+        return typePlan && valuePlan &&
+               !layoutIndexPlansEquivalent(*typePlan, *valuePlan);
+      };
+      // The relabelled reduce a value was built from, walking back through the
+      // relabel-preserving ops only. An exchange read is where the relabel
+      // ends, so the walk stops there.
+      std::function<mlir::triton::ReduceOp(mlir::Value, int)> coneReduce =
+          [&](mlir::Value value, int depth) -> mlir::triton::ReduceOp {
+        if (depth > 8)
+          return {};
+        mlir::Operation *def = value.getDefiningOp();
+        if (!def || def->getAttrOfType<mlir::StringAttr>(kExchangeAttr))
+          return {};
+        if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(def))
+          return reduceIsRelabelled(reduce) ? reduce : mlir::triton::ReduceOp{};
+        if (!mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                       mlir::triton::ReshapeOp,
+                       mlir::triton::gpu::ConvertLayoutOp>(def) &&
+            !mlir::isMemoryEffectFree(def))
+          return {};
+        for (mlir::Value operand : def->getOperands())
+          if (auto found = coneReduce(operand, depth + 1))
+            return found;
+        return {};
+      };
+      bool relabelOk = true;
+      // A column-reduce republished into a tile (`tl.sum(v, 0)[None, :]`) uses
+      // a threadgroup slot and a barrier pair of its own. In a function that
+      // also stages a `tl.scan`, that slot reads back as ZERO -- measured: the
+      // broadcast term contributes nothing, so the kernel returns the scan
+      // alone, while the identical kernel without the scan is exact in all 15
+      // of its cells. Only a tile with more than one element per thread is
+      // affected; at one element there is no band loop for the phases to
+      // disagree about.
+      moduleOp.walk([&](mlir::triton::ExpandDimsOp expand) {
+        auto srcTy =
+            mlir::dyn_cast<mlir::RankedTensorType>(expand.getSrc().getType());
+        auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(expand.getType());
+        if (!srcTy || !resTy || srcTy.getRank() != 1 || resTy.getRank() != 2 ||
+            expand.getAxis() != 0)
+          return;
+        bool sawTileLeaf = false;
+        if (!coneUsesAxis0Reduce(expand.getSrc(), sawTileLeaf, 0))
+          return;
+        auto func = expand->getParentOfType<mlir::triton::FuncOp>();
+        if (!func)
+          return;
+        bool hasScan = false;
+        func.walk([&](mlir::triton::ScanOp) { hasScan = true; });
+        if (!hasScan)
+          return;
+        auto plan = planLayoutIndex(resTy);
+        if (!plan || plan->elemPerThread <= 1)
+          return;
+        expand.emitOpError(
+            "Metal backend: a column-reduce republished into a tile cannot "
+            "share a function with a staged tl.scan above one element per "
+            "thread -- the republished slot is read back as zero");
+        relabelOk = false;
+      });
+      moduleOp.walk([&](mlir::triton::ReshapeOp reshape) {
+        if (reshape->getAttrOfType<mlir::StringAttr>(kExchangeAttr))
+          return;
+        auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+        auto srcTy =
+            mlir::dyn_cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+        if (!dstTy || !srcTy || dstTy.getRank() >= srcTy.getRank())
+          return;
+        if (!coneReduce(reshape.getSrc(), 0))
+          return;
+        reshape.emitOpError(
+            "Metal backend: this tl.reshape flattens a tile built from a "
+            "rank-N reduce that published its result under a thread-major "
+            "relabel, and the flattened read would take the element the "
+            "result TYPE names instead");
+        relabelOk = false;
+      });
+      if (!relabelOk) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     if (mlir::failed(validateTileExchangeScratchBudget(moduleOp))) {
       signalPassFailure();
       return;
