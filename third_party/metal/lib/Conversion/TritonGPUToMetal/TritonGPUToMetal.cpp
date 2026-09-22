@@ -7739,6 +7739,34 @@ static bool coneReplayableAcrossConversion(mlir::Value v,
          !coneHasTensorYieldingIf(v);
 }
 
+// Which producer in a cone is the one no tier replays, for the refusal message.
+//
+// The message used to carry the reason from the FIRST tier asked -- the Wall-11
+// single-load walker -- which stops at whatever it happens to meet. That walker
+// only knows load/arith/exp chains, so it stopped at the `tt.reshape` of the
+// layout chain and EVERY unsupported source reported the same `tt.reshape`:
+// measured over `tl.fma`, a float remainder, `tl.div_rn`, `tl.sqrt_rn` and
+// `tl.clamp`, five different sources produced one identical message naming a
+// node that replays perfectly and that the author cannot remove. The predicate
+// that actually decided -- the cone one, which accepts reshape and walks
+// through it -- has no reason string of its own.
+//
+// Ask it here instead, and report the DEEPEST op it refuses: the one whose
+// operands all replay but which does not. Reusing the predicate is the point;
+// a second list of accepted producers is exactly how these two answers drifted
+// apart in the first place.
+static mlir::Operation *unreplayableConeProducer(mlir::Value v,
+                                                 bool deferAggregateLeaves) {
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || rank1ConeSupported(v, 0, deferAggregateLeaves))
+    return nullptr;
+  for (mlir::Value operand : def->getOperands())
+    if (mlir::Operation *inner =
+            unreplayableConeProducer(operand, deferAggregateLeaves))
+      return inner;
+  return def;
+}
+
 static bool rank1MultiValueReduceSupported(mlir::triton::ReduceOp op,
                                            llvm::StringRef *why = nullptr) {
   auto no = [&](const char *reason) {
@@ -8285,7 +8313,25 @@ static Rank1ReduceSourcePath classifyRank1ReduceSource(
           reduceSrc, /*depth=*/0, chain, load, reduceOp, dominance, reason))) {
     if (coneReplayableAcrossConversion(reduceSrc, deferAggregateLeaves))
       return takeRichCone();
-    reason = "rank-1 reduce cannot replay its source: " + reason;
+    if (mlir::Operation *culprit =
+            unreplayableConeProducer(reduceSrc, deferAggregateLeaves)) {
+      reason = (llvm::Twine("Metal backend: rank-1 reduce cannot replay its "
+                            "source across conversion; the source contains a "
+                            "producer this backend does not re-emit per "
+                            "element: ") +
+                culprit->getName().getStringRef() +
+                ". Use a replayable source expression, or size the tile so one "
+                "element per thread makes replay unnecessary")
+                   .str();
+    } else if (coneHasTensorYieldingIf(reduceSrc)) {
+      reason = "Metal backend: rank-1 reduce cannot replay its source across "
+               "conversion: it passes through an scf.if that yields a tensor, "
+               "which conversion rewrites out of the evaluator's reach";
+    } else {
+      // No single producer is to blame -- the walker's own reason is the best
+      // available account.
+      reason = "Metal backend: rank-1 reduce cannot replay its source: " + reason;
+    }
     return Rank1ReduceSourcePath::Unsupported;
   }
   if (!inspectMask)

@@ -24,5 +24,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
   }
 }
 
-// CHECK: rank-1 reduce cannot replay its source:
-// CHECK-SAME: unsupported producer in elementwise chain: arith.maxsi
+// The message must name the op that was actually refused. It used to carry the
+// reason from the FIRST tier asked -- the single-load walker -- which stops at
+// whatever it meets, so sources refused for entirely different producers all
+// reported one identical node. Here both tiers agree on arith.maxsi, and this
+// fixture pins that the named op is still the real one.
+// CHECK: rank-1 reduce cannot replay its source across conversion
+// CHECK-SAME: does not re-emit per element: arith.maxsi

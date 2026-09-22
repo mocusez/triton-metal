@@ -6220,3 +6220,98 @@ def test_prefix_negation_matches_torch(form, block):
         "sigmoid_sub": lambda: torch.sigmoid(x - y),
     }[form]()
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# A refusal must name the op it actually refused.
+#
+# The rank-1 reduce asks two tiers in turn: the Wall-11 single-load walker, then
+# the general cone predicate. Only the walker produces a reason string, and it
+# stops at whatever it happens to meet -- it knows load/arith/exp chains, so at
+# more than one element per thread it stopped at the `tt.reshape` of the layout
+# chain. The cone predicate, which accepts reshape and walks through it, is the
+# one that actually decides, and it had no reason of its own.
+#
+# The result was that five different unsupported sources produced one identical
+# message naming a node that replays perfectly and that the author cannot
+# remove. Acting on it -- deleting the reshape -- cannot help.
+# ---------------------------------------------------------------------------
+
+_RANK1_CULPRITS = [
+    ("fma", "math.fma"),
+    ("remf", "arith.remf"),
+    ("divrn", "tt.precise_divf"),
+    ("sqrtrn", "tt.precise_sqrt"),
+    ("clamp", "tt.clampf"),
+]
+
+
+@triton.jit
+def _rank1_reduce_producer_kernel(Xp, Yp, O, BLOCK: tl.constexpr,
+                                  FORM: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(Xp + offs)
+    y = tl.load(Yp + offs)
+    if FORM == "fma":
+        v = tl.fma(x, y, x)
+    elif FORM == "remf":
+        v = x % y
+    elif FORM == "divrn":
+        v = tl.div_rn(x, y)
+    elif FORM == "sqrtrn":
+        v = tl.sqrt_rn(x * x + 1.0)
+    else:
+        v = tl.clamp(x, 0.5, 1.5)
+    tl.store(O, tl.sum(v))
+
+
+@pytest.mark.parametrize("form,culprit", _RANK1_CULPRITS,
+                         ids=[f for f, _ in _RANK1_CULPRITS])
+def test_rank1_reduce_refusal_names_the_op_it_refused(form, culprit, tmp_path):
+    """The named op must be the refused one, and must differ between sources."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / f"rank1_culprit_{form}.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = GPUTarget("metal", 9, 32)
+
+        def compile_case(block):
+            return triton.compile(ASTSource(
+                module._rank1_reduce_producer_kernel,
+                signature={{"Xp": "*fp32", "Yp": "*fp32", "O": "*fp32"}},
+                constexprs={{"BLOCK": block, "FORM": {form!r}}}),
+                target=target, options={{"num_warps": 4}})
+
+        try:
+            compile_case(256)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("unreplayable rank-1 source compiled")
+        # One element per thread consumes the converted scalar and replays
+        # nothing, so the same source must still compile.
+        compile_case(128)
+        print("RECOVERED")
+    """))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, timeout=300,
+                            env={**os.environ,
+                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert f"does not re-emit per element: {culprit}" in output, output
+    # The old wording, which carried the single-load walker's stopping point
+    # (a replayable layout node the author cannot remove) as the reason.
+    assert "unsupported producer in elementwise chain" not in output, output
+    assert "RECOVERED" in output, output
+    assert "failed to legalize" not in output, output
