@@ -11290,6 +11290,30 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                          toSignlessInt(x, rewriter, loc))
         .getResult();
   }
+  // The float->int direction, which this cone was missing while the rank-1 one
+  // had it. `tl.sum((x * 4.0).to(tl.int32).to(tl.float32), axis=1)` therefore
+  // compiled at rank 1 and was refused at rank 2 -- the same kernel, a
+  // different axis, a different answer about whether it is supported. The
+  // result type must be SIGNLESS, exactly as in the integer width casts above:
+  // arith rejects a ui32 result.
+  if (auto f2s = mlir::dyn_cast<mlir::arith::FPToSIOp>(def)) {
+    mlir::Value x = evalRank2ConeAt(f2s.getIn(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::FPToSIOp::create(rewriter, loc,
+                                         signlessEltOf(f2s.getType()), x)
+        .getResult();
+  }
+  if (auto f2u = mlir::dyn_cast<mlir::arith::FPToUIOp>(def)) {
+    mlir::Value x = evalRank2ConeAt(f2u.getIn(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    if (!x)
+      return nullptr;
+    return mlir::arith::FPToUIOp::create(rewriter, loc,
+                                         signlessEltOf(f2u.getType()), x)
+        .getResult();
+  }
   if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(def)) {
     mlir::Value x = evalRank2ConeAt(ext.getIn(), rVal, rowBase, nVal, rewriter,
                                     loc, depth + 1);
@@ -12074,7 +12098,8 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
                 mlir::arith::ExtFOp, mlir::arith::TruncFOp,
                 mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
-                mlir::arith::TruncIOp, mlir::triton::TransOp>(def))
+                mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
+                mlir::arith::FPToUIOp, mlir::triton::TransOp>(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def))
     return rank2ConeSupported(sel.getCondition(), depth + 1, preflight) &&
