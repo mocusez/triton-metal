@@ -1228,7 +1228,8 @@ def _gather_source_replay_kernel(x_ptr, idx_ptr, out_ptr, flag,
     tl.store(out_ptr + offs, tl.gather(x, tl.load(idx_ptr + offs), axis=0))
 
 
-@pytest.mark.parametrize("mode", ["fma", "rem", "div", "if"])
+# "div" left this list when the cone tables learned tt.precise_divf.
+@pytest.mark.parametrize("mode", ["fma", "rem", "if"])
 def test_gather_rank1_source_replay_is_rejected_not_crashed(mode, tmp_path):
     """A declined multi-element source must leave compilation recoverable."""
     import os
@@ -1532,7 +1533,8 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
     [
         pytest.param(block, mode, id=f"b{block}_{mode}")
         for block in (32, 256)
-        for mode in ("fma", "rem", "div")
+        # "div" left this list when the cone tables learned tt.precise_divf.
+        for mode in ("fma", "rem")
     ] + [
         pytest.param(128, "nested_if", id="b128_nested_if"),
     ],
@@ -3993,7 +3995,9 @@ def _reduce_replay_loop_kernel(X, Y, O, BLOCK: tl.constexpr,
         tl.store(O, result)
 
 
-@pytest.mark.parametrize("operation", ["sqrt_rn", "div_rn", "fma", "clamp",
+# sqrt_rn and div_rn moved out when the cone tables learned them; they are
+# covered as SUPPORTED below, at more than one element per thread.
+@pytest.mark.parametrize("operation", ["fma", "clamp",
                                        "loop_result", "loop_iter_arg"])
 @pytest.mark.parametrize("num_warps,wrapped,reduction", [(1, False, "sum"), (4, True, "max")])
 def test_reduce_rank1_unreplayable_source_fails_without_crashing(
@@ -6113,7 +6117,8 @@ def test_canonical_affine_scan_unreplayable_source_is_exact(block, mode,
 
 
 @pytest.mark.parametrize(
-    "mode,claimed", [("arithmetic", True), ("fma", False)])
+    "mode,claimed",
+    [("arithmetic", True), ("fma", False), ("div", True)])
 def test_canonical_affine_scan_tier_census(mode, claimed):
     """Which tier ran is not visible in the answer; census the emitted body.
 
@@ -6237,11 +6242,11 @@ def test_prefix_negation_matches_torch(form, block):
 # remove. Acting on it -- deleting the reshape -- cannot help.
 # ---------------------------------------------------------------------------
 
+# divrn/sqrtrn were here until the cone tables learned the precise ops; the
+# remaining three still have no cone emission, so they still name themselves.
 _RANK1_CULPRITS = [
     ("fma", "math.fma"),
     ("remf", "arith.remf"),
-    ("divrn", "tt.precise_divf"),
-    ("sqrtrn", "tt.precise_sqrt"),
     ("clamp", "tt.clampf"),
 ]
 
@@ -6315,3 +6320,79 @@ def test_rank1_reduce_refusal_names_the_op_it_refused(form, culprit, tmp_path):
     assert "unsupported producer in elementwise chain" not in output, output
     assert "RECOVERED" in output, output
     assert "failed to legalize" not in output, output
+
+
+# ---------------------------------------------------------------------------
+# Triton's precise arithmetic inside a replayed cone.
+#
+# `tt.precise_sqrt` and `tt.precise_divf` lower to the SAME Metal spellings the
+# cone evaluators already emit -- `metal.unary_exp sqrtOp` and
+# `metal.binary_exp divOp` -- so teaching them is a table entry, not a new
+# emission. Before this, every site that replays a cone element by element
+# refused them above one element per thread: rank-1 and rank-2 reduce, rank-1
+# scan, gather, histogram at any tile size, and both canonical tuple scans.
+#
+# The frontend types these ops, so the backend only ever sees f32: `tl.sqrt_rn`
+# and `tl.div_rn` on f16 or bf16 are refused in `ast_to_ttir` with
+# "Expected dtype ['fp32']". That is why the table entries carry no width gate.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
+                              BINS: tl.constexpr, SITE: tl.constexpr,
+                              FORM: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(Xp + offs)
+    y = tl.load(Yp + offs)
+    if FORM == "sqrt_rn":
+        v = tl.sqrt_rn(x * x + 1.0)
+    else:
+        v = tl.div_rn(x, y)
+    if SITE == "reduce":
+        tl.store(Op, tl.sum(v))
+    elif SITE == "scan":
+        tl.store(Op + offs, tl.cumsum(v))
+    elif SITE == "gather":
+        tl.store(Op + offs, tl.gather(v, tl.load(Ip + offs), 0))
+    else:
+        tl.store(Op + tl.arange(0, BINS), tl.histogram(v.to(tl.int32), BINS))
+
+
+@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn"])
+@pytest.mark.parametrize("site", ["reduce", "scan", "gather", "histogram"])
+# 128 is one element per thread, where nothing is replayed and these always
+# worked; 256 is two, which is what this slice opened. Histogram replays at
+# every tile size, so 128 is a new case for it too.
+@pytest.mark.parametrize("block", [128, 256])
+def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(0x9E11 + block)
+    bins = 8
+    x = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
+    y = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
+    idx = torch.randperm(block).to(torch.int32).contiguous()
+    v = torch.sqrt(x * x + 1.0) if form == "sqrt_rn" else x / y
+    if site == "reduce":
+        out = torch.zeros(1, dtype=torch.float32, device="mps")
+        expected = v.sum().reshape(1)
+    elif site == "scan":
+        out = torch.zeros(block, dtype=torch.float32, device="mps")
+        expected = torch.cumsum(v, 0)
+    elif site == "gather":
+        out = torch.zeros(block, dtype=torch.float32, device="mps")
+        expected = v[idx.long()]
+    else:
+        out = torch.zeros(bins, dtype=torch.int32, device="mps")
+        expected = torch.bincount(v.to(torch.int32).clamp(0, bins - 1),
+                                  minlength=bins).to(torch.int32)
+    _precise_cone_site_kernel[(1,)](
+        x.to("mps"), y.to("mps"), idx.to("mps"), out, BLOCK=block, BINS=bins,
+        SITE=site, FORM=form, num_warps=4)
+    torch.mps.synchronize()
+    if site == "histogram":
+        assert torch.equal(out.cpu(), expected)
+    else:
+        torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)

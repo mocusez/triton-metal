@@ -1013,7 +1013,15 @@ def test_rank2_reduce_consumer_shapes_match_torch(axis, how, shape, num_warps):
 # test below guards.
 # ---------------------------------------------------------------------------
 
+# Every producer the cone evaluator does not re-emit, for the one-element-per-
+# thread guard: the staged path owns that shape and replays nothing, so all of
+# them are exact there whether the evaluator knows them or not.
 _CONE_FORMS = ["fma", "remf", "divrn", "sqrtrn", "clamp", "cast_i32"]
+# Still outside the evaluator, so still refused once replay is required.
+_CONE_FORMS_REFUSED = ["fma", "remf", "clamp", "cast_i32"]
+# Taught to the shared cone tables: the same Metal spellings the evaluator
+# already emitted for `math.sqrt` and `arith.divf`.
+_CONE_FORMS_REPLAYED = ["divrn", "sqrtrn"]
 
 
 @triton.jit
@@ -1062,7 +1070,7 @@ def _run_cone_producer(form, axis, m, n):
     return out, x.reshape(m, n), y.reshape(m, n)
 
 
-@pytest.mark.parametrize("form", _CONE_FORMS)
+@pytest.mark.parametrize("form", _CONE_FORMS_REFUSED)
 def test_rank2_cone_unreplayable_producer_is_refused(form, tmp_path):
     """Refused before conversion, and compilation stays recoverable.
 
@@ -1137,6 +1145,19 @@ def test_rank2_cone_producer_runs_at_one_element_per_thread(form, axis):
     question without asking the staged path first would take all twelve away.
     """
     out, xm, ym = _run_cone_producer(form, axis, 8, 16)
+    torch.mps.synchronize()
+    expected = _cone_reference(form, xm, ym).sum(dim=1 if axis == 1 else 0)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("form", _CONE_FORMS_REPLAYED)
+# The two geometries where the staged path declines and the cone is genuinely
+# replayed -- exactly where these two used to be refused.
+@pytest.mark.parametrize("shape", [(8, 32), (256, 8)])
+def test_rank2_cone_precise_producer_is_replayed(form, axis, shape):
+    """Taught to the cone tables, so they must be exact where replay happens."""
+    out, xm, ym = _run_cone_producer(form, axis, *shape)
     torch.mps.synchronize()
     expected = _cone_reference(form, xm, ym).sum(dim=1 if axis == 1 else 0)
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)

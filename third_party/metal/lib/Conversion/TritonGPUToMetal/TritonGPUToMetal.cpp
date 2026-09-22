@@ -6453,6 +6453,29 @@ coneUnaryExpOperator(mlir::Operation *def) {
     return UnaryExpOperator::erfOp;
   if (mlir::isa<mlir::math::RsqrtOp>(def))
     return UnaryExpOperator::rsqrtOp;
+  // Triton's precise square root is the same Metal emission as `math.sqrt`
+  // (`TritonPreciseSqrtLowering` builds the identical `metal.unary_exp`), so a
+  // cone replays it by the same table entry rather than a second spelling.
+  // No width gate is needed here: the FRONTEND types it, and `tl.sqrt_rn` on
+  // anything but f32 is refused in `ast_to_ttir` with
+  // "Expected dtype ['fp32']" -- measured on f16 and bf16 -- so the backend
+  // never sees another width. `validatePreciseMathSupport` remains the second
+  // line for hand-written MLIR.
+  if (mlir::isa<mlir::triton::PreciseSqrtOp>(def))
+    return UnaryExpOperator::sqrtOp;
+  return std::nullopt;
+}
+
+// Triton's precise binary arithmetic. `tt.precise_divf` lowers to the same
+// `metal.binary_exp` spelling as `arith.divf`, so this is a table entry rather
+// than a new emission. A table for the same reason as the unary one above:
+// four sites ask this question -- both cone evaluators and both predicates --
+// and a list copied four times is how they drift apart. Same frontend typing
+// argument as `tt.precise_sqrt`.
+static std::optional<BinaryExpOperator>
+conePreciseBinaryOperator(mlir::Operation *def) {
+  if (mlir::isa_and_nonnull<mlir::triton::PreciseDivFOp>(def))
+    return BinaryExpOperator::divOp;
   return std::nullopt;
 }
 
@@ -9963,7 +9986,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
              mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
              mlir::arith::ShRUIOp, mlir::arith::SelectOp, mlir::arith::CmpIOp,
              mlir::arith::CmpFOp>(scalarDef) &&
-         !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef))) {
+         !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef) &&
+         !conePreciseBinaryOperator(scalarDef))) {
       // Ops inside the old loop are erased and can never be reused. Prefix ops
       // were already validated by the pre-conversion dry run; after function
       // conversion some of their supported constants/casts may be represented
@@ -10298,6 +10322,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
   if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
+  if (std::optional<BinaryExpOperator> k = conePreciseBinaryOperator(def))
+    return fbinary(def->getOperand(0), def->getOperand(1), *k);
   // Float extrema. The operand's NaN policy decides the operator, so a replayed
   // cone keeps the same semantics as the elementwise lowering of the same op.
   if (auto extremum = floatExtremumOperator(def))
@@ -11101,6 +11127,8 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::mulOp);
   if (auto o = mlir::dyn_cast<mlir::arith::DivFOp>(def))
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
+  if (std::optional<BinaryExpOperator> k = conePreciseBinaryOperator(def))
+    return binary(def->getOperand(0), def->getOperand(1), *k);
   // Float extrema; same NaN-policy dispatch as the rank-1 cone evaluator.
   if (auto extremum = floatExtremumOperator(def))
     return binary(def->getOperand(0), def->getOperand(1), *extremum);
@@ -11742,6 +11770,11 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank1ConeSupported(def->getOperand(0), depth + 1,
                               deferAggregateLeaves);
+  if (conePreciseBinaryOperator(def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank1ConeSupported(def->getOperand(0), depth + 1,
@@ -12007,6 +12040,9 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
+  if (conePreciseBinaryOperator(def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
