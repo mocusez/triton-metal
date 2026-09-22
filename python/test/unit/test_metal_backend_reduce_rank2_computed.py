@@ -1020,12 +1020,12 @@ _CONE_FORMS = ["fma", "remf", "divrn", "sqrtrn", "clamp", "cast_i32"]
 # Still outside the evaluator, so still refused once replay is required. Each
 # needs an emission the cone does not have: a ternary fma, `precise::fmod`
 # through metal.math_intrinsic, and a clamp carrying a NaN policy.
-_CONE_FORMS_REFUSED = ["fma", "remf", "clamp"]
+_CONE_FORMS_REFUSED = ["fma", "clamp"]
 # Replayed by this cone. The precise pair reuses the spellings the evaluator
 # already emitted for `math.sqrt` and `arith.divf`; the float-to-int cast was
 # simply missing from the rank-2 evaluator and predicate while the rank-1 cone
 # had it, so the same kernel was supported on one axis and refused on another.
-_CONE_FORMS_REPLAYED = ["divrn", "sqrtrn", "cast_i32"]
+_CONE_FORMS_REPLAYED = ["divrn", "sqrtrn", "cast_i32", "remf"]
 
 
 @triton.jit

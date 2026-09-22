@@ -1228,8 +1228,9 @@ def _gather_source_replay_kernel(x_ptr, idx_ptr, out_ptr, flag,
     tl.store(out_ptr + offs, tl.gather(x, tl.load(idx_ptr + offs), axis=0))
 
 
-# "div" left this list when the cone tables learned tt.precise_divf.
-@pytest.mark.parametrize("mode", ["fma", "rem", "if"])
+# "div" and "rem" left this list as the cone tables learned tt.precise_divf and
+# arith.remf.
+@pytest.mark.parametrize("mode", ["fma", "if"])
 def test_gather_rank1_source_replay_is_rejected_not_crashed(mode, tmp_path):
     """A declined multi-element source must leave compilation recoverable."""
     import os
@@ -1533,8 +1534,9 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
     [
         pytest.param(block, mode, id=f"b{block}_{mode}")
         for block in (32, 256)
-        # "div" left this list when the cone tables learned tt.precise_divf.
-        for mode in ("fma", "rem")
+        # "div" and "rem" left as the cone tables learned tt.precise_divf
+        # and arith.remf.
+        for mode in ("fma",)
     ] + [
         pytest.param(128, "nested_if", id="b128_nested_if"),
     ],
@@ -6118,7 +6120,7 @@ def test_canonical_affine_scan_unreplayable_source_is_exact(block, mode,
 
 @pytest.mark.parametrize(
     "mode,claimed",
-    [("arithmetic", True), ("fma", False), ("div", True)])
+    [("arithmetic", True), ("fma", False), ("div", True), ("rem", True)])
 def test_canonical_affine_scan_tier_census(mode, claimed):
     """Which tier ran is not visible in the answer; census the emitted body.
 
@@ -6246,7 +6248,6 @@ def test_prefix_negation_matches_torch(form, block):
 # remaining three still have no cone emission, so they still name themselves.
 _RANK1_CULPRITS = [
     ("fma", "math.fma"),
-    ("remf", "arith.remf"),
     ("clamp", "tt.clampf"),
 ]
 
@@ -6347,6 +6348,8 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
     y = tl.load(Yp + offs)
     if FORM == "sqrt_rn":
         v = tl.sqrt_rn(x * x + 1.0)
+    elif FORM == "rem":
+        v = x % y
     else:
         v = tl.div_rn(x, y)
     if SITE == "reduce":
@@ -6359,7 +6362,7 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         tl.store(Op + tl.arange(0, BINS), tl.histogram(v.to(tl.int32), BINS))
 
 
-@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn"])
+@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem"])
 @pytest.mark.parametrize("site", ["reduce", "scan", "gather", "histogram"])
 # 128 is one element per thread, where nothing is replayed and these always
 # worked; 256 is two, which is what this slice opened. Histogram replays at
@@ -6374,7 +6377,12 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
     x = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
     y = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
     idx = torch.randperm(block).to(torch.int32).contiguous()
-    v = torch.sqrt(x * x + 1.0) if form == "sqrt_rn" else x / y
+    if form == "sqrt_rn":
+        v = torch.sqrt(x * x + 1.0)
+    elif form == "rem":
+        v = torch.fmod(x, y)
+    else:
+        v = x / y
     if site == "reduce":
         out = torch.zeros(1, dtype=torch.float32, device="mps")
         expected = v.sum().reshape(1)
@@ -6396,3 +6404,50 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
         assert torch.equal(out.cpu(), expected)
     else:
         torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _cone_remainder_sign_kernel(Xp, Yp, Op, BLOCK: tl.constexpr,
+                                SITE: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    # A NEGATIVE dividend: fmod keeps the dividend's sign, remainder takes the
+    # divisor's. Every positive-only probe agrees under both, so this is the
+    # only shape that tells the two apart.
+    v = (tl.load(Xp + offs) - 1.7) % tl.load(Yp + offs)
+    if SITE == "reduce":
+        tl.store(Op, tl.sum(v))
+    else:
+        tl.store(Op + offs, tl.cumsum(v))
+
+
+@pytest.mark.parametrize("site", ["reduce", "scan"])
+def test_float_remainder_in_a_cone_is_fmod_not_remainder(site):
+    """Triton's float `%` is fmod. A replayed cone must not drift to remainder.
+
+    `metal::precise::fmod` is what the elementwise lowering emits, and the cone
+    now emits the same call -- but a reference written for the occasion is how
+    this gets called wrong: a previous round used `torch.remainder` and marked
+    ten correct cells as failures. Both references are computed here, and the
+    test asserts the backend matches fmod AND differs from remainder, so it
+    cannot pass by agreeing with the wrong one.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 256  # two elements per thread: the cone is genuinely replayed
+    torch.manual_seed(0xFA11)
+    x = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
+    y = (torch.rand(block, dtype=torch.float32) + 1.0).contiguous()
+    dividend = x - 1.7
+    as_fmod = torch.fmod(dividend, y)
+    as_remainder = torch.remainder(dividend, y)
+    # The probe is only meaningful while the two references disagree.
+    assert not torch.allclose(as_fmod, as_remainder), "probe lost its teeth"
+    out = torch.zeros(1 if site == "reduce" else block,
+                      dtype=torch.float32, device="mps")
+    _cone_remainder_sign_kernel[(1,)](x.to("mps"), y.to("mps"), out,
+                                      BLOCK=block, SITE=site, num_warps=4)
+    torch.mps.synchronize()
+    expected = (as_fmod.sum().reshape(1) if site == "reduce"
+                else torch.cumsum(as_fmod, 0))
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)

@@ -6479,6 +6479,29 @@ conePreciseBinaryOperator(mlir::Operation *def) {
   return std::nullopt;
 }
 
+// Cone producers whose Metal emission is a `metal.math_intrinsic` CALL rather
+// than an operator expression. This is a shape the cone evaluators did not have
+// -- the two tables above map onto `metal.unary_exp` / `metal.binary_exp` -- so
+// it is a table for the same reason: four sites ask, and a list copied four
+// times is how those answers drift apart.
+//
+// `arith.remf` is truncating remainder, i.e. fmod, and the precise namespace is
+// selected deliberately: the default MSL fmod has undefined accuracy under fast
+// math. `ArithRemFLowering` emits exactly this, so a replayed cone and the
+// elementwise path cannot disagree about the value.
+//
+// No width gate, and the reason differs from the precise ops above: those are
+// typed by the frontend, while a f16 `%` IS accepted there and PROMOTED --
+// `extf` to f32, `arith.remf`, `truncf` back -- so the backend only ever sees
+// the f32 form either way. `validatePreciseMathSupport` still refuses a
+// hand-written non-f32 `arith.remf` at module scope.
+static std::optional<llvm::StringRef>
+coneMathIntrinsicSymbol(mlir::Operation *def) {
+  if (mlir::isa_and_nonnull<mlir::arith::RemFOp>(def))
+    return llvm::StringRef("metal::precise::fmod");
+  return std::nullopt;
+}
+
 // Element types `math.absf` has an exact Metal emission for.
 static bool metalAbsFTypeSupported(mlir::Type ty) {
   if (auto rtt = mlir::dyn_cast_or_null<mlir::RankedTensorType>(ty))
@@ -9987,7 +10010,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
              mlir::arith::ShRUIOp, mlir::arith::SelectOp, mlir::arith::CmpIOp,
              mlir::arith::CmpFOp>(scalarDef) &&
          !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef) &&
-         !conePreciseBinaryOperator(scalarDef))) {
+         !conePreciseBinaryOperator(scalarDef) &&
+         !coneMathIntrinsicSymbol(scalarDef))) {
       // Ops inside the old loop are erased and can never be reused. Prefix ops
       // were already validated by the pre-conversion dry run; after function
       // conversion some of their supported constants/casts may be represented
@@ -10324,6 +10348,18 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return fbinary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
   if (std::optional<BinaryExpOperator> k = conePreciseBinaryOperator(def))
     return fbinary(def->getOperand(0), def->getOperand(1), *k);
+  if (std::optional<llvm::StringRef> sym = coneMathIntrinsicSymbol(def)) {
+    mlir::Value a =
+        evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc, depth + 1);
+    mlir::Value b =
+        evalRank1ValueAt(def->getOperand(1), idxVal, rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return MathIntrinsicOp::create(rewriter, loc, a.getType(),
+                                   rewriter.getStringAttr(*sym),
+                                   mlir::ValueRange{a, b})
+        .getResult();
+  }
   // Float extrema. The operand's NaN policy decides the operator, so a replayed
   // cone keeps the same semantics as the elementwise lowering of the same op.
   if (auto extremum = floatExtremumOperator(def))
@@ -11129,6 +11165,18 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return binary(o.getLhs(), o.getRhs(), BinaryExpOperator::divOp);
   if (std::optional<BinaryExpOperator> k = conePreciseBinaryOperator(def))
     return binary(def->getOperand(0), def->getOperand(1), *k);
+  if (std::optional<llvm::StringRef> sym = coneMathIntrinsicSymbol(def)) {
+    mlir::Value a = evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    mlir::Value b = evalRank2ConeAt(def->getOperand(1), rVal, rowBase, nVal,
+                                    rewriter, loc, depth + 1);
+    if (!a || !b)
+      return nullptr;
+    return MathIntrinsicOp::create(rewriter, loc, a.getType(),
+                                   rewriter.getStringAttr(*sym),
+                                   mlir::ValueRange{a, b})
+        .getResult();
+  }
   // Float extrema; same NaN-policy dispatch as the rank-1 cone evaluator.
   if (auto extremum = floatExtremumOperator(def))
     return binary(def->getOperand(0), def->getOperand(1), *extremum);
@@ -11799,6 +11847,11 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
                               deferAggregateLeaves) &&
            rank1ConeSupported(def->getOperand(1), depth + 1,
                               deferAggregateLeaves);
+  if (coneMathIntrinsicSymbol(def))
+    return rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank1ConeSupported(def->getOperand(0), depth + 1,
@@ -12065,6 +12118,9 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (conePreciseBinaryOperator(def))
+    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
+  if (coneMathIntrinsicSymbol(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
            rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
   if (mlir::isa<mlir::math::AbsFOp>(def))
