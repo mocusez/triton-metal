@@ -1474,3 +1474,141 @@ def test_reduce_rank1_tuple_of_three_above_one_element_per_thread():
                                                rel=2e-5)
     assert lo.cpu().item() == x.min().item()
     assert hi.cpu().item() == x.max().item()
+
+
+# ---------------------------------------------------------------------------
+# A rank-1 aggregate whose SOURCE BUFFER the same kernel writes.
+#
+# Above one element per thread the body runs inside a band loop while a
+# whole-CTA aggregate is materialized in the prologue, so the aggregate's read
+# and the kernel's store end up on opposite sides of a boundary the source
+# program never had. `sweeps/s_scan_source_effects.py` measured it over op x
+# write target x order x BLOCK x warps, 168 cells: 27 silently wrong, and every
+# one of them writes the aggregate's OWN buffer at more than one element per
+# thread. Writing any other buffer is exact, rank 2 is exact, and one element
+# per thread is exact -- so the refusals below are about the pairing, not about
+# stores or aggregates.
+#
+# The `tl.sum` case is asymmetric on purpose, and the sweep is why: with the
+# store AFTER the load the prologue read is the correct one, and that shape is
+# an in-place softmax (load a row, reduce it, write the row back). Only a store
+# that PRECEDES the load is refused there.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _scan_then_overwrite_source(X, O, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    v = tl.load(X + i)
+    c = tl.cumsum(v, 0)
+    tl.store(X + i, v * 0.0)
+    tl.store(O + i, c)
+
+
+@triton.jit
+def _scan_into_another_buffer(X, Y, O, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    v = tl.load(X + i)
+    c = tl.cumsum(v, 0)
+    tl.store(Y + i, v * 0.0)
+    tl.store(O + i, c)
+
+
+@triton.jit
+def _overwrite_source_then_reduce(X, O, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    tl.store(X + i, tl.zeros((BLOCK,), tl.float32))
+    v = tl.load(X + i)
+    tl.store(O + i, v * 0.0 + tl.sum(v, 0))
+
+
+@triton.jit
+def _reduce_then_overwrite_source(X, O, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    v = tl.load(X + i)
+    s = tl.sum(v, 0)
+    tl.store(X + i, v * 0.0)
+    tl.store(O + i, v * 0.0 + s)
+
+
+@pytest.mark.parametrize("block,num_warps", [(64, 1), (128, 1), (256, 4)],
+                         ids=["n64_w1_e2", "n128_w1_e4", "n256_w4_e2"])
+def test_rank1_scan_over_a_buffer_the_kernel_writes_is_named(block, num_warps,
+                                                             capfd):
+    x = torch.arange(block, dtype=torch.float32).to("mps")
+    out = torch.zeros(block, device="mps")
+    with pytest.raises(Exception) as error:
+        _scan_then_overwrite_source[(1,)](x, out, BLOCK=block,
+                                          num_warps=num_warps)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    reason = "".join(capfd.readouterr())
+    assert "rank-1 scan reads a buffer the kernel also writes" in reason
+
+    survivor = torch.arange(32, dtype=torch.float32).to("mps")
+    kept = torch.zeros(1, device="mps")
+    reduce_sum_rank1_kernel[(1,)](survivor, kept, BLOCK=32)
+    torch.mps.synchronize()
+    assert kept.cpu().item() == 496.0
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_rank1_scan_over_its_own_buffer_runs_at_one_element_per_thread(
+        num_warps):
+    """The guard on the refusal: at one element per thread there is no band
+    loop for the read and the store to disagree about."""
+    block = 32 * num_warps
+    ref = torch.arange(block, dtype=torch.float32)
+    x = ref.clone().to("mps")
+    out = torch.zeros(block, device="mps")
+    _scan_then_overwrite_source[(1,)](x, out, BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref.cumsum(0))
+    assert torch.equal(x.cpu(), torch.zeros(block))
+
+
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (256, 4)],
+                         ids=["n128_w1_e4", "n256_w4_e2"])
+def test_rank1_scan_writing_another_buffer_still_runs(block, num_warps):
+    """The other half of the guard: the refusal is about the aggregate's own
+    buffer, and a kernel that scans one buffer and writes a second is the
+    common shape."""
+    ref = torch.arange(block, dtype=torch.float32)
+    x = ref.clone().to("mps")
+    y = torch.ones(block, device="mps")
+    out = torch.zeros(block, device="mps")
+    _scan_into_another_buffer[(1,)](x, y, out, BLOCK=block,
+                                    num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), ref.cumsum(0))
+    assert torch.equal(x.cpu(), ref)
+
+
+@pytest.mark.parametrize("block,num_warps", [(64, 1), (128, 1), (256, 4)],
+                         ids=["n64_w1_e2", "n128_w1_e4", "n256_w4_e2"])
+def test_rank1_reduce_after_writing_its_source_is_named(block, num_warps,
+                                                        capfd):
+    x = torch.arange(block, dtype=torch.float32).to("mps")
+    out = torch.zeros(block, device="mps")
+    with pytest.raises(Exception) as error:
+        _overwrite_source_then_reduce[(1,)](x, out, BLOCK=block,
+                                            num_warps=num_warps)
+    assert "convert-tritongpu-to-metal failed" in str(error.value)
+    reason = "".join(capfd.readouterr())
+    assert "rank-1 reduce reads a buffer the kernel wrote earlier" in reason
+
+
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (256, 4), (1024, 1)],
+                         ids=["n128_w1_e4", "n256_w4_e2", "n1024_w1_e32"])
+def test_rank1_reduce_then_overwriting_its_source_still_runs(block, num_warps):
+    """The in-place softmax shape -- load a row, reduce it, write the row back
+    -- and the reason the reduce refusal asks about ORDER instead of matching
+    the scan's."""
+    ref = torch.arange(block, dtype=torch.float32)
+    x = ref.clone().to("mps")
+    out = torch.zeros(block, device="mps")
+    _reduce_then_overwrite_source[(1,)](x, out, BLOCK=block,
+                                        num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(),
+                               torch.full((block,), float(ref.sum())))
+    assert torch.equal(x.cpu(), torch.zeros(block))

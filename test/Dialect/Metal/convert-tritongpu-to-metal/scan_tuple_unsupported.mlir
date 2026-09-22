@@ -111,10 +111,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // thread put this beyond the general tuple scan as well, so it is refused.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @scan_affine_unreplayable_source_multi_element(%x: !tt.ptr<f32>) {
+  // ⚠️ The result goes to a SECOND buffer. Storing back through `%ptr` made
+  // this an in-place scan, and above one element per thread that shape is now
+  // refused earlier and for a different reason (the aggregate's source is read
+  // from the band loop rather than where the load stands), which shadowed the
+  // message this fixture is about.
+  tt.func public @scan_affine_unreplayable_source_multi_element(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
     %off = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked>
     %base = tt.splat %x : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
     %ptr = tt.addptr %base, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %obase = tt.splat %o : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %optr = tt.addptr %obase, %off : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
     %v = tt.load %ptr : tensor<256x!tt.ptr<f32>, #blocked>
     // `arith.maxsi` stands in for "a producer no cone replays". It is not on
     // the widening path, unlike the `math.fma` that used to sit here, so this
@@ -131,7 +138,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %cx = arith.addf %cm, %rx : f32
       tt.scan.return %ca, %cx : f32, f32
     }) : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>)
-    tt.store %ptr, %r#1 : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.store %optr, %r#1 : tensor<256x!tt.ptr<f32>, #blocked>
     tt.return
   }
 }

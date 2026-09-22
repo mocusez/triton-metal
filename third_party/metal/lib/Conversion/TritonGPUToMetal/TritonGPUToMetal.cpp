@@ -40423,6 +40423,128 @@ struct ConvertTritonGPUToMetalPass
       }
     }
 
+    // A rank-1 aggregate whose SOURCE BUFFER this kernel also writes.
+    //
+    // Above one element per thread the body runs inside a band loop while a
+    // whole-CTA aggregate is materialized in the prologue, so the aggregate's
+    // read and the kernel's store sit on opposite sides of a boundary the
+    // source never had. Measured (`sweeps/s_scan_source_effects.py`, 168
+    // cells): a `tl.cumsum` whose buffer is stored to answers with something
+    // that is not the scan for BOTH orders, and a `tl.sum` does when the store
+    // PRECEDES the load -- it reads the values the store replaced. Every cell
+    // writing any OTHER buffer is exact, every rank-2 cell is exact, and every
+    // cell at one element per thread is exact, which is what makes this about
+    // the pairing and not about stores or aggregates as such.
+    //
+    // `tl.sum` with the store AFTER the load stays supported on purpose: the
+    // prologue read is then the correct one, and that is the in-place softmax
+    // shape (load a row, reduce it, write the row back).
+    {
+      auto pointerRoot = [](mlir::Value value) {
+        for (int guard = 0; guard < 16; ++guard) {
+          mlir::Operation *def = value.getDefiningOp();
+          if (!def)
+            break;
+          if (auto add = mlir::dyn_cast<mlir::triton::AddPtrOp>(def))
+            value = add.getPtr();
+          else if (auto splat = mlir::dyn_cast<mlir::triton::SplatOp>(def))
+            value = splat.getSrc();
+          else if (auto bcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+            value = bcast.getSrc();
+          else if (auto cvt =
+                       mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def))
+            value = cvt.getSrc();
+          else if (auto bitcast = mlir::dyn_cast<mlir::triton::BitcastOp>(def))
+            value = bitcast.getSrc();
+          else
+            break;
+        }
+        return value;
+      };
+      bool aggregateOk = true;
+      moduleOp.walk([&](mlir::triton::FuncOp func) {
+        llvm::SmallVector<std::pair<mlir::Value, mlir::Operation *>, 8> writes;
+        func.walk([&](mlir::Operation *op) {
+          if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(op))
+            writes.emplace_back(pointerRoot(store.getPtr()), op);
+          else if (auto rmw = mlir::dyn_cast<mlir::triton::AtomicRMWOp>(op))
+            writes.emplace_back(pointerRoot(rmw.getPtr()), op);
+          else if (auto cas = mlir::dyn_cast<mlir::triton::AtomicCASOp>(op))
+            writes.emplace_back(pointerRoot(cas.getPtr()), op);
+        });
+        if (writes.empty())
+          return;
+        auto check = [&](mlir::Operation *aggregate, mlir::Value src,
+                         bool isScan) {
+          auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(src.getType());
+          if (!srcTy || srcTy.getRank() != 1)
+            return;
+          auto plan = planLayoutIndex(srcTy);
+          if (!plan || plan->elemPerThread <= 1)
+            return;
+          llvm::SmallVector<mlir::triton::LoadOp, 4> loads;
+          llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+          llvm::SmallVector<mlir::Value, 16> worklist{src};
+          while (!worklist.empty()) {
+            mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+            if (!def || !seen.insert(def).second)
+              continue;
+            if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+              loads.push_back(load);
+              continue;
+            }
+            if (def->getNumRegions() != 0)
+              continue;
+            for (mlir::Value operand : def->getOperands())
+              worklist.push_back(operand);
+          }
+          for (mlir::triton::LoadOp load : loads) {
+            mlir::Value root = pointerRoot(load.getPtr());
+            for (auto [writeRoot, writeOp] : writes) {
+              if (writeRoot != root)
+                continue;
+              // A reduce is materialized ahead of the band loop, so a store
+              // that FOLLOWS the load is still ordered correctly against it.
+              if (!isScan && !(writeOp->getBlock() == load->getBlock() &&
+                               writeOp->isBeforeInBlock(load.getOperation())))
+                continue;
+              // Two emit sites rather than one with a ternary: a message
+              // built from a conditional reads as ONE concatenated string to
+              // anything scanning this file for its named diagnostics, and
+              // `audit_diagnostics.py` is the thing that decides which of
+              // these a test still has to pin.
+              if (isScan)
+                aggregate->emitOpError(
+                    "Metal backend: this rank-1 scan reads a buffer the kernel "
+                    "also writes, and above one element per thread its source "
+                    "is read from the band loop rather than where the load "
+                    "stands");
+              else
+                aggregate->emitOpError(
+                    "Metal backend: this rank-1 reduce reads a buffer the "
+                    "kernel wrote earlier, and above one element per thread it "
+                    "is materialized before that write runs");
+              aggregateOk = false;
+              return;
+            }
+          }
+        };
+        func.walk([&](mlir::triton::ScanOp scan) {
+          if (!scan.getSrcs().empty())
+            check(scan.getOperation(), scan.getSrcs().front(), /*isScan=*/true);
+        });
+        func.walk([&](mlir::triton::ReduceOp reduce) {
+          if (!reduce.getSrcs().empty())
+            check(reduce.getOperation(), reduce.getSrcs().front(),
+                  /*isScan=*/false);
+        });
+      });
+      if (!aggregateOk) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     if (mlir::failed(validateTileExchangeScratchBudget(moduleOp))) {
       signalPassFailure();
       return;
