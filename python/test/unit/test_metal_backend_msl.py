@@ -1515,13 +1515,17 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
         x = tl.div_rn(x, 3.0)
         y = tl.cumsum(x, 0, reverse=REVERSE)
         tl.store(out_ptr + offs, y)
-    elif MODE == "clamp":
-        x = tl.clamp(x, 0.5, 1.5)
+    elif MODE == "maxsi":
+        # `arith.maxsi` is not on the cone-widening path, so it stays a valid
+        # stand-in for "a producer no cone replays" however wide the tables
+        # get. The constant second operand matters: `maxsi %x, %x` folds to the
+        # identity and the source would become replayable again.
+        x = tl.maximum(x.to(tl.int32), 3).to(tl.float32)
         y = tl.cumsum(x, 0, reverse=REVERSE)
         tl.store(out_ptr + offs, y)
     elif MODE == "nested_if":
         if flag:
-            x = tl.clamp(x, 0.5, 1.5)
+            x = tl.maximum(x.to(tl.int32), 3).to(tl.float32)
             y = tl.cumsum(x, 0, reverse=REVERSE)
             tl.store(out_ptr + offs, y)
         else:
@@ -1539,9 +1543,9 @@ def _scan_source_preflight_kernel(x_ptr, out_ptr, flag,
     [
         pytest.param(block, mode, id=f"b{block}_{mode}")
         for block in (32, 256)
-        # div, rem and fma left as the cone tables learned them; `tt.clampf`
-        # carries a NaN policy and is still outside the evaluator.
-        for mode in ("clamp",)
+        # Every producer that used to sit here -- div, rem, fma, clamp -- was
+        # learned by the cone tables in turn. The carrier is now structural.
+        for mode in ("maxsi",)
     ] + [
         pytest.param(128, "nested_if", id="b128_nested_if"),
     ],
@@ -4002,11 +4006,11 @@ def _reduce_replay_loop_kernel(X, Y, O, BLOCK: tl.constexpr,
         tl.store(O, result)
 
 
-# sqrt_rn, div_rn and fma moved out as the cone tables learned them; they are
-# covered as SUPPORTED below, at more than one element per thread. `clamp` and
-# the two loop forms remain: the first needs a NaN policy, the others are
-# structurally not cones.
-@pytest.mark.parametrize("operation", ["clamp", "loop_result", "loop_iter_arg"])
+# sqrt_rn, div_rn, fma and clamp all moved out as the cone tables learned them;
+# they are covered as SUPPORTED below. The loop forms remain because they are
+# structurally not cones -- a recurrence cannot be re-derived per element -- so
+# no widening reaches them.
+@pytest.mark.parametrize("operation", ["loop_result", "loop_iter_arg"])
 @pytest.mark.parametrize("num_warps,wrapped,reduction", [(1, False, "sum"), (4, True, "max")])
 def test_reduce_rank1_unreplayable_source_fails_without_crashing(
         operation, num_warps, wrapped, reduction, tmp_path):
@@ -6257,8 +6261,11 @@ def test_prefix_negation_matches_torch(form, block):
 
 # divrn/sqrtrn were here until the cone tables learned the precise ops; the
 # remaining three still have no cone emission, so they still name themselves.
+# The producers that used to be here were learned by the cone tables one slice
+# at a time. `arith.maxsi` is not on that path, and `rank1_reduce_unsupported_
+# chain.mlir` pins the same op from the lit side.
 _RANK1_CULPRITS = [
-    ("clamp", "tt.clampf"),
+    ("maxsi", "arith.maxsi"),
 ]
 
 
@@ -6276,8 +6283,10 @@ def _rank1_reduce_producer_kernel(Xp, Yp, O, BLOCK: tl.constexpr,
         v = tl.div_rn(x, y)
     elif FORM == "sqrtrn":
         v = tl.sqrt_rn(x * x + 1.0)
-    else:
+    elif FORM == "clamp":
         v = tl.clamp(x, 0.5, 1.5)
+    else:
+        v = tl.maximum(x.to(tl.int32), 3).to(tl.float32)
     tl.store(O, tl.sum(v))
 
 
@@ -6362,6 +6371,10 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         v = x % y
     elif FORM == "fma":
         v = tl.fma(x, y, x)
+    elif FORM == "clamp_none":
+        v = tl.clamp(x, 1.2, 1.8)
+    elif FORM == "clamp_all":
+        v = tl.clamp(x, 1.2, 1.8, propagate_nan=tl.PropagateNan.ALL)
     else:
         v = tl.div_rn(x, y)
     if SITE == "reduce":
@@ -6374,7 +6387,8 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         tl.store(Op + tl.arange(0, BINS), tl.histogram(v.to(tl.int32), BINS))
 
 
-@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem", "fma"])
+@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem", "fma",
+                                  "clamp_none", "clamp_all"])
 @pytest.mark.parametrize("site", ["reduce", "scan", "gather", "histogram"])
 # 128 is one element per thread, where nothing is replayed and these always
 # worked; 256 is two, which is what this slice opened. Histogram replays at
@@ -6395,6 +6409,10 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
         v = torch.fmod(x, y)
     elif form == "fma":
         v = x * y + x
+    elif form.startswith("clamp"):
+        # No NaN in this input, so both policies agree here; the policy itself
+        # is pinned bitwise against the elementwise path further down.
+        v = torch.clamp(x, 1.2, 1.8)
     else:
         v = x / y
     if site == "reduce":
@@ -6465,3 +6483,71 @@ def test_float_remainder_in_a_cone_is_fmod_not_remainder(site):
     expected = (as_fmod.sum().reshape(1) if site == "reduce"
                 else torch.cumsum(as_fmod, 0))
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _clamp_policy_elementwise_kernel(Xp, Op, BLOCK: tl.constexpr,
+                                     POLICY: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(Xp + offs)
+    if POLICY == "all":
+        v = tl.clamp(x, -1.0, 1.0, propagate_nan=tl.PropagateNan.ALL)
+    else:
+        v = tl.clamp(x, -1.0, 1.0)
+    tl.store(Op + offs, v)
+
+
+@triton.jit
+def _clamp_policy_cone_kernel(Xp, Ip, Op, BLOCK: tl.constexpr,
+                              POLICY: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(Xp + offs)
+    if POLICY == "all":
+        v = tl.clamp(x, -1.0, 1.0, propagate_nan=tl.PropagateNan.ALL)
+    else:
+        v = tl.clamp(x, -1.0, 1.0)
+    # A gather over an identity permutation: the same values, but the source
+    # must be rebuilt per element rather than consumed as a per-thread scalar.
+    tl.store(Op + offs, tl.gather(v, tl.load(Ip + offs), 0))
+
+
+@pytest.mark.parametrize("policy", ["none", "all"])
+def test_replayed_clamp_matches_elementwise_bitwise(policy):
+    """`tt.clampf` carries a NaN POLICY, and a replayed cone must copy it.
+
+    Dropping the attribute fails nothing that ordinary values can see: the
+    clamp still compiles, still replays, and still returns the right answer
+    everywhere except a NaN, where it hands back a number. Measured with the
+    policy forced off, the ALL case differed from the elementwise path on
+    exactly the NaN lanes (-1.0 against nan) and the NONE case stayed
+    identical, so this comparison is the only thing that pins it.
+
+    Compared as BIT PATTERNS: NaN != NaN and -0.0 == 0.0 under a float
+    compare, which would pass on precisely the inputs that matter.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 256  # two elements per thread: the cone is genuinely replayed
+    vals = [float("nan"), -0.0, 0.0, -5.0, 5.0, 0.5, -0.5, float("inf"),
+            float("-inf"), -1.0, 1.0, 2.5, -2.5, 1e-45, -1e-45, 3.0]
+    x = torch.tensor(vals * (block // len(vals)),
+                     dtype=torch.float32).contiguous()
+    idx = torch.arange(block, dtype=torch.int32).contiguous()
+    elementwise = torch.zeros(block, dtype=torch.float32, device="mps")
+    cone = torch.zeros(block, dtype=torch.float32, device="mps")
+    _clamp_policy_elementwise_kernel[(1,)](x.to("mps"), elementwise,
+                                           BLOCK=block, POLICY=policy,
+                                           num_warps=4)
+    _clamp_policy_cone_kernel[(1,)](x.to("mps"), idx.to("mps"), cone,
+                                    BLOCK=block, POLICY=policy, num_warps=4)
+    torch.mps.synchronize()
+    a, b = elementwise.cpu(), cone.cpu()
+    assert torch.equal(a.view(torch.int32), b.view(torch.int32)), (
+        f"policy={policy}: replayed clamp differs from elementwise\n"
+        f"elementwise={a[:4].tolist()}\ncone={b[:4].tolist()}")
+    # The policy must also be doing something: these two must not agree.
+    expected_nan_is_nan = policy == "all"
+    assert bool(torch.isnan(a[0])) is expected_nan_is_nan, a[:2].tolist()
+    # Signed zero survives both policies.
+    assert bool(torch.signbit(b[1])), b[:2].tolist()

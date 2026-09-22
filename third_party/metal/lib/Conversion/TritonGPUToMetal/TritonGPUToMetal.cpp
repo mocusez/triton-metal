@@ -6518,6 +6518,36 @@ static bool coneFusedTernaryOp(mlir::Operation *def) {
   return mlir::isa_and_nonnull<mlir::math::FmaOp>(def);
 }
 
+// `tt.clampf` is the one producer these tables cannot reduce to a SPELLING.
+// The other four map an op onto "what it is emitted as"; clamp carries a NaN
+// POLICY, and the policy is what decides which MSL form runs. Dropping it
+// would not fail anything -- it would quietly answer a NaN with a number,
+// which is the exact defect `metal.clampf` exists to prevent (MSL has no
+// NaN-propagating extremum, so the propagating form needs the preamble
+// helper). The table therefore only IDENTIFIES the op; each evaluator copies
+// the attribute across.
+//
+// Unlike the other four this envelope is not f32-only: `metal.clampf` covers
+// f32, f16 and bf16, so the predicate carries the width question rather than
+// leaning on `validateClampFSupport` having already run. Same shape as
+// `math.absf` above.
+static bool coneClampFOp(mlir::Operation *def) {
+  return mlir::isa_and_nonnull<mlir::triton::ClampFOp>(def);
+}
+
+static bool coneClampFTypeSupported(mlir::Operation *def) {
+  mlir::Type ty = def->getResult(0).getType();
+  if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(ty))
+    ty = rtt.getElementType();
+  return metalClampFElementTypeSupported(ty);
+}
+
+// The policy as `metal.clampf` spells it, shared so the cone and the
+// elementwise pattern cannot disagree about which form a NaN takes.
+static bool coneClampPropagatesNan(mlir::triton::ClampFOp op) {
+  return op.getPropagateNan() == mlir::triton::PropagateNan::ALL;
+}
+
 // Element types `math.absf` has an exact Metal emission for.
 static bool metalAbsFTypeSupported(mlir::Type ty) {
   if (auto rtt = mlir::dyn_cast_or_null<mlir::RankedTensorType>(ty))
@@ -10028,7 +10058,7 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
          !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef) &&
          !conePreciseBinaryOperator(scalarDef) &&
          !coneMathIntrinsicSymbol(scalarDef) &&
-         !coneFusedTernaryOp(scalarDef))) {
+         !coneFusedTernaryOp(scalarDef) && !coneClampFOp(scalarDef))) {
       // Ops inside the old loop are erased and can never be reused. Prefix ops
       // were already validated by the pre-conversion dry run; after function
       // conversion some of their supported constants/casts may be represented
@@ -10387,6 +10417,19 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     if (!a || !b || !c)
       return nullptr;
     return mlir::triton::metal::FmaOp::create(rewriter, loc, a, b, c)
+        .getResult();
+  }
+  if (auto clamp = mlir::dyn_cast<mlir::triton::ClampFOp>(def)) {
+    mlir::Value x =
+        evalRank1ValueAt(clamp.getX(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value lo =
+        evalRank1ValueAt(clamp.getMin(), idxVal, rewriter, loc, depth + 1);
+    mlir::Value hi =
+        evalRank1ValueAt(clamp.getMax(), idxVal, rewriter, loc, depth + 1);
+    if (!x || !lo || !hi)
+      return nullptr;
+    return mlir::triton::metal::ClampFOp::create(
+               rewriter, loc, x, lo, hi, coneClampPropagatesNan(clamp))
         .getResult();
   }
   // Float extrema. The operand's NaN policy decides the operator, so a replayed
@@ -11218,6 +11261,19 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
     return mlir::triton::metal::FmaOp::create(rewriter, loc, a, b, c)
         .getResult();
   }
+  if (auto clamp = mlir::dyn_cast<mlir::triton::ClampFOp>(def)) {
+    mlir::Value x = evalRank2ConeAt(clamp.getX(), rVal, rowBase, nVal, rewriter,
+                                    loc, depth + 1);
+    mlir::Value lo = evalRank2ConeAt(clamp.getMin(), rVal, rowBase, nVal,
+                                     rewriter, loc, depth + 1);
+    mlir::Value hi = evalRank2ConeAt(clamp.getMax(), rVal, rowBase, nVal,
+                                     rewriter, loc, depth + 1);
+    if (!x || !lo || !hi)
+      return nullptr;
+    return mlir::triton::metal::ClampFOp::create(
+               rewriter, loc, x, lo, hi, coneClampPropagatesNan(clamp))
+        .getResult();
+  }
   // Float extrema; same NaN-policy dispatch as the rank-1 cone evaluator.
   if (auto extremum = floatExtremumOperator(def))
     return binary(def->getOperand(0), def->getOperand(1), *extremum);
@@ -11900,6 +11956,14 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
                               deferAggregateLeaves) &&
            rank1ConeSupported(def->getOperand(2), depth + 1,
                               deferAggregateLeaves);
+  if (coneClampFOp(def))
+    return coneClampFTypeSupported(def) &&
+           rank1ConeSupported(def->getOperand(0), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(1), depth + 1,
+                              deferAggregateLeaves) &&
+           rank1ConeSupported(def->getOperand(2), depth + 1,
+                              deferAggregateLeaves);
   if (mlir::isa<mlir::math::AbsFOp>(def))
     return metalAbsFTypeSupported(def->getResult(0).getType()) &&
            rank1ConeSupported(def->getOperand(0), depth + 1,
@@ -12173,6 +12237,11 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
            rank2ConeSupported(def->getOperand(1), depth + 1, preflight);
   if (coneFusedTernaryOp(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(1), depth + 1, preflight) &&
+           rank2ConeSupported(def->getOperand(2), depth + 1, preflight);
+  if (coneClampFOp(def))
+    return coneClampFTypeSupported(def) &&
+           rank2ConeSupported(def->getOperand(0), depth + 1, preflight) &&
            rank2ConeSupported(def->getOperand(1), depth + 1, preflight) &&
            rank2ConeSupported(def->getOperand(2), depth + 1, preflight);
   if (mlir::isa<mlir::math::AbsFOp>(def))

@@ -1016,16 +1016,16 @@ def test_rank2_reduce_consumer_shapes_match_torch(axis, how, shape, num_warps):
 # Every producer the cone evaluator does not re-emit, for the one-element-per-
 # thread guard: the staged path owns that shape and replays nothing, so all of
 # them are exact there whether the evaluator knows them or not.
-_CONE_FORMS = ["fma", "remf", "divrn", "sqrtrn", "clamp", "cast_i32"]
+_CONE_FORMS = ["fma", "remf", "divrn", "sqrtrn", "clamp", "cast_i32", "maxsi"]
 # Still outside the evaluator, so still refused once replay is required. Each
 # needs an emission the cone does not have: a ternary fma, `precise::fmod`
 # through metal.math_intrinsic, and a clamp carrying a NaN policy.
-_CONE_FORMS_REFUSED = ["clamp"]
+_CONE_FORMS_REFUSED = ["maxsi"]
 # Replayed by this cone. The precise pair reuses the spellings the evaluator
 # already emitted for `math.sqrt` and `arith.divf`; the float-to-int cast was
 # simply missing from the rank-2 evaluator and predicate while the rank-1 cone
 # had it, so the same kernel was supported on one axis and refused on another.
-_CONE_FORMS_REPLAYED = ["divrn", "sqrtrn", "cast_i32", "remf", "fma"]
+_CONE_FORMS_REPLAYED = ["divrn", "sqrtrn", "cast_i32", "remf", "fma", "clamp"]
 
 
 @triton.jit
@@ -1046,6 +1046,10 @@ def _rank2_cone_producer_kernel(Xp, Yp, O, M: tl.constexpr, N: tl.constexpr,
         v = tl.sqrt_rn(x * x + 1.0)
     elif FORM == "clamp":
         v = tl.clamp(x, 0.5, 1.5)
+    elif FORM == "maxsi":
+        # Structural stand-in: not on the cone-widening path. The constant
+        # second operand keeps `maxsi` from folding to the identity.
+        v = tl.maximum(x.to(tl.int32), 3).to(tl.float32)
     else:
         v = (x * 4.0).to(tl.int32).to(tl.float32)
     tl.store(O + tl.arange(0, OUT), tl.sum(v, axis=AXIS))
@@ -1053,6 +1057,8 @@ def _rank2_cone_producer_kernel(Xp, Yp, O, M: tl.constexpr, N: tl.constexpr,
 
 def _cone_reference(form, xm, ym):
     return {
+        "maxsi": lambda: torch.maximum(xm.to(torch.int32),
+                                       torch.tensor(3)).to(torch.float32),
         "fma": lambda: xm * ym + xm,
         "remf": lambda: torch.fmod(xm, ym),
         "divrn": lambda: xm / ym,
