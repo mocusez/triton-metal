@@ -249,6 +249,26 @@ the identical kernel without `tl.cumsum` is exact in all 15 of its cells.
 A sweep without those arms would have produced one big refusal covering all of
 it, and three wrong sentences in the commit message.
 
+### The strongest control is the SAME FUNCTION spelled another way
+
+`sweeps/s_dot_store_transposed.py` asks whether a `tl.dot` result survives a
+transposed store address. Its decisive arm is not the failing cell but
+`tl.store(O + nn * M + mm, tl.trans(acc))`: the same function of the same
+inputs, written the other way. It is exact in all 36 of its cells while the
+transposed address is wrong in all 34 of its own.
+
+That one arm settles three things a single failing cell cannot. The backend can
+already produce this output, so the gap is a routing gap and not a missing
+capability. The defect belongs to the address, not to the dot -- an elementwise
+value through the same address is exact. And when the fix lands, the two
+spellings agreeing is a real assertion rather than a tautology.
+
+The shape to look for: a Triton program almost always has a second spelling
+(`tl.trans` against a transposed address, an `expand_dims` against a reshape,
+an extent-side mask against an index-side one). Sweeping the SPELLING as an
+axis is how both this round and the K-mask round found that only one of two
+equivalent programs reached the fast path.
+
 ## Which compile path a probe used is an axis too
 
 `triton.compile(ASTSource(...))` and the JIT give some shapes DIFFERENT

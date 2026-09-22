@@ -29056,6 +29056,40 @@ static bool sdGetMatrixShape(mlir::RankedTensorType ty, int64_t &M,
   return sdGetBatchedMatrixShape(ty, B, M, N);
 }
 
+// Is this standalone dot's result stored through a COLUMN-MAJOR C tile --
+// `tl.store(O + n * M + m, acc)`, which is C^T written without a `tl.trans`?
+//
+// `rewriteSingleDot`'s 8x8 tier writes its result with `simdgroup_store`, which
+// is row-major at (row, column, stride), so it cannot serve that address. And
+// 8x8 is the one shape where nothing else separates the two: both extents are
+// 8, so the row and column ranges are interchangeable by shape and only the
+// layout `order` tells them apart.
+//
+// One predicate, two askers, so the tiers cannot drift: the eligibility rule
+// below lets `metal.scalar_dot` claim these (it decomposes a thread's flat
+// position with the tile's own `order`), and `rewriteSingleDot` declines them.
+// Measured: without this, `tl.store(O + n * 8 + m, tl.dot(a, b))` wrote the
+// product untransposed, at every warp count.
+static bool sdDotStoreTileIsColumnMajor(mlir::triton::DotOp dot) {
+  if (!dot || !dot.getResult().hasOneUse())
+    return false;
+  mlir::Operation *user = *dot.getResult().getUsers().begin();
+  if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user)) {
+    if (!cvt->hasOneUse())
+      return false;
+    user = *cvt->getUsers().begin();
+  }
+  auto store = mlir::dyn_cast<mlir::triton::StoreOp>(user);
+  if (!store)
+    return false;
+  auto ptrTy = mlir::dyn_cast<mlir::RankedTensorType>(store.getPtr().getType());
+  if (!ptrTy)
+    return false;
+  auto enc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+      ptrTy.getEncoding());
+  return enc && enc.getOrder().size() == 2 && enc.getOrder()[0] == 0;
+}
+
 // A standalone (non-loop) f32 matrix dot whose dims are multiples of 8 and
 // larger than a single 8x8 tile (iters==1 in the source: K <= TILE).
 static bool sdDotEligible(mlir::triton::DotOp dot) {
@@ -29080,7 +29114,18 @@ static bool sdDotEligible(mlir::triton::DotOp dot) {
   // 32x8 also produces an 8x8 result and needs the loop, so it belongs here.
   if (M == 8 && N == 8) {
     auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
-    if (!aTy || aTy.getRank() != 2 || aTy.getShape()[1] <= 8)
+    // ...unless that tier provably cannot take it. A column-major C tile is
+    // one such shape, and reserving 8x8x8 for a tier that then declines left
+    // the dot with no tier at all: measured, a transposed 8x8 store went from
+    // a wrong answer to a named refusal rather than to a right answer.
+    //
+    // A ZERO accumulator is part of the carve-out, measured rather than
+    // assumed: with a separate accumulator buffer as well, the scalar tier
+    // answered wrongly at two and four warps (and the operand cvt for that
+    // accumulator is already refused by name at one warp, and at every wider
+    // shape), so that pair stays outside every tier and keeps the refusal.
+    if ((!aTy || aTy.getRank() != 2 || aTy.getShape()[1] <= 8) &&
+        !(sdDotStoreTileIsColumnMajor(dot) && sdIsZeroInit(dot.getC())))
       return false;
   }
   return true;
@@ -29976,8 +30021,45 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         BarrierOp::create(rewriter, loc);
       }
       // Every thread reloads its output element from scratch.
+      //
+      // The scratch is ROW-MAJOR (`simdgroup_store` at stride N), while
+      // `linUi32` is this (thread, iteration)'s flat position under the RESULT
+      // TILE's own linearization. The two agree only while that tile is
+      // row-major: under `order = [0, 1]` the flat position is `col*M + row`,
+      // so indexing the scratch with it directly hands each lane the element
+      // at the transposed slot. The scalar path below already asks this
+      // question -- `metal.tile_column_major` is set on the op for exactly
+      // this -- and this path did not, which made the fast tier disagree with
+      // the slow one on the same kernel.
+      //
+      // Measured by `sweeps/s_dot_store_transposed.py`: every
+      // `tl.store(O + n * M + m, tl.dot(a, b))` cell returned C where C^T was
+      // asked for -- 34 of 120, at every warp count, both dtypes, with and
+      // without a K loop -- while the same output written as
+      // `tl.store(O + nn * M + mm, tl.trans(acc))` was exact, and so was the
+      // same shape forced onto the scalar tier.
+      mlir::Value readIdx = linUi32;
+      if (op->hasAttr("metal.tile_column_major")) {
+        auto cMrow = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(M)));
+        auto cNcol = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
+        mlir::Value flat = toI32(linUi32);
+        mlir::Value row = mlir::arith::RemSIOp::create(rewriter, loc, flat,
+                                                      cMrow.getResult())
+                              .getResult();
+        mlir::Value col = mlir::arith::DivSIOp::create(rewriter, loc, flat,
+                                                      cMrow.getResult())
+                              .getResult();
+        mlir::Value rowTerm = mlir::arith::MulIOp::create(
+                                  rewriter, loc, row, cNcol.getResult())
+                                  .getResult();
+        readIdx = toUi32(
+            mlir::arith::AddIOp::create(rewriter, loc, rowTerm, col)
+                .getResult());
+      }
       mlir::Value result =
-          TgLoadIndexedOp::create(rewriter, loc, elemTy, scratch, linUi32)
+          TgLoadIndexedOp::create(rewriter, loc, elemTy, scratch, readIdx)
               .getResult();
       rewriter.replaceOp(op, result);
       return mlir::success();
@@ -30876,6 +30958,12 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
   auto store = mlir::dyn_cast<mlir::triton::StoreOp>(resultUser);
   if (!store)
     return;
+  // ...but only while the C tile is ROW-MAJOR. `simdgroup_store` writes at
+  // (row, column, stride); a transposed store address makes the tile
+  // column-major and the product went out untransposed. Asked through the same
+  // predicate `sdDotEligible` uses to hand those dots to `metal.scalar_dot`.
+  if (sdDotStoreTileIsColumnMajor(dot))
+    return;
   // AC2: allow masked stores of the canonical 2D form. If the mask doesn't
   // decompose into (offs_m < M) & (offs_n < N), bail.
   MaskExtents maskExtents;
@@ -30918,6 +31006,23 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
          maskExtents.mExtent.getType() != cOrig.row.getType()) ||
         (nExtentIsLocal &&
          maskExtents.nExtent.getType() != cOrig.col.getType()))
+      return;
+  }
+
+  // Resolve a non-zero accumulator init BEFORE anything is created: this
+  // function's rule is that every fallible check finishes first, or a decline
+  // leaves a half-rewritten module behind.
+  mlir::triton::LoadOp accInitLoad;
+  mlir::Value accInitPtr;
+  if (!sdIsZeroInit(dot.getC())) {
+    mlir::Value initVal = dot.getC();
+    if (auto cvt = initVal.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      initVal = cvt.getSrc();
+    accInitLoad = initVal.getDefiningOp<mlir::triton::LoadOp>();
+    if (!accInitLoad || accInitLoad.getMask())
+      return;
+    accInitPtr = unwrapPtrToKernelArg(accInitLoad.getPtr());
+    if (!accInitPtr || !simdgroupTileIsContiguous(accInitLoad.getPtr()))
       return;
   }
 
@@ -30970,23 +31075,32 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
       mlir::ValueRange{});
 
   // C-init: emit `metal.simdgroup_matrix_zero` when the dot's accumulator
-  // operand is `dense<0.0>` (the canonical `acc = tl.zeros(...)` Triton
-  // pattern, which after trivial scf.for elimination becomes the dot's
-  // direct C operand). Otherwise fall back to loading from the C buffer.
+  // operand is provably zero (the canonical `acc = tl.zeros(...)`, which after
+  // trivial scf.for elimination becomes the dot's direct C operand).
+  //
+  // Otherwise it is a real accumulator and has to be read from the buffer the
+  // KERNEL loaded it from. Reading `cBuf` at the store's own origin is the
+  // right answer only for an in-place `C += A @ B`; for
+  // `tl.dot(a, b, tl.load(C + ...))` with C a separate buffer the kernel's own
+  // `tt.load` never reached the MSL and the answer was `A @ B + O`, silently.
+  // This is the defect `600fb793ed` closed for the wider tiers -- 8x8 kept its
+  // own copy of the assumption.
   mlir::Value acc;
-  if (auto cst = dot.getC().getDefiningOp<mlir::arith::ConstantOp>()) {
-    if (auto dense =
-            mlir::dyn_cast<mlir::DenseFPElementsAttr>(cst.getValue())) {
-      if (dense.isSplat() && dense.getSplatValue<mlir::APFloat>().isZero())
-        acc = SimdgroupMatrixZeroOp::create(builder, loc, matTy).getResult();
-    }
-  }
+  if (sdIsZeroInit(dot.getC()))
+    acc = SimdgroupMatrixZeroOp::create(builder, loc, matTy).getResult();
   if (!acc) {
-    // f32-only: cBuf is bridged with the accumulator elem type (f32). If a
-    // future non-zero, non-f32 accumulator surface is added, this direct
+    // f32-only: the buffer is bridged with the accumulator elem type (f32). If
+    // a future non-zero, non-f32 accumulator surface is added, this direct
     // device load also needs to switch to SimdgroupLoadDeviceStagedOp.
-    acc = SimdgroupLoadOp::create(builder, loc, matTy, cBuf, cRowOrigin,
-                                  cColOrigin, strideCVal)
+    OriginPair initOrig =
+        extractOriginPair<mlir::triton::LoadOp>(accInitLoad);
+    mlir::Value initBuf =
+        bridgePtrToMemref(builder, loc, accInitPtr, elemTy);
+    acc = SimdgroupLoadOp::create(
+              builder, loc, matTy, initBuf,
+              emitOriginOperand(builder, loc, ui32, initOrig.row),
+              emitOriginOperand(builder, loc, ui32, initOrig.col),
+              rowStrideOperand(accInitLoad.getPtr()))
               .getResult();
   }
   auto cResult = SimdgroupMultiplyAccumulateOp::create(
@@ -31619,6 +31733,38 @@ normalizeBlockedDivergentCvt(mlir::triton::gpu::ConvertLayoutOp cvt) {
       if (auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()))
         cst.setValueAttr(dense.reshape(mlir::cast<mlir::ShapedType>(newTy)));
     v.setType(newTy);
+  }
+
+  // An op that RECORDED a fact about its own result layout has to be told the
+  // layout moved. `metal.tile_column_major` on a `metal.scalar_dot` is that
+  // fact -- it says which way `ScalarDotLowering` turns a thread's flat tile
+  // position back into (row, col) -- and it is decided when the op is created,
+  // before this re-encode exists.
+  //
+  // A dot with an epilogue (`tl.dot(a, b) * 2.0` stored through a transposed
+  // address) reaches its store through the elementwise cone rather than
+  // through a result cvt, so `sdDetectResultCvt` does not peel that cvt and it
+  // arrives here instead: the op's result type became column-major while its
+  // attribute still said row-major, and every lane then read the transposed
+  // scratch slot. Measured in `sweeps/s_dot_store_transposed.py`, where the
+  // six `epi_colmajor` cells were the ones the scratch-read fix alone left
+  // wrong.
+  //
+  // Only a rank-2 result is refreshed. For a rank-3 dot the attribute comes
+  // from the function-wide tile geometry, which this cvt says nothing about.
+  for (auto v : ordered) {
+    auto scalarDot = v.getDefiningOp<ScalarDotOp>();
+    if (!scalarDot)
+      continue;
+    auto rt = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+    if (!rt || rt.getRank() != 2)
+      continue;
+    auto tile = tileFromTensor(rt);
+    if (tile && tile->order.size() == 2 && tile->order[0] == 0)
+      scalarDot->setAttr("metal.tile_column_major",
+                         mlir::UnitAttr::get(scalarDot.getContext()));
+    else
+      scalarDot->removeAttr("metal.tile_column_major");
   }
 
   // Bridge each boundary back in. Its own type stayed put (a tt.reduce result

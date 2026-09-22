@@ -3955,3 +3955,241 @@ def test_dot_swizzled_grid_matches_torch(M, N, K, dtype, BK, group_m):
     ref = a.float() @ b.float()
     tol = 3e-3 if dtype is torch.float32 else 3e-1
     torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
+
+
+# ---------------------------------------------------------------------------
+# A dot result stored through a TRANSPOSED address -- `tl.store(O + n*M + m,
+# acc)`, which is how a kernel writes C^T without a `tl.trans`.
+#
+# Found by `python/test/metal_sweeps/sweeps/probe_cvt_envelope.py` while
+# measuring the P2.1 `ttg.convert_layout` envelope, then characterized by
+# `sweeps/s_dot_store_transposed.py`: 34 of 120 cells silently returned C, at
+# every warp count, both dtypes, with and without a K loop, while the SAME
+# output written with an explicit `tl.trans` was exact. The scratch that the
+# dot publishes into is row-major, and the epilogue read it at the flat
+# position the store's COLUMN-major layout hands out.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def dot_store_form_kernel(
+    a_ptr, b_ptr, c_ptr, o_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    FORM: tl.constexpr, EPI: tl.constexpr, INIT: tl.constexpr,
+):
+    m = tl.arange(0, M)[:, None]
+    kk = tl.arange(0, K)[None, :]
+    n = tl.arange(0, N)[None, :]
+    a = tl.load(a_ptr + m * K + kk)
+    b = tl.load(b_ptr + tl.arange(0, K)[:, None] * N + n)
+    if INIT == 0:
+        acc = tl.dot(a, b)
+    elif INIT == 1:                     # a SEPARATE accumulator buffer
+        acc = tl.dot(a, b, tl.load(c_ptr + m * N + n))
+    else:                               # in place: C += A @ B
+        acc = tl.dot(a, b, tl.load(o_ptr + m * N + n))
+    if EPI == 1:
+        acc = acc * 2.0
+    if FORM == 0:                       # row-major store (the control)
+        tl.store(o_ptr + m * N + n, acc)
+    elif FORM == 1:                     # transposed store ADDRESS
+        tl.store(o_ptr + n * M + m, acc)
+    else:                               # the same output via `tl.trans`
+        nn = tl.arange(0, N)[:, None]
+        mm = tl.arange(0, M)[None, :]
+        tl.store(o_ptr + nn * M + mm, tl.trans(acc))
+
+
+def _run_dot_store_form(*, M, N, K, warps, form, epi=0, init=0,
+                        dtype=torch.float32):
+    torch.manual_seed(0x51D0)
+    a = torch.randn((M, K), dtype=dtype)
+    b = torch.randn((K, N), dtype=dtype)
+    c = torch.randn((M, N), dtype=torch.float32)
+    o = torch.zeros((M * N,), dtype=torch.float32)
+    o_init = o.clone().reshape(M, N)
+    compiled = dot_store_form_kernel[(1,)](
+        a, b, c, o, M=M, N=N, K=K, FORM=form, EPI=epi, INIT=init,
+        num_warps=warps,
+    )
+    ref = a.float() @ b.float()
+    if init == 1:
+        ref = ref + c
+    elif init == 2:
+        ref = ref + o_init
+    if epi == 1:
+        ref = ref * 2.0
+    want = ref if form == 0 else ref.t().contiguous()
+    return o.reshape(want.shape), want, compiled
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4])
+@pytest.mark.parametrize(
+    "M,N,K", [pytest.param(16, 16, 16, id="16x16x16"),
+              pytest.param(32, 16, 16, id="32x16x16"),
+              pytest.param(16, 32, 16, id="16x32x16"),
+              pytest.param(32, 32, 32, id="32x32x32")]
+)
+def test_dot_transposed_store_address_matches_torch(M, N, K, warps):
+    got, want, _ = _run_dot_store_form(M=M, N=N, K=K, warps=warps, form=1)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("warps", [1, 2])
+@pytest.mark.parametrize(
+    "M,N,K", [pytest.param(16, 16, 16, id="16x16x16"),
+              pytest.param(32, 16, 16, id="32x16x16")]
+)
+def test_dot_transposed_store_address_with_epilogue_matches_torch(M, N, K,
+                                                                  warps):
+    """`tl.dot(a, b) * 2.0` reaches its store through the elementwise cone.
+
+    That cvt is not the dot's own result convert, so it is collapsed by the
+    cone re-encode instead -- which moved the op's result layout and left the
+    recorded `metal.tile_column_major` answer behind. These were the six cells
+    the epilogue-free fix did not reach.
+    """
+    got, want, _ = _run_dot_store_form(M=M, N=N, K=K, warps=warps, form=1,
+                                       epi=1)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("warps", [1, 2])
+def test_dot_transposed_store_address_f16_operands_match_torch(warps):
+    got, want, _ = _run_dot_store_form(M=16, N=16, K=16, warps=warps, form=1,
+                                       dtype=torch.float16)
+    torch.testing.assert_close(got, want, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4])
+def test_dot_transposed_store_address_agrees_with_the_trans_spelling(warps):
+    """The two spellings of C^T are the same function of the same inputs.
+
+    `tl.trans(acc)` was exact before this fix and the transposed address was
+    not, so this is the arm that says the backend could already produce the
+    output and only one of the two routes reached it.
+    """
+    addr, want, _ = _run_dot_store_form(M=16, N=16, K=16, warps=warps, form=1)
+    trans, want2, _ = _run_dot_store_form(M=16, N=16, K=16, warps=warps,
+                                          form=2)
+    torch.testing.assert_close(want, want2)
+    torch.testing.assert_close(addr, trans)
+
+
+def test_dot_transposed_store_address_still_uses_the_matrix_unit():
+    """Not "correct via a scalar fallback": census the emitted MSL.
+
+    A transposed store address that quietly stopped reaching
+    `simdgroup_multiply_accumulate` would pass every numeric test above while
+    costing the matrix unit, which is the trade this repo has made by accident
+    before.
+    """
+    _got, _want, compiled = _run_dot_store_form(M=16, N=16, K=16, warps=1,
+                                                form=1)
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert msl.count("simdgroup_multiply_accumulate") > 0, msl[:400]
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4])
+def test_dot_row_major_store_is_unchanged(warps):
+    """The control: the same dot stored in the load's own order."""
+    got, want, _ = _run_dot_store_form(M=16, N=16, K=16, warps=warps, form=0)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def dot_loop_store_form_kernel(
+    a_ptr, b_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    BK: tl.constexpr, FORM: tl.constexpr,
+):
+    m = tl.arange(0, M)[:, None]
+    n = tl.arange(0, N)[None, :]
+    acc = tl.zeros((M, N), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        kk = k0 + tl.arange(0, BK)
+        a = tl.load(a_ptr + m * K + kk[None, :])
+        b = tl.load(b_ptr + kk[:, None] * N + n)
+        acc += tl.dot(a, b)
+    if FORM == 0:
+        tl.store(o_ptr + m * N + n, acc)
+    else:
+        tl.store(o_ptr + n * M + m, acc)
+
+
+@pytest.mark.parametrize("warps", [1, 2])
+@pytest.mark.parametrize(
+    "M,N,K,BK", [pytest.param(16, 16, 32, 16, id="16x16x32bk16"),
+                 pytest.param(32, 32, 64, 32, id="32x32x64bk32")]
+)
+def test_dot_transposed_store_address_in_k_loop_matches_torch(M, N, K, BK,
+                                                              warps):
+    torch.manual_seed(0x51D1)
+    a = torch.randn((M, K), dtype=torch.float32)
+    b = torch.randn((K, N), dtype=torch.float32)
+    o = torch.zeros((M * N,), dtype=torch.float32)
+    dot_loop_store_form_kernel[(1,)](a, b, o, M=M, N=N, K=K, BK=BK, FORM=1,
+                                     num_warps=warps)
+    want = (a @ b).t().contiguous()
+    torch.testing.assert_close(o.reshape(N, M), want, atol=2e-3, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# The 8x8 single-iteration tier kept two assumptions of its own, and 8x8 is
+# the one shape where nothing else separates the cases: both extents are 8, so
+# only the layout `order` distinguishes a transposed store address, and the
+# accumulator init was read from the OUTPUT buffer whatever the kernel loaded.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4])
+def test_dot_8x8_transposed_store_address_matches_torch(warps):
+    got, want, _ = _run_dot_store_form(M=8, N=8, K=8, warps=warps, form=1)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4])
+def test_dot_8x8_accumulator_from_another_buffer_matches_torch(warps):
+    """`tl.dot(a, b, tl.load(C + ...))` with C a buffer that is not the output.
+
+    The 8x8 tier emitted `simdgroup_load` from the OUTPUT at the store's own
+    origin, so the kernel's `tt.load` of C never reached the MSL and the answer
+    was `A @ B + O`.
+    """
+    got, want, _ = _run_dot_store_form(M=8, N=8, K=8, warps=warps, form=0,
+                                       init=1)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+
+
+def test_dot_8x8_in_place_accumulate_keeps_the_matrix_unit():
+    """The positive side of that guard: `C += A @ B` on ONE buffer.
+
+    Here the init really is a load of the output tile, so the tier may keep
+    reading the accumulator straight out of `cBuf` -- and it must, or the guard
+    would have cost the matrix unit for the shape it was written for.
+    """
+    got, want, compiled = _run_dot_store_form(M=8, N=8, K=8, warps=1, form=0,
+                                              init=2)
+    torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3)
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert msl.count("simdgroup_multiply_accumulate") > 0, msl[:400]
+    assert msl.count("simdgroup_load(") >= 3, msl[:400]
+
+
+@pytest.mark.parametrize("warps", [2, 4])
+def test_dot_8x8_transposed_store_with_foreign_accumulator_is_named(capfd,
+                                                                   warps):
+    """The fail-close boundary of the carve-out above.
+
+    A transposed 8x8 store is served by `metal.scalar_dot`, but not when the
+    accumulator also comes from a separate buffer: that pair measured wrong at
+    two and four warps, and the accumulator's own operand convert is already
+    refused by name at one warp and at every wider shape. So it keeps the
+    refusal rather than being claimed on the strength of the other corner.
+    """
+    with pytest.raises(Exception):
+        _run_dot_store_form(M=8, N=8, K=8, warps=warps, form=1, init=1)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
