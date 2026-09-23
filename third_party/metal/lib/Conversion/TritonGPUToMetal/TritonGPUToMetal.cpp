@@ -2328,21 +2328,23 @@ static bool transIsFlatIdentityAfterRemap(mlir::triton::TransOp op,
   return transIsFlatIdentityWith(op, srcEnc, dstEnc);
 }
 
-// The rank-2 tile a rank-1 `tt.make_range` actually indexes — the shape of the
-// rank-2 tensor its `expand_dims`/`broadcast` cone feeds.
+// The rank-`rank` tile a rank-1 `tt.make_range` actually indexes — the shape of
+// the tensor its `expand_dims`/`broadcast` cone feeds.
 //
 // `MakeRangeLowering` decomposes such a range against ONE module-wide tile
-// (`findLargestRank2Tile`). That is right only while a kernel holds a single
-// rank-2 tile SHAPE. `tl.trans` and a shape-changing rank-2 `tl.reshape` both
-// introduce a second one, and then one of the two cones is decomposed with the
-// other's row length: a 16x8 -> 8x16 transpose read `x[(lid/16)*8 + lid%16]`
-// instead of `x[lid]`.
+// (`findLargestRank2Tile` / `findLargestRankNTile`), which answers by element
+// COUNT. That is right only while a kernel holds a single tile SHAPE at that
+// rank. `tl.trans` and a shape-changing `tl.reshape` both introduce a second
+// one, and then one of the two cones is decomposed with the other's row length:
+// a 16x8 -> 8x16 transpose read `x[(lid/16)*8 + lid%16]` instead of `x[lid]`.
+// At rank 3 `tl.permute` makes the count a TIE — (2,4,8) against (2,8,4) — so
+// "largest" is a coin flip there rather than merely a wrong preference.
 //
 // Degenerate `[M,1]` / `[1,N]` intermediates are stepped over — they are the
 // `expand_dims` result on the way to the full tile, not a tile of their own.
-// Returns nullopt when the cone reaches no rank-2 tile, or reaches several with
-// different shapes (a matmul's `offs_m` feeds both `[BM,BK]` and `[BM,BN]`);
-// callers must then fall back to the module-wide answer.
+// Returns nullopt when the cone reaches no tile of that rank, or reaches several
+// with different shapes (a matmul's `offs_m` feeds both `[BM,BK]` and
+// `[BM,BN]`); callers must then fall back to the module-wide answer.
 //
 // ⚠️ Answered ONCE, before the conversion, and cached in `g_makeRangeOwnTile`.
 // The walk is FORWARD through users, and `applyFullConversion` replaces those
@@ -2350,7 +2352,7 @@ static bool transIsFlatIdentityAfterRemap(mlir::triton::TransOp op,
 // tensors have already become scalars and be told there is no tile, exactly the
 // failure mode `findSubTpbRank2Companion` documents from the other direction.
 static std::optional<TileInfo>
-makeRangeOwnRank2Tile(mlir::triton::MakeRangeOp op) {
+makeRangeOwnTileOfRank(mlir::triton::MakeRangeOp op, int64_t rank) {
   llvm::SmallVector<mlir::Value, 16> wl{op.getResult()};
   llvm::SmallPtrSet<mlir::Value, 16> seen;
   std::optional<TileInfo> found;
@@ -2364,8 +2366,15 @@ makeRangeOwnRank2Tile(mlir::triton::MakeRangeOp op) {
         if (!rt)
           continue;
         auto info = tileFromTensor(res.getType());
-        if (info && info->rank == 2 && info->shape[0] > 1 &&
-            info->shape[1] > 1) {
+        // EVERY axis non-unit, not "at least two": a rank-3 `tt.broadcast`
+        // intermediate `[A, B, 1]` has two non-unit axes, and stopping the walk
+        // there hands the range a tile one axis short. Measured with the looser
+        // rule: `.omc/fuzz/rank3_reduce.py` 54 OK -> 6 OK / 48 WRONG. At rank 2
+        // this is the identical test this walk has always applied.
+        const bool isTile =
+            info && info->rank == rank &&
+            llvm::all_of(info->shape, [](int64_t s) { return s > 1; });
+        if (isTile) {
           if (!found)
             found = info;
           else if (found->shape != info->shape)
@@ -2383,10 +2392,16 @@ makeRangeOwnRank2Tile(mlir::triton::MakeRangeOp op) {
 // read by `MakeRangeLowering`. Empty for every kernel with a single rank-2 tile
 // shape, which is the overwhelming majority — those keep asking
 // `findLargestRank2Tile` and emit byte for byte what they did before.
-static llvm::DenseMap<mlir::Operation *, TileInfo> g_makeRangeOwnTile;
+//
+// Keyed by (range, rank): one `tt.make_range` can be asked for its rank-2 tile
+// and, in a rank-3 kernel, for its rank-3 one, and the two answers are about
+// different tensors.
+static llvm::DenseMap<std::pair<mlir::Operation *, int64_t>, TileInfo>
+    g_makeRangeOwnTile;
 
-static std::optional<TileInfo> cachedMakeRangeOwnTile(mlir::Operation *op) {
-  auto it = g_makeRangeOwnTile.find(op);
+static std::optional<TileInfo> cachedMakeRangeOwnTile(mlir::Operation *op,
+                                                      int64_t rank = 2) {
+  auto it = g_makeRangeOwnTile.find({op, rank});
   if (it == g_makeRangeOwnTile.end())
     return std::nullopt;
   return it->second;
@@ -2516,7 +2531,7 @@ cachedMakeRangeReshapeAxis(mlir::Operation *op) {
 // Only phantoms are re-read. A kernel that genuinely holds two rank-2 tiles of
 // different `order` — a staged `tl.trans`, where `#blocked1` sits on a real
 // 16x8 tensor — keeps its parent's order; substituting there is what the
-// `makeRangeOwnRank2Tile` machinery already exists to get right, and overriding
+// `makeRangeOwnTileOfRank` machinery already exists to get right, and overriding
 // it turned 15 transpose cases wrong in one build.
 //
 // Answered once in the pre-pass, like the two maps above: the walk reads rank-2
@@ -3867,7 +3882,14 @@ struct MakeRangeLowering
             // their own exact coordinate systems.
             mlir::Operation *modOp = op->getParentOfType<mlir::ModuleOp>();
             std::optional<TileInfo> tile;
-            if (remaining.size() == 1 && modOp) {
+            // This range's OWN tile first, exactly as the rank-2 path above
+            // does. The size walk below is a tie-break between tiles of
+            // different element counts, and `tl.permute` makes the counts
+            // EQUAL — (2,4,8) against (2,8,4) — so it answers the store's
+            // ranges with the load's tile and the addresses collide.
+            if (remaining.size() == 1)
+              tile = cachedMakeRangeOwnTile(op, 3);
+            if (!tile && remaining.size() == 1 && modOp) {
               int64_t bestSize = 0;
               modOp->walk([&](mlir::Operation *inner) {
                 for (auto v : inner->getResults()) {
@@ -5171,7 +5193,7 @@ struct BroadcastLowering
 //   * the two sides must linearize an element to the same flat position
 //     (`transIsFlatIdentity`, checked in the pre-pass);
 //   * the ranges that re-derive the indices must decompose against the tile
-//     they actually index, not a module-wide one (`makeRangeOwnRank2Tile`).
+//     they actually index, not a module-wide one (`makeRangeOwnTileOfRank`).
 // Without the first a standalone `tl.trans` stored its operand untransposed;
 // without the second a 16x8 -> 8x16 `tl.reshape` wrote with the source's row
 // stride. Same identity-passthrough pattern as expand_dims / broadcast. See
@@ -32453,6 +32475,53 @@ static bool planTileExchange(mlir::Operation *exchange,
   return true;
 }
 
+// A rank > 1 `ttg.convert_layout` that genuinely moves data across lanes — the
+// mover a `tl.permute` leaves behind once `tt.trans` has been forwarded as the
+// relabel it is. It needs the full-tile phase (publish, barrier, read in a
+// second loop), which `planTileExchange` grants only to a function that already
+// has a phase; a permute-and-store kernel has none, so without this the cvt is
+// refused by name.
+//
+// The condition is about the CONSUMER, not about the exchange. The read half
+// asks the destination LAYOUT where this lane's element lives, while the store
+// that consumes the result addresses its tile with the backend's own
+// thread-major expression (`localTid * E + iv`). Those agree only when the
+// destination layout IS that expression; otherwise it is one buffer under two
+// index mappings, the shape this file keeps finding.
+//
+// 📏 Measured over 70 rank-3 permute cells (six permutations x fourteen
+// shape/warp pairs, `python/test/metal_sweeps/sweeps/s_rank3_permute.py`) with
+// the gate forced open:
+// every cell whose destination layout is thread-major is exact, and every one
+// of the 19 that are not returns a wrong answer. So this — not the `E >= 8`
+// register band it first looks like — is the boundary: four of the 19 sit at
+// E = 4, and `8x4x4` at one warp is exact under the full reversal while
+// `2x4x16` at one warp is not.
+//
+// The SOURCE side needs no such condition, and that asymmetry is the point: the
+// publish half writes the slot its own layout names and the value it holds came
+// from a load addressed under the same tile, so any source layout publishes
+// correctly. Only the read has a second reader to agree with.
+static bool
+nonLocalCvtReadIsThreadMajor(mlir::triton::gpu::ConvertLayoutOp cvt) {
+  auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+  auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+  if (!srcRtt || !dstRtt || srcRtt.getRank() < 2 ||
+      srcRtt.getShape() != dstRtt.getShape() ||
+      !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+          srcRtt.getEncoding()) ||
+      !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+          dstRtt.getEncoding()))
+    return false;
+  std::optional<LayoutIndexPlan> srcPlan = exchangeSourcePlan(cvt.getSrc());
+  std::optional<LayoutIndexPlan> dstPlan = planLayoutIndex(dstRtt);
+  if (!srcPlan || !dstPlan ||
+      srcPlan->elemPerThread != dstPlan->elemPerThread ||
+      srcPlan->threadsPerBlock() != dstPlan->threadsPerBlock())
+    return false;
+  return layoutFlatIndexIsThreadMajor(*dstPlan);
+}
+
 // Preflight the same allocation ladder that FuncOpLowering emits, through the
 // one shared `assignExchangeBuffers` so preflight and emission cannot drift.
 // Conversion failure is not a safe diagnostic path in this backend, so an
@@ -40486,7 +40555,8 @@ struct ConvertTritonGPUToMetalPass
       }
       if (planTileExchange(
               cvt.getOperation(),
-              /*allowGeneralPhase=*/functionHasRankNPhase(cvt.getOperation())))
+              /*allowGeneralPhase=*/functionHasRankNPhase(cvt.getOperation()) ||
+                  nonLocalCvtReadIsThreadMajor(cvt)))
         continue;
       cvt.emitOpError(
           "ttg.convert_layout: broader staged-transpose deferred to L1d3 "
@@ -40793,6 +40863,51 @@ struct ConvertTritonGPUToMetalPass
         // kernel whose `[:, None]` is still spelled `tt.expand_dims`.
         if (auto rax = makeRangeUnitDimReshapeAxis(range))
           g_makeRangeReshapeAxis[range.getOperation()] = *rax;
+        // A doubly-nested `#ttg.slice` over a rank-3 blocked parent — the
+        // `offs[:, None, None]` cones every rank-3 kernel is built from. The
+        // rank-3 path in `MakeRangeLowering` picks its tile by element COUNT,
+        // and `tl.permute` gives a kernel two rank-3 tiles of the SAME count,
+        // so answer from this range's own cone while the module still has its
+        // rank-3 tensors to walk. Empty — and therefore byte-for-byte
+        // unchanged — for every rank-3 kernel with a single tile shape.
+        if (auto outer3 =
+                mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                    rtt.getEncoding()))
+          if (auto inner3 =
+                  mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                      outer3.getParent()))
+            if (auto parent3 = mlir::dyn_cast_or_null<
+                    mlir::triton::gpu::BlockedEncodingAttr>(
+                    inner3.getParent()))
+              if (parent3.getOrder().size() == 3)
+                if (auto own3 = makeRangeOwnTileOfRank(range, 3)) {
+                  // Substitute only for a genuine TIE — a DIFFERENT shape of
+                  // the SAME element count, which is exactly when "largest" has
+                  // no answer of its own. Both halves of that are measured:
+                  //   * without the same-count half, a batched `tl.dot_scaled`
+                  //     (four rank-3 tiles, `[B,M,K]`, `[B,K,N]`,
+                  //     `[B,M,K/32]`, `[B,M,N]`) hands its scale ranges their
+                  //     own smaller tile while the scaled-dot lowering replays
+                  //     them under the main tile's convention;
+                  //   * without the different-shape half, the same kernel at
+                  //     `M == N` finds two `[B,M,N]` tensors under DIFFERENT
+                  //     blocked encodings, and the two walks disagree about
+                  //     which one to take — same shape, different
+                  //     `sizePerThread`, so `emitTileFlatIndex` chooses
+                  //     `tid*E + iv` in one and `tid + iv*T` in the other.
+                  // Four `test_dot_scaled_*_batched_*` tests fail for each.
+                  std::optional<TileInfo> global3 =
+                      findLargestRankNTile(range, 3);
+                  auto numel3 = [](const TileInfo &t) {
+                    int64_t n = 1;
+                    for (int64_t sz : t.shape)
+                      n *= sz;
+                    return n;
+                  };
+                  if (!global3 || (own3->shape != global3->shape &&
+                                   numel3(*own3) == numel3(*global3)))
+                    g_makeRangeOwnTile[{range.getOperation(), 3}] = *own3;
+                }
         auto slice =
             mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
                 rtt.getEncoding());
@@ -40827,7 +40942,7 @@ struct ConvertTritonGPUToMetalPass
               g_makeRangePhantomOrder[range.getOperation()] = real->order;
           }
         }
-        std::optional<TileInfo> own = makeRangeOwnRank2Tile(range);
+        std::optional<TileInfo> own = makeRangeOwnTileOfRank(range, 2);
         std::optional<TileInfo> global = findLargestRank2Tile(range);
         const bool globalUsable = global && global->rank == 2;
         auto numel = [](const TileInfo &t) {
@@ -40852,7 +40967,7 @@ struct ConvertTritonGPUToMetalPass
           // whose rank-2 range would otherwise find nothing to decompose
           // against and decline inside the conversion. This range knows which
           // tile it indexes; hand `MakeRangeLowering` that one.
-          g_makeRangeOwnTile[range.getOperation()] = *own;
+          g_makeRangeOwnTile[{range.getOperation(), 2}] = *own;
           return;
         }
         if (!globalUsable) {

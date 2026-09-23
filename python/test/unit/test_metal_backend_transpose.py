@@ -544,3 +544,127 @@ def test_permute_rank3_exchanged(A, B, C, perm, num_warps):
         f"exchanged tl.permute {A}x{B}x{C} perm={perm} nw={num_warps}\n"
         f"out={out.cpu()[:16].tolist()}\nexpected={expected[:16].tolist()}"
     )
+
+
+# --------------------------------------------------------------------------
+# The rank-3 permute spelled the way a rank-3 kernel is actually written: a
+# `[:, None, None]` / `[None, :, None]` / `[None, None, :]` address cone, not a
+# rank-1 load reshaped into a cube.
+#
+# The two spellings take different routes. Reshaped, the whole permutation ends
+# up inside the load index's `#ttg.linear` layout and `planLinearRange` reads it
+# off the basis vectors (the section above). Written as an address cone, the
+# permutation is a real `tt.trans` plus the `ttg.convert_layout` Triton inserts
+# before the store — and THAT cvt is the op that moves the data, which took six
+# attempts to establish: the trans is a relabel, the exchange carries it
+# correctly, and the fault was in what the two halves index.
+#
+# The cvt needs the full-tile phase, granted only to a function that already has
+# one, so every shape above a single element per thread was refused by name. It
+# is granted here when the DESTINATION layout's flat index is the thread-major
+# expression `localTid * E + iv` that the consuming store's own address
+# arithmetic emits. That is the boundary, and it is not the register band it
+# resembles: `8x4x4` at one warp is exact under the full reversal at E = 4 while
+# `2x4x16` at one warp, also E = 4, is refused.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def permute_rank3_addr_kernel(
+    x_ptr, o_ptr, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
+    P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr
+):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = tl.load(x_ptr + a * (B * C) + b * C + c)
+    p = tl.permute(v, (P0, P1, P2))
+    i0 = tl.arange(0, S0)[:, None, None]
+    i1 = tl.arange(0, S1)[None, :, None]
+    i2 = tl.arange(0, S2)[None, None, :]
+    tl.store(o_ptr + i0 * (S1 * S2) + i1 * S2 + i2, p)
+
+
+def _run_permute_rank3_addr(A, B, C, perm, num_warps):
+    torch.manual_seed(0)
+    x = torch.randn(A * B * C, dtype=torch.float32)
+    out = torch.zeros(A * B * C, dtype=torch.float32, device="mps")
+    s = tuple((A, B, C)[i] for i in perm)
+    compiled = permute_rank3_addr_kernel[(1,)](
+        x.to("mps"), out, A, B, C, s[0], s[1], s[2], *perm,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    want = x.reshape(A, B, C).permute(*perm)
+    return out.cpu().reshape(want.shape), want, compiled
+
+
+@pytest.mark.parametrize("num_warps,A,B,C", [
+    pytest.param(1, 2, 4, 8, id="2x4x8w1e2"),
+    pytest.param(2, 2, 4, 8, id="2x4x8w2e1"),
+    pytest.param(1, 4, 4, 4, id="4x4x4w1e2"),
+    pytest.param(1, 8, 4, 4, id="8x4x4w1e4"),
+    pytest.param(2, 4, 8, 8, id="4x8x8w2e4"),
+    pytest.param(4, 8, 8, 8, id="8x8x8w4e4"),
+])
+@pytest.mark.parametrize(
+    "perm",
+    [(0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)],
+    ids=lambda p: "".join(str(d) for d in p),
+)
+def test_permute_rank3_address_cone_matches_torch(A, B, C, perm, num_warps):
+    """Every one of these was a named refusal before the cvt got the phase."""
+    got, want, _ = _run_permute_rank3_addr(A, B, C, perm, num_warps)
+    torch.testing.assert_close(got, want)
+
+
+@pytest.mark.parametrize("num_warps,A,B,C", [
+    pytest.param(1, 2, 4, 8, id="2x4x8w1e2"),
+    pytest.param(1, 4, 8, 8, id="4x8x8w1e8"),
+    pytest.param(4, 8, 8, 8, id="8x8x8w4e4"),
+])
+def test_permute_rank3_address_cone_identity_is_unchanged(A, B, C, num_warps):
+    """The control: the same kernel, two rank-3 tile shapes in it, and no
+    permutation. It needs no exchange and was already exact, including at the
+    E = 8 shape the permuting arm still refuses — so the refusal is about the
+    permutation and not about the rank or the band."""
+    got, want, _ = _run_permute_rank3_addr(A, B, C, (0, 1, 2), num_warps)
+    torch.testing.assert_close(got, want)
+
+
+def test_permute_rank3_address_cone_publishes_through_threadgroup_memory():
+    """Census the emitted MSL, not just the numbers.
+
+    Exact would also be the answer if the permute had quietly become a copy at
+    a shape where the permutation happens to be the identity of the data. The
+    mechanism this commit installs is the two-loop exchange, so the barrier and
+    the threadgroup buffer have to be there.
+    """
+    _got, _want, compiled = _run_permute_rank3_addr(2, 4, 8, (0, 2, 1), 1)
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "threadgroup_barrier" in msl, msl[:600]
+    assert "threadgroup " in msl, msl[:600]
+
+
+@pytest.mark.parametrize("num_warps,A,B,C,perm", [
+    pytest.param(1, 4, 8, 8, (0, 2, 1), id="4x8x8w1e8_021"),
+    pytest.param(1, 2, 8, 16, (1, 0, 2), id="2x8x16w1e8_102"),
+    pytest.param(2, 2, 16, 16, (2, 1, 0), id="2x16x16w2e8_210"),
+    pytest.param(1, 2, 4, 16, (2, 1, 0), id="2x4x16w1e4_210"),
+    pytest.param(2, 2, 8, 16, (1, 2, 0), id="2x8x16w2e4_120"),
+])
+def test_permute_rank3_address_cone_off_thread_major_is_named(
+        A, B, C, perm, num_warps):
+    """Fail-closed, and the last two cells are why the gate is not `E <= 4`.
+
+    `2x4x16` at one warp and `2x8x16` at two hold four elements per thread, the
+    same as cells that are exact above; their destination layout puts the
+    register bits at flat offsets 1 and 64 instead of 1 and 2, so the store's
+    own `localTid * E + iv` would read another lane's slot. With the phase
+    forced open all five return wrong answers.
+    """
+    with pytest.raises(Exception) as exc:
+        _run_permute_rank3_addr(A, B, C, perm, num_warps)
+    assert "convert-tritongpu-to-metal failed" in str(exc.value), str(exc.value)
