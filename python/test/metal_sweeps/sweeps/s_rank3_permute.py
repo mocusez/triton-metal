@@ -28,22 +28,24 @@ Three arms, and the controls are what make the permute arm readable:
   address    the SAME FUNCTION with no `tl.permute` at all: the load's index cone
              carries the permuted strides instead.
 
-🔴 That third arm is RED, and its message is the opposite of what a control
-usually carries: **56 of its 84 cells are silently wrong, and they are wrong
-identically on both binaries** (A/B'd). A rank-3 load whose INNERMOST
-destination axis does not carry the source's unit stride returns the wrong
-elements -- all fourteen shape/warp pairs of each of the four permutations that
-move a strided source axis into the last position, from E = 1 upward, while
-`(1, 0, 2)` (which keeps axis 2 innermost) and the identity are exact. Every
-rank-3 address probe before this one held the inner stride at 1
-(`.omc/fuzz/rank3_address.py`'s `strided` mode is `i * PS + j * RS + k`), which
-is why it was never seen. It is the rank-3 instance of the rank-2 defect
-`3aba35ad6f` fixed -- no tier checked that a tile's inner axis is contiguous.
+🔴 That third arm went in as a control and came back RED, which is worth more
+than a green one would have been. **56 of its 84 cells were silently wrong, and
+wrong identically on both binaries** (A/B'd), so the permute fix was NOT "one of
+two spellings reached a path that already worked" -- both spellings were wrong,
+in different ways. A rank-3 load whose INNERMOST destination axis does not carry
+the source's unit stride returned the wrong elements: all fourteen shape/warp
+pairs of each of the four permutations that move a strided source axis into the
+last position, from E = 1 upward, while `(1, 0, 2)` (which keeps axis 2
+innermost) and the identity were exact. Every rank-3 address probe before this
+one held the inner stride at 1 (`.omc/fuzz/rank3_address.py`'s `strided` mode is
+`i * PS + j * RS + k`), which is why it had never been seen.
 
-So the permute fix is NOT "one of two spellings reached a path that already
-worked": both spellings were wrong, in different ways, and this sweep's permute
-arm is the half that is now closed. The address arm is left in, red, because it
-belongs to this family and is the next slice.
+✅ Both halves are now closed, in that order, and the arm is green.
+`remapDivergentConeEncoding` handled a tensor under ONE `#ttg.slice` and
+returned nullptr for nested ones, so a rank-3 index cone -- which reaches its
+tile through TWO -- had its whole rank-1 range layer fall outside the cone the
+normalizer re-encodes. The rank-3 tensors moved to the destination encoding
+while the ranges indexing them kept the source's `order`.
 
 Axes: permutation (all six) x shape x warp count, which is what fixes E.
 

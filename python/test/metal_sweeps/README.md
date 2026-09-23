@@ -272,16 +272,17 @@ equivalent programs reached the fast path.
 And when that arm comes back RED, it is worth more than when it is green.
 `sweeps/s_rank3_permute.py` put `tl.permute(v, perm)` beside the same function
 written with no layout op at all -- a load whose index cone carries the permuted
-strides. 56 of that arm's 84 cells are silently wrong, identically on both
-binaries, so the round's story is not "one of two spellings reached a path that
-worked" but "both spellings were wrong, in different ways, and this commit
-closes one of them". A green control narrows where the defect is; a red one
-tells you the family is bigger than the cell you came in with, and it stops you
-writing a fix note that claims more than you measured.
+strides. 56 of that arm's 84 cells were silently wrong, identically on both
+binaries, so the round's story was not "one of two spellings reached a path that
+worked" but "both spellings are wrong, in different ways". A green control
+narrows where the defect is; a red one tells you the family is bigger than the
+cell you came in with, and it stops you writing a fix note that claims more than
+you measured. Both halves were then closed, in two commits, and the arm is green.
 
-Leave such an arm in the sweep, red, with the reading in the docstring. Moving
-it to its own file would make the permute sweep green and hide the fact that
-the capability is still missing by the other route.
+Keep such an arm in the same sweep rather than moving it to its own file. Moving
+it would have made the permute sweep green and hidden the fact that the
+capability was still missing by the other route -- and it is the arm that found
+the larger of the two defects.
 
 ## Which compile path a probe used is an axis too
 

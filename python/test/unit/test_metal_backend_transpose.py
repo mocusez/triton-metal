@@ -668,3 +668,107 @@ def test_permute_rank3_address_cone_off_thread_major_is_named(
     with pytest.raises(Exception) as exc:
         _run_permute_rank3_addr(A, B, C, perm, num_warps)
     assert "convert-tritongpu-to-metal failed" in str(exc.value), str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# The same permutation with NO layout op at all: a rank-3 load whose index cone
+# carries the permuted strides.
+#
+# This arm went in as the control for the permute above — the same function
+# written the other way — and it came back RED: silently wrong whenever the
+# INNERMOST destination axis does not carry the source's unit stride, at every
+# shape and warp count from one element per thread upward. `(1, 0, 2)` and the
+# identity, which leave axis 2 innermost, were exact. Every rank-3 address probe
+# before it held the inner stride at 1 (`.omc/fuzz/rank3_address.py`'s `strided`
+# mode is `i * PS + j * RS + k`), which is why it had never been seen.
+#
+# Triton's coalescer reads the blocked `order` off the address's contiguity, so
+# such a kernel holds two rank-3 encodings of the SAME shape differing only in
+# `order`, with a `ttg.convert_layout` between them.
+# `normalizeBlockedDivergentCvts` re-encodes the load's producer cone to the
+# store's layout so the cvt collapses — and `remapDivergentConeEncoding` handled
+# a tensor under ONE `#ttg.slice` but returned nullptr for nested ones. A rank-3
+# index cone reaches its tile through TWO (`offs[:, None, None]`), so the whole
+# rank-1 range layer fell outside the cone: the rank-3 tensors moved to the
+# destination encoding while the ranges that index them kept the source's
+# `order`, and the emitted load decomposed `localTid` as (2,4,8) while the store
+# decomposed it as (2,8,4).
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def rank3_strided_load_kernel(
+    x_ptr, o_ptr, S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
+    T0: tl.constexpr, T1: tl.constexpr, T2: tl.constexpr
+):
+    i0 = tl.arange(0, S0)[:, None, None]
+    i1 = tl.arange(0, S1)[None, :, None]
+    i2 = tl.arange(0, S2)[None, None, :]
+    v = tl.load(x_ptr + i0 * T0 + i1 * T1 + i2 * T2)
+    tl.store(o_ptr + i0 * (S1 * S2) + i1 * S2 + i2, v)
+
+
+def _run_rank3_strided_load(A, B, C, perm, num_warps):
+    dims = (A, B, C)
+    src = (B * C, C, 1)
+    s = tuple(dims[i] for i in perm)
+    t = tuple(src[i] for i in perm)
+    x = torch.arange(A * B * C, dtype=torch.float32)
+    out = torch.zeros(A * B * C, dtype=torch.float32, device="mps")
+    compiled = rank3_strided_load_kernel[(1,)](
+        x.to("mps"), out, s[0], s[1], s[2], t[0], t[1], t[2],
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    want = x.reshape(A, B, C).permute(*perm)
+    return out.cpu().reshape(want.shape), want, compiled
+
+
+@pytest.mark.parametrize("num_warps,A,B,C", [
+    pytest.param(2, 2, 4, 8, id="2x4x8w2e1"),
+    pytest.param(1, 2, 4, 8, id="2x4x8w1e2"),
+    pytest.param(1, 8, 4, 4, id="8x4x4w1e4"),
+    pytest.param(1, 4, 8, 8, id="4x8x8w1e8"),
+    pytest.param(2, 2, 16, 16, id="2x16x16w2e8"),
+])
+@pytest.mark.parametrize(
+    "perm",
+    [(0, 2, 1), (1, 2, 0), (2, 0, 1), (2, 1, 0)],
+    ids=lambda p: "".join(str(d) for d in p),
+)
+def test_rank3_load_with_non_unit_inner_stride_matches_torch(
+        A, B, C, perm, num_warps):
+    """The four permutations that move a strided source axis innermost."""
+    got, want, _ = _run_rank3_strided_load(A, B, C, perm, num_warps)
+    assert torch.equal(got, want), (
+        f"{A}x{B}x{C} perm={perm} nw={num_warps}\n"
+        f"got={got.flatten()[:12].tolist()}\n"
+        f"want={want.flatten()[:12].tolist()}"
+    )
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize(
+    "perm", [(0, 1, 2), (1, 0, 2)],
+    ids=lambda p: "".join(str(d) for d in p),
+)
+def test_rank3_load_with_unit_inner_stride_is_unchanged(perm, num_warps):
+    """The control: the two permutations that leave axis 2 innermost were
+    exact on the old binary too, which is what located the defect on the
+    INNER axis rather than on rank 3 or on strided addressing as such."""
+    got, want, _ = _run_rank3_strided_load(4, 8, 8, perm, num_warps)
+    assert torch.equal(got, want)
+
+
+def test_rank3_strided_load_is_normalized_not_staged():
+    """Census the mechanism: this is the cone re-encode, not the exchange.
+
+    A correct answer through a threadgroup publish/barrier/read would pass the
+    numeric tests above while paying for staging a tile that needs no cross-lane
+    move at all — the load can simply be gathered under the store's layout.
+    """
+    _got, _want, compiled = _run_rank3_strided_load(2, 4, 8, (0, 2, 1), 2)
+    msl = compiled.asm["metal"]
+    if isinstance(msl, bytes):
+        msl = msl.decode()
+    assert "threadgroup_barrier" not in msl, msl[:600]
+    assert "threadgroup " not in msl, msl[:600]

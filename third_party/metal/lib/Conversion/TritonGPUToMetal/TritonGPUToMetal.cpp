@@ -31465,12 +31465,26 @@ static mlir::Attribute remapDivergentConeEncoding(mlir::Attribute enc,
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(srcEnc);
   auto dstBlocked =
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(dstEnc);
-  if (srcBlocked && dstBlocked)
-    if (auto slice =
-            mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc))
-      if (slice.getParent() == srcBlocked)
-        return mlir::triton::gpu::SliceEncodingAttr::get(
-            srcBlocked.getContext(), slice.getDim(), dstBlocked);
+  if (!srcBlocked || !dstBlocked)
+    return nullptr;
+  // Nested slices, not just one level. A rank-2 index cone reaches its tile
+  // through ONE `#ttg.slice`, which is all this handled; a rank-3 cone reaches
+  // it through TWO (`offs[:, None, None]` is
+  // `slice<dim=1, parent=slice<dim=2, parent=blocked>>`), and returning nullptr
+  // for those made the whole rank-1 range layer fall OUTSIDE the cone. The
+  // rank-3 tensors above it were then re-encoded to the destination while the
+  // ranges that index them kept the source's `order` — the emitted load
+  // decomposed `localTid` as (2,4,8) while the store decomposed it as (2,8,4),
+  // and a rank-3 tile whose innermost axis carries a non-unit source stride
+  // silently returned another lane's elements. Measured in
+  // `sweeps/s_rank3_permute.py`: 56 of that sweep's 84 `address_*` cells.
+  if (auto slice =
+          mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(enc))
+    if (mlir::Attribute parent =
+            remapDivergentConeEncoding(slice.getParent(), srcEnc, dstEnc))
+      return mlir::triton::gpu::SliceEncodingAttr::get(
+          srcBlocked.getContext(), slice.getDim(),
+          mlir::cast<mlir::triton::gpu::DistributedEncodingTrait>(parent));
   return nullptr;
 }
 
