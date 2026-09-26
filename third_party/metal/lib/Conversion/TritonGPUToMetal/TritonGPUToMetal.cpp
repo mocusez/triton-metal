@@ -1926,8 +1926,18 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           mlir::Operation *clone = phaseBuilder.clone(*def, mapping);
           loopBodyOps.insert(clone);
           if (isExchangeRead) {
-            g_tileExchange[clone] = planIt->second;
-            g_tileExchangeBuf[clone] = g_tileExchangeBuf[def];
+            // Copy BEFORE inserting. Both maps are DenseMaps: `map[clone]`
+            // may grow the table, and under C++17 the right-hand side -- a
+            // reference into that same table -- is evaluated first, so the
+            // assignment then read a moved-from plan whose index terms were
+            // empty. The clone emitted its read at slot 0 for every lane:
+            // `tl.topk` over 128 elements at one warp returned values that
+            // were not in its input, and only at the one exchange count
+            // where this insert happened to rehash.
+            TileExchangePlan plan = planIt->second;
+            mlir::Value buf = g_tileExchangeBuf.lookup(def);
+            g_tileExchange[clone] = std::move(plan);
+            g_tileExchangeBuf[clone] = buf;
           }
           return mapping.lookupOrNull(value) ? mapping.lookup(value)
                                              : clone->getResult(0);

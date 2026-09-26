@@ -2343,9 +2343,15 @@ def test_sort_rank3_exact_rows_at_every_band_count(B, M, N, num_warps):
     assert torch.equal(out.cpu(), x.sort(dim=2).values)
 
 
+# `4x32` at one warp is the shape that exposed a use-after-grow: a phase that
+# rematerialised an exchange read copied its plan with
+# `g_tileExchange[clone] = planIt->second`, and when that insert grew the
+# DenseMap every lane read slot 0. Whether it grows depends on what this
+# process compiled earlier, so these cells cannot pin it; the lit fixture
+# `topk_rematerialized_read_plan.mlir` does, in a fresh process.
 @pytest.mark.parametrize("M,N,K,num_warps", [
     (16, 16, 4, 1), (32, 8, 4, 1), (8, 128, 4, 1), (8, 128, 4, 4),
-    (8, 128, 16, 4),
+    (8, 128, 16, 4), (4, 32, 4, 1), (4, 32, 8, 1),
 ])
 def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps):
     torch = pytest.importorskip("torch")
