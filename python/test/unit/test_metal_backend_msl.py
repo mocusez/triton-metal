@@ -2360,6 +2360,54 @@ def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps):
     assert torch.equal(out.cpu(), x.topk(K, dim=1).values)
 
 
+@triton.jit
+def _rank3_bitcast_reduce_kernel(x_ptr, o_ptr, A: tl.constexpr, B: tl.constexpr,
+                                 C: tl.constexpr, FLIP: tl.constexpr):
+    offs = (tl.arange(0, A)[:, None, None] * (B * C)
+            + tl.arange(0, B)[None, :, None] * C
+            + tl.arange(0, C)[None, None, :])
+    x = tl.load(x_ptr + offs)
+    if FLIP:
+        y = tl.flip(x, 0)
+    else:
+        ix = x.to(tl.int32, bitcast=True)
+        y = (ix + tl.sum(ix, 0, keep_dims=True)).to(tl.float32, bitcast=True)
+    tl.store(o_ptr + offs, y)
+
+
+# A staged rank-3 reduce relabels its scratch to the thread-major label its
+# load uses only when every leaf of the source cone is such a load, reached
+# through elementwise ops. That walk admitted arith/math only, so a
+# `tt.bitcast` -- the op `tl.flip` and the sort comparators reach their reduce
+# through -- left the publish under the LAYOUT's label while the fold read under
+# the thread-major one: every element wrong from E = 32 up, while the
+# `arith.fptosi` spelling of the same kernel was exact.
+# A flip along an axis of 4 reshapes to rank 4 and is refused by name (the
+# relabelled-reduce reshape), so only the size-2 flip -- a single rank-3
+# reduce -- is here.
+@pytest.mark.parametrize("A,B,C,num_warps,flip", [
+    (2, 16, 32, 1, True), (2, 16, 32, 4, True), (2, 4, 8, 1, True),
+    (2, 16, 32, 1, False), (2, 16, 32, 4, False), (4, 16, 32, 1, False),
+    (2, 4, 8, 1, False),
+])
+def test_rank3_reduce_of_a_bitcast_is_exact(A, B, C, num_warps, flip):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(A * 1009 + B * 31 + C + num_warps)
+    x = (torch.randperm(A * B * C).float() - A * B * C / 2).reshape(A, B, C)
+    out = torch.zeros(A, B, C, dtype=torch.float32, device="mps")
+    _rank3_bitcast_reduce_kernel[(1,)](x.to("mps"), out, A, B, C, flip,
+                                       num_warps=num_warps)
+    torch.mps.synchronize()
+    if flip:
+        want = x.flip(0)
+    else:
+        ix = x.view(torch.int32)
+        want = (ix + ix.sum(0, keepdim=True, dtype=torch.int32)).view(torch.float32)
+    assert torch.equal(out.cpu().view(torch.int32), want.contiguous().view(torch.int32))
+
+
 # N and num_warps are swept together so the cells span ONE through THIRTY-TWO
 # elements per thread, `N / (32 * num_warps)`. That axis is the one this path
 # breaks along and the matrix used to sit entirely at one element per thread,

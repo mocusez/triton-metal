@@ -3151,10 +3151,23 @@ static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
     return dense && dense.isSplat();
   }
-  if (!mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+  // Triton's own elementwise ops keep the coordinates too. `tl.flip` and the
+  // sort comparators reach their reduce through `tt.bitcast`, and refusing it
+  // here left that reduce publishing under the layout's label while its fold
+  // read under this one -- a silent wrong answer from four elements per
+  // thread up (`x.to(tl.int32, bitcast=True)` summed along a rank-3 axis),
+  // while the `arith.fptosi` spelling of the same kernel was exact.
+  const bool tritonElementwise =
+      mlir::isa<mlir::triton::TritonDialect>(def->getDialect()) &&
+      def->hasTrait<mlir::OpTrait::Elementwise>() &&
+      def->getNumResults() == 1 && mlir::isMemoryEffectFree(def) &&
+      !mlir::isa<mlir::triton::PointerType>(
+          mlir::getElementTypeOrSelf(def->getResult(0).getType()));
+  if (!tritonElementwise &&
+      !mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
           def->getDialect()))
     return false;
-  // Elementwise arith/math only: same-shape operands, one result.
+  // Elementwise only: same-shape operands, one result.
   if (def->getNumResults() != 1)
     return false;
   for (mlir::Value operand : def->getOperands()) {
