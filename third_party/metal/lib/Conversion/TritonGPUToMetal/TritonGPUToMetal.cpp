@@ -32240,8 +32240,15 @@ static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value) {
   return plan;
 }
 
-static bool planTileExchange(mlir::Operation *exchange,
-                             bool allowGeneralPhase = false) {
+// `srcLabel` / `dstLabel` replace the plan a side would otherwise be asked for
+// when the caller knows the VALUE carries a different label than its type
+// names -- a rank >= 2 tile rooted at a thread-major load, or one a thread-major
+// store will consume. The exchange then publishes and reads under the labels
+// the two sides' own addresses use.
+static bool
+planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
+                 std::optional<LayoutIndexPlan> srcLabel = std::nullopt,
+                 std::optional<LayoutIndexPlan> dstLabel = std::nullopt) {
   mlir::Value source;
   mlir::Value result;
   bool isReshape = false;
@@ -32268,8 +32275,10 @@ static bool planTileExchange(mlir::Operation *exchange,
   if ((!isReshape && !isBroadcast && srcRtt.getShape() != dstRtt.getShape()) ||
       (isReshape && srcRtt.getNumElements() != dstRtt.getNumElements()))
     return false;
-  std::optional<LayoutIndexPlan> srcPlan = exchangeSourcePlan(source);
-  std::optional<LayoutIndexPlan> dstPlan = planLayoutIndex(dstRtt);
+  std::optional<LayoutIndexPlan> srcPlan =
+      srcLabel ? srcLabel : exchangeSourcePlan(source);
+  std::optional<LayoutIndexPlan> dstPlan =
+      dstLabel ? dstLabel : planLayoutIndex(dstRtt);
   if (!srcPlan || !dstPlan)
     return false;
   if (isBroadcast) {
@@ -40405,18 +40414,71 @@ struct ConvertTritonGPUToMetalPass
     // a non-local convert_layout instead of silently reinterpreting a scalar
     // owned by a different lane.
     bool reshapeOk = true;
-    llvm::SmallVector<mlir::triton::ReshapeOp, 4> reshapesNeedingExchange;
+    struct ReshapeExchange {
+      mlir::triton::ReshapeOp reshape;
+      std::optional<LayoutIndexPlan> srcLabel, dstLabel;
+    };
+    llvm::SmallVector<ReshapeExchange, 4> reshapesNeedingExchange;
+    // `tl.sort`/`tl.topk` over a rank >= 2 tile reshape the WHOLE tile into a
+    // `[2] * log2(numel)` hypercube and back. The hypercube stages are indexed
+    // in layout space -- their `_indicator` aranges are emitted there, and so
+    // is every staged reduce's scratch -- while a rank >= 2 blocked tile holds
+    // the element the backend's own thread-major expression names,
+    // `localTid * E + iv`, because that is how its load and its store address
+    // it. The two labels agree up to four elements per thread and diverge at
+    // eight, where the layout interleaves its second register band at the
+    // CTA-tile stride: every comparator then paired elements the kernel never
+    // meant to compare. 📏 18 of 82 sort/topk/flip probes silently wrong, all
+    // at E >= 8 and all on a rank >= 2 input -- the rank-1 input of the same
+    // size is exact, because a rank-1 tile's ranges ARE emitted in layout
+    // space. So the entry and exit reshapes are exchanges between the two
+    // labels, not relabels.
+    auto isBinaryHypercube = [](mlir::RankedTensorType ty) {
+      return ty.getRank() >= 2 &&
+             llvm::all_of(ty.getShape(), [](int64_t e) { return e == 2; });
+    };
+    auto isThreadMajorTile = [&](mlir::RankedTensorType ty) {
+      return ty.getRank() >= 2 && !isBinaryHypercube(ty) &&
+             mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+                 ty.getEncoding());
+    };
     moduleOp.walk([&](mlir::triton::ReshapeOp reshape) {
       auto srcTy =
           mlir::dyn_cast<mlir::RankedTensorType>(reshape.getSrc().getType());
       auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
       if (!srcTy || !dstTy || !functionHasRankNPhase(reshape.getOperation()) ||
           srcTy.getNumElements() != dstTy.getNumElements() ||
-          srcTy.getElementType() != dstTy.getElementType() ||
-          (!mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
-               srcTy.getEncoding()) &&
-           !mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
-               dstTy.getEncoding())))
+          srcTy.getElementType() != dstTy.getElementType())
+        return;
+      const bool touchesSlice =
+          mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+              srcTy.getEncoding()) ||
+          mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+              dstTy.getEncoding());
+      std::optional<LayoutIndexPlan> srcLabel, dstLabel;
+      auto threadMajorLabel =
+          [&](mlir::RankedTensorType ty) -> std::optional<LayoutIndexPlan> {
+        auto own = planLayoutIndex(ty);
+        if (!own)
+          return std::nullopt;
+        return threadMajorLayoutPlan(ty.getShape(), own->threadsPerBlock());
+      };
+      // Entry: only a tile whose every leaf is a load at its own rank is known
+      // to hold thread-major elements; anything else keeps asking its type.
+      if (isThreadMajorTile(srcTy) && isBinaryHypercube(dstTy) &&
+          coneIsThreadMajorLoadRooted(reshape.getSrc(), srcTy.getRank())) {
+        srcLabel = threadMajorLabel(srcTy);
+        if (!srcLabel)
+          return;
+      }
+      // Exit: the rank >= 2 result is consumed thread-major (its store, or
+      // anything elementwise before it), so read it under that label.
+      if (isBinaryHypercube(srcTy) && isThreadMajorTile(dstTy)) {
+        dstLabel = threadMajorLabel(dstTy);
+        if (!dstLabel)
+          return;
+      }
+      if (!touchesSlice && !srcLabel && !dstLabel)
         return;
       // Ask the VALUE, not the type: a staged rank-N reduce relabels its
       // result, and this walk is what decides whether the reshape needs an
@@ -40424,15 +40486,15 @@ struct ConvertTritonGPUToMetalPass
       // (n,))` go from a named refusal to a correct answer with this, and the
       // same substitution in the broadcast walk next door moved nothing, so it
       // is not there.
-      auto srcPlan = exchangeSourcePlan(reshape.getSrc());
-      auto dstPlan = planLayoutIndex(dstTy);
+      auto srcPlan = srcLabel ? srcLabel : exchangeSourcePlan(reshape.getSrc());
+      auto dstPlan = dstLabel ? dstLabel : planLayoutIndex(dstTy);
       if (srcPlan && dstPlan &&
           !layoutFlatIndexPlansEquivalent(*srcPlan, *dstPlan))
-        reshapesNeedingExchange.push_back(reshape);
+        reshapesNeedingExchange.push_back({reshape, srcLabel, dstLabel});
     });
-    for (auto reshape : reshapesNeedingExchange) {
+    for (auto &[reshape, srcLabel, dstLabel] : reshapesNeedingExchange) {
       if (planTileExchange(reshape.getOperation(),
-                           /*allowGeneralPhase=*/true))
+                           /*allowGeneralPhase=*/true, srcLabel, dstLabel))
         continue;
       reshape.emitOpError(
           "Metal backend: this tl.reshape changes physical element ownership "

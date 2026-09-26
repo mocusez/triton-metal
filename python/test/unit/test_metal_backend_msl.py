@@ -2282,6 +2282,84 @@ def test_topk_masked_padding_sentinel(descending):
     assert torch.equal(out.cpu(), expected)
 
 
+@triton.jit
+def _sort_rank2_kernel(x_ptr, o_ptr, M: tl.constexpr, N: tl.constexpr,
+                       DESCENDING: tl.constexpr):
+    offs = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(o_ptr + offs, tl.sort(tl.load(x_ptr + offs), descending=DESCENDING))
+
+
+@triton.jit
+def _sort_rank3_kernel(x_ptr, o_ptr, B: tl.constexpr, M: tl.constexpr,
+                       N: tl.constexpr):
+    offs = (tl.arange(0, B)[:, None, None] * (M * N)
+            + tl.arange(0, M)[None, :, None] * N
+            + tl.arange(0, N)[None, None, :])
+    tl.store(o_ptr + offs, tl.sort(tl.load(x_ptr + offs)))
+
+
+# `tl.sort`/`tl.topk` over a rank >= 2 tile reshape the WHOLE tile into a
+# `[2] * log2(numel)` hypercube. The hypercube stages are indexed in layout
+# space, while a rank >= 2 tile holds the element its thread-major load and
+# store address, `localTid * E + iv`. The two labels agree up to four elements
+# per thread; at eight the layout interleaves its second register band at the
+# CTA-tile stride and every comparator paired elements the kernel never meant
+# to compare, so the rows came back permuted -- silently, and only on a rank
+# >= 2 input: the rank-1 tile of the same size is exact because its ranges ARE
+# emitted in layout space. The entry and exit reshapes now exchange between the
+# two labels. The cells span E = 1..32 (`M*N / (32 * num_warps)`) and use a
+# PERMUTATION: the tests above sit at E <= 2 on nearly sorted input, which is
+# how this survived.
+@pytest.mark.parametrize("M,N,num_warps", [
+    (4, 32, 1), (4, 32, 4), (16, 16, 1), (16, 16, 4), (32, 8, 1),
+    (8, 128, 1), (8, 128, 4), (2, 512, 1),
+])
+@pytest.mark.parametrize("descending", [False, True])
+def test_sort_rank2_exact_rows_at_every_band_count(M, N, num_warps, descending):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(M * 131 + N + num_warps)
+    x = (torch.randperm(M * N).float() - M * N / 2).reshape(M, N)
+    out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    _sort_rank2_kernel[(1,)](x.to("mps"), out, M, N, descending,
+                             num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.sort(dim=1, descending=descending).values)
+
+
+@pytest.mark.parametrize("B,M,N,num_warps", [
+    (2, 4, 8, 1), (4, 8, 16, 1), (4, 8, 16, 4), (2, 16, 32, 1), (2, 16, 32, 4),
+])
+def test_sort_rank3_exact_rows_at_every_band_count(B, M, N, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(B * 7 + M * 131 + N + num_warps)
+    x = (torch.randperm(B * M * N).float() - B * M * N / 2).reshape(B, M, N)
+    out = torch.zeros(B, M, N, dtype=torch.float32, device="mps")
+    _sort_rank3_kernel[(1,)](x.to("mps"), out, B, M, N, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.sort(dim=2).values)
+
+
+@pytest.mark.parametrize("M,N,K,num_warps", [
+    (16, 16, 4, 1), (32, 8, 4, 1), (8, 128, 4, 1), (8, 128, 4, 4),
+    (8, 128, 16, 4),
+])
+def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    torch.manual_seed(M * 17 + N + K)
+    x = (torch.randperm(M * N).float() - M * N / 2).reshape(M, N)
+    out = torch.zeros(M, K, dtype=torch.float32, device="mps")
+    _topk_rank2_v2_kernel[(1,)](x.to("mps"), out, M, N, K, True,
+                              num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), x.topk(K, dim=1).values)
+
+
 # N and num_warps are swept together so the cells span ONE through THIRTY-TWO
 # elements per thread, `N / (32 * num_warps)`. That axis is the one this path
 # breaks along and the matrix used to sit entirely at one element per thread,
