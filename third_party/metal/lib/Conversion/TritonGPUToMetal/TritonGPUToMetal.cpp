@@ -11250,11 +11250,31 @@ static bool rank2ConeSupported(mlir::Value v, int depth,
 // Returns null on any unsupported producer (caller bails to
 // notifyMatchFailure).
 //===----------------------------------------------------------------------===//
+// The value a replayed cone should read THROUGH a layout op. A cvt is a
+// shape-only step for replay -- the evaluator addresses logical (row, col) --
+// but once `planTileExchange` has split one into publish/read, the READ's
+// operand is a placeholder `dense<0>` and the value lives on its publish.
+// Recursing into the placeholder replayed that constant: `tl.sum(tl.trans(x)
+// + w, 0)` folded `0 + w`, silently, in 16 of 50 cells at 2..4 elements per
+// thread. The publish's operand is the pre-exchange value, which the
+// evaluator can replay (a `tt.trans` swaps the coordinates).
+static mlir::Value coneReplaySource(mlir::Operation *def) {
+  if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      tag && tag.getValue() == "read") {
+    auto it = g_tileExchange.find(def);
+    if (it != g_tileExchange.end() && it->second.publishOp &&
+        it->second.publishOp->getNumOperands() == 1)
+      return it->second.publishOp->getOperand(0);
+    return {};
+  }
+  return def->getOperand(0);
+}
+
 static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                    mlir::Value rowBase, mlir::Value nVal,
                                    mlir::ConversionPatternRewriter &rewriter,
                                    mlir::Location loc, int depth) {
-  if (depth > 24)
+  if (depth > 24 || !v)
     return nullptr;
   auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
   auto scalarEltOf = [](mlir::Type t) -> mlir::Type {
@@ -11521,8 +11541,8 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
   // Shape-only cvt / reshape: recurse the source unchanged.
   if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return evalRank2ConeAt(def->getOperand(0), rVal, rowBase, nVal, rewriter,
-                           loc, depth + 1);
+    return evalRank2ConeAt(coneReplaySource(def), rVal, rowBase, nVal,
+                           rewriter, loc, depth + 1);
 
   // tl.where → arith.select; comparisons feeding the where condition.
   if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
@@ -12411,7 +12431,7 @@ preprocessLoopCarriedGathers(mlir::ModuleOp moduleOp,
 // answers false for is a PRODUCER no tier re-emits at any tile size, which is
 // what the preflight caller exists to name.
 static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
-  if (depth > 24)
+  if (depth > 24 || !v)
     return false;
   // A staged [M,N] tile is a leaf: it reads out of threadgroup memory, so the
   // walk stops here and never has to re-emit the recurrence behind it.
@@ -12449,7 +12469,7 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   }
   if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
+    return rank2ConeSupported(coneReplaySource(def), depth + 1, preflight);
   if (coneUnaryExpOperator(def) || coneClonableUnaryOp(def))
     return rank2ConeSupported(def->getOperand(0), depth + 1, preflight);
   if (conePreciseBinaryOperator(def))

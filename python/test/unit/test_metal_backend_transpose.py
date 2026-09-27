@@ -772,3 +772,40 @@ def test_rank3_strided_load_is_normalized_not_staged():
         msl = msl.decode()
     assert "threadgroup_barrier" not in msl, msl[:600]
     assert "threadgroup " not in msl, msl[:600]
+
+
+@triton.jit
+def _trans_add_reduce_kernel(X, W, Y, M: tl.constexpr, N: tl.constexpr,
+                             AXIS: tl.constexpr):
+    m = tl.arange(0, M)
+    n = tl.arange(0, N)
+    x = tl.load(X + m[:, None] * N + n[None, :])
+    w = tl.load(W + n[:, None] * M + m[None, :])
+    s = tl.sum(tl.trans(x) + w, AXIS)
+    if AXIS == 0:
+        tl.store(Y + m, s)
+    else:
+        tl.store(Y + n, s)
+
+
+# `tl.sum(tl.trans(x) + w, axis)`: the reduce replays its source cone from
+# memory, stepping through the `ttg.convert_layout` Triton puts after the
+# trans as a shape-only op. Once that cvt had been split into an exchange's
+# publish/read, the READ's operand was a `dense<0>` placeholder, and the replay
+# folded `0 + w` -- every element wrong, silently. The replay now reads through
+# a read to its publish's source. 📏 `s_trans_consumers.py` 16 wrong -> 0; the
+# shapes whose cvt cannot be exchanged stay a named refusal.
+@pytest.mark.parametrize("M,N,num_warps", [
+    (8, 8, 1), (16, 16, 2), (16, 16, 4), (16, 32, 4), (32, 16, 4), (8, 64, 4),
+    (64, 8, 4), (4, 128, 4),
+])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_trans_add_reduce_matches_torch(M, N, num_warps, axis):
+    torch.manual_seed(M * 31 + N + num_warps + axis)
+    x = torch.randn(M, N)
+    w = torch.randn(N, M)
+    y = torch.zeros(M if axis == 0 else N, device="mps")
+    _trans_add_reduce_kernel[(1,)](x.to("mps"), w.to("mps"), y, M, N, axis,
+                                   num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu(), (x.T + w).sum(axis), atol=1e-4, rtol=1e-4)
