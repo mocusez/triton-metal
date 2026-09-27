@@ -2017,6 +2017,146 @@ def test_tuple_scan_rankn_unrelated_runtime_loop_remains_supported():
     torch.testing.assert_close(scratch.cpu(), torch.arange(1, 18, dtype=torch.int32), atol=0, rtol=0)
 
 
+# ---------------------------------------------------------------------------
+# Scans beside other staged work in ONE function (`probe_diag_staged.py`).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _scan_bcast_kernel(V, Y, R: tl.constexpr, C: tl.constexpr, ROWS: tl.constexpr):
+    r = tl.arange(0, R)
+    c = tl.arange(0, C)
+    if ROWS:
+        s = tl.cumsum(tl.load(V + r), 0)
+        out = s[:, None] * 2.0 + c[None, :].to(tl.float32)
+    else:
+        s = tl.cumsum(tl.load(V + c), 0)
+        out = s[None, :] + r[:, None].to(tl.float32)
+    tl.store(Y + r[:, None] * C + c[None, :], out)
+
+
+# A rank-1 scan result holds element `localTid`, and `expand_dims` /
+# `broadcast` forward it, so `tl.cumsum(v, 0)[None, :]` added into a tile gave
+# thread t the prefix at `t` instead of at its column: every row but the first
+# wrong. It now takes the column-reduce republish, indexed by the axis the
+# expand did not insert.
+@pytest.mark.parametrize("R,C,num_warps,rows", [
+    (4, 32, 1, False), (2, 16, 1, False), (16, 64, 4, False), (8, 32, 2, False),
+    (32, 4, 1, True), (64, 16, 4, True), (16, 16, 1, True),
+])
+def test_scan_result_broadcast_into_tile_matches_torch(R, C, num_warps, rows):
+    torch.manual_seed(R * 7 + C + num_warps)
+    v = torch.randn(R if rows else C)
+    y = torch.zeros(R, C, device="mps")
+    _scan_bcast_kernel[(1,)](v.to("mps"), y, R, C, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    s = v.cumsum(0)
+    want = (s[:, None] * 2 + torch.arange(C).float()[None, :]) if rows else \
+        (s[None, :] + torch.arange(R).float()[:, None])
+    torch.testing.assert_close(y.cpu(), want, atol=1e-4, rtol=1e-4)
+
+
+def test_scan_result_broadcast_beyond_one_pass_is_named(capfd):
+    with pytest.raises(Exception):
+        _scan_bcast_kernel[(1,)](torch.zeros(64, device="mps"),
+                                 torch.zeros(4, 64, device="mps"), 4, 64, False,
+                                 num_warps=1)
+    assert "a rank-1 tl.scan result broadcast into a rank-2 tile" in \
+        capfd.readouterr().err
+
+
+@triton.jit
+def _two_scans_kernel(X, V, Y, Z, R: tl.constexpr, C: tl.constexpr,
+                      N: tl.constexpr):
+    r = tl.arange(0, R)
+    c = tl.arange(0, C)
+    n = tl.arange(0, N)
+    tl.store(Z + n, tl.cumsum(tl.load(V + n), 0))
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1))
+
+
+def _run_two_scans(R, C, N, w):
+    torch.manual_seed(R + C + N + w)
+    x = torch.randn(R, C)
+    v = torch.randn(N)
+    y = torch.zeros(R, C, device="mps")
+    z = torch.zeros(N, device="mps")
+    _two_scans_kernel[(1,)](x.to("mps"), v.to("mps"), y, z, R, C, N, num_warps=w)
+    torch.mps.synchronize()
+    return y.cpu(), z.cpu(), x.cumsum(1), v.cumsum(0)
+
+
+# A rank-1 scan beside a MULTI-BAND staged scan runs inside that scan's band
+# loop, with its trip count, and stores to a layout-space index while reading
+# its result back thread-major: exact while its own layout is thread-major,
+# silently wrong from eight elements per thread. Those are refused by name.
+@pytest.mark.parametrize("R,C,N,w", [(4, 32, 128, 1), (16, 16, 128, 1),
+                                     (2, 16, 512, 1), (8, 64, 128, 1)])
+def test_rank1_scan_beside_multiband_scan_matches_torch(R, C, N, w):
+    y, z, want_y, want_z = _run_two_scans(R, C, N, w)
+    torch.testing.assert_close(y, want_y, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(z, want_z, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("R,C,N,w", [(4, 32, 256, 1), (16, 16, 256, 1),
+                                     (8, 64, 1024, 4)])
+def test_rank1_scan_beside_multiband_scan_is_named(capfd, R, C, N, w):
+    with pytest.raises(Exception):
+        _run_two_scans(R, C, N, w)
+    assert "a rank-1 tl.scan whose layout is not thread-major" in \
+        capfd.readouterr().err
+
+
+@triton.jit
+def _reduce_beside_scan_kernel(X, W, Y, Z, A: tl.constexpr, B: tl.constexpr,
+                               C: tl.constexpr, RANK3: tl.constexpr):
+    b = tl.arange(0, B)
+    c = tl.arange(0, C)
+    o = b[:, None] * C + c[None, :]
+    w = tl.load(W + o)
+    tl.store(Z + o, tl.cumsum(w, 1))
+    if RANK3:
+        a = tl.arange(0, A)
+        x = tl.load(X + a[:, None, None] * (B * C) + b[None, :, None] * C
+                    + c[None, None, :])
+        tl.store(Y + o, tl.sum(x, 0))
+    else:
+        tl.store(Y + c, tl.sum(w, 0))
+
+
+# A rank-2 reduce beside a multi-band staged scan died inside the conversion
+# or, stored on its own along axis 0, returned a wrong answer; a rank-3 one was
+# wrong whenever its layout was not thread-major. Both are refused by name.
+@pytest.mark.parametrize("A,B,C,w,rank3,msg", [
+    (1, 16, 16, 1, False, "a rank-2 tl.reduce cannot share a function"),
+    (1, 8, 64, 4, False, "a rank-2 tl.reduce cannot share a function"),
+    (4, 8, 16, 1, True, "a rank-3 tl.reduce whose layout is not thread-major"),
+    (2, 16, 16, 1, True, "a rank-3 tl.reduce whose layout is not thread-major"),
+])
+def test_reduce_beside_multiband_scan_is_named(capfd, A, B, C, w, rank3, msg):
+    with pytest.raises(Exception):
+        _reduce_beside_scan_kernel[(1,)](
+            torch.zeros(A * B * C, device="mps"), torch.zeros(B * C, device="mps"),
+            torch.zeros(B * C, device="mps"), torch.zeros(B * C, device="mps"),
+            A, B, C, rank3, num_warps=w)
+    assert msg in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("A,B,C,w", [(2, 8, 8, 1), (4, 8, 16, 4), (2, 16, 16, 4)])
+def test_rank3_reduce_beside_scan_thread_major_matches_torch(A, B, C, w):
+    torch.manual_seed(A + B + C + w)
+    x = torch.randn(A, B, C)
+    ww = torch.randn(B, C)
+    y = torch.zeros(B * C, device="mps")
+    z = torch.zeros(B * C, device="mps")
+    _reduce_beside_scan_kernel[(1,)](x.to("mps"), ww.to("mps"), y, z, A, B, C,
+                                     True, num_warps=w)
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu().reshape(B, C), x.sum(0), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(z.cpu().reshape(B, C), ww.cumsum(1), atol=1e-4, rtol=1e-4)
+
+
 @triton.jit
 def _rank3_reduce_plus_tile_kernel(X, W, Y, A: tl.constexpr, B: tl.constexpr,
                                    C: tl.constexpr):

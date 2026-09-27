@@ -5141,6 +5141,36 @@ static bool coneUsesAxis0Reduce(mlir::Value v, bool &sawTileLeaf, int depth) {
   return any;
 }
 
+// The rank-1 `tt.scan` a rank-1 value's cone is built from, through
+// elementwise ops only, as its result type; null when there is none.
+// `sawTileLeaf` reports a device load / make_range met on the way, the other
+// element convention (see `coneUsesAxis0Reduce`).
+static mlir::RankedTensorType coneRank1ScanType(mlir::Value v,
+                                                bool &sawTileLeaf, int depth) {
+  if (depth > 24)
+    return {};
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def || !def->getBlock())
+    return {};
+  if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+        scan.getSrcs().front().getType());
+    return ty && ty.getRank() == 1 ? ty : mlir::RankedTensorType();
+  }
+  if (mlir::isa<mlir::triton::LoadOp, mlir::triton::MakeRangeOp>(def)) {
+    sawTileLeaf = true;
+    return {};
+  }
+  if (mlir::isa<mlir::triton::SplatOp, mlir::arith::ConstantOp>(def) ||
+      def->getNumRegions() != 0)
+    return {};
+  mlir::RankedTensorType found;
+  for (mlir::Value o : def->getOperands())
+    if (auto t = coneRank1ScanType(o, sawTileLeaf, depth + 1))
+      found = t;
+  return found;
+}
+
 // Pre-conversion pass: record every `tt.expand_dims` that lifts a column-reduce
 // result into a rank-2 tile. Fails the pass on a cone that mixes the two
 // element conventions — that shape has no correct single-scalar answer, and
@@ -5160,6 +5190,33 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
     if (!resBlocked)
       return;
     bool sawTileLeaf = false;
+    // A rank-1 scan result holds the same convention a column reduce does --
+    // element `localTid` -- and `expand_dims` / `broadcast` forward it the
+    // same way, so `tl.cumsum(v, 0)[None, :]` added into a tile handed thread
+    // t the prefix at `t` instead of at its column: every row but the first
+    // wrong (`probe_diag_staged.py`, 6 of 6 shapes). It takes the same
+    // republish, indexed by whichever axis the expand did NOT insert -- but
+    // only while the scan fits the CTA in one pass: above that its lanes hold
+    // several prefixes each and no single-slot publish carries them.
+    bool sawScanTileLeaf = false;
+    if (auto scanTy = coneRank1ScanType(ed.getSrc(), sawScanTileLeaf, 0)) {
+      int64_t tpb = 1;
+      for (auto t : resBlocked.getThreadsPerWarp())
+        tpb *= t;
+      for (auto w : resBlocked.getWarpsPerCTA())
+        tpb *= w;
+      if (sawScanTileLeaf || scanTy.getNumElements() > tpb ||
+          coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0)) {
+        ed.emitError(
+            "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
+            "tile is supported only when the scan fits one element per thread "
+            "and its cone holds no device load or other reduction");
+        status = mlir::failure();
+        return;
+      }
+      out.insert(ed.getOperation());
+      return;
+    }
     if (!coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0))
       return;
     if (ed.getAxis() != 0) {
@@ -5234,7 +5291,11 @@ struct ExpandDimsLowering
         return rewriter.notifyMatchFailure(
             op, "expand_dims: column-reduce republish needs a rank-2 blocked "
                 "tile and a scalarized source");
-      if (tile->shape[1] > tile->threadsPerBlock) {
+      // The coordinate this lane's element is indexed by is the axis the
+      // expand did NOT insert: the column for `[None, :]` (every column
+      // reduce), the row for a scan result expanded `[:, None]`.
+      const int coordAxis = 1 - static_cast<int>(op.getAxis());
+      if (tile->shape[coordAxis] > tile->threadsPerBlock) {
         // More columns than threads: no lane holds the value for the column
         // its tile position names, and publishing this lane's scalar would
         // only make one column per thread available. The producing column
@@ -5243,7 +5304,7 @@ struct ExpandDimsLowering
         // reduce leaf resolves to that buffer, and everything above it is
         // elementwise.
         mlir::Value col = emitTileAxisCoord(op, *tile, parentBlocked,
-                                            /*axis=*/1, rewriter, loc);
+                                            coordAxis, rewriter, loc);
         mlir::Value v = evalRank1ValueAt(op.getSrc(), col, rewriter, loc, 0);
         if (!v)
           return rewriter.notifyMatchFailure(
@@ -5264,7 +5325,7 @@ struct ExpandDimsLowering
         mlir::Value buf =
             publishLaneBands({scalar}, tpb, stageTy, rewriter, loc);
         mlir::Value col = emitTileAxisCoord(op, *tile, parentBlocked,
-                                            /*axis=*/1, rewriter, loc);
+                                            coordAxis, rewriter, loc);
         rewriter.replaceOp(op,
                            readLaneBandSlot(buf, col, tpb, stageTy,
                                             scalar.getType(), rewriter, loc));
@@ -16296,6 +16357,80 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
   });
   llvm::SmallVector<mlir::triton::ScanOp, 8> scans;
   bool valid = true;
+  // A rank-1 scan keeps its own prefix-sum lowering even in a function whose
+  // rank >= 2 scans are staged -- and there it runs inside the staged scan's
+  // register-band loop, with that loop's trip count, and its store addresses
+  // a layout-space index while its result is read back thread-major. The two
+  // agree while the rank-1 layout IS thread-major (up to four elements per
+  // thread at sizePerThread 4). 📏 With a multi-band staged scan beside it,
+  // every cell whose rank-1 layout is not thread-major was silently wrong
+  // (`probe_diag_staged.py`: 8 elements per thread and up, at every rank-2
+  // band count above one), and none below. Refuse those by name.
+  llvm::SmallPtrSet<mlir::Operation *, 8> multiBandFunctions;
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    auto type =
+        mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
+    if (type.getRank() < 2)
+      return;
+    if (auto layout = phaseLayout(scan); layout && layout->elemPerThread > 1)
+      multiBandFunctions.insert(scan->getParentOfType<mlir::triton::FuncOp>());
+  });
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    auto func = scan->getParentOfType<mlir::triton::FuncOp>();
+    if (!func || !multiBandFunctions.count(func))
+      return;
+    auto type =
+        mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
+    if (type.getRank() != 1)
+      return;
+    auto plan = planLayoutIndex(type);
+    if (plan && plan->elemPerThread > 1 && !layoutFlatIndexIsThreadMajor(*plan)) {
+      scan.emitOpError(
+          "Metal backend: a rank-1 tl.scan whose layout is not thread-major "
+          "cannot share a function with a multi-band staged scan");
+      valid = false;
+    }
+  });
+  // A staged rank-3 reduce is the same defect from the other side: beside a
+  // multi-band staged scan its result is wrong exactly when its source layout
+  // is not thread-major (📏 `probe_diag_staged.py` / eight shapes x two warp
+  // counts: wrong at E >= 8 with a scan of two bands or more, exact everywhere
+  // else, even with the two results stored separately).
+  moduleOp.walk([&](mlir::triton::ReduceOp reduce) {
+    auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
+    if (!func || !multiBandFunctions.count(func))
+      return;
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+        reduce.getSrcs().front().getType());
+    if (!type || type.getRank() < 2)
+      return;
+    // Rank 2 has no working combination at all: 📏 every row or column
+    // reduce beside a multi-band staged scan either died inside the
+    // conversion ("failed to legalize tt.reduce") or -- stored on its own,
+    // along axis 0 -- returned a wrong answer, for either scan axis.
+    if (type.getRank() == 2) {
+      // A column reduce broadcast back into the tile (`tl.sum(v, 0)[None,
+      // :]`) has its own, more specific refusal further on; leave it that.
+      if (reduce.getAxis() == 0 &&
+          llvm::any_of(reduce->getUsers(), [](mlir::Operation *u) {
+            auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(u);
+            return ed && ed.getAxis() == 0;
+          }))
+        return;
+      reduce.emitOpError(
+          "Metal backend: a rank-2 tl.reduce cannot share a function with a "
+          "multi-band staged scan");
+      valid = false;
+      return;
+    }
+    auto plan = planLayoutIndex(type);
+    if (plan && plan->elemPerThread > 1 && !layoutFlatIndexIsThreadMajor(*plan)) {
+      reduce.emitOpError(
+          "Metal backend: a rank-3 tl.reduce whose layout is not thread-major "
+          "cannot share a function with a multi-band staged scan");
+      valid = false;
+    }
+  });
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
     auto func = scan->getParentOfType<mlir::triton::FuncOp>();
     if (!func || !phaseFunctions.count(func))
