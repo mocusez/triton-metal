@@ -256,6 +256,11 @@ struct LayoutIndexPlan {
   int threadsPerBlock() const { return 1 << (laneBits + warpBits); }
   // How many elements one thread holds under THIS layout.
   int64_t elemPerThread = 1;
+  // A constant XORed into each dimension's coordinate; empty means none. Only
+  // a `tl.flip` read sets it: reversing a power-of-two extent is XOR with
+  // extent - 1.
+  llvm::SmallVector<int32_t, 4> dimXor;
+  int32_t xorOf(size_t d) const { return d < dimXor.size() ? dimXor[d] : 0; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -299,6 +304,9 @@ static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
 // dominates both loops. Keyed the same way.
 static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
 static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
+// Marks the `ttg.convert_layout` that stands for a whole `tl.flip` until the
+// convert_layout walk plans it as an exchange (see `rewriteHypercubeFlips`).
+static constexpr llvm::StringLiteral kFlipDimAttr = "metal.flip_dim";
 // Set by the pre-conversion cvt walk on a `ttg.convert_layout` it classified
 // as a scalar relabel, so `ConvertLayoutLowering` reaches the same verdict.
 static constexpr llvm::StringLiteral kScalarIdentityAttr =
@@ -313,6 +321,11 @@ static constexpr llvm::StringLiteral kScalarIdentityAttr =
 // thread. The publish's operand is the pre-exchange value, which the
 // evaluator can replay (a `tt.trans` swaps the coordinates).
 static mlir::Value coneReplaySource(mlir::Operation *def) {
+  // A flip reorders the logical tile: replaying its source at (r, c) reads
+  // the unflipped element. `rewriteHypercubeFlips` keeps flips away from
+  // every consumer that replays; this is the backstop.
+  if (def->hasAttr(kFlipDimAttr))
+    return {};
   // A carried tile's read holds a placeholder too, and its value lives in a
   // slot no cone can replay.
   if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
@@ -321,6 +334,13 @@ static mlir::Value coneReplaySource(mlir::Operation *def) {
   if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
       tag && tag.getValue() == "read") {
     auto it = g_tileExchange.find(def);
+    // Every other exchange moves a tile between layouts and keeps each
+    // logical element where it was; a `tl.flip` read (a reversed axis in its
+    // read label) does not, so replaying its published value at (r, c) would
+    // read the unflipped element.
+    if (it != g_tileExchange.end() &&
+        llvm::any_of(it->second.dst.dimXor, [](int32_t x) { return x != 0; }))
+      return {};
     if (it != g_tileExchange.end() && it->second.publishOp &&
         it->second.publishOp->getNumOperands() == 1)
       return it->second.publishOp->getOperand(0);
@@ -3066,6 +3086,9 @@ static bool layoutIndexPlansEquivalent(const LayoutIndexPlan &lhs,
       lhs.rowMajorStride != rhs.rowMajorStride ||
       lhs.dimTerms.size() != rhs.dimTerms.size())
     return false;
+  for (size_t d = 0; d < lhs.dimTerms.size(); ++d)
+    if (lhs.xorOf(d) != rhs.xorOf(d))
+      return false;
   for (auto [lhsTerms, rhsTerms] : llvm::zip(lhs.dimTerms, rhs.dimTerms)) {
     if (lhsTerms.size() != rhsTerms.size())
       return false;
@@ -3084,7 +3107,9 @@ static bool layoutFlatIndexPlansEquivalent(const LayoutIndexPlan &lhs,
                                            const LayoutIndexPlan &rhs) {
   if (lhs.laneBits != rhs.laneBits || lhs.warpBits != rhs.warpBits ||
       lhs.registerBits != rhs.registerBits ||
-      lhs.elemPerThread != rhs.elemPerThread)
+      lhs.elemPerThread != rhs.elemPerThread ||
+      llvm::any_of(lhs.dimXor, [](int32_t x) { return x != 0; }) ||
+      llvm::any_of(rhs.dimXor, [](int32_t x) { return x != 0; }))
     return false;
   auto contribution = [](const LayoutIndexPlan &plan,
                          LayoutIndexPlan::Coord coord, int bit) {
@@ -3473,6 +3498,10 @@ emitLayoutElementIndex(mlir::Operation *op, const LayoutIndexPlan &plan,
                       .getResult()
                 : term;
     }
+    if (int32_t flip = plan.xorOf(d))
+      acc = acc ? mlir::arith::XOrIOp::create(rewriter, loc, acc, cst(flip))
+                      .getResult()
+                : cst(flip);
     if (!acc)
       continue; // this dimension is entirely broadcast: coordinate 0
     if (plan.rowMajorStride[d] != 1)
@@ -39070,6 +39099,320 @@ validateRankNTupleScanScratchBudget(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
+// `tl.flip(x, d)` reaches the backend as a hypercube: `x` reshaped so axis d
+// becomes k axes of extent 2, then one round per new axis of
+// `y ^ broadcast(expand_dims(xor_sum(y, axis)))` -- which swaps the two
+// halves along that bit -- and a reshape back. Every round is a rank-N
+// reduce, and above one register band those publish their results under a
+// thread-major relabel that the reshape back cannot read (15 of 82 probe
+// cells, refused by name). The whole chain is one permutation, so replace it
+// by a single `ttg.convert_layout` marked with the flipped axis; the
+// convert_layout walk plans it as one exchange whose read reverses that axis.
+// Whether a flip's result only flows through elementwise and shape ops into
+// stores. Every exchange but a flip moves a tile between layouts and keeps
+// each logical element where it was, and many passes -- the preflight ones
+// above all -- peel a `ttg.convert_layout` as such a relabel; a reduce, scan,
+// dot or loop reached from a flip would be judged on the unflipped source
+// before conversion and fail inside it. Those keep Triton's own chain.
+static bool flipResultReachesOnlyStores(mlir::Value result) {
+  llvm::SmallVector<mlir::Value, 16> work{result};
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  while (!work.empty()) {
+    mlir::Value value = work.pop_back_val();
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!seen.insert(user).second)
+        continue;
+      if (mlir::isa<mlir::triton::StoreOp>(user))
+        continue;
+      if (user->getNumRegions() != 0 || !mlir::isMemoryEffectFree(user) ||
+          mlir::isa<mlir::triton::DotOp, mlir::triton::DotScaledOp,
+                    mlir::triton::GatherOp, mlir::triton::HistogramOp>(user) ||
+          user->hasTrait<mlir::OpTrait::IsTerminator>())
+        return false;
+      llvm::append_range(work, user->getResults());
+    }
+  }
+  return true;
+}
+
+static bool isXorCombine(mlir::triton::ReduceOp reduce) {
+  mlir::Block &block = reduce.getCombineOp().front();
+  if (block.getNumArguments() != 2 || !llvm::hasNItems(block, 2))
+    return false;
+  auto xorOp = mlir::dyn_cast<mlir::arith::XOrIOp>(block.front());
+  auto ret = mlir::dyn_cast<mlir::triton::ReduceReturnOp>(block.back());
+  if (!xorOp || !ret || ret->getNumOperands() != 1 ||
+      ret->getOperand(0) != xorOp.getResult())
+    return false;
+  llvm::SmallPtrSet<mlir::Value, 2> args(block.getArguments().begin(),
+                                         block.getArguments().end());
+  return xorOp.getLhs() != xorOp.getRhs() && args.count(xorOp.getLhs()) &&
+         args.count(xorOp.getRhs());
+}
+
+// One round `y ^ broadcast(expand_dims(xor_sum(y, a)))` over an axis of
+// extent 2: the swap of that axis's two halves. Returns the axis, or -1.
+static int64_t xorSwapRoundAxis(mlir::arith::XOrIOp xorOp, mlir::Value &input) {
+  auto type = mlir::dyn_cast<mlir::RankedTensorType>(xorOp.getType());
+  if (!type)
+    return -1;
+  for (int side = 0; side < 2; ++side) {
+    mlir::Value keep = xorOp->getOperand(side);
+    auto broadcast =
+        xorOp->getOperand(1 - side).getDefiningOp<mlir::triton::BroadcastOp>();
+    auto expand = broadcast
+                      ? broadcast.getSrc().getDefiningOp<mlir::triton::ExpandDimsOp>()
+                      : nullptr;
+    auto reduce = expand
+                      ? expand.getSrc().getDefiningOp<mlir::triton::ReduceOp>()
+                      : nullptr;
+    if (!reduce || reduce->getNumOperands() != 1 ||
+        reduce->getNumResults() != 1 || reduce->getOperand(0) != keep ||
+        static_cast<int64_t>(reduce.getAxis()) !=
+            static_cast<int64_t>(expand.getAxis()) ||
+        keep.getType() != type || !isXorCombine(reduce) ||
+        type.getDimSize(reduce.getAxis()) != 2)
+      continue;
+    input = keep;
+    return reduce.getAxis();
+  }
+  return -1;
+}
+
+static bool rewriteHypercubeFlipsOnce(mlir::ModuleOp moduleOp) {
+  bool changed = false;
+  // Both passes collect first and erase dead chains as they go, so an op
+  // collected later may already be gone.
+  llvm::DenseSet<mlir::Operation *> erased;
+  llvm::SmallVector<mlir::triton::ReshapeOp, 4> exits;
+  moduleOp.walk([&](mlir::triton::ReshapeOp reshape) {
+    exits.push_back(reshape);
+  });
+  // Last flip first: a flip feeding another flip only reaches stores once
+  // the later one is no longer a chain of reduces.
+  for (mlir::triton::ReshapeOp exit : llvm::reverse(exits)) {
+    if (erased.count(exit.getOperation()))
+      continue;
+    auto outTy = mlir::dyn_cast<mlir::RankedTensorType>(exit.getType());
+    auto hyperTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(exit.getSrc().getType());
+    if (!outTy || !hyperTy || hyperTy.getRank() <= outTy.getRank())
+      continue;
+    // Walk the xor rounds back from the exit to the entry reshape.
+    llvm::SmallVector<int64_t, 8> axes;
+    mlir::Value y = exit.getSrc();
+    mlir::triton::ReshapeOp entry;
+    while (!entry) {
+      if (auto reshape = y.getDefiningOp<mlir::triton::ReshapeOp>()) {
+        entry = reshape;
+        break;
+      }
+      auto xorOp = y.getDefiningOp<mlir::arith::XOrIOp>();
+      if (!xorOp)
+        break;
+      mlir::Value prev;
+      for (int side = 0; side < 2 && !prev; ++side) {
+        mlir::Value keep = xorOp->getOperand(side);
+        auto broadcast = xorOp->getOperand(1 - side)
+                             .getDefiningOp<mlir::triton::BroadcastOp>();
+        auto expand = broadcast ? broadcast.getSrc()
+                                      .getDefiningOp<mlir::triton::ExpandDimsOp>()
+                                : nullptr;
+        auto reduce =
+            expand ? expand.getSrc().getDefiningOp<mlir::triton::ReduceOp>()
+                   : nullptr;
+        if (!reduce || reduce->getNumOperands() != 1 ||
+            reduce->getNumResults() != 1 || reduce->getOperand(0) != keep ||
+            static_cast<int64_t>(reduce.getAxis()) !=
+                static_cast<int64_t>(expand.getAxis()) ||
+            keep.getType() != hyperTy || !isXorCombine(reduce))
+          continue;
+        axes.push_back(reduce.getAxis());
+        prev = keep;
+      }
+      if (!prev)
+        break;
+      y = prev;
+    }
+    if (!entry || axes.empty() || entry.getType() != hyperTy)
+      continue;
+    auto inTy =
+        mlir::dyn_cast<mlir::RankedTensorType>(entry.getSrc().getType());
+    if (!inTy || inTy.getElementType() != outTy.getElementType())
+      continue;
+    // The rounds must cover the axes d .. d+k-1, each an odd number of times
+    // (a flip) or each an even number (the identity: two integer flips of
+    // one axis fuse into one chain once Triton folds the reshapes between).
+    llvm::sort(axes);
+    llvm::SmallVector<int64_t, 8> unique(axes.begin(), axes.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    const int64_t k = unique.size();
+    const int64_t d = unique.front();
+    bool contiguous = true;
+    for (int64_t i = 0; i < k && contiguous; ++i)
+      contiguous = unique[i] == d + i && hyperTy.getDimSize(d + i) == 2;
+    if (!contiguous)
+      continue;
+    auto parity = [&](int64_t axis) {
+      return llvm::count(axes, axis) % 2;
+    };
+    const bool flips = parity(d) == 1;
+    if (llvm::any_of(unique, [&](int64_t a) { return parity(a) != parity(d); }))
+      continue;
+    // The tile being flipped: axis d of it is exactly those k bits. Without
+    // bitcasts between them (an integer tile) Triton folds the reshapes on
+    // either side into their neighbours', so only one end may still have
+    // the tile's shape; recover it from whichever does.
+    auto isTile = [&](mlir::RankedTensorType ty) {
+      if (ty.getRank() != hyperTy.getRank() - k + 1 || d >= ty.getRank() ||
+          ty.getDimSize(d) != (int64_t{1} << k))
+        return false;
+      for (int64_t i = 0; i < ty.getRank(); ++i)
+        if (i != d &&
+            ty.getDimSize(i) != hyperTy.getDimSize(i < d ? i : i + k - 1))
+          return false;
+      return true;
+    };
+    mlir::RankedTensorType tileTy =
+        isTile(outTy) ? outTy : isTile(inTy) ? inTy : nullptr;
+    if (!tileTy || !flipResultReachesOnlyStores(exit.getResult()))
+      continue;
+    mlir::OpBuilder b(exit);
+    mlir::Value source = entry.getSrc();
+    if (inTy.getShape() != tileTy.getShape())
+      source = mlir::triton::ReshapeOp::create(b, exit.getLoc(), tileTy, source)
+                   .getResult();
+    mlir::Value result = source;
+    if (flips) {
+      auto flip = mlir::triton::gpu::ConvertLayoutOp::create(
+          b, exit.getLoc(), tileTy, source);
+      flip->setAttr(kFlipDimAttr, b.getI64IntegerAttr(d));
+      result = flip.getResult();
+    } else if (source.getType() != tileTy) {
+      result = mlir::triton::gpu::ConvertLayoutOp::create(b, exit.getLoc(),
+                                                          tileTy, source)
+                   .getResult();
+    }
+    if (outTy.getShape() != tileTy.getShape())
+      result = mlir::triton::ReshapeOp::create(b, exit.getLoc(), outTy, result)
+                   .getResult();
+    exit.getResult().replaceAllUsesWith(result);
+    changed = true;
+    // The chain is dead now unless something else reads a piece of it.
+    llvm::SmallVector<mlir::Operation *, 32> work{exit.getOperation()};
+    while (!work.empty()) {
+      mlir::Operation *op = work.pop_back_val();
+      // An op reached twice (a value feeding both the reduce and the xor of
+      // a round) is erased on the first visit.
+      if (erased.count(op) || !op->use_empty() || !mlir::isMemoryEffectFree(op))
+        continue;
+      llvm::SmallVector<mlir::Operation *, 4> operands;
+      for (mlir::Value operand : op->getOperands())
+        if (mlir::Operation *def = operand.getDefiningOp())
+          operands.push_back(def);
+      erased.insert(op);
+      op->erase();
+      llvm::append_range(work, operands);
+    }
+  }
+
+  // A flip along an axis of extent 2 is ONE round with no reshapes around it
+  // (Triton folds the reshape to the same shape). `tl.sort` spells its
+  // compare-and-swap with the same round, on a hypercube it reshaped into and
+  // with a select that compares the round against its input; those keep the
+  // sort's own planning, so skip a round fed by a reshape or a select, or
+  // whose result meets its own input in a compare or select.
+  llvm::SmallVector<mlir::arith::XOrIOp, 4> rounds;
+  // Tensor rounds only: the scalar xor inside each xor_sum's combine region
+  // is freed with its reduce, which `erased` does not record.
+  moduleOp.walk([&](mlir::arith::XOrIOp xorOp) {
+    if (mlir::isa<mlir::RankedTensorType>(xorOp.getType()))
+      rounds.push_back(xorOp);
+  });
+  for (mlir::arith::XOrIOp xorOp : llvm::reverse(rounds)) {
+    if (erased.count(xorOp.getOperation()))
+      continue;
+    mlir::Value input;
+    int64_t axis = xorSwapRoundAxis(xorOp, input);
+    if (axis < 0)
+      continue;
+    auto isEncoded = [](mlir::Type type) {
+      auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
+      return rtt && mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+                        rtt.getEncoding());
+    };
+    if (!isEncoded(input.getType()))
+      continue;
+    mlir::Value origin = input;
+    while (auto bitcast = origin.getDefiningOp<mlir::triton::BitcastOp>())
+      origin = bitcast.getSrc();
+    if (mlir::isa_and_nonnull<mlir::triton::ReshapeOp, mlir::arith::SelectOp>(
+            origin.getDefiningOp()))
+      continue;
+    // A lone round only. Without bitcasts between them (an integer tile),
+    // Triton folds one flip's exit reshape into the next flip's entry and
+    // the two chains fuse on a hypercube; a round in the middle of that is
+    // not a flip of the user's tile (17 i32 cells went wrong taking it).
+    auto isRound = [](mlir::Operation *op) {
+      mlir::Value unused;
+      auto xorOp = mlir::dyn_cast_or_null<mlir::arith::XOrIOp>(op);
+      return xorOp && xorSwapRoundAxis(xorOp, unused) >= 0;
+    };
+    if (isRound(origin.getDefiningOp()) ||
+        llvm::any_of(xorOp.getResult().getUsers(), isRound))
+      continue;
+    // Does the round's result (through bitcasts) meet the round's input (or
+    // what it was bitcast from) in a compare or a select?
+    llvm::SmallPtrSet<mlir::Value, 4> inputs{input, origin};
+    llvm::SmallVector<mlir::Value, 4> results{xorOp.getResult()};
+    bool compareAndSwap = false;
+    while (!results.empty() && !compareAndSwap) {
+      mlir::Value value = results.pop_back_val();
+      for (mlir::Operation *user : value.getUsers()) {
+        if (mlir::isa<mlir::triton::BitcastOp>(user)) {
+          results.push_back(user->getResult(0));
+          continue;
+        }
+        if (mlir::isa<mlir::arith::CmpFOp, mlir::arith::CmpIOp,
+                      mlir::arith::SelectOp>(user))
+          for (mlir::Value operand : user->getOperands())
+            compareAndSwap |= inputs.count(operand) != 0;
+      }
+    }
+    if (compareAndSwap || !flipResultReachesOnlyStores(xorOp.getResult()))
+      continue;
+    mlir::OpBuilder b(xorOp);
+    auto flip = mlir::triton::gpu::ConvertLayoutOp::create(
+        b, xorOp.getLoc(), xorOp.getType(), input);
+    flip->setAttr(kFlipDimAttr, b.getI64IntegerAttr(axis));
+    xorOp.getResult().replaceAllUsesWith(flip.getResult());
+    changed = true;
+    llvm::SmallVector<mlir::Operation *, 8> work{xorOp.getOperation()};
+    while (!work.empty()) {
+      mlir::Operation *op = work.pop_back_val();
+      // An op reached twice (a value feeding both the reduce and the xor of
+      // a round) is erased on the first visit.
+      if (erased.count(op) || !op->use_empty() || !mlir::isMemoryEffectFree(op))
+        continue;
+      llvm::SmallVector<mlir::Operation *, 4> operands;
+      for (mlir::Value operand : op->getOperands())
+        if (mlir::Operation *def = operand.getDefiningOp())
+          operands.push_back(def);
+      erased.insert(op);
+      op->erase();
+      llvm::append_range(work, operands);
+    }
+  }
+  return changed;
+}
+
+// To a fixed point: rewriting one flip can make the flip feeding it
+// rewritable (see `flipResultReachesOnlyStores`).
+static void rewriteHypercubeFlips(mlir::ModuleOp moduleOp) {
+  while (rewriteHypercubeFlipsOnce(moduleOp)) {
+  }
+}
+
 // A tensor a nested-scan segment can recompute where it is read: a regionless,
 // effect-free cone whose leaves are scalars. Anything else -- a load, notably --
 // is computed once and carried to its readers through a slot.
@@ -40671,6 +41014,7 @@ struct ConvertTritonGPUToMetalPass
     g_rankNPlannedReduces.clear();
     g_broadcastExchange.clear();
 
+    rewriteHypercubeFlips(moduleOp);
     if (mlir::failed(selectNestedScanLoops(moduleOp))) {
       signalPassFailure();
       return;
@@ -41780,6 +42124,40 @@ struct ConvertTritonGPUToMetalPass
     // `ConvertLayoutLowering`). See
     // the implementation notes.
     bool cvtOk = true;
+    // A `tl.flip` (see `rewriteHypercubeFlips`) is one exchange: publish
+    // under the source's label, read under the destination's with the
+    // flipped axis reversed. The labels are the ones the convert_layout
+    // exchange below would pick.
+    llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp, 4> flips;
+    moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
+      if (cvt->hasAttr(kFlipDimAttr))
+        flips.push_back(cvt);
+    });
+    for (auto cvt : flips) {
+      auto dstTy = mlir::cast<mlir::RankedTensorType>(cvt.getType());
+      const int64_t dim =
+          cvt->getAttrOfType<mlir::IntegerAttr>(kFlipDimAttr).getInt();
+      std::optional<LayoutIndexPlan> src, dst;
+      if (!functionHasRankNPhase(cvt.getOperation()))
+        if (auto labels = threadMajorCvtLabels(cvt)) {
+          src = labels->first;
+          dst = labels->second;
+        }
+      if (!dst) {
+        src = exchangeSourcePlan(cvt.getSrc());
+        dst = planLayoutIndex(dstTy);
+      }
+      if (src && dst) {
+        dst->dimXor.assign(dstTy.getRank(), 0);
+        dst->dimXor[dim] = static_cast<int32_t>(dstTy.getDimSize(dim) - 1);
+        if (planTileExchange(cvt.getOperation(), /*allowGeneralPhase=*/true,
+                             src, dst))
+          continue;
+      }
+      cvt.emitOpError("Metal backend: this tl.flip cannot be scheduled as an "
+                      "exact-layout exchange");
+      cvtOk = false;
+    }
     // Collect first, decide after: `planTileExchange` REWRITES the body (it
     // splits the cvt into a publish/read pair and reorders around it), and
     // mutating inside a walk is not allowed.

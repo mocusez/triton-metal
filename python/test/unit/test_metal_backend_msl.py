@@ -6694,3 +6694,47 @@ def test_replayed_clamp_matches_elementwise_bitwise(policy):
     assert bool(torch.isnan(a[0])) is expected_nan_is_nan, a[:2].tolist()
     # Signed zero survives both policies.
     assert bool(torch.signbit(b[1])), b[:2].tolist()
+
+
+# `tl.flip` over rank >= 2 tiles. Triton spells it as a hypercube of xor-sum
+# reduces between two reshapes (or one round, with no reshapes, over an axis
+# of extent 2); the backend replaces the chain by one exchange whose read
+# reverses the axis. Above one register band the old chain's reduces
+# relabelled their results and the reshape back could not read them.
+@triton.jit
+def _flip_rank_n_kernel(x_ptr, o_ptr, A: tl.constexpr, B: tl.constexpr,
+                        C: tl.constexpr, RANK: tl.constexpr, DIM: tl.constexpr,
+                        TWICE: tl.constexpr):
+    if RANK == 2:
+        off = tl.arange(0, A)[:, None] * B + tl.arange(0, B)[None, :]
+    else:
+        off = (tl.arange(0, A)[:, None, None] * (B * C) +
+               tl.arange(0, B)[None, :, None] * C + tl.arange(0, C)[None, None, :])
+    y = tl.flip(tl.load(x_ptr + off) * 2 + 1, DIM)
+    if TWICE:
+        y = tl.flip(y, RANK - 1)
+    tl.store(o_ptr + off, y)
+
+
+@pytest.mark.parametrize("shape,dim,num_warps", [
+    ((16, 16), 0, 1), ((16, 16), 1, 1), ((8, 128), 1, 4), ((32, 8), 0, 1),
+    ((2, 32), 0, 1), ((4, 8, 16), 0, 1), ((4, 8, 16), 2, 1), ((2, 16, 32), 1, 4),
+    ((8, 2, 16), 1, 1)])
+@pytest.mark.parametrize("dtype", ["float32", "float16", "int32"])
+@pytest.mark.parametrize("twice", [False, True])
+def test_flip_rank_n_matches_torch(shape, dim, num_warps, dtype, twice):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    A, B, C = (list(shape) + [1])[:3]
+    n = A * B * C
+    x = (torch.randperm(n, generator=torch.Generator().manual_seed(n + dim)) % 97 -
+         48).to(getattr(torch, dtype)).reshape(shape)
+    out = torch.zeros_like(x, device="mps")
+    _flip_rank_n_kernel[(1,)](x.to("mps"), out, A, B, C, len(shape), dim, twice,
+                              num_warps=num_warps)
+    torch.mps.synchronize()
+    want = (x * 2 + 1).flip(dim)
+    if twice:
+        want = want.flip(len(shape) - 1)
+    assert torch.equal(out.cpu(), want)
