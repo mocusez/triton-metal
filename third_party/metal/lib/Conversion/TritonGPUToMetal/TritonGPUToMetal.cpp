@@ -299,6 +299,27 @@ static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
 // dominates both loops. Keyed the same way.
 static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
 static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
+
+// The value a replayed cone should read THROUGH a layout op. A cvt is a
+// shape-only step for replay -- the evaluator addresses logical (row, col) --
+// but once `planTileExchange` has split one into publish/read, the READ's
+// operand is a placeholder `dense<0>` and the value lives on its publish.
+// Recursing into the placeholder replayed that constant: `tl.sum(tl.trans(x)
+// + w, 0)` folded `0 + w`, silently, in 16 of 50 cells at 2..4 elements per
+// thread. The publish's operand is the pre-exchange value, which the
+// evaluator can replay (a `tt.trans` swaps the coordinates).
+static mlir::Value coneReplaySource(mlir::Operation *def) {
+  if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      tag && tag.getValue() == "read") {
+    auto it = g_tileExchange.find(def);
+    if (it != g_tileExchange.end() && it->second.publishOp &&
+        it->second.publishOp->getNumOperands() == 1)
+      return it->second.publishOp->getOperand(0);
+    return {};
+  }
+  return def->getOperand(0);
+}
+
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
@@ -9601,9 +9622,12 @@ static mlir::Value peelShapeOps(mlir::Value v) {
   while (mlir::Operation *d = v.getDefiningOp()) {
     if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                   mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
-            d))
-      v = d->getOperand(0);
-    else
+            d)) {
+      mlir::Value src = coneReplaySource(d);
+      if (!src)
+        break;
+      v = src;
+    } else
       break;
   }
   return v;
@@ -9620,7 +9644,7 @@ static mlir::Value
 scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
                      mlir::ConversionPatternRewriter &rewriter,
                      mlir::Location loc, int depth = 0) {
-  if (depth > 24)
+  if (depth > 24 || !v)
     return {};
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
     return v; // already a scalar (e.g. a tt.splat src or a program-id)
@@ -9630,7 +9654,7 @@ scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return scalarizeConeAtIndex(def->getOperand(0), idx, rewriter, loc,
+    return scalarizeConeAtIndex(coneReplaySource(def), idx, rewriter, loc,
                                 depth + 1);
   if (auto mr = mlir::dyn_cast<mlir::triton::MakeRangeOp>(def)) {
     int32_t s = static_cast<int32_t>(mr.getStart());
@@ -10333,7 +10357,7 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return evalRank1ValueAt(def->getOperand(0), idxVal, rewriter, loc,
+    return evalRank1ValueAt(coneReplaySource(def), idxVal, rewriter, loc,
                             depth + 1);
 
   // Tensor-yielding scf.if with a UNIFORM (scalar) condition → per-element
@@ -10840,6 +10864,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
 static mlir::Value evalRank1ValueAt(mlir::Value v, mlir::Value idxVal,
                                     mlir::ConversionPatternRewriter &rewriter,
                                     mlir::Location loc, int depth) {
+  if (!v)
+    return nullptr;
   Rank1EvalMemo localMemo;
   std::optional<llvm::SaveAndRestore<Rank1EvalMemo *>> guard;
   if (depth == 0 && !g_rank1EvalMemo)
@@ -11250,25 +11276,6 @@ static bool rank2ConeSupported(mlir::Value v, int depth,
 // Returns null on any unsupported producer (caller bails to
 // notifyMatchFailure).
 //===----------------------------------------------------------------------===//
-// The value a replayed cone should read THROUGH a layout op. A cvt is a
-// shape-only step for replay -- the evaluator addresses logical (row, col) --
-// but once `planTileExchange` has split one into publish/read, the READ's
-// operand is a placeholder `dense<0>` and the value lives on its publish.
-// Recursing into the placeholder replayed that constant: `tl.sum(tl.trans(x)
-// + w, 0)` folded `0 + w`, silently, in 16 of 50 cells at 2..4 elements per
-// thread. The publish's operand is the pre-exchange value, which the
-// evaluator can replay (a `tt.trans` swaps the coordinates).
-static mlir::Value coneReplaySource(mlir::Operation *def) {
-  if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
-      tag && tag.getValue() == "read") {
-    auto it = g_tileExchange.find(def);
-    if (it != g_tileExchange.end() && it->second.publishOp &&
-        it->second.publishOp->getNumOperands() == 1)
-      return it->second.publishOp->getOperand(0);
-    return {};
-  }
-  return def->getOperand(0);
-}
 
 static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
                                    mlir::Value rowBase, mlir::Value nVal,
@@ -11974,7 +11981,7 @@ static mlir::triton::LoadOp findFirstRank2LoadInCone(mlir::Value v, int depth) {
 // Mirrors `scalarizeConeAtIndex`'s accepted index producers (predicate only).
 static bool indexConeSupported(mlir::Value v, int depth,
                                bool deferAggregateLeaves = false) {
-  if (depth > 24)
+  if (depth > 24 || !v)
     return false;
   if (!mlir::isa<mlir::RankedTensorType>(v.getType()))
     return true; // scalar
@@ -11984,7 +11991,7 @@ static bool indexConeSupported(mlir::Value v, int depth,
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return indexConeSupported(def->getOperand(0), depth + 1,
+    return indexConeSupported(coneReplaySource(def), depth + 1,
                               deferAggregateLeaves);
   if (mlir::isa<mlir::triton::MakeRangeOp>(def))
     return true;
@@ -12018,7 +12025,7 @@ static bool indexConeSupported(mlir::Value v, int depth,
 // Mirrors `evalRank1ValueAt`'s accepted producers (predicate only).
 static bool rank1ConeSupported(mlir::Value v, int depth,
                                bool deferAggregateLeaves) {
-  if (depth > 24)
+  if (depth > 24 || !v)
     return false;
   if (g_loopGatherStagedValues && g_loopGatherStagedValues->count(v))
     return true;
@@ -12101,7 +12108,7 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
-    return rank1ConeSupported(def->getOperand(0), depth + 1,
+    return rank1ConeSupported(coneReplaySource(def), depth + 1,
                               deferAggregateLeaves);
   // Tensor-yielding scf.if with a scalar (uniform) condition → per-element
   // select of the two branch yields.
