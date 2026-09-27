@@ -699,3 +699,45 @@ def test_i32_keep_dims_reduce_compiles_in_bounded_time(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     size = int(proc.stdout.split("MSL_BYTES")[1].split()[0])
     assert size < 20000, f"emitted MSL is {size} bytes"
+
+
+# `tl.sum(x)` with no axis is a reduce over `tl.reshape(x, (n,))`; the
+# whole-tile aggregate replays that cone at a flat index, and a rank-2
+# broadcast in the address must read its source at `i / N` (or `i % N`), not
+# at `i`. Replaying `i` read every address with row == col.
+# The two address spellings fail differently: an offset tile broadcasts
+# integers, the inline spelling broadcasts a POINTER tile, whose walk used to
+# stop at the broadcast and drop the row offset under it.
+@triton.jit
+def _whole_tile_reduce_kernel(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr,
+                              OP: tl.constexpr, INLINE: tl.constexpr):
+    if INLINE:
+        x = tl.load(x_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
+    else:
+        off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        x = tl.load(x_ptr + off)
+    if OP == 0:
+        r = tl.sum(x)
+    elif OP == 1:
+        r = tl.max(x)
+    elif OP == 2:
+        r = tl.min(x)
+    else:
+        r = tl.sum(x * x)
+    tl.store(out_ptr, r)
+
+
+@pytest.mark.parametrize("shape", [(4, 32), (16, 16), (8, 128), (64, 16)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("op", [0, 1, 2, 3])
+@pytest.mark.parametrize("inline", [False, True])
+def test_no_axis_reduce_over_rank2_tile(shape, num_warps, op, inline):
+    M, N = shape
+    x = (torch.randperm(M * N, generator=torch.Generator().manual_seed(M * N + op))
+         % 97 - 48).float().reshape(M, N)
+    out = torch.zeros(1, device="mps")
+    _whole_tile_reduce_kernel[(1,)](x.to("mps"), out, M, N, op, inline,
+                                    num_warps=num_warps)
+    torch.mps.synchronize()
+    want = [x.sum(), x.max(), x.min(), (x * x).sum()][op]
+    assert out.cpu()[0] == want

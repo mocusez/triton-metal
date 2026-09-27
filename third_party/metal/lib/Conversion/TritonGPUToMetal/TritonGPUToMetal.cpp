@@ -9734,6 +9734,58 @@ static mlir::Value peelShapeOps(mlir::Value v) {
   return v;
 }
 
+// The row-major flat index of the element of a broadcast's SOURCE that
+// element `idx` of its result reads. A flat-index cone walk may pass straight
+// through elementwise ops, reshapes, expand_dims (a unit axis moves no flat
+// index) and convert_layout, but not a broadcast of rank >= 2: `(16,1)->(16,16)`
+// reads source element `i / 16`, not `i`. Passing `i` through read every
+// rank-2 address with row == col, so `tl.sum(x)` over a 2-D tile -- which
+// Triton spells as a reduce over `tl.reshape(x, (n,))` -- summed the diagonal
+// band instead of the tile (57 of 84 sum/max/min/sum-of-squares cells wrong
+// at two or more elements per thread). Rank-1 broadcasts keep `idx`.
+static mlir::Value broadcastSourceFlatIndex(mlir::triton::BroadcastOp broadcast,
+                                            mlir::Value idx,
+                                            mlir::ConversionPatternRewriter &rewriter,
+                                            mlir::Location loc) {
+  auto srcTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getSrc().getType());
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getType());
+  if (!srcTy || !resTy || resTy.getRank() < 2 ||
+      srcTy.getShape() == resTy.getShape())
+    return idx;
+  auto cst = [&](int64_t v) {
+    return mlir::arith::ConstantOp::create(
+               rewriter, loc, rewriter.getIntegerAttr(idx.getType(), v))
+        .getResult();
+  };
+  mlir::Value srcIdx;
+  int64_t resStride = 1, srcStride = 1;
+  for (int64_t d = resTy.getRank() - 1; d >= 0; --d) {
+    if (srcTy.getDimSize(d) > 1) {
+      mlir::Value coord = idx;
+      if (resStride != 1)
+        coord = mlir::arith::DivSIOp::create(rewriter, loc, coord,
+                                             cst(resStride))
+                    .getResult();
+      if (d > 0)
+        coord = mlir::arith::RemSIOp::create(rewriter, loc, coord,
+                                             cst(resTy.getDimSize(d)))
+                    .getResult();
+      if (srcStride != 1)
+        coord = mlir::arith::MulIOp::create(rewriter, loc, coord,
+                                            cst(srcStride))
+                    .getResult();
+      srcIdx = srcIdx ? mlir::arith::AddIOp::create(rewriter, loc, srcIdx,
+                                                    coord)
+                            .getResult()
+                      : coord;
+    }
+    resStride *= resTy.getDimSize(d);
+    srcStride *= srcTy.getDimSize(d);
+  }
+  return srcIdx ? srcIdx : cst(0);
+}
+
 // Symbolically evaluate the SCALAR integer value of an index cone `v` at
 // logical element position `idx` (an i32 scalar). Walks the ORIGINAL Triton
 // cone: make_range(start s) -> idx + s; tt.splat(x) -> x; integer
@@ -9752,6 +9804,11 @@ scalarizeConeAtIndex(mlir::Value v, mlir::Value idx,
   mlir::Operation *def = v.getDefiningOp();
   if (!def)
     return {};
+  if (auto broadcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+    return scalarizeConeAtIndex(
+        broadcast.getSrc(),
+        broadcastSourceFlatIndex(broadcast, idx, rewriter, loc), rewriter, loc,
+        depth + 1);
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
@@ -10454,7 +10511,13 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
         .getResult(0);
   }
 
-  // Shape-only ops: recurse operand 0 at the same index.
+  // Shape-only ops: recurse operand 0 at the same index -- except a rank >= 2
+  // broadcast, which reads its source at another flat index.
+  if (auto broadcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+    return evalRank1ValueAt(
+        broadcast.getSrc(),
+        broadcastSourceFlatIndex(broadcast, idxVal, rewriter, loc), rewriter,
+        loc, depth + 1);
   if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
                 mlir::triton::gpu::ConvertLayoutOp, mlir::triton::ReshapeOp>(
           def))
@@ -10553,6 +10616,11 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     };
     {
       mlir::Value cur = load.getPtr();
+      // The index the current pointer is read at: a pointer broadcast of rank
+      // >= 2 reads its source elsewhere (`broadcastSourceFlatIndex`). The walk
+      // used to stop at a pointer broadcast and silently drop every offset
+      // under it -- `x_ptr + r[:, None] * N + c[None, :]` lost its row.
+      mlir::Value curIdx = idxVal;
       bool sawSplat = false;
       bool addressOk = true;
       while (true) {
@@ -10560,12 +10628,25 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
           sawSplat = true;
           cur = sp.getSrc();
         }
+        if (auto broadcast = cur.getDefiningOp<mlir::triton::BroadcastOp>()) {
+          curIdx = broadcastSourceFlatIndex(broadcast, curIdx, rewriter, loc);
+          cur = broadcast.getSrc();
+          continue;
+        }
+        // A pointer bitcast (a bool tile read through i8) moves no index.
+        if (mlir::isa_and_nonnull<mlir::triton::ExpandDimsOp,
+                                  mlir::triton::gpu::ConvertLayoutOp,
+                                  mlir::triton::BitcastOp>(
+                cur.getDefiningOp())) {
+          cur = cur.getDefiningOp()->getOperand(0);
+          continue;
+        }
         auto ap = cur.getDefiningOp<mlir::triton::AddPtrOp>();
         if (!ap)
           break;
         mlir::Value off = ap.getOffset();
         if (mlir::isa<mlir::RankedTensorType>(off.getType())) {
-          mlir::Value s = scalarizeConeAtIndex(off, idxVal, rewriter, loc, 0);
+          mlir::Value s = scalarizeConeAtIndex(off, curIdx, rewriter, loc, 0);
           if (!s)
             return nullptr;
           addTerm(s);
@@ -10576,7 +10657,7 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
           // that is about to be erased.  Replay the scalar cone as well; the
           // old iv resolves through g_loopScalarRemap.
           mlir::Value s =
-              evalRank1ValueAt(off, idxVal, rewriter, loc, depth + 1);
+              evalRank1ValueAt(off, curIdx, rewriter, loc, depth + 1);
           if (!s) {
             addressOk = false;
             break;
@@ -10585,7 +10666,8 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
         }
         cur = ap.getPtr();
       }
-      if (!addressOk)
+      // A tensor pointer left over is an address this walk cannot read.
+      if (!addressOk || mlir::isa<mlir::RankedTensorType>(cur.getType()))
         return nullptr;
       // A zero tensor offset canonicalises away the addptr entirely, leaving
       // `tt.load(tt.splat(base))` (for example `position_ids[rows % 1]`).
@@ -12250,6 +12332,14 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
         sawSplat = true;
         cur = splat.getSrc();
       }
+      if (mlir::isa_and_nonnull<mlir::triton::BroadcastOp,
+                                mlir::triton::ExpandDimsOp,
+                                mlir::triton::gpu::ConvertLayoutOp,
+                                mlir::triton::BitcastOp>(
+              cur.getDefiningOp())) {
+        cur = cur.getDefiningOp()->getOperand(0);
+        continue;
+      }
       auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>();
       if (!addptr)
         break;
@@ -12263,7 +12353,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
         return false;
       cur = addptr.getPtr();
     }
-    if (!sawAddPtr && !sawSplat)
+    if ((!sawAddPtr && !sawSplat) ||
+        mlir::isa<mlir::RankedTensorType>(cur.getType()))
       return false;
     // Masked loads are handled by an scf.if guard; the mask + other cones must
     // themselves be evaluable at an index.
