@@ -4334,6 +4334,27 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
             dstRtt.getEncoding())) {
       if (srcRtt.getShape() != dstRtt.getShape())
         return false;
+      // Two slices that drop the SAME axis of two rank-2 parents do not move
+      // anything in this backend: a rank-1 value holds element `localTid % n`
+      // whichever parent its type names -- that is what the row- and
+      // column-reduce lowerings hand every thread. Comparing the two parents'
+      // plans answers a question the value never asked, and the exchange it
+      // led to published `localTid % n` into the slot the source parent names
+      // for that lane. 📏 `tl.max(x, 1, keep_dims=True)` stored as an `[R, 1]`
+      // column put row 0's maximum in every row: `s_keepdims_reduce_store.py`
+      // 26 wrong and 62 refused, from 0 and 6 before the plan comparison went
+      // in. A staged rank-N reduce DOES relabel its result, so its producer
+      // keeps the comparison below.
+      {
+        auto srcSlice = mlir::cast<mlir::triton::gpu::SliceEncodingAttr>(
+            srcRtt.getEncoding());
+        auto dstSlice = mlir::cast<mlir::triton::gpu::SliceEncodingAttr>(
+            dstRtt.getEncoding());
+        mlir::Operation *producer = op.getSrc().getDefiningOp();
+        if (srcRtt.getRank() == 1 && srcSlice.getDim() == dstSlice.getDim() &&
+            !(producer && g_rankNPlannedReduces.count(producer)))
+          return true;
+      }
       auto srcPlan = exchangeSourcePlan(op.getSrc());
       auto dstPlan = planLayoutIndex(dstRtt);
       if (!srcPlan || !dstPlan ||

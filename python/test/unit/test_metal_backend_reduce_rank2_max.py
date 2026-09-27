@@ -613,3 +613,53 @@ def test_axis0_reduce_reexpanded_i32_is_rejected_not_crashed(capfd):
                                       64, 1, BM=64, BN=4)
     torch.mps.synchronize()
     torch.testing.assert_close(got.cpu(), torch.zeros(64), atol=0, rtol=0)
+
+
+@triton.jit
+def _keepdims_reduce_store_kernel(x_ptr, y_ptr, M: tl.constexpr,
+                                  N: tl.constexpr, OP: tl.constexpr,
+                                  AXIS: tl.constexpr):
+    r = tl.arange(0, M)
+    c = tl.arange(0, N)
+    x = tl.load(x_ptr + r[:, None] * N + c[None, :])
+    if AXIS == 1:
+        m = tl.sum(x, 1, keep_dims=True) if OP == 0 else tl.max(x, 1, keep_dims=True)
+        tl.store(y_ptr + r[:, None] + tl.arange(0, 1)[None, :], m)
+    else:
+        m = tl.sum(x, 0, keep_dims=True) if OP == 0 else tl.max(x, 0, keep_dims=True)
+        tl.store(y_ptr + tl.arange(0, 1)[:, None] + c[None, :], m)
+
+
+# A reduce result stored with its reduced axis KEPT -- a per-row statistic next
+# to its tile, and what `tl.topk(x, 1)` lowers to. Triton moves the result
+# between two slices that drop the SAME axis of two rank-2 parents, and a rank-1
+# value holds element `localTid % n` under either, so that conversion is a
+# relabel. When slice-to-slice conversions began comparing the two parents'
+# plans, this one became an exchange that published `localTid % n` into the
+# slot the source parent names for the lane: every row got row 0's value, and
+# other shapes were refused. 📏 `s_keepdims_reduce_store.py` 26 wrong / 62
+# refused -> 0 / 6.
+# An axis-0 reduce with more output columns than threads is a named refusal of
+# its own, before and after, so those cells are left out.
+_KEEPDIMS_CASES = [
+    (M, N, w, op, axis)
+    for (M, N, w) in ((2, 16, 1), (4, 32, 1), (4, 32, 4), (8, 32, 2),
+                      (16, 16, 4), (2, 64, 1), (32, 8, 4), (8, 128, 1))
+    for op in ("sum", "max")
+    for axis in (1, 0)
+    if not (axis == 0 and N > 32 * w)
+]
+
+
+@pytest.mark.parametrize("M,N,num_warps,op,axis", _KEEPDIMS_CASES)
+def test_keep_dims_reduce_stored_as_a_tile(M, N, num_warps, op, axis):
+    torch.manual_seed(M * 31 + N + num_warps)
+    x = torch.randint(-64, 64, (M, N), device="mps").float()
+    n = M if axis == 1 else N
+    y = torch.zeros(n, device="mps")
+    _keepdims_reduce_store_kernel[(1,)](x, y, M, N, 0 if op == "sum" else 1,
+                                        axis, num_warps=num_warps)
+    torch.mps.synchronize()
+    xc = x.cpu()
+    want = xc.sum(axis) if op == "sum" else xc.amax(axis)
+    assert torch.equal(y.cpu(), want)
