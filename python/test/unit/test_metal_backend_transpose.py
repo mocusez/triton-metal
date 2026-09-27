@@ -655,19 +655,17 @@ def test_permute_rank3_address_cone_publishes_through_threadgroup_memory():
     pytest.param(1, 2, 4, 16, (2, 1, 0), id="2x4x16w1e4_210"),
     pytest.param(2, 2, 8, 16, (1, 2, 0), id="2x8x16w2e4_120"),
 ])
-def test_permute_rank3_address_cone_off_thread_major_is_named(
+def test_permute_rank3_address_cone_off_thread_major_matches_torch(
         A, B, C, perm, num_warps):
-    """Fail-closed, and the last two cells are why the gate is not `E <= 4`.
-
-    `2x4x16` at one warp and `2x8x16` at two hold four elements per thread, the
-    same as cells that are exact above; their destination layout puts the
-    register bits at flat offsets 1 and 64 instead of 1 and 2, so the store's
-    own `localTid * E + iv` would read another lane's slot. With the phase
-    forced open all five return wrong answers.
+    """These were refused by name: their destination LAYOUT is not the
+    thread-major expression the store addresses by, and the exchange used the
+    layouts' own plans. The exchange now publishes and reads under the
+    thread-major labels the values actually carry -- the operand's, with its
+    axes permuted through the `tt.trans`, and the store's -- which is exact
+    whatever either layout is. `s_rank3_permute.py`: 19 named -> 0, 0 wrong.
     """
-    with pytest.raises(Exception) as exc:
-        _run_permute_rank3_addr(A, B, C, perm, num_warps)
-    assert "convert-tritongpu-to-metal failed" in str(exc.value), str(exc.value)
+    got, want, _ = _run_permute_rank3_addr(A, B, C, perm, num_warps)
+    torch.testing.assert_close(got, want)
 
 
 # --------------------------------------------------------------------------
@@ -802,6 +800,25 @@ def _trans_add_reduce_kernel(X, W, Y, M: tl.constexpr, N: tl.constexpr,
 @pytest.mark.parametrize("axis", [0, 1])
 def test_trans_add_reduce_matches_torch(M, N, num_warps, axis):
     torch.manual_seed(M * 31 + N + num_warps + axis)
+    x = torch.randn(M, N)
+    w = torch.randn(N, M)
+    y = torch.zeros(M if axis == 0 else N, device="mps")
+    _trans_add_reduce_kernel[(1,)](x.to("mps"), w.to("mps"), y, M, N, axis,
+                                   num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu(), (x.T + w).sum(axis), atol=1e-4, rtol=1e-4)
+
+
+# Shapes whose trans cvt used to be refused ("broader staged-transpose
+# deferred") because neither layout was thread-major. The exchange now runs
+# between the two thread-major labels. `s_trans_consumers.py`: 34 named -> 0.
+@pytest.mark.parametrize("M,N,num_warps", [
+    (16, 32, 1), (32, 32, 1), (64, 64, 4), (8, 64, 1), (64, 8, 2), (4, 128, 1),
+    (32, 16, 2),
+])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_trans_add_reduce_beyond_thread_major_layouts(M, N, num_warps, axis):
+    torch.manual_seed(M * 17 + N + num_warps + axis)
     x = torch.randn(M, N)
     w = torch.randn(N, M)
     y = torch.zeros(M if axis == 0 else N, device="mps")

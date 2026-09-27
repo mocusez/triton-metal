@@ -29496,7 +29496,9 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
       // it: forwarded, the init was read under one bijection while the lane
       // computed another (`tid + iv * T` against `tid * E + iv`) -- a
       // column-major C at two and four warps was wrong in 254 of 256
-      // elements. Leave the dot for the named refusal.
+      // elements. Leaving the cvt for the pre-pass's thread-major exchange
+      // fixed 21 of 27 cells and left those three wrong -- the accumulator
+      // operand never reaches that exchange -- so it keeps the refusal.
       return mlir::failure();
   }
   mlir::OpBuilder kBuilder(dot);
@@ -32825,6 +32827,96 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
   g_tileExchange[publish.getOperation()] = plan;
   g_tileExchange[readOp] = plan;
   return true;
+}
+
+// The labels a rank-2 blocked -> blocked `ttg.convert_layout` publishes and
+// reads under when both sides are thread-major tiles (see the caller). Only
+// row-major `order` on the tile the addresses were built for: the thread-major
+// flat index is decoded through `order`, and `threadMajorLayoutPlan` spells
+// the row-major decoding.
+static std::optional<std::pair<LayoutIndexPlan, LayoutIndexPlan>>
+threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
+  auto isRowMajor = [](mlir::triton::gpu::BlockedEncodingAttr enc,
+                       int64_t rank) {
+    auto order = enc.getOrder();
+    if (static_cast<int64_t>(order.size()) != rank)
+      return false;
+    for (int64_t k = 0; k < rank; ++k)
+      if (order[k] != rank - 1 - k)
+        return false;
+    return true;
+  };
+  auto rowMajorBlocked = [&](mlir::RankedTensorType ty) {
+    auto enc = ty ? mlir::dyn_cast_or_null<
+                        mlir::triton::gpu::BlockedEncodingAttr>(ty.getEncoding())
+                  : nullptr;
+    return enc && (ty.getRank() == 2 || ty.getRank() == 3) &&
+           isRowMajor(enc, ty.getRank());
+  };
+  auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
+  auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+  if (!srcTy || !dstTy || srcTy.getShape() != dstTy.getShape() ||
+      srcTy.getElementType() != dstTy.getElementType() ||
+      !rowMajorBlocked(dstTy) ||
+      !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+          srcTy.getEncoding()))
+    return std::nullopt;
+  const int64_t rank = dstTy.getRank();
+  auto dstOwn = planLayoutIndex(dstTy);
+  if (!dstOwn)
+    return std::nullopt;
+  const int64_t tpb = dstOwn->threadsPerBlock();
+  std::optional<LayoutIndexPlan> dst =
+      threadMajorLayoutPlan(dstTy.getShape(), tpb);
+  if (!dst)
+    return std::nullopt;
+  auto rowMajorStrides = [&](mlir::RankedTensorType ty) {
+    llvm::SmallVector<int64_t, 3> strides(rank, 1);
+    for (int64_t d = rank - 2; d >= 0; --d)
+      strides[d] = strides[d + 1] * ty.getDimSize(d + 1);
+    return strides;
+  };
+
+  std::optional<LayoutIndexPlan> src;
+  mlir::Value v = cvt.getSrc();
+  if (auto tr = v.getDefiningOp<mlir::triton::TransOp>()) {
+    auto inTy = mlir::dyn_cast<mlir::RankedTensorType>(tr.getSrc().getType());
+    auto perm = tr.getOrder();
+    if (!rowMajorBlocked(inTy) ||
+        static_cast<int64_t>(perm.size()) != rank ||
+        !coneIsThreadMajorLoadRooted(tr.getSrc(), rank))
+      return std::nullopt;
+    std::optional<LayoutIndexPlan> in =
+        threadMajorLayoutPlan(inTy.getShape(), tpb);
+    if (!in)
+      return std::nullopt;
+    // Result axis i is operand axis perm[i].
+    src = *in;
+    for (int64_t i = 0; i < rank; ++i)
+      src->dimTerms[i] = in->dimTerms[perm[i]];
+    auto strides = rowMajorStrides(srcTy);
+    src->rowMajorStride.assign(strides.begin(), strides.end());
+  } else {
+    if (!coneIsThreadMajorLoadRooted(v, rank))
+      return std::nullopt;
+    auto enc = mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(
+        srcTy.getEncoding());
+    if (isRowMajor(enc, rank)) {
+      src = threadMajorLayoutPlan(srcTy.getShape(), tpb);
+    } else if (rank == 2 && enc.getOrder()[0] == 0 && enc.getOrder()[1] == 1) {
+      // Column-major: the flat index `tid * E + iv` decodes as `c * M + r`,
+      // the row-major decoding of the transposed shape with its axes swapped.
+      src = threadMajorLayoutPlan({srcTy.getDimSize(1), srcTy.getDimSize(0)},
+                                  tpb);
+      if (!src)
+        return std::nullopt;
+      std::swap(src->dimTerms[0], src->dimTerms[1]);
+      src->rowMajorStride = {srcTy.getDimSize(1), 1};
+    }
+  }
+  if (!src || src->elemPerThread != dst->elemPerThread)
+    return std::nullopt;
+  return std::make_pair(*src, *dst);
 }
 
 // A rank > 1 `ttg.convert_layout` that genuinely moves data across lanes — the
@@ -40957,6 +41049,22 @@ struct ConvertTritonGPUToMetalPass
           cvtOk = false;
           continue;
         }
+      }
+      // Outside a rank-N phase every rank-2 tile this backend holds carries
+      // the thread-major label its load and store address it by, whatever
+      // blocked layout its type names. So a data-moving cvt between two such
+      // tiles is an exchange between two thread-major labels -- through a
+      // `tt.trans`, which is a relabel here, the source's label is its
+      // operand's with the two axes swapped. Publishing and reading under
+      // those labels is exact whether or not either LAYOUT is thread-major,
+      // which is the question `nonLocalCvtReadIsThreadMajor` has to ask when
+      // the exchange uses the layouts' own plans.
+      if (!functionHasRankNPhase(cvt.getOperation())) {
+        auto labels = threadMajorCvtLabels(cvt);
+        if (labels &&
+            planTileExchange(cvt.getOperation(), /*allowGeneralPhase=*/true,
+                             labels->first, labels->second))
+          continue;
       }
       if (planTileExchange(
               cvt.getOperation(),
