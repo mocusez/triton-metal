@@ -741,3 +741,29 @@ def test_no_axis_reduce_over_rank2_tile(shape, num_warps, op, inline):
     torch.mps.synchronize()
     want = [x.sum(), x.max(), x.min(), (x * x).sum()][op]
     assert out.cpu()[0] == want
+
+
+# A tile whose load reads a broadcast POINTER gets a column-major layout from
+# Triton. Flattening it with `tl.reshape` and storing it through a rank-1
+# address is an exchange whose two halves must use the labels the emitter
+# addresses the tiles by, not the layouts Triton inferred for the reshape.
+@triton.jit
+def _flatten_broadcast_pointer_kernel(v_ptr, out_ptr, M: tl.constexpr,
+                                      N: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    row = tl.arange(0, M)[:, None] + tl.zeros((M, N), tl.int32)
+    x = (off % 13 - 6).to(tl.float32) + tl.load(v_ptr + row)
+    tl.store(out_ptr + tl.arange(0, M * N), tl.reshape(x, (M * N,)))
+
+
+@pytest.mark.parametrize("shape", [(16, 16), (8, 128), (32, 8), (4, 32)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_flatten_broadcast_pointer_tile(shape, num_warps):
+    M, N = shape
+    v = (torch.arange(M) % 5 - 2).float()
+    out = torch.zeros(M * N, device="mps")
+    _flatten_broadcast_pointer_kernel[(1,)](v.to("mps"), out, M, N,
+                                            num_warps=num_warps)
+    torch.mps.synchronize()
+    flat = torch.arange(M * N)
+    assert torch.equal(out.cpu(), (flat % 13 - 6).float() + v[flat // N])

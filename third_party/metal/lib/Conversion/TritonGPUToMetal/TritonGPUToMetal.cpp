@@ -33184,18 +33184,19 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
 // row-major `order` on the tile the addresses were built for: the thread-major
 // flat index is decoded through `order`, and `threadMajorLayoutPlan` spells
 // the row-major decoding.
-// The label this backend's own emitter gives a blocked rank-2/3 tile: its
+// The label this backend's own emitter gives a blocked rank-1/2/3 tile: its
 // load and store address element `localTid * E + iv` when the layout keeps
 // several elements per thread along some axis, `localTid + iv * T` when every
 // sizePerThread is 1 -- decoded through the layout's `order` (row-major, or
-// column-major at rank 2). Null for anything else.
+// column-major at rank 2). Null for anything else. Inside a rank-N phase the
+// ranges are planned in layout space instead; callers ask outside one.
 static std::optional<LayoutIndexPlan>
 emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
   auto enc = ty ? mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
                       ty.getEncoding())
                 : nullptr;
   const int64_t rank = ty ? ty.getRank() : 0;
-  if (!enc || (rank != 2 && rank != 3) ||
+  if (!enc || rank < 1 || rank > 3 ||
       static_cast<int64_t>(enc.getOrder().size()) != rank)
     return std::nullopt;
   bool rowMajor = true;
@@ -41899,6 +41900,33 @@ struct ConvertTritonGPUToMetalPass
           continue;
         }
       }
+      // A rank-1 cvt reading a flattened rank-2/3 tile. `tt.reshape` is a
+      // relabel here, so the value still carries the emitter's label for the
+      // tile it flattens (`localTid * E + iv` through that tile's order), not
+      // the layout Triton inferred for the reshape. The two agree for the
+      // row-major tiles loads usually get and disagree for the column-major
+      // one a broadcast-pointer load gets: `tl.reshape(x, (n,))` of such a
+      // tile, stored, was a permutation of it (47 sweep cells).
+      if (!functionHasRankNPhase(cvt.getOperation()) && srcRtt && dstRtt &&
+          srcRtt.getRank() == 1)
+        if (auto reshape =
+                cvt.getSrc().getDefiningOp<mlir::triton::ReshapeOp>())
+          if (auto tileTy = mlir::dyn_cast<mlir::RankedTensorType>(
+                  reshape.getSrc().getType())) {
+            // The rank-1 destination is read by its store under the emitter's
+            // label too, not under its layout.
+            auto own = planLayoutIndex(dstRtt);
+            auto srcLabel =
+                own ? emitterTileLabel(tileTy, own->threadsPerBlock())
+                    : std::nullopt;
+            auto dstPlan =
+                own ? emitterTileLabel(dstRtt, own->threadsPerBlock())
+                    : std::nullopt;
+            if (srcLabel && dstPlan &&
+                planTileExchange(cvt.getOperation(), /*allowGeneralPhase=*/true,
+                                 srcLabel, dstPlan))
+              continue;
+          }
       // Outside a rank-N phase every rank-2 tile this backend holds carries
       // the thread-major label its load and store address it by, whatever
       // blocked layout its type names. So a data-moving cvt between two such
