@@ -20,9 +20,12 @@
 // CHECK: metal.atomic_rmw Or
 // CHECK: metal.atomic_rmw Xor
 // MSL-LABEL: kernel void atomic_bitwise_scalar_i32
-// MSL: atomic_fetch_and_explicit((device atomic_uint*)&v0[0], v1[0], memory_order_relaxed)
-// MSL: atomic_fetch_or_explicit((device atomic_uint*)&v0[0], v1[0], memory_order_relaxed)
-// MSL: atomic_fetch_xor_explicit((device atomic_uint*)&v0[0], v1[0], memory_order_relaxed)
+// The i32 operand's ui32 -> i32 reinterpret of `v1[0]` is used three times, so
+// it is bound once.
+// MSL: int [[VAL:v[0-9]+]] = v1[0];
+// MSL: atomic_fetch_and_explicit((device atomic_uint*)&v0[0], [[VAL]], memory_order_relaxed)
+// MSL: atomic_fetch_or_explicit((device atomic_uint*)&v0[0], [[VAL]], memory_order_relaxed)
+// MSL: atomic_fetch_xor_explicit((device atomic_uint*)&v0[0], [[VAL]], memory_order_relaxed)
 
 // CHECK-LABEL: metal.kernel atomic_xchg_scalar_f32
 // CHECK: metal.atomic_rmw Xchg

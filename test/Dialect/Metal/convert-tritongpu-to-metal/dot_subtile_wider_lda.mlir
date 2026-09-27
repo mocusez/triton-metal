@@ -75,4 +75,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 // The K loop runs over the TILE's K (8), not over the leading dimension.
 // MSL: for (int [[K:v[0-9]+]] = 0; [[K]] < 8; [[K]] += 8)
 // A is staged with the real row stride 64 and masked at the tile's K.
-// MSL: gj < ((0 + 8) + 0)) ? v0[gi * 64 + gj]
+// The K extent is bound once (`(0 + 8)`) and the staged load masks at it.
+// MSL: uint32_t [[KEXT:v[0-9]+]] = (0 + 8);
+// MSL: gj < ([[KEXT]] + 0)) ? v0[gi * 64 + gj]

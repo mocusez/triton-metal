@@ -8701,10 +8701,34 @@ void ModuleTranslation::translate(mlir::Region &region) {
       // it here pins the read to the scan's own position in IR order.
       // `readOverwrittenLater` pins a device/threadgroup read the same way when
       // a later op in this region overwrites the buffer it reads.
+      // A scalar `unrealized_conversion_cast` (the ui32 <-> i32 signedness
+      // reinterpret, which integer kernels are full of) is as pure as the ops
+      // below and was missing from the list: an i32 `tl.max(x, 1,
+      // keep_dims=True)` over 4x32 carries 62 multi-use casts, and re-inlining
+      // them at every use never finished emitting -- the compile hung.
+      // Pointer/memref bridges stay inlined: they have no scalar temp type.
+      // A cast of a leaf (a constant, a thread or threadgroup id, a block
+      // argument) costs nothing to re-inline and stays inline, so a constant
+      // divisor keeps its literal (`/ (uint32_t)(32)`).
+      auto isScalarCast = [&](mlir::Operation &o) {
+        auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(&o);
+        if (!cast || cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+          return false;
+        mlir::Type t = cast->getResult(0).getType();
+        if (!t.isIntOrFloat())
+          return false;
+        mlir::Operation *src = cast->getOperand(0).getDefiningOp();
+        return src &&
+               !mlir::isa<mlir::arith::ConstantOp,
+                          mlir::triton::metal::ConstantOp,
+                          mlir::triton::metal::ThreadIdOp,
+                          mlir::triton::metal::ThreadgroupIdOp>(src);
+      };
       if (op.getNumResults() == 1 && !op.getResult(0).use_empty() &&
           (!op.getResult(0).hasOneUse() || op.hasAttr("metal.materialize") ||
            readOverwrittenLater) &&
           _letBound.find(&op) == _letBound.end() &&
+          (isScalarCast(op) ||
           // Allowlist of pure inlineable value ops translateValue emits as a
           // standalone expression. Restricting to these keeps CSE safe (some
           // other value ops assume they're inlined at a use). Covers adder's
@@ -8727,7 +8751,7 @@ void ModuleTranslation::translate(mlir::Region &region) {
                     mlir::triton::metal::MathIntrinsicOp,
                     mlir::triton::metal::Fp8ConvertOp,
                     mlir::triton::metal::MulHiUIOp,
-                    mlir::triton::metal::GetElementOp>(&op)) {
+                    mlir::triton::metal::GetElementOp>(&op))) {
         _output << "\n";
         indent();
         unsigned idx = _varCount++;

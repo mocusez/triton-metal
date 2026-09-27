@@ -663,3 +663,39 @@ def test_keep_dims_reduce_stored_as_a_tile(M, N, num_warps, op, axis):
     xc = x.cpu()
     want = xc.sum(axis) if op == "sum" else xc.amax(axis)
     assert torch.equal(y.cpu(), want)
+
+
+# An i32 keep-dims reduce stored as a column never finished COMPILING: the MSL
+# emitter re-inlines every multi-use value that is not on its let-binding
+# allowlist, and the scalar `unrealized_conversion_cast` (the ui32 <-> i32
+# signedness reinterpret integer kernels are full of) was not on it -- 62 of
+# them in this kernel, re-expanded at every use. Run in a subprocess with a
+# timeout so a regression fails here instead of hanging the suite.
+_I32_KEEPDIMS_SCRIPT = r"""
+import torch, triton, triton.language as tl
+@triton.jit
+def k(X, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    tl.store(Y + r[:, None] + tl.arange(0, 1)[None, :], tl.max(x, 1, keep_dims=True))
+x = (torch.randperm(128) - 64).to(torch.int32).reshape(4, 32)
+y = torch.zeros(4, dtype=torch.int32, device="mps")
+c = k[(1,)](x.to("mps"), y, 4, 32, num_warps=1)
+torch.mps.synchronize()
+assert torch.equal(y.cpu(), x.amax(1)), (y.cpu(), x.amax(1))
+msl = c.asm["metal"]
+msl = msl if isinstance(msl, str) else msl.decode()
+print("MSL_BYTES", len(msl))
+"""
+
+
+def test_i32_keep_dims_reduce_compiles_in_bounded_time(tmp_path):
+    import subprocess
+    import sys
+    script = tmp_path / "i32_keepdims.py"  # @triton.jit needs a source file
+    script.write_text(_I32_KEEPDIMS_SCRIPT)
+    proc = subprocess.run([sys.executable, str(script)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    size = int(proc.stdout.split("MSL_BYTES")[1].split()[0])
+    assert size < 20000, f"emitted MSL is {size} bytes"
