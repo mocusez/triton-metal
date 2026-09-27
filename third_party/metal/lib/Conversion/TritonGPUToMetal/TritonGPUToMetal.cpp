@@ -4343,6 +4343,8 @@ isContiguousSliceToBlockedStoreIdentity(mlir::triton::gpu::ConvertLayoutOp op) {
 // declared here because every scheduler that decides whether an exchange is
 // NEEDED has to ask the same question the scheduler itself asks.
 static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value);
+static std::optional<std::pair<LayoutIndexPlan, LayoutIndexPlan>>
+threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt);
 
 static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(op.getSrc().getType());
@@ -29432,8 +29434,26 @@ static bool sdDotEligible(mlir::triton::DotOp dot) {
     // answered wrongly at two and four warps (and the operand cvt for that
     // accumulator is already refused by name at one warp, and at every wider
     // shape), so that pair stays outside every tier and keeps the refusal.
+    //
+    // An accumulator the single-dot tier cannot read is another such shape:
+    // it takes a zero init or an unmasked, contiguous load, and declines a
+    // scaled, masked or column-major one -- which then had no tier at all.
+    // This tier checks the init's lane mapping before it claims it.
+    auto singleDotTakesAcc = [&]() {
+      if (sdIsZeroInit(dot.getC()))
+        return true;
+      mlir::Value init = dot.getC();
+      if (auto cvt = init.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        init = cvt.getSrc();
+      auto load = init.getDefiningOp<mlir::triton::LoadOp>();
+      return load && !load.getMask() &&
+             unwrapPtrToKernelArg(load.getPtr()) &&
+             simdgroupTileIsContiguous(load.getPtr()) &&
+             !axisHasConstantNonUnitStride(load.getPtr(), 1);
+    };
     if ((!aTy || aTy.getRank() != 2 || aTy.getShape()[1] <= 8) &&
-        !(sdDotStoreTileIsColumnMajor(dot) && sdIsZeroInit(dot.getC())))
+        !(sdDotStoreTileIsColumnMajor(dot) && sdIsZeroInit(dot.getC())) &&
+        singleDotTakesAcc())
       return false;
   }
   return true;
@@ -29474,6 +29494,34 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
   // for one shape the cvt is a relabel here.
   mlir::Value cInit = dot.getC();
   auto cCvt = cInit.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+  // The lane computes the element its RESULT tile's mapping names (element
+  // count, contiguous-or-strided, order); an init held under any other mapping
+  // is some other lane's element.
+  // A splat is the same value in every lane, so no lane mapping can be wrong
+  // for it -- an integer dot's `dense<0> : i32` init among them, which
+  // `sdIsZeroInit` (float-only) does not recognise.
+  auto isSplatConstant = [](mlir::Value v) {
+    auto cst = v ? v.getDefiningOp<mlir::arith::ConstantOp>()
+                 : mlir::arith::ConstantOp();
+    auto dense =
+        cst ? mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()) : nullptr;
+    return dense && dense.isSplat();
+  };
+  auto sameLaneMapping = [&](mlir::Type ty) {
+    auto a = tileFromTensor(ty);
+    auto b = tileFromTensor(resultTensorTy);
+    if (!a || !b || a->elemPerThread != b->elemPerThread ||
+        a->threadsPerBlock != b->threadsPerBlock || a->order != b->order)
+      return false;
+    return a->elemPerThread <= 1 || a->contiguous == b->contiguous;
+  };
+  if (!cCvt && !sdIsZeroInit(cInit) && !isSplatConstant(cInit) &&
+      !sameLaneMapping(cInit.getType()))
+    // The divergent-cvt normaliser can re-encode the init's load into the
+    // dot's own layout before this tier runs, leaving no cvt: a column-major
+    // C then arrived strided (`tid + iv * T`) while the lane computed
+    // `tid * E + iv`, 254 of 256 elements wrong at four warps.
+    return mlir::failure();
   if (cCvt) {
     auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getSrc().getType());
     auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getType());
@@ -29489,16 +29537,19 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
     // 27 of 27 sweep cells wrong.
     if (srcB && dstB && srcTy.getShape() == dstTy.getShape() &&
         srcTy.getElementType() == dstTy.getElementType() &&
-        srcB.getOrder() == dstB.getOrder())
+        (srcB.getOrder() == dstB.getOrder() ||
+         isSplatConstant(cCvt.getSrc())))
       cInit = cCvt.getSrc();
+    else if (threadMajorCvtLabels(cCvt) && sameLaneMapping(cCvt.getType()))
+      // Not a relabel, but the pre-pass exchanges it between the two
+      // tiles' own labels (`threadMajorCvtLabels`), and the destination's
+      // label is the one this lane computes: keep the cvt as the init.
+      cCvt = {};
     else
-      // Anything else is not a relabel, and this tier has no exchange for
-      // it: forwarded, the init was read under one bijection while the lane
+      // Forwarded, the init would be read under one bijection while the lane
       // computed another (`tid + iv * T` against `tid * E + iv`) -- a
       // column-major C at two and four warps was wrong in 254 of 256
-      // elements. Leaving the cvt for the pre-pass's thread-major exchange
-      // fixed 21 of 27 cells and left those three wrong -- the accumulator
-      // operand never reaches that exchange -- so it keeps the refusal.
+      // elements. Leave the dot for the named refusal.
       return mlir::failure();
   }
   mlir::OpBuilder kBuilder(dot);
@@ -32866,8 +32917,49 @@ threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
   if (!dstOwn)
     return std::nullopt;
   const int64_t tpb = dstOwn->threadsPerBlock();
-  std::optional<LayoutIndexPlan> dst =
-      threadMajorLayoutPlan(dstTy.getShape(), tpb);
+  // The emitter's own label for a tile is `localTid * E + iv` only when its
+  // layout keeps several elements per thread along some axis; with every
+  // sizePerThread at 1 the tile loop strides, `localTid + iv * T` -- the same
+  // choice `retileFromRangeParent` makes for the ranges that address it. The
+  // register bits then sit ABOVE the thread bits instead of below them.
+  auto labelFor = [&](llvm::ArrayRef<int64_t> shape,
+                      mlir::triton::gpu::BlockedEncodingAttr enc)
+      -> std::optional<LayoutIndexPlan> {
+    std::optional<LayoutIndexPlan> plan = threadMajorLayoutPlan(shape, tpb);
+    if (!plan || plan->elemPerThread <= 1 ||
+        llvm::any_of(enc.getSizePerThread(), [](unsigned s) { return s > 1; }))
+      return plan;
+    const int regBits = plan->registerBits;
+    const int thrBits = plan->laneBits + plan->warpBits;
+    for (auto &terms : plan->dimTerms)
+      for (auto &t : terms) {
+        // Flat bit b: contiguous puts registers at [0, regBits) and threads
+        // above; strided puts threads at [0, thrBits) and registers above.
+        int flatBit;
+        if (t.coord == LayoutIndexPlan::Register)
+          flatBit = t.bit;
+        else if (t.coord == LayoutIndexPlan::Lane)
+          flatBit = regBits + t.bit;
+        else
+          flatBit = regBits + plan->laneBits + t.bit;
+        if (flatBit < thrBits) {
+          if (flatBit < plan->laneBits) {
+            t.coord = LayoutIndexPlan::Lane;
+            t.bit = flatBit;
+          } else {
+            t.coord = LayoutIndexPlan::Warp;
+            t.bit = flatBit - plan->laneBits;
+          }
+        } else {
+          t.coord = LayoutIndexPlan::Register;
+          t.bit = flatBit - thrBits;
+        }
+      }
+    return plan;
+  };
+  std::optional<LayoutIndexPlan> dst = labelFor(
+      dstTy.getShape(),
+      mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(dstTy.getEncoding()));
   if (!dst)
     return std::nullopt;
   auto rowMajorStrides = [&](mlir::RankedTensorType ty) {
@@ -32886,8 +32978,9 @@ threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
         static_cast<int64_t>(perm.size()) != rank ||
         !coneIsThreadMajorLoadRooted(tr.getSrc(), rank))
       return std::nullopt;
-    std::optional<LayoutIndexPlan> in =
-        threadMajorLayoutPlan(inTy.getShape(), tpb);
+    std::optional<LayoutIndexPlan> in = labelFor(
+        inTy.getShape(), mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(
+                             inTy.getEncoding()));
     if (!in)
       return std::nullopt;
     // Result axis i is operand axis perm[i].
@@ -32902,12 +32995,11 @@ threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
     auto enc = mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(
         srcTy.getEncoding());
     if (isRowMajor(enc, rank)) {
-      src = threadMajorLayoutPlan(srcTy.getShape(), tpb);
+      src = labelFor(srcTy.getShape(), enc);
     } else if (rank == 2 && enc.getOrder()[0] == 0 && enc.getOrder()[1] == 1) {
-      // Column-major: the flat index `tid * E + iv` decodes as `c * M + r`,
-      // the row-major decoding of the transposed shape with its axes swapped.
-      src = threadMajorLayoutPlan({srcTy.getDimSize(1), srcTy.getDimSize(0)},
-                                  tpb);
+      // Column-major: the flat index decodes as `c * M + r`, the row-major
+      // decoding of the transposed shape with its axes swapped.
+      src = labelFor({srcTy.getDimSize(1), srcTy.getDimSize(0)}, enc);
       if (!src)
         return std::nullopt;
       std::swap(src->dimTerms[0], src->dimTerms[1]);
