@@ -4193,3 +4193,67 @@ def test_dot_8x8_transposed_store_with_foreign_accumulator_is_named(capfd,
     with pytest.raises(Exception):
         _run_dot_store_form(M=8, N=8, K=8, warps=warps, form=1, init=1)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `tl.dot(a, b, c)` with a LOADED accumulator and no K loop: C = A @ B + C.
+# The accumulator reaches the dot through a blocked -> blocked convert into
+# the dot's parent layout, which was refused by name at every shape but 8x8.
+# The scalar tier now takes the init from before that convert when both
+# layouts decode the flat index the same way (same shape, same `order`): a
+# rank-2 tile holds element `localTid * E + iv` under either. A column-major C
+# (`order = [0, 1]`) is not that, and was worse than refused -- 8x8 read it
+# row-major into the matrix unit (a constexpr stride was invisible to the
+# contiguity check) and 2/4 warps read it under the other bijection -- so it
+# is refused by name. 📏 `s_dot_loaded_acc.py` 58 OK / 6 wrong / 98 refused
+# -> 129 / 0 / 33.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _dot_loaded_acc_kernel(A, B, C, O, M: tl.constexpr, N: tl.constexpr,
+                           K: tl.constexpr, FORM: tl.constexpr):
+    m = tl.arange(0, M)
+    n = tl.arange(0, N)
+    k = tl.arange(0, K)
+    a = tl.load(A + m[:, None] * K + k[None, :])
+    b = tl.load(B + k[:, None] * N + n[None, :])
+    if FORM == 0:
+        c = tl.load(C + m[:, None] * N + n[None, :])
+    elif FORM == 1:
+        c = tl.load(O + m[:, None] * N + n[None, :])
+    elif FORM == 2:
+        c = tl.load(C + m[:, None] * N + n[None, :]) * 0.5
+    else:
+        c = tl.load(C + n[None, :] * M + m[:, None])
+    tl.store(O + m[:, None] * N + n[None, :], tl.dot(a, b, c))
+
+
+def _run_loaded_acc(M, N, K, warps, form):
+    torch.manual_seed(M * 7 + N * 3 + K + warps + form)
+    a = torch.randn(M, K)
+    b = torch.randn(K, N)
+    c = torch.randn(M, N)
+    o0 = torch.randn(M, N)
+    cbuf = c.T.contiguous() if form == 3 else c
+    o = o0.clone().to("mps")
+    _dot_loaded_acc_kernel[(1,)](a.to("mps"), b.to("mps"), cbuf.to("mps"), o,
+                                 M, N, K, form, num_warps=warps)
+    torch.mps.synchronize()
+    acc = {0: c, 1: o0, 2: 0.5 * c, 3: c}[form]
+    return o.cpu(), a @ b + acc
+
+
+@pytest.mark.parametrize("M,N,K", [(16, 16, 16), (32, 16, 32), (64, 64, 32),
+                                   (16, 32, 8)])
+@pytest.mark.parametrize("warps", [1, 2, 4])
+@pytest.mark.parametrize("form", [0, 1, 2], ids=["separate", "in_place", "scaled"])
+def test_dot_loaded_accumulator_matches_torch(M, N, K, warps, form):
+    got, want = _run_loaded_acc(M, N, K, warps, form)
+    torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("M,N,K,warps", [(8, 8, 8, 1), (8, 16, 8, 2),
+                                         (16, 16, 16, 4), (32, 32, 32, 1)])
+def test_dot_column_major_accumulator_is_named(capfd, M, N, K, warps):
+    with pytest.raises(Exception):
+        _run_loaded_acc(M, N, K, warps, form=3)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err

@@ -23419,6 +23419,70 @@ static mlir::Value findAxisStride(mlir::Value ptr, int axis);
 static std::optional<int64_t> getScalarIntegerConstant(mlir::Value value);
 static mlir::Value sdResolveLoopCarriedPtrInit(mlir::Value ptr);
 
+// `findAxisStride` names a stride only when it arrives as a `tt.splat` of a
+// scalar, which is how a RUNTIME stride looks. A constexpr stride is folded
+// into an `arith.constant dense<S>` multiplier, which that walk does not see,
+// and "no multiplier found" reads as unit -- so a C tile addressed
+// column-major with a constexpr extent (`C + n * M + m`) passed as contiguous
+// and was loaded row-major into the matrix unit: 8x8 `tl.dot(a, b, c)` with
+// such a c was wrong in 56 of 64 elements. Walk the same chain and report a
+// constant multiplier on `axis` that is not 1. Deliberately NOT folded into
+// `simdgroupTileIsContiguous`: a column-major STORE with a constexpr stride
+// is lowered on the matrix unit by a tier that relies on that check's answer.
+static bool axisHasConstantNonUnitStride(mlir::Value ptr, int axis) {
+  std::function<bool(mlir::Value, int)> fromOffset = [&](mlir::Value off,
+                                                         int depth) -> bool {
+    if (!off || depth > 8)
+      return false;
+    if (auto addi = off.getDefiningOp<mlir::arith::AddIOp>())
+      return fromOffset(addi.getLhs(), depth + 1) ||
+             fromOffset(addi.getRhs(), depth + 1);
+    if (auto bc = off.getDefiningOp<mlir::triton::BroadcastOp>())
+      return fromOffset(bc.getSrc(), depth + 1);
+    if (auto ed = off.getDefiningOp<mlir::triton::ExpandDimsOp>())
+      return fromOffset(ed.getSrc(), depth + 1);
+    auto muli = off.getDefiningOp<mlir::arith::MulIOp>();
+    if (!muli)
+      return false;
+    auto ax = findExpandDimsAxis(off);
+    auto logicalAxis =
+        ax ? logicalMatrixAxisFromExpandDims(off, *ax) : std::nullopt;
+    if (!logicalAxis || *logicalAxis != axis)
+      return false;
+    for (mlir::Value operand : {muli.getLhs(), muli.getRhs()}) {
+      mlir::Value v = operand;
+      while (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
+        v = bc.getSrc();
+      auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+      auto dense =
+          cst ? mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue())
+              : nullptr;
+      if (dense && dense.isSplat() &&
+          dense.getSplatValue<llvm::APInt>().getSExtValue() != 1)
+        return true;
+    }
+    return false;
+  };
+  for (int depth = 0; depth < 8 && ptr; ++depth) {
+    if (auto addptr = ptr.getDefiningOp<mlir::triton::AddPtrOp>()) {
+      if (fromOffset(addptr.getOffset(), 0))
+        return true;
+      ptr = addptr.getPtr();
+      continue;
+    }
+    if (auto bc = ptr.getDefiningOp<mlir::triton::BroadcastOp>()) {
+      ptr = bc.getSrc();
+      continue;
+    }
+    if (auto ed = ptr.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+      ptr = ed.getSrc();
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
 // A `metal.simdgroup_load` / `metal.simdgroup_store` addresses its 8x8 tile as
 // `buf[(row + i) * stride + col + j]`: the ROW axis carries a stride, the
 // inner axis advances one element at a time. Every tier that lowers a `tt.dot`
@@ -29373,12 +29437,47 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
       mlir::dyn_cast<mlir::RankedTensorType>(dot.getA().getType());
   if (!aOperandTy || aOperandTy.getRank() < 2)
     return mlir::failure();
+  // A loaded accumulator -- `tl.dot(a, b, tl.load(C))`, i.e. C = A @ B + C --
+  // reaches the dot through a blocked -> blocked `ttg.convert_layout` into the
+  // dot's parent layout, and that cvt (sizePerThread > 1) is outside every
+  // staged-transpose envelope, so the whole kernel was refused by name at
+  // every shape but 8x8. Take the init from BEFORE the cvt: a rank-2 blocked
+  // tile holds element `localTid * E + iv` whichever blocked encoding names
+  // it, which is also the element this scalar dot computes for the lane, so
+  // for one shape the cvt is a relabel here.
+  mlir::Value cInit = dot.getC();
+  auto cCvt = cInit.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>();
+  if (cCvt) {
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getSrc().getType());
+    auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getType());
+    auto srcB = srcTy ? mlir::dyn_cast<mlir::triton::gpu::BlockedEncodingAttr>(
+                            srcTy.getEncoding())
+                      : nullptr;
+    auto dstB = dstTy ? mlir::dyn_cast<mlir::triton::gpu::BlockedEncodingAttr>(
+                            dstTy.getEncoding())
+                      : nullptr;
+    // The flat index is decoded through the layout's `order`, so the two are
+    // one element only under the same `order`: a C loaded column-major
+    // (`C + n * M + m`) gets `order = [0, 1]`, and peeling it answered
+    // 27 of 27 sweep cells wrong.
+    if (srcB && dstB && srcTy.getShape() == dstTy.getShape() &&
+        srcTy.getElementType() == dstTy.getElementType() &&
+        srcB.getOrder() == dstB.getOrder())
+      cInit = cCvt.getSrc();
+    else
+      // Anything else is not a relabel, and this tier has no exchange for
+      // it: forwarded, the init was read under one bijection while the lane
+      // computed another (`tid + iv * T` against `tid * E + iv`) -- a
+      // column-major C at two and four warps was wrong in 254 of 256
+      // elements. Leave the dot for the named refusal.
+      return mlir::failure();
+  }
   mlir::OpBuilder kBuilder(dot);
   auto staticK = mlir::arith::ConstantOp::create(
       kBuilder, dot.getLoc(),
       kBuilder.getI32IntegerAttr(
           static_cast<int32_t>(aOperandTy.getShape().back())));
-  if (!sdEmitScalarDot(dot, aLoad, bLoad, dot.getC(), replaceTarget,
+  if (!sdEmitScalarDot(dot, aLoad, bLoad, cInit, replaceTarget,
                        resultTensorTy, {}, {}, {},
                        /*transposeA=*/false,
                        /*scaleInfo=*/nullptr,
@@ -29396,6 +29495,8 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
     sdEraseCone(cvtA.getResult());
   if (cvtB)
     sdEraseCone(cvtB.getResult());
+  if (cCvt && cCvt->use_empty())
+    cCvt.erase();
   return mlir::success();
 }
 
@@ -31239,7 +31340,13 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
     if (!accInitLoad || accInitLoad.getMask())
       return;
     accInitPtr = unwrapPtrToKernelArg(accInitLoad.getPtr());
-    if (!accInitPtr || !simdgroupTileIsContiguous(accInitLoad.getPtr()))
+    // A constexpr inner stride is invisible to `simdgroupTileIsContiguous`
+    // (see `axisHasConstantNonUnitStride`), and this init is read row-major
+    // straight into the matrix unit: a C loaded column-major was wrong in 56
+    // of 64 elements at every warp count. Asked here only -- the tiers that
+    // lower a column-major STORE rely on that check's current answer.
+    if (!accInitPtr || !simdgroupTileIsContiguous(accInitLoad.getPtr()) ||
+        axisHasConstantNonUnitStride(accInitLoad.getPtr(), 1))
       return;
   }
 
