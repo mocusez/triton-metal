@@ -299,6 +299,10 @@ static llvm::DenseMap<mlir::Operation *, TileExchangePlan> g_tileExchange;
 // dominates both loops. Keyed the same way.
 static llvm::DenseMap<mlir::Operation *, mlir::Value> g_tileExchangeBuf;
 static constexpr llvm::StringLiteral kExchangeAttr = "metal.exchange";
+// Set by the pre-conversion cvt walk on a `ttg.convert_layout` it classified
+// as a scalar relabel, so `ConvertLayoutLowering` reaches the same verdict.
+static constexpr llvm::StringLiteral kScalarIdentityAttr =
+    "metal.scalar_identity";
 
 // The value a replayed cone should read THROUGH a layout op. A cvt is a
 // shape-only step for replay -- the evaluator addresses logical (row, col) --
@@ -4343,6 +4347,8 @@ isContiguousSliceToBlockedStoreIdentity(mlir::triton::gpu::ConvertLayoutOp op) {
 // declared here because every scheduler that decides whether an exchange is
 // NEEDED has to ask the same question the scheduler itself asks.
 static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value);
+static std::optional<LayoutIndexPlan>
+emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb);
 static std::optional<std::pair<LayoutIndexPlan, LayoutIndexPlan>>
 threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt);
 
@@ -4390,8 +4396,18 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
             srcRtt.getEncoding()) &&
         mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
             dstRtt.getEncoding())) {
+      // Compare with the label the destination is READ under -- the
+      // emitter's tile label -- not with its layout's plan. A staged rank-3
+      // reduce already relabels its result thread-major, and asking the
+      // layout turned that correct relabel into an exchange that read under
+      // the layout's mapping: `tl.sum(x, 0) + w` over 2x16x16 at one warp,
+      // every element wrong.
       auto srcPlan = exchangeSourcePlan(op.getSrc());
-      auto dstPlan = planLayoutIndex(dstRtt);
+      std::optional<LayoutIndexPlan> dstPlan;
+      if (auto own = planLayoutIndex(dstRtt))
+        dstPlan = emitterTileLabel(dstRtt, own->threadsPerBlock());
+      if (!dstPlan)
+        dstPlan = planLayoutIndex(dstRtt);
       if (!srcPlan || !dstPlan ||
           !layoutIndexPlansEquivalent(*srcPlan, *dstPlan))
         return false;
@@ -4613,7 +4629,7 @@ struct ConvertLayoutLowering
     // Path 2: scalar-identity relabel (slice broadcast/reduce cones, or a
     // degenerate blocked↔blocked permuting only size-1 axes). See
     // `isScalarIdentityConvert`. Genuine transposes fall through to Path 3.
-    if (isScalarIdentityConvert(op)) {
+    if (op->hasAttr(kScalarIdentityAttr) || isScalarIdentityConvert(op)) {
       rewriter.replaceOp(op, adaptor.getSrc());
       return mlir::success();
     }
@@ -32920,6 +32936,61 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
 // row-major `order` on the tile the addresses were built for: the thread-major
 // flat index is decoded through `order`, and `threadMajorLayoutPlan` spells
 // the row-major decoding.
+// The label this backend's own emitter gives a blocked rank-2/3 tile: its
+// load and store address element `localTid * E + iv` when the layout keeps
+// several elements per thread along some axis, `localTid + iv * T` when every
+// sizePerThread is 1 -- decoded through the layout's `order` (row-major, or
+// column-major at rank 2). Null for anything else.
+static std::optional<LayoutIndexPlan>
+emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
+  auto enc = ty ? mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+                      ty.getEncoding())
+                : nullptr;
+  const int64_t rank = ty ? ty.getRank() : 0;
+  if (!enc || (rank != 2 && rank != 3) ||
+      static_cast<int64_t>(enc.getOrder().size()) != rank)
+    return std::nullopt;
+  bool rowMajor = true;
+  for (int64_t k = 0; k < rank; ++k)
+    rowMajor &= enc.getOrder()[k] == rank - 1 - k;
+  const bool colMajor = rank == 2 && enc.getOrder()[0] == 0;
+  if (!rowMajor && !colMajor)
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 3> shape(ty.getShape());
+  if (colMajor)
+    std::swap(shape[0], shape[1]);
+  std::optional<LayoutIndexPlan> plan = threadMajorLayoutPlan(shape, tpb);
+  if (!plan)
+    return std::nullopt;
+  if (plan->elemPerThread > 1 &&
+      llvm::none_of(enc.getSizePerThread(), [](unsigned s) { return s > 1; })) {
+    // Strided: threads on the low flat bits, registers above them.
+    const int regBits = plan->registerBits;
+    const int thrBits = plan->laneBits + plan->warpBits;
+    for (auto &terms : plan->dimTerms)
+      for (auto &t : terms) {
+        int flatBit = t.coord == LayoutIndexPlan::Register ? t.bit
+                      : t.coord == LayoutIndexPlan::Lane
+                          ? regBits + t.bit
+                          : regBits + plan->laneBits + t.bit;
+        if (flatBit < thrBits) {
+          t.coord = flatBit < plan->laneBits ? LayoutIndexPlan::Lane
+                                             : LayoutIndexPlan::Warp;
+          t.bit = flatBit < plan->laneBits ? flatBit
+                                           : flatBit - plan->laneBits;
+        } else {
+          t.coord = LayoutIndexPlan::Register;
+          t.bit = flatBit - thrBits;
+        }
+      }
+  }
+  if (colMajor) {
+    std::swap(plan->dimTerms[0], plan->dimTerms[1]);
+    plan->rowMajorStride = {ty.getDimSize(1), 1};
+  }
+  return plan;
+}
+
 static std::optional<std::pair<LayoutIndexPlan, LayoutIndexPlan>>
 threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
   auto isRowMajor = [](mlir::triton::gpu::BlockedEncodingAttr enc,
@@ -41092,8 +41163,15 @@ struct ConvertTritonGPUToMetalPass
       // transposes (both blocked, >=2 non-unit dims) are NOT accepted here and
       // fall through to the rank-2 staged-transpose envelope below (or the L1d3
       // reject).
-      if (isScalarIdentityConvert(cvt))
+      if (isScalarIdentityConvert(cvt)) {
+        // Record the verdict: the lowering asks again DURING the conversion,
+        // when a staged reduce producer has already been rewritten and
+        // `exchangeSourcePlan` can no longer see its relabel -- the answer
+        // flipped and the cvt failed to legalize.
+        cvt->setAttr(kScalarIdentityAttr,
+                     mlir::UnitAttr::get(cvt.getContext()));
         return;
+      }
       auto srcBlocked =
           srcRtt
               ? mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(

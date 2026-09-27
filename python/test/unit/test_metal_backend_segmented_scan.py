@@ -2015,3 +2015,31 @@ def test_tuple_scan_rankn_unrelated_runtime_loop_remains_supported():
     torch.testing.assert_close(count.cpu(), torch.arange(1, 17, dtype=torch.int32).expand(8, 16),
                                atol=0, rtol=0)
     torch.testing.assert_close(scratch.cpu(), torch.arange(1, 18, dtype=torch.int32), atol=0, rtol=0)
+
+
+@triton.jit
+def _rank3_reduce_plus_tile_kernel(X, W, Y, A: tl.constexpr, B: tl.constexpr,
+                                   C: tl.constexpr):
+    a = tl.arange(0, A)
+    b = tl.arange(0, B)
+    c = tl.arange(0, C)
+    x = tl.load(X + a[:, None, None] * (B * C) + b[None, :, None] * C
+                + c[None, None, :])
+    w = tl.load(W + b[:, None] * C + c[None, :])
+    tl.store(Y + b[:, None] * C + c[None, :], tl.sum(x, 0) + w)
+
+
+# A staged rank-3 reduce relabels its result thread-major, so the cvt that
+# takes it to `w`'s layout is a relabel. Comparing it with the destination
+# LAYOUT's plan instead of the label the destination is read under turned it
+# into an exchange read under the layout's mapping: every element wrong.
+@pytest.mark.parametrize("A,B,C,w", [(2, 16, 16, 1), (4, 8, 16, 1), (4, 8, 8, 2)])
+def test_rank3_reduce_plus_loaded_tile_matches_torch(A, B, C, w):
+    torch.manual_seed(A * 3 + B + C + w)
+    x = torch.randn(A, B, C)
+    ww = torch.randn(B, C)
+    y = torch.zeros(B, C, device="mps")
+    _rank3_reduce_plus_tile_kernel[(1,)](x.to("mps"), ww.to("mps"), y, A, B, C,
+                                         num_warps=w)
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu(), x.sum(0) + ww, atol=1e-4, rtol=1e-4)
