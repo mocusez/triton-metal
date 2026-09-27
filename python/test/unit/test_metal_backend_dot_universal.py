@@ -4251,26 +4251,21 @@ def test_dot_loaded_accumulator_matches_torch(M, N, K, warps, form):
     torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
 
 
-# A column-major C is exchanged into the dot's layout between the two tiles'
-# own labels, and taken only when the destination's label is the one the
-# scalar dot's lane computes (element count, contiguous-or-strided, order).
-# Where the normaliser has already re-encoded C into the dot's strided layout,
-# or the two mappings differ, it keeps the named refusal.
+# A column-major C is exchanged into the RESULT tile's encoding between the
+# two tiles' own labels, so the init each lane reads is the element it
+# computes (element count, contiguous-or-strided, order). The last four cells
+# are the ones where the divergent-cvt normaliser had already re-encoded C into
+# the dot's strided layout, leaving no cvt to exchange -- the tier now inserts
+# its own. `s_dot_loaded_acc.py` 58 / 6 wrong / 98 refused -> 162 / 0 / 0.
 @pytest.mark.parametrize("M,N,K,warps", [(8, 16, 8, 1), (16, 16, 16, 1),
                                          (32, 32, 32, 1), (32, 32, 32, 4),
                                          (64, 64, 32, 2), (16, 32, 8, 4),
-                                         (8, 8, 8, 2), (8, 8, 8, 4)])
+                                         (8, 8, 8, 2), (8, 8, 8, 4),
+                                         (8, 8, 8, 1), (8, 16, 8, 2),
+                                         (16, 16, 16, 4), (16, 16, 64, 4)])
 def test_dot_column_major_accumulator_matches_torch(M, N, K, warps):
     got, want = _run_loaded_acc(M, N, K, warps, form=3)
     torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.parametrize("M,N,K,warps", [(8, 8, 8, 1), (8, 16, 8, 2),
-                                         (16, 16, 16, 4), (16, 16, 64, 4)])
-def test_dot_column_major_accumulator_is_named(capfd, M, N, K, warps):
-    with pytest.raises(Exception):
-        _run_loaded_acc(M, N, K, warps, form=3)
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
 
 
 # 8x8 is reserved for the single-dot tier, which reads only a zero init or an

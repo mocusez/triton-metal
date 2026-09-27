@@ -29515,13 +29515,42 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
       return false;
     return a->elemPerThread <= 1 || a->contiguous == b->contiguous;
   };
+  // When the init's own mapping is not the lane's, move it INTO the result
+  // tile's encoding with a cvt of our own: the pre-pass exchanges that between
+  // the two tiles' labels (`threadMajorCvtLabels`), and the destination's is
+  // by construction the one this lane computes. Nothing else is touched until
+  // the tier commits, so the cvt is erased again if it does not.
+  mlir::triton::gpu::ConvertLayoutOp ownCvt;
+  auto intoResultLayout = [&](mlir::Value src) -> mlir::Value {
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(src.getType());
+    if (!srcTy || srcTy.getRank() != 2 || resultTensorTy.getRank() != 2 ||
+        srcTy.getShape() != resultTensorTy.getShape() ||
+        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            resultTensorTy.getEncoding()))
+      return {};
+    mlir::OpBuilder b(dot);
+    auto cvt = mlir::triton::gpu::ConvertLayoutOp::create(
+        b, dot.getLoc(),
+        mlir::RankedTensorType::get(srcTy.getShape(), srcTy.getElementType(),
+                                    resultTensorTy.getEncoding()),
+        src);
+    if (!threadMajorCvtLabels(cvt) || !sameLaneMapping(cvt.getType())) {
+      cvt.erase();
+      return {};
+    }
+    ownCvt = cvt;
+    return cvt.getResult();
+  };
   if (!cCvt && !sdIsZeroInit(cInit) && !isSplatConstant(cInit) &&
-      !sameLaneMapping(cInit.getType()))
+      !sameLaneMapping(cInit.getType())) {
     // The divergent-cvt normaliser can re-encode the init's load into the
     // dot's own layout before this tier runs, leaving no cvt: a column-major
     // C then arrived strided (`tid + iv * T`) while the lane computed
     // `tid * E + iv`, 254 of 256 elements wrong at four warps.
-    return mlir::failure();
+    cInit = intoResultLayout(cInit);
+    if (!cInit)
+      return mlir::failure();
+  }
   if (cCvt) {
     auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getSrc().getType());
     auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cCvt.getType());
@@ -29545,6 +29574,10 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
       // tiles' own labels (`threadMajorCvtLabels`), and the destination's
       // label is the one this lane computes: keep the cvt as the init.
       cCvt = {};
+    else if (mlir::Value moved = intoResultLayout(cCvt.getSrc()))
+      // Its destination is not the lane's mapping; exchange the source
+      // straight into the result tile's instead.
+      cInit = moved;
     else
       // Forwarded, the init would be read under one bijection while the lane
       // computed another (`tid + iv * T` against `tid * E + iv`) -- a
@@ -29565,6 +29598,8 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
                        staticK.getResult())) {
     // The dot stays for another tier; leave no dead constant behind for it.
     staticK.erase();
+    if (ownCvt)
+      ownCvt.erase();
     return mlir::failure();
   }
 
