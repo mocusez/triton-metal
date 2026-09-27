@@ -3480,6 +3480,63 @@ linearRangeHypercubeAxis(mlir::triton::MakeRangeOp op) {
   }
   if (axis < 0 || rank < 2)
     return std::nullopt;
+  // The tile the indicator is broadcast INTO is the one whose bit it names.
+  // The kernel's largest tile is only a stand-in for it, and a wrong one once
+  // the divergent-cvt normaliser has re-encoded a topk's last comparator into
+  // its store's layout: `tl.topk(x, 2)` over two rows then compares a `2x2`
+  // tile while the largest is the `2x64` input, whose axis 1 is not the
+  // indicator's extent -- so the override below never fired and the column
+  // bit came from the range's own register basis, which is 0 in every lane of
+  // the re-encoded cone.
+  {
+    // Forward from each reshape through elementwise ops and PARTIAL
+    // broadcasts (the comparator XORs this indicator with another axis's
+    // after widening both to a common shape) to the broadcast that yields a
+    // tile with no unit axis. ⚠️ A partial broadcast is not the tile: its
+    // layout names different bits than the full hypercube's, and stopping
+    // there broke `tl.sort` over 1024 elements at one warp.
+    mlir::RankedTensorType full;
+    bool agree = true;
+    for (mlir::Operation *user : op.getResult().getUsers()) {
+      mlir::Attribute enc =
+          mlir::cast<mlir::RankedTensorType>(user->getResult(0).getType())
+              .getEncoding();
+      llvm::SmallVector<mlir::Value, 8> work{user->getResult(0)};
+      llvm::SmallPtrSet<mlir::Value, 16> seen;
+      while (!work.empty()) {
+        mlir::Value v = work.pop_back_val();
+        if (!seen.insert(v).second || seen.size() > 64)
+          continue;
+        for (mlir::Operation *next : v.getUsers()) {
+          const bool isBroadcast = mlir::isa<mlir::triton::BroadcastOp>(next);
+          if (next->getNumResults() != 1 ||
+              (!isBroadcast &&
+               !mlir::isa<mlir::arith::ArithDialect>(next->getDialect())))
+            continue;
+          auto nTy = mlir::dyn_cast<mlir::RankedTensorType>(
+              next->getResult(0).getType());
+          if (!nTy || nTy.getRank() != rank || nTy.getEncoding() != enc ||
+              nTy.getDimSize(axis) != extent)
+            continue;
+          if (isBroadcast &&
+              llvm::all_of(nTy.getShape(), [](int64_t d) { return d > 1; })) {
+            if (full && full != nTy)
+              agree = false;
+            full = nTy;
+            continue;
+          }
+          work.push_back(next->getResult(0));
+        }
+      }
+    }
+    if (agree && full)
+      if (auto enc =
+              mlir::dyn_cast<mlir::triton::gpu::BlockedEncodingAttr>(
+                  full.getEncoding()))
+        if (std::optional<TileInfo> tile = tileFromTensor(full);
+            tile && static_cast<int64_t>(tile->shape.size()) == rank)
+          return LinearRangeAxis{*tile, enc, axis};
+  }
   mlir::triton::gpu::BlockedEncodingAttr enc;
   std::optional<TileInfo> tile = findLargestRankNTile(op, rank, &enc);
   if (!tile || !enc || static_cast<int64_t>(tile->shape.size()) != rank ||
@@ -4083,6 +4140,27 @@ struct MakeRangeLowering
           op, rewriter.getI32IntegerAttr(static_cast<int32_t>(op.getStart())));
       return mlir::success();
     }
+    // A size-2 hypercube indicator whose reshape folded away arrives with the
+    // hypercube's own encoding, a slice nested over a slice at a depth no path
+    // above reads: `tl.topk(x, 2)` over a single row died here with "failed
+    // to legalize tt.make_range". In a rank-N phase the hypercube is indexed
+    // in layout space, and `toLinearLayout` describes this encoding exactly,
+    // so the range is its own layout element -- as a `#ttg.linear` indicator
+    // is. Last resort only: the rank-3 path above owns the doubly nested
+    // slices a rank-3 kernel's ranges carry, and taking those over in the
+    // phase branch answered 21 of 54 rank-3 reduce cells wrong.
+    if (rankNPhase && resTy.getRank() == 1)
+      if (auto slice =
+              mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                  resTy.getEncoding());
+          slice &&
+          mlir::isa<mlir::triton::gpu::SliceEncodingAttr>(slice.getParent()))
+        if (std::optional<LayoutIndexPlan> plan = planLayoutIndex(resTy))
+          if (mlir::Value idx =
+                  emitLayoutElementIndex(op, *plan, rewriter, loc)) {
+            rewriter.replaceOp(op, withStart(idx));
+            return mlir::success();
+          }
     return rewriter.notifyMatchFailure(
         op, "tt.make_range: no per-element index decomposition for this layout "
             "(supported: rank-1 blocked, rank-2 slice-of-blocked, rank-3 "
@@ -4270,6 +4348,26 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
             op.getSrc().getDefiningOp()) &&
         g_rankNPlannedReduces.count(op.getSrc().getDefiningOp())) {
       auto srcPlan = planLayoutIndex(srcRtt);
+      auto dstPlan = planLayoutIndex(dstRtt);
+      if (!srcPlan || !dstPlan ||
+          !layoutIndexPlansEquivalent(*srcPlan, *dstPlan))
+        return false;
+    }
+    // Any rank >= 2 slice -> blocked pair, not only a staged reduce's own
+    // result: a topk whose last comparator has the output's shape keeps no
+    // reshape to exchange at, and the divergent-cvt normaliser re-encodes
+    // that comparator into the store's layout, leaving the cvt on its INPUT --
+    // a `select` over the hypercube remnant, not a reduce. Forwarding it as a
+    // relabel handed every lane the remnant's element for (tid, iv) under a
+    // store loop with a different trip count; `tl.topk(x, 2)` over two rows
+    // stored one row's maximum in both columns. Ask the value's plan, as the
+    // reduce case above asks the type's.
+    if (srcRtt.getRank() >= 2 &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            srcRtt.getEncoding()) &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            dstRtt.getEncoding())) {
+      auto srcPlan = exchangeSourcePlan(op.getSrc());
       auto dstPlan = planLayoutIndex(dstRtt);
       if (!srcPlan || !dstPlan ||
           !layoutIndexPlansEquivalent(*srcPlan, *dstPlan))
@@ -16539,8 +16637,42 @@ struct ReduceRankNLowering
       // lower-rank result layout is wrong when that layout replicates owners:
       // at 1024 elements it handed several lanes a neighbouring pair's XOR
       // even though the staged reduction buffer itself was correct.
+      //
+      // "Its own" means the element the CONSUMER holds, which is the source
+      // element only while both carry one encoding. A topk whose last stage
+      // already has the output's shape has no reshape to exchange at: the
+      // divergent-cvt normaliser re-encodes the final comparator cone into the
+      // store's layout instead, and the keep-dims result then arrives under
+      // `expand_dims` in THAT encoding. Asking the source layout there read
+      // partners for another lane's element -- `tl.topk(x, 2)` over two rows
+      // stored the first row's maximum in all four slots.
+      LayoutIndexPlan elementLayout = plan->srcLayout;
+      {
+        auto srcTy =
+            mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+        mlir::Attribute consumerEnc;
+        bool agree = true;
+        for (mlir::Operation *user : op->getResult(0).getUsers()) {
+          auto expandTy = mlir::dyn_cast<mlir::RankedTensorType>(
+              user->getResult(0).getType());
+          mlir::Attribute enc = expandTy ? expandTy.getEncoding() : nullptr;
+          if (!enc || (consumerEnc && enc != consumerEnc))
+            agree = false;
+          consumerEnc = enc;
+        }
+        if (agree && consumerEnc && consumerEnc != srcTy.getEncoding() &&
+            mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(consumerEnc)) {
+          auto consumerTy = mlir::RankedTensorType::get(
+              srcTy.getShape(), srcTy.getElementType(), consumerEnc);
+          // Every blocked layout has a plan; a `notifyMatchFailure` here
+          // would kill the process inside the full conversion.
+          if (std::optional<LayoutIndexPlan> consumerPlan =
+                  planLayoutIndex(consumerTy))
+            elementLayout = *consumerPlan;
+        }
+      }
       mlir::Value flat =
-          emitLayoutElementIndex(op, plan->srcLayout, rewriter, loc);
+          emitLayoutElementIndex(op, elementLayout, rewriter, loc);
       if (!flat)
         return rewriter.notifyMatchFailure(
             op, "rank-N reduce: source layout index unavailable");

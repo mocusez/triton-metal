@@ -2349,9 +2349,20 @@ def test_sort_rank3_exact_rows_at_every_band_count(B, M, N, num_warps):
 # DenseMap every lane read slot 0. Whether it grows depends on what this
 # process compiled earlier, so these cells cannot pin it; the lit fixture
 # `topk_rematerialized_read_plan.mlir` does, in a fresh process.
+#
+# The small-k cells are where the hypercube remnant already has the OUTPUT's
+# shape, so the last comparator reaches its store with no reshape to exchange
+# at. They needed three things at once: a nested-slice size-2 indicator range
+# (k=2 over one row died with "failed to legalize tt.make_range"), the final
+# slice -> blocked conversion exchanged instead of forwarded, and the staged
+# xor-reduce's keep-dims read and the column indicator both taken from the
+# store-layout cone the normaliser re-encoded the comparator into. k=1 is
+# `tl.max(x, 1, keep_dims=True)` stored as a column.
 @pytest.mark.parametrize("M,N,K,num_warps", [
     (16, 16, 4, 1), (32, 8, 4, 1), (8, 128, 4, 1), (8, 128, 4, 4),
     (8, 128, 16, 4), (4, 32, 4, 1), (4, 32, 8, 1),
+    (2, 64, 2, 1), (2, 16, 2, 4), (2, 128, 2, 4), (1, 16, 4, 1),
+    (1, 64, 4, 4), (1, 32, 2, 1), (1, 128, 2, 4), (4, 32, 1, 1), (8, 32, 1, 4),
 ])
 def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps):
     torch = pytest.importorskip("torch")
