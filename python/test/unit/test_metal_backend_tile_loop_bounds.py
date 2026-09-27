@@ -139,3 +139,58 @@ def test_narrow_atomic_stays_inside_its_tensor():
     torch.mps.synchronize()
     torch.testing.assert_close(out_vec.cpu(), torch.ones(N), atol=0, rtol=0)
     _assert_untouched(big, N)
+
+
+@triton.jit
+def _two_tiles_kernel(A, B, C, D, R1: tl.constexpr, C1: tl.constexpr,
+                      R2: tl.constexpr, C2: tl.constexpr,
+                      SHARE_ROWS: tl.constexpr):
+    r1 = tl.arange(0, R1)
+    c1 = tl.arange(0, C1)
+    a = tl.load(A + r1[:, None] * C1 + c1[None, :])
+    tl.store(B + r1[:, None] * C1 + c1[None, :], a * 2.0)
+    if SHARE_ROWS:
+        r2 = r1
+    else:
+        r2 = tl.arange(0, R2)
+    c2 = tl.arange(0, C2)
+    c = tl.load(C + r2[:, None] * C2 + c2[None, :])
+    tl.store(D + r2[:, None] * C2 + c2[None, :], c + 1.0)
+
+
+# Two INDEPENDENT rank-2 tiles of different shapes in one kernel. Every rank-2
+# range decomposes against a tile, and a range that knew its own one was only
+# allowed to use it when that tile held as many elements as the kernel's
+# largest -- so a `[4, 2]` store beside a `[4, 4]` one wrote `tid / 4, tid % 4`,
+# and a `[R, 1]` column was never recognised as a tile at all. 📏
+# `s_two_rank2_tiles.py`: 156 of 270 such kernels silently wrong, now 0. The
+# cells cover a unit column, a unit row, the smaller tile above one pass
+# (E = 2), and the LARGER tile going wrong beside a smaller one. Both outputs go
+# through canary views: a smaller tile runs under the larger one's tile loop.
+@pytest.mark.parametrize("first,second,num_warps,share", [
+    ((4, 1), (4, 4), 1, False),
+    ((4, 1), (4, 4), 1, True),
+    ((16, 1), (16, 16), 2, True),
+    ((4, 2), (4, 4), 1, False),
+    ((1, 64), (16, 16), 1, False),
+    ((64, 1), (64, 32), 1, True),
+    ((32, 2), (8, 128), 1, False),
+    ((16, 16), (64, 32), 1, False),
+    ((64, 32), (16, 16), 4, False),
+    ((64, 8), (16, 16), 2, False),
+])
+def test_two_independent_rank2_tiles_each_use_their_own_shape(
+        first, second, num_warps, share):
+    (r1, c1), (r2, c2) = first, second
+    torch.manual_seed(r1 * 131 + c1 * 7 + r2 + c2 + num_warps)
+    a = torch.randn(r1, c1, device="mps")
+    c = torch.randn(r2, c2, device="mps")
+    big_b, b = _canary_view(r1 * c1)
+    big_d, d = _canary_view(r2 * c2)
+    _two_tiles_kernel[(1,)](a, b, c, d, r1, c1, r2, c2, share,
+                            num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(b.cpu().reshape(r1, c1), a.cpu() * 2)
+    assert torch.equal(d.cpu().reshape(r2, c2), c.cpu() + 1)
+    _assert_untouched(big_b, r1 * c1)
+    _assert_untouched(big_d, r2 * c2)

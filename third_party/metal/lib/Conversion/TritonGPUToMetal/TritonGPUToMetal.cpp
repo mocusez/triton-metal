@@ -2371,6 +2371,25 @@ makeRangeOwnTileOfRank(mlir::triton::MakeRangeOp op, int64_t rank) {
     if (!seen.insert(v).second)
       continue;
     for (mlir::Operation *user : v.getUsers()) {
+      // The address a rank-2 load or store is GIVEN is its tile, unit axis or
+      // not: a `[BM, 1]` statistics column is the whole tile that access
+      // walks, not an `expand_dims` on the way to a wider one. Without this a
+      // range whose only rank-2 use is such a column found nothing and was
+      // decomposed against the kernel's largest tile instead -- a `[4, 1]`
+      // store beside a `[4, 4]` one wrote row `tid / 4` of a four-row buffer.
+      // Rank 2 only: the rank-3 walk's every-axis rule is load-bearing.
+      if (rank == 2 &&
+          mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(user) &&
+          user->getNumOperands() > 0 && user->getOperand(0) == v) {
+        auto info = tileFromTensor(v.getType());
+        if (info && info->rank == 2) {
+          if (!found)
+            found = info;
+          else if (found->shape != info->shape)
+            return std::nullopt;
+          continue;
+        }
+      }
       for (mlir::Value res : user->getResults()) {
         auto rt = mlir::dyn_cast<mlir::RankedTensorType>(res.getType());
         if (!rt)
@@ -41044,23 +41063,20 @@ struct ConvertTritonGPUToMetalPass
         std::optional<TileInfo> own = makeRangeOwnTileOfRank(range, 2);
         std::optional<TileInfo> global = findLargestRank2Tile(range);
         const bool globalUsable = global && global->rank == 2;
-        auto numel = [](const TileInfo &t) {
-          int64_t n = 1;
-          for (int64_t s : t.shape)
-            n *= s;
-          return n;
-        };
-        // Without phase scheduling, substitute only between tiles that
-        // enumerate the SAME number of elements. The flat index and tile-loop
-        // trip count otherwise come from different bijections — the pair that
-        // once made a multi-warp matmul wrong on three launches out of four.
-        // A rank-N reduction phase gives each segment its own trip count, so a
-        // topk input range and its smaller output range may safely use the
-        // distinct tiles found by their own cones. A matmul has no such phase
-        // and retains the historical same-numel guard.
-        const bool hasRankNPhases = !g_rankNReducePublish.empty();
-        if (own && (!globalUsable || own->shape != global->shape) &&
-            (hasRankNPhases || !global || numel(*own) == numel(*global))) {
+        // Every range that knows its own tile uses it. This used to be allowed
+        // only between tiles enumerating the SAME number of elements (or under
+        // rank-N phases), because a multi-warp matmul had once taken its tile
+        // loop's trip count from one tile and its flat index from another. That
+        // guard left every OTHER second tile decomposed against the largest
+        // one's row length -- a `[4, 2]` store beside a `[4, 4]` one wrote
+        // `tid / 4, tid % 4` -- and 📏 `s_two_rank2_tiles.py` found 156 of 270
+        // independent two-tile kernels silently wrong. Without it: 270 / 270,
+        // and the matmul it was written for
+        // (`test_multiwarp_multitile_matmul_is_deterministic`, eight launches
+        // at 1, 2 and 4 warps) and nine dot / matmul / layout sweeps are
+        // unchanged cell for cell. Measured, not argued: if a kernel shape
+        // brings the trip-count disagreement back, that test is where it shows.
+        if (own && (!globalUsable || own->shape != global->shape)) {
           // Two rank-2 shapes in one kernel — or, for a rank-1 -> rank-2
           // `tl.reshape`, a module whose largest tile is the rank-1 source and
           // whose rank-2 range would otherwise find nothing to decompose
