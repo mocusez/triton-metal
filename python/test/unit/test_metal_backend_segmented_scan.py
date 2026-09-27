@@ -1230,7 +1230,7 @@ def _rankn_tuple_chained_loop_kernel(x_ptr, value_ptr, count_ptr, rows,
 
 
 @triton.jit
-def _rankn_tuple_scan_invalid_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+def _rankn_tuple_scan_carried_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
     index = tl.reshape(tl.arange(0, 128), (8, 16))
     value = tl.full((8, 16), 0.0, tl.float32)
     count = tl.full((8, 16), 0, tl.int32)
@@ -1278,6 +1278,122 @@ def _rankn_tuple_scan_hoisted_snapshot_loop_kernel(x_ptr, value_ptr, count_ptr, 
                                            _tuple_sum_and_count_combine)
         tl.store(value_ptr + row * 128 + index, value)
         tl.store(count_ptr + row * 128 + index, count)
+
+
+@triton.jit
+def _rankn_tuple_scan_scalar_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 128), (8, 16))
+    total = 0.0
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 128 + index) + total
+        count = tl.full((8, 16), 1, tl.int32)
+        value, count = tl.associative_scan((x, count), 1,
+                                           _tuple_sum_and_count_combine)
+        tl.store(value_ptr + row * 128 + index, value)
+        tl.store(count_ptr + row * 128 + index, count)
+        total = total + 1.0
+
+
+@triton.jit
+def _rankn_tuple_scan_dot_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 256), (16, 16))
+    acc = tl.zeros((16, 16), tl.float32)
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 256 + index)
+        acc = tl.dot(x, x, acc)
+        tl.store(value_ptr + row * 256 + index, tl.cumsum(acc, 1))
+
+
+# A multi-band scan inside a runtime loop runs the body as register-band
+# phases; a tile the loop carries has no register to live in between them and
+# goes through a threadgroup slot instead.
+@triton.jit
+def _scan_loop_accumulate_kernel(x_ptr, out_ptr, trips, R: tl.constexpr,
+                                 C: tl.constexpr, AXIS: tl.constexpr):
+    off = tl.arange(0, R)[:, None] * C + tl.arange(0, C)[None, :]
+    base = tl.load(x_ptr + off)
+    acc = base * 0.0
+    for t in range(trips):
+        x = tl.load(x_ptr + t * R * C + off)
+        acc += tl.cumsum(x, AXIS)
+    tl.store(out_ptr + off, acc + base)
+
+
+@mps_only
+@pytest.mark.parametrize("trips", [0, 3])
+@pytest.mark.parametrize("shape,axis,num_warps", [
+    ((4, 32), 0, 1), ((4, 32), 1, 1), ((16, 16), 0, 4), ((32, 32), 1, 4)])
+def test_scan_in_loop_carries_accumulator(trips, shape, axis, num_warps):
+    rows, cols = shape
+    x = (torch.arange(max(trips, 1) * rows * cols) % 7 - 3).float().reshape(
+        max(trips, 1), rows, cols)
+    out = torch.zeros(rows, cols, device="mps")
+    _scan_loop_accumulate_kernel[(1,)](x.to("mps"), out, trips, rows, cols, axis,
+                                       num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x[:trips].cumsum(axis + 1).sum(0) + x[0]
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _scan_loop_recurrence_kernel(x_ptr, out_ptr, trips, R: tl.constexpr,
+                                 C: tl.constexpr, AXIS: tl.constexpr):
+    off = tl.arange(0, R)[:, None] * C + tl.arange(0, C)[None, :]
+    s = tl.zeros((R, C), tl.int32)
+    for t in range(trips):
+        s = tl.cumsum(s + tl.load(x_ptr + t * R * C + off), AXIS)
+        tl.store(out_ptr + t * R * C + off, s)
+
+
+@mps_only
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_scan_in_loop_reads_its_carried_result(axis, num_warps):
+    trips, rows, cols = 3, 8, 64
+    x = (torch.arange(trips * rows * cols) % 5 - 2).int().reshape(trips, rows, cols)
+    out = torch.zeros_like(x, device="mps")
+    _scan_loop_recurrence_kernel[(1,)](x.to("mps"), out, trips, rows, cols, axis,
+                                       num_warps=num_warps)
+    torch.mps.synchronize()
+    s = torch.zeros(rows, cols, dtype=torch.int32)
+    for t in range(trips):
+        s = (s + x[t]).cumsum(axis, dtype=torch.int32)
+        assert torch.equal(out[t].cpu(), s), t
+
+
+@mps_only
+def test_tuple_scan_rankn_carried_loop():
+    rows = 5
+    x = torch.randn(rows, 8, 16)
+    value = torch.empty_like(x, device="mps")
+    count = torch.empty(x.shape, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_carried_loop_kernel[(1,)](x.to("mps"), value, count, rows,
+                                                num_warps=1)
+    torch.mps.synchronize()
+    v = torch.zeros(8, 16)
+    c = torch.zeros(8, 16, dtype=torch.int32)
+    for row in range(rows):
+        v = (v + x[row]).cumsum(1)
+        c = (c + 1).cumsum(1, dtype=torch.int32)
+        torch.testing.assert_close(value[row].cpu(), v, atol=1e-4, rtol=1e-4)
+        assert torch.equal(count[row].cpu(), c), row
+
+
+@mps_only
+def test_tuple_scan_rankn_loop_reads_snapshot():
+    rows = 4
+    x = torch.randn(rows, 8, 16)
+    value = torch.empty_like(x, device="mps")
+    count = torch.empty(x.shape, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_snapshot_loop_kernel[(1,)](x.to("mps"), value, count, rows,
+                                                 num_warps=1)
+    torch.mps.synchronize()
+    for row in range(rows):
+        torch.testing.assert_close(value[row].cpu(), x[0].cumsum(1),
+                                   atol=1e-4, rtol=1e-4)
+        assert torch.equal(count[row].cpu(),
+                           torch.full((8, 16), 1 + row, dtype=torch.int32).cumsum(
+                               1, dtype=torch.int32)), row
 
 
 @mps_only
@@ -1474,12 +1590,12 @@ def test_tuple_scan_rankn_outside_envelope_is_named(shape, axis, num_warps, dtyp
 
 
 @pytest.mark.parametrize("kernel,reason", [
-    ("_rankn_tuple_scan_invalid_loop_kernel",
-     "nested scan requires one top-level for loop without iter_args"),
     ("_rankn_tuple_scan_nested_loop_kernel",
-     "nested scan requires one top-level for loop without iter_args"),
-    ("_rankn_tuple_scan_snapshot_loop_kernel",
-     "nested scan cannot replay an external tensor value"),
+     "nested scan requires one top-level for loop directly around it"),
+    ("_rankn_tuple_scan_scalar_carry_loop_kernel",
+     "nested scan carries only tensors between iterations"),
+    ("_rankn_tuple_scan_dot_carry_loop_kernel",
+     "nested scan carrying a tile cannot share its loop with a tl.dot"),
     ("_rankn_tuple_scan_hoisted_snapshot_loop_kernel",
      "staged scan cannot partition surrounding loops"),
 ])

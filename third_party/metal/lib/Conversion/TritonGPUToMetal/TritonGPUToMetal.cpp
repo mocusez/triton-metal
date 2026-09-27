@@ -313,6 +313,11 @@ static constexpr llvm::StringLiteral kScalarIdentityAttr =
 // thread. The publish's operand is the pre-exchange value, which the
 // evaluator can replay (a `tt.trans` swaps the coordinates).
 static mlir::Value coneReplaySource(mlir::Operation *def) {
+  // A carried tile's read holds a placeholder too, and its value lives in a
+  // slot no cone can replay.
+  if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      tag && tag.getValue() == "carry_read")
+    return {};
   if (auto tag = def->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
       tag && tag.getValue() == "read") {
     auto it = g_tileExchange.find(def);
@@ -601,8 +606,22 @@ static llvm::DenseSet<mlir::Operation *> g_nestedScanLoops;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanFunctions;
 static constexpr llvm::StringLiteral kScanBandLoopAttr = "metal.scan_band_loop";
 
+// A nested-scan loop runs its body as register-band phases, so a tile it
+// carries from one iteration to the next (an iter_arg), or a tile computed
+// before it that it or the code after it reads, has no register to live in
+// between the phases. Each such tile gets a threadgroup slot: a write and
+// reads marked `kExchangeAttr` = "carry_write" / "carry_read", both indexed by
+// the carried tile's own layout, so a lane reads back the element it wrote.
+// They are not exchange publishes and never end a phase.
+static constexpr llvm::StringLiteral kCarryWrite = "carry_write";
+static constexpr llvm::StringLiteral kCarryRead = "carry_read";
+static constexpr llvm::StringLiteral kCarrySlotAttr = "metal.carry_slot";
+// Threadgroup bytes of those slots, per function, counted by the budget
+// validators before the slots exist.
+static llvm::DenseMap<mlir::Operation *, int64_t> g_nestedScanCarryBytes;
+
 static int64_t nestedScanExchangeBytes(mlir::triton::FuncOp func) {
-  int64_t bytes = 0;
+  int64_t bytes = g_nestedScanCarryBytes.lookup(func.getOperation());
   func.walk([&](mlir::scf::ForOp loop) {
     if (g_nestedScanLoops.count(loop.getOperation()))
       bytes += assignExchangeBuffers(*loop.getBody()).totalBytes;
@@ -4559,7 +4578,10 @@ struct ConvertLayoutLowering
       const TileExchangePlan &plan = planIt->second;
       auto loc = op.getLoc();
       auto ui32 = rewriter.getIntegerType(32, /*isSigned=*/false);
-      const bool isPublish = tag.getValue() == "publish";
+      // A carry write stores exactly like a publish; its slot is not a phase
+      // boundary, which only the phase scheduler cares about.
+      const bool isPublish =
+          tag.getValue() == "publish" || tag.getValue() == kCarryWrite;
       // Each half asks its OWN layout where the lane's element lives; the
       // buffer is indexed by element, so neither needs the other's inverse.
       mlir::Value idx = emitLayoutElementIndex(
@@ -38956,9 +38978,91 @@ validateRankNTupleScanScratchBudget(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
-// The first local phase envelope keeps all tensor effects in a single
-// top-level runtime loop. Scalars outside it are uniform function inputs or
-// pure expressions. Tensor snapshots cannot be reloaded inside the loop.
+// A tensor a nested-scan segment can recompute where it is read: a regionless,
+// effect-free cone whose leaves are scalars. Anything else -- a load, notably --
+// is computed once and carried to its readers through a slot.
+static bool nestedScanReplayable(mlir::Value value,
+                                 llvm::DenseMap<mlir::Value, bool> &memo) {
+  if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
+    return true;
+  if (auto it = memo.find(value); it != memo.end())
+    return it->second;
+  mlir::Operation *def = value.getDefiningOp();
+  bool ok = def && def->getNumRegions() == 0 && mlir::isMemoryEffectFree(def);
+  memo[value] = ok;
+  if (ok)
+    for (mlir::Value operand : def->getOperands())
+      if (!nestedScanReplayable(operand, memo)) {
+        ok = false;
+        break;
+      }
+  memo[value] = ok;
+  return ok;
+}
+
+// The tiles a nested-scan loop carries through slots: one per iter_arg, then
+// one per tensor computed before the loop that the loop or the code after it
+// reads and that cannot be recomputed there (returned in `spilled`).
+static llvm::SmallVector<mlir::Type, 4>
+nestedScanCarriedTypes(mlir::scf::ForOp loop,
+                       llvm::SmallVectorImpl<mlir::Value> *spilled = nullptr) {
+  llvm::SmallVector<mlir::Type, 4> types;
+  for (mlir::Value init : loop.getInitArgs())
+    types.push_back(init.getType());
+  llvm::DenseMap<mlir::Value, bool> memo;
+  llvm::SetVector<mlir::Value> crossing;
+  auto consider = [&](mlir::Value value) {
+    mlir::Operation *def = value.getDefiningOp();
+    if (!def || def->getBlock() != loop->getBlock() ||
+        !def->isBeforeInBlock(loop))
+      return;
+    if (!nestedScanReplayable(value, memo))
+      crossing.insert(value);
+  };
+  loop.getBody()->walk([&](mlir::Operation *op) {
+    for (mlir::Value operand : op->getOperands())
+      consider(operand);
+  });
+  for (mlir::Operation *op = loop->getNextNode(); op; op = op->getNextNode())
+    for (mlir::Value operand : op->getOperands())
+      consider(operand);
+  for (mlir::Value value : crossing) {
+    types.push_back(value.getType());
+    if (spilled)
+      spilled->push_back(value);
+  }
+  return types;
+}
+
+// Why a carried tile cannot take a slot, or empty when it can. The slot is
+// indexed by the tile's own layout on both sides, so it needs a layout the
+// band loops walk exactly: the function tile's register count, one owner per
+// element (a replicated owner could read another lane's write of THIS
+// iteration), and a type threadgroup memory holds.
+static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
+                                                  const TileInfo &tile) {
+  auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
+  if (!rtt)
+    return "nested scan carries only tensors between iterations";
+  mlir::Type elem = rtt.getElementType();
+  if (!elem.isIntOrFloat() || elem.getIntOrFloatBitWidth() < 8)
+    return "nested scan carries only integer or floating-point tiles of at "
+           "least eight bits";
+  auto plan = planLayoutIndex(rtt);
+  if (!plan || plan->elemPerThread != tile.elemPerThread ||
+      plan->threadsPerBlock() != tile.threadsPerBlock ||
+      layoutHasReplicatedOwners(*plan))
+    return "nested scan carries only tiles with one owner per element and "
+           "the function tile's register count";
+  return {};
+}
+
+// The first local phase envelope keeps all tensor effects of the loop in a
+// single top-level runtime loop. Tensor work before it (loads and pure
+// compute) and after it (loads, compute, stores) runs in its own register-band
+// loop; tiles that cross from one segment or iteration to the next go through
+// slots (see `kCarryWrite`). Scalars outside it are uniform function inputs or
+// pure expressions.
 static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
   bool valid = true;
@@ -38971,10 +39075,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()))
       return;
     auto loop = mlir::dyn_cast<mlir::scf::ForOp>(scan->getParentOp());
-    if (!loop || !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()) ||
-        loop.getNumRegionIterArgs() != 0) {
+    if (!loop || !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp())) {
       scan.emitOpError("Metal backend: nested scan requires one top-level for "
-                       "loop without iter_args");
+                       "loop directly around it");
       valid = false;
       return;
     }
@@ -38983,15 +39086,31 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
   });
   if (!valid)
     return mlir::failure();
+  llvm::DenseMap<mlir::Operation *, int> loopsPerFunction;
+  for (auto loop : loops)
+    ++loopsPerFunction[loop->getParentOfType<mlir::triton::FuncOp>()];
   for (auto loop : loops) {
     auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+    bool outerTensorWork = false;
     for (mlir::Operation &op : func.getBody().front()) {
       if (&op == loop || op.hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
-      if (op.getNumRegions() || (!mlir::isMemoryEffectFree(&op) &&
-                                 !mlir::isa<mlir::triton::GetProgramIdOp>(&op)))
+      bool after = loop->isBeforeInBlock(&op);
+      if (op.getNumRegions() ||
+          (!mlir::isMemoryEffectFree(&op) &&
+           !mlir::isa<mlir::triton::GetProgramIdOp, mlir::triton::LoadOp>(
+               &op) &&
+           !(after && mlir::isa<mlir::triton::StoreOp>(&op))))
         return loop.emitOpError("Metal backend: nested scan cannot replay an "
                                 "external tensor value or move outer effects");
+      auto isTensor = [](mlir::Type type) {
+        return mlir::isa<mlir::RankedTensorType>(type);
+      };
+      // Pure tensor work before the loop is either localized below or
+      // feeds a carry; work after it, or any load, runs in a band loop.
+      if (after || !mlir::isMemoryEffectFree(&op))
+        outerTensorWork |= llvm::any_of(op.getResultTypes(), isTensor) ||
+                           llvm::any_of(op.getOperandTypes(), isTensor);
     }
     for (mlir::Operation &op : *loop.getBody()) {
       if (mlir::isa<mlir::triton::ScanOp>(&op) ||
@@ -39004,10 +39123,40 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         return loop.emitOpError("Metal backend: nested scan requires a flat "
                                 "load/compute/store loop body");
     }
+    llvm::SmallVector<mlir::Type, 4> carried = nestedScanCarriedTypes(loop);
+    if (!carried.empty() || outerTensorWork) {
+      auto tile = findTileInfo(func);
+      if (!tile)
+        return loop.emitOpError(
+            "Metal backend: nested scan carrying a tile has no function tile");
+      if (loopsPerFunction.lookup(func) > 1)
+        return loop.emitOpError("Metal backend: nested scan carrying a tile "
+                                "supports one scan loop per function");
+      // The slot read's operand is a placeholder; keep the dot tiers, which
+      // recognise a zero accumulator by its producer, away from it.
+      for (mlir::Operation &op : *loop.getBody())
+        if (mlir::isa<mlir::triton::DotOp, mlir::triton::DotScaledOp>(&op))
+          return loop.emitOpError("Metal backend: nested scan carrying a tile "
+                                  "cannot share its loop with a tl.dot");
+      int64_t bytes = 0;
+      for (mlir::Type type : carried) {
+        llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
+        if (!why.empty())
+          return loop.emitOpError("Metal backend: ") << why;
+        auto rtt = mlir::cast<mlir::RankedTensorType>(type);
+        bytes += rtt.getNumElements() *
+                 (metalStorageElementType(rtt.getElementType())
+                      .getIntOrFloatBitWidth() /
+                  8);
+      }
+      g_nestedScanCarryBytes[func.getOperation()] += bytes;
+    }
     mlir::OpBuilder builder(loop.getContext());
     builder.setInsertionPointToStart(loop.getBody());
     mlir::IRMapping mapping;
-    bool cloneable = true;
+    llvm::DenseMap<mlir::Value, bool> memo;
+    // Pure external tensor cones get local copies; what is not pure is left
+    // for a slot (`materializeNestedScanCarries`).
     std::function<mlir::Value(mlir::Value)> localize =
         [&](mlir::Value value) -> mlir::Value {
       if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
@@ -39015,16 +39164,10 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       if (auto mapped = mapping.lookupOrNull(value))
         return mapped;
       auto def = value.getDefiningOp();
-      if (def && loop->isAncestor(def))
+      if (!def || loop->isAncestor(def) || !nestedScanReplayable(value, memo))
         return value;
-      if (!def || def->getNumRegions() || !mlir::isMemoryEffectFree(def)) {
-        cloneable = false;
-        return value;
-      }
       for (mlir::Value operand : def->getOperands())
         localize(operand);
-      if (!cloneable)
-        return value;
       builder.clone(*def, mapping);
       return mapping.lookup(value);
     };
@@ -39034,11 +39177,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
     for (mlir::Operation *op : bodyOps)
       for (mlir::OpOperand &use : op->getOpOperands())
         use.set(localize(use.get()));
-    if (!cloneable)
-      return loop.emitOpError(
-          "Metal backend: nested scan cannot replay an external tensor value");
-    // Pure external tensor cones now have local copies. Remove only dead
-    // originals so no tensor outside a band loop is accidentally scalarized.
+    // Remove only dead originals so no tensor outside a band loop is
+    // accidentally scalarized.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -39051,15 +39191,267 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         }
       }
     }
-    for (mlir::Operation &op : func.getBody().front())
-      if (&op != loop && llvm::any_of(op.getResultTypes(), [](mlir::Type type) {
-            return mlir::isa<mlir::RankedTensorType>(type);
-          }))
-        return loop.emitOpError("Metal backend: nested scan cannot leave "
-                                "tensor work outside its loop");
     g_nestedScanFunctions.insert(func.getOperation());
   }
   return mlir::success();
+}
+
+// Give a nested-scan loop's carried tiles their slots and its outer tensor
+// work its band loops, right before the phases are cut. Everything here was
+// preflighted by `selectNestedScanLoops`; it runs this late because a slot
+// write is a pure op with no user, which every dead-code sweep before the
+// conversion would erase.
+static mlir::FailureOr<mlir::scf::ForOp>
+materializeNestedScanCarries(mlir::scf::ForOp loop) {
+  auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+  mlir::Block &top = func.getBody().front();
+  auto isTensor = [](mlir::Type type) {
+    return mlir::isa<mlir::RankedTensorType>(type);
+  };
+  auto touchesTensor = [&](mlir::Operation &op) {
+    return llvm::any_of(op.getResultTypes(), isTensor) ||
+           llvm::any_of(op.getOperandTypes(), isTensor);
+  };
+  llvm::SmallVector<mlir::Value, 4> spilled;
+  llvm::SmallVector<mlir::Type, 4> carried =
+      nestedScanCarriedTypes(loop, &spilled);
+  bool outerTensorWork = false;
+  for (mlir::Operation &op : top)
+    if (&op != loop && !op.hasTrait<mlir::OpTrait::IsTerminator>() &&
+        (loop->isBeforeInBlock(&op) || !mlir::isMemoryEffectFree(&op)) &&
+        touchesTensor(op))
+      outerTensorWork = true;
+  if (carried.empty() && !outerTensorWork)
+    return loop;
+  auto tile = findTileInfo(func);
+  if (!tile) {
+    loop.emitOpError("Metal backend: nested scan carrying a tile has no "
+                     "function tile");
+    return mlir::failure();
+  }
+  for (mlir::Type type : carried)
+    if (llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
+        !why.empty()) {
+      loop.emitOpError("Metal backend: ") << why;
+      return mlir::failure();
+    }
+
+  auto loc = loop.getLoc();
+  llvm::SmallVector<mlir::RankedTensorType, 4> slotTypes;
+  auto write = [&](mlir::OpBuilder &b, unsigned slot, mlir::Value value) {
+    auto op = mlir::triton::gpu::ConvertLayoutOp::create(b, loc,
+                                                         value.getType(), value);
+    op->setAttr(kExchangeAttr, b.getStringAttr(kCarryWrite));
+    op->setAttr(kCarrySlotAttr, b.getI64IntegerAttr(slot));
+  };
+  auto read = [&](mlir::OpBuilder &b, unsigned slot) -> mlir::Value {
+    mlir::RankedTensorType type = slotTypes[slot];
+    mlir::Value placeholder =
+        mlir::arith::ConstantOp::create(
+            b, loc,
+            mlir::DenseElementsAttr::get(
+                type, b.getZeroAttr(type.getElementType())))
+            .getResult();
+    auto op = mlir::triton::gpu::ConvertLayoutOp::create(b, loc, type,
+                                                         placeholder);
+    op->setAttr(kExchangeAttr, b.getStringAttr(kCarryRead));
+    op->setAttr(kCarrySlotAttr, b.getI64IntegerAttr(slot));
+    return op.getResult();
+  };
+  // One read, placed before the first use in `block`, serves every use there.
+  auto readInBlock = [&](mlir::Value value, unsigned slot, mlir::Block &block,
+                         llvm::function_ref<bool(mlir::Operation *)> inScope) {
+    llvm::SmallVector<mlir::OpOperand *, 8> uses;
+    mlir::Operation *first = nullptr;
+    for (mlir::OpOperand &use : value.getUses()) {
+      mlir::Operation *owner = block.findAncestorOpInBlock(*use.getOwner());
+      if (!owner || !inScope(owner))
+        continue;
+      uses.push_back(&use);
+      if (!first || owner->isBeforeInBlock(first))
+        first = owner;
+    }
+    if (!first)
+      return;
+    mlir::OpBuilder b(first);
+    mlir::Value loaded = read(b, slot);
+    for (mlir::OpOperand *use : uses)
+      use->set(loaded);
+  };
+  auto everywhere = [](mlir::Operation *) { return true; };
+  auto afterLoop = [&](mlir::Operation *op) {
+    return op != loop.getOperation() && loop->isBeforeInBlock(op);
+  };
+  mlir::Block &body = *loop.getBody();
+  mlir::OpBuilder before(loop);
+
+  // Tiles computed before the loop that cannot be recomputed where read.
+  for (mlir::Value value : spilled) {
+    unsigned slot = slotTypes.size();
+    slotTypes.push_back(mlir::cast<mlir::RankedTensorType>(value.getType()));
+    write(before, slot, value);
+    readInBlock(value, slot, body, everywhere);
+    readInBlock(value, slot, top, afterLoop);
+  }
+  // Iter_args: every read of this iteration's value precedes the writes of
+  // the next, which sit at the very end of the body.
+  auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
+  unsigned firstIterSlot = slotTypes.size();
+  for (auto [init, arg] :
+       llvm::zip(loop.getInitArgs(), loop.getRegionIterArgs())) {
+    unsigned slot = slotTypes.size();
+    slotTypes.push_back(mlir::cast<mlir::RankedTensorType>(init.getType()));
+    write(before, slot, init);
+    readInBlock(arg, slot, body, everywhere);
+  }
+  {
+    mlir::OpBuilder atYield(yield);
+    for (auto [i, next] : llvm::enumerate(yield.getOperands()))
+      write(atYield, firstIterSlot + i, next);
+  }
+  for (auto [i, result] : llvm::enumerate(loop.getResults()))
+    readInBlock(result, firstIterSlot + i, top, afterLoop);
+
+  // The same loop without iter_args.
+  auto newLoop = mlir::scf::ForOp::create(before, loc, loop.getLowerBound(),
+                                          loop.getUpperBound(), loop.getStep());
+  newLoop->setDiscardableAttrs(loop->getDiscardableAttrDictionary());
+  mlir::Block &newBody = *newLoop.getBody();
+  newBody.getOperations().splice(newBody.getTerminator()->getIterator(),
+                                 body.getOperations(), body.begin(),
+                                 yield->getIterator());
+  loop.getInductionVar().replaceAllUsesWith(newLoop.getInductionVar());
+  g_nestedScanLoops.erase(loop.getOperation());
+  g_nestedScanLoops.insert(newLoop.getOperation());
+  loop->erase();
+
+  // Pure tensors computed before the loop and read inside or after it are
+  // recomputed there, as `selectNestedScanLoops` did for the body.
+  auto localizeInto = [&](mlir::Block &block, mlir::Block::iterator at,
+                          llvm::function_ref<bool(mlir::Operation *)> inScope) {
+    mlir::OpBuilder b(&block, at);
+    mlir::IRMapping mapping;
+    llvm::DenseMap<mlir::Value, bool> memo;
+    std::function<mlir::Value(mlir::Value)> localize =
+        [&](mlir::Value value) -> mlir::Value {
+      if (!isTensor(value.getType()))
+        return value;
+      if (auto mapped = mapping.lookupOrNull(value))
+        return mapped;
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def || def->getBlock() != &top || !def->isBeforeInBlock(newLoop) ||
+          !nestedScanReplayable(value, memo))
+        return value;
+      for (mlir::Value operand : def->getOperands())
+        localize(operand);
+      b.clone(*def, mapping);
+      return mapping.lookup(value);
+    };
+    llvm::SmallVector<mlir::Operation *, 32> users;
+    for (mlir::Operation &op : block)
+      if (inScope(&op))
+        users.push_back(&op);
+    for (mlir::Operation *op : users)
+      op->walk([&](mlir::Operation *nested) {
+        for (mlir::OpOperand &use : nested->getOpOperands())
+          use.set(localize(use.get()));
+      });
+  };
+  localizeInto(newBody, newBody.begin(), everywhere);
+  localizeInto(top, std::next(newLoop->getIterator()),
+               [&](mlir::Operation *op) {
+                 return newLoop->isBeforeInBlock(op) &&
+                        !op->hasTrait<mlir::OpTrait::IsTerminator>();
+               });
+  // Drop the originals nothing reads any more; a slot write has no user by
+  // construction and must stay.
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto it = top.rbegin(); it != top.rend();) {
+      mlir::Operation &op = *it++;
+      if (&op != newLoop.getOperation() && op.getNumResults() &&
+          !op.hasAttr(kExchangeAttr) && mlir::isOpTriviallyDead(&op)) {
+        op.erase();
+        changed = true;
+      }
+    }
+  }
+
+  // The tensor work on either side of the loop runs in a band loop of its
+  // own, with a barrier between it and the loop.
+  mlir::OpBuilder b(func.getContext());
+  auto constant = [&](int64_t n) {
+    return mlir::arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(n))
+        .getResult();
+  };
+  auto band = [&](llvm::ArrayRef<mlir::Operation *> ops) -> mlir::LogicalResult {
+    if (ops.empty())
+      return mlir::success();
+    auto phase = mlir::scf::ForOp::create(b, loc, constant(0),
+                                          constant(tile->elemPerThread),
+                                          constant(1));
+    phase->setAttr(kScanBandLoopAttr, b.getUnitAttr());
+    for (mlir::Operation *op : ops)
+      op->moveBefore(phase.getBody()->getTerminator());
+    for (mlir::Operation *op : ops)
+      for (mlir::Value result : op->getResults())
+        for (mlir::Operation *user : result.getUsers())
+          if (!phase->isAncestor(user)) {
+            op->emitOpError("Metal backend: nested scan cannot carry this "
+                            "value between the loop and the code around it");
+            return mlir::failure();
+          }
+    return mlir::success();
+  };
+  llvm::SmallVector<mlir::Operation *, 32> preOps, postOps;
+  for (mlir::Operation &op : top) {
+    if (&op == newLoop.getOperation() ||
+        op.hasTrait<mlir::OpTrait::IsTerminator>() || !touchesTensor(op))
+      continue;
+    (newLoop->isBeforeInBlock(&op) ? postOps : preOps).push_back(&op);
+  }
+  b.setInsertionPoint(newLoop);
+  if (mlir::failed(band(preOps)))
+    return mlir::failure();
+  if (!preOps.empty())
+    BarrierOp::create(b, loc);
+  b.setInsertionPoint(top.getTerminator());
+  if (!postOps.empty())
+    BarrierOp::create(b, loc);
+  if (mlir::failed(band(postOps)))
+    return mlir::failure();
+
+  // The slots, and the plan each carry op lowers against.
+  b.setInsertionPointToStart(&top);
+  llvm::SmallVector<mlir::Value, 4> buffers;
+  for (mlir::RankedTensorType type : slotTypes)
+    buffers.push_back(ThreadgroupAllocaOp::create(
+        b, loc,
+        MetalMemRefType::get(func.getContext(),
+                             metalStorageElementType(type.getElementType()),
+                             type.getNumElements())));
+  bool registered = true;
+  func.walk([&](mlir::triton::gpu::ConvertLayoutOp op) {
+    auto slot = op->getAttrOfType<mlir::IntegerAttr>(kCarrySlotAttr);
+    if (!slot)
+      return;
+    auto type = mlir::cast<mlir::RankedTensorType>(op.getType());
+    auto plan = planLayoutIndex(type);
+    if (!plan || slot.getInt() >= static_cast<int64_t>(buffers.size())) {
+      registered = false;
+      return;
+    }
+    g_tileExchange[op.getOperation()] = TileExchangePlan{
+        *plan, *plan, type.getNumElements(),
+        metalStorageElementType(type.getElementType()), nullptr,
+        /*endsPhase=*/false};
+    g_tileExchangeBuf[op.getOperation()] = buffers[slot.getInt()];
+  });
+  if (!registered) {
+    newLoop.emitOpError("Metal backend: nested scan lost a carried tile's slot");
+    return mlir::failure();
+  }
+  return newLoop;
 }
 
 // Commit local band phases while tensor operands and the original user loop
@@ -39071,7 +39463,12 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
     if (g_nestedScanLoops.count(loop.getOperation()))
       loops.push_back(loop);
   });
-  for (auto loop : loops) {
+  for (auto original : loops) {
+    mlir::FailureOr<mlir::scf::ForOp> carried =
+        materializeNestedScanCarries(original);
+    if (mlir::failed(carried))
+      return mlir::failure();
+    mlir::scf::ForOp loop = *carried;
     auto func = loop->getParentOfType<mlir::triton::FuncOp>();
     mlir::Block &body = *loop.getBody();
     auto assignment = assignExchangeBuffers(body);
@@ -39183,6 +39580,26 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
     phaseBody.getOperations().splice(std::prev(phaseBody.end()),
                                      body.getOperations(), segmentBegin,
                                      terminator);
+
+    // A carry op indexes its slot by its own layout at the band's register
+    // index, so its band must walk exactly that many registers.
+    mlir::LogicalResult bandsFit = mlir::success();
+    func.walk([&](mlir::triton::gpu::ConvertLayoutOp op) {
+      if (!op->hasAttr(kCarrySlotAttr) || mlir::failed(bandsFit))
+        return;
+      auto band = op->getParentOfType<mlir::scf::ForOp>();
+      auto limit = band && band->hasAttr(kScanBandLoopAttr)
+                       ? band.getUpperBound().getDefiningOp<mlir::arith::ConstantOp>()
+                       : mlir::arith::ConstantOp();
+      auto limitAttr =
+          limit ? mlir::dyn_cast<mlir::IntegerAttr>(limit.getValue()) : nullptr;
+      if (!limitAttr ||
+          limitAttr.getInt() != g_tileExchange.lookup(op).src.elemPerThread)
+        bandsFit = op.emitOpError("Metal backend: nested scan carries a tile "
+                                  "through a phase of another register count");
+    });
+    if (mlir::failed(bandsFit))
+      return mlir::failure();
   }
   return mlir::success();
 }
@@ -40158,6 +40575,7 @@ struct ConvertTritonGPUToMetalPass
     g_stagedScanRanges.clear();
     g_nestedScanLoops.clear();
     g_nestedScanFunctions.clear();
+    g_nestedScanCarryBytes.clear();
     g_rankNPlannedReduces.clear();
     g_broadcastExchange.clear();
 
