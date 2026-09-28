@@ -1192,6 +1192,8 @@ def test_rank2_cone_precise_producer_is_replayed(form, axis, shape):
 #               E = 8 -- `ttg.convert_layout` between two `#ttg.slice`
 #               encodings of one parent is not a relabel, and was being
 #               forwarded as one, which answered with the SAME-axis broadcast.
+#               Above it the exchange reads the slice where the broadcast
+#               tile's elements are (see the tests after the refusal helper).
 #   scanmix     a column-reduce republished into a tile in a function that also
 #               stages a `tl.scan`, wrong from E >= 2.
 #
@@ -1306,10 +1308,12 @@ def test_rank3_reduce_cross_axis_broadcast_matches_torch(shape, num_warps,
 
 @triton.jit
 def _rank3_reduce_bcast_flat_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
-                                    C: tl.constexpr, AXIS: tl.constexpr):
+                                    C: tl.constexpr, AXIS: tl.constexpr,
+                                    D0: tl.constexpr, D1: tl.constexpr,
+                                    D2: tl.constexpr):
     f = tl.arange(0, A * B * C)
     v = tl.reshape(tl.load(X + f), (A, B, C))
-    back = tl.sum(v, AXIS)[:, None, :] + tl.zeros((A, B, C), tl.float32)
+    back = tl.sum(v, AXIS)[:, None, :] + tl.zeros((D0, D1, D2), tl.float32)
     tl.store(O + f, tl.reshape(back, (A * B * C,)))
 
 
@@ -1346,84 +1350,62 @@ def _refusal_child(tmp_path, name, body, timeout=300):
     return result, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize(
-    "shape,num_warps", [((4, 8, 8), 1), ((8, 8, 8), 1), ((8, 8, 8), 2)],
-    ids=["4x8x8_w1_e8", "8x8x8_w1_e16", "8x8x8_w2_e8"],
+# Above one register band a staged rank-N reduce publishes its result under a
+# thread-major relabel, and two consumers of it used to be refused by name:
+#   * the result broadcast back and FLATTENED (`tl.reshape(back, (n,))`): the
+#     tile holds thread-major elements, while the flattening reshape inside a
+#     rank-N phase reads its source under the layout;
+#   * the result broadcast back on ANOTHER axis: the `slice -> slice`
+#     conversion changes how many elements a thread owns.
+# Both are exchanges now -- the first publishes the tile under its thread-major
+# label, the second reads the slice at the element each broadcast-tile
+# position names (the tile's own label with the slice axis dropped). 📏
+# `s_reduce_consumers` 613 OK / 101 refused -> 701 / 13, 0 wrong either side.
+_ABOVE_ONE_BAND = pytest.mark.parametrize(
+    "shape,num_warps",
+    [((4, 8, 8), 1), ((8, 8, 8), 1), ((8, 8, 8), 2), ((4, 4, 16), 1)],
+    ids=["4x8x8_w1_e8", "8x8x8_w1_e16", "8x8x8_w2_e8", "4x4x16_w1_e8"],
 )
-def test_rank3_reduce_broadcast_flattened_is_refused(shape, num_warps,
-                                                     tmp_path):
-    """Above one register band the relabel has already travelled through the
-    broadcast, and flattening reads the element the TYPE names. Refused, and
-    the same broadcast stored through a rank-3 address stays supported -- that
-    arm is exact in all 108 of its sweep cells, which is why this refusal is
-    about the flatten and not about the broadcast."""
-    a, b, c = shape
-    result, output = _refusal_child(tmp_path, "rank3_bcast_flat", f"""
-        n = {a} * {b} * {c}
-        x = torch.zeros(n, device="mps")
-        o = torch.zeros(n, device="mps")
-        for attempt in range(2):
-            try:
-                module._rank3_reduce_bcast_flat_kernel[(1,)](
-                    x, o, A={a}, B={b}, C={c}, AXIS=1,
-                    num_warps={num_warps})
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("a flattened rank-3 broadcast compiled")
-        # The neighbour that keeps a rank-3 address is supported and stays so.
-        y = torch.zeros(64, device="mps")
-        module._rank3_reduce_cross_axis_kernel[(1,)](
-            y, torch.zeros(64, device="mps"), A=4, B=4, C=4, AXIS=1,
-            D0=4, D1=4, D2=4, num_warps=1)
-        print("RECOVERED")
-    """)
-    needle = ("this tl.reshape flattens a tile built from a rank-N reduce "
-              "that published its result under a thread-major relabel")
-    assert result.returncode == 0, output
-    assert output.count(needle) == 2, output
-    assert "RECOVERED" in output, output
-    assert "failed to legalize" not in output, output
 
 
-@pytest.mark.parametrize(
-    "shape,num_warps", [((4, 8, 8), 1), ((8, 8, 8), 1)],
-    ids=["4x8x8_w1_e8", "8x8x8_w1_e16"],
-)
-def test_rank3_reduce_cross_axis_broadcast_is_refused_above_one_band(
-        shape, num_warps, tmp_path):
-    """The exchange that repairs the cross-axis conversion indexes its buffer
-    by element and lets each half ask its own layout, so it can repair a pair
-    whose threads own the same NUMBER of elements. Above one register band
-    these two slices do not, and the refusal says exactly that; below it the
-    same kernel compiles and is exact (the test above)."""
+@_ABOVE_ONE_BAND
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_rank3_reduce_broadcast_flattened_matches_torch(shape, num_warps, axis):
+    """`tl.sum(v, ax)[:, None, :]` broadcast back, then flattened and stored.
+    Axis 1 is the same-axis broadcast; 0 and 2 go through the cross-axis
+    conversion too."""
     a, b, c = shape
-    dest = _cross_axis_dest(shape, 0)
-    result, output = _refusal_child(tmp_path, "rank3_cross_axis", f"""
-        n = {a} * {b} * {c}
-        x = torch.zeros(n, device="mps")
-        try:
-            module._rank3_reduce_cross_axis_kernel[(1,)](
-                x, torch.zeros(n, device="mps"), A={a}, B={b}, C={c}, AXIS=0,
-                D0={dest[0]}, D1={dest[1]}, D2={dest[2]},
-                num_warps={num_warps})
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("a cross-axis broadcast compiled above a band")
-        # Two elements per thread on the same axis is inside the envelope.
-        y = torch.zeros(64, device="mps")
-        module._rank3_reduce_cross_axis_kernel[(1,)](
-            y, torch.zeros(64, device="mps"), A=4, B=4, C=4, AXIS=0,
-            D0=4, D1=4, D2=4, num_warps=1)
-        print("RECOVERED")
-    """)
-    needle = ("this slice-to-slice ttg.convert_layout changes how many "
-              "elements a thread owns")
-    assert result.returncode == 0, output
-    assert output.count(needle) == 1, output
-    assert "RECOVERED" in output, output
-    assert "failed to legalize" not in output, output
+    dest = _cross_axis_dest(shape, axis)
+    torch.manual_seed(0xF1A7 + a * 31 + b * 7 + c + axis)
+    x = torch.randn(a * b * c, dtype=torch.float32).contiguous()
+    expected = (x.reshape(a, b, c).sum(axis)[:, None, :]
+                .expand(*dest).reshape(-1).contiguous())
+    out = torch.zeros(a * b * c, dtype=torch.float32, device="mps")
+    _rank3_reduce_bcast_flat_kernel[(1,)](
+        x.to("mps"), out, A=a, B=b, C=c, AXIS=axis,
+        D0=dest[0], D1=dest[1], D2=dest[2], num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=2e-3)
+
+
+@_ABOVE_ONE_BAND
+@pytest.mark.parametrize("axis", [0, 2])
+def test_rank3_reduce_cross_axis_broadcast_above_one_band_matches_torch(
+        shape, num_warps, axis):
+    """The cross-axis broadcast stored through a rank-3 address, where the two
+    slices disagree on how many elements a thread owns."""
+    a, b, c = shape
+    dest = _cross_axis_dest(shape, axis)
+    torch.manual_seed(0xC805 + a * 31 + b * 7 + c + axis)
+    x = torch.randn(a * b * c, dtype=torch.float32).contiguous()
+    expected = (x.reshape(a, b, c).sum(axis)[:, None, :]
+                .expand(*dest).reshape(-1).contiguous())
+    out = torch.zeros(a * b * c, dtype=torch.float32, device="mps")
+    _rank3_reduce_cross_axis_kernel[(1,)](
+        x.to("mps"), out, A=a, B=b, C=c, AXIS=axis,
+        D0=dest[0], D1=dest[1], D2=dest[2], num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-3, rtol=2e-3)
 
 
 @triton.jit

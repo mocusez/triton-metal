@@ -33323,6 +33323,128 @@ emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
   return plan;
 }
 
+// A slice-to-slice cvt that only moves a reduce's result to the axis a
+// broadcast puts back: every user is `tt.expand_dims` on the destination's
+// slice axis, and those flow through elementwise ops into ONE broadcast tile
+// with the slice's parent layout. The slice is then read at whatever element
+// that tile names, so the destination label is the tile's own with the slice
+// axis dropped -- the emitter's label when the tile is stored, and its layout
+// when it is flattened inside a rank-N phase, where the flattening reshape
+// reads it under its layout. Nullopt for any other consumer, or a tile read
+// both ways.
+static std::optional<LayoutIndexPlan>
+sliceBroadcastReadLabel(mlir::triton::gpu::ConvertLayoutOp cvt, int64_t tpb,
+                        bool inRankNPhase) {
+  auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+  auto slice =
+      dstTy ? mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                  dstTy.getEncoding())
+            : nullptr;
+  if (!slice || cvt.getResult().use_empty())
+    return std::nullopt;
+  const unsigned axis = slice.getDim();
+  auto elementwise = [](mlir::Operation *op) {
+    return op->getNumResults() == 1 && mlir::isMemoryEffectFree(op) &&
+           (op->hasTrait<mlir::OpTrait::Elementwise>() ||
+            mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+                op->getDialect()));
+  };
+  mlir::RankedTensorType tileTy;
+  bool stored = false, flattened = false;
+  llvm::SmallVector<mlir::Value, 8> expanded, tiles;
+  for (mlir::Operation *user : cvt.getResult().getUsers()) {
+    auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+    if (!expand || expand.getAxis() != axis)
+      return std::nullopt;
+    expanded.push_back(expand.getResult());
+  }
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  while (!expanded.empty()) {
+    mlir::Value v = expanded.pop_back_val();
+    for (mlir::Operation *user : v.getUsers()) {
+      if (!seen.insert(user).second)
+        continue;
+      if (auto bcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(user)) {
+        auto ty = mlir::dyn_cast<mlir::RankedTensorType>(bcast.getType());
+        if (!ty || ty.getEncoding() != slice.getParent() ||
+            (tileTy && ty.getShape() != tileTy.getShape()))
+          return std::nullopt;
+        tileTy = ty;
+        tiles.push_back(bcast.getResult());
+      } else if (elementwise(user)) {
+        expanded.push_back(user->getResult(0));
+      } else {
+        return std::nullopt;
+      }
+    }
+  }
+  while (!tiles.empty()) {
+    mlir::Value v = tiles.pop_back_val();
+    for (mlir::Operation *user : v.getUsers()) {
+      if (!seen.insert(user).second)
+        continue;
+      if (mlir::isa<mlir::triton::StoreOp>(user) &&
+          user->getOperand(1) == v) {
+        stored = true;
+      } else if (auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(user)) {
+        auto ty = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+        if (!ty || ty.getRank() != 1)
+          return std::nullopt;
+        flattened = true;
+      } else if (elementwise(user) &&
+                 user->getResult(0).getType() == v.getType()) {
+        tiles.push_back(user->getResult(0));
+      } else {
+        return std::nullopt;
+      }
+    }
+  }
+  if (!tileTy || stored == flattened || (flattened && !inRankNPhase))
+    return std::nullopt;
+  std::optional<LayoutIndexPlan> plan =
+      stored ? emitterTileLabel(tileTy, tpb) : planLayoutIndex(tileTy);
+  if (!plan || plan->threadsPerBlock() != tpb ||
+      axis >= plan->dimTerms.size())
+    return std::nullopt;
+  plan->dimTerms.erase(plan->dimTerms.begin() + axis);
+  plan->dimXor.clear();
+  plan->rowMajorStride.assign(dstTy.getRank(), 1);
+  for (int64_t d = dstTy.getRank() - 2; d >= 0; --d)
+    plan->rowMajorStride[d] =
+        plan->rowMajorStride[d + 1] * dstTy.getDimSize(d + 1);
+  return plan;
+}
+
+// True when `value` is a tile built from a rank-N reduce that relabelled its
+// result thread-major, reached only through `tt.expand_dims`, `tt.broadcast`
+// and pure elementwise ops. Such a reduce's keep-dims read hands each tile
+// element the result its thread-major position names, so the tile carries the
+// emitter's thread-major label -- not the layout its type names, which is
+// what a flattening reshape inside a rank-N phase reads it under otherwise.
+// An exchange boundary (a read) ends the walk: past it the value is in the
+// label the exchange read it under.
+static bool tileFromRelabelledReduce(mlir::Value value, int depth = 0) {
+  if (depth > 8)
+    return false;
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def || def->getAttrOfType<mlir::StringAttr>(kExchangeAttr))
+    return false;
+  if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(def)) {
+    auto plan = planRankNReduce(reduce);
+    return plan && plan->threadMajorRelabel;
+  }
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp>(def))
+    return tileFromRelabelledReduce(def->getOperand(0), depth + 1);
+  if (def->getNumResults() != 1 || !mlir::isMemoryEffectFree(def) ||
+      !(def->hasTrait<mlir::OpTrait::Elementwise>() ||
+        mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+            def->getDialect())))
+    return false;
+  return llvm::any_of(def->getOperands(), [&](mlir::Value operand) {
+    return tileFromRelabelledReduce(operand, depth + 1);
+  });
+}
+
 static std::optional<std::pair<LayoutIndexPlan, LayoutIndexPlan>>
 threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
   auto isRowMajor = [](mlir::triton::gpu::BlockedEncodingAttr enc,
@@ -42189,6 +42311,17 @@ struct ConvertTritonGPUToMetalPass
         if (!dstLabel)
           return;
       }
+      // Exit from a relabelled reduce broadcast back into a tile: the tile
+      // holds thread-major elements (see `tileFromRelabelledReduce`), so the
+      // flattening reads it under that label. 📏 32 `s_reduce_consumers`
+      // cells (a same-axis broadcast, flattened, at E >= 8) went from a named
+      // refusal to exact with this.
+      if (!srcLabel && dstTy.getRank() == 1 && isThreadMajorTile(srcTy) &&
+          tileFromRelabelledReduce(reshape.getSrc())) {
+        srcLabel = threadMajorLabel(srcTy);
+        if (!srcLabel)
+          return;
+      }
       if (!touchesSlice && !srcLabel && !dstLabel)
         return;
       // Ask the VALUE, not the type: a staged rank-N reduce relabels its
@@ -42371,6 +42504,16 @@ struct ConvertTritonGPUToMetalPass
         // each side, which this exchange does not give it.
         auto srcPlan = exchangeSourcePlan(cvt.getSrc());
         auto dstPlan = planLayoutIndex(dstRtt);
+        // Unless the destination is only a reduce's result on its way to the
+        // axis a broadcast puts back: read it where that tile's elements are.
+        if (srcPlan && dstPlan)
+          if (auto label = sliceBroadcastReadLabel(
+                  cvt, dstPlan->threadsPerBlock(),
+                  functionHasRankNPhase(cvt.getOperation()));
+              label && planTileExchange(cvt.getOperation(),
+                                        /*allowGeneralPhase=*/true, srcPlan,
+                                        label))
+            continue;
         if (srcPlan && dstPlan &&
             srcPlan->elemPerThread != dstPlan->elemPerThread) {
           cvt.emitOpError(
@@ -42447,16 +42590,15 @@ struct ConvertTritonGPUToMetalPass
     // consumer x source x axis x shape x warps) rather than argued:
     //
     //   flatten   the result broadcast back into a tile and then flattened by
-    //             `tl.reshape` for a rank-1 store -- 32 cells, E >= 8, while
-    //             the SAME broadcast stored through a rank-3 address is exact
-    //             in all 108 of its cells, which is why this refusal is about
-    //             the flatten and not about the broadcast
+    //             `tl.reshape` for a rank-1 store -- 32 cells, E >= 8. Now an
+    //             exchange: the reshape walk publishes such a tile under its
+    //             thread-major label (`tileFromRelabelledReduce`); this refusal
+    //             keeps any cone that walk does not recognise
     //   crossaxis the result expanded along an axis OTHER than the one the
     //             reduce removed (`tl.sum(v, 0)[:, None, :]`) -- 16 cells,
-    //             E >= 8. Below that band the exchange now handles it (see the
-    //             slice-to-slice guard in `isScalarIdentityConvert`); above it
-    //             the relabel has already propagated past the `tt.expand_dims`
-    //             and no single exchange carries it
+    //             E >= 8. Now an exchange too: the slice-to-slice cvt reads
+    //             where the broadcast tile's elements are
+    //             (`sliceBroadcastReadLabel`)
     //   scanmix   a column-reduce republished into a tile in a function that
     //             also stages a `tl.scan` -- 13 cells from E >= 2. The
     //             republish reads its threadgroup slot as zero once the scan's
