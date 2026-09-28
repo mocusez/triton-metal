@@ -3,8 +3,8 @@
 `tl.flip` arrives as a hypercube of xor-sum reduces between two reshapes; the
 backend replaces the chain by one exchange whose read reverses the flipped
 axis. Neighbours probe the labels that exchange has to agree with: a computed
-source, a second flip, a reduce or a scan in the same function, and a flip
-feeding a reduce.
+source, a second flip, a reduce, an argmax or a scan in the same function,
+and a flip feeding a reduce.
 
 Tags encode form, rank, shape, axis, warps and dtype.
 """
@@ -48,8 +48,12 @@ def flip_kernel(X, Y, Z, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
     elif FORM == 4:        # a flip whose result is reduced
         y = tl.flip(x, DIM)
         tl.store(Z + tl.arange(0, 1), tl.max(tl.reshape(y, (A * B * C,)) * 1, 0)[None])
-    else:                  # a scan in the same function
+    elif FORM == 5:        # a scan in the same function
         y = tl.flip(x, DIM) + tl.cumsum(x, RANK - 1)
+    else:                  # an argmax over the flattened source beside it
+        y = tl.flip(x, DIM)
+        i = tl.argmax(tl.reshape(x, (A * B * C,)), 0)
+        tl.store(Z + tl.arange(0, 1), i.to(Z.dtype.element_ty)[None])
     tl.store(Y + off, y)
 
 
@@ -75,7 +79,7 @@ def _cell(shape, dim, w, dtype, form):
         want = xc.flip(dim).flip(rank - 1)
     elif form == 3:
         want = xc.flip(dim)
-    elif form == 4:
+    elif form in (4, 6):
         want = xc.flip(dim)
     else:
         want = xc.flip(dim) + xc.cumsum(rank - 1).to(dtype)
@@ -87,6 +91,8 @@ def _cell(shape, dim, w, dtype, form):
         return f"sum {z.cpu()[0]} != {xc.sum()}"
     if form == 4 and z.cpu()[0] != xc.max():
         return f"max {z.cpu()[0]} != {xc.max()}"
+    if form == 6 and xc.flatten()[int(z.cpu()[0])] != xc.max():
+        return f"argmax {int(z.cpu()[0])} -> {xc.flatten()[int(z.cpu()[0])]} != max {xc.max()}"
     return None
 
 
@@ -95,7 +101,7 @@ SHAPES = [(32,), (256,), (1024,), (4, 32), (16, 16), (32, 8), (8, 128), (2, 64),
 WARPS = [1, 4]
 DTYPES = [(torch.float32, "f32"), (torch.int32, "i32"), (torch.float16, "f16"),
           (torch.int8, "i8")]
-FORMS = ["plain", "computed", "twice", "withsum", "reduced", "withscan"]
+FORMS = ["plain", "computed", "twice", "withsum", "reduced", "withscan", "withargmax"]
 
 
 def cells(sw):
@@ -108,6 +114,8 @@ def cells(sw):
                             continue  # i8 sum/cumsum overflow the oracle
                         if dn == "f16" and form == 5:
                             continue  # f16 scan is refused by name
+                        if dn == "i8" and form == 6:
+                            continue  # the index does not fit the i8 output
                         tag = f"{fn}_{'x'.join(map(str, shape))}_d{dim}_w{w}_{dn}"
                         sw.run(tag, lambda shape=shape, dim=dim, w=w, dtype=dtype, form=form:
                                _cell(shape, dim, w, dtype, form))

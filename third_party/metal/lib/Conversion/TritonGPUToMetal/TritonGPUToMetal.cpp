@@ -1937,7 +1937,6 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           phaseSet.insert(&*it);
         }
         mlir::Operation *phaseAnchor = phaseOps.front();
-        mlir::OpBuilder phaseBuilder(phaseAnchor);
         mlir::IRMapping mapping;
         bool rematerializationFailed = false;
         std::function<mlir::Value(mlir::Value)> rematerialize =
@@ -1987,7 +1986,13 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
               return {};
             }
           }
-          mlir::Operation *clone = phaseBuilder.clone(*def, mapping);
+          // Through the rewriter: this runs inside the conversion, which
+          // legalizes only the ops it is told about. A plain builder's clone
+          // of an exchange-read `tt.reshape` was never lowered and reached
+          // the translator (a flattened tile's argmax beside a `tl.flip`).
+          mlir::OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPoint(phaseAnchor);
+          mlir::Operation *clone = rewriter.clone(*def, mapping);
           loopBodyOps.insert(clone);
           if (isExchangeRead) {
             // Copy BEFORE inserting. Both maps are DenseMaps: `map[clone]`
@@ -4003,7 +4008,18 @@ struct MakeRangeLowering
     }
     if (std::optional<LayoutIndexPlan> plan =
             planLinearRange(op, /*allowMixedHypercube=*/rankNPhase)) {
-      if (mlir::Value idx = emitLayoutElementIndex(op, *plan, rewriter, loc)) {
+      // With no tile loop around it a thread holds one band, and a blocked
+      // range answers with that band (`emitTileFlatIndex` returns the local
+      // tid). Name band 0 here too instead of failing to legalize: a flattened
+      // tile's range that only feeds a reduce, which replays its cone at
+      // logical positions, is exactly this.
+      mlir::Value band0;
+      if (plan->registerBits > 0 && !findOutermostScfFor(op))
+        band0 = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI32IntegerAttr(0))
+                    .getResult();
+      if (mlir::Value idx =
+              emitLayoutElementIndex(op, *plan, rewriter, loc, band0)) {
         if (op.getStart() != 0) {
           auto start = mlir::arith::ConstantOp::create(
               rewriter, loc,
@@ -8570,6 +8586,32 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
   return mlir::success();
 }
 
+// The threads a rank-1 `#ttg.linear` tensor is spread over, or 0 for any
+// other encoding. Triton gives `tl.reshape(x, (n,))` of a tile whose order is
+// not row-major a linear layout, chosen so the reshape moves nothing: lane t
+// holds the tile's element under that order. A monoid reduce over it is
+// order-free, but no rank-1 path reads a linear layout's geometry, so it is
+// rebuilt at logical positions like a slice source (see `lowerRank1Reduce`).
+// Without this every such reduce failed to legalize and killed the process.
+static int64_t linearRank1ReduceThreads(mlir::RankedTensorType rtt) {
+  auto lin = rtt && rtt.getRank() == 1
+                 ? mlir::dyn_cast_or_null<
+                       mlir::triton::gpu::LinearEncodingAttr>(rtt.getEncoding())
+                 : nullptr;
+  if (!lin)
+    return 0;
+  const mlir::triton::LinearLayout &ll = lin.getLinearLayout();
+  if (ll.getNumOutDims() != 1)
+    return 0;
+  int64_t tpb = 1;
+  for (const char *dim : {"lane", "warp"}) {
+    auto it = ll.getBases().find(mlir::StringAttr::get(rtt.getContext(), dim));
+    if (it != ll.getBases().end())
+      tpb <<= it->second.size();
+  }
+  return tpb;
+}
+
 // Canonical blocked multi-band geometry. Slice/companion replay and the
 // contiguous masked specialization have independent envelopes.
 static llvm::StringRef rank1ReduceGeometryFailure(int64_t block, int64_t tpb,
@@ -8937,17 +8979,23 @@ static mlir::LogicalResult lowerRank1Reduce(
           rtt.getEncoding());
   auto srcSlice = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
       rtt.getEncoding());
-  const bool sliceSource = static_cast<bool>(srcSlice);
+  const int64_t linearThreads = linearRank1ReduceThreads(rtt);
+  // A linear source is rebuilt at logical positions exactly as a slice one is.
+  const bool sliceSource = static_cast<bool>(srcSlice) || linearThreads > 0;
   if (!srcBlocked && srcSlice)
     srcBlocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
         srcSlice.getParent());
-  if (!srcBlocked)
+  if (!srcBlocked && !linearThreads)
     return mlir::failure();
   int64_t tpb = 1;
-  for (auto t : srcBlocked.getThreadsPerWarp())
-    tpb *= t;
-  for (auto w : srcBlocked.getWarpsPerCTA())
-    tpb *= w;
+  if (linearThreads) {
+    tpb = linearThreads;
+  } else {
+    for (auto t : srcBlocked.getThreadsPerWarp())
+      tpb *= t;
+    for (auto w : srcBlocked.getWarpsPerCTA())
+      tpb *= w;
+  }
   if (tpb <= 0 || (tpb & (tpb - 1)) != 0)
     return mlir::failure(); // require power-of-two tpb for the butterfly
 
@@ -33216,9 +33264,10 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
 // The label this backend's own emitter gives a blocked rank-1/2/3 tile: its
 // load and store address element `localTid * E + iv` when the layout keeps
 // several elements per thread along some axis, `localTid + iv * T` when every
-// sizePerThread is 1 -- decoded through the layout's `order` (row-major, or
-// column-major at rank 2). Null for anything else. Inside a rank-N phase the
-// ranges are planned in layout space instead; callers ask outside one.
+// sizePerThread is 1 -- decoded through the layout's `order`, fastest axis
+// first, as `emitTileCoordByOrder` does. Null for anything else. Inside a
+// rank-N phase the ranges are planned in layout space instead; callers ask
+// outside one.
 static std::optional<LayoutIndexPlan>
 emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
   auto enc = ty ? mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
@@ -33228,15 +33277,17 @@ emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
   if (!enc || rank < 1 || rank > 3 ||
       static_cast<int64_t>(enc.getOrder().size()) != rank)
     return std::nullopt;
-  bool rowMajor = true;
-  for (int64_t k = 0; k < rank; ++k)
-    rowMajor &= enc.getOrder()[k] == rank - 1 - k;
-  const bool colMajor = rank == 2 && enc.getOrder()[0] == 0;
-  if (!rowMajor && !colMajor)
-    return std::nullopt;
-  llvm::SmallVector<int64_t, 3> shape(ty.getShape());
-  if (colMajor)
-    std::swap(shape[0], shape[1]);
+  // Plan the row-major decoding of the shape permuted so the fastest axis is
+  // last, then hand each axis its terms back. `slot[d]` is where axis `d` sits
+  // in that permuted shape.
+  llvm::SmallVector<int64_t, 3> shape(rank), slot(rank, -1);
+  for (int64_t k = 0; k < rank; ++k) {
+    const unsigned d = enc.getOrder()[k];
+    if (d >= static_cast<unsigned>(rank) || slot[d] >= 0)
+      return std::nullopt;
+    slot[d] = rank - 1 - k;
+    shape[rank - 1 - k] = ty.getDimSize(d);
+  }
   std::optional<LayoutIndexPlan> plan = threadMajorLayoutPlan(shape, tpb);
   if (!plan)
     return std::nullopt;
@@ -33262,9 +33313,12 @@ emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
         }
       }
   }
-  if (colMajor) {
-    std::swap(plan->dimTerms[0], plan->dimTerms[1]);
-    plan->rowMajorStride = {ty.getDimSize(1), 1};
+  auto permuted = plan->dimTerms;
+  for (int64_t d = 0; d < rank; ++d)
+    plan->dimTerms[d] = permuted[slot[d]];
+  for (int64_t d = rank - 1, stride = 1; d >= 0; --d) {
+    plan->rowMajorStride[d] = stride;
+    stride *= ty.getDimSize(d);
   }
   return plan;
 }
@@ -41661,6 +41715,19 @@ struct ConvertTritonGPUToMetalPass
             return;
           }
         }
+        // A linear source takes the lowering's logical-position rebuild,
+        // which needs the whole cone replayable and at most 64 per thread.
+        if (int64_t threads = linearRank1ReduceThreads(rtt)) {
+          if (red.getSrcs().size() == 1 &&
+              (!rank1ConeSupported(red.getSrcs().front(), 0) ||
+               (rtt.getDimSize(0) + threads - 1) / threads > 64)) {
+            red.emitOpError(
+                "rank-1 reduce over a flattened tile's linear layout needs a "
+                "replayable source cone and at most 64 elements per thread");
+            reduceOk = false;
+            return;
+          }
+        }
         auto blocked =
             mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
                 rtt.getEncoding());
@@ -42054,6 +42121,42 @@ struct ConvertTritonGPUToMetalPass
       auto srcTy =
           mlir::dyn_cast<mlir::RankedTensorType>(reshape.getSrc().getType());
       auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+      // Flattening a tile outside a rank-N phase: both sides hold the element
+      // the emitter's own label names, and those agree only when the tile's
+      // order is row-major. For any other order the relabel hands lane t the
+      // tile's element under that order, while the rank-1 side -- a range, a
+      // store, the index operand of an argmax -- means row-major element t.
+      // Triton marks a reshape that only feeds reduces `allow_reorder`, which
+      // a single-operand reduce tolerates and an argmax does not: its index
+      // comes from a range over the reshaped value (6 sweep cells at one
+      // element per thread). A flattened tile that a convert_layout reads is
+      // exchanged by that cvt (see the cvt walk), so it is left alone here.
+      // Nor is one that only single-operand reduces read: order does not
+      // matter to them, so the exchange would be a round trip through
+      // threadgroup memory for nothing.
+      auto orderFreeReduce = [](mlir::Operation *user) {
+        auto red = mlir::dyn_cast<mlir::triton::ReduceOp>(user);
+        return red && red.getSrcs().size() == 1;
+      };
+      if (srcTy && dstTy && !functionHasRankNPhase(reshape.getOperation()) &&
+          srcTy.getRank() >= 2 && dstTy.getRank() == 1 &&
+          srcTy.getNumElements() == dstTy.getNumElements() &&
+          srcTy.getElementType() == dstTy.getElementType() &&
+          llvm::none_of(reshape->getUsers(), [](mlir::Operation *user) {
+            return mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user);
+          })) {
+        if (llvm::all_of(reshape->getUsers(), orderFreeReduce))
+          return;
+        auto own = planLayoutIndex(dstTy);
+        auto srcLabel = own ? emitterTileLabel(srcTy, own->threadsPerBlock())
+                            : std::nullopt;
+        auto dstLabel = own ? emitterTileLabel(dstTy, own->threadsPerBlock())
+                            : std::nullopt;
+        if (srcLabel && dstLabel &&
+            !layoutFlatIndexPlansEquivalent(*srcLabel, *dstLabel))
+          reshapesNeedingExchange.push_back({reshape, srcLabel, dstLabel});
+        return;
+      }
       if (!srcTy || !dstTy || !functionHasRankNPhase(reshape.getOperation()) ||
           srcTy.getNumElements() != dstTy.getNumElements() ||
           srcTy.getElementType() != dstTy.getElementType())

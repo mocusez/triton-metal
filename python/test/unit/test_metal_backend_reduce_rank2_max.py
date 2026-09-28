@@ -767,3 +767,81 @@ def test_flatten_broadcast_pointer_tile(shape, num_warps):
     torch.mps.synchronize()
     flat = torch.arange(M * N)
     assert torch.equal(out.cpu(), (flat % 13 - 6).float() + v[flat // N])
+
+
+# The same flattened tile at rank 3, where Triton's order for it is neither
+# row- nor column-major ([0, 2, 1]), and under order-sensitive consumers other
+# than a store: an argmax, whose index is a range over the reshaped value, and
+# a sum weighted by flat position. Triton marks a reshape that only feeds
+# reduces `allow_reorder`; the argmax still needs row-major element t in lane t.
+@triton.jit
+def _flatten_broadcast_pointer_consumer_kernel(v_ptr, out_ptr, A: tl.constexpr,
+                                               B: tl.constexpr, C: tl.constexpr,
+                                               RANK: tl.constexpr,
+                                               OP: tl.constexpr):
+    if RANK == 2:
+        off = tl.arange(0, A)[:, None] * B + tl.arange(0, B)[None, :]
+        row = tl.arange(0, A)[:, None] + tl.zeros((A, B), tl.int32)
+    else:
+        off = (tl.arange(0, A)[:, None, None] * (B * C) +
+               tl.arange(0, B)[None, :, None] * C + tl.arange(0, C)[None, None, :])
+        row = tl.arange(0, A)[:, None, None] + tl.zeros((A, B, C), tl.int32)
+    x = (off % 13 - 6).to(tl.float32) + tl.load(v_ptr + row)
+    flat = tl.reshape(x, (A * B * C,))
+    if OP == 0:
+        tl.store(out_ptr + tl.arange(0, A * B * C), flat)
+    elif OP == 1:
+        tl.store(out_ptr, tl.argmax(flat, 0).to(tl.float32))
+    else:
+        tl.store(out_ptr, tl.sum(flat * (tl.arange(0, A * B * C) % 7).to(tl.float32), 0))
+
+
+@pytest.mark.parametrize("shape", [(2, 16), (4, 32), (16, 16), (2, 4, 8), (4, 8, 16),
+                                   (2, 16, 32)])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("op", ["store", "argmax", "weighted"])
+def test_flatten_broadcast_pointer_tile_consumers(shape, num_warps, op):
+    A, B, C = (list(shape) + [1])[:3]
+    n = A * B * C
+    v = (torch.arange(A) % 5 - 2).float()
+    out = torch.zeros(n, device="mps")
+    _flatten_broadcast_pointer_consumer_kernel[(1,)](
+        v.to("mps"), out, A, B, C, len(shape), ["store", "argmax", "weighted"].index(op),
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    flat = torch.arange(n)
+    want = (flat % 13 - 6).float() + v[flat // (B * C)]
+    got = out.cpu()
+    if op == "store":
+        assert torch.equal(got, want)
+    elif op == "argmax":
+        assert int(got[0]) == int(torch.argmax(want))
+    else:
+        assert got[0] == (want * (flat % 7).float()).sum()
+
+
+# An argmax over a flattened tile beside a `tl.flip` of the same tile. The flip
+# splits the function into exchange phases, and the argmax's flattened source is
+# rebuilt in its own phase; that copy has to be lowered like the original.
+@triton.jit
+def _flatten_argmax_beside_flip_kernel(x_ptr, y_ptr, i_ptr, M: tl.constexpr,
+                                       N: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    x = tl.load(x_ptr + off)
+    tl.store(y_ptr + off, tl.flip(x, 0))
+    tl.store(i_ptr, tl.argmax(tl.reshape(x, (M * N,)), 0))
+
+
+@pytest.mark.parametrize("shape", [(4, 32), (16, 16), (8, 128)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_flatten_argmax_beside_flip(shape, num_warps):
+    M, N = shape
+    g = torch.Generator().manual_seed(M * N + num_warps)
+    x = (torch.randperm(M * N, generator=g) % 23 - 11).float()
+    y = torch.zeros(M, N, device="mps")
+    i = torch.zeros(1, dtype=torch.int32, device="mps")
+    _flatten_argmax_beside_flip_kernel[(1,)](x.to("mps"), y, i, M, N,
+                                             num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(y.cpu(), x.reshape(M, N).flip(0))
+    assert x[int(i.cpu()[0])] == x.max()

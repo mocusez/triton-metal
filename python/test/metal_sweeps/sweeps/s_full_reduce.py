@@ -5,7 +5,8 @@ cone walk that passes a rank >= 2 broadcast through unchanged reads every
 2-D address with row == col, so the answer is a sum over the wrong elements.
 Cells vary the op, the source cone (a load, a computed tile, an outer
 product of two ranges, a masked load), rank, shape, warps and dtype, and add
-two order-sensitive consumers of the flattened tile: a cumsum and a store.
+order-sensitive consumers of the flattened tile: a cumsum, a store, an argmax
+and a sum weighted by flat position.
 
 Tags encode op, source, shape, warps and dtype.
 """
@@ -60,7 +61,9 @@ def kernel(X, V, Z, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
         r = tl.sum(tl.reshape(x, (A * B * C,)), 0)
     elif OP == 5:
         r = tl.argmax(tl.reshape(x, (A * B * C,)), 0)
-    if OP <= 5:
+    elif OP == 8:  # order-sensitive: each element weighted by its flat position
+        r = tl.sum(tl.reshape(x, (A * B * C,)) * (tl.arange(0, A * B * C) % 7).to(x.dtype), 0)
+    if OP <= 5 or OP == 8:
         tl.store(Z, r)
     elif OP == 6:
         tl.store(Z + tl.arange(0, A * B * C), tl.cumsum(tl.reshape(x, (A * B * C,)), 0))
@@ -68,7 +71,7 @@ def kernel(X, V, Z, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
         tl.store(Z + tl.arange(0, A * B * C), tl.reshape(x, (A * B * C,)))
 
 
-OPS = ["sum", "max", "min", "custom", "flatsum", "argmax", "flatcumsum", "flatstore"]
+OPS = ["sum", "max", "min", "custom", "flatsum", "argmax", "flatcumsum", "flatstore", "flatweighted"]
 SRCS = ["load", "computed", "outer", "masked", "ptrbcast"]
 
 
@@ -79,7 +82,7 @@ def _cell(shape, w, dtype, op, src):
     g = torch.Generator().manual_seed(n + 31 * op + 7 * src + w)
     x = (torch.randperm(n, generator=g) % 23 - 11).to(dtype)
     v = (torch.arange(A) % 5 - 2).to(dtype)
-    out_n = n if op >= 6 else 1
+    out_n = n if op in (6, 7) else 1
     z = torch.zeros(out_n, dtype=torch.int32 if op == 5 else dtype, device="mps")
     kernel[(1,)](x.to("mps"), v.to("mps"), z, A, B, C, rank, op, src, num_warps=w)
     torch.mps.synchronize()
@@ -95,7 +98,8 @@ def _cell(shape, w, dtype, op, src):
         t = torch.where(off % 3 != 0, x.double(), torch.full_like(x.double(), 5))
     else:
         t = x.double()
-    want = [t.sum(), t.max(), t.min(), t.max(), t.sum(), None, t.cumsum(0), t][op]
+    want = [t.sum(), t.max(), t.min(), t.max(), t.sum(), None, t.cumsum(0), t,
+            (t * (off % 7).double()).sum()][op]
     got = z.cpu()
     if op == 5:
         ok = t[int(got[0])] == t.max()
@@ -121,6 +125,8 @@ def cells(sw):
                     for src, sn in enumerate(SRCS):
                         if dn == "f16" and op == 6:
                             continue  # f16 scan is refused by name
+                        if dn == "f16" and op == 8:
+                            continue  # the weighted sum leaves f16's exact range
                         tag = f"{on}_{sn}_{'x'.join(map(str, shape))}_w{w}_{dn}"
                         sw.run(tag, lambda shape=shape, w=w, dtype=dtype, op=op, src=src:
                                _cell(shape, w, dtype, op, src))
