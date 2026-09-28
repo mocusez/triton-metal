@@ -27153,6 +27153,30 @@ static std::optional<int64_t> sdConstStride(mlir::Value v, int depth = 0) {
   return std::nullopt;
 }
 
+// True when an offset contribution is an index with coefficient ONE: ranges,
+// splatted scalars and constants joined only by `arith.addi` through
+// expand_dims/broadcast, with no multiply anywhere. That is what a row index
+// becomes when Triton specializes a runtime stride of 1 to a constant and
+// folds `r * 1` away (`tl.dot` called with N = 1 or K = 1): the stride is then
+// exactly 1, not unknown.
+static bool sdIsUnitIndex(mlir::Value v, int depth = 0) {
+  if (depth > 8 || !v)
+    return false;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::triton::MakeRangeOp, mlir::triton::SplatOp,
+                mlir::arith::ConstantOp>(def))
+    return true;
+  if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                mlir::triton::gpu::ConvertLayoutOp>(def))
+    return sdIsUnitIndex(def->getOperand(0), depth + 1);
+  if (auto addi = mlir::dyn_cast<mlir::arith::AddIOp>(def))
+    return sdIsUnitIndex(addi.getLhs(), depth + 1) &&
+           sdIsUnitIndex(addi.getRhs(), depth + 1);
+  return false;
+}
+
 // Split a canonical matrix pointer chain (rank-2 or rank-3)
 //   addptr(broadcast(addptr(splat(arg), INNER)), OUTER)
 // into batch/row/column offset contributions and its root kernel-arg pointer.
@@ -28062,6 +28086,15 @@ static ScalarDotOp sdCreateScalarDot(
       strideBOpt = strideBColOpt;
     }
   }
+  // A row index with no multiply at all is stride 1 -- a specialized runtime
+  // extent of 1 (`K` for A, `N` for B) folded out of `r * K`. Reading it as
+  // 1 is exact whatever the column axis carries: the op addresses
+  // `row * stride + col`, which is the pointer arithmetic as written. 📏 90
+  // `s_dot` cells with a runtime N or K of 1 were refused by name.
+  if (!strideADynamic && !strideAOpt && sdIsUnitIndex(aParts.rowContrib))
+    strideAOpt = 1;
+  if (!strideBDynamic && !strideBOpt && sdIsUnitIndex(bParts.rowContrib))
+    strideBOpt = 1;
   if (!inferPhysicalStrides &&
       ((!strideADynamic && (!strideAOpt || *strideAOpt <= 0)) ||
        (!strideBDynamic && (!strideBOpt || *strideBOpt <= 0))))
@@ -29792,9 +29825,19 @@ static bool sdDotEligible(mlir::triton::DotOp dot) {
              simdgroupTileIsContiguous(load.getPtr()) &&
              !axisHasConstantNonUnitStride(load.getPtr(), 1);
     };
+    // So are masked or non-contiguous operands, which that tier declines
+    // outright: an 8x8 matmul called with K = 1 has its loop folded away by
+    // the specialization and reaches here as one masked dot.
+    auto singleDotTakesOperands = [&]() {
+      auto a = sdPeelToLoad(dot.getA());
+      auto b = sdPeelToLoad(dot.getB());
+      return a && b && !a.getMask() && !b.getMask() &&
+             simdgroupTileIsContiguous(a.getPtr()) &&
+             simdgroupTileIsContiguous(b.getPtr());
+    };
     if ((!aTy || aTy.getRank() != 2 || aTy.getShape()[1] <= 8) &&
         !(sdDotStoreTileIsColumnMajor(dot) && sdIsZeroInit(dot.getC())) &&
-        singleDotTakesAcc())
+        singleDotTakesAcc() && singleDotTakesOperands())
       return false;
   }
   return true;
@@ -42999,10 +43042,8 @@ struct ConvertTritonGPUToMetalPass
     // `applyFullConversion`: a decline in there does not raise, it SEGFAULTS
     // the process during the failed conversion's rollback (verified with a
     // hand-written module whose only oddity is an unpatterned op). A matmul
-    // with a runtime extent of 1 — Triton specializes the argument to a
-    // constant, which changes the tile order and puts the shape outside every
-    // matcher's envelope — killed the calling process rather than reporting
-    // anything.
+    // with a runtime extent of 1 killed the calling process this way before it
+    // was named here, and is now claimed (`sdIsUnitIndex`).
     //
     // Deliberately after the convert-layout classification: a module that both
     // has an unclaimed dot and an out-of-envelope cvt keeps the cvt's more
@@ -43012,8 +43053,8 @@ struct ConvertTritonGPUToMetalPass
       moduleOp.walk([&](mlir::triton::DotOp dot) {
         dot.emitOpError(
             "Metal backend: no matmul lowering matched this tl.dot. Shapes "
-            "with a runtime extent of 1, a transposed-B address at BLOCK=8, "
-            "and non-power-of-two tiles are outside every tier's envelope");
+            "such as a transposed-B address at BLOCK=8 and non-power-of-two "
+            "tiles are outside every tier's envelope");
         dotsOk = false;
       });
       if (!dotsOk) {
