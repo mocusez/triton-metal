@@ -3132,8 +3132,10 @@ def test_dot_accumulate_in_place_matches_torch(BK):
     torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
 
 
-def test_dot_accumulator_from_other_buffer_is_named(capfd):
-    """A C tile that is not the destination must be refused, not substituted."""
+def test_dot_accumulator_from_other_buffer_matches_torch():
+    """A C tile that is not the destination: C = A @ B + C_other. Once refused
+    by name (no tier took a pointer-advance loop whose accumulator was loaded);
+    the scalar tier now collapses that loop."""
     M = N = 32
     K = 64
     torch.manual_seed(0xACC2)
@@ -3141,12 +3143,11 @@ def test_dot_accumulator_from_other_buffer_is_named(capfd):
     b = torch.randn((K, N), dtype=torch.float32)
     c = torch.randn((M, N), dtype=torch.float32)
     out = torch.zeros((M, N), dtype=torch.float32)
-    with pytest.raises(Exception):
-        dot_acc_init_kernel[(M // 16, N // 16)](
-            a, b, c, out, K, 1, N, 1, N, 1,
-            BLOCK_M=16, BLOCK_N=16, BLOCK_K=16, K_TILES=K // 16,
-        )
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+    dot_acc_init_kernel[(M // 16, N // 16)](
+        a, b, c, out, K, 1, N, 1, N, 1,
+        BLOCK_M=16, BLOCK_N=16, BLOCK_K=16, K_TILES=K // 16,
+    )
+    torch.testing.assert_close(out, a @ b + c, atol=1e-4, rtol=1e-4)
 
 
 # ----------------------------------------------------------------------------
@@ -3154,7 +3155,9 @@ def test_dot_accumulator_from_other_buffer_is_named(capfd):
 # `buf[(row + i) * stride + col + j]`, so the tile's inner axis advances one
 # element at a time. A wider ROW stride is fine -- that is a sub-block of a
 # larger matrix, and the stride operand says so. A non-unit INNER stride is not
-# expressible, and every tier used to compute against it as if it were dense.
+# expressible there, and every tier used to compute against it as if it were
+# dense; it was then refused by name, and the scalar tier -- which re-derives
+# every address -- now takes it exactly.
 # ----------------------------------------------------------------------------
 @triton.jit
 def dot_strided_address_kernel(
@@ -3221,10 +3224,14 @@ def test_dot_wide_row_strides_match_torch():
         pytest.param(1, 1, True, id="strided_output_column"),
     ],
 )
-def test_dot_non_unit_inner_stride_is_named(capfd, sak, sbn, transpose_out):
-    with pytest.raises(Exception):
-        _run_strided(pad=24, sak=sak, sbn=sbn, transpose_out=transpose_out)
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+@pytest.mark.parametrize("BK", [8, 16, 32])
+def test_dot_non_unit_inner_stride_matches_torch(sak, sbn, transpose_out, BK):
+    """No tier could address a non-unit INNER stride, so these were refused by
+    name. The scalar tier re-derives every address and is exact at any stride;
+    it now takes this pointer-advance loop, and keeps the SIMD-group path to
+    the tiles it can address."""
+    got, ref = _run_strided(pad=24, sak=sak, sbn=sbn, transpose_out=transpose_out, BK=BK)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
 # ----------------------------------------------------------------------------
@@ -4274,3 +4281,93 @@ def test_dot_column_major_accumulator_matches_torch(M, N, K, warps):
 def test_dot_8x8_scaled_accumulator_matches_torch(warps):
     got, want = _run_loaded_acc(8, 8, 8, warps, form=2)
     torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
+
+
+# --- Pointer-advance K loops with an epilogue --------------------------------
+#
+# `a_ptrs += BLOCK_K * stride_ak` carries the operand pointers as loop
+# iter_args. Only the bare-store form of that loop had a tier; a fused
+# epilogue, an accumulator loaded from C, `tl.trans(b)`, or an f16 store left
+# the dot unclaimed (`dot_form_block_k`: 72 named refusals). The scalar tier
+# collapses such a loop once it has proved each pointer steps by exactly one K
+# tile along its operand's K axis, which names the reduction's length.
+@triton.jit
+def _ptr_advance_kernel(a_ptr, b_ptr, c_ptr, out_ptr, sam, sak, sbk, sbn, som, son, trips,
+                        FORM: tl.constexpr, ASTEP: tl.constexpr, BLOCK_M: tl.constexpr,
+                        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * sam + offs_k[None, :] * sak
+    if FORM == 2:  # B given as B^T (N x K), read through tl.trans
+        b_ptrs = b_ptr + offs_n[:, None] * sbn + offs_k[None, :] * sbk
+    else:
+        b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    off = offs_m[:, None] * som + offs_n[None, :] * son
+    if FORM == 1:
+        acc = tl.load(c_ptr + off)
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, trips):
+        if FORM == 2:
+            acc = tl.dot(tl.load(a_ptrs), tl.trans(tl.load(b_ptrs)), acc)
+        else:
+            acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += ASTEP * BLOCK_K * sak
+        b_ptrs += BLOCK_K * sbk
+    if FORM == 0:
+        acc = acc * 2.5 + tl.load(c_ptr + off) * -0.75
+    if FORM == 3:
+        tl.store(out_ptr + off, acc.to(tl.float16))
+    else:
+        tl.store(out_ptr + off, acc)
+
+
+def _run_ptr_advance(form, bk, warps, trips=None, astep=1, k_total=64, a_cols=None):
+    m = n = 32
+    torch.manual_seed(form * 7 + bk + warps)
+    dt = torch.float16 if form == 3 else torch.float32
+    a_cols = a_cols or k_total
+    a = torch.randn(m, a_cols, dtype=dt)
+    b = torch.randn(k_total, n, dtype=dt)
+    c = torch.randn(m, n, dtype=torch.float32)
+    out = torch.zeros(m, n, dtype=dt)
+    trips = trips if trips is not None else k_total // bk
+    b_arg = b.t().contiguous() if form == 2 else b
+    sbk, sbn = (1, k_total) if form == 2 else (n, 1)
+    _ptr_advance_kernel[(m // 16, n // 16)](
+        a.to("mps"), b_arg.to("mps"), c.to("mps"), out_mps := out.to("mps"), a_cols, 1, sbk, sbn, n,
+        1, trips, FORM=form, ASTEP=astep, BLOCK_M=16, BLOCK_N=16, BLOCK_K=bk, num_warps=warps)
+    torch.mps.synchronize()
+    kk = trips * bk
+    ref = a[:, :kk].float() @ b[:kk].float()
+    if form == 0:
+        ref = ref * 2.5 + c * -0.75
+    elif form == 1:
+        ref = ref + c
+    return out_mps.cpu().float(), ref
+
+
+@pytest.mark.parametrize("form", [0, 1, 2, 3], ids=["epilogue", "accinit", "transb", "f16store"])
+@pytest.mark.parametrize("bk", [16, 32])
+@pytest.mark.parametrize("warps", [1, 4])
+def test_ptr_advance_dot_forms_match_torch(form, bk, warps):
+    got, want = _run_ptr_advance(form, bk, warps)
+    tol = 2e-1 if form == 3 else 5e-3
+    torch.testing.assert_close(got, want, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("warps", [1, 4])
+def test_ptr_advance_dot_partial_k_matches_torch(warps):
+    """Two of four K tiles of an A whose rows are twice as long: the length is
+    trips x BLOCK_K, not A's row stride."""
+    got, want = _run_ptr_advance(0, 16, warps, trips=2, a_cols=128)
+    torch.testing.assert_close(got, want, atol=5e-3, rtol=5e-3)
+
+
+def test_ptr_advance_dot_with_a_skipping_step_is_refused(capfd):
+    """A pointer that steps two tiles per trip is not a K loop the collapse can
+    name; it must stay a named refusal rather than become a wrong answer."""
+    with pytest.raises(Exception):
+        _run_ptr_advance(0, 16, 1, trips=2, astep=2, a_cols=128)
+    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err

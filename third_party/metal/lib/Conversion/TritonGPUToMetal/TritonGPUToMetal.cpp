@@ -28033,6 +28033,10 @@ static ScalarDotOp sdCreateScalarDot(
   // n_features while it reduces over n_samples. Accept both constexpr strides
   // (dense constants) and runtime i32 kernel arguments; LeetGPU-style kernels
   // commonly keep M/N/K dynamic even with a constexpr tile size.
+  // A `tt.trans` in B's cone (the caller's flag) leaves the loaded tile as
+  // [N, K]: its rows are what the transposed index scales. Only a transpose
+  // read off the ADDRESS below keeps the tile [K, N] with N on its columns.
+  const bool bConeTransposed = transposeB;
   mlir::Value aPtr = inferPhysicalStrides
                          ? sdResolveLoopCarriedPtrInit(aLoad.getPtr())
                          : aLoad.getPtr();
@@ -28380,10 +28384,11 @@ static ScalarDotOp sdCreateScalarDot(
         aPtr, transposeA ? BatchedMatrixAxis::Col : BatchedMatrixAxis::Row);
     aPhysicalColStride = sdFindPhysicalAxisStride(
         aPtr, transposeA ? BatchedMatrixAxis::Row : BatchedMatrixAxis::Col);
+    const bool bAxesSwapped = transposeB && !bConeTransposed;
     bPhysicalRowStride = sdFindPhysicalAxisStride(
-        bPtr, transposeB ? BatchedMatrixAxis::Col : BatchedMatrixAxis::Row);
+        bPtr, bAxesSwapped ? BatchedMatrixAxis::Col : BatchedMatrixAxis::Row);
     bPhysicalColStride = sdFindPhysicalAxisStride(
-        bPtr, transposeB ? BatchedMatrixAxis::Row : BatchedMatrixAxis::Col);
+        bPtr, bAxesSwapped ? BatchedMatrixAxis::Row : BatchedMatrixAxis::Col);
   }
   auto isUnitPhysicalStride =
       [](const std::optional<SdAxisStride> &stride) -> bool {
@@ -30232,29 +30237,61 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   // convert_layout on each side when the loop carries the accumulator in the
   // epilogue `#blocked` encoding rather than the dot `#blocked1` encoding (the
   // K-not-a-multiple-of-TILE shape does this).
-  if (forOp.getNumResults() != 1)
-    return mlir::failure();
+  //
+  // Or a POINTER-ADVANCE loop, which also carries the operand pointers and
+  // steps each by one tile of K per trip (`a_ptrs += BLOCK_K * stride_ak`).
+  // Those carries must feed nothing but their own advance and the operand
+  // load, and must be dead after the loop; `ptrAdvance` below then proves the
+  // step so the collapsed reduction can name its length.
   auto peelCvt = [](mlir::Value v) -> mlir::Value {
     if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
       return cvt.getSrc();
     return v;
   };
   auto yield = mlir::cast<mlir::scf::YieldOp>(forOp.getBody()->getTerminator());
-  if (yield.getNumOperands() != 1 ||
-      peelCvt(yield.getOperand(0)) != dot.getResult())
+  if (yield.getNumOperands() != forOp.getNumResults() ||
+      forOp.getNumResults() < 1)
     return mlir::failure();
-  if (peelCvt(dot.getC()) != forOp.getRegionIterArg(0))
+  std::optional<unsigned> accIdx;
+  for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+    if (peelCvt(yield.getOperand(i)) == dot.getResult()) {
+      if (accIdx)
+        return mlir::failure();
+      accIdx = i;
+    }
+  if (!accIdx || peelCvt(dot.getC()) != forOp.getRegionIterArg(*accIdx))
     return mlir::failure();
 
   auto aLoad = sdPeelToLoad(dot.getA());
   auto bLoad = sdPeelToLoad(dot.getB());
   if (!aLoad || !bLoad)
     return mlir::failure();
+  const bool ptrAdvance = forOp.getNumResults() > 1;
+  if (ptrAdvance) {
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+      if (i == *accIdx)
+        continue;
+      mlir::BlockArgument carried = forOp.getRegionIterArg(i);
+      auto step =
+          yield.getOperand(i).getDefiningOp<mlir::triton::AddPtrOp>();
+      if (!forOp.getResult(i).use_empty() || !step ||
+          step.getPtr() != carried ||
+          !forOp.isDefinedOutsideOfLoop(step.getOffset()))
+        return mlir::failure();
+      for (mlir::Operation *user : carried.getUsers())
+        if (user != step.getOperation() && user != aLoad.getOperation() &&
+            user != bLoad.getOperation())
+          return mlir::failure();
+    }
+    if (forOp.getRegionIterArg(*accIdx) == aLoad.getPtr() ||
+        aLoad.getMask() || bLoad.getMask())
+      return mlir::failure();
+  }
 
   // The loop result feeds the epilogue, optionally via a `#blocked1 ->
   // #blocked` cvt (when the loop carried #blocked1). A bare `dot -> tt.store`
   // loop (no epilogue arith) is deferred to the SIMD-group recompute path.
-  mlir::Value loopRes = forOp.getResult(0);
+  mlir::Value loopRes = forOp.getResult(*accIdx);
   auto loopResTy = mlir::cast<mlir::RankedTensorType>(loopRes.getType());
   mlir::triton::gpu::ConvertLayoutOp resCvt;
   mlir::Value replaceTarget;
@@ -30326,6 +30363,68 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
         *step == aTy.getShape()[1] &&
         !ptrIsLoopCarried(aLoad.getPtr()) && !ptrIsLoopCarried(bLoad.getPtr()))
       reductionExtent = forOp.getUpperBound();
+    // A pointer-advance loop from zero by one: its length is trips times the
+    // K tile, PROVIDED each operand pointer steps by exactly that many
+    // elements along its own K axis -- A's columns, B's rows (its columns
+    // once it crosses a transpose). Anything else keeps the refusal.
+    if (ptrAdvance && aTy && aTy.getRank() == 2 && lower && *lower == 0 &&
+        step && *step == 1 && ptrIsLoopCarried(aLoad.getPtr()) &&
+        ptrIsLoopCarried(bLoad.getPtr())) {
+      const int64_t tileK = aTy.getShape()[1];
+      auto stepsOneTile = [&](mlir::Value carried, BatchedMatrixAxis kAxis) {
+        auto arg = mlir::cast<mlir::BlockArgument>(carried);
+        auto advance =
+            yield.getOperand(arg.getArgNumber() - 1)
+                .getDefiningOp<mlir::triton::AddPtrOp>();
+        auto stride = sdFindPhysicalAxisStride(carried, kAxis);
+        // A bare `offs_k[None, :]` -- a unit stride specialized away -- is
+        // stride 1, which the physical-stride walk does not report.
+        if (!stride) {
+          SdPtrParts parts = sdSplitPtr(sdResolveLoopCarriedPtrInit(carried));
+          mlir::Value contrib = kAxis == BatchedMatrixAxis::Row
+                                    ? parts.rowContrib
+                                    : parts.colContrib;
+          if (contrib && sdIsUnitIndex(contrib))
+            stride = SdAxisStride{{}, 1, 1};
+        }
+        if (!advance || !stride)
+          return false;
+        mlir::Value inc = advance.getOffset();
+        if (stride->constant && !stride->dynamic) {
+          auto c = sdDenseSplatIntConstant(inc);
+          if (!c) {
+            mlir::Value src = sdSplatScalarSource(inc);
+            c = src ? sdDenseSplatIntConstant(src) : std::nullopt;
+          }
+          return c && *c == tileK * *stride->constant;
+        }
+        mlir::Value src = sdSplatScalarSource(inc);
+        auto mul = src ? src.getDefiningOp<mlir::arith::MulIOp>()
+                       : mlir::arith::MulIOp();
+        if (!mul || !stride->dynamic)
+          return false;
+        const int64_t want = tileK * stride->multiplier;
+        auto lc = sdDenseSplatIntConstant(mul.getLhs());
+        auto rc = sdDenseSplatIntConstant(mul.getRhs());
+        return (mul.getLhs() == stride->dynamic && rc && *rc == want) ||
+               (mul.getRhs() == stride->dynamic && lc && *lc == want);
+      };
+      const bool bTransposed = sdConeCrossesTranspose(dot.getB());
+      if (stepsOneTile(aLoad.getPtr(), BatchedMatrixAxis::Col) &&
+          stepsOneTile(bLoad.getPtr(), bTransposed ? BatchedMatrixAxis::Col
+                                                   : BatchedMatrixAxis::Row)) {
+        mlir::OpBuilder b(forOp);
+        reductionExtent =
+            mlir::arith::MulIOp::create(
+                b, forOp.getLoc(), forOp.getUpperBound(),
+                mlir::arith::ConstantOp::create(
+                    b, forOp.getLoc(),
+                    b.getIntegerAttr(forOp.getUpperBound().getType(), tileK)))
+                .getResult();
+      }
+    }
+    if (ptrAdvance && !reductionExtent)
+      return mlir::failure();
     // A TILE-INDEX K loop -- `for block_k in range(0, tl.cdiv(K, BK))` -- steps
     // by ONE and does the multiply inside (`k = block_k*BK + arange`). Its
     // upper bound is a tile COUNT, not a length, so the rule above does not
@@ -30350,12 +30449,28 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
     }
   }
 
-  mlir::Value cInit = forOp.getInitArgs()[0];
-  if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
-                       resultTensorTy, {}, {}, reductionExtent,
-                       /*transposeA=*/false,
-                       /*scaleInfo=*/nullptr,
-                       sdConeCrossesTranspose(dot.getB())))
+  mlir::Value cInit = forOp.getInitArgs()[*accIdx];
+  if (ptrAdvance) {
+    // The operands' address arithmetic lives in the carries' init chains.
+    auto scalarDot = sdCreateScalarDot(
+        forOp, aLoad, bLoad, cInit, replaceTarget, resultTensorTy, {}, {},
+        reductionExtent, /*transposeA=*/false, /*scaleInfo=*/nullptr,
+        sdConeCrossesTranspose(dot.getB()), /*inferPhysicalStrides=*/true);
+    if (!scalarDot) {
+      if (auto dead = reductionExtent.getDefiningOp<mlir::arith::MulIOp>()) {
+        auto cst = dead.getRhs().getDefiningOp();
+        dead.erase();
+        if (cst && cst->use_empty())
+          cst->erase();
+      }
+      return mlir::failure();
+    }
+    replaceTarget.replaceAllUsesWith(scalarDot.getResult());
+  } else if (!sdEmitScalarDot(forOp, aLoad, bLoad, cInit, replaceTarget,
+                              resultTensorTy, {}, {}, reductionExtent,
+                              /*transposeA=*/false,
+                              /*scaleInfo=*/nullptr,
+                              sdConeCrossesTranspose(dot.getB())))
     return mlir::failure();
 
   if (resCvt)
