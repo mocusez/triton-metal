@@ -1612,3 +1612,58 @@ def test_rank1_reduce_then_overwriting_its_source_still_runs(block, num_warps):
     torch.testing.assert_close(out.cpu(),
                                torch.full((block,), float(ref.sum())))
     assert torch.equal(x.cpu(), torch.zeros(block))
+
+
+# f16 / bf16 argmax and argmin, and a general f16 tuple reduce. The tuple
+# reduce carried only f32 and i32 in its threadgroup slots, so every half-
+# precision `tl.argmax` was refused by name (185 sweep cells). The half value
+# now rides an f32 slot -- exact both ways -- while the combine replays at its
+# own type, so ties resolve to the lowest index exactly as Triton's do.
+@triton.jit
+def _half_arg_kernel(x_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, N))
+    if OP == 0:
+        tl.store(out_ptr, tl.argmax(x, 0))
+    else:
+        tl.store(out_ptr, tl.argmin(x, 0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
+@pytest.mark.parametrize("op", ["argmax", "argmin"])
+@pytest.mark.parametrize("n,num_warps", [(32, 1), (256, 1), (256, 4), (1024, 4), (2048, 2)])
+def test_half_precision_argmax_argmin_matches_torch(dtype, op, n, num_warps):
+    g = torch.Generator().manual_seed(n + num_warps)
+    x = ((torch.randperm(n, generator=g) % 23) - 11).to(dtype)  # many ties
+    out = torch.zeros(1, dtype=torch.int32, device="mps")
+    _half_arg_kernel[(1,)](x.to("mps"), out, n, ["argmax", "argmin"].index(op),
+                           num_warps=num_warps)
+    torch.mps.synchronize()
+    want = x.float().argmax() if op == "argmax" else x.float().argmin()
+    assert int(out.cpu()[0]) == int(want)
+
+
+@triton.jit
+def _pair_max_combine(a, ai, b, bi):
+    take_a = (a > b) | ((a == b) & (ai < bi))
+    return tl.where(take_a, a, b), tl.where(take_a, ai, bi)
+
+
+@triton.jit
+def _half_tuple_reduce_kernel(x_ptr, v_ptr, i_ptr, N: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, N)) * 2.0
+    v, i = tl.reduce((x, tl.arange(0, N)), 0, _pair_max_combine)
+    tl.store(v_ptr, v)
+    tl.store(i_ptr, i)
+
+
+@pytest.mark.parametrize("n,num_warps", [(64, 1), (512, 4)])
+def test_half_precision_tuple_reduce_matches_torch(n, num_warps):
+    g = torch.Generator().manual_seed(n)
+    x = ((torch.randperm(n, generator=g) % 17) - 8).half()
+    v = torch.zeros(1, dtype=torch.float16, device="mps")
+    i = torch.zeros(1, dtype=torch.int32, device="mps")
+    _half_tuple_reduce_kernel[(1,)](x.to("mps"), v, i, n, num_warps=num_warps)
+    torch.mps.synchronize()
+    y = x * 2
+    assert v.cpu()[0].item() == y.max().item()
+    assert int(i.cpu()[0]) == int(y.float().argmax())

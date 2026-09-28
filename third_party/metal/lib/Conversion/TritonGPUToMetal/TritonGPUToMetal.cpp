@@ -8166,6 +8166,14 @@ static bool rank1TupleSlotTypeSupported(mlir::Type ty) {
   return ty.isF32() || ty.isInteger(32);
 }
 
+// A tuple REDUCE also carries f16 and bf16, in an f32 slot: widening is exact
+// and the value read back is truncated to exactly what was written, while the
+// combine keeps replaying at the source's own type, so its comparisons and
+// ties are the program's. That is what `tl.argmax` over an f16 tile needs.
+static bool rank1TupleReduceSlotTypeSupported(mlir::Type ty) {
+  return rank1TupleSlotTypeSupported(ty) || ty.isF16() || ty.isBF16();
+}
+
 // The general multi-value rank-1 reduce this backend lowers: N >= 2 sources of
 // one shared rank-1 shape and blocked encoding, N results of the sources' own
 // element types, a replayable combine region over its 2N arguments, and at
@@ -8307,8 +8315,9 @@ static bool rank1MultiValueReduceSupported(mlir::triton::ReduceOp op,
         ty.getEncoding() != first.getEncoding())
       return no("every source of a tuple reduce must share one shape and "
                 "encoding");
-    if (!rank1TupleSlotTypeSupported(ty.getElementType()))
-      return no("a general tuple reduce carries f32 and i32 values only");
+    if (!rank1TupleReduceSlotTypeSupported(ty.getElementType()))
+      return no("a general tuple reduce carries f32, f16, bf16 and i32 values "
+                "only");
     if (op->getResult(i).getType() != ty.getElementType())
       return no("each tuple result must have its source's element type");
   }
@@ -8402,7 +8411,10 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
                 "type");
       mine.push_back(v);
     }
-    mlir::Type storeTy = ety.isF32() ? ety : mlir::Type(ui32);
+    mlir::Type storeTy = ety.isF32() ? ety
+                         : (ety.isF16() || ety.isBF16())
+                             ? mlir::Type(rewriter.getF32Type())
+                             : mlir::Type(ui32);
     eltTys.push_back(ety);
     storeTys.push_back(storeTy);
     bufs.push_back(ThreadgroupAllocaOp::create(
@@ -8411,15 +8423,26 @@ static mlir::LogicalResult lowerRank1MultiValueReduce(
                                             slots))
                        .getResult());
   }
+  auto isHalfSlot = [&](size_t i) {
+    return storeTys[i] != eltTys[i] && mlir::isa<mlir::FloatType>(eltTys[i]);
+  };
   auto toStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
     if (storeTys[i] == eltTys[i])
       return v;
+    if (isHalfSlot(i))
+      return mlir::arith::ExtFOp::create(rewriter, loc, storeTys[i], v)
+          .getResult();
     return mlir::UnrealizedConversionCastOp::create(
                rewriter, loc, mlir::TypeRange{storeTys[i]}, mlir::ValueRange{v})
         .getResult(0);
   };
   auto fromStorage = [&](mlir::Value v, size_t i) -> mlir::Value {
-    return storeTys[i] == eltTys[i] ? v : toSignlessInt(v, rewriter, loc);
+    if (storeTys[i] == eltTys[i])
+      return v;
+    if (isHalfSlot(i))
+      return mlir::arith::TruncFOp::create(rewriter, loc, eltTys[i], v)
+          .getResult();
+    return toSignlessInt(v, rewriter, loc);
   };
 
   // The leading barrier prevents iteration t+1 from overwriting a static

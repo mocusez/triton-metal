@@ -71,22 +71,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// A tuple reduce whose slots are f16. Each lockstep buffer is one 32-bit slot,
-// and only f32 and i32 have a spelling on both sides of its ui32 storage
-// bridge; a narrower type would need its own staging decision, so it stays
-// refused rather than silently widened.
+// A tuple reduce whose slots are i16. Each lockstep buffer is one 32-bit slot:
+// f32 and i32 have a spelling on both sides of its storage bridge, and f16 /
+// bf16 ride an f32 slot exactly (widened on write, truncated on read). A
+// narrower integer would need its own staging decision, so it stays refused
+// rather than silently widened.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_tuple_f16_deferred(%x_ptr: !tt.ptr<f16>) {
-    %x = arith.constant dense<1.0> : tensor<64xf16, #blocked>
-    %y = arith.constant dense<2.0> : tensor<64xf16, #blocked>
-    // expected-error @+1 {{a general tuple reduce carries f32 and i32 values only}}
+  tt.func public @reduce_tuple_i16_deferred(%x_ptr: !tt.ptr<i16>) {
+    %x = arith.constant dense<1> : tensor<64xi16, #blocked>
+    %y = arith.constant dense<2> : tensor<64xi16, #blocked>
+    // expected-error @+1 {{a general tuple reduce carries f32, f16, bf16 and i32 values only}}
     %r:2 = "tt.reduce"(%x, %y) ({
-    ^bb0(%a1: f16, %b1: f16, %a2: f16, %b2: f16):
-      %m1 = arith.minnumf %a1, %a2 : f16
-      %m2 = arith.maxnumf %b1, %b2 : f16
-      tt.reduce.return %m1, %m2 : f16, f16
-    }) {axis = 0 : i32} : (tensor<64xf16, #blocked>, tensor<64xf16, #blocked>) -> (f16, f16)
+    ^bb0(%a1: i16, %b1: i16, %a2: i16, %b2: i16):
+      %m1 = arith.minsi %a1, %a2 : i16
+      %m2 = arith.maxsi %b1, %b2 : i16
+      tt.reduce.return %m1, %m2 : i16, i16
+    }) {axis = 0 : i32} : (tensor<64xi16, #blocked>, tensor<64xi16, #blocked>) -> (i16, i16)
     tt.return
   }
 }
