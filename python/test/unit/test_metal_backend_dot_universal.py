@@ -3787,16 +3787,16 @@ def test_dot_transposed_b_address_strided_dense_axis_matches_torch():
     torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
 
 
-def test_dot_real_trans_b_strided_dense_axis_is_named(capfd):
-    """A real `tt.trans` still refuses.
+@pytest.mark.parametrize("use_off", [False, True], ids=["no_base", "base"])
+@pytest.mark.parametrize("sbk", [2, 3])
+def test_dot_real_trans_b_strided_dense_axis_matches_torch(sbk, use_off):
+    """A real `tt.trans` B carries a region too, built with its axes swapped.
 
-    The region's two block arguments are the TILE's axes, and a `tt.trans`
-    consumer swaps them -- so the axes the lowering would bind are not the axes
-    the region was built against. Refused rather than guessed at.
+    Its tile is [N, K] while the lowering binds B's region as (k, column), so
+    the region is built with the tile's axis 0 on the block's second argument.
     """
-    with pytest.raises(Exception):
-        _run_transposed_b(real_trans=True, use_off=False, sbk=2)
-    assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+    got, ref = _run_transposed_b(real_trans=True, use_off=use_off, sbk=sbk)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
 
 
 @triton.jit
@@ -3854,21 +3854,28 @@ def _run_transposed_b_wrap(*, real_trans, tail, wrap=7, N=64):
     return big_c[:M, :N], a @ gathered.t(), a @ bnk[:N].t()
 
 
-@pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
-def test_dot_transposed_b_unrelated_modulo_is_named(capfd, real_trans):
-    """A `%` a transposed B cannot prove must be refused, not dropped.
+def test_dot_transposed_b_unrelated_modulo_is_named(capfd):
+    """A `%` an address-only transposed B cannot prove must be refused, not dropped.
 
     Every tier rebuilds the address from an origin and a stride, so all of them
     DROP the remainder. That is sound only for the tail wrap, whose divisor is
     the extent guarding the axis. `n % 7` moves columns the mask keeps, and both
     spellings answered with column `n` -- bit-identical to the remainder being
-    absent. A transposed operand has no index region to fall back to (the
-    region's block arguments are the TILE's axes and `tt.trans` swaps them), so
-    the correct outcome here is a named refusal rather than a computation.
+    absent. An address-only transposed operand has no index region to fall back
+    to, so the correct outcome here is a named refusal rather than a computation.
     """
     with pytest.raises(Exception):
-        _run_transposed_b_wrap(real_trans=real_trans, tail=False)
+        _run_transposed_b_wrap(real_trans=False, tail=False)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("wrap", [5, 7, 13])
+def test_dot_real_trans_b_unrelated_modulo_matches_torch(wrap):
+    """A real `tt.trans` B spells the remainder in its index region instead."""
+    got, gathered, dropped = _run_transposed_b_wrap(real_trans=True, tail=False,
+                                                    wrap=wrap)
+    torch.testing.assert_close(got, gathered, atol=2e-3, rtol=2e-3)
+    assert not torch.allclose(got, dropped, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.parametrize("real_trans", [False, True], ids=["addr", "trans"])
@@ -4524,3 +4531,114 @@ def test_dot_two_independent_accumulators_stay_refused(capfd):
         return
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), -(a.cpu() @ b.cpu()), atol=2e-3, rtol=2e-3)
+
+
+# --- A runtime-K loop counting elements, with output-edge operand guards ----
+#
+# `for kk in range(0, K, BK)` with `offs_k < K - kk` on the K axis and the
+# output-edge guards `offs_m < M` / `offs_n < N` on the other axis of A / B.
+# With a column-strided output the SIMD-group tier cannot store it, and the
+# scalar tier took only a pure `K - kk * BK` guard, so this was refused by name
+# (`matmul_address_forms` rtkcolstr, 6 cells). The edge guards zero only rows
+# and columns the store mask drops, so they are accepted when the store mask
+# bounds the same index by the same extent.
+@triton.jit
+def _rtk_edge_guard_kernel(a_ptr, b_ptr, o_ptr, M, N, K, M_A, sam, sbk, som, son,
+                           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                           EPI: tl.constexpr, OWN_A_BOUND: tl.constexpr):
+    if not OWN_A_BOUND:
+        M_A = M
+    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_m[:, None] * sam + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_n[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, K, BK):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M_A) & (offs_k[None, :] < K - kk), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - kk) & (offs_n[None, :] < N), other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BK
+        b_ptrs += BK * sbk
+    if EPI:
+        acc = tl.maximum(acc, 0.0)
+    tl.store(o_ptr + offs_m[:, None] * som + offs_n[None, :] * son, acc,
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def _run_rtk_edge_guard(m, n, k, bk, warps, epi, col_major, m_a=None):
+    torch.manual_seed(m * 7 + n + k + bk + warps)
+    a = torch.randn(m, k)
+    b = torch.randn(k, n)
+    if col_major:
+        out = torch.zeros(n, m, device="mps")
+        som, son = 1, m
+    else:
+        out = torch.zeros(m, n, device="mps")
+        som, son = n, 1
+    grid = (triton.cdiv(m, 32), triton.cdiv(n, 32))
+    _rtk_edge_guard_kernel[grid](a.to("mps"), b.to("mps"), out, m, n, k,
+                                 m if m_a is None else m_a, k, n, som, son,
+                                 BM=32, BN=32, BK=bk, EPI=epi,
+                                 OWN_A_BOUND=m_a is not None, num_warps=warps)
+    torch.mps.synchronize()
+    ref = a @ b
+    if epi:
+        ref = ref.clamp(min=0)
+    return (out.cpu().t() if col_major else out.cpu()), ref
+
+
+@pytest.mark.parametrize("mnk", [(64, 64, 64), (100, 72, 88)], ids=["even", "ragged"])
+@pytest.mark.parametrize("bk", [8, 16, 32])
+@pytest.mark.parametrize("warps", [1, 4])
+@pytest.mark.parametrize("epi", [0, 1], ids=["plain", "relu"])
+@pytest.mark.parametrize("col_major", [False, True], ids=["rowmajor", "colmajor"])
+def test_runtime_k_element_step_edge_guards_match_torch(mnk, bk, warps, epi, col_major):
+    got, ref = _run_rtk_edge_guard(*mnk, bk, warps, epi, col_major)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+def test_runtime_k_edge_guard_on_another_extent_is_not_dropped(capfd):
+    """A's row guard names an extent the store does not: rows in [M_A, M) must
+    come out zero, which a collapse that drops the guard would get wrong."""
+    try:
+        got, ref = _run_rtk_edge_guard(64, 64, 64, 16, 1, 0, True, m_a=40)
+    except Exception:
+        assert "error:" in capfd.readouterr().err  # a named refusal, not a crash
+        return
+    ref[40:] = 0.0
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+# --- A standalone dot over an operand taken from every other column ---------
+#
+# An A whose K (or a B whose N) advances by more than one carries its index
+# as a region, and a region needed the load's mask to name the reduction
+# length. With no mask on either operand the kernel reads both whole tiles,
+# so the tile's own K is exact (`matmul_address_forms` oneastride/onebstride).
+@triton.jit
+def _single_dot_strided_kernel(a_ptr, b_ptr, o_ptr, sam, sak, sbk, sbn,
+                               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    ok = tl.arange(0, BK)
+    a = tl.load(a_ptr + om[:, None] * sam + ok[None, :] * sak)
+    b = tl.load(b_ptr + ok[:, None] * sbk + on[None, :] * sbn)
+    tl.store(o_ptr + om[:, None] * BN + on[None, :], tl.dot(a, b))
+
+
+@pytest.mark.parametrize("sak,sbn", [(2, 1), (1, 2), (3, 2)])
+@pytest.mark.parametrize("shape", [(64, 64, 64), (32, 16, 64), (16, 32, 32)])
+@pytest.mark.parametrize("warps", [1, 4])
+def test_single_dot_strided_operand_matches_torch(sak, sbn, shape, warps):
+    m, n, k = shape
+    torch.manual_seed(m + n + k + sak + sbn)
+    big_a = torch.randn(m, sak * k + 24)
+    big_b = torch.randn(k, sbn * n + 24)
+    out = torch.zeros(m, n, device="mps")
+    _single_dot_strided_kernel[(1,)](big_a.to("mps"), big_b.to("mps"), out,
+                                     big_a.shape[1], sak, big_b.shape[1], sbn,
+                                     BM=m, BN=n, BK=k, num_warps=warps)
+    torch.mps.synchronize()
+    ref = big_a[:, :sak * k:sak] @ big_b[:, :sbn * n:sbn]
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)

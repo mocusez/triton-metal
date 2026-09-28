@@ -27665,11 +27665,15 @@ sdScalarizeSelfContainedCone(mlir::OpBuilder &builder, mlir::Location loc,
 // are scalarized SEPARATELY, each against its own axis, so a cone that names
 // only its own index can never be confused for the other axis -- which a
 // single walk could not tell apart when the two tile extents are equal.
+// `swapAxes` binds the tile's axis 0 to the block's SECOND argument: a B read
+// through a `tt.trans` is loaded as an [N, K] tile, while the lowering binds
+// B's region as (k, column).
 static mlir::LogicalResult
 sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
                              mlir::RankedTensorType tileTy, mlir::Location loc,
                              mlir::MLIRContext *ctx,
-                             llvm::SmallVectorImpl<mlir::Value> &captures) {
+                             llvm::SmallVectorImpl<mlir::Value> &captures,
+                             bool swapAxes = false) {
   if (!tileTy || tileTy.getRank() < 2)
     return mlir::failure();
   SdPtrParts parts = sdSplitPtr(ptr);
@@ -27684,8 +27688,8 @@ sdPopulateOperandIndexRegion(mlir::Region &region, mlir::Value ptr,
   mlir::Block *body = builder.createBlock(&region, region.end(),
                                           {i32, i32}, {loc, loc});
   builder.setInsertionPointToStart(body);
-  mlir::Value axis0 = body->getArgument(0);
-  mlir::Value axis1 = body->getArgument(1);
+  mlir::Value axis0 = body->getArgument(swapAxes ? 1 : 0);
+  mlir::Value axis1 = body->getArgument(swapAxes ? 0 : 1);
   SdConeCaptures captured;
   captured.block = body;
 
@@ -28051,6 +28055,54 @@ sdCanonicalScaleBatchStride(mlir::Value ptr, mlir::RankedTensorType scaleTy);
 // Defined with the scale helpers below; the wrap proof needs it here.
 static bool sdAreSameMaskExtent(mlir::Value lhs, mlir::Value rhs);
 
+// True when two index tensors compute the same values and differ at most in
+// their layout encodings. A layout pass rematerialises `pid * BM + arange` once
+// per encoding it needs, so the operand mask's row index and the store mask's
+// are two SSA values spelling one index; comparing them by identity misses
+// every such pair. Deliberately small: ranges, splats of one scalar, constants
+// and integer add/sub/mul over those, through layout converts.
+static bool sdSameIndexIgnoringLayout(mlir::Value a, mlir::Value b,
+                                      int depth = 0) {
+  auto peel = [](mlir::Value v) {
+    while (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      v = cvt.getSrc();
+    return v;
+  };
+  a = peel(a);
+  b = peel(b);
+  if (a == b)
+    return true;
+  auto ta = mlir::dyn_cast<mlir::RankedTensorType>(a.getType());
+  auto tb = mlir::dyn_cast<mlir::RankedTensorType>(b.getType());
+  if (depth > 8 || !ta || !tb || ta.getShape() != tb.getShape() ||
+      ta.getElementType() != tb.getElementType())
+    return false;
+  if (auto ca = sdDenseSplatIntConstant(a)) {
+    auto cb = sdDenseSplatIntConstant(b);
+    return cb && *ca == *cb;
+  }
+  mlir::Operation *da = a.getDefiningOp();
+  mlir::Operation *db = b.getDefiningOp();
+  if (!da || !db || da->getName() != db->getName())
+    return false;
+  if (auto ra = mlir::dyn_cast<mlir::triton::MakeRangeOp>(da)) {
+    auto rb = mlir::cast<mlir::triton::MakeRangeOp>(db);
+    return ra.getStart() == rb.getStart() && ra.getEnd() == rb.getEnd();
+  }
+  if (auto sa = mlir::dyn_cast<mlir::triton::SplatOp>(da))
+    return sa.getSrc() == mlir::cast<mlir::triton::SplatOp>(db).getSrc();
+  if (auto ea = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(da))
+    if (ea.getAxis() != mlir::cast<mlir::triton::ExpandDimsOp>(db).getAxis())
+      return false;
+  if (!mlir::isa<mlir::arith::AddIOp, mlir::arith::SubIOp, mlir::arith::MulIOp,
+                 mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp>(da))
+    return false;
+  for (auto [x, y] : llvm::zip(da->getOperands(), db->getOperands()))
+    if (!sdSameIndexIgnoringLayout(x, y, depth + 1))
+      return false;
+  return true;
+}
+
 static ScalarDotOp sdCreateScalarDot(
     mlir::Operation *insertBefore, mlir::triton::LoadOp aLoad,
     mlir::triton::LoadOp bLoad, mlir::Value cInit, mlir::Value replaceTarget,
@@ -28164,6 +28216,7 @@ static ScalarDotOp sdCreateScalarDot(
   // arguments are the TILE's axes, and a real `tt.trans` consumer swaps them.
   bool aIndexRegion = false;
   bool bIndexRegion = false;
+  bool bRealTrans = false, bRealTransRegion = false;
   // A `%` on the axis the rebuild does not advance is only sound as the TAIL
   // WRAP. Keep the divisors here and prove them once the store's mask extents
   // are known, a few blocks below.
@@ -28219,14 +28272,28 @@ static ScalarDotOp sdCreateScalarDot(
             &bLooseWrapDivisor))
       bIndexRegion = true;
     bLooseAxis = bDenseAxis == 0 ? 1 : 0;
-    // A transposed operand is still refused on the old terms: it has no region
-    // to fall back to. Its `%` needs the same proof as a straight B's, and the
+    // A B read through a real `tt.trans` CAN carry a region: its tile is
+    // [N, K], and the region is built with its two block arguments swapped to
+    // match. Every address that neither folds nor is dense -- a K taken from
+    // every other column, an unproven wrap -- goes there instead of being
+    // refused. 📏 12 `dot_transposed_address` cells were refused by name.
+    bRealTrans = transposeB && bDenseAxis == 1;
+    if (bRealTrans) {
+      bRealTransRegion =
+          !simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis) ||
+          !sdOperandAddressIsRebuildable(
+              sdResolveLoopCarriedPtrInit(bLoad.getPtr()), bDenseAxis,
+              &bTransposedWrapDivisor);
+      bIndexRegion = bRealTransRegion;
+    }
+    // An address-only transpose is still refused on the old terms: it has no
+    // region to fall back to. Its `%` needs the same proof as a straight B's, and the
     // axis to prove it against is N in BOTH spellings -- a real `tt.trans`
     // loads [N, K] so its dense axis is 1 and N is axis 0, an address-only
     // transpose loads [K, N] so its dense axis is 0 and N is axis 1. Measured
     // before this was added: `n % 7` on either spelling answered with column
     // `n`, bit-identical to the remainder simply being absent.
-    if (transposeB &&
+    if (transposeB && bDenseAxis == 0 &&
         (!simdgroupTileIsContiguous(bLoad.getPtr(), bDenseAxis) ||
          !sdOperandAddressIsRebuildable(
              sdResolveLoopCarriedPtrInit(bLoad.getPtr()), bDenseAxis,
@@ -28304,8 +28371,11 @@ static ScalarDotOp sdCreateScalarDot(
     // TILE's axes and a `tt.trans` consumer swaps them -- so an unproven wrap
     // here is a NAMED REFUSAL, not a widening.
     if (bTransposedWrapDivisor &&
-        !proven(bTransposedWrapDivisor, maskExtents.nExtent))
-      return {};
+        !proven(bTransposedWrapDivisor, maskExtents.nExtent)) {
+      if (!bRealTrans)
+        return {};
+      bIndexRegion = bRealTransRegion = true;
+    }
   }
 
   mlir::OpBuilder builder(insertBefore);
@@ -28482,6 +28552,15 @@ static ScalarDotOp sdCreateScalarDot(
   // `BK > K` collapses the K loop to a single trip, Triton folds the loop, the
   // loop rule never runs, and a tile-K extent reads the columns past K that
   // the source's mask had promised as zeros.
+  //
+  // With NO mask on either operand there is nothing to promise: the kernel
+  // reads every element of both tiles, so the tile's own K is the length, and
+  // exactly so -- not `min(stride_a, K)`, whose `stride_a` is the row cone's
+  // arbitrary constant here. 📏 a standalone dot over an A or B taken from
+  // every other column was refused by name at every shape.
+  if ((aIndexRegion || bIndexRegion) && !reductionExtent && standaloneTileK &&
+      !aLoad.getMask() && !bLoad.getMask())
+    reductionExtent = standaloneTileK;
   if ((aIndexRegion || bIndexRegion) && !reductionExtent) {
     MaskExtents aExt = extractMaskExtents(aLoad.getMask(),
                                           /*allowDenseSplatBounds=*/true,
@@ -28703,7 +28782,8 @@ static ScalarDotOp sdCreateScalarDot(
     if (built && bIndexRegion)
       built = mlir::succeeded(sdPopulateOperandIndexRegion(
           scalarDot.getBIndex(), sdResolveLoopCarriedPtrInit(bLoad.getPtr()),
-          bTileTy, loc, builder.getContext(), captures));
+          bTileTy, loc, builder.getContext(), captures,
+          /*swapAxes=*/bRealTransRegion));
     if (!built) {
       scalarDot.erase();
       return {};
@@ -30364,14 +30444,46 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
       if (forOp.getRegionIterArg(*accIdx) == l.a.getPtr())
         return mlir::failure();
   }
-  // The one operand mask a pointer-advance loop may carry is the ragged-K
-  // guard every Triton matmul writes, `offs_k < K - kk * BLOCK_K` with a zero
-  // `other`: once collapsed it says exactly "k < K", which the reduction
-  // length states instead. `loopKBound` returns that K, or null for any other
-  // mask -- an offset K index, a bound that is not the loop's own tile step,
-  // a non-zero fill -- which keeps the refusal.
-  auto loopKBound = [&](mlir::triton::LoadOp load,
-                        int kDim) -> std::optional<mlir::Value> {
+  // The operand masks a pointer-advance loop may carry are the ones every
+  // Triton matmul writes, with a zero `other`:
+  //   * the ragged-K guard, `offs_k < K - kk * BLOCK_K` when the loop counts
+  //     tiles or `offs_k < K - kk` when it counts elements: once collapsed it
+  //     says exactly "k < K", which the reduction length states instead;
+  //   * the output-edge guard on the operand's OTHER axis, `offs_m < M` on A's
+  //     rows or `offs_n < N` on B's columns. It zeroes only the rows (columns)
+  //     whose results the store mask drops, and the collapsed op computes
+  //     nothing there: it guards every output by that same store mask. So it
+  //     is accepted only when the store mask bounds the same index by the
+  //     same extent.
+  // `loopKBound` returns the K, a null value for a mask with no K leaf, or
+  // nullopt for anything else -- an offset K index, a bound that is not the
+  // loop's own tile step, a non-zero fill, a guard the store does not repeat --
+  // which keeps the refusal. 📏 a runtime-K loop writing a column-strided
+  // output (the SIMD tier's store must be contiguous) was refused by name.
+  // The proof is against the store whose mask the collapsed op will guard by
+  // (`sdFindStore`), so a result reaching a second store proves nothing.
+  MaskExtents storeExtents;
+  {
+    llvm::SmallVector<mlir::Operation *, 8> wl(
+        forOp.getResult(*accIdx).getUsers().begin(),
+        forOp.getResult(*accIdx).getUsers().end());
+    llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+    unsigned stores = 0;
+    while (!wl.empty()) {
+      mlir::Operation *u = wl.pop_back_val();
+      if (!seen.insert(u).second)
+        continue;
+      if (mlir::isa<mlir::triton::StoreOp>(u))
+        ++stores;
+      for (mlir::Value res : u->getResults())
+        wl.append(res.getUsers().begin(), res.getUsers().end());
+    }
+    auto outStore = sdFindStore(forOp.getResult(*accIdx));
+    if (stores == 1 && outStore && outStore.getMask())
+      storeExtents = extractMaskExtents(outStore.getMask());
+  }
+  auto loopKBound = [&](mlir::triton::LoadOp load, int kDim,
+                        bool isA) -> std::optional<mlir::Value> {
     if (!load.getMask())
       return mlir::Value();
     if (mlir::Value other = load.getOther()) {
@@ -30386,51 +30498,94 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
       if (!(f && f.getValue().isZero()) && !(i && i.getValue().isZero()))
         return std::nullopt;
     }
-    mlir::Value m = load.getMask();
-    while (auto bc = m.getDefiningOp<mlir::triton::BroadcastOp>())
-      m = bc.getSrc();
-    auto cmp = m.getDefiningOp<mlir::arith::CmpIOp>();
-    if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
-      return std::nullopt;
-    auto lhsTy = mlir::dyn_cast<mlir::RankedTensorType>(cmp.getLhs().getType());
     auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
-    if (!lhsTy || !loadTy || lhsTy.getRank() != 2 || loadTy.getRank() != 2 ||
-        lhsTy.getDimSize(kDim) != loadTy.getDimSize(kDim) ||
-        lhsTy.getDimSize(1 - kDim) != 1)
+    if (!loadTy || loadTy.getRank() != 2)
       return std::nullopt;
-    mlir::Value idx = cmp.getLhs();
-    while (true) {
-      if (auto ed = idx.getDefiningOp<mlir::triton::ExpandDimsOp>())
-        idx = ed.getSrc();
-      else if (auto cv = idx.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
-        idx = cv.getSrc();
-      else
-        break;
-    }
-    auto range = idx.getDefiningOp<mlir::triton::MakeRangeOp>();
-    if (!range || range.getStart() != 0)
+    // A conjunction of comparisons, each broadcast to the tile; any other
+    // combinator (an `or`, a select) is not a rectangle and is refused.
+    llvm::SmallVector<mlir::arith::CmpIOp, 2> leaves;
+    std::function<bool(mlir::Value)> collect = [&](mlir::Value v) -> bool {
+      while (auto bc = v.getDefiningOp<mlir::triton::BroadcastOp>())
+        v = bc.getSrc();
+      if (auto andi = v.getDefiningOp<mlir::arith::AndIOp>())
+        return collect(andi.getLhs()) && collect(andi.getRhs());
+      auto cmp = v.getDefiningOp<mlir::arith::CmpIOp>();
+      if (!cmp || leaves.size() >= 4)
+        return false;
+      leaves.push_back(cmp);
+      return true;
+    };
+    if (!collect(load.getMask()))
       return std::nullopt;
-    mlir::Value bound = sdSplatScalarSource(cmp.getRhs());
-    auto sub = bound ? bound.getDefiningOp<mlir::arith::SubIOp>()
-                     : mlir::arith::SubIOp();
-    auto mul = sub ? sub.getRhs().getDefiningOp<mlir::arith::MulIOp>()
-                   : mlir::arith::MulIOp();
-    if (!mul || !forOp.isDefinedOutsideOfLoop(sub.getLhs()))
-      return std::nullopt;
+    auto stripShells = [](mlir::Value idx) {
+      while (true) {
+        if (auto ed = idx.getDefiningOp<mlir::triton::ExpandDimsOp>())
+          idx = ed.getSrc();
+        else if (auto cv =
+                     idx.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+          idx = cv.getSrc();
+        else
+          break;
+      }
+      return idx;
+    };
+    auto lower = sdDenseSplatIntConstant(forOp.getLowerBound());
+    auto step = sdDenseSplatIntConstant(forOp.getStep());
     mlir::Value iv = forOp.getInductionVar();
-    auto lc = sdDenseSplatIntConstant(mul.getLhs());
-    auto rc = sdDenseSplatIntConstant(mul.getRhs());
     const int64_t tileK = loadTy.getDimSize(kDim);
-    if (!((mul.getLhs() == iv && rc && *rc == tileK) ||
-          (mul.getRhs() == iv && lc && *lc == tileK)))
+    mlir::Value kBound;
+    for (auto cmp : leaves) {
+      if (cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+        return std::nullopt;
+      auto lhsTy =
+          mlir::dyn_cast<mlir::RankedTensorType>(cmp.getLhs().getType());
+      if (!lhsTy || lhsTy.getRank() != 2)
+        return std::nullopt;
+      mlir::Value idx = stripShells(cmp.getLhs());
+      mlir::Value bound = sdSplatScalarSource(cmp.getRhs());
+      if (!bound)
+        return std::nullopt;
+      if (lhsTy.getDimSize(kDim) == tileK && lhsTy.getDimSize(1 - kDim) == 1) {
+        auto range = idx.getDefiningOp<mlir::triton::MakeRangeOp>();
+        auto sub = bound.getDefiningOp<mlir::arith::SubIOp>();
+        if (kBound || !range || range.getStart() != 0 || !sub ||
+            !forOp.isDefinedOutsideOfLoop(sub.getLhs()) || !lower ||
+            *lower != 0 || !step)
+          return std::nullopt;
+        // Counting tiles: `K - kk * BK`, the loop stepping by one.
+        bool matches = false;
+        if (auto mul = sub.getRhs().getDefiningOp<mlir::arith::MulIOp>()) {
+          auto lc = sdDenseSplatIntConstant(mul.getLhs());
+          auto rc = sdDenseSplatIntConstant(mul.getRhs());
+          matches = *step == 1 && ((mul.getLhs() == iv && rc && *rc == tileK) ||
+                                   (mul.getRhs() == iv && lc && *lc == tileK));
+        }
+        // Counting elements: `K - kk`, the loop stepping by one tile.
+        if (sub.getRhs() == iv && *step == tileK)
+          matches = true;
+        if (!matches)
+          return std::nullopt;
+        kBound = sub.getLhs();
+        continue;
+      }
+      mlir::Value outIndex = isA ? storeExtents.mIndex : storeExtents.nIndex;
+      mlir::Value outExtent = isA ? storeExtents.mExtent : storeExtents.nExtent;
+      if (lhsTy.getDimSize(kDim) == 1 &&
+          lhsTy.getDimSize(1 - kDim) == loadTy.getDimSize(1 - kDim) &&
+          storeExtents.mExtent && storeExtents.nExtent && outIndex &&
+          sdSameIndexIgnoringLayout(idx, outIndex) &&
+          sdAreSameMaskExtent(bound, outExtent))
+        continue;
       return std::nullopt;
-    return sub.getLhs();
+    }
+    return kBound;
   };
   mlir::Value maskedK;
   if (ptrAdvance) {
     for (auto [k, l] : llvm::enumerate(links)) {
-      auto aK = loopKBound(l.a, 1);
-      auto bK = loopKBound(l.b, sdConeCrossesTranspose(l.dot.getB()) ? 1 : 0);
+      auto aK = loopKBound(l.a, 1, /*isA=*/true);
+      auto bK = loopKBound(l.b, sdConeCrossesTranspose(l.dot.getB()) ? 1 : 0,
+                           /*isA=*/false);
       if (!aK || !bK || (*aK && *bK && *aK != *bK) || (bool)*aK != (bool)*bK)
         return mlir::failure();
       if (k == 0)
@@ -30519,8 +30674,11 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
     // K tile, PROVIDED each operand pointer steps by exactly that many
     // elements along its own K axis -- A's columns, B's rows (its columns
     // once it crosses a transpose). Anything else keeps the refusal.
+    // A loop counting ELEMENTS instead -- `for kk in range(0, K, BK)`, stepping
+    // by the K tile -- runs ceil(K / BK) trips of the same tile.
     if (ptrAdvance && aTy && aTy.getRank() == 2 && lower && *lower == 0 &&
-        step && *step == 1 && ptrIsLoopCarried(aLoad.getPtr()) &&
+        step && (*step == 1 || *step == aTy.getShape()[1]) &&
+        ptrIsLoopCarried(aLoad.getPtr()) &&
         ptrIsLoopCarried(bLoad.getPtr())) {
       const int64_t tileK = aTy.getShape()[1];
       auto stepsOneTile = [&](mlir::Value carried, BatchedMatrixAxis kAxis) {
@@ -30573,13 +30731,27 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
       });
       if (everyLinkSteps) {
         mlir::OpBuilder b(forOp);
-        reductionExtent =
-            mlir::arith::MulIOp::create(
-                b, forOp.getLoc(), forOp.getUpperBound(),
-                mlir::arith::ConstantOp::create(
-                    b, forOp.getLoc(),
-                    b.getIntegerAttr(forOp.getUpperBound().getType(), tileK)))
-                .getResult();
+        auto ubTy = forOp.getUpperBound().getType();
+        auto cst = [&](int64_t c) {
+          return mlir::arith::ConstantOp::create(b, forOp.getLoc(),
+                                                 b.getIntegerAttr(ubTy, c))
+              .getResult();
+        };
+        mlir::Value trips = forOp.getUpperBound();
+        if (*step != 1)
+          // ceil(ub / BK), and none at all for a non-positive bound.
+          trips = mlir::arith::MaxSIOp::create(
+                      b, forOp.getLoc(),
+                      mlir::arith::DivSIOp::create(
+                          b, forOp.getLoc(),
+                          mlir::arith::AddIOp::create(b, forOp.getLoc(), trips,
+                                                      cst(tileK - 1)),
+                          cst(tileK)),
+                      cst(0))
+                      .getResult();
+        reductionExtent = mlir::arith::MulIOp::create(b, forOp.getLoc(), trips,
+                                                      cst(tileK))
+                              .getResult();
         if (maskedK)
           reductionExtent = mlir::arith::MinSIOp::create(
                                 b, forOp.getLoc(), reductionExtent, maskedK)
@@ -30632,15 +30804,28 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
     if (!scalarDot) {
       for (auto it = made.rbegin(); it != made.rend(); ++it)
         it->erase();
-      mlir::Operation *minOp = reductionExtent.getDefiningOp<mlir::arith::MinSIOp>();
-      mlir::Value product = minOp ? minOp->getOperand(0) : reductionExtent;
-      if (minOp)
-        minOp->erase();
-      if (auto dead = product.getDefiningOp<mlir::arith::MulIOp>()) {
-        auto cst = dead.getRhs().getDefiningOp();
-        dead.erase();
-        if (cst && cst->use_empty())
-          cst->erase();
+      // Take back the extent arithmetic built for the collapse: its pure cone,
+      // erased until nothing in it is left without a use.
+      llvm::SetVector<mlir::Operation *> cone;
+      std::function<void(mlir::Value, int)> gather = [&](mlir::Value v,
+                                                         int depth) {
+        mlir::Operation *def = v.getDefiningOp();
+        if (!def || depth > 6 || def->getNumRegions() != 0 ||
+            !mlir::isMemoryEffectFree(def) || !cone.insert(def))
+          return;
+        for (mlir::Value operand : def->getOperands())
+          gather(operand, depth + 1);
+      };
+      gather(reductionExtent, 0);
+      llvm::SmallPtrSet<mlir::Operation *, 8> erased;
+      for (bool progress = true; progress;) {
+        progress = false;
+        for (mlir::Operation *op : cone)
+          if (!erased.contains(op) && op->use_empty()) {
+            erased.insert(op);
+            op->erase();
+            progress = true;
+          }
       }
       return mlir::failure();
     }
