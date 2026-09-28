@@ -4371,3 +4371,60 @@ def test_ptr_advance_dot_with_a_skipping_step_is_refused(capfd):
     with pytest.raises(Exception):
         _run_ptr_advance(0, 16, 1, trips=2, astep=2, a_cols=128)
     assert "no matmul lowering matched this tl.dot" in capfd.readouterr().err
+
+
+# --- Tutorial-03 matmul with a ragged-K mask ---------------------------------
+#
+# The loop every Triton matmul copies: pointer advance, a K guard written
+# `offs_k < K - kk * BLOCK_K` against the induction variable, and `% M` on the
+# row offsets. With an activation epilogue it had no tier at all, and a 64x64
+# accumulator on one warp overran the SIMD-group tier's 32 tiles per warp.
+# Collapsed, the K guard says exactly "k < K", which becomes the reduction
+# length; any other mask keeps the refusal.
+@triton.jit
+def _tutorial_matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
+                            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                            ACT: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_am = (pid_m * BM + tl.arange(0, BM)) % M
+    offs_bn = (pid_n * BN + tl.arange(0, BN)) % N
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_am[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_bn[None, :] * sbn
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kk in range(0, tl.cdiv(K, BK)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - kk * BK, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - kk * BK, other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BK * sak
+        b_ptrs += BK * sbk
+    if ACT:
+        acc = tl.where(acc >= 0, acc, 0.01 * acc)
+    offs_cm = pid_m * BM + tl.arange(0, BM)
+    offs_cn = pid_n * BN + tl.arange(0, BN)
+    tl.store(c_ptr + offs_cm[:, None] * scm + offs_cn[None, :] * scn,
+             acc.to(c_ptr.dtype.element_ty),
+             mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["f32", "f16"])
+@pytest.mark.parametrize("act", [0, 1], ids=["plain", "leaky_relu"])
+@pytest.mark.parametrize("block,warps", [(64, 1), (64, 4), (32, 4)])
+@pytest.mark.parametrize("mnk", [(128, 128, 96), (100, 132, 100)], ids=["even", "ragged"])
+def test_tutorial_matmul_ragged_k_matches_torch(dtype, act, block, warps, mnk):
+    m, n, k = mnk
+    torch.manual_seed(m + n + k + block + warps + act)
+    a = torch.randn(m, k, dtype=dtype)
+    b = torch.randn(k, n, dtype=dtype)
+    c = torch.zeros(m, n, dtype=dtype, device="mps")
+    ad, bd = a.to("mps"), b.to("mps")
+    grid = (triton.cdiv(m, block), triton.cdiv(n, block))
+    _tutorial_matmul_kernel[grid](ad, bd, c, m, n, k, k, 1, n, 1, n, 1, BM=block, BN=block,
+                                  BK=32, ACT=act, num_warps=warps)
+    torch.mps.synchronize()
+    ref = a.float() @ b.float()
+    if act:
+        ref = torch.where(ref >= 0, ref, 0.01 * ref)
+    tol = 6e-2 if dtype == torch.float16 else 1e-3
+    torch.testing.assert_close(c.cpu().float(), ref, atol=tol, rtol=tol)

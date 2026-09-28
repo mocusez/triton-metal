@@ -30283,9 +30283,78 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
             user != bLoad.getOperation())
           return mlir::failure();
     }
-    if (forOp.getRegionIterArg(*accIdx) == aLoad.getPtr() ||
-        aLoad.getMask() || bLoad.getMask())
+    if (forOp.getRegionIterArg(*accIdx) == aLoad.getPtr())
       return mlir::failure();
+  }
+  // The one operand mask a pointer-advance loop may carry is the ragged-K
+  // guard every Triton matmul writes, `offs_k < K - kk * BLOCK_K` with a zero
+  // `other`: once collapsed it says exactly "k < K", which the reduction
+  // length states instead. `loopKBound` returns that K, or null for any other
+  // mask -- an offset K index, a bound that is not the loop's own tile step,
+  // a non-zero fill -- which keeps the refusal.
+  auto loopKBound = [&](mlir::triton::LoadOp load,
+                        int kDim) -> std::optional<mlir::Value> {
+    if (!load.getMask())
+      return mlir::Value();
+    if (mlir::Value other = load.getOther()) {
+      auto cst = other.getDefiningOp<mlir::arith::ConstantOp>();
+      auto dense =
+          cst ? mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()) : nullptr;
+      if (!dense || !dense.isSplat())
+        return std::nullopt;
+      mlir::Attribute v = dense.getSplatValue<mlir::Attribute>();
+      auto f = mlir::dyn_cast<mlir::FloatAttr>(v);
+      auto i = mlir::dyn_cast<mlir::IntegerAttr>(v);
+      if (!(f && f.getValue().isZero()) && !(i && i.getValue().isZero()))
+        return std::nullopt;
+    }
+    mlir::Value m = load.getMask();
+    while (auto bc = m.getDefiningOp<mlir::triton::BroadcastOp>())
+      m = bc.getSrc();
+    auto cmp = m.getDefiningOp<mlir::arith::CmpIOp>();
+    if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt)
+      return std::nullopt;
+    auto lhsTy = mlir::dyn_cast<mlir::RankedTensorType>(cmp.getLhs().getType());
+    auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
+    if (!lhsTy || !loadTy || lhsTy.getRank() != 2 || loadTy.getRank() != 2 ||
+        lhsTy.getDimSize(kDim) != loadTy.getDimSize(kDim) ||
+        lhsTy.getDimSize(1 - kDim) != 1)
+      return std::nullopt;
+    mlir::Value idx = cmp.getLhs();
+    while (true) {
+      if (auto ed = idx.getDefiningOp<mlir::triton::ExpandDimsOp>())
+        idx = ed.getSrc();
+      else if (auto cv = idx.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        idx = cv.getSrc();
+      else
+        break;
+    }
+    auto range = idx.getDefiningOp<mlir::triton::MakeRangeOp>();
+    if (!range || range.getStart() != 0)
+      return std::nullopt;
+    mlir::Value bound = sdSplatScalarSource(cmp.getRhs());
+    auto sub = bound ? bound.getDefiningOp<mlir::arith::SubIOp>()
+                     : mlir::arith::SubIOp();
+    auto mul = sub ? sub.getRhs().getDefiningOp<mlir::arith::MulIOp>()
+                   : mlir::arith::MulIOp();
+    if (!mul || !forOp.isDefinedOutsideOfLoop(sub.getLhs()))
+      return std::nullopt;
+    mlir::Value iv = forOp.getInductionVar();
+    auto lc = sdDenseSplatIntConstant(mul.getLhs());
+    auto rc = sdDenseSplatIntConstant(mul.getRhs());
+    const int64_t tileK = loadTy.getDimSize(kDim);
+    if (!((mul.getLhs() == iv && rc && *rc == tileK) ||
+          (mul.getRhs() == iv && lc && *lc == tileK)))
+      return std::nullopt;
+    return sub.getLhs();
+  };
+  mlir::Value maskedK;
+  if (ptrAdvance) {
+    auto aK = loopKBound(aLoad, 1);
+    auto bK = loopKBound(bLoad, sdConeCrossesTranspose(dot.getB()) ? 1 : 0);
+    if (!aK || !bK || (*aK && *bK && *aK != *bK) || (bool)*aK != (bool)*bK)
+      return mlir::failure();
+    maskedK = *aK;
   }
 
   // The loop result feeds the epilogue, optionally via a `#blocked1 ->
@@ -30421,6 +30490,10 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
                     b, forOp.getLoc(),
                     b.getIntegerAttr(forOp.getUpperBound().getType(), tileK)))
                 .getResult();
+        if (maskedK)
+          reductionExtent = mlir::arith::MinSIOp::create(
+                                b, forOp.getLoc(), reductionExtent, maskedK)
+                                .getResult();
       }
     }
     if (ptrAdvance && !reductionExtent)
@@ -30457,7 +30530,11 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
         reductionExtent, /*transposeA=*/false, /*scaleInfo=*/nullptr,
         sdConeCrossesTranspose(dot.getB()), /*inferPhysicalStrides=*/true);
     if (!scalarDot) {
-      if (auto dead = reductionExtent.getDefiningOp<mlir::arith::MulIOp>()) {
+      mlir::Operation *minOp = reductionExtent.getDefiningOp<mlir::arith::MinSIOp>();
+      mlir::Value product = minOp ? minOp->getOperand(0) : reductionExtent;
+      if (minOp)
+        minOp->erase();
+      if (auto dead = product.getDefiningOp<mlir::arith::MulIOp>()) {
         auto cst = dead.getRhs().getDefiningOp();
         dead.erase();
         if (cst && cst->use_empty())
@@ -38753,6 +38830,12 @@ static bool valueFeedsDotOperand(mlir::Value value, int depth = 0) {
 static mlir::LogicalResult
 validateCanonicalMultiTileDotSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
+  // Loops the SIMD-group tier cannot take for the last reason below alone --
+  // too many accumulator tiles for one warp. The scalar tier re-derives every
+  // element and has no such bound, so offer it the loop (after the walk: it
+  // erases the loop) and refuse only what it declines too.
+  llvm::SmallVector<std::pair<mlir::triton::DotOp, mlir::scf::ForOp>, 2>
+      offerScalar;
   moduleOp.walk([&](mlir::triton::DotOp dot) {
     if (!valid)
       return;
@@ -38839,14 +38922,22 @@ validateCanonicalMultiTileDotSupport(mlir::ModuleOp moduleOp) {
             !isNumericZero(load.getOther()))
           return;
       }
-      dot.emitOpError(
-          "Metal backend: masked runtime-K multi-tile canonical dot requires "
-          "rectangular input masks tied to the loaded pointer coordinates, "
-          "numeric-zero `other`, a supported scalar base offset, and at most "
-          "32 accumulator tiles per warp");
-      valid = false;
+      offerScalar.push_back({dot, loop});
     }
   });
+  for (auto [dot, loop] : offerScalar) {
+    if (!valid)
+      break;
+    if (mlir::succeeded(
+            tryScalarDotLoopFallback(loop, /*allowStoreConsumer=*/true)))
+      continue;
+    dot.emitOpError(
+        "Metal backend: masked runtime-K multi-tile canonical dot requires "
+        "rectangular input masks tied to the loaded pointer coordinates, "
+        "numeric-zero `other`, a supported scalar base offset, and at most "
+        "32 accumulator tiles per warp");
+    valid = false;
+  }
   return mlir::success(valid);
 }
 
