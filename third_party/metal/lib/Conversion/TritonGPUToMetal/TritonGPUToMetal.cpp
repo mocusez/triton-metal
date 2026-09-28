@@ -10816,14 +10816,24 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return scfIf.getResult(0);
   }
 
-  // int → float cast.
+  // int → float cast, to the op's OWN float type. This used to be f32 always,
+  // so `(i % 13).to(tl.float16) + tl.load(f16_ptr)` replayed as an f32 plus
+  // an f16 and failed the verifier -- 105 `s_full_reduce` cells reported an
+  // internal type mismatch instead of a sum. `evalRank2ConeAt` already asks
+  // the op.
+  auto castResultTy = [](mlir::Operation *op) -> mlir::Type {
+    mlir::Type t = op->getResult(0).getType();
+    if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(t))
+      return rtt.getElementType();
+    return t;
+  };
   if (auto s2f = mlir::dyn_cast<mlir::arith::SIToFPOp>(def)) {
     mlir::Value x =
         evalRank1ValueAt(s2f.getIn(), idxVal, rewriter, loc, depth + 1);
     if (!x)
       return nullptr;
-    return mlir::arith::SIToFPOp::create(rewriter, loc, rewriter.getF32Type(),
-                                         x)
+    return mlir::arith::SIToFPOp::create(rewriter, loc, castResultTy(s2f),
+                                         toSignlessInt(x, rewriter, loc))
         .getResult();
   }
   if (auto u2f = mlir::dyn_cast<mlir::arith::UIToFPOp>(def)) {
@@ -10831,7 +10841,7 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
         evalRank1ValueAt(u2f.getIn(), idxVal, rewriter, loc, depth + 1);
     if (!x)
       return nullptr;
-    return mlir::arith::UIToFPOp::create(rewriter, loc, rewriter.getF32Type(),
+    return mlir::arith::UIToFPOp::create(rewriter, loc, castResultTy(u2f),
                                          toSignlessInt(x, rewriter, loc))
         .getResult();
   }

@@ -845,3 +845,35 @@ def test_flatten_argmax_beside_flip(shape, num_warps):
     torch.mps.synchronize()
     assert torch.equal(y.cpu(), x.reshape(M, N).flip(0))
     assert x[int(i.cpu()[0])] == x.max()
+
+
+# A whole-tile reduce whose cone casts an integer to f16. The rank-1 replay
+# emitted every int -> float cast as f32, so `(i % 13).to(tl.float16) + x`
+# became an f32 plus an f16 and the kernel failed the verifier with an
+# internal type mismatch instead of reducing.
+@triton.jit
+def _int_to_half_cone_reduce_kernel(v_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr,
+                                    OP: tl.constexpr):
+    off = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    row = tl.arange(0, M)[:, None] + tl.zeros((M, N), tl.int32)
+    x = (off % 13 - 6).to(tl.float16) + tl.load(v_ptr + row)
+    if OP == 0:
+        tl.store(out_ptr, tl.sum(x))
+    else:
+        tl.store(out_ptr, tl.max(x))
+
+
+@pytest.mark.parametrize("shape", [(16, 16), (32, 32), (8, 128)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("op", ["sum", "max"])
+def test_int_to_half_cone_whole_tile_reduce(shape, num_warps, op):
+    M, N = shape
+    v = (torch.arange(M) % 5 - 2).half()
+    out = torch.zeros(1, dtype=torch.float16, device="mps")
+    _int_to_half_cone_reduce_kernel[(1,)](v.to("mps"), out, M, N, ["sum", "max"].index(op),
+                                          num_warps=num_warps)
+    torch.mps.synchronize()
+    flat = torch.arange(M * N)
+    t = (flat % 13 - 6).double() + v.double()[flat // N]
+    want = t.sum() if op == "sum" else t.max()
+    assert out.cpu()[0].item() == want.item()
