@@ -13,6 +13,7 @@ with it. The verdict vocabulary is the point:
   NAMED    exit 1 carrying a "Metal backend: ..." diagnostic — a good rejection
   UNNAMED  exit 1 with no named reason — reaches conversion teardown, P0 gap
   KILLER   died on a signal — P0 gap, and the signal varies between runs
+  HANG     no result within PROBE_TIMEOUT seconds (default 300); killed — P0 gap
   FRONT    the Triton FRONTEND refused it; not a backend gap
 
 FRONT is not a nicety. In the round-11 audit 12 of 164 probes were `ast_to_ttir`
@@ -64,11 +65,27 @@ def run_src(tag, src):
     env = dict(os.environ)
     # A per-probe cache keeps one probe's compile from masking the next one's.
     env["TRITON_CACHE_DIR"] = os.path.join(SCRATCH, "cache", tag)
-    return subprocess.run([sys.executable, path], capture_output=True,
-                          text=True, env=env, timeout=300)
+    # A probe that never finishes -- a GPU kernel that does not complete, or a
+    # compiler loop -- is a verdict of its own, not a reason to abandon every
+    # probe after it. `subprocess.run` kills the child when the timeout fires.
+    try:
+        return subprocess.run([sys.executable, path], capture_output=True,
+                              text=True, env=env, timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        def text(v):
+            return v.decode(errors="replace") if isinstance(v, bytes) else (v or "")
+        return subprocess.CompletedProcess(e.cmd, HANG_RC, text(e.stdout),
+                                           text(e.stderr))
+
+
+# Seconds one probe may run; `run_src` reports a probe past it with `HANG_RC`.
+PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "300"))
+HANG_RC = -1000
 
 
 def classify(rc, out, err):
+    if rc == HANG_RC:
+        return "HANG", f"no result after {PROBE_TIMEOUT}s; killed"
     if rc == 0:
         # The probe checked its own answer and said so.
         if "WRONG" in out or "WRONG" in err:
@@ -104,18 +121,20 @@ def main():
             r = run_src(name, HEAD + textwrap.dedent(PROBES[name]))
             codes.append(r.returncode)
             v, w = classify(r.returncode, r.stdout, r.stderr)
-            # A killer anywhere in the repeats wins: the signal is intermittent.
-            if v == "KILLER" or (verdict == "OK" and v != "OK"):
+            # A killer or a hang anywhere in the repeats wins: both are
+            # intermittent.
+            if v in ("KILLER", "HANG") or (verdict == "OK" and v != "OK"):
                 verdict, why = v, w
         tally[verdict] = tally.get(verdict, 0) + 1
         line = f"{verdict:8} {name:40} {sorted(set(codes))}"
-        if verdict in ("KILLER", "UNNAMED", "WRONG"):
+        if verdict in ("KILLER", "HANG", "UNNAMED", "WRONG"):
             findings.append(f"{line}\n         | {why}")
         print(line + (f"\n         | {why}" if verdict != "OK" else ""), flush=True)
     print("\n# " + " / ".join(f"{v} {n}" for v, n in sorted(tally.items())),
           flush=True)
     if findings:
-        print("\n# P0 GAPS (crash, unnamed decline, or wrong answer):", flush=True)
+        print("\n# P0 GAPS (crash, hang, unnamed decline, or wrong answer):",
+              flush=True)
         for f in findings:
             print(f, flush=True)
     # Exit non-zero so a driver or CI step can gate on it.

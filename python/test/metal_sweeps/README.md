@@ -19,9 +19,18 @@ crashes in the `tl.dot` sweep into clean skips is what let it finish, and it
 immediately surfaced **14 wrong answers that had been hiding behind them**.
 
 `drive.sh` re-invokes the script with whatever crashed added to `SWEEP_SKIP`,
-up to 40 times, then prints unique WRONG answers, unique rejections, and the
-crashed tags. It exits non-zero if anything crashed, because a crashed cell is a
-P0 gap on its own: the decline is in the wrong place.
+up to `SWEEP_MAX_ATTEMPTS` times (default 40), then prints unique WRONG answers,
+unique rejections, and the crashed tags. It exits non-zero if anything crashed,
+because a crashed cell is a P0 gap on its own: the decline is in the wrong place.
+
+It also runs a per-cell watchdog. A GPU kernel that never completes blocks the
+process in `torch.mps.synchronize()` indefinitely -- one cell ran for 6.5 hours
+before anyone looked -- and a compiler loop does the same at compile time. Once
+one cell's progress marker is older than `SWEEP_CELL_TIMEOUT` seconds (default
+300) the driver kills the sweep's python process (its pid is in
+`<name>.pid`), writes `HANG <tag>` to the results, and skips the cell on the
+next attempt. A hung cell is a P0 gap too, and also makes the driver exit
+non-zero.
 
 A compile-time REJECTION is not a bug, and is counted separately. Only a WRONG
 ANSWER is.
@@ -45,6 +54,7 @@ so. Before blaming a change for a crash, histogram both builds.
 | `NAMED` | exit 1 carrying a `Metal backend: …` diagnostic — a good rejection |
 | `UNNAMED` | exit 1 with no named reason — reaches conversion teardown, **P0 gap** |
 | `KILLER` | died on a signal — **P0 gap** |
+| `HANG` | no result within `PROBE_TIMEOUT` seconds (default 300), killed — **P0 gap** |
 | `FRONT` | the Triton **frontend** refused it; not a backend gap |
 
 `FRONT` is not a nicety. In the round-11 audit 12 of 164 probes were
