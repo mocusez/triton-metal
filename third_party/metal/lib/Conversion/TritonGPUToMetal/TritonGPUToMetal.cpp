@@ -30255,9 +30255,19 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
                          bool allowStoreConsumer = false) {
   llvm::SmallVector<mlir::triton::DotOp> dots;
   forOp.getBodyRegion().walk([&](mlir::triton::DotOp d) { dots.push_back(d); });
-  if (dots.size() != 1)
+  if (dots.empty())
     return mlir::failure();
   auto dot = dots[0];
+  // Links of a chain may carry different encodings -- a layout pass can
+  // re-encode one and put a convert_layout between them -- but they are one
+  // accumulator: same shape, same element type.
+  for (auto other : dots) {
+    auto a = mlir::cast<mlir::RankedTensorType>(other.getType());
+    auto b = mlir::cast<mlir::RankedTensorType>(dot.getType());
+    if (a.getShape() != b.getShape() ||
+        a.getElementType() != b.getElementType())
+      return mlir::failure();
+  }
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   int64_t matrixM = 0, matrixN = 0;
   if (!resTy || !resTy.getElementType().isF32() ||
@@ -30285,21 +30295,53 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   if (yield.getNumOperands() != forOp.getNumResults() ||
       forOp.getNumResults() < 1)
     return mlir::failure();
+  // Several dots may accumulate into the one carried tile in a chain,
+  // `acc = dot(a, b, acc); acc = dot(a, d, acc)`: each takes the previous
+  // one's result as its C. The chain collapses to scalar dots in the same
+  // order, each seeded with the one before -- the same sum, reassociated the
+  // way any dot's reduction order already is.
   std::optional<unsigned> accIdx;
+  mlir::triton::DotOp last;
   for (unsigned i = 0; i < forOp.getNumResults(); ++i)
-    if (peelCvt(yield.getOperand(i)) == dot.getResult()) {
-      if (accIdx)
-        return mlir::failure();
-      accIdx = i;
-    }
-  if (!accIdx || peelCvt(dot.getC()) != forOp.getRegionIterArg(*accIdx))
+    for (auto candidate : dots)
+      if (peelCvt(yield.getOperand(i)) == candidate.getResult()) {
+        if (accIdx)
+          return mlir::failure();
+        accIdx = i;
+        last = candidate;
+      }
+  if (!accIdx)
     return mlir::failure();
-
-  auto aLoad = sdPeelToLoad(dot.getA());
-  auto bLoad = sdPeelToLoad(dot.getB());
-  if (!aLoad || !bLoad)
+  llvm::SmallVector<mlir::triton::DotOp, 2> chain{last};
+  while (true) {
+    auto prev =
+        peelCvt(chain.front().getC()).getDefiningOp<mlir::triton::DotOp>();
+    if (!prev || !llvm::is_contained(dots, prev) ||
+        llvm::is_contained(chain, prev))
+      break;
+    chain.insert(chain.begin(), prev);
+  }
+  if (chain.size() != dots.size() ||
+      peelCvt(chain.front().getC()) != forOp.getRegionIterArg(*accIdx))
     return mlir::failure();
+  dot = chain.front();
+  struct Link {
+    mlir::triton::DotOp dot;
+    mlir::triton::LoadOp a, b;
+  };
+  llvm::SmallVector<Link, 2> links;
+  for (auto d : chain) {
+    auto a = sdPeelToLoad(d.getA());
+    auto b = sdPeelToLoad(d.getB());
+    if (!a || !b)
+      return mlir::failure();
+    links.push_back({d, a, b});
+  }
+  auto aLoad = links.front().a;
+  auto bLoad = links.front().b;
   const bool ptrAdvance = forOp.getNumResults() > 1;
+  if (links.size() > 1 && !ptrAdvance)
+    return mlir::failure();
   if (ptrAdvance) {
     for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
       if (i == *accIdx)
@@ -30312,12 +30354,15 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
           !forOp.isDefinedOutsideOfLoop(step.getOffset()))
         return mlir::failure();
       for (mlir::Operation *user : carried.getUsers())
-        if (user != step.getOperation() && user != aLoad.getOperation() &&
-            user != bLoad.getOperation())
+        if (user != step.getOperation() &&
+            llvm::none_of(links, [&](Link l) {
+              return user == l.a.getOperation() || user == l.b.getOperation();
+            }))
           return mlir::failure();
     }
-    if (forOp.getRegionIterArg(*accIdx) == aLoad.getPtr())
-      return mlir::failure();
+    for (Link l : links)
+      if (forOp.getRegionIterArg(*accIdx) == l.a.getPtr())
+        return mlir::failure();
   }
   // The one operand mask a pointer-advance loop may carry is the ragged-K
   // guard every Triton matmul writes, `offs_k < K - kk * BLOCK_K` with a zero
@@ -30383,11 +30428,16 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   };
   mlir::Value maskedK;
   if (ptrAdvance) {
-    auto aK = loopKBound(aLoad, 1);
-    auto bK = loopKBound(bLoad, sdConeCrossesTranspose(dot.getB()) ? 1 : 0);
-    if (!aK || !bK || (*aK && *bK && *aK != *bK) || (bool)*aK != (bool)*bK)
-      return mlir::failure();
-    maskedK = *aK;
+    for (auto [k, l] : llvm::enumerate(links)) {
+      auto aK = loopKBound(l.a, 1);
+      auto bK = loopKBound(l.b, sdConeCrossesTranspose(l.dot.getB()) ? 1 : 0);
+      if (!aK || !bK || (*aK && *bK && *aK != *bK) || (bool)*aK != (bool)*bK)
+        return mlir::failure();
+      if (k == 0)
+        maskedK = *aK;
+      else if (*aK != maskedK)
+        return mlir::failure();
+    }
   }
 
   // The loop result feeds the epilogue, optionally via a `#blocked1 ->
@@ -30511,10 +30561,17 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
         return (mul.getLhs() == stride->dynamic && rc && *rc == want) ||
                (mul.getRhs() == stride->dynamic && lc && *lc == want);
       };
-      const bool bTransposed = sdConeCrossesTranspose(dot.getB());
-      if (stepsOneTile(aLoad.getPtr(), BatchedMatrixAxis::Col) &&
-          stepsOneTile(bLoad.getPtr(), bTransposed ? BatchedMatrixAxis::Col
-                                                   : BatchedMatrixAxis::Row)) {
+      const bool everyLinkSteps = llvm::all_of(links, [&](Link l) {
+        auto lTy = mlir::dyn_cast<mlir::RankedTensorType>(l.a.getType());
+        const bool bTransposed = sdConeCrossesTranspose(l.dot.getB());
+        return lTy && lTy.getRank() == 2 && lTy.getShape()[1] == tileK &&
+               ptrIsLoopCarried(l.a.getPtr()) &&
+               ptrIsLoopCarried(l.b.getPtr()) &&
+               stepsOneTile(l.a.getPtr(), BatchedMatrixAxis::Col) &&
+               stepsOneTile(l.b.getPtr(), bTransposed ? BatchedMatrixAxis::Col
+                                                      : BatchedMatrixAxis::Row);
+      });
+      if (everyLinkSteps) {
         mlir::OpBuilder b(forOp);
         reductionExtent =
             mlir::arith::MulIOp::create(
@@ -30558,11 +30615,23 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   mlir::Value cInit = forOp.getInitArgs()[*accIdx];
   if (ptrAdvance) {
     // The operands' address arithmetic lives in the carries' init chains.
-    auto scalarDot = sdCreateScalarDot(
-        forOp, aLoad, bLoad, cInit, replaceTarget, resultTensorTy, {}, {},
-        reductionExtent, /*transposeA=*/false, /*scaleInfo=*/nullptr,
-        sdConeCrossesTranspose(dot.getB()), /*inferPhysicalStrides=*/true);
+    // A chain seeds each scalar dot with the one before; a link that fails
+    // undoes the ones already made.
+    llvm::SmallVector<ScalarDotOp, 2> made;
+    ScalarDotOp scalarDot;
+    for (Link l : links) {
+      scalarDot = sdCreateScalarDot(
+          forOp, l.a, l.b, made.empty() ? cInit : made.back().getResult(),
+          replaceTarget, resultTensorTy, {}, {}, reductionExtent,
+          /*transposeA=*/false, /*scaleInfo=*/nullptr,
+          sdConeCrossesTranspose(l.dot.getB()), /*inferPhysicalStrides=*/true);
+      if (!scalarDot)
+        break;
+      made.push_back(scalarDot);
+    }
     if (!scalarDot) {
+      for (auto it = made.rbegin(); it != made.rend(); ++it)
+        it->erase();
       mlir::Operation *minOp = reductionExtent.getDefiningOp<mlir::arith::MinSIOp>();
       mlir::Value product = minOp ? minOp->getOperand(0) : reductionExtent;
       if (minOp)

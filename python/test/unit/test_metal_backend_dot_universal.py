@@ -4428,3 +4428,99 @@ def test_tutorial_matmul_ragged_k_matches_torch(dtype, act, block, warps, mnk):
         ref = torch.where(ref >= 0, ref, 0.01 * ref)
     tol = 6e-2 if dtype == torch.float16 else 1e-3
     torch.testing.assert_close(c.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+# --- Several dots chained on one accumulator in a pointer-advance loop ------
+#
+# `acc = tl.dot(a, b, acc); acc = tl.dot(a, d, acc)` -- each dot's C is the
+# previous one's result. The scalar tier took one dot per loop only, so this
+# was refused by name (`dot_form_block_k` twodot, 12 cells). The chain
+# collapses to scalar dots in order, each seeded with the one before.
+@triton.jit
+def _dot_chain_kernel(a_ptr, e_ptr, b_ptr, d_ptr, out_ptr, K, sak, sbk, sbn,
+                      FORM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                      BLOCK_K: tl.constexpr, MASKED: tl.constexpr):
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :] * sak
+    e_ptrs = e_ptr + offs_m[:, None] * K + offs_k[None, :] * sak
+    b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    d_ptrs = d_ptr + offs_k[:, None] * sbk + offs_n[None, :] * sbn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for kk in range(0, tl.cdiv(K, BLOCK_K)):
+        if MASKED:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - kk * BLOCK_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - kk * BLOCK_K, other=0.0)
+            d = tl.load(d_ptrs, mask=offs_k[:, None] < K - kk * BLOCK_K, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            d = tl.load(d_ptrs)
+        acc = tl.dot(a, b, acc)
+        if FORM == 0:    # same A, two B
+            acc = tl.dot(a, d, acc)
+        elif FORM == 1:  # a second A
+            if MASKED:
+                e = tl.load(e_ptrs, mask=offs_k[None, :] < K - kk * BLOCK_K, other=0.0)
+            else:
+                e = tl.load(e_ptrs)
+            acc = tl.dot(e, d, acc)
+        else:            # three links
+            acc = tl.dot(a, d, acc)
+            acc = tl.dot(a, b, acc)
+        a_ptrs += BLOCK_K * sak
+        e_ptrs += BLOCK_K * sak
+        b_ptrs += BLOCK_K * sbk
+        d_ptrs += BLOCK_K * sbk
+    tl.store(out_ptr + offs_m[:, None] * sbk + offs_n[None, :], acc)
+
+
+@pytest.mark.parametrize("form", [0, 1, 2], ids=["shared_a", "second_a", "three_links"])
+@pytest.mark.parametrize("bk,warps", [(16, 1), (32, 4)])
+@pytest.mark.parametrize("masked", [False, True], ids=["exact_k", "ragged_k"])
+def test_dot_chain_in_pointer_advance_loop_matches_torch(form, bk, warps, masked):
+    m = n = 32
+    k = 72 if masked else 64
+    torch.manual_seed(form * 11 + bk + warps + int(masked))
+    a, e = torch.randn(m, k), torch.randn(m, k)
+    b, d = torch.randn(k, n), torch.randn(k, n)
+    out = torch.zeros(m, n, device="mps")
+    _dot_chain_kernel[(m // 16, n // 16)](a.to("mps"), e.to("mps"), b.to("mps"), d.to("mps"), out,
+                                         k, 1, n, 1, FORM=form, BLOCK_M=16, BLOCK_N=16,
+                                         BLOCK_K=bk, MASKED=masked, num_warps=warps)
+    torch.mps.synchronize()
+    ref = [a @ b + a @ d, a @ b + e @ d, 2 * (a @ b) + a @ d][form]
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _two_accumulators_kernel(a_ptr, b_ptr, out_ptr, K_TILES: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    a_ptrs = a_ptr + offs[:, None] * (K_TILES * BLOCK) + offs[None, :]
+    b_ptrs = b_ptr + offs[:, None] * BLOCK + offs[None, :]
+    acc1 = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    for _ in range(0, K_TILES):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        acc1 = tl.dot(a, b, acc1)
+        acc2 = tl.dot(a, b * 2.0, acc2)
+        a_ptrs += BLOCK
+        b_ptrs += BLOCK * BLOCK
+    tl.store(out_ptr + offs[:, None] * BLOCK + offs[None, :], acc1 - acc2)
+
+
+def test_dot_two_independent_accumulators_stay_refused(capfd):
+    """Two dots on two different accumulators are not a chain; the collapse
+    must leave them to the named refusal rather than fold them together."""
+    a = torch.randn(16, 64, device="mps")
+    b = torch.randn(64, 16, device="mps")
+    out = torch.zeros(16, 16, device="mps")
+    try:
+        _two_accumulators_kernel[(1,)](a, b, out, K_TILES=4, BLOCK=16)
+    except Exception:
+        assert "error:" in capfd.readouterr().err  # a named refusal, not a crash
+        return
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), -(a.cpu() @ b.cpu()), atol=2e-3, rtol=2e-3)
