@@ -2311,32 +2311,36 @@ void ModuleTranslation::translate(mlir::scf::ForOp op) {
 
 // A Python `while` in a @triton.jit kernel lowers to
 //
-//   %r:N = scf.while (%a0 = %init0, ...) {
+//   %r:M = scf.while (%a0 = %init0, ...) {       // N before-region args
 //            %c = <predicate over %a0..>
-//            scf.condition(%c) %a0, ...        // forwards the block args
+//            scf.condition(%c) %f0, ...           // M forwarded values
 //          } do {
-//          ^bb0(%b0, ...):
+//          ^bb0(%b0, ...):                          // M after-region args
 //            ...body...
-//            scf.yield %next0, ...
+//            scf.yield %next0, ...                  // N values, back to %a
 //          }
 //
-// MSL has no multi-value loop carry, so each carried value becomes a temp
-// declared before the loop and the whole thing emits as
+// MSL has no multi-value loop carry, so every carried value is a temp declared
+// before the loop, and the whole thing emits as
 //
-//   T v0 = init0; ...
-//   bool vC;
+//   T vA0 = init0; ...        // before-region args
+//   U vF0; ...                // forwarded values: after-region args + results
+//   bool vC = false;
 //   while (true) {
-//     { ...before ops...  vC = <predicate>; }
+//     { ...before ops...  vC = <predicate>; vF0 = f0; ... }
 //     if (!vC) break;
-//     { ...after ops...   v0 = next0; ... }
+//     { ...after ops...   vA0 = next0; ... }
 //   }
 //
-// The two regions keep their own C scopes (that is just what `translate(Region)`
-// emits) which is why `scf.condition` MUST forward the before-region block
-// arguments verbatim: anything else would forward a value whose MSL temp is
-// scoped inside the before block and therefore dead by the time the after block
-// reads it. Every kernel shape Triton emits satisfies this; anything else is
-// rejected loudly rather than mistranslated.
+// The two sets are kept apart. Aliasing them -- one temp per position -- was
+// only right when the condition forwards its block args verbatim AND the yield
+// writes no temp a later yielded value still reads: `a, b = b, a + b` wrote `a`
+// first and then read the NEW `a`, so Fibonacci(10) came out 512, not 55.
+// Separate, the condition reads only `vA` and writes only `vF`, the yield reads
+// only `vF` and writes only `vA`, and both behave as the simultaneous tuple
+// assignments they are. The forwarded values are copied INSIDE the before
+// region's C scope, where they are still alive, which is also what lets
+// `scf.condition` forward anything at all, not only its block arguments.
 void ModuleTranslation::translate(mlir::scf::WhileOp op) {
   auto &beforeRegion = op.getBefore();
   auto &afterRegion = op.getAfter();
@@ -2347,27 +2351,13 @@ void ModuleTranslation::translate(mlir::scf::WhileOp op) {
                     "scf.condition\n";
     llvm_unreachable("Unexpected operation");
   }
-  bool forwardsBlockArgs =
-      condOp.getArgs().size() == beforeRegion.getNumArguments();
-  for (auto [i, forwarded] : llvm::enumerate(condOp.getArgs()))
-    if (forwarded != beforeRegion.getArgument(i))
-      forwardsBlockArgs = false;
-  if (!forwardsBlockArgs) {
-    llvm::errs() << "[metal] scf.while: scf.condition must forward the "
-                    "before-region block arguments unchanged\n";
-    llvm_unreachable("Unexpected operation");
-  }
 
-  // One MSL temp per carried value; before-arg, after-arg and loop result all
-  // alias it.
   llvm::SmallVector<unsigned, 8> carried;
   for (unsigned i = 0; i < op.getNumOperands(); ++i) {
     mlir::Value init = op.getOperand(i);
     unsigned idx = _varCount++;
     carried.push_back(idx);
     _buffers[beforeRegion.getArgument(i).getAsOpaquePointer()] = idx;
-    _buffers[afterRegion.getArgument(i).getAsOpaquePointer()] = idx;
-    _buffers[op.getResult(i).getAsOpaquePointer()] = idx;
     _output << typeToString(init.getType()) << " v" << idx << " = ";
     if (auto *initDef = init.getDefiningOp())
       translateValue(initDef);
@@ -2377,6 +2367,17 @@ void ModuleTranslation::translate(mlir::scf::WhileOp op) {
     indent();
   }
   _scfWhileCarried[op.getOperation()] = carried;
+
+  llvm::SmallVector<unsigned, 8> forwarded;
+  for (unsigned j = 0; j < op.getNumResults(); ++j) {
+    unsigned idx = _varCount++;
+    forwarded.push_back(idx);
+    _buffers[afterRegion.getArgument(j).getAsOpaquePointer()] = idx;
+    _buffers[op.getResult(j).getAsOpaquePointer()] = idx;
+    _output << typeToString(op.getResult(j).getType()) << " v" << idx << ";\n";
+    indent();
+  }
+  _scfWhileForwarded[op.getOperation()] = forwarded;
 
   unsigned condIdx = _varCount++;
   _scfWhileCond[op.getOperation()] = condIdx;
@@ -2409,6 +2410,17 @@ void ModuleTranslation::translate(mlir::scf::ConditionOp op) {
   _output << "v" << it->second << " = ";
   translateValueOrVarName(op.getCondition());
   _output << ";";
+  auto fw = _scfWhileForwarded.find(parent.getOperation());
+  assert(fw != _scfWhileForwarded.end() &&
+         fw->second.size() == op.getArgs().size() &&
+         "scf.condition: forwarded value/temp count mismatch");
+  for (auto [j, value] : llvm::enumerate(op.getArgs())) {
+    _output << "\n";
+    indent();
+    _output << "v" << fw->second[j] << " = ";
+    translateValueOrVarName(value);
+    _output << ";";
+  }
 }
 
 void ModuleTranslation::translate(mlir::scf::YieldOp op) {

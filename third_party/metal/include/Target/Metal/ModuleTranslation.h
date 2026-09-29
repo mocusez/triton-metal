@@ -93,13 +93,14 @@ private:
   // `scf.while` (a Python `while` in a @triton.jit kernel). MSL has no
   // multi-value loop carry, so the carried values become plain temps declared
   // before the loop: `_scfWhileCarried` maps the op to those temp indices (in
-  // iter-arg order) and `_scfWhileCond` to the temp holding the `scf.condition`
-  // predicate. The before/after region block arguments and the loop results all
-  // resolve to the SAME temps through `_buffers`, which is sound only because
-  // the emitter requires `scf.condition` to forward the before-region block
-  // arguments unchanged — the shape Triton's while-loop lowering always emits.
+  // iter-arg order, the before-region block arguments) and `_scfWhileCond` to
+  // the temp holding the `scf.condition` predicate.
   std::map<mlir::Operation *, llvm::SmallVector<unsigned, 8>> _scfWhileCarried;
   std::map<mlir::Operation *, unsigned> _scfWhileCond;
+  // The temps holding what `scf.condition` forwards: the after-region block
+  // arguments and the loop's results. Kept apart from `_scfWhileCarried` so
+  // neither the condition nor the yield writes a temp it still reads.
+  std::map<mlir::Operation *, llvm::SmallVector<unsigned, 8>> _scfWhileForwarded;
   // L1d2b inline-barrier contract: maps an op whose result has been
   // force-materialized as a named MSL let-binding to that temp's index.
   // Currently populated for `metal.tg_load_indexed` at statement-walk

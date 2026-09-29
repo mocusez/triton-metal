@@ -929,6 +929,83 @@ def test_while_loop_two_carried_values_on_mps(n_elements):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
 
 
+
+# `a, b = b, a + b` is a simultaneous tuple assignment. The emitter gave each
+# carried position ONE temp shared by the before args, the after args and the
+# yield, so it wrote `a` and then read the new `a`: Fibonacci(10) came out 512.
+@triton.jit
+def while_swap_kernel(n_ptr, out_ptr, ROTATE: tl.constexpr):
+    n = tl.load(n_ptr)
+    i = 0
+    if ROTATE:
+        a = 1
+        b = 2
+        c = 3
+        while i < n:
+            a, b, c = b, c, a
+            i += 1
+        tl.store(out_ptr + 2, c)
+    else:
+        a = 0
+        b = 1
+        while i < n:
+            a, b = b, a + b
+            i += 1
+    tl.store(out_ptr, a)
+    tl.store(out_ptr + 1, b)
+
+
+@pytest.mark.parametrize("rotate", [False, True], ids=["fibonacci", "rotate3"])
+@pytest.mark.parametrize("n", [0, 1, 2, 10, 20])
+def test_while_loop_swapping_carries_on_mps(rotate, n):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    out = torch.zeros(3, dtype=torch.int32, device="mps")
+    while_swap_kernel[(1,)](torch.tensor([n], dtype=torch.int32, device="mps"), out,
+                            ROTATE=rotate)
+    torch.mps.synchronize()
+    if rotate:
+        vals = [1, 2, 3]
+        want = vals[n % 3:] + vals[:n % 3]
+    else:
+        a, b = 0, 1
+        for _ in range(n):
+            a, b = b, a + b
+        want = [a, b]
+    assert out.cpu().tolist()[:len(want)] == want
+
+
+# A carried value loaded in the body and tested by the condition. When the
+# kernel never reads it after the loop, canonicalization drops that result:
+# the loop carries two values but `scf.condition` forwards one, and the emitter
+# aborted the process on anything but a verbatim forward of every block arg.
+@triton.jit
+def while_until_negative_kernel(x_ptr, out_ptr, STORE_V: tl.constexpr):
+    i = 0
+    v = tl.load(x_ptr)
+    while v >= 0:
+        i += 1
+        v = tl.load(x_ptr + i)
+    tl.store(out_ptr, i)
+    if STORE_V:
+        tl.store(out_ptr + 1, v)
+
+
+@pytest.mark.parametrize("store_v", [True, False], ids=["both_used", "v_unused"])
+@pytest.mark.parametrize("stop", [0, 1, 5, 31])
+def test_while_loop_condition_on_body_load_on_mps(stop, store_v):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = torch.arange(1, 33, dtype=torch.int32)
+    x[stop] = -7
+    out = torch.zeros(2, dtype=torch.int32, device="mps")
+    while_until_negative_kernel[(1,)](x.to("mps"), out, STORE_V=store_v)
+    torch.mps.synchronize()
+    assert out.cpu().tolist() == [stop, -7 if store_v else 0]
+
+
 # --- Unsupported constructs must fail, not crash --------------------------
 #
 # Before `validateUnsupportedOpsRejected`, these reached applyFullConversion
