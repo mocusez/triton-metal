@@ -26,6 +26,28 @@ module {
       metal.simdgroup_store %mapped, %c_buf[%row, %col], %stride : !metal.simdgroup_matrix<8 x 8 x f32>, !metal.memref<? x f32>, ui32, ui32, ui32
       metal.return
     }
+
+    // `acc * alpha + bias[col]`: the body sees each element's global row and
+    // column, and its captures (a runtime scalar, a buffer) are bound once.
+    metal.kernel simdgroup_map_bias address_space_device [true, true, true, true] {
+    ^bb0(%a_buf: !metal.memref<? x f32>, %c_buf: !metal.memref<? x f32>, %bias: !metal.memref<? x f32>, %alpha_buf: !metal.memref<? x f32>):
+      %zero_u = metal.constant 0 : ui32
+      %row = metal.constant 16 : ui32
+      %col = metal.constant 8 : ui32
+      %stride = metal.constant 8 : ui32
+      %alpha = metal.get_element %alpha_buf[%zero_u] : (!metal.memref<? x f32>, ui32) -> f32
+      %acc = metal.simdgroup_load %a_buf[%zero_u, %zero_u], %stride : (!metal.memref<? x f32>, ui32, ui32, ui32) -> !metal.simdgroup_matrix<8 x 8 x f32>
+      %mapped = metal.simdgroup_map %acc origin [%row, %col] captures(%alpha, %bias : f32, !metal.memref<? x f32>) : !metal.simdgroup_matrix<8 x 8 x f32> -> !metal.simdgroup_matrix<8 x 8 x f32> {
+      ^bb0(%x: f32, %r: si32, %c: si32, %s: f32, %b: !metal.memref<? x f32>):
+        %cu = metal.cast %c : (si32) -> ui32
+        %bv = metal.get_element %b[%cu] : (!metal.memref<? x f32>, ui32) -> f32
+        %scaled = metal.binary_exp %x, %s, mulOp : (f32, f32) -> f32
+        %y = metal.binary_exp %scaled, %bv, addOp : (f32, f32) -> f32
+        metal.simdgroup_map_yield %y : f32
+      }
+      metal.simdgroup_store %mapped, %c_buf[%zero_u, %zero_u], %stride : !metal.simdgroup_matrix<8 x 8 x f32>, !metal.memref<? x f32>, ui32, ui32, ui32
+      metal.return
+    }
   }
 }
 
@@ -42,3 +64,18 @@ module {
 // The store reads the mapped matrix, not the accumulator.
 // CHECK: simdgroup_store(v[[OUT]],
 // CHECK: return
+
+// CHECK: kernel void simdgroup_map_bias
+// CHECK: simdgroup_float8x8 v[[OUT2:[0-9]+]] = v{{[0-9]+}};
+// Captures are bound once, before the element loop.
+// CHECK: auto v[[S:[0-9]+]] = {{.*}};
+// CHECK: auto v[[B:[0-9]+]] = v{{[0-9]+}};
+// The lane's row, and its first column; the element index adds to the column.
+// CHECK: ushort v[[L:[0-9]+]] = (ushort)(id.x & 31u);
+// CHECK: int v[[R:[0-9]+]] = (int)({{.*}}16{{.*}}) + (((v[[L]] >> 2) & 4) + ((v[[L]] >> 1) & 3));
+// CHECK: int v[[C0:[0-9]+]] = (int)({{.*}}8{{.*}}) + (((v[[L]] >> 2) & 2) * 2 + (v[[L]] & 1) * 2);
+// CHECK: for (ushort v[[E2:[0-9]+]] = 0; v[[E2]] < 2; ++v[[E2]]) {
+// CHECK: int v[[C:[0-9]+]] = v[[C0]] + v[[E2]];
+// CHECK: v[[B]][
+// CHECK: v[[OUT2]].thread_elements()[v[[E2]]] = v{{[0-9]+}};
+// CHECK: simdgroup_store(v[[OUT2]],

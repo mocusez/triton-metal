@@ -23942,19 +23942,36 @@ static mlir::Value emitConeScalar(mlir::OpBuilder &b, mlir::Location loc,
                                   llvm::DenseMap<void *, mlir::Value> &memo,
                                   int depth);
 } // namespace
+static mlir::Value sdSplatScalarSource(mlir::Value v);
+static bool sdSameIndexIgnoringLayout(mlir::Value a, mlir::Value b, int depth);
+static bool sdAreSameMaskExtent(mlir::Value lhs, mlir::Value rhs);
 
-// A matmul's VALUE-ONLY epilogue: the elementwise cone between a K loop's
-// accumulator and the one value its store path consumes -- `acc * 0.5 + 1`, a
-// leaky ReLU `where(acc >= 0, acc, 0.01 * acc)`, a sigmoid. Every op is
-// elementwise over the accumulator tile, every operand outside the cone is a
-// splat constant, and exactly one cone value leaves it, through one use. Such
-// an epilogue is a scalar function of each accumulator element alone, so the
-// SIMD-group tiers apply it to their accumulator matrices in registers
-// (`metal.simdgroup_map`) instead of ceding the whole matmul to the scalar
-// tier. 📏 the tutorial matmul with a leaky ReLU ran 5-16x slower than without.
+// A matmul's epilogue: the elementwise cone between a K loop's accumulator
+// and the one value its store path consumes -- `acc * 0.5 + 1`, a leaky ReLU
+// `where(acc >= 0, acc, 0.01 * acc)`, `acc * alpha`, `acc + bias[None, :]`.
+// Every op is elementwise over the accumulator tile and exactly one cone value
+// leaves it, through one use. Operands from outside the cone are leaves:
+//   * a splat constant;
+//   * a splat of a runtime float scalar defined before the loop;
+//   * a rank-1 load broadcast along one axis of the tile (a bias vector),
+//     which the region re-reads at each element's own coordinate -- only
+//     accepted once `buildSimdValueEpilogueBody` has tied its index to the
+//     store's.
+// Such an epilogue is a scalar function of each accumulator element and its
+// coordinates, so the SIMD-group tiers apply it to their accumulator matrices
+// in registers (`metal.simdgroup_map`) instead of ceding the whole matmul to
+// the scalar tier. 📏 the tutorial matmul with a leaky ReLU ran 5-16x slower
+// than without, and with a bias about 13x.
 struct SimdValueEpilogue {
   mlir::Value out;                            // what the store path consumes
   llvm::SmallVector<mlir::Operation *, 8> ops; // the cone, in IR order
+  llvm::SmallVector<mlir::Value, 2> scalarLeaves;
+  struct VectorLeaf {
+    mlir::triton::LoadOp load;
+    mlir::Value key; // where the scalar walk stops peeling: the load or its extf
+    int axis; // the tile axis the vector runs along: 0 = rows, 1 = columns
+  };
+  llvm::SmallVector<VectorLeaf, 2> vectorLeaves;
 };
 
 static std::optional<SimdValueEpilogue>
@@ -23963,7 +23980,7 @@ matchSimdValueEpilogue(mlir::Value acc) {
   ep.out = acc;
   auto accTy = mlir::dyn_cast<mlir::RankedTensorType>(acc.getType());
   mlir::Operation *accDef = acc.getDefiningOp();
-  if (!accTy || !accDef)
+  if (!accTy || !accDef || accTy.getRank() != 2)
     return std::nullopt;
   auto isConeOp = [](mlir::Operation *op) {
     return op->getNumResults() == 1 && op->getNumRegions() == 0 &&
@@ -23980,6 +23997,16 @@ matchSimdValueEpilogue(mlir::Value acc) {
     auto dense =
         cst ? mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()) : nullptr;
     return dense && dense.isSplat();
+  };
+  // Defined before the loop in its own block, or a function argument: it
+  // then dominates wherever the tier emits its stores.
+  auto availableBeforeLoop = [&](mlir::Value v) {
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v))
+      return arg.getOwner()->isEntryBlock() &&
+             mlir::isa<mlir::triton::FuncOp>(arg.getOwner()->getParentOp());
+    mlir::Operation *def = v.getDefiningOp();
+    return def && def->getBlock() == accDef->getBlock() &&
+           def->isBeforeInBlock(accDef);
   };
   llvm::SmallPtrSet<mlir::Operation *, 16> cone;
   llvm::SmallVector<mlir::Value, 8> frontier{acc};
@@ -24001,13 +24028,62 @@ matchSimdValueEpilogue(mlir::Value acc) {
   auto inCone = [&](mlir::Value v) {
     return v == acc || (v.getDefiningOp() && cone.contains(v.getDefiningOp()));
   };
+  // A leaf that is neither a constant nor in the cone: a runtime scalar or a
+  // vector broadcast along one axis. Anything else refuses the epilogue.
+  auto classifyLeaf = [&](mlir::Value v) -> bool {
+    if (isSplatConstant(v))
+      return true;
+    if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
+      mlir::Value scalar = splat.getSrc();
+      if (!scalar.getType().isF32() || !availableBeforeLoop(scalar))
+        return false;
+      if (!llvm::is_contained(ep.scalarLeaves, scalar))
+        ep.scalarLeaves.push_back(scalar);
+      return true;
+    }
+    mlir::Value w = v;
+    int expandAxis = -1;
+    for (int guard = 0; guard < 6; ++guard) {
+      if (auto bc = w.getDefiningOp<mlir::triton::BroadcastOp>())
+        w = bc.getSrc();
+      else if (auto cvt = w.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        w = cvt.getSrc();
+      else if (auto ed = w.getDefiningOp<mlir::triton::ExpandDimsOp>()) {
+        if (expandAxis != -1)
+          return false;
+        expandAxis = ed.getAxis();
+        w = ed.getSrc();
+      } else
+        break;
+    }
+    mlir::Value key = w;
+    if (auto ext = w.getDefiningOp<mlir::arith::ExtFOp>())
+      w = ext.getIn();
+    while (auto cvt = w.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      w = cvt.getSrc();
+    auto load = w.getDefiningOp<mlir::triton::LoadOp>();
+    auto loadTy = load ? mlir::dyn_cast<mlir::RankedTensorType>(load.getType())
+                       : nullptr;
+    if (!load || expandAxis < 0 || !loadTy || loadTy.getRank() != 1 ||
+        load->getBlock() != accDef->getBlock() ||
+        !mlir::isa<mlir::FloatType>(loadTy.getElementType()))
+      return false;
+    int axis = 1 - expandAxis;
+    if (loadTy.getDimSize(0) != accTy.getDimSize(axis))
+      return false;
+    if (llvm::none_of(ep.vectorLeaves, [&](const SimdValueEpilogue::VectorLeaf &l) {
+          return l.load == load;
+        }))
+      ep.vectorLeaves.push_back({load, key, axis});
+    return true;
+  };
   for (mlir::Operation *op : cone) {
     auto ty = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
     if (op->getBlock() != accDef->getBlock() || !ty ||
         ty.getShape() != accTy.getShape())
       return std::nullopt;
     for (mlir::Value operand : op->getOperands())
-      if (!inCone(operand) && !isSplatConstant(operand))
+      if (!inCone(operand) && !classifyLeaf(operand))
         return std::nullopt;
   }
   mlir::Value exit;
@@ -24036,43 +24112,255 @@ matchSimdValueEpilogue(mlir::Value acc) {
   return ep;
 }
 
-// The epilogue as a `metal.simdgroup_map` body over one element of `elemTy`,
-// or null when a cone op has no scalar spelling. It is built once, before the
-// tier commits to anything, and held by a throwaway module until each store
-// clones it.
-static mlir::OwningOpRef<mlir::ModuleOp>
+// What the tier knows about its output tile, for tying a vector leaf's index
+// to each element's own coordinate.
+struct SimdEpilogueCoords {
+  mlir::Value rowOrigin, colOrigin; // the store's scalar origins, may be null
+  int64_t tileM = 0, tileN = 0;
+  MaskExtents storeMask;
+};
+
+// The epilogue as a `metal.simdgroup_map` body, built once before the tier
+// commits to anything and held by a throwaway module until each store clones
+// it. `captures` lists, in block-argument order, what each capture argument is
+// bound to; the tier materializes them once it commits.
+struct SimdEpilogueBody {
+  mlir::OwningOpRef<mlir::ModuleOp> holder;
+  bool needsCoords = false;
+  struct Capture {
+    enum Kind { Scalar, Buffer, Extent } kind;
+    mlir::Value value;  // the scalar, the buffer's pointer, or the extent
+    mlir::Type elemTy;  // Buffer only
+  };
+  llvm::SmallVector<Capture, 4> captures;
+};
+
+static std::optional<SimdEpilogueBody>
 buildSimdValueEpilogueBody(const SimdValueEpilogue &ep, mlir::Value acc,
-                           mlir::Type elemTy, mlir::Location loc) {
-  mlir::OwningOpRef<mlir::ModuleOp> holder = mlir::ModuleOp::create(loc);
-  mlir::Block *block = holder->getBody();
+                           mlir::Type elemTy, mlir::Location loc,
+                           const SimdEpilogueCoords *coords) {
+  SimdEpilogueBody body;
+  if ((!ep.scalarLeaves.empty() || !ep.vectorLeaves.empty()) && !coords)
+    return std::nullopt;
+  mlir::MLIRContext *ctx = acc.getContext();
+  auto si32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Signed);
+  auto ui32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Unsigned);
+  auto f32 = mlir::Float32Type::get(ctx);
+
+  // A vector leaf is re-read at the element's coordinate, which is only the
+  // value the kernel loaded when its index IS the store's: `origin + arange`
+  // along the same axis. A mask on it must be the store's own bound on that
+  // axis, so every lane it zeroes is a lane the store drops; the region then
+  // clamps the index so those lanes never read past the buffer.
+  struct VectorPlan {
+    mlir::Value ptr, extent;
+  };
+  llvm::SmallVector<VectorPlan, 2> vectorPlans;
+  for (const auto &leaf : ep.vectorLeaves) {
+    mlir::triton::LoadOp load = leaf.load;
+    const int64_t dim = leaf.axis == 0 ? coords->tileM : coords->tileN;
+    mlir::Value origin = leaf.axis == 0 ? coords->rowOrigin : coords->colOrigin;
+    auto peel = [](mlir::Value v) {
+      while (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        v = cvt.getSrc();
+      return v;
+    };
+    auto isRange = [&](mlir::Value v) {
+      auto r = peel(v).getDefiningOp<mlir::triton::MakeRangeOp>();
+      return r && r.getStart() == 0 && r.getEnd() == dim;
+    };
+    auto isCoordIndex = [&](mlir::Value v) {
+      v = peel(v);
+      if (!origin)
+        return isRange(v);
+      auto add = v.getDefiningOp<mlir::arith::AddIOp>();
+      if (!add)
+        return false;
+      auto isOrigin = [&](mlir::Value x) {
+        auto s = peel(x).getDefiningOp<mlir::triton::SplatOp>();
+        return s && s.getSrc() == origin;
+      };
+      return (isOrigin(add.getLhs()) && isRange(add.getRhs())) ||
+             (isOrigin(add.getRhs()) && isRange(add.getLhs()));
+    };
+    auto addr = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
+    auto base = addr ? addr.getPtr().getDefiningOp<mlir::triton::SplatOp>()
+                     : mlir::triton::SplatOp();
+    auto baseArg =
+        base ? mlir::dyn_cast<mlir::BlockArgument>(base.getSrc()) : nullptr;
+    if (!addr || !baseArg || !baseArg.getOwner()->isEntryBlock() ||
+        !isCoordIndex(addr.getOffset()))
+      return std::nullopt;
+    mlir::Value extent;
+    if (mlir::Value mask = load.getMask()) {
+      auto cmp = mask.getDefiningOp<mlir::arith::CmpIOp>();
+      mlir::Value storeExtent = leaf.axis == 0 ? coords->storeMask.mExtent
+                                               : coords->storeMask.nExtent;
+      mlir::Value storeIndex = leaf.axis == 0 ? coords->storeMask.mIndex
+                                              : coords->storeMask.nIndex;
+      mlir::Value bound = cmp ? sdSplatScalarSource(cmp.getRhs()) : nullptr;
+      if (!cmp || cmp.getPredicate() != mlir::arith::CmpIPredicate::slt ||
+          !bound || !storeExtent || !coords->storeMask.mExtent ||
+          !coords->storeMask.nExtent ||
+          !sdSameIndexIgnoringLayout(cmp.getLhs(), addr.getOffset(), 0) ||
+          !storeIndex ||
+          !sdSameIndexIgnoringLayout(storeIndex, addr.getOffset(), 0) ||
+          !sdAreSameMaskExtent(bound, storeExtent) ||
+          !bound.getType().isInteger(32))
+        return std::nullopt;
+      extent = bound;
+    }
+    vectorPlans.push_back({baseArg, extent});
+  }
+
+  body.holder = mlir::ModuleOp::create(loc);
+  mlir::Block *block = body.holder->getBody();
   mlir::Value arg = block->addArgument(elemTy, loc);
+  mlir::Value row, col;
+  if (!ep.vectorLeaves.empty()) {
+    body.needsCoords = true;
+    row = block->addArgument(si32, loc);
+    col = block->addArgument(si32, loc);
+  }
+  llvm::DenseMap<void *, mlir::Value> leafMap, memo;
+  leafMap[acc.getAsOpaquePointer()] = arg;
+  for (mlir::Value scalar : ep.scalarLeaves) {
+    leafMap[scalar.getAsOpaquePointer()] = block->addArgument(f32, loc);
+    body.captures.push_back({SimdEpilogueBody::Capture::Scalar, scalar, {}});
+  }
   mlir::OpBuilder b(block, block->end());
-  llvm::DenseMap<void *, mlir::Value> leaf, memo;
-  leaf[acc.getAsOpaquePointer()] = arg;
-  mlir::Value out = emitConeScalar(b, loc, ep.out, leaf, memo, 0);
+  using BOP = mlir::triton::metal::BinaryExpOperator;
+  for (auto [leaf, plan] : llvm::zip(ep.vectorLeaves, vectorPlans)) {
+    mlir::triton::LoadOp load = leaf.load;
+    auto loadTy = mlir::cast<mlir::RankedTensorType>(load.getType());
+    mlir::Type vecElemTy = loadTy.getElementType();
+    auto memTy = mlir::triton::metal::MetalMemRefType::get(ctx, vecElemTy, 0);
+    mlir::Value buf = block->addArgument(memTy, loc);
+    body.captures.push_back(
+        {SimdEpilogueBody::Capture::Buffer, plan.ptr, vecElemTy});
+    mlir::Value index = leaf.axis == 0 ? row : col;
+    if (plan.extent) {
+      mlir::Value ext = block->addArgument(ui32, loc);
+      body.captures.push_back(
+          {SimdEpilogueBody::Capture::Extent, plan.extent, {}});
+      auto cst = [&](int64_t c) {
+        return mlir::triton::metal::ConstantOp::create(
+                   b, loc, b.getIntegerAttr(si32, c))
+            .getResult();
+      };
+      mlir::Value extS =
+          mlir::triton::metal::CastOp::create(b, loc, si32, ext).getResult();
+      mlir::Value last = mlir::triton::metal::BinaryExpOp::create(
+                             b, loc, BOP::subOp, extS, cst(1))
+                             .getResult();
+      index = mlir::triton::metal::BinaryExpOp::create(b, loc, BOP::minOp,
+                                                       index, last)
+                  .getResult();
+      index = mlir::triton::metal::BinaryExpOp::create(b, loc, BOP::maxOp,
+                                                       index, cst(0))
+                  .getResult();
+    }
+    mlir::Value idxU =
+        mlir::triton::metal::CastOp::create(b, loc, ui32, index).getResult();
+    mlir::Value elem =
+        mlir::triton::metal::GetElementOp::create(b, loc, buf, idxU)
+            .getResult();
+    if (vecElemTy != f32)
+      elem = mlir::triton::metal::CastOp::create(b, loc, f32, elem).getResult();
+    leafMap[leaf.key.getAsOpaquePointer()] = elem;
+  }
+  mlir::Value out = emitConeScalar(b, loc, ep.out, leafMap, memo, 0);
   if (!out || out.getType() != elemTy)
-    return nullptr;
+    return std::nullopt;
   mlir::triton::metal::SimdgroupMapYieldOp::create(b, loc, out);
-  return holder;
+  return body;
+}
+
+// The capture operands, created once where the tier emits its stores.
+static llvm::SmallVector<mlir::Value, 4>
+materializeSimdEpilogueCaptures(mlir::OpBuilder &b, mlir::Location loc,
+                                const SimdEpilogueBody *body) {
+  llvm::SmallVector<mlir::Value, 4> values;
+  if (!body)
+    return values;
+  auto ui32 = b.getIntegerType(32, /*isSigned=*/false);
+  for (const auto &c : body->captures) {
+    switch (c.kind) {
+    case SimdEpilogueBody::Capture::Scalar:
+      values.push_back(c.value);
+      break;
+    case SimdEpilogueBody::Capture::Buffer:
+      values.push_back(bridgePtrToMemref(b, loc, c.value, c.elemTy));
+      break;
+    case SimdEpilogueBody::Capture::Extent:
+      values.push_back(emitExtentUi32(b, loc, ui32, c.value));
+      break;
+    }
+  }
+  return values;
 }
 
 // Apply the held body to `matrix`, or return it unchanged when there is none.
+// `row`/`col` are the tile's global origin, needed only when the body reads
+// its coordinates.
 static mlir::Value applySimdValueEpilogue(mlir::OpBuilder &b, mlir::Location loc,
-                                          mlir::ModuleOp body,
-                                          mlir::Value matrix) {
-  if (!body)
+                                          const SimdEpilogueBody *body,
+                                          mlir::ValueRange captures,
+                                          mlir::Value matrix,
+                                          mlir::Value row = {},
+                                          mlir::Value col = {}) {
+  if (!body || !body->holder)
     return matrix;
+  llvm::SmallVector<mlir::Value, 2> origin;
+  if (body->needsCoords)
+    origin = {row, col};
   auto map = mlir::triton::metal::SimdgroupMapOp::create(
-      b, loc, matrix.getType(), matrix);
+      b, loc, matrix.getType(), matrix, origin, captures);
   mlir::IRMapping mapping;
-  body.getBodyRegion().cloneInto(&map.getBody(), mapping);
+  body->holder.get().getBodyRegion().cloneInto(&map.getBody(), mapping);
   return map.getResult();
 }
 
-// Erase a matched epilogue once its store is gone, users first.
+// Erase a matched epilogue once its store is gone, users first, and then the
+// vector loads only it read.
 static void eraseSimdValueEpilogue(const SimdValueEpilogue &ep) {
   for (auto it = ep.ops.rbegin(); it != ep.ops.rend(); ++it)
     (*it)->erase();
+  for (const auto &leaf : ep.vectorLeaves) {
+    llvm::SmallVector<mlir::Operation *, 4> chain;
+    std::function<void(mlir::Operation *)> dropIfDead =
+        [&](mlir::Operation *op) {
+          // The load itself is erased once, below, after every head.
+          if (!op || !op->use_empty() ||
+              !mlir::isa<mlir::triton::BroadcastOp, mlir::triton::ExpandDimsOp,
+                         mlir::triton::gpu::ConvertLayoutOp,
+                         mlir::arith::ExtFOp>(op))
+            return;
+          llvm::SmallVector<mlir::Operation *, 2> defs{
+              op->getOperand(0).getDefiningOp()};
+          op->erase();
+          for (mlir::Operation *d : defs)
+            dropIfDead(d);
+        };
+    // Walk the load's users down to the (now dead) broadcast heads.
+    llvm::SmallVector<mlir::Operation *, 4> heads;
+    std::function<void(mlir::Value)> findHeads = [&](mlir::Value v) {
+      for (mlir::Operation *u : v.getUsers()) {
+        if (u->use_empty())
+          heads.push_back(u);
+        else if (mlir::isa<mlir::triton::BroadcastOp, mlir::triton::ExpandDimsOp,
+                           mlir::triton::gpu::ConvertLayoutOp,
+                           mlir::arith::ExtFOp>(u))
+          findHeads(u->getResult(0));
+      }
+    };
+    mlir::triton::LoadOp load = leaf.load;
+    findHeads(load.getResult());
+    for (mlir::Operation *h : heads)
+      dropIfDead(h);
+    if (load->use_empty())
+      load->erase();
+  }
 }
 
 static mlir::LogicalResult
@@ -24299,13 +24587,16 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   auto epilogue = matchSimdValueEpilogue(forOp.getResult(accIdx));
   if (!epilogue)
     return mlir::failure();
-  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
+  // Constant epilogues only: this tier does not tie a leaf to its store.
+  std::optional<SimdEpilogueBody> epilogueBody;
   if (!epilogue->ops.empty()) {
     epilogueBody = buildSimdValueEpilogueBody(
-        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc());
+        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc(),
+        /*coords=*/nullptr);
     if (!epilogueBody)
       return mlir::failure();
   }
+  const SimdEpilogueBody *epilogueRef = epilogueBody ? &*epilogueBody : nullptr;
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert an f32 accumulator loses to an
@@ -24585,8 +24876,8 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     // operands when the tt.store had a (offs_m < M) & (offs_n < N) mask so
     // the emitter routes through the threadgroup-scratch masked epilogue.
     SimdgroupStoreOp::create(builder, loc,
-                             applySimdValueEpilogue(builder, loc,
-                                                    epilogueBody.get(), acc),
+                             applySimdValueEpilogue(builder, loc, epilogueRef,
+                                                    {}, acc),
                              cBuf, cRowOrigin, cColOrigin,
                              strideCVal, partialExtents, mlir::ValueRange{});
   } else {
@@ -24731,7 +25022,7 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
 
         SimdgroupStoreOp::create(builder, loc,
                                  applySimdValueEpilogue(
-                                     builder, loc, epilogueBody.get(), acc),
+                                     builder, loc, epilogueRef, {}, acc),
                                  cBuf, cTileRow, cTileCol,
                                  strideCVal, partialExtents,
                                  multiWarp && !partialExtents.empty()
@@ -25089,13 +25380,6 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   auto epilogue = matchSimdValueEpilogue(forOp.getResult(accIdx));
   if (!epilogue)
     return mlir::failure();
-  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
-  if (!epilogue->ops.empty()) {
-    epilogueBody = buildSimdValueEpilogueBody(
-        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc());
-    if (!epilogueBody)
-      return mlir::failure();
-  }
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert an f32 accumulator loses to an
@@ -25251,6 +25535,20 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
          maskExtents.mExtent.getType() != cOrig.row.getType()) ||
         (nExtentIsLocal &&
          maskExtents.nExtent.getType() != cOrig.col.getType()))
+      return mlir::failure();
+  }
+
+  // The epilogue's body needs the store: a vector leaf is tied to its origin,
+  // tile and mask. A column origin with the destination's scalar base folded
+  // in is not a column index, so that shape takes constant epilogues only.
+  std::optional<SimdEpilogueBody> epilogueBody;
+  if (!epilogue->ops.empty()) {
+    SimdEpilogueCoords coords{cOrig.row, cOrig.col, shape[0], shape[1],
+                              maskExtents};
+    epilogueBody = buildSimdValueEpilogueBody(
+        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc(),
+        cBaseOffset.value ? nullptr : &coords);
+    if (!epilogueBody)
       return mlir::failure();
   }
 
@@ -25554,13 +25852,18 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
         builder, loc, ui32, emitExtentUi32(builder, loc, ui32, nExtent),
         cBaseOffset.value));
   }
+  const SimdEpilogueBody *epilogueRef = epilogueBody ? &*epilogueBody : nullptr;
+  llvm::SmallVector<mlir::Value, 4> epilogueCaps =
+      materializeSimdEpilogueCaptures(builder, loc, epilogueRef);
   auto emitStores = [&](mlir::OpBuilder &b, mlir::Location l,
                         mlir::ValueRange accs) {
     for (int mi = 0; mi < mPerWarp; ++mi) {
       for (int ni = 0; ni < nPerWarp; ++ni) {
         int idx = mi * nPerWarp + ni;
         SimdgroupStoreOp::create(
-            b, l, applySimdValueEpilogue(b, l, epilogueBody.get(), accs[idx]),
+            b, l,
+            applySimdValueEpilogue(b, l, epilogueRef, epilogueCaps, accs[idx],
+                                   cRowTiles[mi], cColTiles[ni]),
             cBuf, cRowTiles[mi], cColTiles[ni], strideCVal,
             partialExtents,
             (activeWarps > 1 && !partialExtents.empty())
@@ -25971,13 +26274,6 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   auto epilogue = matchSimdValueEpilogue(forOp.getResult(0));
   if (!epilogue)
     return mlir::failure();
-  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
-  if (!epilogue->ops.empty()) {
-    epilogueBody = buildSimdValueEpilogueBody(*epilogue, forOp.getResult(0),
-                                              elemTy, forOp.getLoc());
-    if (!epilogueBody)
-      return mlir::failure();
-  }
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert that an f32 accumulator loses to an
@@ -26070,6 +26366,20 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
     if (!base.valid || (base.value && !isNumericZero(base.value)))
       return mlir::failure();
   }
+
+  // The epilogue's body needs the store: a vector leaf is tied to its origin,
+  // tile and mask. Built before anything is emitted, so a refusal leaves no IR.
+  std::optional<SimdEpilogueBody> epilogueBody;
+  if (!epilogue->ops.empty()) {
+    OriginPair storeOrigin = extractOriginPair<mlir::triton::StoreOp>(store);
+    SimdEpilogueCoords coords{storeOrigin.row, storeOrigin.col, shape[0],
+                              shape[1], storeExt};
+    epilogueBody = buildSimdValueEpilogueBody(*epilogue, forOp.getResult(0),
+                                              elemTy, forOp.getLoc(), &coords);
+    if (!epilogueBody)
+      return mlir::failure();
+  }
+  const SimdEpilogueBody *epilogueRef = epilogueBody ? &*epilogueBody : nullptr;
 
   mlir::OpBuilder builder(forOp);
   auto loc = forOp.getLoc();
@@ -26222,13 +26532,16 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
     oPartial.push_back(emitExtentUi32(builder, loc, ui32, storeExt.mExtent));
     oPartial.push_back(emitExtentUi32(builder, loc, ui32, storeExt.nExtent));
   }
+  llvm::SmallVector<mlir::Value, 4> epilogueCaps =
+      materializeSimdEpilogueCaptures(builder, loc, epilogueRef);
   auto emitStores = [&](mlir::OpBuilder &b, mlir::ValueRange accs) {
     for (int mi = 0; mi < mPerWarp; ++mi)
       for (int ni = 0; ni < nTiles; ++ni)
         SimdgroupStoreOp::create(
             b, loc,
-            applySimdValueEpilogue(b, loc, epilogueBody.get(),
-                                   accs[mi * nTiles + ni]),
+            applySimdValueEpilogue(b, loc, epilogueRef, epilogueCaps,
+                                   accs[mi * nTiles + ni], cRowTile[mi],
+                                   cColTile[ni]),
             cBuf, cRowTile[mi], cColTile[ni],
             strideCVal, oPartial,
             multiWarp && store.getMask() ? mlir::ValueRange{widx}

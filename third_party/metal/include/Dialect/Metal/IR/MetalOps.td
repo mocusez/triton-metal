@@ -1877,24 +1877,34 @@ def SimdgroupMultiplyAccumulateOp
 }
 
 def SimdgroupMapOp
-    : Metal_Op<"simdgroup_map", [SingleBlock, RecursiveMemoryEffects]> {
+    : Metal_Op<"simdgroup_map", [SingleBlock, RecursiveMemoryEffects,
+                                 AttrSizedOperandSegments]> {
   let summary = "Apply an elementwise scalar function to every element of a SIMD-group matrix";
 
   let description = [{
-    A matmul's value-only epilogue -- `acc * 0.5 + 1`, a leaky ReLU, a
-    sigmoid -- applied to an accumulator tile while it is still in registers.
-    The body takes one element (block argument of the matrix's element type)
-    and yields its image through `metal.simdgroup_map_yield`; every other value
-    it uses is a constant it defines itself. The lowering copies the matrix and
-    rewrites each lane's `thread_elements()` in place, so whichever store
-    follows -- direct, masked-tail or narrowing -- is unchanged.
+    A matmul's epilogue -- `acc * 0.5 + 1`, a leaky ReLU, `acc * alpha`,
+    `acc + bias[n]` -- applied to an accumulator tile while it is still in
+    registers. The lowering copies the matrix and rewrites each lane's two
+    `thread_elements()` in place, so whichever store follows -- direct,
+    masked-tail or narrowing -- is unchanged.
+
+    The body's block arguments are: the element (of the matrix's element
+    type); then, when `origin = [row, col]` (the tile's global origin) is
+    given, the element's global row and column as si32; then one argument per
+    `captures` operand, bound to that operand's value (a runtime scalar, a
+    buffer, an extent). The body yields the element's image through
+    `metal.simdgroup_map_yield`.
   }];
 
-  let arguments = (ins Metal_SimdgroupMatrixType:$matrix);
+  let arguments = (ins Metal_SimdgroupMatrixType:$matrix,
+                       Variadic<UI32>:$origin,
+                       Variadic<AnyType>:$captures);
   let results = (outs Metal_SimdgroupMatrixType:$result);
   let regions = (region SizedRegion<1>:$body);
 
-  let assemblyFormat = "$matrix attr-dict `:` type($matrix) `->` type($result) $body";
+  let assemblyFormat = "$matrix (`origin` `[` $origin^ `]`)?"
+                       " (`captures` `(` $captures^ `:` type($captures) `)`)?"
+                       " attr-dict `:` type($matrix) `->` type($result) $body";
 }
 
 def SimdgroupMapYieldOp : Metal_Op<"simdgroup_map_yield",

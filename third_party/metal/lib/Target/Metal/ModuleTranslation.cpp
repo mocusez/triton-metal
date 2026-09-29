@@ -1890,17 +1890,57 @@ void ModuleTranslation::translate(
 // Each lane owns two elements of an 8x8 SIMD-group matrix. The body is a pure
 // scalar DAG, so IR order is a valid emission order; its values are let-bound
 // in a scope of their own, one per element.
+//
+// With an origin, the body also sees each element's global coordinates. A lane
+// holds row `(q & 4) + (lane / 2) % 4` and columns `(q & 2) * 2 + (lane % 2) * 2`
+// and one past it, `q = lane / 4` -- the layout Apple's simdgroup_matrix uses
+// and MLX's steel kernels index by.
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupMapOp op) {
   auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
       op.getResult().getType());
+  mlir::Block &body = op.getBody().front();
+  const bool hasCoords = op.getOrigin().size() == 2;
+  const unsigned captureBase = hasCoords ? 3 : 1;
   emitSimdgroupMatrixType(_output, resTy);
   unsigned id = _varCount++;
   _output << " v" << id << " = ";
   translateVarName(op.getMatrix());
   printDelim();
+  for (auto [i, capture] : llvm::enumerate(op.getCaptures())) {
+    _output << "\n";
+    indent();
+    unsigned idx = _varCount++;
+    _output << "auto v" << idx << " = ";
+    translateValueOrVarName(capture);
+    printDelim();
+    _buffers[body.getArgument(captureBase + i).getAsOpaquePointer()] = idx;
+  }
+  unsigned rowBase = 0, colBase = 0;
+  if (hasCoords) {
+    unsigned lane = _varCount++;
+    _output << "\n";
+    indent();
+    _output << "ushort v" << lane << " = (ushort)(id.x & 31u)";
+    printDelim();
+    rowBase = _varCount++;
+    _output << "\n";
+    indent();
+    _output << "int v" << rowBase << " = (int)(";
+    translateValueOrVarName(op.getOrigin()[0]);
+    _output << ") + (((v" << lane << " >> 2) & 4) + ((v" << lane
+            << " >> 1) & 3))";
+    printDelim();
+    colBase = _varCount++;
+    _output << "\n";
+    indent();
+    _output << "int v" << colBase << " = (int)(";
+    translateValueOrVarName(op.getOrigin()[1]);
+    _output << ") + (((v" << lane << " >> 2) & 2) * 2 + (v" << lane
+            << " & 1) * 2)";
+    printDelim();
+  }
   _output << "\n";
   indent();
-  mlir::Block &body = op.getBody().front();
   unsigned elemIdx = _varCount++;
   _output << "for (ushort v" << elemIdx << " = 0; v" << elemIdx
           << " < 2; ++v" << elemIdx << ") {";
@@ -1913,6 +1953,15 @@ void ModuleTranslation::translate(mlir::triton::metal::SimdgroupMapOp op) {
             << " = v" << id << ".thread_elements()[v" << elemIdx << "]";
     printDelim();
     _buffers[body.getArgument(0).getAsOpaquePointer()] = argIdx;
+    if (hasCoords) {
+      _buffers[body.getArgument(1).getAsOpaquePointer()] = rowBase;
+      unsigned col = _varCount++;
+      _output << "\n";
+      indent();
+      _output << "int v" << col << " = v" << colBase << " + v" << elemIdx;
+      printDelim();
+      _buffers[body.getArgument(2).getAsOpaquePointer()] = col;
+    }
     for (mlir::Operation &o : body.without_terminator()) {
       _letBound.erase(&o);
       _output << "\n";

@@ -4646,14 +4646,17 @@ def test_single_dot_strided_operand_matches_torch(sak, sbn, shape, warps):
 
 # --- A value-only epilogue on the SIMD-group tiers -------------------------
 #
-# An epilogue that is a function of each accumulator element alone, with
-# constant operands, is applied to the accumulator matrices in registers
+# An epilogue that is a function of each accumulator element -- with constant
+# operands, a runtime scalar, or a bias vector read at the element's own row or
+# column -- is applied to the accumulator matrices in registers
 # (`metal.simdgroup_map`). Before, any epilogue at all sent the matmul to the
 # scalar tier: the tutorial matmul with a leaky ReLU ran at 70-190 GFLOP/s
-# against 730-1560 without it. Epilogues that read a bias vector or a runtime
-# scalar are not value-only and must still be answered by another tier.
+# against 730-1560 without it, and with a bias at 75 against 1000. A vector
+# read at any other index is not the element's and must be left to another
+# tier, still answered.
 @triton.jit
-def _epilogue_matmul_kernel(a_ptr, b_ptr, c_ptr, bias_ptr, M, N, K, alpha,
+def _epilogue_matmul_kernel(a_ptr, b_ptr, c_ptr, bias_ptr, rbias_ptr, hbias_ptr,
+                            M, N, K, alpha,
                             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                             K_TILES: tl.constexpr, LOOP: tl.constexpr,
                             EPI: tl.constexpr):
@@ -4697,32 +4700,46 @@ def _epilogue_matmul_kernel(a_ptr, b_ptr, c_ptr, bias_ptr, M, N, K, alpha,
         acc = acc + tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
     elif EPI == 6:
         acc = acc * alpha
+    elif EPI == 7:
+        acc = acc + tl.load(rbias_ptr + offs_m, mask=offs_m < M, other=0.0)[:, None]
+    elif EPI == 8:
+        acc = acc + tl.load(hbias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)[None, :]
+    elif EPI == 9:  # not the element's column: must not be read at it
+        acc = acc + tl.load(bias_ptr + offs_n + 1)[None, :]
     tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
-_EPILOGUES = {1: "leaky", 2: "scaleshift", 3: "silu", 4: "clampabs", 5: "bias", 6: "alpha"}
+_EPILOGUES = {1: "leaky", 2: "scaleshift", 3: "silu", 4: "clampabs", 5: "bias", 6: "alpha",
+              7: "rowbias", 8: "halfbias", 9: "shiftedbias"}
 
 
-def _epilogue_ref(r, epi, bias, alpha):
+def _epilogue_ref(r, epi, bias, alpha, rbias, hbias):
+    n = r.shape[1]
     return {0: lambda: r, 1: lambda: torch.where(r >= 0, r, 0.01 * r),
             2: lambda: r * 0.5 + 1.0, 3: lambda: r * torch.sigmoid(r),
-            4: lambda: (r.abs() - 1.0).clamp(-2.0, 3.0), 5: lambda: r + bias[None, :],
-            6: lambda: r * alpha}[epi]()
+            4: lambda: (r.abs() - 1.0).clamp(-2.0, 3.0), 5: lambda: r + bias[None, :n],
+            6: lambda: r * alpha, 7: lambda: r + rbias[:, None],
+            8: lambda: r + hbias[None, :], 9: lambda: r + bias[None, 1:n + 1]}[epi]()
 
 
 def _run_epilogue_matmul(loop, epi, m, n, k, dtype, warps, block=64):
     torch.manual_seed(m + n + k + epi + loop)
     a = torch.randn(m, k)
     b = torch.randn(k, n)
-    bias = torch.randn(n)
+    # Whole tiles plus one: EPI 9 reads `offs_n + 1` unmasked, as it says.
+    bias = torch.randn(triton.cdiv(n, block) * block + 1)
+    rbias = torch.randn(m)
+    hbias = torch.randn(n).half()
     c = torch.zeros(m, n, dtype=dtype, device="mps")
     grid = (triton.cdiv(m, block), triton.cdiv(n, block))
-    h = _epilogue_matmul_kernel[grid](a.to("mps"), b.to("mps"), c, bias.to("mps"), m, n, k, 0.75,
+    h = _epilogue_matmul_kernel[grid](a.to("mps"), b.to("mps"), c, bias.to("mps"),
+                                      rbias.to("mps"), hbias.to("mps"), m, n, k, 0.75,
                                       BM=block, BN=block, BK=32, K_TILES=k // 32, LOOP=loop,
                                       EPI=epi, num_warps=warps)
     torch.mps.synchronize()
-    ref = _epilogue_ref(a.double() @ b.double(), epi, bias.double(), 0.75)
+    ref = _epilogue_ref(a.double() @ b.double(), epi, bias.double(), 0.75, rbias.double(),
+                        hbias.double())
     msl = h.asm["metal"]
     return c.cpu().double(), ref, msl.decode() if isinstance(msl, bytes) else msl
 
@@ -4746,3 +4763,19 @@ def test_matmul_value_epilogue_stays_on_simdgroup_tier(loop, epi):
     _, _, msl = _run_epilogue_matmul(loop, epi, m, n, k, torch.float32, 4)
     assert "simdgroup_multiply_accumulate" in msl
     assert "thread_elements()" in msl
+
+
+@pytest.mark.parametrize("loop", [0, 2], ids=["tutorial", "recompute"])
+@pytest.mark.parametrize("epi", [5, 6, 7, 8], ids=["bias", "alpha", "rowbias", "halfbias"])
+def test_matmul_bias_epilogue_stays_on_simdgroup_tier(loop, epi):
+    """A bias read at the element's own coordinate, or a runtime scalar, too."""
+    _, _, msl = _run_epilogue_matmul(loop, epi, 128, 128, 96, torch.float32, 4)
+    assert "thread_elements()" in msl
+
+
+@pytest.mark.parametrize("loop", [0, 2], ids=["tutorial", "recompute"])
+def test_matmul_shifted_bias_is_not_read_at_the_element(loop):
+    """`bias[offs_n + 1]` is not the element's column; the map must not claim it."""
+    got, ref, msl = _run_epilogue_matmul(loop, 9, 100, 72, 88, torch.float32, 4)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+    assert "thread_elements()" not in msl
