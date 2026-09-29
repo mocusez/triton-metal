@@ -96,7 +96,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // CHECK: metal.simdgroup_index
 // CHECK-NOT: metal.simdgroup_index
-// CHECK-COUNT-64: metal.simdgroup_multiply_accumulate
+// One K loop over 32 elements carrying the warp's sixteen accumulators.
+// CHECK: scf.for {{.*}} to %c32_i32 step %c8_i32
+// CHECK-COUNT-16: metal.simdgroup_multiply_accumulate
 // CHECK-NOT: metal.simdgroup_multiply_accumulate
 // CHECK: metal.return
 // REJECT: canonical multi-tile dot has no valid warp partition
@@ -198,9 +200,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // STATIC: metal.simdgroup_index
 // STATIC-NOT: tt.dot
+// An interior block runs an unmasked K loop, a boundary block a masked one;
+// each carries the warp's sixteen accumulators and stores them masked.
 // STATIC-LOAD-LABEL: metal.kernel k_masked_static
-// STATIC-LOAD-COUNT-32: metal.simdgroup_load_device_staged_masked
+// STATIC-LOAD: scf.if
+// STATIC-LOAD-COUNT-8: metal.simdgroup_load_device_staged {{.*}}
+// STATIC-LOAD: } else {
+// STATIC-LOAD-COUNT-8: metal.simdgroup_load_device_staged_masked
 // STATIC-MMA-LABEL: metal.kernel k_masked_static
 // STATIC-MMA-COUNT-16: metal.simdgroup_multiply_accumulate
+// STATIC-MMA: } else {
+// STATIC-MMA-COUNT-16: metal.simdgroup_multiply_accumulate
 // STATIC-STORE-LABEL: metal.kernel k_masked_static
+// STATIC-STORE-COUNT-16: metal.simdgroup_store{{.*}}partial{{.*}}warp
+// STATIC-STORE: } else {
 // STATIC-STORE-COUNT-16: metal.simdgroup_store{{.*}}partial{{.*}}warp

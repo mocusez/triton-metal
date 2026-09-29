@@ -93,13 +93,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 //  - the cvt-strip preprocess eliminates the two #blocked→#dot_op cvts;
 //  - the canonical-3-iter_arg matcher accepts the loop body (now with cvts
 //    gone, the body has 6 ops: load, load, dot, addptr, addptr, yield);
-//  - the unroller emits a simdgroup chain BEFORE the for (the for is then
-//    erased) — N=2 iterations + an outer c-init + final store.
+//  - the source loop becomes one K loop of SIMD-group MMAs over
+//    2 trips x 8 = 16 elements, then the final store.
 //
 // CHECK-LABEL: metal.kernel dot_canonical_3iterarg
 // CHECK-NOT: ttg.convert_layout
 // CHECK-NOT: tt.dot
-// CHECK-NOT: scf.for
-// CHECK-COUNT-2: metal.simdgroup_multiply_accumulate
+// CHECK: scf.for {{.*}} to %c16_i32 step %c8_i32
+// CHECK: metal.simdgroup_multiply_accumulate
+// CHECK-NOT: metal.simdgroup_multiply_accumulate
+// CHECK: scf.yield
 // CHECK: metal.simdgroup_store
 // CHECK: metal.return

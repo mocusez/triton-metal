@@ -25299,8 +25299,16 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
     return mlir::failure();
   int64_t BK = *bkOpt;
   mlir::Value loopElementUpper = normalizeRuntimeKLoopUpper(forOp, BK);
-  if (!loopElementUpper)
-    return mlir::failure();
+  // A constant trip count stepping by one covers `trips * BK` elements; the
+  // constant is materialized only once the tier commits.
+  std::optional<int64_t> constElementUpper;
+  if (!loopElementUpper) {
+    auto trips = getScalarIntegerConstant(forOp.getUpperBound());
+    auto step = getScalarIntegerConstant(forOp.getStep());
+    if (!trips || *trips < 1 || !step || *step != 1)
+      return mlir::failure();
+    constElementUpper = *trips * BK;
+  }
   auto iterArgs = forOp.getRegionIterArgs();
   int accIdx = -1, aIdx = -1, bIdx = -1;
   for (int i = 0; i < 3; ++i) {
@@ -25337,14 +25345,15 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
       return ia.getInt();
     return std::nullopt;
   };
-  // Lower bound and step must be static; UPPER bound must be RUNTIME (this is
-  // exactly the case the static matcher rejects).
+  // Lower bound and step must be static. The upper bound may be either: the
+  // static tier runs first and unrolls up to eight trips, and a CONSTANT loop
+  // longer than that used to have no matmul tier at all -- it fell to the
+  // scalar dot's per-tile staging, 240 GFLOP/s at K = 2048 against 1000 for
+  // the same loop with a runtime bound.
   auto lo = getConstInt(forOp.getLowerBound());
   auto st = getConstInt(forOp.getStep());
   if (!lo || *lo != 0 || !st || *st <= 0)
     return mlir::failure();
-  if (getConstInt(forOp.getUpperBound()))
-    return mlir::failure(); // static → other path
 
   auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   if (!resTy)
@@ -25711,6 +25720,11 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   auto c8 = mlir::arith::ConstantOp::create(builder, loc,
                                             builder.getI32IntegerAttr(8));
   mlir::Value ub = loopElementUpper; // runtime total K (i32)
+  if (!ub) // i32, like the bounds of the loop built from it below
+    ub = mlir::arith::ConstantOp::create(
+             builder, loc,
+             builder.getI32IntegerAttr(static_cast<int32_t>(*constElementUpper)))
+             .getResult();
 
   // Staging an operand tile behind a runtime bounds test costs 1.29x-1.42x on
   // a 1024-cubed fp16 product, measured against the same kernel with unmasked
@@ -32668,13 +32682,16 @@ static void rewriteSingleDot(mlir::triton::DotOp dot) {
     return;
   if (!sdFastTierWrapsAreProven(dot))
     return;
-  // Matmul track session 4c-3: try canonical 3-iter_arg unroll first
-  // (real Triton matmul shape with a_ptrs/b_ptrs/acc iter_args).
-  if (mlir::succeeded(tryUnrollCanonical3IterArgDot(dot)))
-    return;
-  // W2a: canonical 3-iter_arg K-loop with a RUNTIME trip count (emits an
-  // scf.for of simdgroup_multiply_accumulate rather than a static unroll).
+  // W2a: canonical 3-iter_arg K-loop (a_ptrs/b_ptrs/acc iter_args), emitted
+  // as an scf.for of simdgroup_multiply_accumulate. It takes constant trip
+  // counts too, and goes FIRST: the full unroll below measured 2.5-3x slower
+  // at every trip count it accepts (K = 256 at n = 2048: 403 against 1303
+  // GFLOP/s, 9861 lines of MSL against 668).
   if (mlir::succeeded(tryRuntimeKLoopCanonicalDot(dot)))
+    return;
+  // Matmul track session 4c-3: canonical 3-iter_arg static unroll, for the
+  // shapes the loop above declines.
+  if (mlir::succeeded(tryUnrollCanonical3IterArgDot(dot)))
     return;
   // W2b: recompute-from-IV runtime-K loop (accumulator-only iter_arg; the
   // LoRA-style shape whose addresses are rebuilt from the induction var).

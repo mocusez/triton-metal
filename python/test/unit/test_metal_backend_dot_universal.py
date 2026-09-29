@@ -4779,3 +4779,64 @@ def test_matmul_shifted_bias_is_not_read_at_the_element(loop):
     got, ref, msl = _run_epilogue_matmul(loop, 9, 100, 72, 88, torch.float32, 4)
     torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
     assert "thread_elements()" not in msl
+
+
+# --- A K loop with a constant trip count ------------------------------------
+#
+# `for _ in range(0, K_TILES)` with pointer advance. The static tier unrolled
+# up to eight trips and the runtime-K tier refused a constant bound, so a
+# longer constant loop fell to the scalar dot's per-tile staging (240 GFLOP/s
+# at K = 2048 against 1000 with a runtime bound), and the unroll itself ran
+# 2.5-3x slower than the loop. The runtime-K tier now takes constant bounds and
+# goes first.
+@triton.jit
+def _constant_trip_matmul_kernel(a_ptr, b_ptr, c_ptr, K, N,
+                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                                 K_TILES: tl.constexpr):
+    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for _ in range(0, K_TILES):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+        a_ptrs += BK
+        b_ptrs += BK * N
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
+
+
+def _run_constant_trip(k_tiles, bk, block, warps, m=128, n=128):
+    k = k_tiles * bk
+    torch.manual_seed(k_tiles * 31 + bk + block + warps)
+    a = torch.randn(m, k)
+    b = torch.randn(k, n)
+    c = torch.zeros(m, n, device="mps")
+    h = _constant_trip_matmul_kernel[(m // block, n // block)](
+        a.to("mps"), b.to("mps"), c, k, n, BM=block, BN=block, BK=bk, K_TILES=k_tiles,
+        num_warps=warps)
+    torch.mps.synchronize()
+    msl = h.asm["metal"]
+    return c.cpu(), a @ b, msl.decode() if isinstance(msl, bytes) else msl
+
+
+@pytest.mark.parametrize("k_tiles", [1, 2, 3, 8, 9, 16, 64])
+@pytest.mark.parametrize("bk", [16, 32])
+@pytest.mark.parametrize("block,warps", [(64, 4), (32, 1), (32, 4)])
+def test_constant_trip_matmul_matches_torch(k_tiles, bk, block, warps):
+    got, ref, _ = _run_constant_trip(k_tiles, bk, block, warps)
+    torch.testing.assert_close(got, ref, atol=2e-3 * k_tiles, rtol=2e-3)
+
+
+@pytest.mark.parametrize("k_tiles", [2, 8, 16, 64])
+def test_constant_trip_matmul_is_a_loop_not_an_unroll(k_tiles):
+    """One K loop of SIMD-group MMAs, the same kernel whatever the trip count.
+
+    The unroll grew with the trips (2565 lines of MSL at two, 9861 at eight),
+    and the scalar dot's per-tile staging it fell to beyond eight was 542; the
+    K loop is about 175 at any trip count.
+    """
+    _, _, msl = _run_constant_trip(k_tiles, 32, 64, 4)
+    assert "simdgroup_multiply_accumulate" in msl
+    assert msl.count("simdgroup_multiply_accumulate") <= 32
+    assert len(msl.splitlines()) < 400

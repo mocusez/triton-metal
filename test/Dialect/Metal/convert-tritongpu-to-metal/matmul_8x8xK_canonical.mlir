@@ -80,33 +80,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// IR-level: scf.for erased; dense<0.0> C-init → simdgroup_matrix_zero;
-// 2×(A,B) loads = 4 simdgroup_load_device_staged; 2 MA ops; 1 store.
-// The resulting straight-line kernel has no thread- or simdgroup-indexed work,
-// so launching the otherwise-requested four warps would duplicate the same
-// 8×8 tile four times. Pin the compiler-to-launcher 32-thread override.
+// IR-level: the source loop becomes ONE K loop of SIMD-group MMAs over
+// K = 2 trips x 8 = 16 elements, stepping 8; dense<0.0> C-init →
+// simdgroup_matrix_zero; per step one (A, B) staged pair and one MA; one store.
+// (The two trips used to be unrolled; the loop measured 2.5-3x faster than the
+// unroll at every trip count it accepted, so it goes first.) The kernel has no
+// thread- or simdgroup-indexed work, so launching the otherwise-requested four
+// warps would duplicate the same 8×8 tile four times. Pin the
+// compiler-to-launcher 32-thread override.
 // PASS: module attributes {{.*}}metal.threads_per_group = 32 : i32
 // PASS: metal.module
 // PASS: metal.kernel matmul_canonical
-// PASS-NOT: scf.for
+// PASS-NOT: tt.dot
 // PASS: metal.simdgroup_matrix_zero
+// PASS: %c16_i32 = arith.constant 16 : i32
+// PASS: scf.for {{.*}} to %c16_i32 step %c8_i32
 // PASS-COUNT-2: metal.simdgroup_load_device_staged
 // PASS: metal.simdgroup_multiply_accumulate
-// PASS-COUNT-2: metal.simdgroup_load_device_staged
-// PASS: metal.simdgroup_multiply_accumulate
+// PASS-NOT: metal.simdgroup_multiply_accumulate
+// PASS: scf.yield
 // PASS: metal.simdgroup_store
 
-// MSL end-to-end: with device-staged loads, the per-iter K-axis origin
-// (0 for iter 0, 8 for iter 1) lives inside the staging cooperative-copy
-// expansion that precedes each simdgroup_load from `_stage_shared`. Each
-// simdgroup_load itself reads `&_stage_shared[0], 8` (threadgroup buffer
-// base, stride 8). The zero-init C is a zero-constructor (`v3(0.0f)`) and
-// does not emit a simdgroup_load.
+// MSL end-to-end: the K loop's induction variable is the K-axis origin of
+// the staging cooperative copy that precedes each simdgroup_load from
+// `_stage_shared`. The zero-init C is a zero-constructor and does not emit a
+// simdgroup_load.
 // MSL: kernel void matmul_canonical
+// MSL: for (
 // MSL: simdgroup_load(
 // MSL: simdgroup_load(
 // MSL: simdgroup_multiply_accumulate(
-// MSL: simdgroup_load(
-// MSL: simdgroup_load(
-// MSL: simdgroup_multiply_accumulate(
+// MSL-NOT: simdgroup_multiply_accumulate(
 // MSL: simdgroup_store(

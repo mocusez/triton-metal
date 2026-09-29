@@ -8,7 +8,8 @@
 //      `metal.simdgroup_multiply_accumulate` ops (one per K-tile);
 //   2. emits a single `metal.simdgroup_matrix_zero` for the acc init
 //      (no spurious load from the C buffer);
-//   3. produces no residual `scf.for` or `tt.dot` after the conversion.
+//   3. produces no residual `tt.dot` after the conversion (the source loop
+//      becomes one K loop of SIMD-group MMAs).
 //
 // Acceptance: post-pass MLIR must contain exactly `K_TILES` =
 // `K / BLOCK_K` = 4 `metal.simdgroup_multiply_accumulate` ops.
@@ -73,11 +74,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
+// The four trips are one K loop over 4 x 8 = 32 elements, one MMA per step.
 // CHECK-LABEL: metal.kernel dot_universal_kloop4
 // CHECK-NOT: ttg.convert_layout
 // CHECK-NOT: tt.dot
-// CHECK-NOT: scf.for
 // CHECK: metal.simdgroup_matrix_zero
-// CHECK-COUNT-4: metal.simdgroup_multiply_accumulate
+// CHECK: scf.for {{.*}} to %c32_i32 step %c8_i32
+// CHECK: metal.simdgroup_multiply_accumulate
+// CHECK-NOT: metal.simdgroup_multiply_accumulate
+// CHECK: scf.yield
 // CHECK: metal.simdgroup_store
 // CHECK: metal.return

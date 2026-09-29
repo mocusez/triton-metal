@@ -19,7 +19,11 @@
 // CHECK: metal.simdgroup_index
 // CHECK: arith.divui {{.*}}, {{.*}} : i32
 // CHECK: arith.remui {{.*}}, {{.*}} : i32
-// CHECK-COUNT-32: metal.simdgroup_multiply_accumulate
+// One K loop carrying the group's eight accumulators, eight MMAs per step.
+// CHECK: scf.for
+// CHECK-COUNT-8: metal.simdgroup_multiply_accumulate
+// CHECK-NOT: metal.simdgroup_multiply_accumulate
+// CHECK: scf.yield
 // MSL: threadgroup float _stage_shared[8][64]
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 16 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @k(%a_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %b_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %c_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %stride_am: i32 {tt.divisibility = 16 : i32}, %stride_bk: i32 {tt.divisibility = 16 : i32}, %stride_cm: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
