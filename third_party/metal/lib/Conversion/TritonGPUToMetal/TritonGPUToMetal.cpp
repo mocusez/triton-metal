@@ -24272,6 +24272,11 @@ buildSimdValueEpilogueBody(const SimdValueEpilogue &ep, mlir::Value acc,
   mlir::Value out = emitConeScalar(b, loc, ep.out, leafMap, memo, 0);
   if (!out || out.getType() != elemTy)
     return std::nullopt;
+  // A cone of layout converts only is the identity: no map at all.
+  if (out == arg && body.captures.empty() && !body.needsCoords) {
+    body.holder = nullptr;
+    return body;
+  }
   mlir::triton::metal::SimdgroupMapYieldOp::create(b, loc, out);
   return body;
 }
@@ -25217,6 +25222,17 @@ static mlir::Value normalizeCanonicalKExtent(mlir::Value extent,
                                              int64_t bk) {
   if (!extent)
     return {};
+  // A loop that runs exactly one trip -- the one a lone dot is wrapped in --
+  // has its local and global K coordinates equal, so a bound defined outside
+  // it (`offs_k < K`) is already the K bound.
+  {
+    auto lower = getScalarIntegerConstant(loop.getLowerBound());
+    auto upper = getScalarIntegerConstant(loop.getUpperBound());
+    auto step = getScalarIntegerConstant(loop.getStep());
+    if (lower && *lower == 0 && upper && step && *upper > 0 &&
+        *upper <= *step && loop.isDefinedOutsideOfLoop(extent))
+      return extent;
+  }
   mlir::Value elementUpper =
       bk > 0 ? normalizeRuntimeKLoopUpper(loop, bk) : loop.getUpperBound();
   if (!elementUpper)
@@ -31511,6 +31527,172 @@ static void preprocessGramDots(mlir::ModuleOp moduleOp) {
 // loop) BEFORE the convert_layout legality walk, so their out-of-envelope
 // operand/result cvts are gone by the time the walk (and applyFullConversion)
 // runs. Emits `metal.scalar_dot` (lowered by `ScalarDotLowering`).
+// A lone `tl.dot` over more than one 8x8 tile -- K = BLOCK_K, so Triton left
+// no K loop -- has no SIMD-group matmul tier: the early scalar pass claims it
+// and runs it on the scalar dot's SIMD-group path, 446-809 GFLOP/s at n = 2048
+// against 1000-1300 for the same product written with a K loop. Give it the
+// one-trip pointer-advance K loop the runtime-K tier matches: iter_args (A
+// pointers, B pointers, C), each pointer bumped by one K tile along its
+// operand's K axis (which the single trip never uses). Only a dot whose result
+// reaches its store the way those tiers take it is wrapped; anything else keeps
+// the scalar dot. The loop is marked, so the final pass can put a loop no tier
+// took back the way it was.
+static constexpr llvm::StringLiteral kLoneDotKLoopAttr = "metal.lone_dot_k_loop";
+
+static bool wrapLoneDotInKLoop(mlir::triton::DotOp dot) {
+  auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
+  if (!resTy || resTy.getRank() != 2 || !resTy.getElementType().isF32() ||
+      resTy.getDimSize(0) % 8 != 0 || resTy.getDimSize(1) % 8 != 0 ||
+      resTy.getDimSize(0) * resTy.getDimSize(1) <= 64)
+    return false;
+  auto loadA = dot.getA().getDefiningOp<mlir::triton::LoadOp>();
+  auto trans = dot.getB().getDefiningOp<mlir::triton::TransOp>();
+  auto loadB = trans ? trans.getSrc().getDefiningOp<mlir::triton::LoadOp>()
+                     : dot.getB().getDefiningOp<mlir::triton::LoadOp>();
+  if (!loadA || !loadB || loadA->getBlock() != dot->getBlock() ||
+      loadB->getBlock() != dot->getBlock())
+    return false;
+  auto aTy = mlir::cast<mlir::RankedTensorType>(loadA.getType());
+  const int64_t bk = aTy.getDimSize(1);
+  if (bk % 8 != 0 || !simdgroupTileIsContiguous(loadA.getPtr()))
+    return false;
+  // The tier reads each operand's row stride as a runtime splat and assumes 8
+  // when there is none. A stride Triton specialized away -- `m * K` with a
+  // runtime K of 1 folds to `m` -- has no splat, and was read 8 rows apart.
+  // 📏 30 `s_dot` cells with K = 1 answered wrong before this was checked.
+  if (!findStrideSplatSourceInPtrChain(loadA.getPtr()) ||
+      !findStrideSplatSourceInPtrChain(loadB.getPtr()))
+    return false;
+  // The result must reach its store as the SIMD-group tiers take it.
+  auto epilogue = matchSimdValueEpilogue(dot.getResult());
+  if (!epilogue)
+    return false;
+  mlir::Operation *user = *epilogue->out.getUsers().begin();
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(user)) {
+    if (!trunc.getResult().hasOneUse())
+      return false;
+    user = *trunc.getResult().getUsers().begin();
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user)) {
+      if (!cvt.getResult().hasOneUse())
+        return false;
+      user = *cvt.getResult().getUsers().begin();
+    }
+  }
+  if (!mlir::isa<mlir::triton::StoreOp>(user))
+    return false;
+  // B steps along its K axis: axis 0, or 1 through a `tt.trans`. A unit
+  // stride there is a constant bump; otherwise the runtime stride times BK.
+  const int bKAxis = trans ? 1 : 0;
+  mlir::Value bStride = findAxisStride(loadB.getPtr(), bKAxis);
+  if (!bStride && !(trans && simdgroupTileIsContiguous(loadB.getPtr(), 1)))
+    return false;
+
+  mlir::OpBuilder b(dot);
+  auto loc = dot.getLoc();
+  auto i32 = b.getI32Type();
+  auto cst = [&](int64_t v) {
+    return mlir::arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(v))
+        .getResult();
+  };
+  auto offsetTy = [&](mlir::Value ptr) {
+    auto ptrTy = mlir::cast<mlir::RankedTensorType>(ptr.getType());
+    return mlir::RankedTensorType::get(ptrTy.getShape(), i32,
+                                       ptrTy.getEncoding());
+  };
+  mlir::Value aBump = mlir::arith::ConstantOp::create(
+      b, loc,
+      mlir::DenseElementsAttr::get(offsetTy(loadA.getPtr()),
+                                   b.getI32IntegerAttr(bk)));
+  mlir::Value bBump;
+  if (bStride) {
+    mlir::Value scaled =
+        mlir::arith::MulIOp::create(b, loc, bStride, cst(bk)).getResult();
+    bBump = mlir::triton::SplatOp::create(b, loc, offsetTy(loadB.getPtr()),
+                                          scaled)
+                .getResult();
+  } else {
+    bBump = mlir::arith::ConstantOp::create(
+        b, loc,
+        mlir::DenseElementsAttr::get(offsetTy(loadB.getPtr()),
+                                     b.getI32IntegerAttr(bk)));
+  }
+  mlir::Value tile = cst(bk);
+  auto forOp = mlir::scf::ForOp::create(
+      b, loc, cst(0), tile, tile,
+      mlir::ValueRange{loadA.getPtr(), loadB.getPtr(), dot.getC()});
+  forOp->setAttr(kLoneDotKLoopAttr, b.getUnitAttr());
+  {
+    mlir::OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(forOp.getBody());
+    mlir::IRMapping map;
+    map.map(loadA.getPtr(), forOp.getRegionIterArgs()[0]);
+    map.map(loadB.getPtr(), forOp.getRegionIterArgs()[1]);
+    map.map(dot.getC(), forOp.getRegionIterArgs()[2]);
+    b.clone(*loadA, map);
+    b.clone(*loadB, map);
+    if (trans)
+      b.clone(*trans, map);
+    mlir::Operation *inner = b.clone(*dot, map);
+    mlir::Value nextA = mlir::triton::AddPtrOp::create(
+                            b, loc, forOp.getRegionIterArgs()[0].getType(),
+                            forOp.getRegionIterArgs()[0], aBump)
+                            .getResult();
+    mlir::Value nextB = mlir::triton::AddPtrOp::create(
+                            b, loc, forOp.getRegionIterArgs()[1].getType(),
+                            forOp.getRegionIterArgs()[1], bBump)
+                            .getResult();
+    mlir::scf::YieldOp::create(
+        b, loc, mlir::ValueRange{nextA, nextB, inner->getResult(0)});
+  }
+  dot.getResult().replaceAllUsesWith(forOp.getResult(2));
+  dot.erase();
+  if (trans && trans->use_empty())
+    trans.erase();
+  if (loadA->use_empty())
+    loadA.erase();
+  if (loadB->use_empty())
+    loadB.erase();
+  return true;
+}
+
+static void wrapLoneDotsInKLoops(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::DotOp> lone;
+  moduleOp.walk([&](mlir::triton::DotOp d) {
+    if (!d->getParentOfType<mlir::scf::ForOp>())
+      lone.push_back(d);
+  });
+  for (auto d : lone)
+    (void)wrapLoneDotInKLoop(d);
+}
+
+// Put a wrapped lone dot no tier took back as it was, and hand it to the
+// scalar dot as before.
+static void unwrapLoneDotKLoops(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  moduleOp.walk([&](mlir::scf::ForOp f) {
+    if (f->hasAttr(kLoneDotKLoopAttr))
+      loops.push_back(f);
+  });
+  for (auto forOp : loops) {
+    mlir::OpBuilder b(forOp);
+    mlir::IRMapping map;
+    for (auto [arg, init] :
+         llvm::zip(forOp.getRegionIterArgs(), forOp.getInits()))
+      map.map(arg, init);
+    mlir::triton::DotOp dot;
+    for (mlir::Operation &op : forOp.getBody()->without_terminator()) {
+      if (mlir::isa<mlir::triton::AddPtrOp>(op))
+        continue;
+      mlir::Operation *copy = b.clone(op, map);
+      if (auto d = mlir::dyn_cast<mlir::triton::DotOp>(copy))
+        dot = d;
+    }
+    forOp.getResult(2).replaceAllUsesWith(dot.getResult());
+    forOp.erase();
+    (void)tryScalarDotFallback(dot);
+  }
+}
+
 static void preprocessScalarDots(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::DotOp> standalone;
   moduleOp.walk([&](mlir::triton::DotOp d) {
@@ -31544,6 +31726,7 @@ static void preprocessScalarDots(mlir::ModuleOp moduleOp) {
 // and carries no epilogue result cvt (epilogue dots were claimed early), so no
 // out-of-envelope cvt survives into the (already-run) legality walk.
 static void finalizeScalarDots(mlir::ModuleOp moduleOp) {
+  unwrapLoneDotKLoops(moduleOp);
   llvm::SmallVector<mlir::scf::ForOp> loops;
   moduleOp.walk([&](mlir::scf::ForOp f) { loops.push_back(f); });
   for (auto f : loops)
@@ -42435,6 +42618,10 @@ struct ConvertTritonGPUToMetalPass
     // canonical body shape. See
     // the implementation notes.
     preprocessDotCvtChains(moduleOp);
+
+    // A lone multi-tile dot becomes the one-trip K loop the runtime-K
+    // SIMD-group tier matches; see `wrapLoneDotsInKLoops`.
+    wrapLoneDotsInKLoops(moduleOp);
 
     // Scalar-GEMM correctness fallback: rewrite standalone / single-loop f32
     // dots with a general (alpha*out + beta*C) epilogue to `metal.scalar_dot`

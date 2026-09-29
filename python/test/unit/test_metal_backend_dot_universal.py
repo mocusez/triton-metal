@@ -4853,7 +4853,7 @@ def test_constant_trip_matmul_is_a_loop_not_an_unroll(k_tiles):
 @triton.jit
 def _single_dot_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                       MASKED: tl.constexpr):
+                       MASKED: tl.constexpr, ROWSIGN: tl.constexpr = 0):
     offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
     offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
@@ -4867,20 +4867,26 @@ def _single_dot_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
     else:
         a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
         b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :])
-        tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], tl.dot(a, b))
+        c = tl.dot(a, b)
+        if ROWSIGN:  # row-dependent: no SIMD-group tier carries it
+            c = tl.where(offs_m[:, None] % 2 == 0, c, -c)
+        tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], c)
 
 
-def _run_single_dot(m, n, k, bm, bn, bk, warps, masked):
+def _run_single_dot(m, n, k, bm, bn, bk, warps, masked, rowsign=0):
     torch.manual_seed(m + n + k + bm + bn + warps)
     a = torch.randn(m, k)
     b = torch.randn(k, n)
     c = torch.zeros(m, n, device="mps")
     h = _single_dot_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
         a.to("mps"), b.to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk, MASKED=masked,
-        num_warps=warps)
+        ROWSIGN=rowsign, num_warps=warps)
     torch.mps.synchronize()
     msl = h.asm["metal"]
-    return c.cpu(), a @ b, msl.decode() if isinstance(msl, bytes) else msl
+    ref = a @ b
+    if rowsign:
+        ref = ref * torch.where(torch.arange(m) % 2 == 0, 1.0, -1.0)[:, None]
+    return c.cpu(), ref, msl.decode() if isinstance(msl, bytes) else msl
 
 
 @pytest.mark.parametrize("m,n,k,bm,bn,bk,masked", [
@@ -4892,15 +4898,95 @@ def _run_single_dot(m, n, k, bm, bn, bk, warps, masked):
     (16, 512, 16, 16, 256, 16, 1),    # short and wide, masked
 ])
 @pytest.mark.parametrize("warps", [1, 4])
-def test_single_dot_multi_tile_matches_torch(m, n, k, bm, bn, bk, masked, warps):
-    got, ref, _ = _run_single_dot(m, n, k, bm, bn, bk, warps, masked)
+@pytest.mark.parametrize("rowsign", [0, 1], ids=["matmul_tier", "scalar_dot"])
+def test_single_dot_multi_tile_matches_torch(m, n, k, bm, bn, bk, masked, warps, rowsign):
+    if rowsign and masked:
+        pytest.skip("the row-sign epilogue is written on the unmasked form")
+    got, ref, _ = _run_single_dot(m, n, k, bm, bn, bk, warps, masked, rowsign)
     torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
 
 
 def test_single_dot_stages_each_tile_once_per_step():
-    """One K loop for the warp's sixteen tiles, not sixteen loops of one MMA."""
+    """On the scalar dot: one K loop for the warp's sixteen tiles, not sixteen
+    loops of one MMA. A row-dependent epilogue keeps the dot there."""
     import re
-    _, _, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0)
+    _, _, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0, rowsign=1)
     k_loops = re.findall(r"for \(int v\d+ = 0; v\d+ < [^;]+; v\d+ \+= 8\)", msl)
+    assert "[4096]" in msl  # the scalar dot's M x N result scratch
     assert msl.count("simdgroup_multiply_accumulate") == 16
     assert len(k_loops) == 1
+
+
+# --- A lone dot on the runtime-K matmul tier ---------------------------------
+#
+# K = BLOCK_K, so Triton leaves no K loop. The lone dot is wrapped in the one-
+# trip pointer-advance K loop the runtime-K tier matches: 656-809 -> 1018-1271
+# GFLOP/s at n = 2048 (BLOCK_K 32-64). One it declines is put back for the
+# scalar dot. A stride Triton specialized away (`m * K` with K = 1) has no
+# runtime splat for the tier to read, so that dot is never wrapped.
+@triton.jit
+def _lone_dot_forms_kernel(a_ptr, b_ptr, c_ptr, cin_ptr, bias_ptr, M, N, K,
+                           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                           FORM: tl.constexpr):
+    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+    if FORM == 2:  # B stored [N, K], read through a real tt.trans
+        bt = tl.load(b_ptr + offs_n[:, None] * K + offs_k[None, :],
+                     mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0.0)
+        c = tl.dot(a, tl.trans(bt))
+    else:
+        b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :],
+                    mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        if FORM == 3:  # accumulate onto a loaded C
+            c = tl.dot(a, b, tl.load(cin_ptr + offs_m[:, None] * N + offs_n[None, :],
+                                     mask=mask_mn, other=0.0))
+        else:
+            c = tl.dot(a, b)
+    if FORM == 5:
+        c = c + tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
+    elif FORM == 6:
+        c = tl.where(c >= 0, c, 0.01 * c)
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], c.to(c_ptr.dtype.element_ty),
+             mask=mask_mn)
+
+
+_LONE_FORMS = ["plain", "ragged", "transb", "loadedc", "f16out", "bias", "leaky"]
+
+
+@pytest.mark.parametrize("form", range(len(_LONE_FORMS)), ids=_LONE_FORMS)
+@pytest.mark.parametrize("warps", [1, 4])
+def test_lone_dot_forms_match_torch(form, warps):
+    m, n, k = (100, 72, 24) if form == 1 else (128, 128, 32)
+    torch.manual_seed(form * 13 + warps)
+    a = torch.randn(m, k)
+    bkn = torch.randn(k, n)
+    cin = torch.randn(m, n)
+    bias = torch.randn(n)
+    b = bkn.t().contiguous() if form == 2 else bkn
+    dtype = torch.float16 if form == 4 else torch.float32
+    c = torch.zeros(m, n, dtype=dtype, device="mps")
+    _lone_dot_forms_kernel[(triton.cdiv(m, 64), triton.cdiv(n, 64))](
+        a.to("mps"), b.to("mps"), c, cin.to("mps"), bias.to("mps"), m, n, k,
+        BM=64, BN=64, BK=32, FORM=form, num_warps=warps)
+    torch.mps.synchronize()
+    ref = a @ bkn
+    if form == 3:
+        ref = ref + cin
+    elif form == 5:
+        ref = ref + bias[None, :]
+    elif form == 6:
+        ref = torch.where(ref >= 0, ref, 0.01 * ref)
+    tol = 2e-2 if dtype == torch.float16 else 2e-3
+    torch.testing.assert_close(c.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+def test_lone_dot_runs_on_the_matmul_tier():
+    """No M x N result scratch: the matmul tier stores its tiles directly."""
+    got, ref, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+    assert "simdgroup_multiply_accumulate" in msl
+    assert "[4096]" not in msl
