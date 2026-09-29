@@ -31727,65 +31727,84 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
         // Storage keeps the widx ValueRange address stable for the staged
         // loads.
         llvm::SmallVector<mlir::Value, 1> widxStore{widxUi};
-        for (int mIter = 0; mIter < mPerWarp; ++mIter) {
+        // One K loop per chunk of this warp's tiles, carrying the chunk's
+        // accumulators: each step stages every A row-tile and B column-tile of
+        // the chunk ONCE and issues all of its MMAs. One loop per tile, as
+        // this was, staged an A and a B tile for every single MMA -- a
+        // quarter of the reuse the matmul tiers get, and what held every
+        // scalar-dot matmul (a K = BLOCK_K dot, an epilogue the SIMD tiers
+        // decline) near 250 GFLOP/s against their 1000+. The chunk is capped
+        // at 32 accumulators, the budget the runtime-K tier runs with.
+        auto tileIndexI32 = [&](mlir::Value warpPart, int iter,
+                                int warps) -> mlir::Value {
+          if (iter == 0 && warps == 1)
+            return warpPart;
+          auto c = mlir::arith::ConstantOp::create(
+              rewriter, loc, rewriter.getI32IntegerAttr(iter * warps));
+          return mlir::arith::AddIOp::create(rewriter, loc, warpPart,
+                                             c.getResult())
+              .getResult();
+        };
+        const int colsPerChunk = std::min(nPerWarp, 32);
+        const int rowsPerChunk = std::max(1, std::min(mPerWarp, 32 / colsPerChunk));
+        mlir::Value widx =
+            (numWarps > 1) ? mlir::Value(widxStore[0]) : mlir::Value();
+        auto addUi32 = [&](mlir::Value lhs, mlir::Value rhs) -> mlir::Value {
+          return toUi32(mlir::arith::AddIOp::create(rewriter, loc, toI32(lhs),
+                                                    toI32(rhs))
+                            .getResult());
+        };
+        mlir::Value scratchStride =
+            ConstantOp::create(rewriter, loc, rewriter.getIntegerAttr(ui32, N))
+                .getResult();
+        for (int m0 = 0; m0 < mPerWarp; m0 += rowsPerChunk) {
+          const int rows = std::min(rowsPerChunk, mPerWarp - m0);
           // tile_m = warpM + mIter*warpsM  (interleaved warp tiling)
-          mlir::Value mTileIdx = warpM;
-          if (mIter != 0 || warpsM != 1) {
-            auto c = mlir::arith::ConstantOp::create(
-                rewriter, loc, rewriter.getI32IntegerAttr(mIter * warpsM));
-            mTileIdx =
-                mlir::arith::AddIOp::create(rewriter, loc, warpM, c.getResult())
+          llvm::SmallVector<mlir::Value, 8> aTileRows, locRows;
+          for (int r = 0; r < rows; ++r) {
+            mlir::Value rowOff =
+                mlir::arith::MulIOp::create(
+                    rewriter, loc, tileIndexI32(warpM, m0 + r, warpsM),
+                    eight.getResult())
                     .getResult();
+            aTileRows.push_back(toUi32(
+                mlir::arith::AddIOp::create(rewriter, loc, rowOrigI32, rowOff)
+                    .getResult()));
+            locRows.push_back(toUi32(rowOff));
           }
-          mlir::Value rowOff = mlir::arith::MulIOp::create(
-                                   rewriter, loc, mTileIdx, eight.getResult())
-                                   .getResult();
-          mlir::Value aTileRow = toUi32(
-              mlir::arith::AddIOp::create(rewriter, loc, rowOrigI32, rowOff)
-                  .getResult());
-          mlir::Value locRow = toUi32(rowOff);
-          for (int nIter = 0; nIter < nPerWarp; ++nIter) {
-            mlir::Value nTileIdx = warpN;
-            if (nIter != 0 || warpsN != 1) {
-              auto c = mlir::arith::ConstantOp::create(
-                  rewriter, loc, rewriter.getI32IntegerAttr(nIter * warpsN));
-              nTileIdx = mlir::arith::AddIOp::create(rewriter, loc, warpN,
-                                                     c.getResult())
-                             .getResult();
+          for (int n0 = 0; n0 < nPerWarp; n0 += colsPerChunk) {
+            const int cols = std::min(colsPerChunk, nPerWarp - n0);
+            llvm::SmallVector<mlir::Value, 8> bTileCols, locCols;
+            for (int c = 0; c < cols; ++c) {
+              mlir::Value colOff =
+                  mlir::arith::MulIOp::create(
+                      rewriter, loc, tileIndexI32(warpN, n0 + c, warpsN),
+                      eight.getResult())
+                      .getResult();
+              bTileCols.push_back(toUi32(
+                  mlir::arith::AddIOp::create(rewriter, loc, colOrigI32, colOff)
+                      .getResult()));
+              locCols.push_back(toUi32(colOff));
             }
-            mlir::Value colOff = mlir::arith::MulIOp::create(
-                                     rewriter, loc, nTileIdx, eight.getResult())
-                                     .getResult();
-            mlir::Value bTileCol = toUi32(
-                mlir::arith::AddIOp::create(rewriter, loc, colOrigI32, colOff)
-                    .getResult());
-            mlir::Value locCol = toUi32(colOff);
-            // K-reduction carrying an 8x8 simdgroup accumulator.
-            mlir::Value accZero =
-                SimdgroupMatrixZeroOp::create(rewriter, loc, matTy).getResult();
+            llvm::SmallVector<mlir::Value, 32> accInits;
+            for (int t = 0; t < rows * cols; ++t)
+              accInits.push_back(
+                  SimdgroupMatrixZeroOp::create(rewriter, loc, matTy)
+                      .getResult());
             auto kZero = mlir::arith::ConstantOp::create(
                 rewriter, loc, rewriter.getI32IntegerAttr(0));
             auto kStep = mlir::arith::ConstantOp::create(
                 rewriter, loc, rewriter.getI32IntegerAttr(8));
             auto kLoop = mlir::scf::ForOp::create(
                 rewriter, loc, kZero.getResult(), toI32(reductionExtentUi),
-                kStep.getResult(), mlir::ValueRange{accZero});
+                kStep.getResult(), accInits);
             {
               mlir::OpBuilder::InsertionGuard g3(rewriter);
               rewriter.setInsertionPointToStart(kLoop.getBody());
-              mlir::Value acc = kLoop.getRegionIterArgs()[0];
-              mlir::Value widx =
-                  (numWarps > 1) ? mlir::Value(widxStore[0]) : mlir::Value();
               // Preserve flat scalar base offsets by adding them to the column
               // coordinate. The staged load computes row*stride+column, so
               // this remains valid without assuming the offset is divisible
               // by the runtime stride.
-              auto addUi32 = [&](mlir::Value lhs,
-                                 mlir::Value rhs) -> mlir::Value {
-                return toUi32(mlir::arith::AddIOp::create(
-                                  rewriter, loc, toI32(lhs), toI32(rhs))
-                                  .getResult());
-              };
               mlir::Value kUi =
                   addUi32(toUi32(kLoop.getInductionVar()), reductionStartUi);
               mlir::Value reductionEndUi =
@@ -31793,36 +31812,41 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
               mlir::Value aPhysicalCol = addUi32(kUi, adaptor.getABaseOffset());
               mlir::Value aPhysicalColExtent =
                   addUi32(reductionEndUi, adaptor.getABaseOffset());
-              mlir::Value bPhysicalCol =
-                  addUi32(bTileCol, adaptor.getBBaseOffset());
               mlir::Value bPhysicalColExtent =
                   addUi32(extentN, adaptor.getBBaseOffset());
               // A[aTileRow, k]: masked to (realM rows, realK cols).
-              mlir::Value aTile = emitStagedLoad(
-                  rewriter, loc, matTy, adaptor.getABuf(), aTileRow,
-                  aPhysicalCol, strideAui,
-                  /*transposed=*/false, extentM, aPhysicalColExtent, widx);
+              llvm::SmallVector<mlir::Value, 8> aTiles, bTiles;
+              for (mlir::Value aTileRow : aTileRows)
+                aTiles.push_back(emitStagedLoad(
+                    rewriter, loc, matTy, adaptor.getABuf(), aTileRow,
+                    aPhysicalCol, strideAui,
+                    /*transposed=*/false, extentM, aPhysicalColExtent, widx));
               // B[k, bTileCol]: masked to (realK rows, realN cols).
-              mlir::Value bTile =
-                  emitStagedLoad(rewriter, loc, matTy, adaptor.getBBuf(), kUi,
-                                 bPhysicalCol, strideBui, /*transposed=*/false,
-                                 reductionEndUi, bPhysicalColExtent, widx);
-              mlir::Value newAcc = SimdgroupMultiplyAccumulateOp::create(
-                                       rewriter, loc, matTy, acc, aTile, bTile)
-                                       .getResult();
-              mlir::scf::YieldOp::create(rewriter, loc,
-                                         mlir::ValueRange{newAcc});
+              for (mlir::Value bTileCol : bTileCols)
+                bTiles.push_back(emitStagedLoad(
+                    rewriter, loc, matTy, adaptor.getBBuf(), kUi,
+                    addUi32(bTileCol, adaptor.getBBaseOffset()), strideBui,
+                    /*transposed=*/false, reductionEndUi, bPhysicalColExtent,
+                    widx));
+              llvm::SmallVector<mlir::Value, 32> newAccs;
+              for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < cols; ++c)
+                  newAccs.push_back(
+                      SimdgroupMultiplyAccumulateOp::create(
+                          rewriter, loc, matTy,
+                          kLoop.getRegionIterArgs()[r * cols + c], aTiles[r],
+                          bTiles[c])
+                          .getResult());
+              mlir::scf::YieldOp::create(rewriter, loc, newAccs);
             }
-            // Store the tile into scratch at LOCAL (tile_m*8, tile_n*8), stride
-            // N.
-            mlir::Value scratchStride =
-                ConstantOp::create(rewriter, loc,
-                                   rewriter.getIntegerAttr(ui32, N))
-                    .getResult();
-            SimdgroupStoreOp::create(rewriter, loc, kLoop.getResult(0), scratch,
-                                     locRow, locCol, scratchStride,
-                                     llvm::SmallVector<mlir::Value, 2>{},
-                                     mlir::ValueRange{});
+            // Store each tile into scratch at LOCAL (tile_m*8, tile_n*8),
+            // stride N.
+            for (int r = 0; r < rows; ++r)
+              for (int c = 0; c < cols; ++c)
+                SimdgroupStoreOp::create(
+                    rewriter, loc, kLoop.getResult(r * cols + c), scratch,
+                    locRows[r], locCols[c], scratchStride,
+                    llvm::SmallVector<mlir::Value, 2>{}, mlir::ValueRange{});
           }
         }
         BarrierOp::create(rewriter, loc);

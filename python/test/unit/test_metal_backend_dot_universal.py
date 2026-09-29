@@ -4840,3 +4840,67 @@ def test_constant_trip_matmul_is_a_loop_not_an_unroll(k_tiles):
     assert "simdgroup_multiply_accumulate" in msl
     assert msl.count("simdgroup_multiply_accumulate") <= 32
     assert len(msl.splitlines()) < 400
+
+
+# --- The scalar dot's SIMD-group path reuses each staged tile ---------------
+#
+# A lone `tl.dot` (K = BLOCK_K, so Triton leaves no loop) and every epilogue
+# the SIMD-group tiers decline run on the scalar dot's SIMD-group path. It ran
+# one K loop per 8x8 output tile, staging an A and a B tile for every single
+# MMA: 234-279 GFLOP/s at n = 2048. It now runs one K loop per chunk of a
+# warp's tiles (at most 32 accumulators), staging each A row-tile and B
+# column-tile once per step: 446-809.
+@triton.jit
+def _single_dot_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
+                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                       MASKED: tl.constexpr):
+    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    if MASKED:
+        a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :],
+                    mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], tl.dot(a, b),
+                 mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    else:
+        a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
+        b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :])
+        tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], tl.dot(a, b))
+
+
+def _run_single_dot(m, n, k, bm, bn, bk, warps, masked):
+    torch.manual_seed(m + n + k + bm + bn + warps)
+    a = torch.randn(m, k)
+    b = torch.randn(k, n)
+    c = torch.zeros(m, n, device="mps")
+    h = _single_dot_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
+        a.to("mps"), b.to("mps"), c, m, n, k, BM=bm, BN=bn, BK=bk, MASKED=masked,
+        num_warps=warps)
+    torch.mps.synchronize()
+    msl = h.asm["metal"]
+    return c.cpu(), a @ b, msl.decode() if isinstance(msl, bytes) else msl
+
+
+@pytest.mark.parametrize("m,n,k,bm,bn,bk,masked", [
+    (128, 128, 32, 64, 64, 32, 0),
+    (128, 128, 64, 64, 64, 64, 0),
+    (100, 72, 24, 64, 64, 32, 1),     # ragged M, N and K under one tile
+    (8, 1024, 32, 8, 512, 32, 0),     # 64 column tiles: more than one chunk
+    (512, 16, 16, 256, 16, 16, 0),    # tall and thin
+    (16, 512, 16, 16, 256, 16, 1),    # short and wide, masked
+])
+@pytest.mark.parametrize("warps", [1, 4])
+def test_single_dot_multi_tile_matches_torch(m, n, k, bm, bn, bk, masked, warps):
+    got, ref, _ = _run_single_dot(m, n, k, bm, bn, bk, warps, masked)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+def test_single_dot_stages_each_tile_once_per_step():
+    """One K loop for the warp's sixteen tiles, not sixteen loops of one MMA."""
+    import re
+    _, _, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0)
+    k_loops = re.findall(r"for \(int v\d+ = 0; v\d+ < [^;]+; v\d+ \+= 8\)", msl)
+    assert msl.count("simdgroup_multiply_accumulate") == 16
+    assert len(k_loops) == 1
