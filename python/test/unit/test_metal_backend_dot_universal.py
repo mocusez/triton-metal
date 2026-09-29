@@ -4642,3 +4642,107 @@ def test_single_dot_strided_operand_matches_torch(sak, sbn, shape, warps):
     torch.mps.synchronize()
     ref = big_a[:, :sak * k:sak] @ big_b[:, :sbn * n:sbn]
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=2e-3)
+
+
+# --- A value-only epilogue on the SIMD-group tiers -------------------------
+#
+# An epilogue that is a function of each accumulator element alone, with
+# constant operands, is applied to the accumulator matrices in registers
+# (`metal.simdgroup_map`). Before, any epilogue at all sent the matmul to the
+# scalar tier: the tutorial matmul with a leaky ReLU ran at 70-190 GFLOP/s
+# against 730-1560 without it. Epilogues that read a bias vector or a runtime
+# scalar are not value-only and must still be answered by another tier.
+@triton.jit
+def _epilogue_matmul_kernel(a_ptr, b_ptr, c_ptr, bias_ptr, M, N, K, alpha,
+                            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                            K_TILES: tl.constexpr, LOOP: tl.constexpr,
+                            EPI: tl.constexpr):
+    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    if LOOP == 0:
+        a_ptrs = a_ptr + (offs_m % M)[:, None] * K + offs_k[None, :]
+        b_ptrs = b_ptr + offs_k[:, None] * N + (offs_n % N)[None, :]
+        for kk in range(0, tl.cdiv(K, BK)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - kk * BK, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - kk * BK, other=0.0)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BK
+            b_ptrs += BK * N
+    elif LOOP == 1:
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+        b_ptrs = b_ptr + offs_k[:, None] * N + offs_n[None, :]
+        for _ in range(0, K_TILES):
+            acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)
+            a_ptrs += BK
+            b_ptrs += BK * N
+    else:
+        for kk in range(0, K, BK):
+            ok = kk + offs_k
+            a = tl.load(a_ptr + offs_m[:, None] * K + ok[None, :],
+                        mask=(offs_m[:, None] < M) & (ok[None, :] < K), other=0.0)
+            b = tl.load(b_ptr + ok[:, None] * N + offs_n[None, :],
+                        mask=(ok[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+            acc += tl.dot(a, b)
+    if EPI == 1:
+        acc = tl.where(acc >= 0, acc, 0.01 * acc)
+    elif EPI == 2:
+        acc = acc * 0.5 + 1.0
+    elif EPI == 3:
+        acc = acc / (1.0 + tl.exp(-acc))
+    elif EPI == 4:
+        acc = tl.minimum(tl.maximum(tl.abs(acc) - 1.0, -2.0), 3.0)
+    elif EPI == 5:
+        acc = acc + tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
+    elif EPI == 6:
+        acc = acc * alpha
+    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+_EPILOGUES = {1: "leaky", 2: "scaleshift", 3: "silu", 4: "clampabs", 5: "bias", 6: "alpha"}
+
+
+def _epilogue_ref(r, epi, bias, alpha):
+    return {0: lambda: r, 1: lambda: torch.where(r >= 0, r, 0.01 * r),
+            2: lambda: r * 0.5 + 1.0, 3: lambda: r * torch.sigmoid(r),
+            4: lambda: (r.abs() - 1.0).clamp(-2.0, 3.0), 5: lambda: r + bias[None, :],
+            6: lambda: r * alpha}[epi]()
+
+
+def _run_epilogue_matmul(loop, epi, m, n, k, dtype, warps, block=64):
+    torch.manual_seed(m + n + k + epi + loop)
+    a = torch.randn(m, k)
+    b = torch.randn(k, n)
+    bias = torch.randn(n)
+    c = torch.zeros(m, n, dtype=dtype, device="mps")
+    grid = (triton.cdiv(m, block), triton.cdiv(n, block))
+    h = _epilogue_matmul_kernel[grid](a.to("mps"), b.to("mps"), c, bias.to("mps"), m, n, k, 0.75,
+                                      BM=block, BN=block, BK=32, K_TILES=k // 32, LOOP=loop,
+                                      EPI=epi, num_warps=warps)
+    torch.mps.synchronize()
+    ref = _epilogue_ref(a.double() @ b.double(), epi, bias.double(), 0.75)
+    msl = h.asm["metal"]
+    return c.cpu().double(), ref, msl.decode() if isinstance(msl, bytes) else msl
+
+
+@pytest.mark.parametrize("loop", [0, 1, 2], ids=["tutorial", "static", "recompute"])
+@pytest.mark.parametrize("epi", list(_EPILOGUES), ids=list(_EPILOGUES.values()))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["f32", "f16"])
+@pytest.mark.parametrize("warps", [1, 4])
+def test_matmul_epilogue_matches_torch(loop, epi, dtype, warps):
+    m, n, k = (128, 128, 96) if loop == 1 else (100, 72, 88)
+    got, ref, _ = _run_epilogue_matmul(loop, epi, m, n, k, dtype, warps)
+    tol = 2e-2 if dtype == torch.float16 else 2e-3
+    torch.testing.assert_close(got, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("loop", [0, 1, 2], ids=["tutorial", "static", "recompute"])
+@pytest.mark.parametrize("epi", [1, 2, 3, 4], ids=["leaky", "scaleshift", "silu", "clampabs"])
+def test_matmul_value_epilogue_stays_on_simdgroup_tier(loop, epi):
+    """The epilogue is applied to the accumulator matrices, not by the scalar tier."""
+    m, n, k = (128, 128, 96)
+    _, _, msl = _run_epilogue_matmul(loop, epi, m, n, k, torch.float32, 4)
+    assert "simdgroup_multiply_accumulate" in msl
+    assert "thread_elements()" in msl

@@ -469,7 +469,8 @@ void ModuleTranslation::translateVarName(mlir::Value memref) {
                   mlir::triton::metal::SimdgroupLoadDeviceStagedOp,
             mlir::triton::metal::SimdgroupLoadDeviceStagedMaskedOp,
                   mlir::triton::metal::SimdgroupLoadOp,
-                  mlir::triton::metal::SimdgroupMultiplyAccumulateOp>(opInst)) {
+                  mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
+                  mlir::triton::metal::SimdgroupMapOp>(opInst)) {
     _output << "v" << _alloca[opInst];
   } else {
     llvm_unreachable("llvm_unreachable");
@@ -668,6 +669,7 @@ bool ModuleTranslation::isStatementPrintable(Operation *opInst) {
             mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
+            mlir::triton::metal::SimdgroupMapOp,
             mlir::triton::metal::SimdgroupStoreOp,
             mlir::triton::metal::SimdgroupFusedStoreOp, mlir::scf::IfOp,
             mlir::scf::ForOp, mlir::scf::WhileOp,
@@ -732,6 +734,7 @@ void ModuleTranslation::translateStatement(Operation *opInst) {
             mlir::triton::metal::SimdgroupLoadDeviceStagedBatchOp,
             mlir::triton::metal::SimdgroupLoadOp,
             mlir::triton::metal::SimdgroupMultiplyAccumulateOp,
+            mlir::triton::metal::SimdgroupMapOp,
             mlir::triton::metal::SimdgroupStoreOp,
             mlir::triton::metal::SimdgroupFusedStoreOp,
             mlir::triton::metal::SimdgroupIndexOp>(
@@ -1882,6 +1885,57 @@ void ModuleTranslation::translate(
   _output << ")";
   _alloca[op] = id;
   printDelim();
+}
+
+// Each lane owns two elements of an 8x8 SIMD-group matrix. The body is a pure
+// scalar DAG, so IR order is a valid emission order; its values are let-bound
+// in a scope of their own, one per element.
+void ModuleTranslation::translate(mlir::triton::metal::SimdgroupMapOp op) {
+  auto resTy = llvm::cast<mlir::triton::metal::MetalSimdgroupMatrixType>(
+      op.getResult().getType());
+  emitSimdgroupMatrixType(_output, resTy);
+  unsigned id = _varCount++;
+  _output << " v" << id << " = ";
+  translateVarName(op.getMatrix());
+  printDelim();
+  _output << "\n";
+  indent();
+  mlir::Block &body = op.getBody().front();
+  unsigned elemIdx = _varCount++;
+  _output << "for (ushort v" << elemIdx << " = 0; v" << elemIdx
+          << " < 2; ++v" << elemIdx << ") {";
+  {
+    INDENT();
+    _output << "\n";
+    indent();
+    unsigned argIdx = _varCount++;
+    _output << typeToString(body.getArgument(0).getType()) << " v" << argIdx
+            << " = v" << id << ".thread_elements()[v" << elemIdx << "]";
+    printDelim();
+    _buffers[body.getArgument(0).getAsOpaquePointer()] = argIdx;
+    for (mlir::Operation &o : body.without_terminator()) {
+      _letBound.erase(&o);
+      _output << "\n";
+      indent();
+      unsigned idx = _varCount++;
+      _output << typeToString(o.getResult(0).getType()) << " v" << idx
+              << " = ";
+      translateValue(&o);
+      printDelim();
+      _letBound[&o] = idx;
+    }
+    auto yield =
+        mlir::cast<mlir::triton::metal::SimdgroupMapYieldOp>(body.getTerminator());
+    _output << "\n";
+    indent();
+    _output << "v" << id << ".thread_elements()[v" << elemIdx << "] = ";
+    translateValueOrVarName(yield.getValue());
+    printDelim();
+  }
+  _output << "\n";
+  indent();
+  _output << "}";
+  _alloca[op] = id;
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::SimdgroupStoreOp op) {

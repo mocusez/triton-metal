@@ -290,6 +290,7 @@ private:
   void translate(mlir::triton::metal::SimdgroupLoadOp op);
   void translate(mlir::triton::metal::SimdgroupMultiplyAccumulateOp op);
   void translate(mlir::triton::metal::SimdgroupStoreOp op);
+  void translate(mlir::triton::metal::SimdgroupMapOp op);
   void translate(mlir::triton::metal::SimdgroupFusedStoreOp op);
 };
 

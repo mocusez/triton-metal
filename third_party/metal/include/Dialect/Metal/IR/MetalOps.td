@@ -1876,6 +1876,35 @@ def SimdgroupMultiplyAccumulateOp
                        " `:` functional-type(operands, results)";
 }
 
+def SimdgroupMapOp
+    : Metal_Op<"simdgroup_map", [SingleBlock, RecursiveMemoryEffects]> {
+  let summary = "Apply an elementwise scalar function to every element of a SIMD-group matrix";
+
+  let description = [{
+    A matmul's value-only epilogue -- `acc * 0.5 + 1`, a leaky ReLU, a
+    sigmoid -- applied to an accumulator tile while it is still in registers.
+    The body takes one element (block argument of the matrix's element type)
+    and yields its image through `metal.simdgroup_map_yield`; every other value
+    it uses is a constant it defines itself. The lowering copies the matrix and
+    rewrites each lane's `thread_elements()` in place, so whichever store
+    follows -- direct, masked-tail or narrowing -- is unchanged.
+  }];
+
+  let arguments = (ins Metal_SimdgroupMatrixType:$matrix);
+  let results = (outs Metal_SimdgroupMatrixType:$result);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = "$matrix attr-dict `:` type($matrix) `->` type($result) $body";
+}
+
+def SimdgroupMapYieldOp : Metal_Op<"simdgroup_map_yield",
+                                   [Pure, Terminator,
+                                    HasParent<"SimdgroupMapOp">]> {
+  let summary = "Terminator of a metal.simdgroup_map body";
+  let arguments = (ins AnyType:$value);
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def SimdgroupStoreOp
     : Metal_Op<"simdgroup_store", [AttrSizedOperandSegments]> {
   let summary = "Cooperative SIMD-group store of a matrix tile to device memory";

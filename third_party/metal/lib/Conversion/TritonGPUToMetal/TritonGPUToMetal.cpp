@@ -23935,6 +23935,146 @@ static mlir::Value emitExtentUi32(mlir::OpBuilder &b, mlir::Location loc,
 // `[tt.load A, tt.load B, tt.dot, tt.addptr A, tt.addptr B, scf.yield]`.
 // For each unrolled iter i, emits per-iter K-axis origin = base + i*BK.
 // See the implementation notes.
+namespace {
+static mlir::Value emitConeScalar(mlir::OpBuilder &b, mlir::Location loc,
+                                  mlir::Value v,
+                                  llvm::DenseMap<void *, mlir::Value> &leaf,
+                                  llvm::DenseMap<void *, mlir::Value> &memo,
+                                  int depth);
+} // namespace
+
+// A matmul's VALUE-ONLY epilogue: the elementwise cone between a K loop's
+// accumulator and the one value its store path consumes -- `acc * 0.5 + 1`, a
+// leaky ReLU `where(acc >= 0, acc, 0.01 * acc)`, a sigmoid. Every op is
+// elementwise over the accumulator tile, every operand outside the cone is a
+// splat constant, and exactly one cone value leaves it, through one use. Such
+// an epilogue is a scalar function of each accumulator element alone, so the
+// SIMD-group tiers apply it to their accumulator matrices in registers
+// (`metal.simdgroup_map`) instead of ceding the whole matmul to the scalar
+// tier. 📏 the tutorial matmul with a leaky ReLU ran 5-16x slower than without.
+struct SimdValueEpilogue {
+  mlir::Value out;                            // what the store path consumes
+  llvm::SmallVector<mlir::Operation *, 8> ops; // the cone, in IR order
+};
+
+static std::optional<SimdValueEpilogue>
+matchSimdValueEpilogue(mlir::Value acc) {
+  SimdValueEpilogue ep;
+  ep.out = acc;
+  auto accTy = mlir::dyn_cast<mlir::RankedTensorType>(acc.getType());
+  mlir::Operation *accDef = acc.getDefiningOp();
+  if (!accTy || !accDef)
+    return std::nullopt;
+  auto isConeOp = [](mlir::Operation *op) {
+    return op->getNumResults() == 1 && op->getNumRegions() == 0 &&
+           mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp,
+                     mlir::arith::MulFOp, mlir::arith::DivFOp,
+                     mlir::arith::NegFOp, mlir::arith::MaxNumFOp,
+                     mlir::arith::MinNumFOp, mlir::arith::CmpFOp,
+                     mlir::arith::SelectOp, mlir::math::ExpOp,
+                     mlir::math::Exp2Op, mlir::math::SqrtOp, mlir::math::AbsFOp,
+                     mlir::triton::gpu::ConvertLayoutOp>(op);
+  };
+  auto isSplatConstant = [](mlir::Value v) {
+    auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+    auto dense =
+        cst ? mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue()) : nullptr;
+    return dense && dense.isSplat();
+  };
+  llvm::SmallPtrSet<mlir::Operation *, 16> cone;
+  llvm::SmallVector<mlir::Value, 8> frontier{acc};
+  while (!frontier.empty()) {
+    mlir::Value v = frontier.pop_back_val();
+    for (mlir::Operation *user : v.getUsers())
+      if (!cone.contains(user) && isConeOp(user)) {
+        if (cone.size() >= 64)
+          return std::nullopt;
+        cone.insert(user);
+        frontier.push_back(user->getResult(0));
+      }
+  }
+  if (cone.empty()) {
+    if (!acc.hasOneUse())
+      return std::nullopt;
+    return ep;
+  }
+  auto inCone = [&](mlir::Value v) {
+    return v == acc || (v.getDefiningOp() && cone.contains(v.getDefiningOp()));
+  };
+  for (mlir::Operation *op : cone) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+    if (op->getBlock() != accDef->getBlock() || !ty ||
+        ty.getShape() != accTy.getShape())
+      return std::nullopt;
+    for (mlir::Value operand : op->getOperands())
+      if (!inCone(operand) && !isSplatConstant(operand))
+        return std::nullopt;
+  }
+  mlir::Value exit;
+  auto noteExits = [&](mlir::Value v) {
+    for (mlir::Operation *user : v.getUsers())
+      if (!cone.contains(user)) {
+        if (exit && exit != v)
+          return false;
+        exit = v;
+      }
+    return true;
+  };
+  if (!noteExits(acc))
+    return std::nullopt;
+  for (mlir::Operation *op : cone)
+    if (!noteExits(op->getResult(0)))
+      return std::nullopt;
+  if (!exit || exit == acc || !exit.hasOneUse() ||
+      mlir::cast<mlir::RankedTensorType>(exit.getType()).getElementType() !=
+          accTy.getElementType())
+    return std::nullopt;
+  ep.out = exit;
+  for (mlir::Operation &op : *accDef->getBlock())
+    if (cone.contains(&op))
+      ep.ops.push_back(&op);
+  return ep;
+}
+
+// The epilogue as a `metal.simdgroup_map` body over one element of `elemTy`,
+// or null when a cone op has no scalar spelling. It is built once, before the
+// tier commits to anything, and held by a throwaway module until each store
+// clones it.
+static mlir::OwningOpRef<mlir::ModuleOp>
+buildSimdValueEpilogueBody(const SimdValueEpilogue &ep, mlir::Value acc,
+                           mlir::Type elemTy, mlir::Location loc) {
+  mlir::OwningOpRef<mlir::ModuleOp> holder = mlir::ModuleOp::create(loc);
+  mlir::Block *block = holder->getBody();
+  mlir::Value arg = block->addArgument(elemTy, loc);
+  mlir::OpBuilder b(block, block->end());
+  llvm::DenseMap<void *, mlir::Value> leaf, memo;
+  leaf[acc.getAsOpaquePointer()] = arg;
+  mlir::Value out = emitConeScalar(b, loc, ep.out, leaf, memo, 0);
+  if (!out || out.getType() != elemTy)
+    return nullptr;
+  mlir::triton::metal::SimdgroupMapYieldOp::create(b, loc, out);
+  return holder;
+}
+
+// Apply the held body to `matrix`, or return it unchanged when there is none.
+static mlir::Value applySimdValueEpilogue(mlir::OpBuilder &b, mlir::Location loc,
+                                          mlir::ModuleOp body,
+                                          mlir::Value matrix) {
+  if (!body)
+    return matrix;
+  auto map = mlir::triton::metal::SimdgroupMapOp::create(
+      b, loc, matrix.getType(), matrix);
+  mlir::IRMapping mapping;
+  body.getBodyRegion().cloneInto(&map.getBody(), mapping);
+  return map.getResult();
+}
+
+// Erase a matched epilogue once its store is gone, users first.
+static void eraseSimdValueEpilogue(const SimdValueEpilogue &ep) {
+  for (auto it = ep.ops.rbegin(); it != ep.ops.rend(); ++it)
+    (*it)->erase();
+}
+
 static mlir::LogicalResult
 tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   auto forOp = dot->getParentOfType<mlir::scf::ForOp>();
@@ -24156,8 +24296,16 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     return mlir::failure();
 
   // Locate the store consuming the for's accumulator result.
-  if (!forOp.getResult(accIdx).hasOneUse())
+  auto epilogue = matchSimdValueEpilogue(forOp.getResult(accIdx));
+  if (!epilogue)
     return mlir::failure();
+  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
+  if (!epilogue->ops.empty()) {
+    epilogueBody = buildSimdValueEpilogueBody(
+        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc());
+    if (!epilogueBody)
+      return mlir::failure();
+  }
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert an f32 accumulator loses to an
@@ -24166,7 +24314,7 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
   // slot and casts on the element write, while the unmasked path would need a
   // Metal overload writing an f32 matrix into a half buffer, which does not
   // exist.
-  mlir::Operation *accUser = *forOp.getResult(accIdx).getUsers().begin();
+  mlir::Operation *accUser = *epilogue->out.getUsers().begin();
   mlir::arith::TruncFOp narrowing;
   mlir::triton::gpu::ConvertLayoutOp narrowCvt;
   if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
@@ -24436,7 +24584,10 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     // Final store. AC2: attach `partial_extents = [m_extent, n_extent]`
     // operands when the tt.store had a (offs_m < M) & (offs_n < N) mask so
     // the emitter routes through the threadgroup-scratch masked epilogue.
-    SimdgroupStoreOp::create(builder, loc, acc, cBuf, cRowOrigin, cColOrigin,
+    SimdgroupStoreOp::create(builder, loc,
+                             applySimdValueEpilogue(builder, loc,
+                                                    epilogueBody.get(), acc),
+                             cBuf, cRowOrigin, cColOrigin,
                              strideCVal, partialExtents, mlir::ValueRange{});
   } else {
     // AC4 v6 multi-tile path.
@@ -24578,7 +24729,10 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
           }
         }
 
-        SimdgroupStoreOp::create(builder, loc, acc, cBuf, cTileRow, cTileCol,
+        SimdgroupStoreOp::create(builder, loc,
+                                 applySimdValueEpilogue(
+                                     builder, loc, epilogueBody.get(), acc),
+                                 cBuf, cTileRow, cTileCol,
                                  strideCVal, partialExtents,
                                  multiWarp && !partialExtents.empty()
                                      ? mlir::ValueRange{widxUi32Hoisted}
@@ -24595,6 +24749,7 @@ tryUnrollCanonical3IterArgDot(mlir::triton::DotOp dot) {
     narrowCvt.erase();
   if (narrowing)
     narrowing.erase();
+  eraseSimdValueEpilogue(*epilogue);
   forOp.erase();
   return mlir::success();
 }
@@ -24931,8 +25086,16 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   if (mPerWarp * nPerWarp > 32)
     return mlir::failure();
 
-  if (!forOp.getResult(accIdx).hasOneUse())
+  auto epilogue = matchSimdValueEpilogue(forOp.getResult(accIdx));
+  if (!epilogue)
     return mlir::failure();
+  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
+  if (!epilogue->ops.empty()) {
+    epilogueBody = buildSimdValueEpilogueBody(
+        *epilogue, forOp.getResult(accIdx), elemTy, forOp.getLoc());
+    if (!epilogueBody)
+      return mlir::failure();
+  }
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert an f32 accumulator loses to an
@@ -24943,8 +25106,7 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
   // store can carry the narrowing: it stages through an f32 threadgroup slot
   // and casts on the element write, while the unmasked path would need a Metal
   // overload writing an f32 matrix into a half buffer, which does not exist.
-  mlir::Operation *accUser =
-      *forOp.getResult(accIdx).getUsers().begin();
+  mlir::Operation *accUser = *epilogue->out.getUsers().begin();
   mlir::arith::TruncFOp narrowing;
   mlir::triton::gpu::ConvertLayoutOp narrowCvt;
   if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
@@ -25398,7 +25560,8 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
       for (int ni = 0; ni < nPerWarp; ++ni) {
         int idx = mi * nPerWarp + ni;
         SimdgroupStoreOp::create(
-            b, l, accs[idx], cBuf, cRowTiles[mi], cColTiles[ni], strideCVal,
+            b, l, applySimdValueEpilogue(b, l, epilogueBody.get(), accs[idx]),
+            cBuf, cRowTiles[mi], cColTiles[ni], strideCVal,
             partialExtents,
             (activeWarps > 1 && !partialExtents.empty())
                 ? mlir::ValueRange{widx}
@@ -25483,6 +25646,7 @@ tryRuntimeKLoopCanonicalDot(mlir::triton::DotOp dot) {
     narrowCvt.erase();
   if (narrowing)
     narrowing.erase();
+  eraseSimdValueEpilogue(*epilogue);
   forOp.erase();
   return mlir::success();
 }
@@ -25804,8 +25968,16 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   if (mPerWarp * nTiles > 32)
     return mlir::failure();
 
-  if (!forOp.getResult(0).hasOneUse())
+  auto epilogue = matchSimdValueEpilogue(forOp.getResult(0));
+  if (!epilogue)
     return mlir::failure();
+  mlir::OwningOpRef<mlir::ModuleOp> epilogueBody;
+  if (!epilogue->ops.empty()) {
+    epilogueBody = buildSimdValueEpilogueBody(*epilogue, forOp.getResult(0),
+                                              elemTy, forOp.getLoc());
+    if (!epilogueBody)
+      return mlir::failure();
+  }
   // A matmul that writes a narrower element than its f32 accumulator puts one
   // dtype convert between the loop and the store: `acc.to(tl.float16)` is an
   // `arith.truncf`, and the layout convert that an f32 accumulator loses to an
@@ -25816,7 +25988,7 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
   // staging slot. Without this the early scalar-dot fallback claims every real
   // f16 matmul: measured medians of 187 against 713 billion floating-point
   // operations a second on a 1024-cubed product.
-  mlir::Operation *accUser = *forOp.getResult(0).getUsers().begin();
+  mlir::Operation *accUser = *epilogue->out.getUsers().begin();
   mlir::arith::TruncFOp narrowing;
   mlir::triton::gpu::ConvertLayoutOp narrowCvt;
   if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(accUser)) {
@@ -26054,7 +26226,10 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
     for (int mi = 0; mi < mPerWarp; ++mi)
       for (int ni = 0; ni < nTiles; ++ni)
         SimdgroupStoreOp::create(
-            b, loc, accs[mi * nTiles + ni], cBuf, cRowTile[mi], cColTile[ni],
+            b, loc,
+            applySimdValueEpilogue(b, loc, epilogueBody.get(),
+                                   accs[mi * nTiles + ni]),
+            cBuf, cRowTile[mi], cColTile[ni],
             strideCVal, oPartial,
             multiWarp && store.getMask() ? mlir::ValueRange{widx}
                                          : mlir::ValueRange{});
@@ -26121,6 +26296,7 @@ tryRuntimeKLoopRecomputeDot(mlir::triton::DotOp dot) {
     narrowCvt.erase();
   if (narrowing)
     narrowing.erase();
+  eraseSimdValueEpilogue(*epilogue);
   forOp.erase();
   return mlir::success();
 }
@@ -30635,6 +30811,14 @@ tryScalarDotLoopFallback(mlir::scf::ForOp forOp,
   };
   if (!allowStoreConsumer && reachesStore(afterRes))
     return mlir::failure();
+  // A value-only epilogue before that store is carried by the SIMD-group tiers
+  // too (`metal.simdgroup_map`); defer it the same way. If no SIMD tier takes
+  // it, the final pass (`allowStoreConsumer`) still collapses it here.
+  if (!allowStoreConsumer) {
+    auto epilogue = matchSimdValueEpilogue(loopRes);
+    if (epilogue && !epilogue->ops.empty() && reachesStore(epilogue->out))
+      return mlir::failure();
+  }
 
   // Collapsing the loop means naming the reduction's length, and with no
   // extent the op falls back to A's ROW stride. That is the same length only
