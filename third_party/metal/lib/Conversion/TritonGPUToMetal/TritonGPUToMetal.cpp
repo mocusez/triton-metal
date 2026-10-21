@@ -352,9 +352,12 @@ static mlir::Value coneReplaySource(mlir::Operation *def) {
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
-// A row reduction consumes the same complete input publication as a scan.
+// A reduction consumes a complete input publication grouped with a scan.
 static constexpr llvm::StringLiteral kScanInputReduceAttr =
     "metal.scan_input_reduce";
+// This expand forwards a fold already evaluated at its tile's column.
+static constexpr llvm::StringLiteral kScanColumnBroadcastAttr =
+    "metal.scan_column_broadcast";
 // Set on a rank-N reduce whose staged scratch is relabelled into the emitter's
 // own thread-major order. The decision is made from the reduce's SOURCE, and
 // the phase pre-pass later replaces that source with a placeholder, so it has
@@ -5309,6 +5312,8 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
                           llvm::DenseSet<mlir::Operation *> &out) {
   mlir::LogicalResult status = mlir::success();
   moduleOp.walk([&](mlir::triton::ExpandDimsOp ed) {
+    if (ed->hasAttr(kScanColumnBroadcastAttr))
+      return;
     auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
     auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(ed.getType());
     if (!srcTy || srcTy.getRank() != 1 || !resTy || resTy.getRank() != 2)
@@ -5407,6 +5412,10 @@ struct ExpandDimsLowering
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ExpandDimsOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    if (op->hasAttr(kScanColumnBroadcastAttr)) {
+      rewriter.replaceOp(op, adaptor.getSrc());
+      return mlir::success();
+    }
     auto loc = op.getLoc();
     auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
     if (auto attr = op->getAttrOfType<mlir::TypeAttr>(
@@ -16674,6 +16683,99 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
   return mlir::success();
 }
 
+// A direct same-tile column broadcast consumes the exact fold at each tile
+// element's column, without a lane-indexed republish. Check its entire consumer
+// cone so early preflight and scan planning agree on the admitted envelope.
+static mlir::triton::ExpandDimsOp
+scanColumnBroadcastExpand(mlir::triton::ReduceOp reduce) {
+  if (reduce.getSrcs().size() != 1)
+    return {};
+  auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+      reduce.getSrcs().front().getType());
+  if (!type || type.getRank() != 2)
+    return {};
+  if (reduce.getAxis() != 0 || reduce.getSrcs().size() != 1 ||
+      reduce.getNumResults() != 1 || !reduce->hasOneUse() ||
+      (!type.getElementType().isF32() &&
+       !type.getElementType().isInteger(32)))
+    return {};
+  auto *combine = reduceCombineBinaryOp(reduce);
+  if (!combine ||
+      !mlir::isa<mlir::arith::AddFOp, mlir::arith::MaximumFOp,
+                 mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
+                 mlir::arith::MinNumFOp, mlir::arith::AddIOp,
+                 mlir::arith::MaxSIOp, mlir::arith::MinSIOp>(combine))
+    return {};
+  auto layout = planLayoutIndex(type);
+  if (!layout || type.getDimSize(0) < 2 || type.getDimSize(0) > 64 ||
+      type.getDimSize(1) < 2 || type.getDimSize(1) > 256)
+    return {};
+  auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(
+      *reduce->getUsers().begin());
+  if (!expand || expand.getAxis() != 0 || !expand->hasOneUse() ||
+      expand->getBlock() != reduce->getBlock())
+    return {};
+  auto broadcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(
+      *expand->getUsers().begin());
+  if (!broadcast || broadcast.getType() != type ||
+      broadcast->getBlock() != reduce->getBlock())
+    return {};
+  llvm::SmallVector<mlir::Value, 16> worklist{broadcast.getResult()};
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  bool sawStore = false;
+  while (!worklist.empty()) {
+    auto value = worklist.pop_back_val();
+    for (auto *user : value.getUsers()) {
+      if (user->getBlock() != reduce->getBlock())
+        return {};
+      if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(user)) {
+        if (store.getValue() != value)
+          return {};
+        sawStore = true;
+        continue;
+      }
+      if (!seen.insert(user).second)
+        continue;
+      if (user->getNumRegions() || user->hasAttr(kExchangeAttr) ||
+          !user->hasTrait<mlir::OpTrait::Elementwise>() ||
+          !mlir::isMemoryEffectFree(user) ||
+          mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user))
+        return {};
+      for (auto result : user->getResults()) {
+        auto resultTy =
+            mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
+        if (!resultTy || resultTy.getShape() != type.getShape() ||
+            resultTy.getEncoding() != type.getEncoding())
+          return {};
+        worklist.push_back(result);
+      }
+    }
+  }
+  return sawStore ? expand : mlir::triton::ExpandDimsOp{};
+}
+
+// Only postpone the legacy wide-column gate for a single, matching staged
+// scan. The phase planner remains authoritative about source lifetimes and
+// publication budgets, and the caller must verify that it claimed this reduce.
+static bool hasMatchingColumnBroadcastScan(mlir::triton::ReduceOp reduce) {
+  auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
+  if (!func)
+    return false;
+  llvm::SmallVector<mlir::triton::ScanOp, 2> scans;
+  func.walk([&](mlir::triton::ScanOp scan) { scans.push_back(scan); });
+  if (scans.size() != 1)
+    return false;
+  auto scan = scans.front();
+  if (scan.getSrcs().size() != 1 ||
+      scan->getBlock() != reduce->getBlock() ||
+      !mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) ||
+      !scan->isBeforeInBlock(reduce) ||
+      scan.getSrcs().front().getType() != reduce.getSrcs().front().getType())
+    return false;
+  auto plan = planStagedScan(scan);
+  return plan && plan->layout && plan->layout->elemPerThread > 1;
+}
+
 // Publish every source register band before a staged scan reads any prefix.
 // Keep independent work before the boundary and rematerialize shared indices.
 static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
@@ -16808,20 +16910,21 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                      store.getValue() == cvt.getResult();
                             });
       };
-      // Column reductions use the same exact-layout fold, but only vector
-      // stores are admitted: column broadcasts still need their own phase
-      // and result-mapping contract.
+      // Column vector stores use the exact result layout. A narrow broadcast
+      // below instead evaluates the fold at each consuming tile's column.
       bool directColumnStore =
           reduce.getAxis() == 0 && !reduce->use_empty() &&
           llvm::all_of(reduce->getUsers(), isDirectStore);
-      if ((reduce.getAxis() == 1 || directColumnStore) &&
+      if ((reduce.getAxis() == 1 || reduce.getAxis() == 0) &&
           functionScans.size() == 1 &&
           (type.getElementType().isF32() ||
            type.getElementType().isInteger(32))) {
         auto scan = functionScans.front();
         auto scanPlan = planStagedScan(scan);
         bool sameSource = scan.getSrcs().front() == reduce.getSrcs().front();
+        auto columnExpand = scanColumnBroadcastExpand(reduce);
         if (scanPlan && scanPlan->layout &&
+            (reduce.getAxis() == 1 || directColumnStore || columnExpand) &&
             scanPlan->layout->elemPerThread > 1 &&
             scan->getBlock() == reduce->getBlock() &&
             mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) &&
@@ -16835,7 +16938,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             valid = false;
             return;
           }
-          if (directColumnStore && type.getElementType().isInteger(32)) {
+          if ((directColumnStore || columnExpand) &&
+              type.getElementType().isInteger(32)) {
             auto load = reduce.getSrcs().front().getDefiningOp<
                 mlir::triton::LoadOp>();
             if (!load || load.getMask()) {
@@ -16886,20 +16990,32 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           reduce->setAttr(kScanInputReduceAttr,
                           mlir::UnitAttr::get(moduleOp.getContext()));
           if (planRankNReduce(reduce)) {
+            if (columnExpand)
+              columnExpand->setAttr(kScanColumnBroadcastAttr,
+                                    mlir::UnitAttr::get(moduleOp.getContext()));
             scanInputReduces[scan.getOperation()].push_back(reduce);
             return;
           }
           reduce->removeAttr(kScanInputReduceAttr);
         }
       }
-      // A column reduce broadcast back into the tile (`tl.sum(v, 0)[None,
-      // :]`) has its own, more specific refusal further on; leave it that.
+      // Reject unsupported direct column broadcasts before partitioning the
+      // scan. Region captures can otherwise fail dominance verification before
+      // the later legacy-republish guard gets a chance to name the boundary.
+      // The expand's local element count cannot exempt a small independent
+      // tile: the surrounding scan still partitions the function into bands.
       if (reduce.getAxis() == 0 &&
           llvm::any_of(reduce->getUsers(), [](mlir::Operation *u) {
             auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(u);
             return ed && ed.getAxis() == 0;
-          }))
+          })) {
+        reduce.emitOpError(
+            "Metal backend: a scan-input column broadcast requires "
+            "same-layout f32/i32 sources and direct same-layout consumers in the "
+            "original tile");
+        valid = false;
         return;
+      }
       reduce.emitOpError(
           "Metal backend: a rank-2 tl.reduce cannot share a function with a "
           "multi-band staged scan");
@@ -42977,6 +43093,9 @@ struct ConvertTritonGPUToMetalPass
     // body is deferred to L3a; meanwhile any tt.reduce in the input IR is
     // rejected here with the spec-mandated error strings so the negative lit
     // suite still exercises the gate.
+    llvm::SmallVector<std::pair<mlir::triton::ReduceOp,
+                                mlir::triton::ExpandDimsOp>, 4>
+        deferredScanColumnBroadcasts;
     bool reduceOk = true;
     moduleOp.walk([&](mlir::triton::ReduceOp red) {
       auto axes = red.getAxis();
@@ -43228,6 +43347,11 @@ struct ConvertTritonGPUToMetalPass
                 (reexpanded &&
                  !(rank2Axis0ColumnBufferUsable(red, tpb, bn) &&
                    axis0ReexpansionConeEvaluable(red)))) {
+              if (auto expand = scanColumnBroadcastExpand(red);
+                  expand && hasMatchingColumnBroadcastScan(red)) {
+                deferredScanColumnBroadcasts.emplace_back(red, expand);
+                return;
+              }
               red.emitOpError(
                   "rank-2 axis=0 reduce with more output columns than threads "
                   "needs a rank-1 consumer carrying exactly those columns, and "
@@ -43662,6 +43786,20 @@ struct ConvertTritonGPUToMetalPass
     if (mlir::failed(preprocessStagedScanPhases(moduleOp))) {
       signalPassFailure();
       return;
+    }
+    // A deferred legacy rejection must never fall through to an unplanned
+    // lowering: failed full-conversion rollback is not a safe refusal path.
+    for (auto [reduce, expand] : deferredScanColumnBroadcasts) {
+      if (!reduce->hasAttr(kScanInputReduceAttr) ||
+          !expand->hasAttr(kScanColumnBroadcastAttr) ||
+          !g_rankNReducePublish.count(reduce.getOperation()) ||
+          !g_rankNPlannedReduces.count(reduce.getOperation())) {
+        reduce.emitOpError(
+            "Metal backend: wide scan-input column broadcast requires a "
+            "planned shared-input publication");
+        signalPassFailure();
+        return;
+      }
     }
     auto functionHasStagedScanPhase = [&](mlir::Operation *candidate) {
       auto func = candidate->getParentOfType<mlir::triton::FuncOp>();
@@ -44232,10 +44370,12 @@ struct ConvertTritonGPUToMetalPass
       // also stages a `tl.scan`, that slot reads back as ZERO -- measured: the
       // broadcast term contributes nothing, so the kernel returns the scan
       // alone, while the identical kernel without the scan is exact in all 15
-      // of its cells. Only a tile with more than one element per thread is
-      // affected; at one element there is no band loop for the phases to
-      // disagree about.
+      // of its cells. This legacy check uses the expanded tile's band count;
+      // preprocessStagedScanPhases also rejects unsupported direct broadcasts
+      // with smaller tiles when another scan makes the function multi-band.
       moduleOp.walk([&](mlir::triton::ExpandDimsOp expand) {
+        if (expand->hasAttr(kScanColumnBroadcastAttr))
+          return;
         auto srcTy =
             mlir::dyn_cast<mlir::RankedTensorType>(expand.getSrc().getType());
         auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(expand.getType());

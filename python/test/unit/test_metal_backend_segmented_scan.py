@@ -20,6 +20,7 @@ by the same predicate the pattern dispatches on.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import textwrap
@@ -2950,10 +2951,17 @@ def test_multiband_scan_shared_input_column_reduce_matches_torch(
 @triton.jit
 def _unsupported_shared_input_column_reduce_kernel(X, Y, Scanned, BROADCAST: tl.constexpr):
     row = tl.arange(0, 8)
-    column = tl.arange(0, 64)
-    offset = row[:, None] * 64 + column[None, :]
+    if BROADCAST:
+        column = tl.arange(0, 512)
+        offset = row[:, None] * 512 + column[None, :]
+    else:
+        column = tl.arange(0, 64)
+        offset = row[:, None] * 64 + column[None, :]
     x = tl.load(X + offset)
-    scanned = tl.cumsum(x, 1)
+    if BROADCAST:
+        scanned = tl.cumsum(x, 0)
+    else:
+        scanned = tl.cumsum(x, 1)
     if BROADCAST:
         reduced = tl.sum(x, 0)
         tl.store(Y + offset, scanned + reduced[None, :])
@@ -3388,8 +3396,12 @@ def test_multiband_scan_different_input_column_reduce_i32_source_is_named(masked
 @triton.jit
 def _unsupported_different_input_scan_column_reduce_kernel(X, W, Y, Column, MODE: tl.constexpr):
     row = tl.arange(0, 8)
-    column = tl.arange(0, 64)
-    offset = row[:, None] * 64 + column[None, :]
+    if MODE == 3:
+        column = tl.arange(0, 512)
+        offset = row[:, None] * 512 + column[None, :]
+    else:
+        column = tl.arange(0, 64)
+        offset = row[:, None] * 64 + column[None, :]
     x = tl.load(X + offset)
     if MODE != 0:
         w = tl.load(W + offset)
@@ -3422,6 +3434,849 @@ def test_multiband_scan_different_input_column_reduce_outside_envelope_is_named(
         "_unsupported_different_input_scan_column_reduce_kernel",
         {"X": "*fp32", "W": "*fp32", "Y": "*fp32", "Column": "*fp32"},
         {"MODE": mode}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert diagnostic in output, output
+
+
+@triton.jit
+def _shared_input_scan_column_broadcast_kernel(
+        X, Y, N, R: tl.constexpr, C: tl.constexpr, SCAN_AXIS: tl.constexpr,
+        REVERSE: tl.constexpr, REDUCTION: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr, SNAPSHOT: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = program * (R * C) + row[:, None] * C + column[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    if SNAPSHOT:
+        if MASKED:
+            tl.store(X + offset, x * 3 + 17, offset < N)
+        else:
+            tl.store(X + offset, x * 3 + 17)
+    if REDUCTION == "sum":
+        reduced = tl.sum(x, 0)
+    elif REDUCTION == "min":
+        reduced = tl.min(x, 0)
+    else:
+        reduced = tl.max(x, 0)
+    result = scanned + reduced[None, :]
+    if MASKED:
+        tl.store(Y + offset, result, offset < N)
+    else:
+        tl.store(Y + offset, result)
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["sum", "min", "max"])
+@pytest.mark.parametrize("rows,columns,num_warps,scan_axis,reverse,masked,computed,snapshot", [
+    (2, 32, 1, 1, False, False, False, False),
+    (16, 16, 1, 0, True, True, False, True),
+    (16, 32, 4, 1, True, True, True, False),
+    (8, 64, 4, 0, False, False, True, True),
+    (32, 32, 1, 1, False, True, True, False),
+    (32, 16, 4, 0, True, False, False, False),
+    (64, 2, 1, 1, True, False, True, True),
+    (4, 64, 4, 1, False, True, False, False),
+])
+def test_multiband_scan_shared_input_column_broadcast_matches_torch(
+        rows, columns, num_warps, scan_axis, reverse, masked, computed, snapshot, reduction):
+    programs = 2
+    size = programs * rows * columns
+    valid = size - columns - 1 if masked else size
+    index = torch.arange(valid)
+    # Every unmasked column has a nonzero, distinct reduction contribution.
+    original = (1 + (index % columns) * 3 + (index // columns) % 11).float()
+    padded = torch.zeros(size)
+    padded[:valid] = original
+    tile = padded.reshape(programs, rows, columns)
+    if computed:
+        tile = tile * 2 + 3
+    axis = scan_axis + 1
+    source = tile.flip(axis) if reverse else tile
+    scanned = source.cumsum(axis)
+    if reverse:
+        scanned = scanned.flip(axis)
+    if reduction == "sum":
+        reduced = tile.sum(1)
+    elif reduction == "min":
+        reduced = tile.amin(1)
+    else:
+        reduced = tile.amax(1)
+    contribution = reduced[:, None, :].expand_as(tile)
+    expected = scanned + contribution
+    sentinel = -999999
+    values = original.to("mps")
+    output = torch.full((size,), sentinel, dtype=torch.float32, device="mps")
+    compiled = _shared_input_scan_column_broadcast_kernel[(programs,)](
+        values, output, valid, rows, columns, scan_axis, reverse, reduction,
+        masked, computed, snapshot, num_warps=num_warps)
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    # Reuse one complete input publication. Extra barriers or tile buffers
+    # would reintroduce legacy column republishing; the common per-thread
+    # scratch reservation is optional and may appear only once.
+    assert msl.count("threadgroup_barrier(") == 1, msl
+    buffers = sorted(int(size) for size in re.findall(
+        r"\bthreadgroup\s+float\s+\w+\s*\[\s*(\d+)\s*\]\s*;", msl))
+    assert buffers in ([rows * columns], [32 * num_warps, rows * columns]), msl
+    torch.mps.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual[:valid], expected.flatten()[:valid], atol=0, rtol=0)
+    torch.testing.assert_close(actual[:valid] - scanned.flatten()[:valid],
+                               contribution.flatten()[:valid], atol=0, rtol=0)
+    assert (actual[valid:] == sentinel).all()
+    expected_input = tile.flatten()[:valid] * 3 + 17 if snapshot else original
+    torch.testing.assert_close(values.cpu(), expected_input, atol=0, rtol=0)
+
+
+@triton.jit
+def _unsupported_shared_input_column_broadcast_kernel(
+        X, W, Y, Scanned, Vector, steps, R: tl.constexpr, C: tl.constexpr,
+        MODE: tl.constexpr):
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = row[:, None] * C + column[None, :]
+    if MODE == 8:
+        for step in range(steps):
+            x = tl.load(X + step * (R * C) + offset)
+            scanned = tl.cumsum(x, 1)
+            reduced = tl.sum(x, 0)
+            tl.store(Y + step * (R * C) + offset, scanned + reduced[None, :])
+    else:
+        if MODE == 0:
+            x = tl.load(X + offset, column[None, :] < C - 1, other=0)
+        else:
+            x = tl.load(X + offset)
+        if MODE == 2:
+            scanned = tl.cumsum(x, 0)
+        else:
+            scanned = tl.cumsum(x, 1)
+        if MODE == 1:
+            w = tl.load(W + offset)
+        if MODE == 7:
+            scanned += tl.cumsum(x * 2 + 1, 1)
+        if MODE == 1:
+            reduced = tl.sum(w, 0)
+        else:
+            reduced = tl.sum(x, 0)
+        if MODE == 3:
+            tl.store(Vector + column, reduced)
+        if MODE == 4:
+            tile = scanned + reduced[:, None]
+            tl.store(Y + offset, tile)
+        elif MODE == 5:
+            wider_row = tl.arange(0, 2 * R)
+            wider_offset = wider_row[:, None] * C + column[None, :]
+            tl.store(Y + wider_offset, reduced[None, :] + wider_row[:, None])
+        elif MODE == 6:
+            tl.store(Y + offset, scanned + (reduced * 2 + 1)[None, :])
+        else:
+            tile = scanned + reduced[None, :]
+            if MODE == 9:
+                if steps > 1:
+                    tl.store(Y + offset, tile)
+                else:
+                    tl.store(Y + offset, tile * 2)
+            elif MODE == 10:
+                tl.store(Vector + row, tl.sum(tile, 1))
+            else:
+                tl.store(Y + offset, tile)
+        tl.store(Scanned + offset, scanned)
+
+
+@pytest.mark.parametrize("mode,diagnostic", [
+    (0, "a shared scan-input column reduction on i32 requires a direct unmasked tt.load"),
+    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
+     "without intervening writes or input exchanges"),
+    (2, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (3, "a scan-input column broadcast requires same-layout f32/i32 sources and "
+     "direct same-layout consumers in the original tile"),
+    (4, "a rank-2 tl.reduce cannot share a function"),
+    (5, "a scan-input column broadcast requires same-layout f32/i32 sources and "
+     "direct same-layout consumers in the original tile"),
+    (6, "a rank-2 tl.reduce cannot share a function"),
+    (7, "a scan-input column broadcast requires same-layout f32/i32 sources and "
+     "direct same-layout consumers in the original tile"),
+    (8, "nested scan requires a flat load/compute/store loop body"),
+    (9, "a scan-input column broadcast requires same-layout f32/i32 sources and "
+     "direct same-layout consumers in the original tile"),
+    (10, "rank-2 reduce cannot replay its computed source cone across conversion"),
+], ids=["masked_i32", "load_after_scan", "wide_columns", "mixed_store", "cross_axis",
+        "wider_tile", "pre_expand_arithmetic", "multiple_scans", "nested_scan",
+        "region_capture", "downstream_reduce"])
+def test_multiband_scan_shared_input_column_broadcast_outside_envelope_is_named(mode, diagnostic):
+    dtype = "*i32" if mode == 0 else "*fp32"
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_shared_input_column_broadcast_kernel",
+        {"X": dtype, "W": dtype, "Y": dtype, "Scanned": dtype,
+         "Vector": dtype, "steps": "i32"},
+        {"R": 16, "C": 512 if mode == 2 else 16, "MODE": mode}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert diagnostic in output, output
+
+
+@triton.jit
+def _small_column_broadcast_beside_multiband_scan_kernel(X, W, Y, Z, SCAN_AXIS: tl.constexpr):
+    small_row = tl.arange(0, 2)
+    small_column = tl.arange(0, 2)
+    small_offset = small_row[:, None] * 2 + small_column[None, :]
+    small = tl.load(W + small_offset)
+    column_sum = tl.sum(small, 0)
+    tl.store(Z + small_offset, small + column_sum[None, :])
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    offset = row[:, None] * 16 + column[None, :]
+    x = tl.load(X + offset)
+    tl.store(Y + offset, tl.cumsum(x, SCAN_AXIS))
+
+
+@pytest.mark.parametrize("scan_axis", [0, 1])
+def test_small_column_broadcast_beside_independent_multiband_scan_is_named(scan_axis):
+    # A one-band expand still shares the function's multi-band scan partition.
+    # Letting this bypass the guard produced wrong values in all four cells of
+    # [[2, 7], [3, 11]] + column_sum, even with separate scan/output pointers.
+    result = _compile_rankn_nested_negative_in_child(
+        "_small_column_broadcast_beside_multiband_scan_kernel",
+        {"X": "*fp32", "W": "*fp32", "Y": "*fp32", "Z": "*fp32"},
+        {"SCAN_AXIS": scan_axis}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert ("a scan-input column broadcast requires same-layout f32/i32 sources "
+            "and direct same-layout consumers in the original tile") in output, output
+
+
+@triton.jit
+def _different_input_scan_column_broadcast_kernel(
+        X, W, Y, N, R: tl.constexpr, C: tl.constexpr, SCAN_AXIS: tl.constexpr,
+        REVERSE: tl.constexpr, REDUCTION: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr, FROM_SCAN_INPUT: tl.constexpr,
+        SCAN_MASKED: tl.constexpr = False, SCAN_COMPUTED: tl.constexpr = False):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = program * (R * C) + row[:, None] * C + column[None, :]
+    if MASKED or SCAN_MASKED:
+        x = tl.load(X + offset, offset < N, other=0)
+    else:
+        x = tl.load(X + offset)
+    if SCAN_COMPUTED:
+        x = x * 2 + 3
+    if FROM_SCAN_INPUT:
+        w = x * 2 + 3
+    elif MASKED:
+        w = tl.load(W + offset, offset < N, other=0)
+    else:
+        w = tl.load(W + offset)
+    if COMPUTED:
+        w = w * 3 - 1
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    if REDUCTION == "sum":
+        reduced = tl.sum(w, 0)
+    elif REDUCTION == "min":
+        reduced = tl.min(w, 0)
+    else:
+        reduced = tl.max(w, 0)
+    result = scanned + reduced[None, :]
+    if MASKED:
+        tl.store(Y + offset, result, offset < N)
+    else:
+        tl.store(Y + offset, result)
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["sum", "min", "max"])
+@pytest.mark.parametrize("rows,columns,num_warps,scan_axis,reverse,masked,computed,from_scan_input", [
+    (2, 32, 1, 1, False, False, False, False),
+    (16, 16, 1, 0, True, True, False, False),
+    (16, 32, 4, 1, True, True, True, False),
+    (8, 64, 4, 0, False, False, False, True),
+    (32, 32, 1, 1, False, True, False, True),
+    (32, 16, 4, 0, True, False, True, False),
+    (64, 2, 1, 1, True, False, True, True),
+    (4, 64, 4, 1, False, True, False, False),
+    (64, 64, 4, 0, False, False, False, False),
+])
+def test_multiband_scan_different_input_column_broadcast_matches_torch(
+        rows, columns, num_warps, scan_axis, reverse, masked, computed,
+        from_scan_input, reduction):
+    programs = 2
+    size = programs * rows * columns
+    valid = size - columns - 1 if masked else size
+    index = torch.arange(valid)
+    x_values = (1 + (index % columns) * 3 + (index // columns) % 11).float()
+    w_values = (7 + (index % columns) * 5 + (index // columns) % 13 * 2).float()
+    x = torch.zeros(size)
+    w = torch.zeros(size)
+    x[:valid], w[:valid] = x_values, w_values
+    x = x.reshape(programs, rows, columns)
+    w = w.reshape(programs, rows, columns)
+    if from_scan_input:
+        w = x * 2 + 3
+    if computed:
+        w = w * 3 - 1
+    axis = scan_axis + 1
+    source = x.flip(axis) if reverse else x
+    scanned = source.cumsum(axis)
+    if reverse:
+        scanned = scanned.flip(axis)
+    if reduction == "sum":
+        reduced = w.sum(1)
+    elif reduction == "min":
+        reduced = w.amin(1)
+    else:
+        reduced = w.amax(1)
+    contribution = reduced[:, None, :].expand_as(x)
+    expected = scanned + contribution
+    sentinel = -999999
+    output = torch.full((size,), sentinel, dtype=torch.float32, device="mps")
+    _different_input_scan_column_broadcast_kernel[(programs,)](
+        x_values.to("mps"), w_values.to("mps"), output, valid,
+        rows, columns, scan_axis, reverse, reduction, masked, computed,
+        from_scan_input, num_warps=num_warps)
+    torch.mps.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual[:valid], expected.flatten()[:valid], atol=0, rtol=0)
+    torch.testing.assert_close(actual[:valid] - scanned.flatten()[:valid],
+                               contribution.flatten()[:valid], atol=0, rtol=0)
+    assert (actual[valid:] == sentinel).all()
+
+
+@triton.jit
+def _different_inputs_scan_multiple_column_broadcasts_kernel(
+        X, W, V, Sum, Max, Min, SharedMax, R: tl.constexpr, C: tl.constexpr,
+        SCAN_AXIS: tl.constexpr):
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = row[:, None] * C + column[None, :]
+    x = tl.load(X + offset)
+    w = tl.load(W + offset)
+    v = tl.load(V + offset)
+    scanned = tl.cumsum(x, SCAN_AXIS)
+    summed = tl.sum(w, 0)
+    maximum = tl.max(w, 0)
+    minimum = tl.min(v, 0)
+    shared_maximum = tl.max(x, 0)
+    # W is published once for two reducers, while X also remains available to
+    # its scan and shared-source reducer. All reductions precede every store.
+    tl.store(Sum + offset, scanned + summed[None, :])
+    tl.store(Max + offset, scanned + maximum[None, :])
+    tl.store(Min + offset, scanned + minimum[None, :])
+    tl.store(SharedMax + offset, scanned + shared_maximum[None, :])
+
+
+@mps_only
+@pytest.mark.parametrize("rows,columns,scan_axis,num_warps", [(16, 16, 0, 1), (64, 32, 1, 4)])
+def test_multiband_scan_different_inputs_multiple_column_broadcasts_match_torch(
+        rows, columns, scan_axis, num_warps):
+    index = torch.arange(rows * columns).reshape(rows, columns)
+    x = (1 + (index % columns) * 3 + (index // columns) % 11).float()
+    w = (7 + (index % columns) * 5 + (index // columns) % 13 * 2).float()
+    v = ((index % columns) * 7 - (index // columns) % 17 * 3 - 29).float()
+    outputs = [torch.empty((rows, columns), dtype=torch.float32, device="mps") for _ in range(4)]
+    compiled = _different_inputs_scan_multiple_column_broadcasts_kernel[(1,)](
+        x.to("mps"), w.to("mps"), v.to("mps"), *outputs,
+        rows, columns, scan_axis, num_warps=num_warps)
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    # Three distinct SSA inputs need three complete publications, independent
+    # of the number of reducers. Neither duplicate W nor republish reductions.
+    assert msl.count("threadgroup_barrier(") == 1, msl
+    buffers = sorted(int(size) for size in re.findall(
+        r"\bthreadgroup\s+float\s+\w+\s*\[\s*(\d+)\s*\]\s*;", msl))
+    full_buffers = [rows * columns] * 3
+    assert buffers in (full_buffers, [32 * num_warps] + full_buffers), msl
+    torch.mps.synchronize()
+    scanned = x.cumsum(scan_axis)
+    reductions = [w.sum(0), w.amax(0), v.amin(0), x.amax(0)]
+    for actual, reduced in zip(outputs, reductions):
+        contribution = reduced[None, :].expand_as(x)
+        torch.testing.assert_close(actual.cpu(), scanned + contribution, atol=0, rtol=0)
+        torch.testing.assert_close(actual.cpu() - scanned, contribution, atol=0, rtol=0)
+
+
+def test_multiband_scan_different_inputs_column_broadcast_budget_is_named():
+    result = _compile_rankn_nested_negative_in_child(
+        "_different_inputs_scan_multiple_column_broadcasts_kernel",
+        {"X": "*fp32", "W": "*fp32", "V": "*fp32", "Sum": "*fp32",
+         "Max": "*fp32", "Min": "*fp32", "SharedMax": "*fp32"},
+        {"R": 64, "C": 64, "SCAN_AXIS": 0}, num_warps=4)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "full-tile exchange scratch needs" in output, output
+    assert "exceeding the 32768-byte budget" in output, output
+
+
+@triton.jit
+def _unsupported_different_input_column_broadcast_kernel(
+        X, W, Y, MODE: tl.constexpr):
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    offset = row[:, None] * 16 + column[None, :]
+    x = tl.load(X + offset)
+    if MODE != 0:
+        w = tl.load(W + offset)
+    if MODE == 2:
+        tl.store(W + offset, x + 17)
+    elif MODE == 4:
+        w = tl.trans(w)
+    scanned = tl.cumsum(x, 1)
+    if MODE == 0:
+        w = tl.load(W + offset)
+    elif MODE == 1:
+        w = w * 2 + 3
+    elif MODE == 3:
+        tl.store(W + offset, x + 17)
+    elif MODE == 5:
+        w = scanned * 2 + 1
+    reduced = tl.sum(w, 0)
+    tl.store(Y + offset, scanned + reduced[None, :])
+
+
+@pytest.mark.parametrize("mode,diagnostic", [
+    (0, "distinct scan/reduce inputs require same-layout sources defined before the scan "
+     "without intervening writes or input exchanges"),
+    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
+     "without intervening writes or input exchanges"),
+    (2, "distinct scan/reduce inputs require same-layout sources defined before the scan "
+     "without intervening writes or input exchanges"),
+    (3, "distinct scan/reduce inputs require same-layout sources defined before the scan "
+     "without intervening writes or input exchanges"),
+    (4, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (5, "rank-2 reduce cannot replay its computed source cone across conversion"),
+], ids=["load_after_scan", "compute_after_scan", "write_before_scan", "write_after_scan",
+        "transpose", "scan_result"])
+def test_multiband_scan_different_input_column_broadcast_outside_envelope_is_named(mode, diagnostic):
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_different_input_column_broadcast_kernel",
+        {"X": "*fp32", "W": "*fp32", "Y": "*fp32"}, {"MODE": mode}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert diagnostic in output, output
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["sum", "min", "max"])
+@pytest.mark.parametrize("rows,columns,num_warps,scan_axis,reverse,shared", [
+    (2, 32, 1, 1, False, True),
+    (16, 16, 1, 0, True, True),
+    (16, 32, 4, 1, True, True),
+    (8, 64, 4, 0, False, True),
+    (32, 32, 1, 1, False, False),
+    (32, 16, 4, 0, True, False),
+    (64, 2, 1, 1, True, False),
+    (4, 64, 4, 1, False, False),
+])
+def test_multiband_scan_i32_column_broadcast_matches_torch(
+        rows, columns, num_warps, scan_axis, reverse, shared, reduction):
+    programs = 2
+    size = programs * rows * columns
+    index = torch.arange(size)
+    if reduction == "sum":
+        if rows == 64 and not shared:
+            # Exercise modular i32 accumulation in the reduction itself.
+            w = (2 ** 30 + index % 31).to(torch.int32)
+        else:
+            w = ((index * 7) % 31 - 15).to(torch.int32)
+    else:
+        # Min/max must compare signed integers exactly, including values that
+        # cannot round-trip through f32 and values close to both i32 limits.
+        category = (index // columns + index) % 4
+        w = torch.where(category == 0, -(2 ** 31) + 7 + index % 13,
+                        torch.where(category == 1, 2 ** 31 - 9 - index % 11,
+                                    torch.where(category == 2, 2 ** 24 + index % 31,
+                                                -(2 ** 24) - index % 37))).to(torch.int32)
+    x = w.clone() if shared else (index % 17 - 8).to(torch.int32)
+    x_tile = x.reshape(programs, rows, columns)
+    w_tile = w.reshape(programs, rows, columns)
+    axis = scan_axis + 1
+    source = x_tile.flip(axis) if reverse else x_tile
+    # Scan prefixes and elementwise addition intentionally wrap modulo 2**32.
+    scanned = source.cumsum(axis, dtype=torch.int64).to(torch.int32)
+    if reverse:
+        scanned = scanned.flip(axis)
+    if reduction == "sum":
+        reduced = w_tile.sum(1, dtype=torch.int64).to(torch.int32)
+    elif reduction == "min":
+        reduced = w_tile.amin(1)
+    else:
+        reduced = w_tile.amax(1)
+    contribution = reduced[:, None, :].expand_as(x_tile)
+    expected = scanned + contribution
+    sentinel = -999999
+    output = torch.full((size + 7,), sentinel, dtype=torch.int32, device="mps")
+    if shared:
+        _shared_input_scan_column_broadcast_kernel[(programs,)](
+            x.to("mps"), output, size, rows, columns, scan_axis, reverse,
+            reduction, False, False, False, num_warps=num_warps)
+    else:
+        _different_input_scan_column_broadcast_kernel[(programs,)](
+            x.to("mps"), w.to("mps"), output, size, rows, columns,
+            scan_axis, reverse, reduction, False, False, False,
+            num_warps=num_warps)
+    torch.mps.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual[:size], expected.flatten(), atol=0, rtol=0)
+    torch.testing.assert_close(actual[:size] - scanned.flatten(), contribution.flatten(), atol=0, rtol=0)
+    assert (actual[size:] == sentinel).all()
+
+
+@mps_only
+@pytest.mark.parametrize("scan_axis", [0, 1])
+@pytest.mark.parametrize("computed", [False, True], ids=["masked_scan", "computed_scan"])
+def test_multiband_scan_i32_nonplain_scan_column_broadcast_matches_torch(scan_axis, computed):
+    rows, columns = 16, 16
+    size = rows * columns
+    valid = size if computed else size - 7
+    index = torch.arange(size).reshape(rows, columns)
+    x = (index % 17 - 8).to(torch.int32)
+    w = ((index % 31 - 15) * 1000001).to(torch.int32)
+    source = x * 2 + 3 if computed else x.clone()
+    if not computed:
+        source.flatten()[valid:] = 0
+    scanned = source.cumsum(scan_axis).to(torch.int32)
+    contribution = w.amin(0)[None, :].expand_as(w)
+    sentinel = -999999
+    output = torch.full((size + 7,), sentinel, dtype=torch.int32, device="mps")
+    _different_input_scan_column_broadcast_kernel[(1,)](
+        x.to("mps"), w.to("mps"), output, valid, rows, columns,
+        scan_axis, False, "min", False, False, False,
+        SCAN_MASKED=not computed, SCAN_COMPUTED=computed, num_warps=1)
+    torch.mps.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual[:size], (scanned + contribution).flatten(), atol=0, rtol=0)
+    torch.testing.assert_close(actual[:size] - scanned.flatten(), contribution.flatten(), atol=0, rtol=0)
+    assert (actual[size:] == sentinel).all()
+
+
+@mps_only
+@pytest.mark.parametrize("scan_axis", [0, 1])
+def test_multiband_scan_i32_column_broadcast_retains_input_snapshot(scan_axis):
+    x = (torch.arange(256).reshape(16, 16) % 17 - 8).to(torch.int32)
+    values = x.to("mps")
+    output = torch.empty((16, 16), dtype=torch.int32, device="mps")
+    _shared_input_scan_column_broadcast_kernel[(1,)](
+        values, output, x.numel(), 16, 16, scan_axis, False, "max",
+        False, False, True, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(values.cpu(), x * 3 + 17, atol=0, rtol=0)
+    torch.testing.assert_close(output.cpu(), x.cumsum(scan_axis).to(torch.int32) + x.amax(0)[None, :],
+                               atol=0, rtol=0)
+
+
+@triton.jit
+def _i32_scan_multiple_column_broadcasts_kernel(
+        X, W, V, Sum, Min, Max, OtherMin, SharedMax,
+        SCAN_AXIS: tl.constexpr, MULTIPLE_SOURCES: tl.constexpr):
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    offset = row[:, None] * 16 + column[None, :]
+    x = tl.load(X + offset)
+    if MULTIPLE_SOURCES:
+        w = tl.load(W + offset)
+        v = tl.load(V + offset)
+    else:
+        w = x
+        v = x
+    scanned = tl.cumsum(x, SCAN_AXIS)
+    summed = tl.sum(w, 0)
+    minimum = tl.min(w, 0)
+    maximum = tl.max(w, 0)
+    other_minimum = tl.min(v, 0)
+    shared_maximum = tl.max(x, 0)
+    tl.store(Sum + offset, scanned + summed[None, :])
+    tl.store(Min + offset, scanned + minimum[None, :])
+    tl.store(Max + offset, scanned + maximum[None, :])
+    tl.store(OtherMin + offset, scanned + other_minimum[None, :])
+    tl.store(SharedMax + offset, scanned + shared_maximum[None, :])
+
+
+@mps_only
+@pytest.mark.parametrize("multiple_sources,scan_axis,num_warps", [(False, 0, 1), (True, 1, 4)])
+def test_multiband_scan_i32_multiple_column_broadcasts_match_torch(multiple_sources, scan_axis, num_warps):
+    index = torch.arange(256).reshape(16, 16)
+    x = (index % 17 - 8).to(torch.int32)
+    w = ((index * 3 + 5) % 23 - 11).to(torch.int32) if multiple_sources else x
+    v = ((index * 7 + 2) % 31 - 19).to(torch.int32) if multiple_sources else x
+    outputs = [torch.empty((16, 16), dtype=torch.int32, device="mps") for _ in range(5)]
+    compiled = _i32_scan_multiple_column_broadcasts_kernel[(1,)](
+        x.to("mps"), w.to("mps"), v.to("mps"), *outputs,
+        scan_axis, multiple_sources, num_warps=num_warps)
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    assert msl.count("threadgroup_barrier(") == 1, msl
+    buffers = sorted(int(size) for size in re.findall(
+        r"\bthreadgroup\s+(?:u?int32_t|u?int)\s+\w+\s*\[\s*(\d+)\s*\]\s*;", msl))
+    full_buffers = [256] * (3 if multiple_sources else 1)
+    assert buffers in (full_buffers, [32 * num_warps] + full_buffers), msl
+    torch.mps.synchronize()
+    scanned = x.cumsum(scan_axis).to(torch.int32)
+    reductions = [w.sum(0).to(torch.int32), w.amin(0), w.amax(0), v.amin(0), x.amax(0)]
+    for actual, reduced in zip(outputs, reductions):
+        contribution = reduced[None, :].expand_as(x)
+        torch.testing.assert_close(actual.cpu(), scanned + contribution, atol=0, rtol=0)
+        torch.testing.assert_close(actual.cpu() - scanned, contribution, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["distinct_source", "shared_source"])
+@pytest.mark.parametrize("masked,computed", [(True, False), (False, True)],
+                         ids=["masked_reduce", "computed_reduce"])
+def test_multiband_scan_i32_column_broadcast_source_is_named(shared, masked, computed):
+    constexprs = {"R": 16, "C": 16, "SCAN_AXIS": 0, "REVERSE": False,
+                  "REDUCTION": "max", "MASKED": masked, "COMPUTED": computed}
+    signature = {"X": "*i32", "Y": "*i32", "N": "i32"}
+    if shared:
+        kernel = "_shared_input_scan_column_broadcast_kernel"
+        constexprs["SNAPSHOT"] = False
+    else:
+        kernel = "_different_input_scan_column_broadcast_kernel"
+        signature["W"] = "*i32"
+        constexprs.update(FROM_SCAN_INPUT=False, SCAN_MASKED=False, SCAN_COMPUTED=False)
+    result = _compile_rankn_nested_negative_in_child(kernel, signature, constexprs, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "a shared scan-input column reduction on i32 requires a direct unmasked tt.load" in output, output
+
+
+@pytest.mark.parametrize("dtype,reduction,diagnostic", [
+    ("*u32", "min", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    ("*u32", "max", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    ("*i64", "sum", "rank >= 2 scan is implemented for a blocked tile"),
+])
+def test_multiband_scan_integer_column_broadcast_type_is_named(dtype, reduction, diagnostic):
+    result = _compile_rankn_nested_negative_in_child(
+        "_shared_input_scan_column_broadcast_kernel", {"X": dtype, "Y": dtype, "N": "i32"},
+        {"R": 16, "C": 16, "SCAN_AXIS": 1, "REVERSE": False,
+         "REDUCTION": reduction, "MASKED": False, "COMPUTED": False, "SNAPSHOT": False},
+        num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert diagnostic in output, output
+
+
+@pytest.mark.parametrize("mode,columns,diagnostic", [
+    (2, 512, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (3, 16, "a scan-input column broadcast requires same-layout f32/i32 sources"),
+], ids=["wide_columns", "mixed_store"])
+def test_multiband_scan_i32_column_broadcast_consumer_is_named(mode, columns, diagnostic):
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_shared_input_column_broadcast_kernel",
+        {"X": "*i32", "W": "*i32", "Y": "*i32", "Scanned": "*i32",
+         "Vector": "*i32", "steps": "i32"},
+        {"R": 16, "C": columns, "MODE": mode}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert diagnostic in output, output
+
+
+@triton.jit
+def _i32_column_product_combine(lhs, rhs):
+    return lhs * rhs
+
+
+@triton.jit
+def _unsupported_i32_scan_column_product_kernel(X, Y):
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    offset = row[:, None] * 16 + column[None, :]
+    x = tl.load(X + offset)
+    scanned = tl.cumsum(x, 1)
+    reduced = tl.reduce(x, 0, _i32_column_product_combine)
+    tl.store(Y + offset, scanned + reduced[None, :])
+
+
+def test_multiband_scan_i32_column_broadcast_product_is_named():
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_i32_scan_column_product_kernel", {"X": "*i32", "Y": "*i32"},
+        {}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "a scan-input column broadcast requires same-layout f32/i32 sources" in output, output
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["sum", "min", "max"])
+@pytest.mark.parametrize("rows,columns,num_warps,scan_axis,reverse,dtype,shared,masked,computed", [
+    (8, 64, 1, 1, False, torch.float32, True, True, True),
+    (8, 64, 1, 0, True, torch.int32, False, False, False),
+    (8, 128, 1, 0, False, torch.float32, False, True, True),
+    (8, 128, 4, 0, True, torch.int32, True, False, False),
+    (4, 256, 1, 0, False, torch.float32, True, True, False),
+    (8, 256, 4, 0, True, torch.int32, False, False, False),
+    (32, 256, 4, 0, False, torch.float32, True, False, False),
+    (16, 256, 4, 0, True, torch.int32, False, False, False),
+    (4, 64, 1, 1, True, torch.int32, True, False, False),
+    (8, 256, 4, 0, True, torch.float32, False, False, True),
+])
+def test_multiband_scan_wide_column_broadcast_matches_torch(
+        rows, columns, num_warps, scan_axis, reverse, dtype, shared, masked, computed, reduction):
+    programs = 2
+    size = programs * rows * columns
+    valid = size - columns - 1 if masked else size
+    index = torch.arange(valid)
+    if dtype == torch.int32 and reduction != "sum":
+        category = (index // columns + index) % 4
+        w_values = torch.where(category == 0, -(2 ** 31) + 7 + index % 13,
+                               torch.where(category == 1, 2 ** 31 - 9 - index % 11,
+                                           torch.where(category == 2, 2 ** 24 + index % 31,
+                                                       -(2 ** 24) - index % 37))).to(dtype)
+    elif dtype == torch.int32 and rows == 16:
+        w_values = (2 ** 30 + index % 31).to(dtype)
+    else:
+        w_values = (7 + (index % columns) * 5 + (index // columns) % 13 * 2).to(dtype)
+    x_values = w_values.clone() if shared else (1 + index % columns * 3 + index // columns % 11).to(dtype)
+    x = torch.zeros(size, dtype=dtype)
+    w = torch.zeros(size, dtype=dtype)
+    x[:valid], w[:valid] = x_values, w_values
+    x = x.reshape(programs, rows, columns)
+    w = w.reshape(programs, rows, columns)
+    if computed:
+        if shared:
+            x = x * 2 + 3
+            w = x
+        else:
+            w = w * 3 - 1
+    axis = scan_axis + 1
+    source = x.flip(axis) if reverse else x
+    # Integer prefixes, reductions, and final addition use modulo-2**32 results.
+    scanned = source.cumsum(axis).to(dtype)
+    if reverse:
+        scanned = scanned.flip(axis)
+    if reduction == "sum":
+        reduced = w.sum(1).to(dtype)
+    elif reduction == "min":
+        reduced = w.amin(1)
+    else:
+        reduced = w.amax(1)
+    contribution = reduced[:, None, :].expand_as(x)
+    expected = scanned + contribution
+    sentinel = -999999
+    output = torch.full((size + 7,), sentinel, dtype=dtype, device="mps")
+    if shared:
+        _shared_input_scan_column_broadcast_kernel[(programs,)](
+            x_values.to("mps"), output, valid, rows, columns, scan_axis, reverse,
+            reduction, masked, computed, False, num_warps=num_warps)
+    else:
+        _different_input_scan_column_broadcast_kernel[(programs,)](
+            x_values.to("mps"), w_values.to("mps"), output, valid,
+            rows, columns, scan_axis, reverse, reduction, masked, computed,
+            False, num_warps=num_warps)
+    torch.mps.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual[:valid], expected.flatten()[:valid], atol=0, rtol=0)
+    torch.testing.assert_close(actual[:valid] - scanned.flatten()[:valid],
+                               contribution.flatten()[:valid], atol=0, rtol=0)
+    assert (actual[valid:] == sentinel).all()
+
+
+@mps_only
+@pytest.mark.parametrize("columns,num_warps,dtype", [(128, 1, torch.float32), (256, 4, torch.int32)])
+def test_multiband_scan_wide_multiple_column_broadcasts_match_torch(columns, num_warps, dtype):
+    rows = 8
+    index = torch.arange(rows * columns).reshape(rows, columns)
+    x = (index % 17 - 8).to(dtype)
+    w = ((index * 3 + 5) % 23 - 11).to(dtype)
+    v = ((index * 7 + 2) % 31 - 19).to(dtype)
+    outputs = [torch.empty((rows, columns), dtype=dtype, device="mps") for _ in range(4)]
+    compiled = _different_inputs_scan_multiple_column_broadcasts_kernel[(1,)](
+        x.to("mps"), w.to("mps"), v.to("mps"), *outputs,
+        rows, columns, 0, num_warps=num_warps)
+    raw = compiled.asm["metal"]
+    msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    assert msl.count("threadgroup_barrier(") == 1, msl
+    buffers = sorted(int(size) for size in re.findall(
+        r"\bthreadgroup\s+(?:float|u?int32_t|u?int)\s+\w+\s*\[\s*(\d+)\s*\]\s*;", msl))
+    full_buffers = [rows * columns] * 3
+    assert buffers in (full_buffers, [32 * num_warps] + full_buffers), msl
+    torch.mps.synchronize()
+    scanned = x.cumsum(0).to(dtype)
+    reductions = [w.sum(0).to(dtype), w.amax(0), v.amin(0), x.amax(0)]
+    for actual, reduced in zip(outputs, reductions):
+        contribution = reduced[None, :].expand_as(x)
+        torch.testing.assert_close(actual.cpu(), scanned + contribution, atol=0, rtol=0)
+        torch.testing.assert_close(actual.cpu() - scanned, contribution, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["combined_inputs", "single_input"])
+def test_multiband_scan_wide_column_broadcast_budget_is_named(shared):
+    signature = {"X": "*fp32", "Y": "*fp32", "N": "i32"}
+    constexprs = {"R": 64 if shared else 32, "C": 256, "SCAN_AXIS": 0,
+                  "REVERSE": False, "REDUCTION": "sum", "MASKED": False, "COMPUTED": False}
+    if shared:
+        kernel = "_shared_input_scan_column_broadcast_kernel"
+        constexprs["SNAPSHOT"] = False
+    else:
+        kernel = "_different_input_scan_column_broadcast_kernel"
+        signature["W"] = "*fp32"
+        constexprs.update(FROM_SCAN_INPUT=False, SCAN_MASKED=False, SCAN_COMPUTED=False)
+    result = _compile_rankn_nested_negative_in_child(kernel, signature, constexprs, num_warps=4)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    if shared:
+        assert "rank >= 2 scan is implemented for a blocked tile" in output, output
+        assert "threadgroup budget" in output, output
+    else:
+        assert "full-tile exchange scratch needs" in output, output
+        assert "exceeding the 32768-byte budget" in output, output
+
+
+@triton.jit
+def _unsupported_wide_scan_column_broadcast_kernel(X, Y, Vector, MODE: tl.constexpr):
+    if MODE == 4:
+        row = tl.arange(0, 64)
+        column = tl.arange(0, 64)
+        offset = row[:, None] * 64 + column[None, :]
+    else:
+        row = tl.arange(0, 8)
+        column = tl.arange(0, 128)
+        offset = row[:, None] * 128 + column[None, :]
+    x = tl.load(X + offset)
+    if MODE == 0:
+        reduced = tl.sum(x, 0)
+    if MODE == 4:
+        w = tl.trans(x)
+    if MODE == 3:
+        reduced = tl.sum(x, 0)
+        tl.store(Y + offset, x + reduced[None, :])
+    else:
+        if MODE == 6:
+            scanned = tl.cumsum(x, 1)
+        else:
+            scanned = tl.cumsum(x, 0)
+        if MODE == 1:
+            scanned += tl.cumsum(x + 1, 0)
+        if MODE == 4:
+            reduced = tl.sum(w, 0)
+        elif MODE == 5:
+            reduced = tl.sum(scanned, 0)
+        elif MODE != 0:
+            reduced = tl.sum(x, 0)
+        if MODE == 2:
+            tl.store(Vector + column, reduced)
+        tl.store(Y + offset, scanned + reduced[None, :])
+
+
+@pytest.mark.parametrize("mode,diagnostic", [
+    (0, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (1, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (2, "a scan-input column broadcast requires same-layout f32/i32 sources"),
+    (3, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (4, "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (5, "rank-2 reduce cannot replay its computed source cone across conversion"),
+    (6, "rank >= 2 scan is implemented for a blocked tile"),
+], ids=["reduce_before_scan", "multiple_scans", "mixed_store", "no_scan",
+        "different_layout", "scan_result", "long_scan_axis"])
+def test_multiband_scan_wide_column_broadcast_outside_envelope_is_named(mode, diagnostic):
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_wide_scan_column_broadcast_kernel",
+        {"X": "*fp32", "Y": "*fp32", "Vector": "*fp32"}, {"MODE": mode}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     assert diagnostic in output, output

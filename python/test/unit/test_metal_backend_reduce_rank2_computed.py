@@ -1428,11 +1428,12 @@ def _column_reduce_scan_kernel(X, O, M: tl.constexpr, N: tl.constexpr,
 )
 def test_column_reduce_republished_beside_a_scan_is_refused(shape, num_warps,
                                                             tmp_path):
-    """The republish writes the column sums to a threadgroup slot and reads
-    them back after a barrier. Once a staged `tl.scan` splits the body into
-    phases that slot reads back as ZERO, so the kernel returned the scan alone
-    -- measured on 13 cells from E >= 2, while the identical kernel WITHOUT the
-    scan is exact in all 15 of its own."""
+    """A column reduce before the scan stays outside the grouped-input path.
+
+    The legacy republish read back zero when scan phases split its lifetime.
+    Only a following reduce with a proven direct consumer mapping bypasses it;
+    this earlier reduce must still fail cleanly and leave compilation usable.
+    """
     m, n = shape
     result, output = _refusal_child(tmp_path, "colreduce_scan", f"""
         x = torch.zeros({m} * {n}, device="mps")
@@ -1448,8 +1449,8 @@ def test_column_reduce_republished_beside_a_scan_is_refused(shape, num_warps,
             x, o, M={m}, N={n}, WITH_SCAN=False, num_warps={num_warps})
         print("RECOVERED")
     """)
-    needle = ("a column-reduce republished into a tile cannot share a function "
-              "with a staged tl.scan")
+    needle = ("a scan-input column broadcast requires same-layout f32/i32 sources "
+              "and direct same-layout consumers in the original tile")
     assert result.returncode == 0, output
     assert output.count(needle) == 1, output
     assert "RECOVERED" in output, output

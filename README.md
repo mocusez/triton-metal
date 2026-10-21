@@ -708,9 +708,21 @@ The current dependency-ordered priorities are:
    device writes; repeated inputs share a publication, within the existing
    threadgroup-memory budget. i32 reduction inputs still require direct
    unmasked loads; independent scan inputs may be masked or computed.
-   Reducing the scan result, multi-band column broadcasts, and mixed
-   row-store/broadcast or cross-axis/wider broadcast consumers remain rejected
-   in this combination. Mixed device-load cones for wide rank-1 scan broadcasts,
+   Shared or distinct-source f32/i32 column sum/min/max can also broadcast
+   directly back into the original tile after the scan, with 2..64 rows and
+   2..256 columns, including more columns than threads. The scan-axis extent
+   remains at most 64, and all input buffers must fit the 32 KiB budget.
+   i32 uses signed extrema
+   and requires a direct unmasked reduction input; an independent scan input
+   may be masked or computed. This path requires the original layout and
+   only elementwise consumers followed by stores. Distinct sources obey the same
+   pre-scan computation and write-isolation rules above; repeated sources share
+   a buffer. The fold reads its own complete input buffer without another column
+   publication. Other column broadcasts
+   (including independent small tiles beside a multi-band scan), reducing the
+   scan result, and mixed row-store/broadcast or cross-axis/wider broadcast
+   consumers remain rejected in this combination. Mixed device-load cones for
+   wide rank-1 scan broadcasts,
    wide tuple scan broadcasts, and ambiguous
    consumer layouts also remain rejected.
    Broader descriptor-reduce type/rank and
