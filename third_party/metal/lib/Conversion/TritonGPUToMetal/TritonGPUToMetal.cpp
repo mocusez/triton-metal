@@ -16938,8 +16938,10 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             valid = false;
             return;
           }
-          if ((directColumnStore || columnExpand) &&
-              type.getElementType().isInteger(32)) {
+          // A tile broadcast folds the published tensor, including masked
+          // fill values and computed i32 elements. It does not replay the
+          // legacy device-load cone. Keep the vector-store source contract.
+          if (directColumnStore && type.getElementType().isInteger(32)) {
             auto load = reduce.getSrcs().front().getDefiningOp<
                 mlir::triton::LoadOp>();
             if (!load || load.getMask()) {

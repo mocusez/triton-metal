@@ -700,7 +700,7 @@ The current dependency-ordered priorities are:
    column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
    supports multiple reductions. f32 sources may be masked or computed;
-   i32 sources require a direct unmasked load.
+   these row and column-vector paths require direct unmasked i32 inputs.
    Axis-1 reductions and axis-0 column-vector stores may also use distinct
    inputs with the same shape, layout, and dtype, published together with the
    scan input. Their complete input computations must precede the scan,
@@ -712,9 +712,10 @@ The current dependency-ordered priorities are:
    directly back into the original tile after the scan, with 2..64 rows and
    2..256 columns, including more columns than threads. The scan-axis extent
    remains at most 64, and all input buffers must fit the 32 KiB budget.
-   i32 uses signed extrema
-   and requires a direct unmasked reduction input; an independent scan input
-   may be masked or computed. This path requires the original layout and
+   This column-broadcast path accepts supported masked or computed f32/i32
+   inputs, preserving mask fill values and computed results. i32 uses signed
+   extrema; independent scan inputs may also be masked or computed.
+   This path requires the original layout and
    only elementwise consumers followed by stores. Distinct sources obey the same
    pre-scan computation and write-isolation rules above; repeated sources share
    a buffer. The fold reads its own complete input buffer without another column
