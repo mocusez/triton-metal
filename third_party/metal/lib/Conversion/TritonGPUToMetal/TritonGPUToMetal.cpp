@@ -352,6 +352,9 @@ static mlir::Value coneReplaySource(mlir::Operation *def) {
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
+// A row reduction consumes the same complete input publication as a scan.
+static constexpr llvm::StringLiteral kScanInputReduceAttr =
+    "metal.scan_input_reduce";
 // Set on a rank-N reduce whose staged scratch is relabelled into the emitter's
 // own thread-major order. The decision is made from the reduce's SOURCE, and
 // the phase pre-pass later replaces that source with a placeholder, so it has
@@ -426,7 +429,15 @@ static ExchangeBufferAssignment assignExchangeBuffers(mlir::Block &body) {
   // buffers and let the shared budget validator reject overflow.
   bool hasGroupedPublishes =
       llvm::any_of(plans, [](const auto *plan) { return !plan->endsPhase; });
-  if (noReuseBytes <= kThreadgroupBudgetBytes || hasGroupedPublishes) {
+  // A reduction sharing a scan publication names its reader through the
+  // phase side table, not an SSA operand. Keep that input immutable even if
+  // other exchanges intervene; the budget validator rejects excess storage.
+  bool hasScanInputReduce = false;
+  body.getParentOp()->walk([&](mlir::Operation *op) {
+    hasScanInputReduce |= op->hasAttr(kScanInputReduceAttr);
+  });
+  if (noReuseBytes <= kThreadgroupBudgetBytes || hasGroupedPublishes ||
+      hasScanInputReduce) {
     for (const TileExchangePlan *plan : plans) {
       out.publishBuffer.push_back(out.buffers.size());
       out.buffers.emplace_back(plan->elemTy, plan->numElements);
@@ -2407,8 +2418,8 @@ static bool transIsFlatIdentityAfterRemap(mlir::triton::TransOp op,
   return transIsFlatIdentityWith(op, srcEnc, dstEnc);
 }
 
-// The rank-`rank` tile a rank-1 `tt.make_range` actually indexes — the shape of
-// the tensor its `expand_dims`/`broadcast` cone feeds.
+// The rank-`rank` tile a value actually indexes through its consumer cone.
+// Used for make_range coordinates and wide scan-result broadcasts.
 //
 // `MakeRangeLowering` decomposes such a range against ONE module-wide tile
 // (`findLargestRank2Tile` / `findLargestRankNTile`), which answers by element
@@ -2423,7 +2434,8 @@ static bool transIsFlatIdentityAfterRemap(mlir::triton::TransOp op,
 // `expand_dims` result on the way to the full tile, not a tile of their own.
 // Returns nullopt when the cone reaches no tile of that rank, or reaches several
 // with different shapes (a matmul's `offs_m` feeds both `[BM,BK]` and
-// `[BM,BN]`); callers must then fall back to the module-wide answer.
+// `[BM,BN]`). Wide scan broadcasts additionally require matching layouts;
+// ambiguity is rejected rather than using the module-wide fallback.
 //
 // ⚠️ Answered ONCE, before the conversion, and cached in `g_makeRangeOwnTile`.
 // The walk is FORWARD through users, and `applyFullConversion` replaces those
@@ -2431,8 +2443,9 @@ static bool transIsFlatIdentityAfterRemap(mlir::triton::TransOp op,
 // tensors have already become scalars and be told there is no tile, exactly the
 // failure mode `findSubTpbRank2Companion` documents from the other direction.
 static std::optional<TileInfo>
-makeRangeOwnTileOfRank(mlir::triton::MakeRangeOp op, int64_t rank) {
-  llvm::SmallVector<mlir::Value, 16> wl{op.getResult()};
+valueConsumerTileOfRank(mlir::Value value, int64_t rank,
+                        bool requireSameLayout = false) {
+  llvm::SmallVector<mlir::Value, 16> wl{value};
   llvm::SmallPtrSet<mlir::Value, 16> seen;
   std::optional<TileInfo> found;
   while (!wl.empty()) {
@@ -2454,7 +2467,12 @@ makeRangeOwnTileOfRank(mlir::triton::MakeRangeOp op, int64_t rank) {
         if (info && info->rank == 2) {
           if (!found)
             found = info;
-          else if (found->shape != info->shape)
+          else if (found->shape != info->shape ||
+                   (requireSameLayout &&
+                    (found->elemPerThread != info->elemPerThread ||
+                     found->contiguous != info->contiguous ||
+                     found->order != info->order ||
+                     found->threadsPerBlock != info->threadsPerBlock)))
             return std::nullopt;
           continue;
         }
@@ -2475,7 +2493,12 @@ makeRangeOwnTileOfRank(mlir::triton::MakeRangeOp op, int64_t rank) {
         if (isTile) {
           if (!found)
             found = info;
-          else if (found->shape != info->shape)
+          else if (found->shape != info->shape ||
+                   (requireSameLayout &&
+                    (found->elemPerThread != info->elemPerThread ||
+                     found->contiguous != info->contiguous ||
+                     found->order != info->order ||
+                     found->threadsPerBlock != info->threadsPerBlock)))
             return std::nullopt; // ambiguous — two tiles, no single answer
           continue;              // the cone ends at the tile it indexes
         }
@@ -2629,7 +2652,7 @@ cachedMakeRangeReshapeAxis(mlir::Operation *op) {
 // Only phantoms are re-read. A kernel that genuinely holds two rank-2 tiles of
 // different `order` — a staged `tl.trans`, where `#blocked1` sits on a real
 // 16x8 tensor — keeps its parent's order; substituting there is what the
-// `makeRangeOwnTileOfRank` machinery already exists to get right, and overriding
+// `valueConsumerTileOfRank` machinery already exists to get right, and overriding
 // it turned 15 transpose cases wrong in one build.
 //
 // Answered once in the pre-pass, like the two maps above: the walk reads rank-2
@@ -4422,8 +4445,6 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
       mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
   if (!srcRtt || !dstRtt)
     return false;
-  if (isContiguousSliceToBlockedStoreIdentity(op))
-    return true;
   if (mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
           srcRtt.getEncoding()) ||
       mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
@@ -4446,6 +4467,11 @@ static bool isScalarIdentityConvert(mlir::triton::gpu::ConvertLayoutOp op) {
           !layoutIndexPlansEquivalent(*srcPlan, *dstPlan))
         return false;
     }
+    // Exact staged reductions retain the slice's register/lane ownership.
+    // Check it before the legacy unmasked-store shortcut: a contiguous axis
+    // alone does not make sizePerThread>1 columns match blocked output lanes.
+    if (isContiguousSliceToBlockedStoreIdentity(op))
+      return true;
     // Any rank >= 2 slice -> blocked pair, not only a staged reduce's own
     // result: a topk whose last comparator has the output's shape keeps no
     // reshape to exchange at, and the divergent-cvt normaliser re-encodes
@@ -5238,6 +5264,42 @@ static mlir::RankedTensorType coneRank1ScanType(mlir::Value v,
   return found;
 }
 
+static bool rank1ConeSupported(mlir::Value v, int depth,
+                               bool deferAggregateLeaves);
+
+// A wide scan broadcast reads the complete prefix buffer at the consumer's
+// coordinate, rather than republishing one scalar per lane. Keep this decision
+// available before conversion, including to the scan-buffer lifetime analysis.
+static bool scanBroadcastNeedsBuffer(mlir::triton::ExpandDimsOp expand) {
+  auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(expand.getSrc().getType());
+  auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(expand.getType());
+  if (!srcTy || srcTy.getRank() != 1 || !dstTy || dstTy.getRank() != 2)
+    return false;
+  auto tile = tileFromTensor(dstTy);
+  return tile && srcTy.getNumElements() > tile->threadsPerBlock;
+}
+
+// Only single-value rank-1 scans register their complete result in scanBufs.
+// Check every leaf: a cone may combine several scans, including a tuple scan
+// whose per-thread placeholder cannot be read at another logical coordinate.
+static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
+  if (depth > 24)
+    return false;
+  if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
+    return true;
+  auto *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
+    auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
+    return scan->getNumResults() == 1 && type.getRank() == 1 &&
+           (type.getElementType().isF32() || type.getElementType().isInteger(32));
+  }
+  return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
+    return scanBroadcastLeavesHaveBuffers(operand, depth + 1);
+  });
+}
+
 // Pre-conversion pass: record every `tt.expand_dims` that lifts a column-reduce
 // result into a rank-2 tile. Fails the pass on a cone that mixes the two
 // element conventions — that shape has no correct single-scalar answer, and
@@ -5262,24 +5324,49 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
     // same way, so `tl.cumsum(v, 0)[None, :]` added into a tile handed thread
     // t the prefix at `t` instead of at its column: every row but the first
     // wrong (`probe_diag_staged.py`, 6 of 6 shapes). It takes the same
-    // republish, indexed by whichever axis the expand did NOT insert -- but
-    // only while the scan fits the CTA in one pass: above that its lanes hold
-    // several prefixes each and no single-slot publish carries them.
+    // republish, indexed by whichever axis the expand did NOT insert. Wider
+    // scans instead read the complete prefix buffer through the cone evaluator.
     bool sawScanTileLeaf = false;
     if (auto scanTy = coneRank1ScanType(ed.getSrc(), sawScanTileLeaf, 0)) {
-      int64_t tpb = 1;
-      for (auto t : resBlocked.getThreadsPerWarp())
-        tpb *= t;
-      for (auto w : resBlocked.getWarpsPerCTA())
-        tpb *= w;
-      if (sawScanTileLeaf || scanTy.getNumElements() > tpb ||
+      if (sawScanTileLeaf ||
           coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0)) {
         ed.emitError(
             "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
-            "tile is supported only when the scan fits one element per thread "
-            "and its cone holds no device load or other reduction");
+            "tile requires a cone with no device load or other reduction");
         status = mlir::failure();
         return;
+      }
+      if (scanBroadcastNeedsBuffer(ed) &&
+          (!scanBroadcastLeavesHaveBuffers(ed.getSrc()) ||
+           !rank1ConeSupported(ed.getSrc(), 0, /*deferAggregateLeaves=*/true))) {
+        ed.emitError(
+            "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
+            "tile above one element per thread requires single-value f32/i32 "
+            "scans and a replayable elementwise cone");
+        status = mlir::failure();
+        return;
+      }
+      if (scanBroadcastNeedsBuffer(ed)) {
+        auto consumer = valueConsumerTileOfRank(
+            ed.getResult(), 2, /*requireSameLayout=*/true);
+        auto type = consumer ? mlir::RankedTensorType::get(
+                                   consumer->shape, resTy.getElementType(),
+                                   resBlocked)
+                             : mlir::RankedTensorType{};
+        auto tile = type ? tileFromTensor(type) : std::nullopt;
+        if (!tile ||
+            consumer->shape[1 - ed.getAxis()] != srcTy.getNumElements() ||
+            tile->elemPerThread != consumer->elemPerThread ||
+            tile->contiguous != consumer->contiguous ||
+            tile->order != consumer->order) {
+          ed.emitError(
+              "Metal backend: a wide rank-1 tl.scan broadcast requires one "
+              "unambiguous rank-2 consumer tile with the same layout and "
+              "matching scan-axis extent");
+          status = mlir::failure();
+          return;
+        }
+        ed->setAttr("metal.scan_broadcast_tile", mlir::TypeAttr::get(type));
       }
       out.insert(ed.getOperation());
       return;
@@ -5322,6 +5409,23 @@ struct ExpandDimsLowering
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getType());
+    if (auto attr = op->getAttrOfType<mlir::TypeAttr>(
+            "metal.scan_broadcast_tile")) {
+      auto tile = tileFromTensor(attr.getValue());
+      auto encoding = mlir::cast<mlir::triton::gpu::BlockedEncodingAttr>(
+          mlir::cast<mlir::RankedTensorType>(attr.getValue()).getEncoding());
+      // Use this broadcast's consumer, not an unrelated larger tile. Wrap the
+      // coordinate because the function's band loop may outlast this tile.
+      mlir::Value coord = emitTileCoordByOrder(
+          op, *tile, encoding.getOrder(), 1 - op.getAxis(), rewriter, loc);
+      mlir::Value value =
+          evalRank1ValueAt(op.getSrc(), coord, rewriter, loc, 0);
+      if (!value)
+        return rewriter.notifyMatchFailure(op,
+                                           "wide scan broadcast cone replay");
+      rewriter.replaceOp(op, value);
+      return mlir::success();
+    }
     if (resTy && g_axis0BroadcastExpands &&
         g_axis0BroadcastExpands->count(op.getOperation())) {
       // A barrier pair only stays uniform if every thread reaches it.
@@ -5521,7 +5625,7 @@ struct BroadcastLowering
 //   * the two sides must linearize an element to the same flat position
 //     (`transIsFlatIdentity`, checked in the pre-pass);
 //   * the ranges that re-derive the indices must decompose against the tile
-//     they actually index, not a module-wide one (`makeRangeOwnTileOfRank`).
+//     they actually index, not a module-wide one (`valueConsumerTileOfRank`).
 // Without the first a standalone `tl.trans` stored its operand untransposed;
 // without the second a 16x8 -> 8x16 `tl.reshape` wrote with the source's row
 // stride. Same identity-passthrough pattern as expand_dims / broadcast. See
@@ -10529,8 +10633,11 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
               .getResult(0);
       mlir::Type eltTy =
           mlir::cast<MetalMemRefType>(it->second.getType()).getType();
-      return GetElementOp::create(rewriter, loc, eltTy, it->second, idxUI32)
-          .getResult();
+      auto read = GetElementOp::create(rewriter, loc, eltTy, it->second, idxUI32);
+      // A later scan may reuse this buffer after the consuming operation.
+      // Preserve the lifetime analysis's read point in the emitted MSL.
+      read->setAttr("metal.materialize", rewriter.getUnitAttr());
+      return read.getResult();
     }
   }
   if (!mlir::isa<mlir::RankedTensorType>(v.getType())) {
@@ -13667,6 +13774,10 @@ struct StagedScanLowering
                             .getResult()
                       : staged;
     }
+    // Keep the prefix as a distinct value before downstream arithmetic.
+    // Inlining its full integer select/add tree into an expression that also
+    // folds this input can be miscompiled by the Metal shader optimizer.
+    result.getDefiningOp()->setAttr("metal.materialize", rewriter.getUnitAttr());
     rewriter.replaceOp(op, bridge(result, elemTy));
     return mlir::success();
   }
@@ -16077,6 +16188,7 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   const bool binaryHypercube = llvm::all_of(
       srcTy.getShape(), [](int64_t extent) { return extent == 2; });
   if (multiBand && srcTy.getRank() < 3 &&
+      !op->hasAttr(kScanInputReduceAttr) &&
       (!mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
            srcTy.getEncoding()) ||
        !layoutHasReplicatedOwners(*srcIndexPlan) || !binaryHypercube))
@@ -16614,6 +16726,52 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       valid = false;
     }
   });
+  // Reductions can reuse the scan input or publish another matching input in
+  // the same phase. Distinct inputs must already exist before the scan, with
+  // no intervening writes: the partitioner must not move or replay snapshots.
+  llvm::DenseMap<mlir::Operation *,
+                 llvm::SmallVector<mlir::triton::ReduceOp, 2>>
+      scanInputReduces;
+  auto canGroupInputs = [](mlir::triton::ScanOp scan,
+                           mlir::triton::ReduceOp reduce) {
+    llvm::SmallVector<mlir::Value, 32> worklist{
+        scan.getSrcs().front(), reduce.getSrcs().front()};
+    llvm::SmallPtrSet<mlir::Operation *, 32> seen;
+    mlir::Operation *firstLoad = nullptr;
+    while (!worklist.empty()) {
+      mlir::Value value = worklist.pop_back_val();
+      auto *def = value.getDefiningOp();
+      if (!def) {
+        if (mlir::isa<mlir::RankedTensorType>(value.getType()))
+          return false;
+        continue;
+      }
+      if (!seen.insert(def).second)
+        continue;
+      if (def->getBlock() != scan->getBlock() ||
+          !def->isBeforeInBlock(scan) || def->getNumRegions() ||
+          def->hasAttr(kExchangeAttr) ||
+          mlir::isa<mlir::triton::TransOp, mlir::triton::ReshapeOp>(def))
+        return false;
+      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def);
+          cvt && !isScalarIdentityConvert(cvt))
+        return false;
+      if (mlir::isa<mlir::triton::LoadOp>(def)) {
+        if (!firstLoad || def->isBeforeInBlock(firstLoad))
+          firstLoad = def;
+      } else if (!mlir::isMemoryEffectFree(def)) {
+        return false;
+      }
+      llvm::append_range(worklist, def->getOperands());
+    }
+    if (firstLoad)
+      for (auto it = std::next(firstLoad->getIterator()); &*it != reduce; ++it)
+        if (&*it != scan && !mlir::isMemoryEffectFree(&*it) &&
+            !mlir::isa<mlir::triton::LoadOp,
+                       mlir::triton::GetProgramIdOp>(&*it))
+          return false;
+    return true;
+  };
   // A staged rank-3 reduce is the same defect from the other side: beside a
   // multi-band staged scan its result is wrong exactly when its source layout
   // is not thread-major (📏 `probe_diag_staged.py` / eight shapes x two warp
@@ -16627,11 +16785,113 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         reduce.getSrcs().front().getType());
     if (!type || type.getRank() < 2)
       return;
-    // Rank 2 has no working combination at all: 📏 every row or column
-    // reduce beside a multi-band staged scan either died inside the
-    // conversion ("failed to legalize tt.reduce") or -- stored on its own,
-    // along axis 0 -- returned a wrong answer, for either scan axis.
+    // The legacy row scanner needs a device-rooted source cone, which the
+    // scan partition replaces with a scratch read. Use the exact-layout fold
+    // over a shared or jointly published input instead.
+    // Keep this path to one top-level scan, followed by the reduction;
+    // arbitrary scan/reduce phases need explicit shared-buffer lifetimes.
     if (type.getRank() == 2) {
+      llvm::SmallVector<mlir::triton::ScanOp, 2> functionScans;
+      func.walk([&](mlir::triton::ScanOp scan) { functionScans.push_back(scan); });
+      auto isDirectStore = [](mlir::Operation *user) {
+        if (mlir::isa<mlir::triton::StoreOp>(user))
+          return true;
+        // Vector stores may convert the sliced reduction layout to the
+        // pointer's rank-1 blocked layout before storing.
+        auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
+        return cvt && !cvt.getResult().use_empty() &&
+               llvm::all_of(cvt.getResult().getUsers(),
+                            [&](mlir::Operation *consumer) {
+                              auto store =
+                                  mlir::dyn_cast<mlir::triton::StoreOp>(consumer);
+                              return store &&
+                                     store.getValue() == cvt.getResult();
+                            });
+      };
+      // Column reductions use the same exact-layout fold, but only vector
+      // stores are admitted: column broadcasts still need their own phase
+      // and result-mapping contract.
+      bool directColumnStore =
+          reduce.getAxis() == 0 && !reduce->use_empty() &&
+          llvm::all_of(reduce->getUsers(), isDirectStore);
+      if ((reduce.getAxis() == 1 || directColumnStore) &&
+          functionScans.size() == 1 &&
+          (type.getElementType().isF32() ||
+           type.getElementType().isInteger(32))) {
+        auto scan = functionScans.front();
+        auto scanPlan = planStagedScan(scan);
+        bool sameSource = scan.getSrcs().front() == reduce.getSrcs().front();
+        if (scanPlan && scanPlan->layout &&
+            scanPlan->layout->elemPerThread > 1 &&
+            scan->getBlock() == reduce->getBlock() &&
+            mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) &&
+            scan->isBeforeInBlock(reduce) &&
+            (sameSource || scan.getSrcs().front().getType() == type)) {
+          if (!sameSource && !canGroupInputs(scan, reduce)) {
+            reduce.emitOpError(
+                "Metal backend: distinct scan/reduce inputs require "
+                "same-layout sources defined before the scan without "
+                "intervening writes or input exchanges");
+            valid = false;
+            return;
+          }
+          if (directColumnStore && type.getElementType().isInteger(32)) {
+            auto load = reduce.getSrcs().front().getDefiningOp<
+                mlir::triton::LoadOp>();
+            if (!load || load.getMask()) {
+              reduce.emitOpError(
+                  "Metal backend: a shared scan-input column reduction on i32 "
+                  "requires a direct unmasked tt.load");
+              valid = false;
+              return;
+            }
+          }
+          // The exact fold either produces a vector value for a direct
+          // store, or the row belonging to each element of the original tile.
+          // Mixed consumers and cross-axis/shape broadcasts require a separate
+          // result exchange; the keep-dims projection cannot represent them.
+          bool sawStore = false, sawExpand = false, consumersValid = true;
+          for (mlir::Operation *user : reduce->getUsers()) {
+            if (isDirectStore(user)) {
+              sawStore = true;
+              continue;
+            }
+            auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+            auto expandTy = expand ? mlir::dyn_cast<mlir::RankedTensorType>(
+                                         expand.getType())
+                                   : mlir::RankedTensorType{};
+            auto consumer = expand ? valueConsumerTileOfRank(
+                                         expand.getResult(), 2,
+                                         /*requireSameLayout=*/true)
+                                   : std::nullopt;
+            if (!expand || expand.getAxis() != reduce.getAxis() ||
+                !expandTy || expandTy.getEncoding() != type.getEncoding() ||
+                !consumer || consumer->shape != scanPlan->tile.shape ||
+                consumer->elemPerThread != scanPlan->tile.elemPerThread ||
+                consumer->contiguous != scanPlan->tile.contiguous ||
+                consumer->order != scanPlan->tile.order) {
+              consumersValid = false;
+              break;
+            }
+            sawExpand = true;
+          }
+          if (!consumersValid || (sawStore && sawExpand)) {
+            reduce.emitOpError(
+                "Metal backend: a shared scan-input row reduction requires "
+                "direct row stores or same-axis broadcasts into its original "
+                "tile");
+            valid = false;
+            return;
+          }
+          reduce->setAttr(kScanInputReduceAttr,
+                          mlir::UnitAttr::get(moduleOp.getContext()));
+          if (planRankNReduce(reduce)) {
+            scanInputReduces[scan.getOperation()].push_back(reduce);
+            return;
+          }
+          reduce->removeAttr(kScanInputReduceAttr);
+        }
+      }
       // A column reduce broadcast back into the tile (`tl.sum(v, 0)[None,
       // :]`) has its own, more specific refusal further on; leave it that.
       if (reduce.getAxis() == 0 &&
@@ -16706,7 +16966,18 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
     }
     auto srcTy =
         mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
+    const size_t scanSourceCount = scan.getSrcs().size();
     llvm::SmallVector<mlir::Value, 4> sources(scan.getSrcs());
+    llvm::SmallVector<std::pair<mlir::triton::ReduceOp, size_t>, 4>
+        reduceSources;
+    for (auto reduce : scanInputReduces[scan.getOperation()]) {
+      auto source = reduce.getSrcs().front();
+      auto found = llvm::find(sources, source);
+      size_t index = std::distance(sources.begin(), found);
+      if (found == sources.end())
+        sources.push_back(source);
+      reduceSources.emplace_back(reduce, index);
+    }
 
     mlir::Operation *segmentAnchor = nullptr;
     for (mlir::Operation &candidate : *block) {
@@ -16885,7 +17156,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       read->setAttr(kExchangeAttr, builder.getStringAttr("read"));
       reads.push_back(read);
     }
-    scan->setOperands(placeholders);
+    scan->setOperands(llvm::ArrayRef(placeholders).take_front(scanSourceCount));
 
     for (mlir::Operation *post : llvm::reverse(postOps))
       post->moveAfter(reads.back());
@@ -16938,8 +17209,17 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       g_tileExchange[reads[i]] = publishPlan;
     }
     g_stagedScanPublish[scan.getOperation()] = publishes.front();
-    if (sources.size() > 1)
-      g_stagedTupleScanPublishes[scan.getOperation()] = publishes;
+    for (auto [reduce, index] : reduceSources) {
+      // The fold reads the publication directly. A placeholder keeps tensor
+      // SSA values from escaping the source's register-band loop.
+      reduce->setOperand(0, placeholders[index]);
+      g_rankNReducePublish[reduce.getOperation()] = publishes[index];
+      g_rankNPlannedReduces.insert(reduce.getOperation());
+    }
+    if (scanSourceCount > 1)
+      g_stagedTupleScanPublishes[scan.getOperation()] =
+          llvm::SmallVector<mlir::Operation *, 4>(
+              publishes.begin(), publishes.begin() + scanSourceCount);
   }
   return mlir::success();
 }
@@ -17246,7 +17526,11 @@ struct ReduceRankNLowering
             mlir::arith::AddIOp::create(rewriter, loc, base, cOff.getResult())
                 .getResult();
       }
-      mlir::Value v = readLaneBandSlot(buf, slot, scratchSlots, plan->stageTy,
+      // A scan publication stores signless i32 as ui32, while a signed
+      // min/max fold needs si32. Load using the buffer's real element type,
+      // then bridge the unchanged bits to the combine's staging type.
+      auto bufferTy = mlir::cast<MetalMemRefType>(buf.getType()).getType();
+      mlir::Value v = readLaneBandSlot(buf, slot, scratchSlots, bufferTy,
                                        plan->stageTy, rewriter, loc);
       if (!result) {
         result = v;
@@ -17688,7 +17972,8 @@ struct ReduceLowering
     // A staged tile is likewise inline: the buffer advances one trip per fill,
     // so the fill IS the recurrence and must run every iteration.
     const bool fillInLoop =
-        inlineStaged || loopVaryingAddr || loopCarriesState || carriedTile;
+        inlineStaged || loopVaryingAddr || loopCarriesState || carriedTile ||
+        op->hasAttr("metal.scan_dependent");
     mlir::Value rowBuf;
     {
       mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -21001,12 +21286,9 @@ static void preprocessMaskedStoreSentinels(mlir::ModuleOp moduleOp,
 // scan's reads, so `ScanLowering` emits an unconditional barrier ahead of a
 // pooled fill.
 //
-// The one shape that must NOT be pooled: a scan whose result feeds a
-// `tt.reduce`. Those consumers do not read the placeholder at the scan site —
-// `g_scanBuffers` makes the reduce re-read `scanbuf[idx]` LAZILY, inside its
-// own emission, which may sit after a later scan has already refilled the
-// buffer. `flowsIntoReduce` detects that and leaves the whole function on the
-// old per-scan allocation.
+// Reductions and wide broadcasts can re-read `scanbuf[idx]` at their own
+// emission sites. Keep the buffer live through the last such reader, and use
+// private allocations when cross-block ordering cannot be proved.
 //===----------------------------------------------------------------------===//
 // (staging element type, buffer length) for a `tt.scan` that `ScanLowering`
 // will accept; `std::nullopt` for anything out of its envelope, which then
@@ -21049,37 +21331,47 @@ scanStagingShape(mlir::triton::ScanOp op, mlir::OpBuilder &builder) {
   return std::make_pair(stageTy, bufLen);
 }
 
-// Does `v` reach a `tt.reduce` through any chain of uses? Conservative: an
+// Reductions and wide broadcasts re-read a scan's buffer at their own emission
+// sites. Other users consume the pinned scalar placeholder at the scan site.
+static bool isScanBufferReader(mlir::Operation *op) {
+  if (mlir::isa<mlir::triton::ReduceOp>(op))
+    return true;
+  auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(op);
+  return expand && scanBroadcastNeedsBuffer(expand);
+}
+
+// Does `v` reach a deferred buffer reader? Conservative: an
 // over-deep chain answers "yes" so the pooling is declined rather than guessed.
-static bool flowsIntoReduce(mlir::Value v, int depth,
-                            llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
+static bool flowsIntoScanBufferReader(
+    mlir::Value v, int depth,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
   if (depth > 32)
     return true;
   for (auto *user : v.getUsers()) {
-    if (mlir::isa<mlir::triton::ReduceOp>(user))
+    if (isScanBufferReader(user))
       return true;
     if (!seen.insert(user).second)
       continue;
     for (auto res : user->getResults())
-      if (flowsIntoReduce(res, depth + 1, seen))
+      if (flowsIntoScanBufferReader(res, depth + 1, seen))
         return true;
   }
   return false;
 }
 
-// The LAST `tt.reduce` in `blk` that transitively consumes `v` — the end of the
-// scan buffer's live range, because a reduce is the one consumer that re-reads
-// `scanbuf` lazily during its OWN emission rather than at the scan site.
+// The last deferred reader in `blk` that transitively consumes `v` marks the
+// end of the scan buffer's live range. This includes wide broadcasts and any
+// subsequent reduce that replays through their original tensor expressions.
 //
-// Sets `escapes` when a consuming reduce sits outside `blk`: positions across
+// Sets `escapes` when a consuming reader sits outside `blk`: positions across
 // blocks are not comparable (`isBeforeInBlock` would be meaningless, and a
-// reduce nested in a loop can re-read on a later trip), so the caller must not
+// reader nested in a loop can re-read on a later trip), so the caller must not
 // trust an interval for that scan.
 //
 // No recursion past a reduce: downstream ops consume the reduce's SCALAR
 // result, not the scan buffer, so they do not extend the range.
 static mlir::Operation *
-latestConsumingReduce(mlir::Value v, mlir::Block *blk, bool &escapes, int depth,
+latestScanBufferReader(mlir::Value v, mlir::Block *blk, bool &escapes, int depth,
                       llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
   if (depth > 32) {
     escapes = true;
@@ -21091,17 +21383,20 @@ latestConsumingReduce(mlir::Value v, mlir::Block *blk, bool &escapes, int depth,
       latest = r;
   };
   for (auto *user : v.getUsers()) {
-    if (mlir::isa<mlir::triton::ReduceOp>(user)) {
+    if (isScanBufferReader(user)) {
       if (user->getBlock() != blk)
         escapes = true;
       else
         keep(user);
-      continue;
+      // A reduce materializes its result; a broadcast may still feed another
+      // lazy reader, so keep walking beyond it.
+      if (mlir::isa<mlir::triton::ReduceOp>(user))
+        continue;
     }
     if (!seen.insert(user).second)
       continue;
     for (auto res : user->getResults())
-      if (auto *sub = latestConsumingReduce(res, blk, escapes, depth + 1, seen))
+      if (auto *sub = latestScanBufferReader(res, blk, escapes, depth + 1, seen))
         keep(sub);
   }
   return latest;
@@ -21130,15 +21425,15 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     auto &entryBlock = funcOp.getBody().front();
 
     // Live range of each scan's buffer. It ENDS AT THE SCAN ITSELF unless a
-    // `tt.reduce` consumes the result: every other consumer reads the pinned
-    // placeholder (`metal.materialize`) at the scan site, so it holds the value
+    // reduce or wide broadcast consumes the result: every other consumer reads
+    // the pinned placeholder (`metal.materialize`) at the scan site, so it holds the value
     // in a register and never touches the buffer again.
     struct ScanLive {
       mlir::triton::ScanOp scan;
       mlir::Type stageTy;
       int64_t bufLen;
       mlir::Operation *liveEnd; // last op that may still read the buffer
-      bool hasReduceConsumer;
+      bool hasBufferReader;
       bool intervalTrusted; // liveEnd comparable against the other scans'
     };
     llvm::SmallVector<ScanLive, 8> lives;
@@ -21146,15 +21441,15 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     for (auto &e : scans) {
       bool escapes = false;
       llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-      mlir::Operation *lastRed = latestConsumingReduce(
+      mlir::Operation *lastReader = latestScanBufferReader(
           e.first->getResult(0), &entryBlock, escapes, 0, seen);
       llvm::SmallPtrSet<mlir::Operation *, 16> seen2;
-      bool anyRed = flowsIntoReduce(e.first->getResult(0), 0, seen2);
+      bool anyReader = flowsIntoScanBufferReader(e.first->getResult(0), 0, seen2);
       bool trusted = !escapes && e.first->getBlock() == &entryBlock &&
-                     (!lastRed || lastRed->getBlock() == &entryBlock);
+                     (!lastReader || lastReader->getBlock() == &entryBlock);
       allIntervalsTrusted &= trusted;
       lives.push_back({e.first, e.second.first, e.second.second,
-                       lastRed ? lastRed : e.first.getOperation(), anyRed,
+                       lastReader ? lastReader : e.first.getOperation(), anyReader,
                        trusted});
     }
 
@@ -21167,12 +21462,12 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     // sequential. The earlier blanket "decline if any scan feeds a reduce" gave
     // that kernel 16 pairs and blew the 32 KB budget.
     //
-    // When the intervals cannot be trusted (a scan or its consuming reduce sits
+    // When the intervals cannot be trusted (a scan or its deferred reader sits
     // outside the entry block — nested in a loop or an if, where a later trip
-    // can re-read), fall back to pooling ONLY the scans no reduce consumes:
+    // can re-read), pool only scans without deferred buffer readers:
     // those are self-contained (fill, prefix-sum, pinned read, done), so they
     // stay safe to share no matter what block they live in, while every
-    // reduce-consuming scan keeps a private pair.
+    // scan with deferred readers keeps a private pair.
     struct Slot {
       mlir::Type stageTy;
       int64_t len;
@@ -21183,7 +21478,7 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     llvm::SmallVector<int, 8> slotOf(lives.size(), -1);
     for (size_t i = 0; i < lives.size(); ++i) {
       auto &L = lives[i];
-      if (!allIntervalsTrusted && L.hasReduceConsumer)
+      if (!allIntervalsTrusted && L.hasBufferReader)
         continue; // private allocation
       for (size_t k = 0; k < slots.size(); ++k) {
         if (slots[k].stageTy != L.stageTy)
@@ -21195,7 +21490,7 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
             slots[k].liveEnd->getBlock() == &entryBlock &&
             L.scan->getBlock() == &entryBlock)
           free = slots[k].liveEnd->isBeforeInBlock(L.scan.getOperation());
-        else if (!free && !L.hasReduceConsumer && !slots[k].liveEnd)
+        else if (!free && !L.hasBufferReader && !slots[k].liveEnd)
           free = true;
         if (free) {
           slots[k].len = std::max(slots[k].len, L.bufLen);
@@ -21233,6 +21528,31 @@ static void preprocessScanBuffers(mlir::ModuleOp moduleOp, ScanBufPool &pool) {
     for (size_t i = 0; i < lives.size(); ++i)
       if (slotOf[i] >= 0)
         pool[lives[i].scan.getOperation()] = slotBufs[slotOf[i]];
+  });
+}
+
+// Row-reduction fills over a scan must run after the prefix buffer is written.
+// Record the dependency before conversion detaches the original tensor cone;
+// the lowering only consults the annotation on its own operation.
+static void markScanDependentReductions(mlir::ModuleOp moduleOp) {
+  moduleOp.walk([&](mlir::triton::ScanOp scan) {
+    llvm::SmallVector<mlir::Value, 16> work(scan.getResults());
+    llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+    while (!work.empty()) {
+      mlir::Value value = work.pop_back_val();
+      for (mlir::Operation *user : value.getUsers()) {
+        if (!seen.insert(user).second)
+          continue;
+        if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(user)) {
+          auto type = mlir::cast<mlir::RankedTensorType>(
+              reduce.getSrcs().front().getType());
+          if (type.getRank() == 2 && reduce.getAxis() == 1)
+            reduce->setAttr("metal.scan_dependent",
+                            mlir::UnitAttr::get(moduleOp.getContext()));
+        }
+        llvm::append_range(work, user->getResults());
+      }
+    }
   });
 }
 
@@ -44154,7 +44474,7 @@ struct ConvertTritonGPUToMetalPass
                     mlir::triton::gpu::BlockedEncodingAttr>(
                     inner3.getParent()))
               if (parent3.getOrder().size() == 3)
-                if (auto own3 = makeRangeOwnTileOfRank(range, 3)) {
+                if (auto own3 = valueConsumerTileOfRank(range.getResult(), 3)) {
                   // Substitute only for a genuine TIE — a DIFFERENT shape of
                   // the SAME element count, which is exactly when "largest" has
                   // no answer of its own. Both halves of that are measured:
@@ -44216,7 +44536,7 @@ struct ConvertTritonGPUToMetalPass
               g_makeRangePhantomOrder[range.getOperation()] = real->order;
           }
         }
-        std::optional<TileInfo> own = makeRangeOwnTileOfRank(range, 2);
+        std::optional<TileInfo> own = valueConsumerTileOfRank(range.getResult(), 2);
         std::optional<TileInfo> global = findLargestRank2Tile(range);
         const bool globalUsable = global && global->rank == 2;
         // Every range that knows its own tile uses it. This used to be allowed
@@ -44338,6 +44658,7 @@ struct ConvertTritonGPUToMetalPass
     // 128 KB against a 32 KB budget. Must run pre-conversion so the allocas
     // land in the original function's entry block and dominate every scan.
     ScanBufPool scanBufPool;
+    markScanDependentReductions(moduleOp);
     preprocessScanBuffers(moduleOp, scanBufPool);
     if (mlir::failed(validateRankNTupleScanScratchBudget(moduleOp))) {
       signalPassFailure();

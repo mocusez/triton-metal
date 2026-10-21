@@ -689,7 +689,31 @@ The current dependency-ordered priorities are:
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing
-   f32/i32 and threadgroup-memory limits. Broader descriptor-reduce type/rank and
+   f32/i32 and threadgroup-memory limits. Single-value f32/i32 rank-1 scan
+   results wider than the threadgroup can now broadcast along either axis of
+   a rank-2 tile, including elementwise combinations of scans and subsequent
+   reductions. Broadcasts use their own consumer tile coordinates and retain
+   prefix buffers through deferred readers. A single top-level multi-band
+   rank-2 scan can now share its input publication with subsequent reductions
+   of the exact same source. Axis-1 reductions support direct row stores or
+   same-axis broadcasts into the original tile; axis-0 reductions support direct
+   column-vector stores, including outputs wider than the threadgroup. The
+   shared path preserves input snapshots across later device stores and
+   supports multiple reductions. f32 sources may be masked or computed;
+   i32 sources require a direct unmasked load.
+   Axis-1 reductions and axis-0 column-vector stores may also use distinct
+   inputs with the same shape, layout, and dtype, published together with the
+   scan input. Their complete input computations must precede the scan,
+   without input exchanges or intervening
+   device writes; repeated inputs share a publication, within the existing
+   threadgroup-memory budget. i32 reduction inputs still require direct
+   unmasked loads; independent scan inputs may be masked or computed.
+   Reducing the scan result, multi-band column broadcasts, and mixed
+   row-store/broadcast or cross-axis/wider broadcast consumers remain rejected
+   in this combination. Mixed device-load cones for wide rank-1 scan broadcasts,
+   wide tuple scan broadcasts, and ambiguous
+   consumer layouts also remain rejected.
+   Broader descriptor-reduce type/rank and
    `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
    canonical dynamic/masked loops, and masked rank-3 batch tails; more general

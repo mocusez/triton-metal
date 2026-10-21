@@ -23,6 +23,7 @@ Shape conventions:
 from __future__ import annotations
 
 import os
+import re
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -2474,17 +2475,12 @@ def test_dot_multiwarp(num_warps):
 
 
 def _capture_msl(num_warps):
-    """Compile dot_multiwarp_kernel and return the emitted MSL source. The
-    cache directory whose `dot_multiwarp_kernel.json` reports the matching
-    `num_warps` is the only candidate, so this works even when multiple
-    parametrize iterations co-exist in `~/.triton/cache`."""
-    import json
-
+    """Return this compilation's MSL, independently of the cache directory."""
     M, N, K = 64, 64, 32
     a = torch.zeros((M, K), dtype=torch.float32).contiguous()
     b = torch.zeros((K, N), dtype=torch.float32).contiguous()
     c = torch.zeros((M, N), dtype=torch.float32).contiguous()
-    dot_multiwarp_kernel[(1, 1)](
+    compiled = dot_multiwarp_kernel[(1, 1)](
         a,
         b,
         c,
@@ -2500,32 +2496,27 @@ def _capture_msl(num_warps):
         K_TILES=K // 8,
         num_warps=num_warps,
     )
-    for root, _dirs, files in os.walk(os.path.expanduser("~/.triton/cache")):
-        if "dot_multiwarp_kernel.json" not in files:
-            continue
-        if "dot_multiwarp_kernel.metal" not in files:
-            continue
-        with open(os.path.join(root, "dot_multiwarp_kernel.json")) as fh:
-            if json.load(fh).get("num_warps") != num_warps:
-                continue
-        with open(os.path.join(root, "dot_multiwarp_kernel.metal")) as fh:
-            return fh.read()
-    return ""
+    msl = compiled.asm["metal"]
+    return msl.decode() if isinstance(msl, bytes) else msl
 
 
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
 def test_dot_multiwarp_msl_predicates(num_warps):
-    """AC4-S5: the emitted MSL contains exactly
-    `(8/warpsM) * (8/warpsN) * K_TILES = 256/num_warps` occurrences of
-    `simdgroup_multiply_accumulate(`. For num_warps>1 the MSL also has
-    `simdgroup_index_in_threadgroup` (the kernel parameter attribute) and
-    per-warp slice indexing via `_stage_shared[sgid]`."""
+    """Check current MSL's MMA partition and shared staging per SIMD-group.
+
+    Multi-warp tiles fit the runtime K-loop tier: 64/num_warps MMAs per
+    iteration, four iterations. The single-warp tile exceeds that tier's
+    accumulator budget and retains the unrolled 256-MMA fallback.
+    """
     msl = _capture_msl(num_warps)
-    assert msl, "no MSL captured (cache miss)"
-    expected_mma = 256 // num_warps
+    assert msl, "no MSL captured from the compiled kernel"
+    expected_mma = 256 if num_warps == 1 else 64 // num_warps
     mma_count = msl.count("simdgroup_multiply_accumulate(")
     assert mma_count == expected_mma, f"num_warps={num_warps}: mma count {mma_count} != expected {expected_mma}"
     if num_warps > 1:
+        assert re.search(r"for \(int (\w+) = 0; \1 < 32; \1 \+= 8\)", msl), (
+            "multi-warp MSL must execute all four K tiles"
+        )
         assert "simdgroup_index_in_threadgroup" in msl, (
             "multi-warp MSL missing simdgroup_index_in_threadgroup parameter"
         )
