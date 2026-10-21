@@ -699,15 +699,18 @@ The current dependency-ordered priorities are:
    same-axis broadcasts into the original tile; axis-0 reductions support direct
    column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
-   supports multiple reductions. f32 sources may be masked or computed;
-   these row and column-vector paths require direct unmasked i32 inputs.
+   supports multiple reductions. f32 sources may be masked or computed.
+   i32 row and column-vector sum and signed min/max also accept supported
+   masked or computed sources, preserving mask fill values and computed results.
+   i32 row product/bitwise reductions and column-vector products still require
+   direct unmasked loads.
    Axis-1 reductions and axis-0 column-vector stores may also use distinct
    inputs with the same shape, layout, and dtype, published together with the
    scan input. Their complete input computations must precede the scan,
    without input exchanges or intervening
    device writes; repeated inputs share a publication, within the existing
-   threadgroup-memory budget. i32 reduction inputs still require direct
-   unmasked loads; independent scan inputs may be masked or computed.
+   threadgroup-memory budget. The same source rules apply to distinct i32
+   reduction inputs; independent scan inputs may be masked or computed.
    Shared or distinct-source f32/i32 column sum/min/max can also broadcast
    directly back into the original tile after the scan, with 2..64 rows and
    2..256 columns, including more columns than threads. The scan-axis extent

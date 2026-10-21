@@ -16754,10 +16754,10 @@ scanColumnBroadcastExpand(mlir::triton::ReduceOp reduce) {
   return sawStore ? expand : mlir::triton::ExpandDimsOp{};
 }
 
-// Only postpone the legacy wide-column gate for a single, matching staged
-// scan. The phase planner remains authoritative about source lifetimes and
-// publication budgets, and the caller must verify that it claimed this reduce.
-static bool hasMatchingColumnBroadcastScan(mlir::triton::ReduceOp reduce) {
+// Only postpone legacy reduce gates for a single, matching staged scan. The
+// phase planner remains authoritative about source lifetimes and publication
+// budgets, and the caller must verify that it claimed this reduce.
+static bool hasMatchingScanInputPublication(mlir::triton::ReduceOp reduce) {
   auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
   if (!func)
     return false;
@@ -16938,10 +16938,16 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             valid = false;
             return;
           }
-          // A tile broadcast folds the published tensor, including masked
-          // fill values and computed i32 elements. It does not replay the
-          // legacy device-load cone. Keep the vector-store source contract.
-          if (directColumnStore && type.getElementType().isInteger(32)) {
+          // Column sums and signed extrema fold the full published tensor,
+          // including masked fill values and computed i32 elements. Other
+          // vector combines retain their direct-load source contract.
+          auto *combine = reduceCombineBinaryOp(reduce);
+          bool publishedColumnCombine =
+              mlir::isa_and_nonnull<mlir::arith::AddIOp,
+                                   mlir::arith::MaxSIOp,
+                                   mlir::arith::MinSIOp>(combine);
+          if (directColumnStore && type.getElementType().isInteger(32) &&
+              !publishedColumnCombine) {
             auto load = reduce.getSrcs().front().getDefiningOp<
                 mlir::triton::LoadOp>();
             if (!load || load.getMask()) {
@@ -43098,6 +43104,7 @@ struct ConvertTritonGPUToMetalPass
     llvm::SmallVector<std::pair<mlir::triton::ReduceOp,
                                 mlir::triton::ExpandDimsOp>, 4>
         deferredScanColumnBroadcasts;
+    llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanRowReduces;
     bool reduceOk = true;
     moduleOp.walk([&](mlir::triton::ReduceOp red) {
       auto axes = red.getAxis();
@@ -43350,7 +43357,7 @@ struct ConvertTritonGPUToMetalPass
                  !(rank2Axis0ColumnBufferUsable(red, tpb, bn) &&
                    axis0ReexpansionConeEvaluable(red)))) {
               if (auto expand = scanColumnBroadcastExpand(red);
-                  expand && hasMatchingColumnBroadcastScan(red)) {
+                  expand && hasMatchingScanInputPublication(red)) {
                 deferredScanColumnBroadcasts.emplace_back(red, expand);
                 return;
               }
@@ -43637,12 +43644,23 @@ struct ConvertTritonGPUToMetalPass
           src = cvt.getSrc();
         auto load = src.getDefiningOp<mlir::triton::LoadOp>();
         if ((!load || load.getMask()) && !stagedFallback) {
-          red.emitOpError(
-              "rank-2 axis=1 reduce over a computed cone is implemented for "
-              "f32 only; other element types require a direct unmasked "
-              "tt.load");
-          reduceOk = false;
-          return;
+          // A matching scan may publish the complete i32 source instead of
+          // replaying a device-load cone. Defer only these combines, and
+          // require actual phase-planner ownership before conversion below.
+          if (rtt.getElementType().isInteger(32) &&
+              red.getSrcs().size() == 1 && red.getNumResults() == 1 &&
+              (combineName == "arith.addi" || combineName == "arith.maxsi" ||
+               combineName == "arith.minsi") &&
+              hasMatchingScanInputPublication(red)) {
+            deferredScanRowReduces.push_back(red);
+          } else {
+            red.emitOpError(
+                "rank-2 axis=1 reduce over a computed cone is implemented for "
+                "f32 only; other element types require a direct unmasked "
+                "tt.load");
+            reduceOk = false;
+            return;
+          }
         }
       }
       // 4) dynamic reduce extent — static shape required. Rank-aware to avoid
@@ -43798,6 +43816,17 @@ struct ConvertTritonGPUToMetalPass
           !g_rankNPlannedReduces.count(reduce.getOperation())) {
         reduce.emitOpError(
             "Metal backend: wide scan-input column broadcast requires a "
+            "planned shared-input publication");
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto reduce : deferredScanRowReduces) {
+      if (!reduce->hasAttr(kScanInputReduceAttr) ||
+          !g_rankNReducePublish.count(reduce.getOperation()) ||
+          !g_rankNPlannedReduces.count(reduce.getOperation())) {
+        reduce.emitOpError(
+            "Metal backend: computed i32 scan-input row reduction requires a "
             "planned shared-input publication");
         signalPassFailure();
         return;
