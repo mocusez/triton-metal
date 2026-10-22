@@ -352,6 +352,8 @@ static mlir::Value coneReplaySource(mlir::Operation *def) {
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
+static constexpr llvm::StringLiteral kExactPhaseSourceAttr =
+    "metal.exact_phase_source";
 // A reduction consumes a complete input publication grouped with a scan.
 static constexpr llvm::StringLiteral kScanInputReduceAttr =
     "metal.scan_input_reduce";
@@ -636,6 +638,7 @@ static llvm::DenseMap<mlir::Operation *,
                       llvm::SmallVector<mlir::Operation *, 4>>
     g_stagedTupleScanPublishes;
 static llvm::DenseMap<int64_t, LayoutIndexPlan> g_stagedScanRanges;
+static llvm::DenseMap<mlir::Operation *, LayoutIndexPlan> g_rankNIndicatorRanges;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanLoops;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanFunctions;
 static constexpr llvm::StringLiteral kScanBandLoopAttr = "metal.scan_band_loop";
@@ -3968,6 +3971,16 @@ struct MakeRangeLowering
           .getResult();
     };
     if (rankNPhase) {
+      // Blocked indicators need the full consumer's coordinate too: their
+      // degenerate shape can place an axis in a different register/lane bit.
+      auto indicator = g_rankNIndicatorRanges.find(op.getOperation());
+      if (indicator != g_rankNIndicatorRanges.end()) {
+        if (mlir::Value idx =
+                emitLayoutElementIndex(op, indicator->second, rewriter, loc)) {
+          rewriter.replaceOp(op, withStart(idx));
+          return mlir::success();
+        }
+      }
       if (std::optional<LayoutIndexPlan> plan =
               planLinearRange(op, /*allowMixedHypercube=*/true)) {
         // The range's own basis stays authoritative while it agrees with the
@@ -16202,8 +16215,15 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // represent their ownership and the phase path must finish those stages.
   const bool binaryHypercube = llvm::all_of(
       srcTy.getShape(), [](int64_t extent) { return extent == 2; });
+  // A flattened result of an exact-layout phase can be published in that
+  // layout directly, even when its producer cannot be replayed per element.
+  const bool linearPhaseResult =
+      srcTy.getRank() == 1 && op->hasAttr(kExactPhaseSourceAttr) &&
+      srcIndexPlan->elemPerThread <= 64 &&
+      mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(
+          srcTy.getEncoding());
   if (multiBand && srcTy.getRank() < 3 &&
-      !op->hasAttr(kScanInputReduceAttr) &&
+      !op->hasAttr(kScanInputReduceAttr) && !linearPhaseResult &&
       (!mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
            srcTy.getEncoding()) ||
        !layoutHasReplicatedOwners(*srcIndexPlan) || !binaryHypercube))
@@ -16434,6 +16454,58 @@ planRankNReduce(mlir::triton::ReduceOp op) {
                                     strides, stageTy, kind});
 }
 
+// Mark linear rank-1 folds of an exact-layout reduction before validation.
+// Unrelated flattened load cones retain the legacy logical-position replay.
+static void markLinearRank1PhaseReductions(mlir::ModuleOp moduleOp) {
+  moduleOp.walk([&](mlir::triton::ReduceOp reduce) {
+    if (reduce.getSrcs().size() != 1)
+      return;
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+        reduce.getSrcs().front().getType());
+    if (!type || type.getRank() != 1 ||
+        !mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(
+            type.getEncoding()))
+      return;
+    auto reshape =
+        reduce.getSrcs().front().getDefiningOp<mlir::triton::ReshapeOp>();
+    if (!reshape)
+      return;
+    auto sourceType =
+        mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+    if (!mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
+            sourceType.getEncoding()))
+      return;
+    llvm::SmallVector<mlir::Value> worklist{reshape.getSrc()};
+    llvm::SmallPtrSet<mlir::Operation *, 32> visited;
+    while (!worklist.empty()) {
+      auto *def = worklist.pop_back_val().getDefiningOp();
+      if (!def || !visited.insert(def).second || !mlir::isMemoryEffectFree(def))
+        continue;
+      if (auto source = mlir::dyn_cast<mlir::triton::ReduceOp>(def)) {
+        auto plan = planRankNReduce(source);
+        if (!plan || plan->threadMajorRelabel)
+          continue;
+        auto sourceTy = mlir::dyn_cast<mlir::RankedTensorType>(
+            source.getSrcs().front().getType());
+        if (sourceTy && sourceTy.getRank() >= 3 && plan->exactLayoutScratch) {
+          reduce->setAttr(kExactPhaseSourceAttr,
+                          mlir::UnitAttr::get(reduce.getContext()));
+          return;
+        }
+      } else if (def->getNumRegions() ||
+                 !(def->getName().getDialectNamespace() == "arith" ||
+                   def->getName().getDialectNamespace() == "math" ||
+                   mlir::isa<mlir::triton::ReshapeOp,
+                             mlir::triton::ExpandDimsOp,
+                             mlir::triton::BroadcastOp,
+                             mlir::triton::BitcastOp>(def))) {
+        continue;
+      }
+      llvm::append_range(worklist, def->getOperands());
+    }
+  });
+}
+
 // Split every multi-band rank-N reduce at a synthetic self-convert publish.
 // The reduce receives a zero tensor placeholder so no SSA value defined inside
 // the publish phase escapes its scf.for.  ReduceRankNLowering ignores that
@@ -16472,7 +16544,8 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
         mlir::isa_and_nonnull<mlir::arith::XOrIOp>(
             reduceCombineBinaryOp(reduce)) &&
         rankNReduceHasKeepDimsUsers(reduce);
-    if (srcTy.getRank() >= 3 || nestedSlice || replicatedRank1Xor ||
+    if (srcTy.getRank() >= 3 || nestedSlice ||
+        reduce->hasAttr(kExactPhaseSourceAttr) || replicatedRank1Xor ||
         replicatedKeepDimsXor)
       if (auto func = reduce->getParentOfType<mlir::triton::FuncOp>())
         phaseFunctions.insert(func.getOperation());
@@ -34642,6 +34715,33 @@ static bool canCloneStoreSideEncodingCone(mlir::Value root,
          !mlir::isa<mlir::RankedTensorType>(root.getType());
 }
 
+// Broadcast permits different encodings when they agree on the source shape.
+// Our scalar tile loop also needs the address cone to use the destination's
+// indexing convention. Recompute pure cones in that encoding, leaving shared
+// producers intact for their other consumers.
+static void normalizeBlockedBroadcastCones(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::BroadcastOp> broadcasts;
+  moduleOp.walk([&](mlir::triton::BroadcastOp op) { broadcasts.push_back(op); });
+  for (auto broadcast : broadcasts) {
+    auto srcTy = mlir::cast<mlir::RankedTensorType>(broadcast.getSrc().getType());
+    auto dstTy = mlir::cast<mlir::RankedTensorType>(broadcast.getType());
+    auto srcEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+        srcTy.getEncoding());
+    auto dstEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+        dstTy.getEncoding());
+    if (!srcEnc || !dstEnc || srcEnc == dstEnc)
+      continue;
+    auto retyped = mlir::RankedTensorType::get(
+        srcTy.getShape(), srcTy.getElementType(), dstEnc);
+    if (mlir::triton::gpu::toLinearLayout(srcTy) !=
+        mlir::triton::gpu::toLinearLayout(retyped))
+      continue;
+    if (mlir::Value source = cloneStoreSideEncodingCone(
+            broadcast.getSrc(), srcEnc, dstEnc, broadcast.getOperation()))
+      broadcast->setOperand(0, source);
+  }
+}
+
 // When a rank-1/rank-2 blocked->blocked relabel feeds a tt.store value, the
 // value may be shared with other consumers (for example, two attention
 // backward dot outputs). The generic divergent-cvt normalizer cannot rewrite
@@ -43135,6 +43235,7 @@ struct ConvertTritonGPUToMetalPass
     g_stagedScanPublish.clear();
     g_stagedTupleScanPublishes.clear();
     g_stagedScanRanges.clear();
+    g_rankNIndicatorRanges.clear();
     g_nestedScanLoops.clear();
     g_nestedScanFunctions.clear();
     g_nestedScanCarryBytes.clear();
@@ -43332,6 +43433,7 @@ struct ConvertTritonGPUToMetalPass
     // producer cone to the dest encoding so the cvt becomes an identity the
     // classifier/lowering accept (turning the transpose into a direct
     // gather/scatter, no threadgroup staging).
+    normalizeBlockedBroadcastCones(moduleOp);
     normalizeBlockedDivergentCvts(moduleOp);
 
     // NOTE: the ttg.convert_layout legality gate used to run HERE, which
@@ -43358,6 +43460,7 @@ struct ConvertTritonGPUToMetalPass
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanColumnProducts;
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanColumnBitwise;
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanUnsignedExtrema;
+    markLinearRank1PhaseReductions(moduleOp);
     bool reduceOk = true;
     moduleOp.walk([&](mlir::triton::ReduceOp red) {
       auto axes = red.getAxis();
@@ -43868,9 +43971,10 @@ struct ConvertTritonGPUToMetalPass
             return;
           }
         }
-        // A linear source takes the lowering's logical-position rebuild,
-        // which needs the whole cone replayable and at most 64 per thread.
-        if (int64_t threads = linearRank1ReduceThreads(rtt)) {
+        // A linear source outside an exact phase uses logical-position
+        // replay, which needs the whole cone and at most 64 per thread.
+        if (int64_t threads = linearRank1ReduceThreads(rtt);
+            threads && !stagedFallback) {
           if (red.getSrcs().size() == 1 &&
               (!rank1ConeSupported(red.getSrcs().front(), 0) ||
                (rtt.getDimSize(0) + threads - 1) / threads > 64)) {
@@ -44989,6 +45093,11 @@ struct ConvertTritonGPUToMetalPass
         auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(range.getType());
         if (!rtt)
           return;
+        if (range->hasAttr(kRankNPhaseAttr) &&
+            mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+                rtt.getEncoding()))
+          if (auto plan = planRangeFromHypercubeConsumer(range))
+            g_rankNIndicatorRanges[range.getOperation()] = *plan;
         // Read here, alongside the other forward walk, because the conversion
         // erases the reshape this one looks for. Cheap and empty for every
         // kernel whose `[:, None]` is still spelled `tt.expand_dims`.

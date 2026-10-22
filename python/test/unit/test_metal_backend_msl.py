@@ -2251,19 +2251,22 @@ def test_two_topk_exact_results():
     assert torch.equal(out1.cpu(), values.sort().values[:K1])
 
 
-def test_topk_followup_elementwise_and_reduce():
+@pytest.mark.parametrize("N,K,num_warps", [(128, 8, 1), (128, 8, 4), (256, 16, 4)])
+def test_topk_followup_elementwise_and_reduce(N, K, num_warps):
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    N, K = 128, 8
-    values = torch.randperm(N).to(torch.float32) - 64
+    # The flattened selection can be linear-encoded, with both replicated
+    # lanes and multiple registers. Its sum must consume the staged values.
+    torch.manual_seed(N + K + num_warps)
+    values = torch.randperm(N).to(torch.float32) - N / 2
     out = torch.empty(K, dtype=torch.float32, device="mps")
     total = torch.empty(1, dtype=torch.float32, device="mps")
     device_values = values.to("mps")
     _topk_elementwise_followup_kernel[(1,)](device_values, out, N, K,
-                                             num_warps=4)
+                                             num_warps=num_warps)
     _topk_reduce_followup_kernel[(1,)](device_values, total, N, K,
-                                        num_warps=4)
+                                        num_warps=num_warps)
     torch.mps.synchronize()
     selected = values.sort(descending=True).values[:K]
     assert torch.equal(out.cpu(), selected * 2 - 1)
@@ -2435,23 +2438,27 @@ def test_sort_rank3_exact_rows_at_every_band_count(B, M, N, num_warps):
 # xor-reduce's keep-dims read and the column indicator both taken from the
 # store-layout cone the normaliser re-encoded the comparator into. k=1 is
 # `tl.max(x, 1, keep_dims=True)` stored as a column.
+# The 8x128 cases also cover mixed-layout pointer broadcasts (K=4, one warp)
+# and a blocked comparator indicator whose coordinate belongs to a lane bit
+# rather than the thread-major register bit (K=16, four warps).
 @pytest.mark.parametrize("M,N,K,num_warps", [
     (16, 16, 4, 1), (32, 8, 4, 1), (8, 128, 4, 1), (8, 128, 4, 4),
     (8, 128, 16, 4), (4, 32, 4, 1), (4, 32, 8, 1),
     (2, 64, 2, 1), (2, 16, 2, 4), (2, 128, 2, 4), (1, 16, 4, 1),
     (1, 64, 4, 4), (1, 32, 2, 1), (1, 128, 2, 4), (4, 32, 1, 1), (8, 32, 1, 4),
 ])
-def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps):
+@pytest.mark.parametrize("descending", [False, True])
+def test_topk_rank2_exact_rows_at_every_band_count(M, N, K, num_warps, descending):
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
     torch.manual_seed(M * 17 + N + K)
     x = (torch.randperm(M * N).float() - M * N / 2).reshape(M, N)
     out = torch.zeros(M, K, dtype=torch.float32, device="mps")
-    _topk_rank2_v2_kernel[(1,)](x.to("mps"), out, M, N, K, True,
+    _topk_rank2_v2_kernel[(1,)](x.to("mps"), out, M, N, K, descending,
                               num_warps=num_warps)
     torch.mps.synchronize()
-    assert torch.equal(out.cpu(), x.topk(K, dim=1).values)
+    assert torch.equal(out.cpu(), x.topk(K, dim=1, largest=descending).values)
 
 
 @triton.jit

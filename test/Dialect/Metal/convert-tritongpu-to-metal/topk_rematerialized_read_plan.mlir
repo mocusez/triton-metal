@@ -1,6 +1,8 @@
 // RUN: triton-metal-opt --convert-tritongpu-to-metal %s | triton-metal-translate --mlir-to-msl | FileCheck %s
 
-// `tl.topk(x, 4)` over a 4x32 tile at one warp, verbatim TTGIR.
+// `tl.topk(x, 4)` over a 4x32 tile at one warp. The range layouts omit
+// redundant zero register bases, as blocked and slice layouts do when converted
+// to linear layouts, so the reshapes preserve the exact register mapping.
 //
 // When a staged phase rematerialised an exchange read it copied the read's plan
 // with `g_tileExchange[clone] = planIt->second`. Both are DenseMaps: the insert
@@ -21,11 +23,11 @@
 #blocked = #ttg.blocked<{sizePerThread = [1, 1, 1, 1, 1, 2, 2], threadsPerWarp = [2, 2, 2, 2, 2, 1, 1], warpsPerCTA = [1, 1, 1, 1, 1, 1, 1], order = [6, 5, 4, 3, 2, 1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
-#linear = #ttg.linear<{register = [[0], [1]], lane = [[0], [0], [0], [0], [0]], warp = [], block = []}>
-#linear1 = #ttg.linear<{register = [[0], [0]], lane = [[1], [0], [0], [0], [0]], warp = [], block = []}>
+#linear = #ttg.linear<{register = [[1]], lane = [[0], [0], [0], [0], [0]], warp = [], block = []}>
+#linear1 = #ttg.linear<{register = [], lane = [[1], [0], [0], [0], [0]], warp = [], block = []}>
 #linear2 = #ttg.linear<{register = [], lane = [[0], [0], [1], [0], [0]], warp = [], block = []}>
 #linear3 = #ttg.linear<{register = [], lane = [[0], [1], [0], [0], [0]], warp = [], block = []}>
-#linear4 = #ttg.linear<{register = [[1], [0]], lane = [[0], [0], [0], [0], [0]], warp = [], block = []}>
+#linear4 = #ttg.linear<{register = [[1]], lane = [[0], [0], [0], [0], [0]], warp = [], block = []}>
 #linear5 = #ttg.linear<{register = [[1]], lane = [[0], [0], [0], [0], [0]], warp = [], block = []}>
 #linear6 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[0, 0], [0, 0], [0, 0], [1, 0], [2, 0]], warp = [], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {

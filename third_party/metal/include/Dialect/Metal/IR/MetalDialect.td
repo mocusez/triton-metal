@@ -19,6 +19,9 @@ def Metal_Dialect : Dialect {
     let summary = "Metal MLIR dialect.";
     let cppNamespace = "::mlir::triton::metal";
 
+    // Preserve the existing attr-dict syntax for inherent attributes.
+    let useStrictPropertiesInAssemblyFormat = 0;
+
     let useDefaultTypePrinterParser = 1;
     let extraClassDeclaration = [{
       Operation *materializeConstant(OpBuilder &builder, Attribute value,
