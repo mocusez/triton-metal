@@ -31,4 +31,4 @@ module {
 // CHECK: constant float *v2 {{\[\[buffer\(2\)\]\]}},
 // CHECK: device float *v3 {{\[\[buffer\(3\)\]\]}},
 // CHECK: uint3 id {{\[\[thread_position_in_grid\]\]}})
-// CHECK: v3[id.x] = (metal::precise::exp(metal::floor(v0[id.x]))) + ((metal::precise::sqrt(metal::ceil(v1[id.x]))) * ((-(v2[id.x]))));
+// CHECK: v3[id.x] = ((metal::precise::exp(metal::floor(v0[id.x]))) + (((metal::precise::sqrt(metal::ceil(v1[id.x]))) * ((-(v2[id.x]))))));

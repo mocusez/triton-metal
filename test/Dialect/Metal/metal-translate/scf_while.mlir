@@ -101,7 +101,7 @@ module {
 // CHECK: v[[FN]] = v[[N]];
 // CHECK: if (!v[[COND]]) break;
 // The body reads the forwarded temps and writes the before-region ones.
-// CHECK: v[[ACC]] = (v[[FACC]]) + (1.0
+// CHECK: v[[ACC]] = ((v[[FACC]]) + (1.0
 // CHECK: v[[N]] = (v[[FN]] + 1)
 // The loop result is the last forwarded value.
 // CHECK: v{{[0-9]+}}[0] = v[[FACC]]
@@ -118,14 +118,14 @@ module {
 // Each yielded value reads only the forwarded temps, so the order of the
 // writes cannot matter.
 // CHECK: v[[A]] = v[[FB]];
-// CHECK: v[[B]] = (v[[FA]]) + (v[[FB]]);
+// CHECK: v[[B]] = ((v[[FA]]) + (v[[FB]]));
 // CHECK: return;
 
 // CHECK: kernel void while_forward_computed(
 // CHECK: float v[[I:[0-9]+]] = 0.0
 // CHECK: float v[[F:[0-9]+]];
 // CHECK: while (true)
-// CHECK: float v[[T:[0-9]+]] = (v[[I]]) + (1.0
+// CHECK: float v[[T:[0-9]+]] = ((v[[I]]) + (1.0
 // CHECK: v[[F]] = v[[T]];
 // CHECK: if (!v{{[0-9]+}}) break;
 // CHECK: v[[I]] = v[[F]];

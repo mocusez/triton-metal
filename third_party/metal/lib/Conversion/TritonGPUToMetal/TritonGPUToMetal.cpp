@@ -7200,8 +7200,9 @@ accumulateScalarAddPtrOffsets(mlir::Value origPtrVal,
 
 // Same, but also walks tt.broadcast / tt.expand_dims so the per-program scalar
 // term of a 2D tile address is reachable. See the definition for why the rank-2
-// axis=1 reduce needs it.
-static mlir::Value accumulateScalarAddPtrOffsetsThroughShape(
+// axis=1 reduce needs it. Success with a null value means no scalar offsets;
+// failure means an offset could not be replayed at the current insertion point.
+static mlir::FailureOr<mlir::Value> accumulateScalarAddPtrOffsetsThroughShape(
     mlir::Value origPtrVal, mlir::ConversionPatternRewriter &rewriter,
     mlir::Location loc);
 
@@ -12197,8 +12198,9 @@ static mlir::Value evalRank2ConeAt(mlir::Value v, mlir::Value rVal,
 // so a walker that stops at shape ops sees nothing at all.
 //
 // Tensor offsets are re-derived per element via `evalRank2ConeAt`; scalar ones
-// (a per-program `pid*stride` base) are added as-is. Returns null if any offset
-// cone is not evaluable, or if the chain carried no offset at all.
+// (a per-program `pid*stride` base) replay through the rank-1 evaluator. The row
+// fill may precede the tile loop that defined the original scalar SSA values.
+// Returns null if any offset cone is not evaluable, or the chain has no offset.
 static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
                                      mlir::Value rowBase, mlir::Value nVal,
                                      mlir::ConversionPatternRewriter &rewriter,
@@ -12241,7 +12243,11 @@ static mlir::Value evalAddPtrChainAt(mlir::Value ptrVal, mlir::Value rVal,
         return nullptr;
       addTerm(s);
     } else {
-      addTerm(off);
+      mlir::Value s =
+          evalRank1ValueAt(off, nVal, rewriter, loc, depth + 1);
+      if (!s)
+        return nullptr;
+      addTerm(s);
     }
     cur = ap.getPtr();
   }
@@ -16368,17 +16374,26 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   const bool isMulI = mlir::isa<mlir::arith::MulIOp>(combine);
   const bool isMaxI = mlir::isa<mlir::arith::MaxSIOp>(combine);
   const bool isMinI = mlir::isa<mlir::arith::MinSIOp>(combine);
+  const bool isMaxUI = mlir::isa<mlir::arith::MaxUIOp>(combine);
+  const bool isMinUI = mlir::isa<mlir::arith::MinUIOp>(combine);
+  // Unsigned extrema use only the scan planner's complete rank-2 input
+  // publication. Legacy scanners and other ranks keep their own contracts.
+  if ((isMaxUI || isMinUI) &&
+      (srcTy.getRank() != 2 || !elemTy.isInteger(32) ||
+       !op->hasAttr(kScanInputReduceAttr)))
+    return std::nullopt;
   const bool isAndI = mlir::isa<mlir::arith::AndIOp>(combine);
   const bool isOrI = mlir::isa<mlir::arith::OrIOp>(combine);
   const bool isXorI = mlir::isa<mlir::arith::XOrIOp>(combine);
   if (isFloat && !(isAddF || isMulF || isMaxF || isMinF))
     return std::nullopt;
   if (isInt &&
-      !(isAddI || isMulI || isMaxI || isMinI || isAndI || isOrI || isXorI))
+      !(isAddI || isMulI || isMaxI || isMinI || isMaxUI || isMinUI || isAndI ||
+        isOrI || isXorI))
     return std::nullopt;
 
-  // Signed extrema must compare as signed, so they stage through si32; every
-  // other integer monoid is bit-preserving and stages through ui32 (the metal
+  // Signed extrema stage through si32 to preserve signed comparisons.
+  // Unsigned extrema and the other integer monoids use ui32 (the metal
   // buffer ops reject signless i32 outright).
   mlir::MLIRContext *ctx = op.getContext();
   mlir::Type stageTy = elemTy;
@@ -16404,13 +16419,14 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     acc *= tile->shape[d];
   }
 
+  const bool isMin = isMinF || isMinI || isMinUI;
   BinaryExpOperator kind =
       isAndI                 ? BinaryExpOperator::bitAndOp
       : isOrI                ? BinaryExpOperator::bitOrOp
       : isXorI               ? BinaryExpOperator::bitXorOp
       : (isMulF || isMulI)   ? BinaryExpOperator::mulOp
       : (isAddF || isAddI)   ? BinaryExpOperator::addOp
-      : (isMinF || isMinI)   ? (isNanExtremum ? BinaryExpOperator::minNanOp
+      : isMin                ? (isNanExtremum ? BinaryExpOperator::minNanOp
                                               : BinaryExpOperator::minOp)
       : isNanExtremum        ? BinaryExpOperator::maxNanOp
                              : BinaryExpOperator::maxOp;
@@ -16701,14 +16717,18 @@ scanColumnBroadcastExpand(mlir::triton::ReduceOp reduce) {
     return {};
   auto *combine = reduceCombineBinaryOp(reduce);
   if (!combine ||
-      !mlir::isa<mlir::arith::AddFOp, mlir::arith::MaximumFOp,
-                 mlir::arith::MaxNumFOp, mlir::arith::MinimumFOp,
+      !mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp,
+                 mlir::arith::MaximumFOp, mlir::arith::MaxNumFOp,
+                 mlir::arith::MinimumFOp,
                  mlir::arith::MinNumFOp, mlir::arith::AddIOp,
-                 mlir::arith::MaxSIOp, mlir::arith::MinSIOp>(combine))
+                 mlir::arith::MaxSIOp, mlir::arith::MinSIOp,
+                 mlir::arith::MaxUIOp, mlir::arith::MinUIOp,
+                 mlir::arith::MulIOp, mlir::arith::AndIOp,
+                 mlir::arith::OrIOp, mlir::arith::XOrIOp>(combine))
     return {};
   auto layout = planLayoutIndex(type);
   if (!layout || type.getDimSize(0) < 2 || type.getDimSize(0) > 64 ||
-      type.getDimSize(1) < 2 || type.getDimSize(1) > 256)
+      type.getDimSize(1) < 2 || type.getDimSize(1) > 512)
     return {};
   auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(
       *reduce->getUsers().begin());
@@ -16754,6 +16774,90 @@ scanColumnBroadcastExpand(mlir::triton::ReduceOp reduce) {
   return sawStore ? expand : mlir::triton::ExpandDimsOp{};
 }
 
+// Vector stores may convert the sliced reduction layout to the pointer's
+// rank-1 blocked layout before storing. Share this predicate between early
+// source preflight and the phase planner so their consumer contracts agree.
+static bool isScanInputReduceStoreConsumer(mlir::Operation *user) {
+  if (mlir::isa<mlir::triton::StoreOp>(user))
+    return true;
+  auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
+  return cvt && !cvt.getResult().use_empty() &&
+         llvm::all_of(cvt.getResult().getUsers(),
+                      [&](mlir::Operation *consumer) {
+                        auto store =
+                            mlir::dyn_cast<mlir::triton::StoreOp>(consumer);
+                        return store && store.getValue() == cvt.getResult();
+                      });
+}
+
+// A mixed row reduction splits its result mapping, not its execution phase.
+// Check beyond the first full tile so region captures and later exchanges
+// cannot enter through an otherwise valid original-tile broadcast.
+static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
+                                         mlir::RankedTensorType type) {
+  llvm::SmallVector<mlir::Value, 16> worklist;
+  for (mlir::Operation *user : reduce->getUsers()) {
+    if (user->getBlock() != reduce->getBlock())
+      return false;
+    if (isScanInputReduceStoreConsumer(user)) {
+      for (auto result : user->getResults())
+        for (mlir::Operation *store : result.getUsers())
+          if (store->getBlock() != reduce->getBlock())
+            return false;
+      continue;
+    }
+    auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+    auto expandType = expand ? mlir::dyn_cast<mlir::RankedTensorType>(
+                                   expand.getType())
+                             : mlir::RankedTensorType{};
+    if (!expand || expand.getAxis() != reduce.getAxis() || !expandType ||
+        expandType.getRank() != 2 ||
+        expandType.getDimSize(0) != type.getDimSize(0) ||
+        expandType.getDimSize(1) != 1 ||
+        expandType.getEncoding() != type.getEncoding())
+      return false;
+    worklist.push_back(expand.getResult());
+  }
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  bool sawTileStore = false;
+  while (!worklist.empty()) {
+    auto value = worklist.pop_back_val();
+    for (mlir::Operation *user : value.getUsers()) {
+      if (user->getBlock() != reduce->getBlock())
+        return false;
+      if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(user)) {
+        auto storedType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (store.getValue() != value || !storedType ||
+            storedType.getShape() != type.getShape() ||
+            storedType.getEncoding() != type.getEncoding())
+          return false;
+        sawTileStore = true;
+        continue;
+      }
+      if (!seen.insert(user).second)
+        continue;
+      if (user->getNumRegions() || user->hasAttr(kExchangeAttr) ||
+          (!mlir::isa<mlir::triton::BroadcastOp>(user) &&
+           !user->hasTrait<mlir::OpTrait::Elementwise>()) ||
+          !mlir::isMemoryEffectFree(user) ||
+          mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user))
+        return false;
+      for (auto result : user->getResults()) {
+        auto resultType =
+            mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
+        if (!resultType || resultType.getRank() != 2 ||
+            resultType.getDimSize(0) != type.getDimSize(0) ||
+            (resultType.getDimSize(1) != 1 &&
+             resultType.getDimSize(1) != type.getDimSize(1)) ||
+            resultType.getEncoding() != type.getEncoding())
+          return false;
+        worklist.push_back(result);
+      }
+    }
+  }
+  return sawTileStore;
+}
+
 // Only postpone legacy reduce gates for a single, matching staged scan. The
 // phase planner remains authoritative about source lifetimes and publication
 // budgets, and the caller must verify that it claimed this reduce.
@@ -16774,6 +16878,49 @@ static bool hasMatchingScanInputPublication(mlir::triton::ReduceOp reduce) {
     return false;
   auto plan = planStagedScan(scan);
   return plan && plan->layout && plan->layout->elemPerThread > 1;
+}
+
+// A jointly published input or a replayed row fold needs an unchanged
+// device source cone. Check all loads, including masked/computed inputs.
+static bool canGroupScanReduceInputs(mlir::triton::ScanOp scan,
+                                    mlir::triton::ReduceOp reduce) {
+  llvm::SmallVector<mlir::Value, 32> worklist{
+      scan.getSrcs().front(), reduce.getSrcs().front()};
+  llvm::SmallPtrSet<mlir::Operation *, 32> seen;
+  mlir::Operation *firstLoad = nullptr;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    auto *def = value.getDefiningOp();
+    if (!def) {
+      if (mlir::isa<mlir::RankedTensorType>(value.getType()))
+        return false;
+      continue;
+    }
+    if (!seen.insert(def).second)
+      continue;
+    if (def->getBlock() != scan->getBlock() ||
+        !def->isBeforeInBlock(scan) || def->getNumRegions() ||
+        def->hasAttr(kExchangeAttr) ||
+        mlir::isa<mlir::triton::TransOp, mlir::triton::ReshapeOp>(def))
+      return false;
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def);
+        cvt && !isScalarIdentityConvert(cvt))
+      return false;
+    if (mlir::isa<mlir::triton::LoadOp>(def)) {
+      if (!firstLoad || def->isBeforeInBlock(firstLoad))
+        firstLoad = def;
+    } else if (!mlir::isMemoryEffectFree(def)) {
+      return false;
+    }
+    llvm::append_range(worklist, def->getOperands());
+  }
+  if (firstLoad)
+    for (auto it = std::next(firstLoad->getIterator()); &*it != reduce; ++it)
+      if (&*it != scan && !mlir::isMemoryEffectFree(&*it) &&
+          !mlir::isa<mlir::triton::LoadOp,
+                     mlir::triton::GetProgramIdOp>(&*it))
+        return false;
+  return true;
 }
 
 // Publish every source register band before a staged scan reads any prefix.
@@ -16834,52 +16981,14 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
   llvm::DenseMap<mlir::Operation *,
                  llvm::SmallVector<mlir::triton::ReduceOp, 2>>
       scanInputReduces;
-  auto canGroupInputs = [](mlir::triton::ScanOp scan,
-                           mlir::triton::ReduceOp reduce) {
-    llvm::SmallVector<mlir::Value, 32> worklist{
-        scan.getSrcs().front(), reduce.getSrcs().front()};
-    llvm::SmallPtrSet<mlir::Operation *, 32> seen;
-    mlir::Operation *firstLoad = nullptr;
-    while (!worklist.empty()) {
-      mlir::Value value = worklist.pop_back_val();
-      auto *def = value.getDefiningOp();
-      if (!def) {
-        if (mlir::isa<mlir::RankedTensorType>(value.getType()))
-          return false;
-        continue;
-      }
-      if (!seen.insert(def).second)
-        continue;
-      if (def->getBlock() != scan->getBlock() ||
-          !def->isBeforeInBlock(scan) || def->getNumRegions() ||
-          def->hasAttr(kExchangeAttr) ||
-          mlir::isa<mlir::triton::TransOp, mlir::triton::ReshapeOp>(def))
-        return false;
-      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def);
-          cvt && !isScalarIdentityConvert(cvt))
-        return false;
-      if (mlir::isa<mlir::triton::LoadOp>(def)) {
-        if (!firstLoad || def->isBeforeInBlock(firstLoad))
-          firstLoad = def;
-      } else if (!mlir::isMemoryEffectFree(def)) {
-        return false;
-      }
-      llvm::append_range(worklist, def->getOperands());
-    }
-    if (firstLoad)
-      for (auto it = std::next(firstLoad->getIterator()); &*it != reduce; ++it)
-        if (&*it != scan && !mlir::isMemoryEffectFree(&*it) &&
-            !mlir::isa<mlir::triton::LoadOp,
-                       mlir::triton::GetProgramIdOp>(&*it))
-          return false;
-    return true;
-  };
+  llvm::SmallVector<std::pair<mlir::triton::ReduceOp, mlir::triton::ReduceOp>, 4>
+      splitRowReduces;
   // A staged rank-3 reduce is the same defect from the other side: beside a
   // multi-band staged scan its result is wrong exactly when its source layout
   // is not thread-major (📏 `probe_diag_staged.py` / eight shapes x two warp
   // counts: wrong at E >= 8 with a scan of two bands or more, exact everywhere
   // else, even with the two results stored separately).
-  moduleOp.walk([&](mlir::triton::ReduceOp reduce) {
+  auto classifyScanInputReduce = [&](mlir::triton::ReduceOp reduce) {
     auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
     if (!func || !multiBandFunctions.count(func))
       return;
@@ -16895,21 +17004,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
     if (type.getRank() == 2) {
       llvm::SmallVector<mlir::triton::ScanOp, 2> functionScans;
       func.walk([&](mlir::triton::ScanOp scan) { functionScans.push_back(scan); });
-      auto isDirectStore = [](mlir::Operation *user) {
-        if (mlir::isa<mlir::triton::StoreOp>(user))
-          return true;
-        // Vector stores may convert the sliced reduction layout to the
-        // pointer's rank-1 blocked layout before storing.
-        auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
-        return cvt && !cvt.getResult().use_empty() &&
-               llvm::all_of(cvt.getResult().getUsers(),
-                            [&](mlir::Operation *consumer) {
-                              auto store =
-                                  mlir::dyn_cast<mlir::triton::StoreOp>(consumer);
-                              return store &&
-                                     store.getValue() == cvt.getResult();
-                            });
-      };
+      auto isDirectStore = isScanInputReduceStoreConsumer;
       // Column vector stores use the exact result layout. A narrow broadcast
       // below instead evaluates the fold at each consuming tile's column.
       bool directColumnStore =
@@ -16930,7 +17025,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) &&
             scan->isBeforeInBlock(reduce) &&
             (sameSource || scan.getSrcs().front().getType() == type)) {
-          if (!sameSource && !canGroupInputs(scan, reduce)) {
+          if (!sameSource && !canGroupScanReduceInputs(scan, reduce)) {
             reduce.emitOpError(
                 "Metal backend: distinct scan/reduce inputs require "
                 "same-layout sources defined before the scan without "
@@ -16938,14 +17033,16 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             valid = false;
             return;
           }
-          // Column sums and signed extrema fold the full published tensor,
-          // including masked fill values and computed i32 elements. Other
-          // vector combines retain their direct-load source contract.
+          // These column monoids fold the complete published tensor, including
+          // masked fill values and computed i32 elements. Other vector
+          // combines retain their direct-load source contract.
           auto *combine = reduceCombineBinaryOp(reduce);
           bool publishedColumnCombine =
-              mlir::isa_and_nonnull<mlir::arith::AddIOp,
-                                   mlir::arith::MaxSIOp,
-                                   mlir::arith::MinSIOp>(combine);
+              mlir::isa_and_nonnull<mlir::arith::AddIOp, mlir::arith::MulIOp,
+                                   mlir::arith::MaxSIOp, mlir::arith::MinSIOp,
+                                   mlir::arith::MaxUIOp, mlir::arith::MinUIOp,
+                                   mlir::arith::AndIOp, mlir::arith::OrIOp,
+                                   mlir::arith::XOrIOp>(combine);
           if (directColumnStore && type.getElementType().isInteger(32) &&
               !publishedColumnCombine) {
             auto load = reduce.getSrcs().front().getDefiningOp<
@@ -16960,8 +17057,9 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           }
           // The exact fold either produces a vector value for a direct
           // store, or the row belonging to each element of the original tile.
-          // Mixed consumers and cross-axis/shape broadcasts require a separate
-          // result exchange; the keep-dims projection cannot represent them.
+          // Mixed row reductions need separate folds for these mappings,
+          // both reading the same publication. Cross-axis/shape broadcasts
+          // still cannot use the keep-dims projection.
           bool sawStore = false, sawExpand = false, consumersValid = true;
           for (mlir::Operation *user : reduce->getUsers()) {
             if (isDirectStore(user)) {
@@ -16987,7 +17085,25 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             }
             sawExpand = true;
           }
-          if (!consumersValid || (sawStore && sawExpand)) {
+          bool splitRowReduction =
+              sawStore && sawExpand && sameSource && reduce.getAxis() == 1 &&
+              reduce.getSrcs().size() == 1 && reduce.getNumResults() == 1 &&
+              ((type.getElementType().isF32() &&
+                mlir::isa_and_nonnull<
+                    mlir::arith::AddFOp, mlir::arith::MulFOp,
+                    mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
+                    mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(combine)) ||
+               (type.getElementType().isInteger(32) &&
+                mlir::isa_and_nonnull<mlir::arith::AddIOp,
+                                     mlir::arith::MulIOp, mlir::arith::AndIOp,
+                                     mlir::arith::OrIOp,
+                                     mlir::arith::XOrIOp, mlir::arith::MaxSIOp,
+                                     mlir::arith::MinSIOp, mlir::arith::MaxUIOp,
+                                     mlir::arith::MinUIOp>(combine))) &&
+              llvm::all_of(type.getShape(),
+                           [](int64_t size) { return size >= 2 && size <= 64; }) &&
+              hasSamePhaseMixedRowConsumers(reduce, type);
+          if (!consumersValid || (sawStore && sawExpand && !splitRowReduction)) {
             reduce.emitOpError(
                 "Metal backend: a shared scan-input row reduction requires "
                 "direct row stores or same-axis broadcasts into its original "
@@ -16997,6 +17113,29 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           }
           reduce->setAttr(kScanInputReduceAttr,
                           mlir::UnitAttr::get(moduleOp.getContext()));
+          if (splitRowReduction) {
+            llvm::SmallVector<mlir::Operation *, 4> stores;
+            for (mlir::Operation *user : reduce->getUsers())
+              if (isDirectStore(user))
+                stores.push_back(user);
+            mlir::OpBuilder builder(reduce);
+            auto vectorReduce = mlir::cast<mlir::triton::ReduceOp>(
+                builder.clone(*reduce.getOperation()));
+            for (mlir::Operation *store : stores)
+              store->replaceUsesOfWith(reduce->getResult(0),
+                                       vectorReduce->getResult(0));
+            if (!planRankNReduce(reduce) || !planRankNReduce(vectorReduce)) {
+              reduce.emitOpError(
+                  "Metal backend: mixed scan-input row reduction requires planned "
+                  "vector and original-tile broadcast folds");
+              valid = false;
+              return;
+            }
+            scanInputReduces[scan.getOperation()].push_back(vectorReduce);
+            scanInputReduces[scan.getOperation()].push_back(reduce);
+            splitRowReduces.emplace_back(reduce, vectorReduce);
+            return;
+          }
           if (planRankNReduce(reduce)) {
             if (columnExpand)
               columnExpand->setAttr(kScanColumnBroadcastAttr,
@@ -17037,7 +17176,14 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           "cannot share a function with a multi-band staged scan");
       valid = false;
     }
-  });
+  };
+  // Classify original operations: a mixed row reduction explicitly
+  // registers its clone, rather than relying on mutation during a walk.
+  llvm::SmallVector<mlir::triton::ReduceOp, 8> inputReduces;
+  moduleOp.walk(
+      [&](mlir::triton::ReduceOp reduce) { inputReduces.push_back(reduce); });
+  for (mlir::triton::ReduceOp reduce : inputReduces)
+    classifyScanInputReduce(reduce);
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
     auto func = scan->getParentOfType<mlir::triton::FuncOp>();
     if (!func || !phaseFunctions.count(func))
@@ -17344,6 +17490,101 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       g_stagedTupleScanPublishes[scan.getOperation()] =
           llvm::SmallVector<mlir::Operation *, 4>(
               publishes.begin(), publishes.begin() + scanSourceCount);
+  }
+  for (auto [broadcast, vector] : splitRowReduces) {
+    auto broadcastPublish = g_rankNReducePublish.find(broadcast.getOperation());
+    auto vectorPublish = g_rankNReducePublish.find(vector.getOperation());
+    if (!broadcast->hasAttr(kScanInputReduceAttr) ||
+        !vector->hasAttr(kScanInputReduceAttr) ||
+        !g_rankNPlannedReduces.count(broadcast.getOperation()) ||
+        !g_rankNPlannedReduces.count(vector.getOperation()) ||
+        broadcastPublish == g_rankNReducePublish.end() ||
+        vectorPublish == g_rankNReducePublish.end() ||
+        broadcastPublish->second != vectorPublish->second)
+      return broadcast.emitOpError(
+          "Metal backend: mixed scan-input row reduction requires both folds to "
+          "share a planned input publication");
+  }
+  return mlir::success();
+}
+
+// The one-band row scanner materializes one scalar per consumer coordinate.
+// A vector store and a tile broadcast need different coordinates, so split
+// their folds before output tiles and layout conversions are classified.
+static mlir::LogicalResult preprocessSingleBandMixedScanRowReductions(
+    mlir::ModuleOp moduleOp,
+    llvm::SmallVectorImpl<mlir::StringAttr> &affectedFunctions) {
+  llvm::SmallVector<mlir::triton::ReduceOp, 8> reduces;
+  moduleOp.walk(
+      [&](mlir::triton::ReduceOp reduce) { reduces.push_back(reduce); });
+  for (auto reduce : reduces) {
+    if (reduce.getSrcs().size() != 1 || reduce.getNumResults() != 1 ||
+        reduce.getAxis() != 1 ||
+        g_rankNPlannedReduces.count(reduce.getOperation()) ||
+        !mlir::isa_and_nonnull<mlir::arith::AddFOp, mlir::arith::MulFOp,
+                              mlir::arith::MaximumFOp,
+                              mlir::arith::MinimumFOp>(
+            reduceCombineBinaryOp(reduce)))
+      continue;
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+        reduce.getSrcs().front().getType());
+    auto tile = type ? tileFromTensor(type) : std::nullopt;
+    if (!type || type.getRank() != 2 || !type.getElementType().isF32() ||
+        !tile || type.getNumElements() != tile->threadsPerBlock ||
+        tile->elemPerThread != 1)
+      continue;
+    auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
+    if (!func || reduce->getParentOp() != func)
+      continue;
+    llvm::SmallVector<mlir::triton::ScanOp, 2> scans;
+    func.walk([&](mlir::triton::ScanOp scan) { scans.push_back(scan); });
+    if (scans.size() != 1 || scans.front().getSrcs().size() != 1)
+      continue;
+    auto scan = scans.front();
+    if (scan->getBlock() != reduce->getBlock() ||
+        !scan->isBeforeInBlock(reduce) ||
+        scan.getSrcs().front() != reduce.getSrcs().front() ||
+        !planStagedScan(scan))
+      continue;
+    llvm::SmallVector<mlir::Operation *, 4> stores;
+    bool sawExpand = false;
+    for (mlir::Operation *user : reduce->getUsers()) {
+      if (isScanInputReduceStoreConsumer(user))
+        stores.push_back(user);
+      sawExpand |= mlir::isa<mlir::triton::ExpandDimsOp>(user);
+    }
+    if (stores.empty() || !sawExpand)
+      continue;
+    if (!llvm::all_of(type.getShape(),
+                      [](int64_t size) { return size >= 2 && size <= 64; }) ||
+        !hasSamePhaseMixedRowConsumers(reduce, type))
+      return reduce.emitOpError(
+          "Metal backend: single-band mixed row reduction requires direct row "
+          "stores and same-phase broadcasts into its original 2..64 tile");
+    // Product's legacy row scanner rereads a direct unmasked load. The staged
+    // fallback for other sources cannot serve these two consumer mappings.
+    // Reject only this matching mixed case; sums retain source replay support.
+    if (mlir::isa_and_nonnull<mlir::arith::MulFOp>(
+            reduceCombineBinaryOp(reduce))) {
+      auto load = reduce.getSrcs().front().getDefiningOp<mlir::triton::LoadOp>();
+      if (!load || load.getMask())
+        return reduce.emitOpError(
+            "Metal backend: single-band mixed row product requires a direct "
+            "unmasked tt.load");
+    }
+    if (!canGroupScanReduceInputs(scan, reduce))
+      return reduce.emitOpError(
+          "Metal backend: single-band mixed row reduction requires replayable "
+          "sources defined before the scan without intervening writes or "
+          "input exchanges");
+    mlir::OpBuilder builder(reduce);
+    auto vectorReduce = mlir::cast<mlir::triton::ReduceOp>(
+        builder.clone(*reduce.getOperation()));
+    for (mlir::Operation *store : stores)
+      store->replaceUsesOfWith(reduce->getResult(0), vectorReduce->getResult(0));
+    auto name = mlir::StringAttr::get(moduleOp.getContext(), func.getName());
+    if (!llvm::is_contained(affectedFunctions, name))
+      affectedFunctions.push_back(name);
   }
   return mlir::success();
 }
@@ -18145,8 +18386,12 @@ struct ReduceLowering
       // Walks through tt.broadcast/tt.expand_dims so the per-program term of a
       // 2D tile address is actually found; when it is, it REPLACES the
       // fabricated tgid*tpb*N below instead of adding to it.
-      mlir::Value scalarOff = accumulateScalarAddPtrOffsetsThroughShape(
+      auto scalarOffOr = accumulateScalarAddPtrOffsetsThroughShape(
           reprLoad.getPtr(), rewriter, loc);
+      if (mlir::failed(scalarOffOr))
+        return rewriter.notifyMatchFailure(
+            op, "rank-2 reduce: failed to replay scalar address offset");
+      mlir::Value scalarOff = *scalarOffOr;
 
       auto cN = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(N)));
@@ -18293,13 +18538,12 @@ struct ReduceLowering
           };
           mlir::Value rowSum;
           if (isF32) {
-            // f32: a single scf.for carrying one f32 iter_arg. Sum/product/max
-            // use exact identities. Min seeds from column zero:
-            // a fully masked nearest-neighbor row is all +inf, so +FLT_MAX is
-            // not an exact identity and would silently change the result.
+            // Float extrema seed from column zero to preserve all-NaN rows
+            // under maxNum/minNum and exact infinities. Sum/product use their
+            // identities; all accumulators retain the tensor's float type.
             mlir::Value initVal;
             mlir::Value colLower = cColLo.getResult();
-            if (isMinF) {
+            if (isMinF || isMaxF) {
               initVal = emitColLoad(cColLo.getResult());
               if (!initVal)
                 return rewriter.notifyMatchFailure(
@@ -18308,10 +18552,7 @@ struct ReduceLowering
             } else {
               // In the tensor's own float type: an f32-typed constant would
               // fail the arith.constant verifier on an f16/bf16 accumulator.
-              double identity = isMaxF
-                                    ? -std::numeric_limits<double>::infinity()
-                                : isMulF ? 1.0
-                                         : 0.0;
+              double identity = isMulF ? 1.0 : 0.0;
               initVal = mlir::arith::ConstantOp::create(
                             rewriter, loc,
                             mlir::cast<mlir::TypedAttr>(
@@ -18795,7 +19036,7 @@ static mlir::Value emitSplatPtrIndex(mlir::Value origPtr,
 // substitute a fabricated `tgid*tpb*N` for the per-program offset — a value
 // that only coincidentally equals `pid*S` when S == tpb*N. Walking the shape
 // ops recovers the real term, so any tile base (e.g. `pid*K*M*N`) is honoured.
-static mlir::Value accumulateScalarAddPtrOffsetsThroughShape(
+static mlir::FailureOr<mlir::Value> accumulateScalarAddPtrOffsetsThroughShape(
     mlir::Value origPtrVal, mlir::ConversionPatternRewriter &rewriter,
     mlir::Location loc) {
   auto i32 = rewriter.getI32Type();
@@ -18807,6 +19048,15 @@ static mlir::Value accumulateScalarAddPtrOffsetsThroughShape(
     if (auto addptr = cur.getDefiningOp<mlir::triton::AddPtrOp>()) {
       mlir::Value off = addptr.getOffset();
       if (!mlir::isa<mlir::RankedTensorType>(off.getType())) {
+        // The caller may hoist the row fill before the function tile loop.
+        // Rebuild scalar dependencies here, just as the complete pointer-chain
+        // evaluator does. An empty success means no scalar offsets; failure
+        // must not be mistaken for that case and use a fabricated program base.
+        auto zero = mlir::arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI32IntegerAttr(0));
+        off = evalRank1ValueAt(off, zero.getResult(), rewriter, loc, /*depth=*/0);
+        if (!off)
+          return mlir::failure();
         if (off.getType() != i32)
           off = mlir::UnrealizedConversionCastOp::create(
                     rewriter, loc, mlir::TypeRange{i32}, mlir::ValueRange{off})
@@ -43105,6 +43355,9 @@ struct ConvertTritonGPUToMetalPass
                                 mlir::triton::ExpandDimsOp>, 4>
         deferredScanColumnBroadcasts;
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanRowReduces;
+    llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanColumnProducts;
+    llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanColumnBitwise;
+    llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanUnsignedExtrema;
     bool reduceOk = true;
     moduleOp.walk([&](mlir::triton::ReduceOp red) {
       auto axes = red.getAxis();
@@ -43306,6 +43559,50 @@ struct ConvertTritonGPUToMetalPass
         reduceOk = false;
         return;
       }
+      // Unlike the signed legacy scanners, unsigned extrema require the
+      // complete scan publication even for a plain source. Keep every such
+      // candidate deferred until the phase planner proves actual ownership.
+      auto columnExpand = scanColumnBroadcastExpand(red);
+      const bool deferredColumnBitwise =
+          rtt.getRank() == 2 && axes == 0 &&
+          rtt.getElementType().isInteger(32) && red.getSrcs().size() == 1 &&
+          red.getNumResults() == 1 && combineEltTy &&
+          combineEltTy.isInteger(32) &&
+          (combineName == "arith.andi" || combineName == "arith.ori" ||
+           combineName == "arith.xori") &&
+          !red->use_empty() &&
+          llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer) &&
+          hasMatchingScanInputPublication(red);
+      if (deferredColumnBitwise)
+        deferredScanColumnBitwise.push_back(red);
+      const bool deferredColumnMonoidBroadcast =
+          columnExpand && combineEltTy &&
+          ((rtt.getElementType().isInteger(32) &&
+            combineEltTy.isInteger(32) &&
+            (combineName == "arith.muli" || combineName == "arith.andi" ||
+             combineName == "arith.ori" || combineName == "arith.xori")) ||
+           (rtt.getElementType().isF32() && combineEltTy.isF32() &&
+            combineName == "arith.mulf")) &&
+          hasMatchingScanInputPublication(red);
+      const bool deferredUnsignedExtremum =
+          rtt.getRank() == 2 && rtt.getElementType().isInteger(32) &&
+          red.getSrcs().size() == 1 && red.getNumResults() == 1 &&
+          combineEltTy && combineEltTy.isInteger(32) &&
+          (combineName == "arith.maxui" || combineName == "arith.minui") &&
+          (axes == 1 ||
+           (axes == 0 &&
+            (columnExpand ||
+             (!red->use_empty() &&
+              llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer))))) &&
+          hasMatchingScanInputPublication(red);
+      if (deferredUnsignedExtremum)
+        deferredScanUnsignedExtrema.push_back(red);
+      // These combines need actual scan publication ownership at both widths;
+      // accepting a narrow result must not fall back to a legacy scanner.
+      if (columnExpand &&
+          (deferredUnsignedExtremum || deferredColumnMonoidBroadcast))
+        deferredScanColumnBroadcasts.emplace_back(red, columnExpand);
+
       // Rank-2 axis=1 ships via the rank-2 ReduceLowering body. Rank-2 axis=0
       // (per-column) ships via lowerRank2Axis0Reduce (Session L3a2) for f32
       // sum/product/max/min and i32 sum/product/max/min. After
@@ -43324,7 +43621,8 @@ struct ConvertTritonGPUToMetalPass
             (combineName == "arith.addi" || combineName == "arith.muli" ||
              combineName == "arith.maxsi" || combineName == "arith.minsi") &&
             combineEltTy && combineEltTy.isInteger(32);
-        if (!fOk && !iOk && !stagedFallback) {
+        if (!fOk && !iOk && !stagedFallback && !deferredUnsignedExtremum &&
+            !deferredColumnMonoidBroadcast && !deferredColumnBitwise) {
           red.emitOpError(
               "tt.reduce axis=0 reduce supports f32/i32 "
               "sum/product/max/min (Session L3a2); other combines deferred");
@@ -43358,7 +43656,8 @@ struct ConvertTritonGPUToMetalPass
                    axis0ReexpansionConeEvaluable(red)))) {
               if (auto expand = scanColumnBroadcastExpand(red);
                   expand && hasMatchingScanInputPublication(red)) {
-                deferredScanColumnBroadcasts.emplace_back(red, expand);
+                if (!deferredUnsignedExtremum && !deferredColumnMonoidBroadcast)
+                  deferredScanColumnBroadcasts.emplace_back(red, expand);
                 return;
               }
               red.emitOpError(
@@ -43378,11 +43677,21 @@ struct ConvertTritonGPUToMetalPass
                   src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
             src = cvt.getSrc();
           auto load = src.getDefiningOp<mlir::triton::LoadOp>();
-          if ((!load || load.getMask()) && !stagedFallback) {
-            red.emitOpError(
-                "rank-2 axis=0 i32 product requires a direct unmasked "
-                "tt.load");
-            reduceOk = false;
+          if ((!load || load.getMask()) && !stagedFallback &&
+              !deferredColumnMonoidBroadcast) {
+            // Only the scan planner can replace the legacy direct-load
+            // product with an exact fold of a complete input publication.
+            if (rtt.getElementType().isInteger(32) &&
+                red.getNumResults() == 1 && !red->use_empty() &&
+                llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer) &&
+                hasMatchingScanInputPublication(red)) {
+              deferredScanColumnProducts.push_back(red);
+            } else {
+              red.emitOpError(
+                  "rank-2 axis=0 i32 product requires a direct unmasked "
+                  "tt.load");
+              reduceOk = false;
+            }
           }
         }
         if (fOk && combineName == "arith.mulf") {
@@ -43391,11 +43700,19 @@ struct ConvertTritonGPUToMetalPass
                   src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
             src = cvt.getSrc();
           auto load = src.getDefiningOp<mlir::triton::LoadOp>();
-          if ((!load || load.getMask()) && !stagedFallback) {
-            red.emitOpError(
-                "rank-2 axis=0 f32 product requires a direct unmasked "
-                "tt.load");
-            reduceOk = false;
+          if ((!load || load.getMask()) && !stagedFallback &&
+              !deferredColumnMonoidBroadcast) {
+            if (rtt.getElementType().isF32() &&
+                red.getNumResults() == 1 && !red->use_empty() &&
+                llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer) &&
+                hasMatchingScanInputPublication(red)) {
+              deferredScanColumnProducts.push_back(red);
+            } else {
+              red.emitOpError(
+                  "rank-2 axis=0 f32 product requires a direct unmasked "
+                  "tt.load");
+              reduceOk = false;
+            }
           }
         }
         return;
@@ -43403,7 +43720,7 @@ struct ConvertTritonGPUToMetalPass
       // 3) combine must be an admitted f32/i32 sum/extrema/product. Triton's
       // tl.max emits arith.maxnumf (IEEE maxNum) while
       // arith.maximumf uses IEEE maximum; both map to MSL max.
-      bool combineOk = false;
+      bool combineOk = deferredUnsignedExtremum;
       // f16/bf16 sums and extrema reduce in their own type (see the identity
       // block in lowerRank1Reduce). Half PRODUCT is deliberately not admitted.
       bool halfSumOrExtrema =
@@ -43619,10 +43936,18 @@ struct ConvertTritonGPUToMetalPass
           src = cvt.getSrc();
         auto load = src.getDefiningOp<mlir::triton::LoadOp>();
         if ((!load || load.getMask()) && !stagedFallback) {
-          red.emitOpError(
-              "rank-2 axis=1 f32 product requires a direct unmasked tt.load");
-          reduceOk = false;
-          return;
+          // A matching scan publishes the complete f32 source, so its exact
+          // row fold does not need the legacy product's device-load replay.
+          if (rtt.getElementType().isF32() && combineEltTy.isF32() &&
+              red.getSrcs().size() == 1 && red.getNumResults() == 1 &&
+              hasMatchingScanInputPublication(red)) {
+            deferredScanRowReduces.push_back(red);
+          } else {
+            red.emitOpError(
+                "rank-2 axis=1 f32 product requires a direct unmasked tt.load");
+            reduceOk = false;
+            return;
+          }
         }
       }
       // Rank-2 axis=1 rides the direct device-load row scanner for every
@@ -43638,7 +43963,7 @@ struct ConvertTritonGPUToMetalPass
       // every run, occasionally SIGABRT). Mirror the gate instead of listing
       // the combines it covers.
       if (rtt.getRank() == 2 && axes == 1 && combineEltTy &&
-          !combineEltTy.isF32()) {
+          !combineEltTy.isF32() && !deferredUnsignedExtremum) {
         mlir::Value src = red.getSrcs().front();
         if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
           src = cvt.getSrc();
@@ -43649,8 +43974,10 @@ struct ConvertTritonGPUToMetalPass
           // require actual phase-planner ownership before conversion below.
           if (rtt.getElementType().isInteger(32) &&
               red.getSrcs().size() == 1 && red.getNumResults() == 1 &&
-              (combineName == "arith.addi" || combineName == "arith.maxsi" ||
-               combineName == "arith.minsi") &&
+              (combineName == "arith.addi" || combineName == "arith.muli" ||
+               combineName == "arith.maxsi" || combineName == "arith.minsi" ||
+               combineName == "arith.andi" || combineName == "arith.ori" ||
+               combineName == "arith.xori") &&
               hasMatchingScanInputPublication(red)) {
             deferredScanRowReduces.push_back(red);
           } else {
@@ -43807,6 +44134,12 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+    llvm::SmallVector<mlir::StringAttr, 2> singleBandMixedRowFunctions;
+    if (mlir::failed(preprocessSingleBandMixedScanRowReductions(
+            moduleOp, singleBandMixedRowFunctions))) {
+      signalPassFailure();
+      return;
+    }
     // A deferred legacy rejection must never fall through to an unplanned
     // lowering: failed full-conversion rollback is not a safe refusal path.
     for (auto [reduce, expand] : deferredScanColumnBroadcasts) {
@@ -43815,7 +44148,7 @@ struct ConvertTritonGPUToMetalPass
           !g_rankNReducePublish.count(reduce.getOperation()) ||
           !g_rankNPlannedReduces.count(reduce.getOperation())) {
         reduce.emitOpError(
-            "Metal backend: wide scan-input column broadcast requires a "
+            "Metal backend: scan-input column broadcast requires a "
             "planned shared-input publication");
         signalPassFailure();
         return;
@@ -43826,8 +44159,41 @@ struct ConvertTritonGPUToMetalPass
           !g_rankNReducePublish.count(reduce.getOperation()) ||
           !g_rankNPlannedReduces.count(reduce.getOperation())) {
         reduce.emitOpError(
-            "Metal backend: computed i32 scan-input row reduction requires a "
+            "Metal backend: computed scan-input row reduction requires a "
             "planned shared-input publication");
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto reduce : deferredScanColumnProducts) {
+      if (!reduce->hasAttr(kScanInputReduceAttr) ||
+          !g_rankNReducePublish.count(reduce.getOperation()) ||
+          !g_rankNPlannedReduces.count(reduce.getOperation())) {
+        reduce.emitOpError(
+            "Metal backend: computed scan-input column product requires a "
+            "planned shared-input publication");
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto reduce : deferredScanColumnBitwise) {
+      if (!reduce->hasAttr(kScanInputReduceAttr) ||
+          !g_rankNReducePublish.count(reduce.getOperation()) ||
+          !g_rankNPlannedReduces.count(reduce.getOperation())) {
+        reduce.emitOpError(
+            "Metal backend: bitwise scan-input column reduction requires a "
+            "planned shared-input publication");
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto reduce : deferredScanUnsignedExtrema) {
+      if (!reduce->hasAttr(kScanInputReduceAttr) ||
+          !g_rankNReducePublish.count(reduce.getOperation()) ||
+          !g_rankNPlannedReduces.count(reduce.getOperation())) {
+        reduce.emitOpError(
+            "Metal backend: unsigned scan-input extrema require a planned "
+            "shared-input publication");
         signalPassFailure();
         return;
       }
@@ -45310,6 +45676,31 @@ struct ConvertTritonGPUToMetalPass
     g_reduceRowBufs = nullptr;
     g_axis0BroadcastExpands = nullptr;
     if (mlir::failed(conversionResult)) {
+      signalPassFailure();
+      return;
+    }
+
+    // Both legacy folds allocate their row buffers during conversion. Check
+    // actual allocations, including scan/store/other-reduce scratch, after a
+    // successful conversion so budget rejection never enters pattern rollback.
+    bool mixedRowScratchValid = true;
+    moduleOp.walk([&](KernelOp kernel) {
+      if (!llvm::is_contained(singleBandMixedRowFunctions, kernel.getNameAttr()))
+        return;
+      int64_t bytes = 0;
+      kernel.walk([&](ThreadgroupAllocaOp alloca) {
+        auto type = mlir::cast<MetalMemRefType>(alloca.getResult().getType());
+        bytes += type.getSize() *
+                 ((type.getType().getIntOrFloatBitWidth() + 7) / 8);
+      });
+      if (bytes > kThreadgroupBudgetBytes) {
+        kernel.emitOpError()
+            << "Metal backend: single-band mixed row reduction scratch needs "
+            << bytes << " bytes, exceeding the 32768-byte budget";
+        mixedRowScratchValid = false;
+      }
+    });
+    if (!mixedRowScratchValid) {
       signalPassFailure();
       return;
     }

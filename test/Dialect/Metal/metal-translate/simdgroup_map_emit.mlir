@@ -58,7 +58,7 @@ module {
 // CHECK: simdgroup_float8x8 v[[OUT:[0-9]+]] = v[[ACC]];
 // CHECK: for (ushort v[[E:[0-9]+]] = 0; v[[E]] < 2; ++v[[E]]) {
 // CHECK: float v[[X:[0-9]+]] = v[[OUT]].thread_elements()[v[[E]]];
-// CHECK: bool v{{[0-9]+}} = (v[[X]]) >= (v{{[0-9]+}});
+// CHECK: bool v{{[0-9]+}} = ((v[[X]]) >= (v{{[0-9]+}}));
 // CHECK: v[[OUT]].thread_elements()[v[[E]]] = v{{[0-9]+}};
 // CHECK: }
 // The store reads the mapped matrix, not the accumulator.

@@ -9750,7 +9750,10 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
     return;
   }
 
-  _output << "(";
+  // Transparent integer bridges can inline this expression into an arith
+  // consumer. Group the whole expression so bitwise folds retain precedence
+  // when, for example, a broadcast row result is added to a scan result.
+  _output << "((";
   translateValueOrVarName(op.getLhs());
   _output << ") ";
 
@@ -9812,7 +9815,7 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
 
   _output << " (";
   translateValueOrVarName(op.getRhs());
-  _output << ")";
+  _output << "))";
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::FmaOp op) {

@@ -68,9 +68,8 @@ module {
       metal.store %p, %out[%tid] : f32, !metal.memref<? x f32>, ui32
       metal.return
     }
-    // A prefix operator is the one context that does not bracket the expression
-    // it embeds, so it is the one that can be broken by `metal.binary_exp`
-    // bracketing only its operands. Both spellings of the prefix minus are
+    // Prefix operators must bracket the complete expression they embed.
+    // Both spellings of the prefix minus are
     // pinned, and each sum is used once so the translator inlines it rather
     // than naming a temp (a named temp would hide the defect).
     metal.kernel prefix_minus_over_binary address_space_device [false, false, true, true] {
@@ -84,6 +83,31 @@ module {
       %sum = metal.binary_exp %a, %b, addOp : (f32, f32) -> f32
       %minus = metal.unary_exp %sum, minusOp : (f32) -> f32
       metal.store %minus, %minus_out[%tid] : f32, !metal.memref<? x f32>, ui32
+      metal.return
+    }
+    // A transparent signedness bridge must preserve the grouping of an
+    // inlined bitwise fold when an arith consumer adds the scan result.
+    metal.kernel arithmetic_over_bitwise address_space_device [false, false, true, true, true] {
+    ^bb0(%a_buf: !metal.memref<? x ui32>, %b_buf: !metal.memref<? x ui32>, %and_out: !metal.memref<? x ui32>, %or_out: !metal.memref<? x ui32>, %xor_out: !metal.memref<? x ui32>):
+      %tid = metal.thread_id "x" : ui32
+      %a = metal.get_element %a_buf[%tid] : (!metal.memref<? x ui32>, ui32) -> ui32
+      %b = metal.get_element %b_buf[%tid] : (!metal.memref<? x ui32>, ui32) -> ui32
+      %base = arith.constant 7 : i32
+      %and = metal.binary_exp %a, %b, bitAndOp : (ui32, ui32) -> ui32
+      %or = metal.binary_exp %a, %b, bitOrOp : (ui32, ui32) -> ui32
+      %xor = metal.binary_exp %a, %b, bitXorOp : (ui32, ui32) -> ui32
+      %and_i = builtin.unrealized_conversion_cast %and : ui32 to i32
+      %or_i = builtin.unrealized_conversion_cast %or : ui32 to i32
+      %xor_i = builtin.unrealized_conversion_cast %xor : ui32 to i32
+      %and_sum = arith.addi %base, %and_i : i32
+      %or_sum = arith.addi %base, %or_i : i32
+      %xor_sum = arith.addi %base, %xor_i : i32
+      %and_u = builtin.unrealized_conversion_cast %and_sum : i32 to ui32
+      %or_u = builtin.unrealized_conversion_cast %or_sum : i32 to ui32
+      %xor_u = builtin.unrealized_conversion_cast %xor_sum : i32 to ui32
+      metal.store %and_u, %and_out[%tid] : ui32, !metal.memref<? x ui32>, ui32
+      metal.store %or_u, %or_out[%tid] : ui32, !metal.memref<? x ui32>, ui32
+      metal.store %xor_u, %xor_out[%tid] : ui32, !metal.memref<? x ui32>, ui32
       metal.return
     }
     metal.module_end
@@ -147,5 +171,10 @@ module {
 // Both prefix spellings must bracket the WHOLE operand. Binding the minus to
 // the left operand alone turns `-(a - b)` into `-a - b`, which is a wrong
 // answer for every sum and difference and right by accident for products.
-// CHECK: = (-((v{{[0-9]+}}) - (v{{[0-9]+}})));
-// CHECK: = (-((v{{[0-9]+}}) + (v{{[0-9]+}})));
+// CHECK: = (-(((v{{[0-9]+}}) - (v{{[0-9]+}}))));
+// CHECK: = (-(((v{{[0-9]+}}) + (v{{[0-9]+}}))));
+
+// CHECK: kernel void arithmetic_over_bitwise
+// CHECK: = (7 + ((v{{[0-9]+}}) & (v{{[0-9]+}})));
+// CHECK: = (7 + ((v{{[0-9]+}}) | (v{{[0-9]+}})));
+// CHECK: = (7 + ((v{{[0-9]+}}) ^ (v{{[0-9]+}})));

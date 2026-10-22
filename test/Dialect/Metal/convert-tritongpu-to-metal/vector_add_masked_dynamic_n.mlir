@@ -128,7 +128,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: v{{[0-9]+}} = v{{[0-9]+}}[v{{[0-9]+}}];
 // MSL: else
 // MSL: v{{[0-9]+}} = 0
-// MSL: float v{{[0-9]+}} = (v{{[0-9]+}}) + (v{{[0-9]+}});
+// MSL: float v{{[0-9]+}} = ((v{{[0-9]+}}) + (v{{[0-9]+}}));
 // Store reuses the shared load mask bool (CSE) for the tg select + guarded store.
 // MSL: v{{[0-9]+}}[{{.*}}] = ({{.*}} ? {{.*}} : {{.*}});
 // MSL: if (v{{[0-9]+}})

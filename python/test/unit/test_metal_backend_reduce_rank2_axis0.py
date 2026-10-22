@@ -511,6 +511,58 @@ def test_reduce_axis0_scalar_base_two_level_addptr(B, M, N, BM, BN):
     torch.testing.assert_close(out.cpu(), inp.cpu().sum(1), atol=1e-3, rtol=1e-3)
 
 
+@triton.jit(do_not_specialize=["runtime_offset", "input_stride", "output_stride"])
+def _colsum_scalar_offset_replay(
+    x_ptr, out_ptr, runtime_offset, input_stride, output_stride,
+    BM: tl.constexpr, BN: tl.constexpr, RUNTIME: tl.constexpr,
+    COMPUTED: tl.constexpr,
+):
+    if RUNTIME:
+        offset = runtime_offset + 3
+    else:
+        offset = 7
+    rows = tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    base = x_ptr + offset + tl.program_id(0) * input_stride
+    x = tl.load(base + rows[:, None] * BN + cols[None, :])
+    if COMPUTED:
+        x = x * x + 0.5
+    result = tl.sum(x, axis=0)
+    tl.store(out_ptr + offset + tl.program_id(0) * output_stride + cols, result)
+
+
+@pytest.mark.parametrize("computed", [False, True], ids=["direct", "computed"])
+@pytest.mark.parametrize("runtime", [False, True], ids=["constexpr", "runtime"])
+def test_reduce_axis0_scalar_offset_replay(computed, runtime):
+    """Scalar pointer terms survive per-column replay with multiple output bands."""
+    m, n, programs, guard = 16, 256, 3, 7
+    input_stride = m * n + 11
+    output_stride = n + 13
+    # The runtime path reuses one unspecialized signature for two physical
+    # displacements, including an arithmetic dependency on a scalar argument.
+    for offset in ((7, 13) if runtime else (7,)):
+        x_cpu = torch.full((offset + programs * input_stride + guard,), 257.0)
+        expected = torch.full((offset + programs * output_stride + guard,), 257.0)
+        for program in range(programs):
+            values = (torch.arange(m)[:, None] + torch.arange(n)[None, :]) % 7 - 3
+            values = values.float() + program * 4
+            input_start = offset + program * input_stride
+            x_cpu[input_start:input_start + m * n] = values.flatten()
+            source = values * values + 0.5 if computed else values
+            output_start = offset + program * output_stride
+            expected[output_start:output_start + n] = source.sum(dim=0)
+        x = x_cpu.to("mps")
+        out = torch.full_like(expected, 257.0, device="mps")
+        _colsum_scalar_offset_replay[(programs,)](
+            x, out, offset - 3, input_stride, output_stride,
+            BM=m, BN=n, RUNTIME=runtime, COMPUTED=computed, num_warps=4,
+        )
+        torch.mps.synchronize()
+        # Whole-allocation checks include the prefix, program gaps and suffix.
+        torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(x.cpu(), x_cpu, atol=0, rtol=0)
+
+
 # --- COMPUTED cone sources ------------------------------------------------
 # Everything above reduces a device tile directly (or the loop-carried
 # accumulator the reassociation produces). A computed tile —

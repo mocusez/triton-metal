@@ -122,9 +122,9 @@ def test_backward_pre_shifted_score_region_compiles_to_msl(monkeypatch):
     assert "float score =" in msl
     assert "-INFINITY" in msl
     assert re.search(
-        r"int32_t v\d+ = \(v\d+\) \+ \(v\d+\);\n"
+        r"int32_t v\d+ = \(\(v\d+\) \+ \(v\d+\)\);\n"
         r"\s*int32_t v\d+ = int32_t\(v\d+\);\n"
-        r"\s*bool v\d+ = \(v\d+\) < \(v\d+\);",
+        r"\s*bool v\d+ = \(\(v\d+\) < \(v\d+\)\);",
         msl,
     )
 

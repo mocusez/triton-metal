@@ -522,6 +522,10 @@ The current dependency-ordered priorities are:
    previously reduced rows packed at `BLOCK_N`, matching only in row 0. Chains
    with a producer the replay cannot evaluate raise a named error before
    conversion.
+   Constant pointer displacements and supported scalar arithmetic over program
+   IDs and runtime arguments are replayed where the row fill is emitted, so a
+   fill hoisted before the tile loop does not reference scalar definitions
+   inside that loop. Loop-varying offsets retain their per-iteration fill.
    A masked row of a rank-2 `axis=0` reduction contributes the load's `other`
    value rather than the combine identity, matching Triton semantics and the
    rank-1 path: a fully masked column of a `tl.max` returns `other`, not
@@ -672,8 +676,9 @@ The current dependency-ordered priorities are:
    The floating `tl.minimum`/`tl.maximum` NaN-policy defect is fixed.
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
-   reduction-fold paths alike. The default number-preferring policy is
-   unchanged and still compiles to the MSL builtin.
+   reduction-fold paths alike. The default number-preferring policy compiles
+   to the MSL builtin. Rank-2 axis-1 float extrema seed from the first source
+   element, preserving NaN for all-NaN rows and exact infinities.
 2. Expand layout conversion, including the shared tile mapping needed for
    cross-lane transpose. Top-level single-value rank >= 2 scans now support
    multiple elements per thread. Rank >= 2 tuple scans now support f32/i32
@@ -696,14 +701,32 @@ The current dependency-ordered priorities are:
    prefix buffers through deferred readers. A single top-level multi-band
    rank-2 scan can now share its input publication with subsequent reductions
    of the exact same source. Axis-1 reductions support direct row stores or
-   same-axis broadcasts into the original tile; axis-0 reductions support direct
-   column-vector stores, including outputs wider than the threadgroup. The
+   same-axis broadcasts into the original tile. Shared-source f32 row
+   sum/product/min/max support both consumers together for tiles with 2..64 rows
+   and columns, including both NaN-propagating and number-preferring extrema,
+   using separate vector and broadcast folds over one input publication.
+   Shared-source i32 row sum/product/AND/OR/XOR and signed or unsigned min/max
+   also support both consumers together under the same multiband tile limits,
+   preserving comparison signedness, 32-bit values and wrapping arithmetic for
+   masked or computed inputs. Axis-0 reductions support
+   direct column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
-   supports multiple reductions. f32 sources may be masked or computed.
-   i32 row and column-vector sum and signed min/max also accept supported
-   masked or computed sources, preserving mask fill values and computed results.
-   i32 row product/bitwise reductions and column-vector products still require
-   direct unmasked loads.
+   supports multiple reductions. f32 row and column-vector sum/product/min/max
+   accept supported masked or computed sources.
+   i32 row sum/product, signed or unsigned min/max and AND/OR/XOR, and
+   column-vector sum/product, signed or unsigned min/max and AND/OR/XOR also
+   accept supported masked or computed sources, preserving mask fill values and
+   computed results. Unsigned min/max use the shared scan publication for
+   plain sources too, with unsigned comparisons over unchanged 32-bit values.
+   A single-band rank-2 scan whose tile exactly fills its threadgroup also
+   supports mixed row-vector stores and original-tile broadcasts of a same-source
+   f32 row sum, product or NaN-propagating min/max, with 2..64 rows and columns.
+   Separate row folds preserve each consumer's result mapping. Sums and
+   NaN-propagating extrema accept replayable masked/computed sources; products
+   require a direct unmasked load. These reductions
+   require no intervening device writes between source loads and
+   the reduction; writes after its outputs are supported. Its complete emitted
+   threadgroup scratch, including both row buffers, must fit the 32 KiB budget.
    Axis-1 reductions and axis-0 column-vector stores may also use distinct
    inputs with the same shape, layout, and dtype, published together with the
    scan input. Their complete input computations must precede the scan,
@@ -711,20 +734,22 @@ The current dependency-ordered priorities are:
    device writes; repeated inputs share a publication, within the existing
    threadgroup-memory budget. The same source rules apply to distinct i32
    reduction inputs; independent scan inputs may be masked or computed.
-   Shared or distinct-source f32/i32 column sum/min/max can also broadcast
-   directly back into the original tile after the scan, with 2..64 rows and
-   2..256 columns, including more columns than threads. The scan-axis extent
+   Shared or distinct-source f32 column sum/product/min/max and i32 column
+   sum/product/min/max/AND/OR/XOR can also broadcast directly back into the
+   original tile after the scan, with 2..64 rows and
+   2..512 columns, including more columns than threads. The scan-axis extent
    remains at most 64, and all input buffers must fit the 32 KiB budget.
    This column-broadcast path accepts supported masked or computed f32/i32
-   inputs, preserving mask fill values and computed results. i32 uses signed
-   extrema; independent scan inputs may also be masked or computed.
+   inputs, preserving mask fill values and computed results. i32 supports both
+   signed and unsigned extrema; independent scan inputs may also be masked or
+   computed.
    This path requires the original layout and
    only elementwise consumers followed by stores. Distinct sources obey the same
    pre-scan computation and write-isolation rules above; repeated sources share
    a buffer. The fold reads its own complete input buffer without another column
    publication. Other column broadcasts
    (including independent small tiles beside a multi-band scan), reducing the
-   scan result, and mixed row-store/broadcast or cross-axis/wider broadcast
+   scan result, and other mixed row-store/broadcast or cross-axis/wider broadcast
    consumers remain rejected in this combination. Mixed device-load cones for
    wide rank-1 scan broadcasts,
    wide tuple scan broadcasts, and ambiguous

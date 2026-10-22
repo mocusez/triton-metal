@@ -7,9 +7,9 @@ arith.maxnumf): the kernel loads a 2D `(M, N)` block, calls
 `tl.max(x, axis=1)`, and stores the resulting `(M,)` vector.
 
 The combine is emitted as `metal.binary_exp ... maxOp` (MSL `max(a, b)`) and
-the per-row scf.for iter_arg is identity-initialised to exact -infinity. Max is
-an exact element selection, so the result is compared bit-tight against
-`torch.amax(input, dim=1)`.
+the per-row scf.for iter_arg starts at the first source element. This keeps
+all-NaN rows NaN under number-preferring max, whose -infinity identity would
+otherwise replace every NaN. Finite maxima remain exact element selections.
 """
 
 from __future__ import annotations
@@ -173,6 +173,350 @@ def test_reduce_max_axis1_all_negative_infinity(M, N):
     out = torch.zeros((M,), dtype=torch.float32)
     reduce_max_axis1_kernel[(1,)](x, out, BLOCK_M=M, BLOCK_N=N)
     assert torch.isneginf(out).all()
+
+
+@triton.jit
+def _reduce_extrema_seed_axis1_kernel(
+    x_ptr, out_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    GUARD: tl.constexpr, BROADCAST: tl.constexpr, SOURCE: tl.constexpr,
+    OP: tl.constexpr,
+):
+    rm = tl.arange(0, BLOCK_M)
+    rn = tl.arange(0, BLOCK_N)
+    rows = tl.program_id(0) * BLOCK_M + rm
+    offsets = rows[:, None] * BLOCK_N + rn[None, :]
+    if SOURCE == "masked":
+        valid = (rn[None, :] < BLOCK_N - 3) & (rm[:, None] != BLOCK_M - 1)
+        x = tl.load(x_ptr + GUARD + offsets, mask=valid, other=float("nan"))
+    else:
+        x = tl.load(x_ptr + GUARD + offsets)
+        if SOURCE == "computed":
+            x = x * 0.5
+    # Match public tl.max/min promotion for bf16, whose scalar maximum/minimum
+    # also promotes to f32 and therefore cannot form a bare bf16 combine region.
+    if x.dtype == tl.bfloat16:
+        x = x.to(tl.float32)
+    if OP == "maxnum":
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_maxnum)
+    elif OP == "minnum":
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_minnum)
+    elif OP == "max":
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_maximum)
+    elif OP == "min":
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_minimum)
+    elif OP == "sum":
+        result = tl.sum(x, axis=1)
+    else:
+        result = tl.reduce(x, axis=1, combine_fn=_product_combine)
+    if BROADCAST:
+        tl.store(out_ptr + GUARD + offsets, result[:, None])
+    else:
+        tl.store(out_ptr + GUARD + rows, result)
+
+
+@triton.jit
+def _rank2_seed_maxnum(a, b):
+    return tl.maximum(a, b).to(a.dtype)
+
+
+@triton.jit
+def _rank2_seed_minnum(a, b):
+    return tl.minimum(a, b).to(a.dtype)
+
+
+@triton.jit
+def _rank2_seed_maximum(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _rank2_seed_minimum(a, b):
+    return tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_maxnum_all_nan_seed(broadcast):
+    """A synthetic -inf must not displace the first real NaN in either mapping."""
+    m, n = 16, 256
+    x = torch.full((m, n), float("nan"), dtype=torch.float32, device="mps")
+    out = torch.zeros((m, n) if broadcast else (m,), device="mps")
+    _reduce_extrema_seed_axis1_kernel[(1,)](
+        x, out, BLOCK_M=m, BLOCK_N=n, GUARD=0, BROADCAST=broadcast,
+        SOURCE="direct", OP="maxnum", num_warps=4,
+    )
+    torch.mps.synchronize()
+    assert torch.isnan(out.cpu()).all()
+
+
+def _check_rank2_extrema_seed(op, source, broadcast, num_warps, dtype=torch.float32,
+                             scalar_offset=False):
+    """Each program has distinct finite rows, NaN placements, and zero signs."""
+    m, n, programs, guard = 16, 256, 3, 7
+    values = torch.empty((programs, m, n), dtype=dtype)
+    for program in range(programs):
+        tile = values[program]
+        tile[:] = (torch.arange(n) % 7 - 3).to(dtype)
+        tile[0] = float("nan")
+        tile[1, 0] = float("nan")
+        tile[2, n // 2] = float("nan")
+        tile[3, -1] = float("nan")
+        tile[4] = -float("inf")
+        tile[5] = float("inf")
+        tile[6] = 0.0
+        tile[7] = -0.0
+        tile[8, ::2] = -float("inf")
+        tile[8, 1::2] = float("inf")
+        tile[9] = program + 0.5
+        tile[10:14] = float("nan")
+        tile[10, n // 3] = program + 2.0
+        tile[11, n // 3] = -float("inf")
+        tile[12, n // 3] = float("inf")
+        tile[13, n // 3] = -0.0
+        tile[14] = -program - 0.5
+        tile[15] = program + 4.0
+    expected_input = values.clone()
+    if source == "masked":
+        expected_input[:, :, n - 3:] = float("nan")
+        expected_input[:, -1] = float("nan")
+    elif source == "computed":
+        expected_input *= 0.5
+    expected_input = expected_input.reshape(programs * m, n)
+    if op in ("sum", "product"):
+        expected = torch.full((programs * m,), 0.0 if op == "sum" else 1.0, dtype=dtype)
+    else:
+        expected = expected_input[:, 0].clone()
+    combine = {
+        "maxnum": torch.fmax,
+        "minnum": torch.fmin,
+        "max": torch.maximum,
+        "min": torch.minimum,
+        "sum": torch.add,
+        "product": torch.mul,
+    }[op]
+    for column in range(0 if op in ("sum", "product") else 1, n):
+        expected = combine(expected, expected_input[:, column])
+    if broadcast:
+        expected = expected[:, None].expand(-1, n).contiguous()
+
+    x_cpu = torch.full((values.numel() + 2 * guard,), 257.0, dtype=dtype)
+    x_cpu[guard:-guard] = values.flatten()
+    x = x_cpu.to("mps")
+    out = torch.full((expected.numel() + 2 * guard,), 257.0, dtype=dtype, device="mps")
+    # Both modes retain physical allocation guards. Raw pointers also exercise
+    # replay of the scalar addptr term when the row scan precedes the tile loop.
+    x_arg = x if scalar_offset else x[guard:-guard]
+    out_arg = out if scalar_offset else out[guard:-guard]
+    _reduce_extrema_seed_axis1_kernel[(programs,)](
+        x_arg, out_arg, BLOCK_M=m, BLOCK_N=n, GUARD=guard if scalar_offset else 0, BROADCAST=broadcast,
+        SOURCE=source, OP=op, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[guard:-guard].reshape(expected.shape), expected,
+                               atol=0, rtol=0, equal_nan=True)
+    # Check the sign of homogeneous zero rows; mixed-sign Num ties are unspecified.
+    actual_values = actual[guard:-guard].reshape(expected.shape)
+    zeros = expected == 0
+    assert torch.equal(torch.signbit(actual_values[zeros]), torch.signbit(expected[zeros]))
+    assert (actual[:guard] == 257).all() and (actual[-guard:] == 257).all()
+    torch.testing.assert_close(x.cpu(), x_cpu, atol=0, rtol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("source", ["direct", "masked", "computed"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_rank2_axis1_maxnum_seed_ieee(source, broadcast, num_warps):
+    """Number-preferring max ignores partial NaNs and preserves all-NaN rows."""
+    _check_rank2_extrema_seed("maxnum", source, broadcast, num_warps)
+
+
+@pytest.mark.parametrize("op", ["minnum", "max", "min"])
+@pytest.mark.parametrize("source", ["direct", "masked", "computed"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_extrema_seed_neighbors(op, source, broadcast):
+    """First-value seeding also preserves minimum and NaN-propagating behavior."""
+    _check_rank2_extrema_seed(op, source, broadcast, 4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("op", ["maxnum", "minnum"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_half_extrema_seed_ieee(dtype, op, broadcast):
+    """Direct f16 and promoted bf16 inputs retain NaNs and zero signs."""
+    _check_rank2_extrema_seed(op, "direct", broadcast, 4, dtype)
+
+
+@pytest.mark.parametrize("op", ["sum", "product"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_sum_product_seed_identity(op, broadcast):
+    """The extrema change leaves sum's +0 and product's +1 seeds intact."""
+    _check_rank2_extrema_seed(op, "direct", broadcast, 4)
+
+
+@pytest.mark.parametrize("op,source", [
+    (op, source)
+    for op in ("maxnum", "minnum", "max", "min", "sum", "product")
+    for source in ("direct", "masked", "computed")
+    if op != "product" or source == "direct"
+])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_scalar_offset_constant(op, source, broadcast):
+    """A scalar pointer displacement must dominate the replayed row source."""
+    _check_rank2_extrema_seed(op, source, broadcast, 4, scalar_offset=True)
+
+
+@triton.jit
+def _reduce_scalar_offset_tile(
+    x_ptr, out_ptr, base_offset, input_program_stride, output_program_stride,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BROADCAST: tl.constexpr,
+    OP: tl.constexpr,
+):
+    rm = tl.arange(0, BLOCK_M)
+    rn = tl.arange(0, BLOCK_N)
+    input_offsets = tl.program_id(0) * input_program_stride + rm[:, None] * BLOCK_N + rn[None, :]
+    x = tl.load(x_ptr + base_offset + input_offsets)
+    if OP == "maxnum":
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_maxnum)
+    elif OP == "sum":
+        result = tl.sum(x, axis=1)
+    else:
+        result = tl.reduce(x, axis=1, combine_fn=_product_combine)
+    if BROADCAST:
+        output_offsets = tl.program_id(0) * output_program_stride + rm[:, None] * BLOCK_N + rn[None, :]
+        tl.store(out_ptr + base_offset + output_offsets, result[:, None])
+    else:
+        output_offsets = tl.program_id(0) * output_program_stride + rm
+        tl.store(out_ptr + base_offset + output_offsets, result)
+
+
+@triton.jit(do_not_specialize=["base_offset", "input_program_stride", "output_program_stride",
+                              "input_tile_stride", "output_tile_stride", "n_tiles"])
+def _reduce_scalar_offset_runtime_kernel(
+    x_ptr, out_ptr, base_offset, input_program_stride, output_program_stride,
+    input_tile_stride, output_tile_stride, n_tiles,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BROADCAST: tl.constexpr,
+    OP: tl.constexpr, LOOP: tl.constexpr,
+):
+    base_offset = tl.where(base_offset > 0, base_offset, -base_offset)
+    if LOOP:
+        for tile in range(n_tiles):
+            # These scalar terms vary with the enclosing runtime loop, while
+            # remaining uniform across every element of the logical block.
+            input_base = base_offset + tile * input_tile_stride
+            output_base = base_offset + tile * output_tile_stride
+            _reduce_scalar_offset_tile(
+                x_ptr + input_base, out_ptr + output_base, 0,
+                input_program_stride, output_program_stride,
+                BLOCK_M, BLOCK_N, BROADCAST, OP,
+            )
+    else:
+        _reduce_scalar_offset_tile(
+            x_ptr, out_ptr, base_offset, input_program_stride, output_program_stride,
+            BLOCK_M, BLOCK_N, BROADCAST, OP,
+        )
+
+
+def _check_rank2_scalar_runtime_offset(op, broadcast, loop):
+    m, n, programs, guard = 16, 256, 3, 7
+    n_tiles = 2 if loop else 1
+    input_program_stride = m * n + 11
+    output_elements = m * n if broadcast else m
+    output_program_stride = output_elements + 13
+    input_tile_stride = programs * input_program_stride + 17
+    output_tile_stride = programs * output_program_stride + 19
+    # Both launches share a compiled runtime signature: neither displacement is
+    # constexpr or an alignment/divisibility specialization.
+    for base_offset in (guard, guard + 6):
+        x_cpu = torch.full((base_offset + n_tiles * input_tile_stride + guard,), 257.0)
+        expected = torch.full((base_offset + n_tiles * output_tile_stride + guard,), 257.0)
+        for tile in range(n_tiles):
+            for program in range(programs):
+                values = torch.ones((m, n))
+                values[:, 0] = program * 32 + tile * 16 + torch.arange(m) + 1
+                values[:, 1] = 2.0
+                values[:, 2] = 0.5
+                input_start = base_offset + tile * input_tile_stride + program * input_program_stride
+                x_cpu[input_start:input_start + m * n] = values.flatten()
+                if op == "maxnum":
+                    result = values.max(dim=1).values
+                elif op == "sum":
+                    result = values.sum(dim=1)
+                else:
+                    result = values.prod(dim=1)
+                if broadcast:
+                    result = result[:, None].expand(-1, n).contiguous()
+                output_start = base_offset + tile * output_tile_stride + program * output_program_stride
+                expected[output_start:output_start + output_elements] = result.flatten()
+        x = x_cpu.to("mps")
+        out = torch.full_like(expected, 257.0, device="mps")
+        _reduce_scalar_offset_runtime_kernel[(programs,)](
+            x, out, base_offset, input_program_stride, output_program_stride,
+            input_tile_stride, output_tile_stride, n_tiles,
+            BLOCK_M=m, BLOCK_N=n, BROADCAST=broadcast, OP=op, LOOP=loop,
+            num_warps=4,
+        )
+        torch.mps.synchronize()
+        # Comparing the entire allocation also verifies all program/tile gaps,
+        # the runtime displacement prefix, and trailing allocation guards.
+        torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(x.cpu(), x_cpu, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("op", ["maxnum", "sum", "product"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_scalar_offset_runtime_argument(op, broadcast):
+    """Runtime block arguments remain valid when row-source replay is hoisted."""
+    _check_rank2_scalar_runtime_offset(op, broadcast, loop=False)
+
+
+@pytest.mark.parametrize("op", ["maxnum", "sum"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_scalar_offset_loop_iteration(op, broadcast):
+    """Enclosing-loop scalar offsets select a fresh tile on each iteration."""
+    _check_rank2_scalar_runtime_offset(op, broadcast, loop=True)
+
+
+@triton.jit
+def _reduce_maxnum_seed_loop_kernel(
+    x_ptr, out_ptr, n_tiles, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    GUARD: tl.constexpr, BROADCAST: tl.constexpr,
+):
+    rm = tl.arange(0, BLOCK_M)
+    rn = tl.arange(0, BLOCK_N)
+    for tile in range(n_tiles):
+        offsets = tile * BLOCK_M * BLOCK_N + rm[:, None] * BLOCK_N + rn[None, :]
+        x = tl.load(x_ptr + GUARD + offsets)
+        result = tl.reduce(x, axis=1, combine_fn=_rank2_seed_maxnum)
+        if BROADCAST:
+            tl.store(out_ptr + GUARD + offsets, result[:, None])
+        else:
+            tl.store(out_ptr + GUARD + tile * BLOCK_M + rm, result)
+
+
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+def test_reduce_rank2_axis1_maxnum_seed_loop_iteration(broadcast):
+    """The first source element changes from NaN to finite and back across iterations."""
+    m, n, guard = 16, 256, 7
+    values = torch.full((2, m, n), float("nan"))
+    values[0, :m // 2] = 2.0
+    values[1, m // 2:] = -3.0
+    expected = values[:, :, 0]
+    if broadcast:
+        expected = expected[:, :, None].expand(-1, -1, n).contiguous()
+    x_cpu = torch.full((values.numel() + 2 * guard,), 257.0)
+    x_cpu[guard:-guard] = values.flatten()
+    x = x_cpu.to("mps")
+    out = torch.full((expected.numel() + 2 * guard,), 257.0, device="mps")
+    _reduce_maxnum_seed_loop_kernel[(1,)](
+        x, out, 2, BLOCK_M=m, BLOCK_N=n, GUARD=guard, BROADCAST=broadcast,
+        num_warps=4,
+    )
+    torch.mps.synchronize()
+    actual = out.cpu()
+    torch.testing.assert_close(actual[guard:-guard].reshape(expected.shape), expected,
+                               atol=0, rtol=0, equal_nan=True)
+    assert (actual[:guard] == 257).all() and (actual[-guard:] == 257).all()
+    torch.testing.assert_close(x.cpu(), x_cpu, atol=0, rtol=0, equal_nan=True)
 
 
 @pytest.mark.parametrize("M, N", [(8, 16), (4, 32), (16, 16), (128, 64)])
