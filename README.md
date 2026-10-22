@@ -257,6 +257,10 @@ non-f32 operands fail in preflight with a named diagnostic instead of reaching
 MSL emission. `tl.abs` supports f16, bf16, and f32; the 16-bit paths clear the
 sign bit directly, preserving subnormals and NaN payloads.
 
+`tl.fdiv(x, y, approx=True)` supports f32 scalars and tensors using Metal's
+ordinary division implementation. It follows the same supported reduction,
+scan and other source-replay paths as ordinary floating-point division.
+
 `tl.sqrt`, `tl.erf`, `tl.exp`, `tl.exp2`, `tl.log`, `tl.log2`, `tl.rsqrt`,
 `tl.sin`, and `tl.cos` require f32 operands on Metal. Unsupported math widths
 receive a named compile diagnostic before MSL emission.

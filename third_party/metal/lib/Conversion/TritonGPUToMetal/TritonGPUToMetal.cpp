@@ -43235,6 +43235,19 @@ validateTensorAddressSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(ok);
 }
 
+// Approximate division permits the ordinary f32 division implementation used
+// by Metal. Normalize before any source-cone planning or structural matching so
+// scalar, tensor and replayed uses all follow the existing arith.divf paths.
+static void preprocessApproximateDivision(mlir::ModuleOp moduleOp) {
+  moduleOp.walk([&](mlir::triton::ApproxDivFOp op) {
+    mlir::OpBuilder builder(op);
+    auto div = mlir::arith::DivFOp::create(builder, op.getLoc(), op.getX(),
+                                         op.getY());
+    op.replaceAllUsesWith(div.getResult());
+    op.erase();
+  });
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -43243,6 +43256,7 @@ struct ConvertTritonGPUToMetalPass
     auto moduleOp = getOperation();
     auto *ctx = &getContext();
 
+    preprocessApproximateDivision(moduleOp);
     preprocessInlineCalls(moduleOp);
     preprocessBoolPointerBitcasts(moduleOp);
     if (mlir::failed(prepareTensorPointerBitcasts(moduleOp))) {

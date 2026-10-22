@@ -6602,6 +6602,10 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         v = tl.clamp(x, 1.2, 1.8)
     elif FORM == "clamp_all":
         v = tl.clamp(x, 1.2, 1.8, propagate_nan=tl.PropagateNan.ALL)
+    elif FORM == "approx_div":
+        v = tl.fdiv(x, y, approx=True)
+    elif FORM == "approx_div_scalar":
+        v = x + tl.fdiv(tl.load(Xp), tl.load(Yp), approx=True)
     else:
         v = tl.div_rn(x, y)
     if SITE == "reduce":
@@ -6614,7 +6618,8 @@ def _precise_cone_site_kernel(Xp, Yp, Ip, Op, BLOCK: tl.constexpr,
         tl.store(Op + tl.arange(0, BINS), tl.histogram(v.to(tl.int32), BINS))
 
 
-@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "rem", "fma",
+@pytest.mark.parametrize("form", ["sqrt_rn", "div_rn", "approx_div",
+                                  "approx_div_scalar", "rem", "fma",
                                   "clamp_none", "clamp_all"])
 @pytest.mark.parametrize("site", ["reduce", "scan", "gather", "histogram"])
 # 128 is one element per thread, where nothing is replayed and these always
@@ -6636,6 +6641,8 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
         v = torch.fmod(x, y)
     elif form == "fma":
         v = x * y + x
+    elif form == "approx_div_scalar":
+        v = x + x[0] / y[0]
     elif form.startswith("clamp"):
         # No NaN in this input, so both policies agree here; the policy itself
         # is pinned bitwise against the elementwise path further down.
@@ -6655,10 +6662,12 @@ def test_precise_arithmetic_in_a_replayed_cone(site, form, block):
         out = torch.zeros(bins, dtype=torch.int32, device="mps")
         expected = torch.bincount(v.to(torch.int32).clamp(0, bins - 1),
                                   minlength=bins).to(torch.int32)
-    _precise_cone_site_kernel[(1,)](
+    compiled = _precise_cone_site_kernel[(1,)](
         x.to("mps"), y.to("mps"), idx.to("mps"), out, BLOCK=block, BINS=bins,
         SITE=site, FORM=form, num_warps=4)
     torch.mps.synchronize()
+    if form.startswith("approx_div"):
+        assert "tt.approx_divf" in compiled.asm["ttir"]
     if site == "histogram":
         assert torch.equal(out.cpu(), expected)
     else:
@@ -6822,3 +6831,106 @@ def test_flip_rank_n_matches_torch(shape, dim, num_warps, dtype, twice):
     if twice:
         want = want.flip(len(shape) - 1)
     assert torch.equal(out.cpu(), want)
+
+
+@triton.jit
+def _approx_div_kernel(Xp, Yp, Op, BLOCK: tl.constexpr):
+    if BLOCK == 0:
+        offs = 0
+    else:
+        offs = tl.arange(0, BLOCK)
+    x = tl.load(Xp + offs)
+    y = tl.load(Yp + offs)
+    tl.store(Op + offs, tl.fdiv(x, y, approx=True))
+
+
+def test_approx_div_scalar_compiles_without_crashing(tmp_path):
+    # Unsupported scalar conversion previously aborted the compiler process.
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = tmp_path / "approx_div_scalar.py"
+    script.write_text(textwrap.dedent(f"""
+        import importlib.util
+        import triton
+        from triton.compiler import ASTSource
+        from triton.backends.compiler import GPUTarget
+        spec = importlib.util.spec_from_file_location("msl_child", {str(Path(__file__).resolve())!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        compiled = triton.compile(ASTSource(
+            module._approx_div_kernel,
+            signature={{"Xp": "*fp32", "Yp": "*fp32", "Op": "*fp32"}},
+            constexprs={{"BLOCK": 0}}), target=GPUTarget("metal", 9, 32),
+            options={{"num_warps": 4}})
+        assert "tt.approx_divf" in compiled.asm["ttir"]
+        raw = compiled.asm["metal"]
+        msl = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        assert "tt.approx_divf" not in msl
+        assert " / " in msl
+        print("COMPILED")
+    """))
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=180,
+        env={**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "cache")})
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "COMPILED" in output, output
+
+
+@pytest.mark.parametrize("block", [128, 256])
+@pytest.mark.parametrize("special", [False, True], ids=["finite", "special"])
+def test_approx_div_elementwise_matches_torch(block, special):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    generator = torch.Generator().manual_seed(0xD1F + block)
+    x = torch.randn(block, generator=generator)
+    y = torch.rand(block, generator=generator) + 0.5
+    if special:
+        x[:12] = torch.tensor([0., -0., 1., -1., 0., float("inf"),
+                               -float("inf"), 1., -1., float("nan"), 1., float("inf")])
+        y[:12] = torch.tensor([2., 2., 0., 0., 0., 2., 2., float("inf"),
+                               float("inf"), 2., float("nan"), float("inf")])
+    expected = x / y
+    storage = torch.full((block + 2,), -1234.5, device="mps")
+    compiled = _approx_div_kernel[(1,)](
+        x.to("mps"), y.to("mps"), storage[1:-1], BLOCK=block, num_warps=4)
+    torch.mps.synchronize()
+    assert "tt.approx_divf" in compiled.asm["ttir"]
+    actual = storage.cpu()
+    assert torch.equal(actual[[0, -1]], torch.full((2,), -1234.5))
+    torch.testing.assert_close(actual[1:-1], expected, atol=1e-6, rtol=1e-6,
+                               equal_nan=True)
+    zero = expected == 0
+    assert torch.equal(torch.signbit(actual[1:-1][zero]), torch.signbit(expected[zero]))
+
+
+@triton.jit
+def _approx_div_rank2_reduce_kernel(Xp, Yp, Op, M: tl.constexpr, N: tl.constexpr):
+    rows = tl.arange(0, M)
+    offs = rows[:, None] * N + tl.arange(0, N)[None, :]
+    x = tl.load(Xp + offs)
+    y = tl.load(Yp + offs)
+    tl.store(Op + rows, tl.sum(tl.fdiv(x, y, approx=True), 1))
+
+
+@pytest.mark.parametrize("n", [32, 64])
+def test_approx_div_rank2_computed_reduce_matches_torch(n):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    m = 8
+    generator = torch.Generator().manual_seed(0xD1F + n)
+    x = torch.randn((m, n), generator=generator)
+    y = torch.rand((m, n), generator=generator) + 0.5
+    storage = torch.full((m + 2,), -1234.5, device="mps")
+    compiled = _approx_div_rank2_reduce_kernel[(1,)](
+        x.to("mps"), y.to("mps"), storage[1:-1], M=m, N=n, num_warps=4)
+    torch.mps.synchronize()
+    assert "tt.approx_divf" in compiled.asm["ttir"]
+    actual = storage.cpu()
+    assert torch.equal(actual[[0, -1]], torch.full((2,), -1234.5))
+    torch.testing.assert_close(actual[1:-1], (x / y).sum(1), atol=2e-5, rtol=1e-5)

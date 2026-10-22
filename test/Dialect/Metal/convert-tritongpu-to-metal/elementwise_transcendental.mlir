@@ -490,3 +490,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: metal.kernel clampf_bf16_kernel
 // CHECK-NOT:   tt.clampf
 // CHECK:       metal.clampf {{.*}}, propagate_nan = false : (bf16, bf16, bf16) -> bf16
+
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @approx_div_scalar(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+    %x = tt.load %lhs : !tt.ptr<f32>
+    %y = tt.load %rhs : !tt.ptr<f32>
+    %r = tt.approx_divf %x, %y : f32
+    tt.store %out, %r : !tt.ptr<f32>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel approx_div_scalar
+// CHECK-NOT: tt.approx_divf
+// CHECK: %[[LHS:.*]] = metal.get_element
+// CHECK: %[[RHS:.*]] = metal.get_element
+// CHECK: %[[QUOTIENT:.*]] = arith.divf %[[LHS]], %[[RHS]] : f32
+// CHECK-NOT: tt.approx_divf
+// CHECK: metal.store %[[QUOTIENT]]
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @approx_div_tensor(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+    %offs = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
+    %lb = tt.splat %lhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %la = tt.addptr %lb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %x = tt.load %la : tensor<256x!tt.ptr<f32>, #blocked>
+    %rb = tt.splat %rhs : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %ra = tt.addptr %rb, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    %y = tt.load %ra : tensor<256x!tt.ptr<f32>, #blocked>
+    %r = tt.approx_divf %x, %y : tensor<256xf32, #blocked>
+    %ob = tt.splat %out : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %ob, %offs : tensor<256x!tt.ptr<f32>, #blocked>, tensor<256xi32, #blocked>
+    tt.store %oa, %r : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel approx_div_tensor
+// CHECK-NOT: tt.approx_divf
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, divOp : (f32, f32) -> f32
+// CHECK-NOT: tt.approx_divf
+// CHECK: metal.store
+// CHECK-NOT: tt.approx_divf
