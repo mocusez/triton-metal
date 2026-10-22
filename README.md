@@ -523,7 +523,9 @@ The current dependency-ordered priorities are:
    with a producer the replay cannot evaluate raise a named error before
    conversion.
    Constant pointer displacements and supported scalar arithmetic over program
-   IDs and runtime arguments are replayed where the row fill is emitted, so a
+   IDs, grid sizes (`tl.num_programs` on any axis), and runtime arguments are
+   replayed where the row fill is emitted. Scalar signed/unsigned integer
+   min/max retain their comparison semantics in address expressions, so a
    fill hoisted before the tile loop does not reference scalar definitions
    inside that loop. Loop-varying offsets retain their per-iteration fill.
    A masked row of a rank-2 `axis=0` reduction contributes the load's `other`

@@ -10677,6 +10677,7 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     if (!scalarDef ||
         (!mlir::isa<
              mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp,
+             mlir::triton::GetNumProgramsOp,
              mlir::arith::SIToFPOp, mlir::arith::UIToFPOp, mlir::arith::ExtFOp,
              mlir::arith::TruncFOp, mlir::arith::ExtUIOp, mlir::arith::ExtSIOp,
              mlir::arith::TruncIOp, mlir::arith::FPToSIOp,
@@ -10688,7 +10689,9 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
              mlir::arith::DivSIOp, mlir::arith::DivUIOp, mlir::arith::RemSIOp,
              mlir::arith::RemUIOp, mlir::arith::AndIOp, mlir::arith::OrIOp,
              mlir::arith::XOrIOp, mlir::arith::ShLIOp, mlir::arith::ShRSIOp,
-             mlir::arith::ShRUIOp, mlir::arith::SelectOp, mlir::arith::CmpIOp,
+             mlir::arith::ShRUIOp, mlir::arith::MinSIOp, mlir::arith::MaxSIOp,
+             mlir::arith::MinUIOp, mlir::arith::MaxUIOp,
+             mlir::arith::SelectOp, mlir::arith::CmpIOp,
              mlir::arith::CmpFOp>(scalarDef) &&
          !coneUnaryExpOperator(scalarDef) && !coneClonableUnaryOp(scalarDef) &&
          !conePreciseBinaryOperator(scalarDef) &&
@@ -10738,6 +10741,19 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return mlir::UnrealizedConversionCastOp::create(
                rewriter, loc, mlir::TypeRange{rewriter.getI32Type()},
                mlir::ValueRange{tg})
+        .getResult(0);
+  }
+
+  if (auto numPrograms = mlir::dyn_cast<mlir::triton::GetNumProgramsOp>(def)) {
+    int axis = static_cast<int>(numPrograms.getAxis());
+    const char *dim = axis == 0 ? "x" : axis == 1 ? "y" : "z";
+    mlir::Value gridSize =
+        ThreadgroupsPerGridOp::create(rewriter, loc, ui32,
+                                     rewriter.getStringAttr(dim))
+            .getResult();
+    return mlir::UnrealizedConversionCastOp::create(
+               rewriter, loc, mlir::TypeRange{rewriter.getI32Type()},
+               mlir::ValueRange{gridSize})
         .getResult(0);
   }
 
@@ -11119,6 +11135,26 @@ evalRank1ValueAtImpl(mlir::Value v, mlir::Value idxVal,
     return make(toSignlessInt(a, rewriter, loc),
                 toSignlessInt(b, rewriter, loc));
   };
+  // Scalar address extrema must be rebuilt before a hoisted row fill. Keep
+  // tensor-cone admission unchanged, and preserve each comparison's signedness.
+  if (!mlir::isa<mlir::RankedTensorType>(v.getType())) {
+    if (auto o = mlir::dyn_cast<mlir::arith::MinSIOp>(def))
+      return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+        return mlir::arith::MinSIOp::create(rewriter, loc, a, b).getResult();
+      });
+    if (auto o = mlir::dyn_cast<mlir::arith::MaxSIOp>(def))
+      return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+        return mlir::arith::MaxSIOp::create(rewriter, loc, a, b).getResult();
+      });
+    if (auto o = mlir::dyn_cast<mlir::arith::MinUIOp>(def))
+      return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+        return mlir::arith::MinUIOp::create(rewriter, loc, a, b).getResult();
+      });
+    if (auto o = mlir::dyn_cast<mlir::arith::MaxUIOp>(def))
+      return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
+        return mlir::arith::MaxUIOp::create(rewriter, loc, a, b).getResult();
+      });
+  }
   if (auto o = mlir::dyn_cast<mlir::arith::AddIOp>(def))
     return ibinary(o.getLhs(), o.getRhs(), [&](mlir::Value a, mlir::Value b) {
       return mlir::arith::AddIOp::create(rewriter, loc, a, b).getResult();
@@ -12479,7 +12515,8 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
         (!g_loopGatherStagedValues &&
          !g_loopGatherOriginalLoop->isAncestor(def)))
       return true;
-    if (mlir::isa<mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp>(def))
+    if (mlir::isa<mlir::arith::ConstantOp, mlir::triton::GetProgramIdOp,
+                  mlir::triton::GetNumProgramsOp>(def))
       return true;
     if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::UIToFPOp,
                   mlir::arith::ExtFOp, mlir::arith::TruncFOp,
@@ -12501,7 +12538,9 @@ static bool rank1ConeSupported(mlir::Value v, int depth,
             mlir::arith::MulIOp, mlir::arith::DivSIOp, mlir::arith::DivUIOp,
             mlir::arith::RemSIOp, mlir::arith::RemUIOp, mlir::arith::AndIOp,
             mlir::arith::OrIOp, mlir::arith::XOrIOp, mlir::arith::ShLIOp,
-            mlir::arith::ShRSIOp, mlir::arith::ShRUIOp, mlir::arith::CmpIOp,
+            mlir::arith::ShRSIOp, mlir::arith::ShRUIOp,
+            mlir::arith::MinSIOp, mlir::arith::MaxSIOp,
+            mlir::arith::MinUIOp, mlir::arith::MaxUIOp, mlir::arith::CmpIOp,
             mlir::arith::CmpFOp>(def))
       return rank1ConeSupported(def->getOperand(0), depth + 1,
                                 deferAggregateLeaves) &&

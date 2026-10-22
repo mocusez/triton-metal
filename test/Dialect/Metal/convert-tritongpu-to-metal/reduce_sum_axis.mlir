@@ -418,3 +418,72 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: metal.barrier
 // CHECK: metal.store
 // CHECK: metal.return
+
+// -----
+// Broadcasting the row sum back to the 16x256 tile forces a function tile
+// loop. Its cooperative row fill runs before that loop, so every scalar
+// address producer must be replayed there rather than captured from the loop.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#rows = #ttg.slice<{dim = 1, parent = #blocked}>
+#cols = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_sum_axis1_scalar_grid_extrema(%x_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>, %a: i32, %b: i32) {
+    %nx = tt.get_num_programs x : i32
+    %ny = tt.get_num_programs y : i32
+    %nz = tt.get_num_programs z : i32
+    %smin = arith.minsi %a, %b : i32
+    %smax = arith.maxsi %smin, %nx : i32
+    %umin = arith.minui %smax, %ny : i32
+    %umax = arith.maxui %umin, %nz : i32
+    %mask = arith.constant 15 : i32
+    %base = arith.andi %umax, %mask : i32
+    %x_base = tt.addptr %x_ptr, %base : !tt.ptr<f32>, i32
+    %stride = arith.constant dense<256> : tensor<16x1xi32, #blocked>
+    %r = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #rows>
+    %r2 = tt.expand_dims %r {axis = 1 : i32} : tensor<16xi32, #rows> -> tensor<16x1xi32, #blocked>
+    %ro = arith.muli %r2, %stride : tensor<16x1xi32, #blocked>
+    %c = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #cols>
+    %c2 = tt.expand_dims %c {axis = 0 : i32} : tensor<256xi32, #cols> -> tensor<1x256xi32, #blocked>
+    %rf = tt.broadcast %ro : tensor<16x1xi32, #blocked> -> tensor<16x256xi32, #blocked>
+    %cf = tt.broadcast %c2 : tensor<1x256xi32, #blocked> -> tensor<16x256xi32, #blocked>
+    %offsets = arith.addi %rf, %cf : tensor<16x256xi32, #blocked>
+    %xp = tt.splat %x_base : !tt.ptr<f32> -> tensor<16x256x!tt.ptr<f32>, #blocked>
+    %addr = tt.addptr %xp, %offsets : tensor<16x256x!tt.ptr<f32>, #blocked>, tensor<16x256xi32, #blocked>
+    %x = tt.load %addr : tensor<16x256x!tt.ptr<f32>, #blocked>
+    %sum = "tt.reduce"(%x) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %add = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %add : f32
+    }) {axis = 1 : i32} : (tensor<16x256xf32, #blocked>) -> tensor<16xf32, #rows>
+    %sum2 = tt.expand_dims %sum {axis = 1 : i32} : tensor<16xf32, #rows> -> tensor<16x1xf32, #blocked>
+    %full = tt.broadcast %sum2 : tensor<16x1xf32, #blocked> -> tensor<16x256xf32, #blocked>
+    %op = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<16x256x!tt.ptr<f32>, #blocked>
+    %oa = tt.addptr %op, %offsets : tensor<16x256x!tt.ptr<f32>, #blocked>, tensor<16x256xi32, #blocked>
+    tt.store %oa, %full : tensor<16x256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+// CHECK-LABEL: metal.kernel reduce_sum_axis1_scalar_grid_extrema
+// Check the replay inside the hoisted row fill, including its address uses.
+// The original producers also occur later in the function tile loop.
+// CHECK: scf.for
+// CHECK: scf.for {{.*}} iter_args
+// CHECK: %[[SMIN:.*]] = arith.minsi {{.*}} : i32
+// CHECK: %[[NX:.*]] = metal.threadgroups_per_grid "x" : ui32
+// CHECK: %[[NX_I:.*]] = builtin.unrealized_conversion_cast %[[NX]] : ui32 to i32
+// CHECK: %[[SMAX:.*]] = arith.maxsi %[[SMIN]], %[[NX_I]] : i32
+// CHECK: %[[NY:.*]] = metal.threadgroups_per_grid "y" : ui32
+// CHECK: %[[NY_I:.*]] = builtin.unrealized_conversion_cast %[[NY]] : ui32 to i32
+// CHECK: %[[UMIN:.*]] = arith.minui %[[SMAX]], %[[NY_I]] : i32
+// CHECK: %[[NZ:.*]] = metal.threadgroups_per_grid "z" : ui32
+// CHECK: %[[NZ_I:.*]] = builtin.unrealized_conversion_cast %[[NZ]] : ui32 to i32
+// CHECK: %[[UMAX:.*]] = arith.maxui %[[UMIN]], %[[NZ_I]] : i32
+// CHECK: %[[BASE:.*]] = arith.andi %[[UMAX]], {{.*}} : i32
+// CHECK: %[[ADDR:.*]] = arith.addi {{.*}}, %[[BASE]] : i32
+// CHECK: %[[ADDR_U:.*]] = builtin.unrealized_conversion_cast %[[ADDR]] : i32 to ui32
+// CHECK: metal.get_element {{.*}}[%[[ADDR_U]]]
+// CHECK: scf.yield {{.*}} : f32
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.store
+// CHECK: metal.return

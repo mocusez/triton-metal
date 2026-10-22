@@ -476,6 +476,102 @@ def test_reduce_rank2_axis1_scalar_offset_loop_iteration(op, broadcast):
     _check_rank2_scalar_runtime_offset(op, broadcast, loop=True)
 
 
+@triton.jit(do_not_specialize=["left", "right", "input_program_stride", "output_program_stride",
+                              "input_tile_stride", "output_tile_stride", "n_tiles"])
+def _reduce_scalar_producer_offset_kernel(
+    x_ptr, out_ptr, left, right, input_program_stride, output_program_stride,
+    input_tile_stride, output_tile_stride, n_tiles,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GUARD: tl.constexpr,
+    BROADCAST: tl.constexpr, OP: tl.constexpr, LOOP: tl.constexpr,
+    PRODUCER: tl.constexpr, AXIS: tl.constexpr,
+):
+    if PRODUCER == "num_programs":
+        selected = tl.num_programs(AXIS)
+    elif PRODUCER == "minsi":
+        selected = tl.minimum(left.to(tl.int32), right.to(tl.int32))
+    elif PRODUCER == "maxsi":
+        selected = tl.maximum(left.to(tl.int32), right.to(tl.int32))
+    elif PRODUCER == "minui":
+        selected = tl.minimum(left.to(tl.uint32), right.to(tl.uint32))
+    else:
+        selected = tl.maximum(left.to(tl.uint32), right.to(tl.uint32))
+    # Preserve the comparison's signedness while bounding actual addresses.
+    base_offset = GUARD + (selected & 31).to(tl.int32)
+    program = tl.program_id(AXIS)
+    input_base = base_offset + program * input_program_stride
+    output_base = base_offset + program * output_program_stride
+    if LOOP:
+        for tile in range(n_tiles):
+            _reduce_scalar_offset_tile(
+                x_ptr + input_base + tile * input_tile_stride,
+                out_ptr + output_base + tile * output_tile_stride,
+                0, 0, 0, BLOCK_M, BLOCK_N, BROADCAST, OP,
+            )
+    else:
+        _reduce_scalar_offset_tile(
+            x_ptr + input_base, out_ptr + output_base,
+            0, 0, 0, BLOCK_M, BLOCK_N, BROADCAST, OP,
+        )
+
+
+@pytest.mark.parametrize("producer,axis", [
+    ("num_programs", 0), ("num_programs", 1), ("num_programs", 2),
+    ("minsi", 0), ("maxsi", 0), ("minui", 0), ("maxui", 0),
+])
+@pytest.mark.parametrize("op", ["maxnum", "sum"])
+@pytest.mark.parametrize("broadcast", [False, True], ids=["vector", "broadcast"])
+@pytest.mark.parametrize("loop", [False, True], ids=["no_loop", "runtime_loop"])
+def test_reduce_rank2_axis1_scalar_offset_producer(producer, axis, op, broadcast, loop):
+    """Replay grid sizes and signed/unsigned extrema in scalar pointer offsets."""
+    m, n, programs, guard = 16, 256, 3, 7
+    n_tiles = 2 if loop else 1
+    output_elements = m * n if broadcast else m
+    input_program_stride = m * n + 11
+    output_program_stride = output_elements + 13
+    input_tile_stride = programs * input_program_stride + 17
+    output_tile_stride = programs * output_program_stride + 19
+    grid = tuple(programs if dim == axis else 1 for dim in range(3))
+    if producer == "num_programs":
+        operands = [(5, 9)]
+    elif producer.endswith("ui"):
+        # Both arguments retain an i32 runtime signature; casting changes which
+        # operand wins when its high bit is set. Operand order changes as well.
+        operands = [(-2147483645, 5), (11, -2147483631)]
+    else:
+        operands = [(-9, 5), (12, -3)]
+    for left, right in operands:
+        if producer == "num_programs":
+            selected = grid[axis]
+        else:
+            values = (left & 0xffffffff, right & 0xffffffff) if producer.endswith("ui") else (left, right)
+            selected = min(values) if producer.startswith("min") else max(values)
+        base_offset = guard + (selected & 31)
+        x_cpu = torch.full((guard + 31 + n_tiles * input_tile_stride + guard,), 257.0)
+        expected = torch.full((guard + 31 + n_tiles * output_tile_stride + guard,), 257.0)
+        for tile in range(n_tiles):
+            for program in range(programs):
+                values = torch.ones((m, n))
+                values[:, 0] = program * 32 + tile * 16 + torch.arange(m) + 1
+                input_start = base_offset + tile * input_tile_stride + program * input_program_stride
+                x_cpu[input_start:input_start + m * n] = values.flatten()
+                result = values.max(dim=1).values if op == "maxnum" else values.sum(dim=1)
+                if broadcast:
+                    result = result[:, None].expand(-1, n).contiguous()
+                output_start = base_offset + tile * output_tile_stride + program * output_program_stride
+                expected[output_start:output_start + output_elements] = result.flatten()
+        x = x_cpu.to("mps")
+        out = torch.full_like(expected, 257.0, device="mps")
+        _reduce_scalar_producer_offset_kernel[grid](
+            x, out, left, right, input_program_stride, output_program_stride,
+            input_tile_stride, output_tile_stride, n_tiles,
+            BLOCK_M=m, BLOCK_N=n, GUARD=guard, BROADCAST=broadcast,
+            OP=op, LOOP=loop, PRODUCER=producer, AXIS=axis, num_warps=4,
+        )
+        torch.mps.synchronize()
+        torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(x.cpu(), x_cpu, atol=0, rtol=0)
+
+
 @triton.jit
 def _reduce_maxnum_seed_loop_kernel(
     x_ptr, out_ptr, n_tiles, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
