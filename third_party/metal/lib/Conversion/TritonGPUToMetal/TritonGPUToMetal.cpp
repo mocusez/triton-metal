@@ -9076,8 +9076,8 @@ static mlir::LogicalResult lowerRank1Reduce(
   // Accept both arith.maximumf (IEEE maximum) and arith.maxnumf (IEEE maxNum).
   // Triton's tl.max emits arith.maxnumf. The two differ only in what a NaN
   // element does, so they share this plan and split at the fold operator via
-  // `isNanExtremum`. Either NaN policy keeps -inf as the max identity: a
-  // masked-out lane holding -inf loses to any real element, including a NaN.
+  // `isNanExtremum`. Number-preferring extrema need a NaN identity to
+  // preserve all-NaN inputs; propagating extrema use their infinite identity.
   bool isMaxF = mlir::isa<mlir::arith::MaximumFOp>(combine) ||
                 mlir::isa<mlir::arith::MaxNumFOp>(combine);
   bool isMinF = mlir::isa<mlir::arith::MinimumFOp>(combine) ||
@@ -9214,14 +9214,18 @@ static mlir::LogicalResult lowerRank1Reduce(
   // si32 for signed-max) via unrealized_conversion_cast.
   auto buildIdentityVal = [&]() -> mlir::Value {
     // Built in the tensor's own float type, so the f16/bf16 tail fill gets a
-    // half-typed ±inf / 0 rather than an f32 one the arith.constant verifier
+    // half-typed identity rather than an f32 one the arith.constant verifier
     // would reject. `getFloatAttr` rounds the double to the target semantics,
-    // and every identity here (0, 1, ±inf) is exactly representable in f16,
-    // bf16 and f32 alike.
+    // and all these identities are representable in f16, bf16 and f32 alike.
     if (isFloat) {
       double identity = 0.0;
       if (isMulF)
         identity = 1.0;
+      else if ((isMaxF || isMinF) && !isNanExtremum)
+        // Infinity would beat a NaN-only partial or a real all-NaN tile.
+        // NaN is neutral for numeric operands under maxNum/minNum, including
+        // infinities, and preserves NaN when every logical value is NaN.
+        identity = std::numeric_limits<double>::quiet_NaN();
       else if (isMaxF)
         identity = -std::numeric_limits<double>::infinity();
       else if (isMinF)

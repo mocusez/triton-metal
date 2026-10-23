@@ -683,7 +683,11 @@ The current dependency-ordered priorities are:
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
    reduction-fold paths alike. The default number-preferring policy compiles
-   to the MSL builtin. Rank-2 axis-0 and axis-1 float extrema seed from the
+   to the MSL builtin. bf16 min/max preserve operand rounding, select through
+   the float overload, and explicitly convert the result back to bf16.
+   Rank-1 floating extrema use a NaN identity for number-preferring partial
+   folds and padding, preserving all-NaN values and their first matching index.
+   Rank-2 axis-0 and axis-1 float extrema seed from the
    first source element, preserving NaN for all-NaN columns or rows and exact
    infinities. Axis-0 f32 `tl.argmin`/`tl.argmax` support the two-pass value/index
    implementation for supported direct and computed tiles, including outputs

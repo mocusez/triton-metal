@@ -59,6 +59,32 @@ module {
       metal.return
     }
 
+    // Ordinary bf16 extrema select through float overloads, retaining both
+    // operand rounding and the bf16 result boundary. Nan-policy helpers stay
+    // directly typed; the sum pins rounding of an inlined bf16 producer.
+    metal.kernel bf16_extrema address_space_device [false, false, true, true, true, true, true, true, true] {
+    ^bb0(%x_buf: !metal.memref<? x bf16>, %y_buf: !metal.memref<? x bf16>, %max_out: !metal.memref<? x bf16>, %min_out: !metal.memref<? x bf16>, %scalar_max_out: !metal.memref<? x bf16>, %scalar_min_out: !metal.memref<? x bf16>, %nan_max_out: !metal.memref<? x bf16>, %nan_min_out: !metal.memref<? x bf16>, %rounded_out: !metal.memref<? x bf16>):
+      %tid = metal.thread_id "x" : ui32
+      %x = metal.get_element %x_buf[%tid] : (!metal.memref<? x bf16>, ui32) -> bf16
+      %y = metal.get_element %y_buf[%tid] : (!metal.memref<? x bf16>, ui32) -> bf16
+      %max = metal.binary_exp %x, %y, maxOp : (bf16, bf16) -> bf16
+      %min = metal.binary_exp %x, %y, minOp : (bf16, bf16) -> bf16
+      %smax = arith.maxnumf %x, %y : bf16
+      %smin = arith.minnumf %x, %y : bf16
+      %nmax = metal.binary_exp %x, %y, maxNanOp : (bf16, bf16) -> bf16
+      %nmin = metal.binary_exp %x, %y, minNanOp : (bf16, bf16) -> bf16
+      %sum = arith.addf %x, %y : bf16
+      %rounded = metal.binary_exp %sum, %x, maxOp : (bf16, bf16) -> bf16
+      metal.store %max, %max_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %min, %min_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %smax, %scalar_max_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %smin, %scalar_min_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %nmax, %nan_max_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %nmin, %nan_min_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %rounded, %rounded_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.return
+    }
+
     metal.kernel powi_helper address_space_device [false, false, true] {
     ^bb0(%x_buf: !metal.memref<? x f32>, %n_buf: !metal.memref<? x si32>, %out: !metal.memref<? x f32>):
       %tid = metal.thread_id "x" : ui32
@@ -162,6 +188,15 @@ module {
 // CHECK-NOT: bfloat(metal::fmin
 // bfloat must convert the promoted float result back.
 // CHECK: bfloat(metal::fmin(metal::fmax(
+
+// CHECK: kernel void bf16_extrema
+// CHECK: = bfloat(max(float(bfloat({{.*}})), float(bfloat({{.*}}))));
+// CHECK: = bfloat(min(float(bfloat({{.*}})), float(bfloat({{.*}}))));
+// CHECK: = bfloat(metal::max(float(bfloat({{.*}})), float(bfloat({{.*}}))));
+// CHECK: = bfloat(metal::min(float(bfloat({{.*}})), float(bfloat({{.*}}))));
+// CHECK: = __triton_maximumf(bfloat({{.*}}), bfloat({{.*}}));
+// CHECK: = __triton_minimumf(bfloat({{.*}}), bfloat({{.*}}));
+// CHECK: = bfloat(max(float(bfloat(({{.*}} + {{.*}}))), float(bfloat({{.*}}))));
 
 // CHECK: kernel void powi_helper
 // CHECK: constant int32_t *

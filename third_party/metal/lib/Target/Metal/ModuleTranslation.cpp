@@ -9273,28 +9273,35 @@ void ModuleTranslation::translateValue(Operation *opInst) {
         emit(op.getRhs());
         _output << ")";
       })
-      .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
-        // Scalar tl.maximum can survive conversion when it combines an
-        // scf.for iter_arg with a reduced tile (online softmax). Tensor forms
-        // lower to metal.binary_exp; spell the scalar form directly in MSL.
-        _output << "metal::max(";
-        translateValueOrVarName(op.getLhs());
+      .Case<mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>([&](auto op) {
+        // Scalar extrema can survive conversion (e.g. loop accumulators).
+        // MSL has no bfloat overload; retain bf16 operand rounding, select
+        // through float, and explicitly restore the bf16 result type.
+        const bool bf16 = op.getType().isBF16();
+        if (bf16)
+          _output << "bfloat(";
+        _output << (mlir::isa<mlir::arith::MaxNumFOp>(op.getOperation())
+                        ? "metal::max("
+                        : "metal::min(");
+        auto emit = [&](mlir::Value value) {
+          if (bf16)
+            _output << "float(bfloat(";
+          translateValueOrVarName(value);
+          if (bf16)
+            _output << "))";
+        };
+        emit(op.getLhs());
         _output << ", ";
-        translateValueOrVarName(op.getRhs());
+        emit(op.getRhs());
         _output << ")";
+        if (bf16)
+          _output << ")";
       })
       .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
         // IEEE-754 maximum (`propagate_nan=tl.PropagateNan.ALL`), NOT the
         // maxNum spelled by MaxNumFOp above: `metal::max` would drop the NaN.
         // Same helper the scalarized-tensor maxNanOp path calls.
         _output << nanPropagatingExtremumHelper(/*isMax=*/true) << "(";
-        translateValueOrVarName(op.getLhs());
-        _output << ", ";
-        translateValueOrVarName(op.getRhs());
-        _output << ")";
-      })
-      .Case<mlir::arith::MinNumFOp>([&](mlir::arith::MinNumFOp op) {
-        _output << "metal::min(";
         translateValueOrVarName(op.getLhs());
         _output << ", ";
         translateValueOrVarName(op.getRhs());
@@ -9742,11 +9749,28 @@ void ModuleTranslation::translate(mlir::triton::metal::BinaryExpOp op) {
         isNanExtremum ? nanPropagatingExtremumHelper(/*isMax=*/!isMin)
                       : (isMin ? llvm::StringRef("min") : llvm::StringRef("max"));
     auto ty = typeToString(op.getResult().getType());
-    _output << fn << "(" << ty << "(";
-    translateValueOrVarName(op.getLhs());
-    _output << "), " << ty << "(";
-    translateValueOrVarName(op.getRhs());
-    _output << "))";
+    // Keep each operand's bf16 rounding before selecting with the unambiguous
+    // float overload. Extrema return an operand, so restoring bf16 is exact.
+    // The NaN-propagating template already supports bfloat directly.
+    const bool promoteBf16 = op.getResult().getType().isBF16() && !isNanExtremum;
+    if (promoteBf16)
+      _output << "bfloat(";
+    _output << fn << "(";
+    auto emit = [&](mlir::Value value) {
+      if (promoteBf16)
+        _output << "float(";
+      _output << ty << "(";
+      translateValueOrVarName(value);
+      _output << ")";
+      if (promoteBf16)
+        _output << ")";
+    };
+    emit(op.getLhs());
+    _output << ", ";
+    emit(op.getRhs());
+    _output << ")";
+    if (promoteBf16)
+      _output << ")";
     return;
   }
 

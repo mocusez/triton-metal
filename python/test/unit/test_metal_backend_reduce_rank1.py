@@ -1643,6 +1643,65 @@ def test_half_precision_argmax_argmin_matches_torch(dtype, op, n, num_warps):
 
 
 @triton.jit
+def _half_arg_edges_kernel(x_ptr, value_ptr, index_ptr, N: tl.constexpr, IS_MIN: tl.constexpr):
+    row = tl.program_id(0)
+    x = tl.load(x_ptr + row * N + tl.arange(0, N))
+    if IS_MIN:
+        value = tl.min(x, axis=0)
+        index = tl.argmin(x, axis=0)
+    else:
+        value = tl.max(x, axis=0)
+        index = tl.argmax(x, axis=0)
+    tl.store(value_ptr + row, value)
+    tl.store(index_ptr + row, index)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["f32", "f16", "bf16"])
+@pytest.mark.parametrize("is_min", [False, True], ids=["argmax", "argmin"])
+@pytest.mark.parametrize("n,num_warps", [(32, 1), (32, 4), (256, 1), (256, 4), (1024, 4)])
+def test_half_precision_arg_extrema_edges(dtype, is_min, n, num_warps):
+    # Each program reduces a rank-1 row. Keep source values in their dtype,
+    # including bf16 normal values outside the finite f16 range.
+    source = torch.ones((7, n), dtype=dtype)
+    source[0, [3, n - 2]] = -13.0
+    source[0, [7, n - 1]] = 13.0
+    source[1] = source[0]
+    source[1, [0, 1, n // 2]] = float("nan")
+    source[2] = float("nan")
+    source[3] = float("inf")
+    source[4] = -float("inf")
+    source[5, 0::2] = -0.0
+    source[5, 1::2] = 0.0
+    limits = torch.finfo(dtype)
+    source[6, n // 2:n // 2 + 4] = torch.tensor(
+        [limits.tiny, -limits.tiny, limits.max, -limits.max], dtype=dtype)
+
+    guard = 5
+    values = torch.full((source.shape[0] + 2 * guard,), 123.0, dtype=dtype, device="mps")
+    indices = torch.full((source.shape[0] + 2 * guard,), -12345, dtype=torch.int32, device="mps")
+    _half_arg_edges_kernel[(source.shape[0],)](
+        source.to("mps"), values[guard:], indices[guard:], N=n, IS_MIN=is_min, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+
+    reference = source.float()
+    is_nan = reference.isnan()
+    identity = float("inf") if is_min else -float("inf")
+    finite = reference.masked_fill(is_nan, identity)
+    extrema = finite.amin(1) if is_min else finite.amax(1)
+    all_nan = is_nan.all(1)
+    extrema = extrema.masked_fill(all_nan, float("nan"))
+    matches = torch.where(all_nan[:, None], is_nan, reference == extrema[:, None])
+    expected_indices = torch.where(matches, torch.arange(n)[None, :], 0x7fffffff).amin(1)
+    actual_values, actual_indices = values.cpu(), indices.cpu()
+    torch.testing.assert_close(actual_values[guard:-guard].float(), extrema, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(actual_indices[guard:-guard], expected_indices.to(torch.int32), atol=0, rtol=0)
+    for output, canary in ((actual_values, 123.0), (actual_indices, -12345)):
+        assert torch.all(output[:guard] == canary)
+        assert torch.all(output[-guard:] == canary)
+
+
+@triton.jit
 def _pair_max_combine(a, ai, b, bi):
     take_a = (a > b) | ((a == b) & (ai < bi))
     return tl.where(take_a, a, b), tl.where(take_a, ai, bi)
