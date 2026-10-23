@@ -9882,30 +9882,36 @@ void ModuleTranslation::translate(mlir::triton::metal::MathIntrinsicOp op) {
 }
 
 void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
-  // `metal::fmin`/`fmax` have native `float` and `half` overloads, but none for
-  // `bfloat`: both operands promote to `float`, and MSL will not implicitly
-  // convert that result back (it is a hard "assigning to 'bfloat' from
-  // incompatible type 'float'" error). Convert explicitly. The round trip is
-  // exact — the result is always one of the three operands, each already a
-  // bfloat value — so this narrows nothing. f32 and f16 keep their previous
-  // spelling byte-for-byte.
-  //
-  // Triton's own `binary_op_type_checking_impl` currently widens a bf16
-  // `tl.clamp` to f32 and truncates the result, so no `@triton.jit` kernel
-  // reaches this branch today; it exists for hand-written Metal IR and so the
-  // op stays correct if that frontend promotion ever goes away. The frontend
-  // path is covered by the f16 runtime tests, this branch by
-  // test/Dialect/Metal/metal-translate/direct_math_ops.mlir.
+  // Constants and inlined arithmetic can be emitted as float expressions even
+  // when their IR type is narrow. Restore that type before selecting an
+  // overload or testing NaN, preserving the operand's rounding boundary.
+  // MSL has half fmin/fmax overloads but no bfloat overloads: round bf16
+  // operands first, select through float, then restore the bf16 result.
+  const bool halfResult = op.getResult().getType().isF16();
   const bool bf16Result = op.getResult().getType().isBF16();
+  auto emitTyped = [&](mlir::Value value) {
+    if (halfResult || bf16Result)
+      _output << (halfResult ? "half(" : "bfloat(");
+    translateValueOrVarName(value);
+    if (halfResult || bf16Result)
+      _output << ")";
+  };
+  auto emitArgument = [&](mlir::Value value) {
+    if (bf16Result)
+      _output << "float(";
+    emitTyped(value);
+    if (bf16Result)
+      _output << ")";
+  };
   auto emitClamp = [&]() {
     if (bf16Result)
       _output << "bfloat(";
     _output << "metal::fmin(metal::fmax(";
-    translateValueOrVarName(op.getX());
+    emitArgument(op.getX());
     _output << ", ";
-    translateValueOrVarName(op.getMin());
+    emitArgument(op.getMin());
     _output << "), ";
-    translateValueOrVarName(op.getMax());
+    emitArgument(op.getMax());
     _output << ")";
     if (bf16Result)
       _output << ")";
@@ -9919,9 +9925,9 @@ void ModuleTranslation::translate(mlir::triton::metal::ClampFOp op) {
   // Triton PropagateNan::ALL applies only to x; NaN bounds are undefined.
   // Preserve x itself so its NaN payload/sign are not unnecessarily replaced.
   _output << "(metal::isnan(";
-  translateValueOrVarName(op.getX());
+  emitArgument(op.getX());
   _output << ") ? ";
-  translateValueOrVarName(op.getX());
+  emitTyped(op.getX());
   _output << " : ";
   emitClamp();
   _output << ")";

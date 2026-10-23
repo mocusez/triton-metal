@@ -429,7 +429,10 @@ The current dependency-ordered priorities are:
    Numeric casts with f64 operands or results also have named diagnostics.
    `tl.clamp` now covers f32, f16 and bf16 rather than f32 alone, and names f64
    in preflight; a bf16 clamp still reaches the backend widened to f32 because
-   Triton's frontend promotes it.
+   Triton's frontend promotes it. Direct narrow-width Metal IR preserves the
+   operand types of constants and inlined expressions: f16 selects the half
+   overloads, while bf16 rounds operands before float selection and converts
+   the result back. Both NaN policies retain these rounding boundaries.
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.

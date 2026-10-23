@@ -12,6 +12,8 @@ See the implementation notes.
 from __future__ import annotations
 
 import math
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -919,7 +921,7 @@ def test_clamp_float_widths_and_nan_policy(dtype, num_warps):
     """f16 clamp used to be rejected outright; this is the width that actually
     reaches `metal.clampf` in f16. Triton widens a bf16 `tl.clamp` to f32 in the
     frontend, so the bf16 row here proves the user-visible result, not the
-    narrow emitter path (that one is pinned by the metal-translate lit). Both
+    narrow emitter path (covered separately by direct-IR GPU tests). Both
     NaN policies must hold at every width: ALL returns NaN for a NaN input,
     NONE lets the number-preferring min/max consume it."""
     # A power of two, as tl.arange requires. Covers both bounds exactly, the
@@ -953,3 +955,83 @@ def test_clamp_float_widths_and_nan_policy(dtype, num_warps):
     keep = ~is_nan_in
     torch.testing.assert_close(got_none[keep], expected_all[keep],
                                rtol=0, atol=0)
+
+
+@pytest.fixture(scope="module")
+def direct_math_shader():
+    from build_helpers import get_cmake_dir
+
+    translator = Path(get_cmake_dir()) / "bin" / "triton-metal-translate"
+    if not translator.is_file():
+        pytest.skip("direct Metal IR tests require triton-metal-translate")
+    fixture = (Path(__file__).resolve().parents[3] / "test" / "Dialect" /
+               "Metal" / "metal-translate" / "direct_math_ops.mlir")
+    source = subprocess.run([str(translator), "--mlir-to-msl", str(fixture)],
+                            check=True, capture_output=True, text=True).stdout
+    # Compile the entire lit fixture: translation alone cannot diagnose MSL
+    # overload ambiguity, and frontend promotion can hide narrow IR paths.
+    return torch.mps.compile_shader(source)
+
+
+def test_clamp_direct_ir_narrow_literal_bounds(direct_math_shader):
+    values = [-5.0, -1.0, -0.0, 0.0, 0.5, 1.0, 5.0, _INF, -_INF, _NAN]
+    xh = torch.tensor(values, dtype=torch.float16)
+    xb = torch.tensor(values, dtype=torch.bfloat16)
+    h_in, b_in = xh.to("mps"), xb.to("mps")
+    h_out, b_out = torch.empty_like(h_in), torch.empty_like(b_in)
+    direct_math_shader.clampf_narrow_widths(
+        h_in, h_out, b_in, b_out, threads=len(values), group_size=len(values))
+    torch.mps.synchronize()
+    expected_half = xh.float().clamp(-1, 1).half()
+    expected_bfloat = torch.fmin(torch.fmax(xb.float(), torch.tensor(-1.0)),
+                                torch.tensor(1.0)).bfloat16()
+    torch.testing.assert_close(h_out.cpu(), expected_half, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(b_out.cpu(), expected_bfloat, atol=0, rtol=0)
+    for output in (h_out, b_out):
+        assert torch.equal(torch.signbit(output.cpu()[2:4]), torch.tensor([True, False]))
+
+
+def test_clamp_direct_ir_half_operands_and_rounding(direct_math_shader):
+    x = torch.tensor([-1.5, -1, -0.0, 0.0, 0.25, 0.5, 1, 1.0009765625,
+                      1.5, 2, 3, _INF, -_INF, _NAN], dtype=torch.float16)
+    x_gpu = x.to("mps")
+    outputs = [torch.empty_like(x_gpu) for _ in range(4)]
+    direct_math_shader.clampf_literal_operands(
+        x_gpu, *outputs, threads=x.numel(), group_size=x.numel())
+    torch.mps.synchronize()
+    xf = x.float()
+    want_none = torch.fmin(torch.fmax(xf, torch.tensor(-2.0)), torch.tensor(2.0)).half()
+    want_all = xf.clamp(-2, 2).half()
+    torch.testing.assert_close(outputs[0].cpu(), want_none, atol=0, rtol=0)
+    torch.testing.assert_close(outputs[1].cpu(), want_all, atol=0, rtol=0, equal_nan=True)
+    # NaN or reversed bounds have no specified clamp result.
+    valid_bounds = (xf >= -2) & ~torch.isnan(xf)
+    want_constant = torch.minimum(torch.full_like(xf, 0.5), xf).half()
+    torch.testing.assert_close(outputs[2].cpu()[valid_bounds], want_constant[valid_bounds],
+                               atol=0, rtol=0)
+    rounded_sum = (xf + 2**-11).half().float()
+    rounded_clamp = torch.fmin(torch.fmax(rounded_sum, torch.tensor(-2.0)),
+                              torch.tensor(2.0)).half()
+    want_rounded = (rounded_clamp.float() - xf).half()
+    torch.testing.assert_close(outputs[3].cpu(), want_rounded, atol=0, rtol=0, equal_nan=True)
+    # The half-way sum rounds back to one before clamp and subtraction.
+    assert outputs[3].cpu()[6].item() == 0
+
+
+def test_clamp_direct_ir_bfloat_operands_and_rounding(direct_math_shader):
+    x = torch.tensor([-3, -1, -0.0, 0.0, 0.5, 1, 1.0078125, 2, 3,
+                      _INF, -_INF, _NAN], dtype=torch.bfloat16)
+    x_gpu = x.to("mps")
+    all_out, rounded_out = torch.empty_like(x_gpu), torch.empty_like(x_gpu)
+    direct_math_shader.clampf_bfloat_operands(
+        x_gpu, all_out, rounded_out, threads=x.numel(), group_size=x.numel())
+    torch.mps.synchronize()
+    xf = x.float()
+    torch.testing.assert_close(all_out.cpu(), xf.clamp(-2, 2).bfloat16(),
+                               atol=0, rtol=0, equal_nan=True)
+    rounded_sum = (xf + 2**-8).bfloat16().float()
+    rounded_clamp = torch.fmin(torch.fmax(rounded_sum, torch.tensor(-2.0)),
+                              torch.tensor(2.0)).bfloat16()
+    want = (rounded_clamp.float() - xf).bfloat16()
+    torch.testing.assert_close(rounded_out.cpu(), want, atol=0, rtol=0, equal_nan=True)
+    assert rounded_out.cpu()[5].item() == 0

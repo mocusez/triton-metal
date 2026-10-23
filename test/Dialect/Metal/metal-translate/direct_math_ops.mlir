@@ -40,9 +40,9 @@ module {
       metal.store %min_num, %min_num_out[%tid] : f32, !metal.memref<? x f32>, ui32
       metal.return
     }
-    // Narrow-width clamp. MSL's fmin/fmax carry `half` natively but have no
-    // `bfloat` overload: both operands promote to `float` and the result will
-    // not implicitly convert back, so the bf16 form must be wrapped.
+    // Narrow-width clamp. Literal operands need their IR type restored to
+    // select MSL's half overload. Bfloat uses explicitly rounded operands in
+    // the float overload, then explicitly converts the result back.
     metal.kernel clampf_narrow_widths address_space_device [false, true, false, true] {
     ^bb0(%h_in: !metal.memref<? x f16>, %h_out: !metal.memref<? x f16>, %b_in: !metal.memref<? x bf16>, %b_out: !metal.memref<? x bf16>):
       %tid = metal.thread_id "x" : ui32
@@ -56,6 +56,47 @@ module {
       %bhi = metal.constant 1.000000e+00 : bf16
       %bc = metal.clampf %bv, %blo, %bhi, propagate_nan = false : (bf16, bf16, bf16) -> bf16
       metal.store %bc, %b_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.return
+    }
+
+    // Both policies, a literal x with a loaded bound, and an inlined producer.
+    // Subtract after the last clamp so rounding its input to half is visible:
+    // x=1 gives half(1 + 2^-11) - 1 = 0, not the unrounded 2^-11.
+    metal.kernel clampf_literal_operands address_space_device [false, true, true, true, true] {
+    ^bb0(%h_in: !metal.memref<? x f16>, %none_out: !metal.memref<? x f16>, %all_out: !metal.memref<? x f16>, %constant_out: !metal.memref<? x f16>, %rounded_out: !metal.memref<? x f16>):
+      %tid = metal.thread_id "x" : ui32
+      %x = metal.get_element %h_in[%tid] : (!metal.memref<? x f16>, ui32) -> f16
+      %lo = metal.constant -2.000000e+00 : f16
+      %hi = metal.constant 2.000000e+00 : f16
+      %constant_x = metal.constant 5.000000e-01 : f16
+      %delta = metal.constant 4.8828125e-04 : f16
+      %none = metal.clampf %x, %lo, %hi, propagate_nan = false : (f16, f16, f16) -> f16
+      %all = metal.clampf %x, %lo, %hi, propagate_nan = true : (f16, f16, f16) -> f16
+      %constant = metal.clampf %constant_x, %lo, %x, propagate_nan = true : (f16, f16, f16) -> f16
+      %sum = arith.addf %x, %delta : f16
+      %clamped_sum = metal.clampf %sum, %lo, %hi, propagate_nan = false : (f16, f16, f16) -> f16
+      %rounded = arith.subf %clamped_sum, %x : f16
+      metal.store %none, %none_out[%tid] : f16, !metal.memref<? x f16>, ui32
+      metal.store %all, %all_out[%tid] : f16, !metal.memref<? x f16>, ui32
+      metal.store %constant, %constant_out[%tid] : f16, !metal.memref<? x f16>, ui32
+      metal.store %rounded, %rounded_out[%tid] : f16, !metal.memref<? x f16>, ui32
+      metal.return
+    }
+
+    // The same producer-rounding boundary matters before bf16 promotion.
+    metal.kernel clampf_bfloat_operands address_space_device [false, true, true] {
+    ^bb0(%b_in: !metal.memref<? x bf16>, %all_out: !metal.memref<? x bf16>, %rounded_out: !metal.memref<? x bf16>):
+      %tid = metal.thread_id "x" : ui32
+      %x = metal.get_element %b_in[%tid] : (!metal.memref<? x bf16>, ui32) -> bf16
+      %lo = metal.constant -2.000000e+00 : bf16
+      %hi = metal.constant 2.000000e+00 : bf16
+      %delta = metal.constant 3.906250e-03 : bf16
+      %all = metal.clampf %x, %lo, %hi, propagate_nan = true : (bf16, bf16, bf16) -> bf16
+      %sum = arith.addf %x, %delta : bf16
+      %clamped_sum = metal.clampf %sum, %lo, %hi, propagate_nan = false : (bf16, bf16, bf16) -> bf16
+      %rounded = arith.subf %clamped_sum, %x : bf16
+      metal.store %all, %all_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
+      metal.store %rounded, %rounded_out[%tid] : bf16, !metal.memref<? x bf16>, ui32
       metal.return
     }
 
@@ -182,12 +223,23 @@ module {
 // CHECK-DAG: = min(float(
 
 // CHECK: kernel void clampf_narrow_widths
-// half rides the native overload, unwrapped, exactly like f32.
-// CHECK: metal::isnan(
-// CHECK-SAME: metal::fmin(metal::fmax(
-// CHECK-NOT: bfloat(metal::fmin
-// bfloat must convert the promoted float result back.
-// CHECK: bfloat(metal::fmin(metal::fmax(
+// All operands, including constants, select the same native half overload.
+// CHECK: metal::isnan(half(
+// CHECK-SAME: metal::fmin(metal::fmax(half({{.*}}), half(-1.000000e+00)), half(1.000000e+00))
+// Bfloat operands round before promotion and the result converts back.
+// CHECK: bfloat(metal::fmin(metal::fmax(float(bfloat({{.*}})), float(bfloat(bfloat(-1.000000e+00)))), float(bfloat(bfloat(1.000000e+00)))))
+
+// CHECK: kernel void clampf_literal_operands
+// CHECK: = metal::fmin(metal::fmax(half({{.*}}), half(-2.000000e+00)), half(2.000000e+00));
+// CHECK: = (metal::isnan(half(
+// CHECK-SAME: metal::fmin(metal::fmax(half({{.*}}), half(-2.000000e+00)), half(2.000000e+00))
+// CHECK: = (metal::isnan(half(5.000000e-01)) ? half(5.000000e-01) : metal::fmin(metal::fmax(half(5.000000e-01), half(-2.000000e+00)), half({{.*}})))
+// CHECK: metal::fmin(metal::fmax(half(({{.*}} + {{.*}})), half(-2.000000e+00)), half(2.000000e+00))
+
+// CHECK: kernel void clampf_bfloat_operands
+// CHECK: metal::isnan(float(bfloat(
+// CHECK-SAME: bfloat(metal::fmin(metal::fmax(float(bfloat({{.*}})), float(bfloat(bfloat(-2.000000e+00)))), float(bfloat(bfloat(2.000000e+00)))))
+// CHECK: bfloat(metal::fmin(metal::fmax(float(bfloat(({{.*}} + {{.*}}))), float(bfloat(bfloat(-2.000000e+00)))), float(bfloat(bfloat(2.000000e+00)))))
 
 // CHECK: kernel void bf16_extrema
 // CHECK: = bfloat(max(float(bfloat({{.*}})), float(bfloat({{.*}}))));
