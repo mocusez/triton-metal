@@ -660,7 +660,7 @@ def _kmeans_assign_axis0_argmin(Points, Centers, IndexOut, N,
     tl.store(IndexOut + cols, tl.argmin(dist, axis=0), mask=mask)
 
 
-@pytest.mark.parametrize("N, K", [(1, 1), (128, 4), (257, 3)])
+@pytest.mark.parametrize("N, K", [(1, 1), (257, 1), (128, 4), (257, 3)])
 def test_reduce_axis0_argmin_computed_kmeans_tile(N, K):
     torch.manual_seed(N * 29 + K)
     points = torch.randn(N, 2, dtype=torch.float32, device="mps")

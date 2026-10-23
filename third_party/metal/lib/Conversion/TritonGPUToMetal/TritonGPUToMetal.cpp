@@ -2865,6 +2865,14 @@ template <typename OrderT>
 static mlir::Value emitTileAxisCoordWithOrder(
     mlir::Operation *op, const TileInfo &tile, OrderT order, int axis,
     mlir::ConversionPatternRewriter &rewriter, mlir::Location loc) {
+  // Singleton tiles can be smaller than the threadgroup. Their replicated
+  // owners must read the same logical element as the squeezed rank-1 result;
+  // a raw outer-axis quotient would load padding while the result wraps.
+  if (tile.shape.size() == 2 &&
+      (tile.shape[0] == 1 || tile.shape[1] == 1)) {
+    llvm::SmallVector<unsigned, 2> tileOrder(order.begin(), order.end());
+    return emitTileCoordByOrder(op, tile, tileOrder, axis, rewriter, loc);
+  }
   mlir::Value idxI32 = emitTileFlatIndex(op, tile, rewriter, loc);
   // Pick div/rem and the divisor based on the `order` permutation. With
   // order=[1,0] (dim 1 contiguous), the canonical linearization is
@@ -41616,54 +41624,27 @@ static mlir::LogicalResult validateHistogramSupport(mlir::ModuleOp moduleOp) {
   return mlir::success(valid);
 }
 
-// `tt.scan` shapes ScanLowering cannot lower.
-//
-// It declines by `notifyMatchFailure`, which in this backend is a process kill
-// rather than an error (the failed conversion's rollback segfaults). A
-// `tl.associative_scan` with a `maximum` combine — a running maximum, which is
-// an ordinary thing to write — took the caller down with it.
-//
-// Kept in step with ScanLowering's own guards: the canonical segmented-sum and
-// affine forms have their own matchers and are admitted whatever their combine
-// looks like; everything else must be a rank-1, axis-0, f32/i32 scan whose
-// combine is add or mul.
-// A rank-2 reduce over an axis of extent ONE, rejected before conversion.
-//
-// It is a no-op reduce, so nothing is lost by declining it, but the tile it
-// leaves behind is degenerate: `tl.arange(0, 1)` as the inner axis makes a
-// BLOCK_N x 1 tile, and both the reduce and the slice-encoded `tt.make_range`
-// over it fall off the end of their lowerings. In conversion that is a process
-// kill, and it takes the next compile in the same context with it — a sweep
-// over head dims lost the whole interpreter at head dim 1.
-//
-// This is not the sub-tpb crossing (see findSubTpbRank2Companion): it fails at
-// num_warps=1 too, where the tile is exactly threadgroup-sized and none of the
-// companion logic runs.
-static mlir::LogicalResult validateUnitAxisReduce(mlir::ModuleOp moduleOp) {
-  bool valid = true;
+// Reducing a singleton axis returns each source element unchanged. Fold it
+// before aggregate/layout analysis: there is no combine invocation, identity
+// seed, or cross-thread communication, including for heterogeneous tuples.
+// The existing reshape checks retain responsibility for the result's layout.
+static void foldUnitAxisReduces(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp> reduces;
   moduleOp.walk([&](mlir::triton::ReduceOp op) {
-    if (op.getSrcs().empty())
-      return;
-    auto srcTy =
-        mlir::dyn_cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
-    if (!srcTy || srcTy.getRank() != 2)
-      return;
-    int32_t axis = static_cast<int32_t>(op.getAxis());
-    if (axis < 0 || axis >= srcTy.getRank())
-      return;
-    if (srcTy.getDimSize(axis) != 1)
-      return;
-    if (isCanonicalRank2Axis1ArgminReduce(op))
-      return;
-    op.emitOpError("Metal backend: reduce over an axis of extent 1 is not "
-                   "supported (source ")
-        << srcTy << ", axis " << axis
-        << "). The reduce is a no-op; drop it, or give the axis a block size "
-           "of at least 2 — a BLOCK x 1 tile has no lowering for its "
-           "slice-encoded rank-1 values.";
-    valid = false;
+    auto srcTy = mlir::cast<mlir::RankedTensorType>(op.getSrcs().front().getType());
+    if (srcTy.getRank() == 2 && srcTy.getDimSize(op.getAxis()) == 1)
+      reduces.push_back(op);
   });
-  return mlir::success(valid);
+  for (auto op : reduces) {
+    mlir::OpBuilder builder(op);
+    for (auto [source, result] : llvm::zip(op.getSrcs(), op.getResults())) {
+      auto type = mlir::cast<mlir::RankedTensorType>(result.getType());
+      auto view = mlir::triton::ReshapeOp::create(builder, op.getLoc(), type,
+                                                source);
+      result.replaceAllUsesWith(view.getResult());
+    }
+    op.erase();
+  }
 }
 
 // Include each tuple's static buffers and the declarations already emitted
@@ -43627,6 +43608,7 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+    foldUnitAxisReduces(moduleOp);
     rewriteCanonicalRank2Axis0Argmin(moduleOp);
 
     // Answered here, once, while the rank-2 tensors are all still present —
@@ -43665,7 +43647,6 @@ struct ConvertTritonGPUToMetalPass
         mlir::failed(validatePreciseMathSupport(moduleOp)) ||
         mlir::failed(validateHistogramSupport(moduleOp)) ||
         mlir::failed(validateScanSupport(moduleOp)) ||
-        mlir::failed(validateUnitAxisReduce(moduleOp)) ||
         mlir::failed(validateAtomicRmwSupport(moduleOp)) ||
         mlir::failed(validateAtomicCasSupport(moduleOp)) ||
         mlir::failed(validateClampFSupport(moduleOp)) ||
@@ -45044,6 +45025,33 @@ struct ConvertTritonGPUToMetalPass
         src = exchangeSourcePlan(cvt.getSrc());
         dst = planLayoutIndex(dstTy);
       }
+      // A squeezed singleton tile still carries its producer's physical
+      // ownership through the bitcasts used by tl.flip. Publish using that
+      // label, then read using the flip result's layout below.
+      if (src && dst && dstTy.getRank() == 1 &&
+          !functionHasRankNPhase(cvt.getOperation())) {
+        mlir::Value source = cvt.getSrc();
+        while (auto bitcast =
+                   source.getDefiningOp<mlir::triton::BitcastOp>()) {
+          auto inputTy =
+              mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getSrc().getType());
+          auto outputTy =
+              mlir::dyn_cast<mlir::RankedTensorType>(bitcast.getType());
+          if (!inputTy || !outputTy ||
+              inputTy.getShape() != outputTy.getShape())
+            break;
+          source = bitcast.getSrc();
+        }
+        if (auto reshape = source.getDefiningOp<mlir::triton::ReshapeOp>()) {
+          auto tileTy =
+              mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+          if (!reshape->hasAttr(kExchangeAttr) && tileTy.getRank() == 2 &&
+              (tileTy.getDimSize(0) == 1 || tileTy.getDimSize(1) == 1))
+            if (auto label =
+                    emitterTileLabel(tileTy, dst->threadsPerBlock()))
+              src = label;
+        }
+      }
       if (src && dst) {
         dst->dimXor.assign(dstTy.getRank(), 0);
         dst->dimXor[dim] = static_cast<int32_t>(dstTy.getDimSize(dim) - 1);
@@ -45060,12 +45068,41 @@ struct ConvertTritonGPUToMetalPass
     // mutating inside a walk is not allowed.
     llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp, 4> outOfEnvelope;
     moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
+      // Earlier reshape/flip planning already assigned these publish/read
+      // pairs physical labels and phase boundaries.
+      if (cvt->hasAttr(kExchangeAttr))
+        return;
       auto srcTy = cvt.getSrc().getType();
       auto dstTy = cvt.getResult().getType();
-      if (srcTy == dstTy)
-        return; // L1c identity — `ConvertLayoutLowering` handles passthrough.
       auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(srcTy);
       auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(dstTy);
+      // A flattened tile retains its producer's element ownership. In
+      // particular, squeezing a singleton reduction can leave a slice result
+      // whose contiguous register bands differ from the blocked store's
+      // strided bands. Route it to the existing flattening exchange below
+      // before either identity shortcut discards the conversion: cone
+      // normalization may already have retyped the reshape result to dstTy.
+      if (srcRtt && dstRtt && srcRtt.getRank() == 1 &&
+          !functionHasRankNPhase(cvt.getOperation())) {
+        if (auto reshape =
+                cvt.getSrc().getDefiningOp<mlir::triton::ReshapeOp>()) {
+          auto tileTy =
+              mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+          auto own = planLayoutIndex(dstRtt);
+          auto srcLabel = own && (tileTy.getRank() == 2 || tileTy.getRank() == 3)
+                              ? emitterTileLabel(tileTy, own->threadsPerBlock())
+                              : std::nullopt;
+          auto dstLabel = own ? emitterTileLabel(dstRtt, own->threadsPerBlock())
+                              : std::nullopt;
+          if (srcLabel && dstLabel &&
+              !layoutFlatIndexPlansEquivalent(*srcLabel, *dstLabel)) {
+            outOfEnvelope.push_back(cvt);
+            return;
+          }
+        }
+      }
+      if (srcTy == dstTy)
+        return; // L1c identity — `ConvertLayoutLowering` handles passthrough.
       // L3a passthrough: rank-1 slice→blocked cvt with matching shape and
       // element type collapses to scalar-identity under the TypeConverter
       // (both sides become the scalar element type). The Triton frontend

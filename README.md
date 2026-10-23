@@ -700,8 +700,10 @@ The current dependency-ordered priorities are:
    wider than the threadgroup and uniform runtime loops. Mixed f32 column
    results retain their own type when used by the i32 index pass; scalar-staged
    results must still refer to the same column. Scalar-staged dependencies
-   reached through a transpose or shape-changing reshape, and reductions over
-   an axis of extent 1, remain rejected.
+   reached through a transpose or shape-changing reshape remain rejected.
+   Rank-2 reductions over an axis of extent 1 preserve each input unchanged,
+   including heterogeneous tuples, NaN payloads and signed zero. Flattened
+   results use an exact layout exchange when register ownership changes.
    Axis-1 f32 arg extrema also support two-pass index folds over wide replayable
    tiles. Both passes run before tensor producers are scalarized; the index
    pass reads the preceding row extrema by logical row and uses a bounded i32

@@ -3584,28 +3584,226 @@ def test_subtpb_rowsum(bm, bn, num_warps):
 
 
 @triton.jit
-def _unit_axis_reduce_kernel(x_ptr, o_ptr, N, BN: tl.constexpr):
-    rn = tl.arange(0, BN)
+def _unit_axis_product_combine(a, b):
+    return a * b
+
+
+@triton.jit
+def _unit_axis_tuple_combine(a_value, a_index, b_value, b_index):
+    # Associative shifted sums make an accidental combine call observable.
+    return a_value + b_value + 1.0, a_index + b_index + 17
+
+
+@triton.jit
+def _unit_axis_reduce_kernel(x_ptr, i_ptr, o_ptr, oi_ptr, N,
+                             BN: tl.constexpr, AXIS: tl.constexpr,
+                             OP: tl.constexpr, GUARD: tl.constexpr):
+    rn = tl.program_id(0) * BN + tl.arange(0, BN)
     rd = tl.arange(0, 1)
-    v = tl.load(x_ptr + rn[:, None] + rd[None, :], mask=rn[:, None] < N,
-                other=0.0)
-    tl.store(o_ptr + rn, tl.sum(v, axis=1), mask=rn < N)
+    if AXIS == 0:
+        offsets = rd[:, None] + rn[None, :]
+    else:
+        offsets = rn[:, None] + rd[None, :]
+    v = tl.load(x_ptr + offsets, mask=offsets < N, other=0.0)
+    if OP == "sum":
+        result = tl.sum(v, axis=AXIS)
+    elif OP == "product":
+        result = tl.reduce(v, AXIS, _unit_axis_product_combine)
+    elif OP == "min":
+        result = tl.min(v, axis=AXIS)
+    elif OP == "max":
+        result = tl.max(v, axis=AXIS)
+    elif OP == "argmin":
+        result = tl.min(v, axis=AXIS)
+        index = tl.argmin(v, axis=AXIS)
+        tl.store(oi_ptr + GUARD + rn, index, mask=rn < N)
+    elif OP == "argmax":
+        result = tl.max(v, axis=AXIS)
+        index = tl.argmax(v, axis=AXIS)
+        tl.store(oi_ptr + GUARD + rn, index, mask=rn < N)
+    else:
+        indices = tl.load(i_ptr + offsets, mask=offsets < N, other=0)
+        result, index = tl.reduce((v, indices), AXIS, _unit_axis_tuple_combine)
+        tl.store(oi_ptr + GUARD + rn, index, mask=rn < N)
+    tl.store(o_ptr + GUARD + rn, result, mask=rn < N)
 
 
-@pytest.mark.parametrize("num_warps", [1, 2, 4])
-def test_unit_axis_reduce_is_rejected_not_crash(num_warps):
-    """Reducing an axis of extent 1 is a no-op, but the BLOCK x 1 tile it
-    leaves has no lowering for its slice-encoded rank-1 values. It used to be
-    declined DURING conversion, which in this backend aborts the process and
-    poisons the context for the next compile — a head-dim sweep lost the whole
-    interpreter at head dim 1. Asserted as a catchable rejection."""
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("n,block", [(7, 16), (32, 32), (259, 256)])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("op", ["sum", "product", "min", "max", "tuple"])
+def test_unit_axis_reduce_preserves_input_bits(axis, n, block, num_warps, op):
+    """Singleton reductions squeeze each source without evaluating a combine.
+
+    Keep NaN payloads and signed zero intact, including across multiple tiles
+    and register bands. Prefix/suffix canaries also cover masked output tails.
+    """
     torch = pytest.importorskip("torch")
     if not torch.backends.mps.is_available():
         pytest.skip("Metal backend requires an MPS-enabled PyTorch")
-    x = torch.rand(32, 1, dtype=torch.float32, device="mps")
-    o = torch.zeros(32, dtype=torch.float32, device="mps")
-    with pytest.raises(Exception):
-        _unit_axis_reduce_kernel[(1,)](x, o, 32, BN=32, num_warps=num_warps)
+    pattern = torch.tensor([
+        0, -2147483648, 2139095040, -8388608, 2143289393, -4194255,
+        1067450368, -1075838976,
+    ], dtype=torch.int32)
+    values = pattern.repeat(triton.cdiv(n, pattern.numel()))[:n].view(torch.float32)
+    indices = torch.arange(n, dtype=torch.int32) * 37 - 12345
+    indices[:4] = torch.tensor([-2147483648, 2147483647, -1, 0], dtype=torch.int32)
+    guard = 5
+    expected = torch.full((n + 2 * guard,), -4321.0, dtype=torch.float32)
+    expected_index = torch.full((n + 2 * guard,), -7654321, dtype=torch.int32)
+    out = expected.to("mps")
+    out_index = expected_index.to("mps")
+    expected[guard:guard + n] = values
+    if op == "tuple":
+        expected_index[guard:guard + n] = indices
+    _unit_axis_reduce_kernel[(triton.cdiv(n, block),)](
+        values.to("mps"), indices.to("mps"), out, out_index, n,
+        BN=block, AXIS=axis, OP=op, GUARD=guard, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu().view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(out_index.cpu(), expected_index)
+
+
+@triton.jit
+def _unit_axis_reduce_arithmetic_kernel(x_ptr, o_ptr, N,
+                                         BN: tl.constexpr,
+                                         AXIS: tl.constexpr,
+                                         GUARD: tl.constexpr):
+    rn = tl.program_id(0) * BN + tl.arange(0, BN)
+    rd = tl.arange(0, 1)
+    if AXIS == 0:
+        offsets = rd[:, None] + rn[None, :]
+    else:
+        offsets = rn[:, None] + rd[None, :]
+    value = tl.load(x_ptr + offsets, mask=offsets < N, other=0.0)
+    result = tl.sum(value, axis=AXIS) * 2.0 + rn
+    tl.store(o_ptr + GUARD + rn, result, mask=rn < N)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_unit_axis_reduce_arithmetic_uses_logical_coordinates(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n, block, guard = 259, 256, 5
+    coordinates = torch.arange(n, dtype=torch.float32)
+    values = (coordinates * 7.0 - 137.0) * 0.125
+    expected = torch.full((n + 2 * guard,), -4321.0, dtype=torch.float32)
+    out = expected.to("mps")
+    expected[guard:guard + n] = values * 2.0 + coordinates
+    _unit_axis_reduce_arithmetic_kernel[(triton.cdiv(n, block),)](
+        values.to("mps"), out, n,
+        BN=block, AXIS=axis, GUARD=guard, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _unit_axis_reduce_flip_kernel(x_ptr, o_ptr, N,
+                                  BN: tl.constexpr,
+                                  AXIS: tl.constexpr,
+                                  GUARD: tl.constexpr):
+    rn = tl.arange(0, BN)
+    rd = tl.arange(0, 1)
+    if AXIS == 0:
+        offsets = rd[:, None] + rn[None, :]
+    else:
+        offsets = rn[:, None] + rd[None, :]
+    value = tl.load(x_ptr + offsets, mask=offsets < N, other=0.0)
+    result = tl.flip(tl.sum(value, axis=AXIS), 0)
+    tl.store(o_ptr + GUARD + rn, result, mask=rn < N)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_unit_axis_reduce_flip_preserves_exchange(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n, guard = 256, 5
+    values = (torch.arange(n, dtype=torch.float32) * 7.0 - 137.0) * 0.125
+    expected = torch.full((n + 2 * guard,), -4321.0, dtype=torch.float32)
+    out = expected.to("mps")
+    expected[guard:guard + n] = values.flip(0)
+    _unit_axis_reduce_flip_kernel[(1,)](
+        values.to("mps"), out, n,
+        BN=n, AXIS=axis, GUARD=guard, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _unit_axis_reduce_loop_keepdims_kernel(x_ptr, o_ptr, N, Iterations,
+                                           BN: tl.constexpr,
+                                           AXIS: tl.constexpr,
+                                           GUARD: tl.constexpr):
+    rn = tl.program_id(0) * BN + tl.arange(0, BN)
+    rd = tl.arange(0, 1)
+    if AXIS == 0:
+        offsets = rd[:, None] + rn[None, :]
+    else:
+        offsets = rn[:, None] + rd[None, :]
+    for iteration in range(Iterations):
+        value = tl.load(x_ptr + iteration * N + offsets,
+                        mask=offsets < N, other=0.0)
+        result = tl.sum(value, axis=AXIS, keep_dims=True)
+        tl.store(o_ptr + iteration * (N + 2 * GUARD) + GUARD + offsets,
+                 result, mask=offsets < N)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_unit_axis_reduce_loop_keepdims_preserves_input_bits(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n, block, iterations, guard = 259, 256, 3, 5
+    pattern = torch.tensor([
+        0, -2147483648, 2139095040, -8388608, 2143289393, -4194255,
+        1067450368, -1075838976,
+    ], dtype=torch.int32)
+    base = pattern.repeat(triton.cdiv(n, pattern.numel()))[:n]
+    values = torch.stack([base.roll(i + 1) for i in range(iterations)]).view(torch.float32)
+    expected = torch.full((iterations, n + 2 * guard), -4321.0, dtype=torch.float32)
+    out = expected.to("mps")
+    expected[:, guard:guard + n] = values
+    _unit_axis_reduce_loop_keepdims_kernel[(triton.cdiv(n, block),)](
+        values.to("mps"), out, n, iterations,
+        BN=block, AXIS=axis, GUARD=guard, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu().view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("op", ["argmin", "argmax"])
+def test_unit_axis_arg_extrema_preserves_value_and_zero_index(axis, num_warps, op):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    n, block, guard = 259, 256, 5
+    pattern = torch.tensor([
+        0, -2147483648, 2139095040, -8388608, 2143289393, -4194255,
+        1067450368, -1075838976,
+    ], dtype=torch.int32)
+    values = pattern.repeat(triton.cdiv(n, pattern.numel()))[:n].view(torch.float32)
+    expected = torch.full((n + 2 * guard,), -4321.0, dtype=torch.float32)
+    expected_index = torch.full((n + 2 * guard,), -7654321, dtype=torch.int32)
+    out, out_index = expected.to("mps"), expected_index.to("mps")
+    expected[guard:guard + n] = values
+    expected_index[guard:guard + n] = 0
+    _unit_axis_reduce_kernel[(triton.cdiv(n, block),)](
+        values.to("mps"), out_index, out, out_index, n,
+        BN=block, AXIS=axis, OP=op, GUARD=guard, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu().view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(out_index.cpu(), expected_index)
 
 
 @triton.jit
