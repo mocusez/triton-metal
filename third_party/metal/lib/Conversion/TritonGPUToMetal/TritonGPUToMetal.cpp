@@ -28927,6 +28927,30 @@ static SdPtrParts sdSplitPtr(mlir::Value ptr) {
         return;
       }
     }
+    mlir::Value flatOffset = off;
+    while (auto bc = flatOffset.getDefiningOp<mlir::triton::BroadcastOp>())
+      flatOffset = bc.getSrc();
+    if (auto flatAdd = flatOffset.getDefiningOp<mlir::arith::AddIOp>()) {
+      // A singleton batch folds to a scalar flat offset. In the combined
+      // address spelling it is splatted beside the already-strided matrix
+      // axis, rather than applied by a scalar addptr before the pointer splat.
+      // Preserve it in baseOffsets instead of absorbing it into rowContrib,
+      // whose affine rebuild only retains the axis origin and stride.
+      auto offTy = mlir::dyn_cast<mlir::RankedTensorType>(flatOffset.getType());
+      if (offTy && offTy.getRank() == 3 && offTy.getDimSize(0) == 1) {
+        for (int side = 0; side < 2; ++side) {
+          auto base = flatAdd->getOperand(side)
+                          .getDefiningOp<mlir::triton::SplatOp>();
+          mlir::Value axis = flatAdd->getOperand(1 - side);
+          if (base && axis.getDefiningOp<mlir::arith::MulIOp>() &&
+              sdBatchedMatrixAxis(axis)) {
+            p.baseOffsets.push_back(base.getSrc());
+            collectContrib(axis, depth + 1);
+            return;
+          }
+        }
+      }
+    }
     auto ax = sdBatchedMatrixAxis(off);
     auto addi = off.getDefiningOp<mlir::arith::AddIOp>();
     if (addi) {
@@ -29778,6 +29802,14 @@ static ScalarDotOp sdCreateScalarDot(
                          : bLoad.getPtr();
   SdPtrParts aParts = sdSplitPtr(aPtr);
   SdPtrParts bParts = sdSplitPtr(bPtr);
+  // Scalar bases are consumed at the replacement dot/loop, so an offset
+  // depending on a loop iteration cannot be captured from the erased body.
+  mlir::DominanceInfo baseDominance(
+      insertBefore->getParentOfType<mlir::triton::FuncOp>());
+  for (const auto *parts : {&aParts, &bParts})
+    for (mlir::Value offset : parts->baseOffsets)
+      if (!baseDominance.properlyDominates(offset, insertBefore))
+        return {};
   int64_t batchTile =
       resultTensorTy.getRank() == 3 ? resultTensorTy.getDimSize(0) : 1;
   if (!aParts.rowContrib || !bParts.rowContrib || !aParts.rootArg ||
@@ -35046,6 +35078,11 @@ static mlir::Value cloneStoreSideEncodingCone(mlir::Value root,
   mlir::IRMapping mapping;
   mlir::OpBuilder builder(insertBefore);
   for (mlir::Operation *op : ordered) {
+    // Scalars have no layout to remap. Preserve their original SSA values:
+    // matmul rewrites extract tile origins from this cone and use them before
+    // the dot/loop, while the cloned store-side cone may sit after it.
+    if (!mlir::isa<mlir::RankedTensorType>(op->getResult(0).getType()))
+      continue;
     mlir::Operation *clone = builder.clone(*op, mapping);
     mlir::Type newTy =
         remapStoreSideConeType(clone->getResult(0).getType(), fromEnc, toEnc);

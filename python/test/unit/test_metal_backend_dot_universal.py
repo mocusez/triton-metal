@@ -2217,6 +2217,9 @@ def batched_f32_rank3_dot_kernel(
         (2, 64, 64, 64, 1, False),
         (3, 70, 66, 50, 1, False),
         (2, 33, 17, 96, 1, False),
+        # Mixed-layout broadcasts with nonzero row/column origins and a K tail.
+        (2, 97, 81, 96, 1, False),
+        (2, 97, 81, 96, 1, True),
         (4, 64, 64, 64, 2, False),
         (3, 70, 66, 50, 2, False),
         (5, 33, 17, 96, 4, False),
@@ -4885,6 +4888,7 @@ def _run_single_dot(m, n, k, bm, bn, bk, warps, masked, rowsign=0):
     (128, 128, 64, 64, 64, 64, 0),
     (100, 72, 24, 64, 64, 32, 1),     # ragged M, N and K under one tile
     (8, 1024, 32, 8, 512, 32, 0),     # 64 column tiles: more than one chunk
+    (16, 1536, 32, 8, 512, 32, 0),    # output re-encoding with nonzero row origins
     (512, 16, 16, 256, 16, 16, 0),    # tall and thin
     (16, 512, 16, 16, 256, 16, 1),    # short and wide, masked
 ])

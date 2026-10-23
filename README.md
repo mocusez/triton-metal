@@ -314,7 +314,13 @@ being approximated with a racy load/modify/store sequence.
 - **`tl.dot` is not layout-general.** Proven scalar and SIMD-group-matrix paths
   cover the tested f32, fp16/bf16, int8, batched, and scaled-dot envelopes.
   Canonical masked multi-tile dots and direct rank-3 batched dots with
-  `K > min(M, N)` are covered. Rank-2 `tt.dot_scaled` additionally accepts
+  `K > min(M, N)` are covered. Layout re-encoding preserves the original
+  scalar tile origins, so mixed-layout output broadcasts do not introduce
+  use-before-definition errors in short-wide or batched matmuls.
+  For singleton batch tiles, combined offsets retain a flat batch base added
+  outside a strided matrix-axis contribution; captured bases must dominate
+  the replacement operation.
+  Rank-2 `tt.dot_scaled` additionally accepts
   matched zero-filled rectangular A/B loads and a matching masked output
   store. A static rank-2 loop slice is covered for matching fp16/bf16 payloads
   with 16- or 32-element E8M0 groups and matching E2M1/E4M3/E5M2 payloads with
