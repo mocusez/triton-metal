@@ -164,7 +164,9 @@ def _umulhi_const_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
     i = tl.arange(0, BLOCK)
     # 0xD2511F53 is philox's round multiplier and exceeds INT32_MAX, so it is
     # the constant whose signed printing broke the widening inside mulhi_ui.
-    tl.store(out_ptr + i, tl.umulhi(tl.load(x_ptr + i), 0xD2511F53))
+    # Give the tensor unsigned type so the scalar fits its computation type.
+    x = tl.load(x_ptr + i).to(tl.uint32, bitcast=True)
+    tl.store(out_ptr + i, tl.umulhi(x, 0xD2511F53))
 
 
 def test_umulhi_constant_operand():

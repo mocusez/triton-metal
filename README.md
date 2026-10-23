@@ -235,6 +235,12 @@ axis indicator for two different hypercube axes once the cube needs more
 register bits than the indicator's linear layout names, so the widest merge
 compared along the neighbouring axis.
 
+Flip recognition also handles duplicate loads introduced by layout
+rematerialization. Equivalent singleton broadcast address cones are normalized
+before common-subexpression elimination, so rank-3 int8 flips retain their
+shared source. Loads separated by a memory write remain distinct; the flip
+matcher still requires identical SSA inputs.
+
 `tt.unsplat` is supported for its verifier-valid source shape: a tensor with
 exactly one logical element. The Metal type conversion maps that tensor to its
 scalar element type, so the lowering is an exact passthrough rather than a

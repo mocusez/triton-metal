@@ -31,6 +31,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/CSE.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -34626,16 +34627,18 @@ static void preprocessDotChains(mlir::ModuleOp moduleOp) {
 // two layouts disagree about which element a thread holds — under
 // slice<dim=1,parent=B> thread t holds row t/N, under #blocked1 it holds row t
 // — so that cvt is a real data relabel and the cone must be re-encoded.
+// Linear sources are used only by the equivalent expanded-arange broadcast
+// normalization below; its caller proves the physical mappings agree.
 static mlir::Attribute remapDivergentConeEncoding(mlir::Attribute enc,
                                                   mlir::Attribute srcEnc,
                                                   mlir::Attribute dstEnc) {
   if (enc == srcEnc)
     return dstEnc;
-  auto srcBlocked =
-      mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(srcEnc);
   auto dstBlocked =
       mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(dstEnc);
-  if (!srcBlocked || !dstBlocked)
+  if (!mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr,
+                            mlir::triton::gpu::LinearEncodingAttr>(srcEnc) ||
+      !dstBlocked)
     return nullptr;
   // Nested slices, not just one level. A rank-2 index cone reaches its tile
   // through ONE `#ttg.slice`, which is all this handled; a rank-3 cone reaches
@@ -34653,7 +34656,7 @@ static mlir::Attribute remapDivergentConeEncoding(mlir::Attribute enc,
     if (mlir::Attribute parent =
             remapDivergentConeEncoding(slice.getParent(), srcEnc, dstEnc))
       return mlir::triton::gpu::SliceEncodingAttr::get(
-          srcBlocked.getContext(), slice.getDim(),
+          srcEnc.getContext(), slice.getDim(),
           mlir::cast<mlir::triton::gpu::DistributedEncodingTrait>(parent));
   return nullptr;
 }
@@ -35126,27 +35129,58 @@ static bool canCloneStoreSideEncodingCone(mlir::Value root,
 // Our scalar tile loop also needs the address cone to use the destination's
 // indexing convention. Recompute pure cones in that encoding, leaving shared
 // producers intact for their other consumers.
-static void normalizeBlockedBroadcastCones(mlir::ModuleOp moduleOp) {
+static bool normalizeBlockedBroadcastCones(mlir::Operation *root,
+                                           bool allowLinearRange = false) {
+  bool changed = false;
   llvm::SmallVector<mlir::triton::BroadcastOp> broadcasts;
-  moduleOp.walk([&](mlir::triton::BroadcastOp op) { broadcasts.push_back(op); });
+  root->walk([&](mlir::triton::BroadcastOp op) { broadcasts.push_back(op); });
   for (auto broadcast : broadcasts) {
     auto srcTy = mlir::cast<mlir::RankedTensorType>(broadcast.getSrc().getType());
     auto dstTy = mlir::cast<mlir::RankedTensorType>(broadcast.getType());
-    auto srcEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
-        srcTy.getEncoding());
+    auto srcEnc = srcTy.getEncoding();
     auto dstEnc = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
         dstTy.getEncoding());
-    if (!srcEnc || !dstEnc || srcEnc == dstEnc)
+    const bool linearRange =
+        allowLinearRange &&
+        mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(srcEnc);
+    if ((!mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(srcEnc) &&
+         !linearRange) || !dstEnc || srcEnc == dstEnc)
       continue;
     auto retyped = mlir::RankedTensorType::get(
         srcTy.getShape(), srcTy.getElementType(), dstEnc);
-    if (mlir::triton::gpu::toLinearLayout(srcTy) !=
-        mlir::triton::gpu::toLinearLayout(retyped))
+    auto sourceLayout = mlir::triton::gpu::toLinearLayout(srcTy);
+    auto targetLayout = mlir::triton::gpu::toLinearLayout(retyped);
+    if (linearRange) {
+      // Only rebuild an arange expanded to a broadcast source. A linear
+      // layout may retain trailing replicated registers for its singleton
+      // dimensions; padding the smaller register domain compares every
+      // physical owner without removing or moving any nonzero basis.
+      llvm::SmallVector<mlir::Operation *, 16> ordered;
+      llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+      if (!collectStoreSideEncodingCone(broadcast.getSrc(), srcEnc, dstEnc,
+                                        ordered, seen) ||
+          ordered.empty() ||
+          !mlir::isa<mlir::triton::MakeRangeOp>(ordered.front()) ||
+          !llvm::all_of(ordered, [](mlir::Operation *op) {
+            return mlir::isa<mlir::triton::MakeRangeOp,
+                              mlir::triton::ExpandDimsOp>(op);
+          }))
+        continue;
+      auto reg = mlir::StringAttr::get(root->getContext(), "register");
+      auto registers = std::max(sourceLayout.getInDimSize(reg),
+                                targetLayout.getInDimSize(reg));
+      sourceLayout = sourceLayout.resizeInDim(reg, registers);
+      targetLayout = targetLayout.resizeInDim(reg, registers);
+    }
+    if (sourceLayout != targetLayout)
       continue;
     if (mlir::Value source = cloneStoreSideEncodingCone(
-            broadcast.getSrc(), srcEnc, dstEnc, broadcast.getOperation()))
+            broadcast.getSrc(), srcEnc, dstEnc, broadcast.getOperation())) {
       broadcast->setOperand(0, source);
+      changed = true;
+    }
   }
+  return changed;
 }
 
 // When a rank-1/rank-2 blocked->blocked relabel feeds a tt.store value, the
@@ -41757,6 +41791,46 @@ static bool isXorCombine(mlir::triton::ReduceOp reduce) {
          args.count(xorOp.getRhs());
 }
 
+// Layout rematerialization may duplicate a flip's source cone with equivalent
+// singleton broadcast encodings. Normalize those pure cones, then let CSE
+// prove whether their loads still name the same memory snapshot. The flip
+// matcher below continues to require identical SSA operands; in particular,
+// an intervening write must not turn two distinct loads into a swap round.
+static void normalizeHypercubeFlipSources(mlir::ModuleOp moduleOp) {
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    bool candidate = false;
+    func.walk([&](mlir::arith::XOrIOp xorOp) {
+      auto type = mlir::dyn_cast<mlir::RankedTensorType>(xorOp.getType());
+      if (candidate || !type)
+        return;
+      for (int side = 0; side < 2; ++side) {
+        auto broadcast = xorOp->getOperand(1 - side)
+                             .getDefiningOp<mlir::triton::BroadcastOp>();
+        auto expand = broadcast ? broadcast.getSrc()
+                                      .getDefiningOp<mlir::triton::ExpandDimsOp>()
+                                : nullptr;
+        auto reduce = expand
+                          ? expand.getSrc().getDefiningOp<mlir::triton::ReduceOp>()
+                          : nullptr;
+        if (reduce && reduce->getNumOperands() == 1 &&
+            reduce->getNumResults() == 1 &&
+            reduce->getOperand(0) != xorOp->getOperand(side) &&
+            reduce->getOperand(0).getType() == type &&
+            reduce.getAxis() == expand.getAxis() &&
+            type.getDimSize(reduce.getAxis()) == 2 && isXorCombine(reduce))
+          candidate = true;
+      }
+    });
+    if (!candidate || !normalizeBlockedBroadcastCones(
+                          func.getOperation(), /*allowLinearRange=*/true))
+      return;
+    mlir::IRRewriter rewriter(func.getContext());
+    mlir::DominanceInfo dominance(func.getOperation());
+    mlir::eliminateCommonSubExpressions(rewriter, dominance,
+                                       func.getOperation());
+  });
+}
+
 // One round `y ^ broadcast(expand_dims(xor_sum(y, a)))` over an axis of
 // extent 2: the swap of that axis's two halves. Returns the axis, or -1.
 static int64_t xorSwapRoundAxis(mlir::arith::XOrIOp xorOp, mlir::Value &input) {
@@ -43610,6 +43684,7 @@ struct ConvertTritonGPUToMetalPass
     }
     foldUnitAxisReduces(moduleOp);
     rewriteCanonicalRank2Axis0Argmin(moduleOp);
+    normalizeHypercubeFlipSources(moduleOp);
 
     // Answered here, once, while the rank-2 tensors are all still present —
     // before the validators, because whether a shuffle's operands are held per

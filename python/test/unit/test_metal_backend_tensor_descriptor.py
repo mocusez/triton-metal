@@ -1,7 +1,7 @@
 """Host-side `TensorDescriptor` arguments (Triton's TMA surface).
 
 The compiler side has worked for a while: a `tensordesc<...>` kernel argument is
-flattened by the frontend into seven parameters —
+flattened by the frontend into 4 * rank + 3 parameters —
 
     base pointer, *shape (i64), *strides (i64), padding == "nan" (i1),
     round_f32_to_tf32 (i1), *shape (i32), *strides (i64)
@@ -15,9 +15,9 @@ nor the reason.
 
 The launcher now expands the descriptor with Triton's own
 `expand_signature` / `decompose_descriptor`, the same pair the NVIDIA launcher
-uses, so the two sides cannot drift on the order. `tensordesc_meta` is None for
-this backend on purpose: Metal has no hardware descriptor object, so the
-decomposed form IS the calling convention.
+uses, so the two sides cannot drift on the order. Metal explicitly selects
+`TensorDescABI.DECOMPOSED`: it has no hardware descriptor object, so the
+decomposed form is the calling convention.
 
 Metal has no TMA hardware and none of this is asynchronous — descriptor loads,
 stores, and reducing stores are rewritten to ordinary pointer operations before

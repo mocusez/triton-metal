@@ -1476,17 +1476,32 @@ def test_column_reduce_without_a_scan_still_matches_torch(shape, num_warps):
 
 
 @triton.jit
-def _rank2_axis1_argmin_kernel(X, O, M: tl.constexpr, N: tl.constexpr):
+def _rank2_argmin_combine(a, ai, b, bi):
+    tie = (a == b) & (ai < bi)
+    take_left = (a < b) | tie
+    return tl.where(take_left, a, b), tl.where(take_left, ai, bi)
+
+
+@triton.jit
+def _rank2_axis1_argmin_kernel(X, O, M: tl.constexpr, N: tl.constexpr,
+                              FORM: tl.constexpr):
     i = tl.arange(0, M)
     j = tl.arange(0, N)
-    tl.store(O + i, tl.argmin(tl.load(X + i[:, None] * N + j[None, :]), axis=1))
+    values = tl.load(X + i[:, None] * N + j[None, :])
+    if FORM == "tuple":
+        indices = tl.broadcast_to(j[None, :], (M, N))
+        _, index = tl.reduce((values, indices), 1, _rank2_argmin_combine)
+    else:
+        index = tl.argmin(values, axis=1)
+    tl.store(O + i, index)
 
 
 @pytest.mark.parametrize(
     "m,num_warps", [(64, 1), (128, 1), (256, 4)],
     ids=["M64_w1", "M128_w1", "M256_w4"],
 )
-def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps,
+@pytest.mark.parametrize("form", ["tuple", "two_pass"])
+def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps, form,
                                                              tmp_path):
     """One row per thread is the whole envelope of this lowering, and more rows
     than threads is the shape a user reaches it with. Found by probing the
@@ -1497,7 +1512,7 @@ def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps,
         o = torch.zeros({m}, dtype=torch.int32, device="mps")
         try:
             module._rank2_axis1_argmin_kernel[(1,)](
-                x, o, M={m}, N=8, num_warps={num_warps})
+                x, o, M={m}, N=8, FORM={form!r}, num_warps={num_warps})
         except RuntimeError:
             pass
         else:
@@ -1507,10 +1522,16 @@ def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps,
         module._rank2_axis1_argmin_kernel[(1,)](
             torch.zeros(rows * 8, device="mps"),
             torch.zeros(rows, dtype=torch.int32, device="mps"),
-            M=rows, N=8, num_warps={num_warps})
+            M=rows, N=8, FORM={form!r}, num_warps={num_warps})
         print("RECOVERED")
     """)
-    needle = "rank-2 axis=1 argmin requires blocked 0 < M <= tpb and N > 0"
+    if form == "tuple":
+        needle = "rank-2 axis=1 argmin requires blocked 0 < M <= tpb and N > 0"
+    else:
+        # tl.argmin now selects matching indices after a value reduction. Its
+        # out-of-envelope index pass reaches the computed-i32 source guard.
+        needle = ("rank-2 axis=1 reduce over a computed cone is implemented for "
+                  "f32 only; other element types require a direct unmasked tt.load")
     assert result.returncode == 0, output
     assert output.count(needle) == 1, output
     assert "RECOVERED" in output, output
@@ -1518,13 +1539,14 @@ def test_rank2_axis1_argmin_above_the_threadgroup_is_refused(m, num_warps,
 
 
 @pytest.mark.parametrize("num_warps", [1, 2, 4])
-def test_rank2_axis1_argmin_at_one_row_per_thread_matches_torch(num_warps):
+@pytest.mark.parametrize("form", ["tuple", "two_pass"])
+def test_rank2_axis1_argmin_at_one_row_per_thread_matches_torch(num_warps, form):
     """The guard on the refusal above."""
     m, n = 32 * num_warps, 8
     torch.manual_seed(0xA6E1 + num_warps)
     x = torch.randn(m, n, dtype=torch.float32).contiguous()
     out = torch.zeros(m, dtype=torch.int32, device="mps")
     _rank2_axis1_argmin_kernel[(1,)](x.to("mps"), out, M=m, N=n,
-                                     num_warps=num_warps)
+                                     FORM=form, num_warps=num_warps)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), x.argmin(dim=1).to(torch.int32))

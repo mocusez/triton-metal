@@ -208,3 +208,182 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.barrier
 // CHECK: scf.for
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+
+// -----
+// A singleton broadcast source may carry a different blocked encoding which
+// agrees on its source shape. Normalize that pure cone before CSE so the two
+// logical loads become one SSA value and the extent-2 XOR round is a flip.
+// This is the 2x4x8 i8 source emitted by tl.flip along axis 0. Keeping i8 pins
+// the flip rewrite: generic staged integer reductions require i32.
+// CHECK-LABEL: metal.kernel flip_equivalent_broadcast_loads
+// CHECK: %[[FLIP:.*]] = metal.threadgroup_alloca : !metal.memref<64 x i8>
+// CHECK: metal.tg_store_indexed %[[FLIP]]
+// CHECK: metal.barrier
+// CHECK: %[[FLIPPED:.*]] = metal.tg_load_indexed %[[FLIP]]
+// CHECK: metal.store %[[FLIPPED]]
+// CHECK-NOT: bitXorOp
+#flip_tile = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
+#flip_broadcast = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [4, 1, 8], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @flip_equivalent_broadcast_loads(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %cst = arith.constant dense<8> : tensor<1x4x1xi32, #flip_tile>
+    %cst_0 = arith.constant dense<32> : tensor<2x1x1xi32, #flip_tile>
+    %0 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>>
+    %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>> -> tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>>
+    %2 = tt.expand_dims %1 {axis = 2 : i32} : tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>> -> tensor<2x1x1xi32, #flip_tile>
+    %3 = arith.muli %2, %cst_0 : tensor<2x1x1xi32, #flip_tile>
+    %4 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>>
+    %5 = tt.expand_dims %4 {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>> -> tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>>
+    %6 = tt.expand_dims %5 {axis = 2 : i32} : tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>> -> tensor<1x4x1xi32, #flip_tile>
+    %7 = arith.muli %6, %cst : tensor<1x4x1xi32, #flip_tile>
+    %8 = tt.broadcast %3 : tensor<2x1x1xi32, #flip_tile> -> tensor<2x4x1xi32, #flip_tile>
+    %9 = tt.broadcast %7 : tensor<1x4x1xi32, #flip_tile> -> tensor<2x4x1xi32, #flip_tile>
+    %10 = arith.addi %8, %9 : tensor<2x4x1xi32, #flip_tile>
+    %11 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_tile}>}>>
+    %12 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_broadcast}>}>>
+    %13 = tt.expand_dims %11 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_tile}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_tile}>>
+    %14 = tt.expand_dims %12 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_broadcast}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_broadcast}>>
+    %15 = tt.expand_dims %13 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_tile}>> -> tensor<1x1x8xi32, #flip_tile>
+    %16 = tt.expand_dims %14 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_broadcast}>> -> tensor<1x1x8xi32, #flip_broadcast>
+    %17 = tt.broadcast %10 : tensor<2x4x1xi32, #flip_tile> -> tensor<2x4x8xi32, #flip_tile>
+    %18 = tt.broadcast %15 : tensor<1x1x8xi32, #flip_tile> -> tensor<2x4x8xi32, #flip_tile>
+    %19 = tt.broadcast %16 : tensor<1x1x8xi32, #flip_broadcast> -> tensor<2x4x8xi32, #flip_tile>
+    %20 = arith.addi %17, %18 : tensor<2x4x8xi32, #flip_tile>
+    %21 = arith.addi %17, %19 : tensor<2x4x8xi32, #flip_tile>
+    %22 = tt.splat %arg0 : !tt.ptr<i8> -> tensor<2x4x8x!tt.ptr<i8>, #flip_tile>
+    %23 = tt.addptr %22, %20 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    %24 = tt.addptr %22, %21 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    %25 = tt.load %23 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>
+    %26 = tt.load %24 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>
+    %27 = "tt.reduce"(%25) <{axis = 0 : i32}> ({
+    ^bb0(%arg3: i8, %arg4: i8):
+      %33 = arith.xori %arg3, %arg4 : i8
+      tt.reduce.return %33 : i8
+    }) : (tensor<2x4x8xi8, #flip_tile>) -> tensor<4x8xi8, #ttg.slice<{dim = 0, parent = #flip_tile}>>
+    %28 = tt.expand_dims %27 {axis = 0 : i32} : tensor<4x8xi8, #ttg.slice<{dim = 0, parent = #flip_tile}>> -> tensor<1x4x8xi8, #flip_tile>
+    %29 = tt.broadcast %28 : tensor<1x4x8xi8, #flip_tile> -> tensor<2x4x8xi8, #flip_tile>
+    %30 = arith.xori %26, %29 : tensor<2x4x8xi8, #flip_tile>
+    %31 = tt.splat %arg1 : !tt.ptr<i8> -> tensor<2x4x8x!tt.ptr<i8>, #flip_tile>
+    %32 = tt.addptr %31, %21 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    tt.store %32, %30 : tensor<2x4x8x!tt.ptr<i8>, #flip_tile>
+    tt.return
+  }
+}
+
+// The same address cones do not make loads equivalent across a write. This
+// is an XOR reduction of the old values combined with newly loaded values,
+// not a flip. i32 admits the generic reduction so the memory ordering and
+// retained combine can be checked directly instead of accepting a decline.
+// CHECK-LABEL: metal.kernel xor_swap_after_store
+// CHECK: metal.get_element %arg0
+// CHECK: metal.store {{.*}}, %arg0
+// CHECK: metal.get_element %arg0
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, bitXorOp
+// CHECK: metal.store {{.*}}, %arg1
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @xor_swap_after_store(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %cst = arith.constant dense<8> : tensor<1x4x1xi32, #flip_tile>
+    %cst_0 = arith.constant dense<32> : tensor<2x1x1xi32, #flip_tile>
+    %0 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>>
+    %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>> -> tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>>
+    %2 = tt.expand_dims %1 {axis = 2 : i32} : tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>> -> tensor<2x1x1xi32, #flip_tile>
+    %3 = arith.muli %2, %cst_0 : tensor<2x1x1xi32, #flip_tile>
+    %4 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>>
+    %5 = tt.expand_dims %4 {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_tile}>}>> -> tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>>
+    %6 = tt.expand_dims %5 {axis = 2 : i32} : tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_tile}>> -> tensor<1x4x1xi32, #flip_tile>
+    %7 = arith.muli %6, %cst : tensor<1x4x1xi32, #flip_tile>
+    %8 = tt.broadcast %3 : tensor<2x1x1xi32, #flip_tile> -> tensor<2x4x1xi32, #flip_tile>
+    %9 = tt.broadcast %7 : tensor<1x4x1xi32, #flip_tile> -> tensor<2x4x1xi32, #flip_tile>
+    %10 = arith.addi %8, %9 : tensor<2x4x1xi32, #flip_tile>
+    %11 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_tile}>}>>
+    %12 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_broadcast}>}>>
+    %13 = tt.expand_dims %11 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_tile}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_tile}>>
+    %14 = tt.expand_dims %12 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_broadcast}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_broadcast}>>
+    %15 = tt.expand_dims %13 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_tile}>> -> tensor<1x1x8xi32, #flip_tile>
+    %16 = tt.expand_dims %14 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_broadcast}>> -> tensor<1x1x8xi32, #flip_broadcast>
+    %17 = tt.broadcast %10 : tensor<2x4x1xi32, #flip_tile> -> tensor<2x4x8xi32, #flip_tile>
+    %18 = tt.broadcast %15 : tensor<1x1x8xi32, #flip_tile> -> tensor<2x4x8xi32, #flip_tile>
+    %19 = tt.broadcast %16 : tensor<1x1x8xi32, #flip_broadcast> -> tensor<2x4x8xi32, #flip_tile>
+    %20 = arith.addi %17, %18 : tensor<2x4x8xi32, #flip_tile>
+    %21 = arith.addi %17, %19 : tensor<2x4x8xi32, #flip_tile>
+    %22 = tt.splat %arg0 : !tt.ptr<i32> -> tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    %23 = tt.addptr %22, %20 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    %24 = tt.addptr %22, %21 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    %25 = tt.load %23 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    %zero = arith.constant dense<0> : tensor<2x4x8xi32, #flip_tile>
+    tt.store %23, %zero : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    %26 = tt.load %24 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    %27 = "tt.reduce"(%25) <{axis = 0 : i32}> ({
+    ^bb0(%arg3: i32, %arg4: i32):
+      %33 = arith.xori %arg3, %arg4 : i32
+      tt.reduce.return %33 : i32
+    }) : (tensor<2x4x8xi32, #flip_tile>) -> tensor<4x8xi32, #ttg.slice<{dim = 0, parent = #flip_tile}>>
+    %28 = tt.expand_dims %27 {axis = 0 : i32} : tensor<4x8xi32, #ttg.slice<{dim = 0, parent = #flip_tile}>> -> tensor<1x4x8xi32, #flip_tile>
+    %29 = tt.broadcast %28 : tensor<1x4x8xi32, #flip_tile> -> tensor<2x4x8xi32, #flip_tile>
+    %30 = arith.xori %26, %29 : tensor<2x4x8xi32, #flip_tile>
+    %31 = tt.splat %arg1 : !tt.ptr<i32> -> tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    %32 = tt.addptr %31, %21 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>, tensor<2x4x8xi32, #flip_tile>
+    tt.store %32, %30 : tensor<2x4x8x!tt.ptr<i32>, #flip_tile>
+    tt.return
+  }
+}
+
+// -----
+// Linear encoding retains a register basis in the singleton middle dimension.
+// On the 1x1x8 broadcast source it is zero, so the range has a duplicate register
+// copy of every value. Matching with the blocked range must preserve all
+// nonzero lane/warp/register bases while allowing only these trailing replicas.
+// CHECK-LABEL: metal.kernel flip_replicated_linear_range
+// CHECK: %[[LINEAR_FLIP:.*]] = metal.threadgroup_alloca : !metal.memref<64 x i8>
+// CHECK: metal.tg_store_indexed %[[LINEAR_FLIP]]
+// CHECK: metal.barrier
+// CHECK: %[[LINEAR_VALUE:.*]] = metal.tg_load_indexed %[[LINEAR_FLIP]]
+// CHECK: metal.store %[[LINEAR_VALUE]]
+// CHECK-NOT: bitXorOp
+#flip_linear_tile = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>
+#flip_linear_range = #ttg.linear<{register = [[0, 1, 0]], lane = [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 2, 0], [1, 0, 0]], warp = [[0, 0, 0], [0, 0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @flip_replicated_linear_range(%arg0: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %cst = arith.constant dense<8> : tensor<1x4x1xi32, #flip_linear_tile>
+    %cst_0 = arith.constant dense<32> : tensor<2x1x1xi32, #flip_linear_tile>
+    %0 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_linear_tile}>}>>
+    %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #flip_linear_tile}>}>> -> tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_linear_tile}>>
+    %2 = tt.expand_dims %1 {axis = 2 : i32} : tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #flip_linear_tile}>> -> tensor<2x1x1xi32, #flip_linear_tile>
+    %3 = arith.muli %2, %cst_0 : tensor<2x1x1xi32, #flip_linear_tile>
+    %4 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_linear_tile}>}>>
+    %5 = tt.expand_dims %4 {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #flip_linear_tile}>}>> -> tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_linear_tile}>>
+    %6 = tt.expand_dims %5 {axis = 2 : i32} : tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #flip_linear_tile}>> -> tensor<1x4x1xi32, #flip_linear_tile>
+    %7 = arith.muli %6, %cst : tensor<1x4x1xi32, #flip_linear_tile>
+    %8 = tt.broadcast %3 : tensor<2x1x1xi32, #flip_linear_tile> -> tensor<2x4x1xi32, #flip_linear_tile>
+    %9 = tt.broadcast %7 : tensor<1x4x1xi32, #flip_linear_tile> -> tensor<2x4x1xi32, #flip_linear_tile>
+    %10 = arith.addi %8, %9 : tensor<2x4x1xi32, #flip_linear_tile>
+    %11 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_linear_tile}>}>>
+    %12 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_linear_range}>}>>
+    %13 = tt.expand_dims %11 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_linear_tile}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_linear_tile}>>
+    %14 = tt.expand_dims %12 {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #flip_linear_range}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_linear_range}>>
+    %15 = tt.expand_dims %13 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_linear_tile}>> -> tensor<1x1x8xi32, #flip_linear_tile>
+    %16 = tt.expand_dims %14 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #flip_linear_range}>> -> tensor<1x1x8xi32, #flip_linear_range>
+    %17 = tt.broadcast %10 : tensor<2x4x1xi32, #flip_linear_tile> -> tensor<2x4x8xi32, #flip_linear_tile>
+    %18 = tt.broadcast %15 : tensor<1x1x8xi32, #flip_linear_tile> -> tensor<2x4x8xi32, #flip_linear_tile>
+    %19 = tt.broadcast %16 : tensor<1x1x8xi32, #flip_linear_range> -> tensor<2x4x8xi32, #flip_linear_tile>
+    %20 = arith.addi %17, %18 : tensor<2x4x8xi32, #flip_linear_tile>
+    %21 = arith.addi %17, %19 : tensor<2x4x8xi32, #flip_linear_tile>
+    %22 = tt.splat %arg0 : !tt.ptr<i8> -> tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>
+    %23 = tt.addptr %22, %20 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>, tensor<2x4x8xi32, #flip_linear_tile>
+    %24 = tt.addptr %22, %21 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>, tensor<2x4x8xi32, #flip_linear_tile>
+    %25 = tt.load %23 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>
+    %26 = tt.load %24 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>
+    %27 = "tt.reduce"(%25) <{axis = 0 : i32}> ({
+    ^bb0(%arg3: i8, %arg4: i8):
+      %33 = arith.xori %arg3, %arg4 : i8
+      tt.reduce.return %33 : i8
+    }) : (tensor<2x4x8xi8, #flip_linear_tile>) -> tensor<4x8xi8, #ttg.slice<{dim = 0, parent = #flip_linear_tile}>>
+    %28 = tt.expand_dims %27 {axis = 0 : i32} : tensor<4x8xi8, #ttg.slice<{dim = 0, parent = #flip_linear_tile}>> -> tensor<1x4x8xi8, #flip_linear_tile>
+    %29 = tt.broadcast %28 : tensor<1x4x8xi8, #flip_linear_tile> -> tensor<2x4x8xi8, #flip_linear_tile>
+    %30 = arith.xori %26, %29 : tensor<2x4x8xi8, #flip_linear_tile>
+    %31 = tt.splat %arg1 : !tt.ptr<i8> -> tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>
+    %32 = tt.addptr %31, %21 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>, tensor<2x4x8xi32, #flip_linear_tile>
+    tt.store %32, %30 : tensor<2x4x8x!tt.ptr<i8>, #flip_linear_tile>
+    tt.return
+  }
+}

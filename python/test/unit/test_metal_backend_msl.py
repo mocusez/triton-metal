@@ -6995,13 +6995,16 @@ def test_replayed_clamp_matches_elementwise_bitwise(policy):
 @triton.jit
 def _flip_rank_n_kernel(x_ptr, o_ptr, A: tl.constexpr, B: tl.constexpr,
                         C: tl.constexpr, RANK: tl.constexpr, DIM: tl.constexpr,
-                        TWICE: tl.constexpr):
+                        TWICE: tl.constexpr, COMPUTED: tl.constexpr = True):
     if RANK == 2:
         off = tl.arange(0, A)[:, None] * B + tl.arange(0, B)[None, :]
     else:
         off = (tl.arange(0, A)[:, None, None] * (B * C) +
                tl.arange(0, B)[None, :, None] * C + tl.arange(0, C)[None, None, :])
-    y = tl.flip(tl.load(x_ptr + off) * 2 + 1, DIM)
+    x = tl.load(x_ptr + off)
+    if COMPUTED:
+        x = x * 2 + 1
+    y = tl.flip(x, DIM)
     if TWICE:
         y = tl.flip(y, RANK - 1)
     tl.store(o_ptr + off, y)
@@ -7028,6 +7031,26 @@ def test_flip_rank_n_matches_torch(shape, dim, num_warps, dtype, twice):
     want = (x * 2 + 1).flip(dim)
     if twice:
         want = want.flip(len(shape) - 1)
+    assert torch.equal(out.cpu(), want)
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2])
+@pytest.mark.parametrize("form", ["plain", "computed", "twice"])
+def test_flip_rank3_int8_duplicated_loads(dim, form):
+    """Layout rematerialization must not hide a flip's shared input load."""
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    x = (torch.randperm(64, generator=torch.Generator().manual_seed(817 + dim))
+         * 7 - 128).to(torch.int8).reshape(2, 4, 8)
+    out = torch.zeros_like(x, device="mps")
+    _flip_rank_n_kernel[(1,)](
+        x.to("mps"), out, 2, 4, 8, 3, dim, form == "twice",
+        COMPUTED=form == "computed", num_warps=4)
+    torch.mps.synchronize()
+    want = (x * 2 + 1 if form == "computed" else x).flip(dim)
+    if form == "twice":
+        want = want.flip(2)
     assert torch.equal(out.cpu(), want)
 
 

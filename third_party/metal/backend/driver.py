@@ -12,7 +12,7 @@ import os
 import platform
 
 from triton.backends.compiler import GPUTarget
-from triton.backends.driver import DriverBase, decompose_descriptor, expand_signature
+from triton.backends.driver import DriverBase, TensorDescABI, decompose_descriptor, expand_signature
 
 
 @functools.lru_cache(maxsize=1)
@@ -354,8 +354,8 @@ class MetalLauncher:
         self._arg_types = [
             sig[n] for n, keep in zip(fn_arg_names, self._arg_mask) if keep
         ]
-        # A host-side `TensorDescriptor` is ONE entry in the signature and SEVEN
-        # kernel parameters. The frontend flattens it to
+        # A host-side `TensorDescriptor` is one entry in the signature and
+        # 4 * rank + 3 kernel parameters. The frontend flattens it to
         # `base, *shape, *strides, padding=="nan", round_f32_to_tf32, *shape,
         # *strides` (shape and strides appear twice: once as the i64 pair the
         # descriptor carries, once as the i32/i64 pair that survives descriptor
@@ -365,14 +365,14 @@ class MetalLauncher:
         #
         # `expand_signature` / `decompose_descriptor` are Triton's own, shared
         # with the NVIDIA launcher, so the two sides cannot drift on the order.
-        # `tensordesc_meta` is None here on purpose: Metal has no hardware
-        # descriptor object, so the decomposed form IS the calling convention.
+        # Metal has no hardware descriptor object, so select the decomposed
+        # ABI explicitly to match the arguments from `decompose_descriptor`.
         self._has_tensordesc = any(
             isinstance(t, str) and t.startswith("tensordesc")
             for t in self._arg_types
         )
         if self._has_tensordesc:
-            self._arg_types = expand_signature(self._arg_types, None, "")
+            self._arg_types = expand_signature(self._arg_types, TensorDescABI.DECOMPOSED)
         # num_warps × warp_size = threadgroup x-dim. Default to 4×32=128.
         # `threads_per_group`, when the compiler set it, overrides that.
         # Scheduled attention kernels use this so dispatch cannot drift from
