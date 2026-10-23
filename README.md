@@ -683,8 +683,15 @@ The current dependency-ordered priorities are:
    `propagate_nan=tl.PropagateNan.ALL` now returns NaN whenever an operand is
    NaN, and orders `-0.0` below `+0.0`, through the elementwise, scalar and
    reduction-fold paths alike. The default number-preferring policy compiles
-   to the MSL builtin. Rank-2 axis-1 float extrema seed from the first source
-   element, preserving NaN for all-NaN rows and exact infinities.
+   to the MSL builtin. Rank-2 axis-0 and axis-1 float extrema seed from the
+   first source element, preserving NaN for all-NaN columns or rows and exact
+   infinities. Axis-0 f32 `tl.argmin`/`tl.argmax` support the two-pass value/index
+   implementation for supported direct and computed tiles, including outputs
+   wider than the threadgroup and uniform runtime loops. Mixed f32 column
+   results retain their own type when used by the i32 index pass; scalar-staged
+   results must still refer to the same column. Scalar-staged dependencies
+   reached through a transpose or shape-changing reshape, and reductions over
+   an axis of extent 1, remain rejected.
 2. Expand layout conversion, including the shared tile mapping needed for
    cross-lane transpose. Top-level single-value rank >= 2 scans now support
    multiple elements per thread. Rank >= 2 tuple scans now support f32/i32

@@ -13011,6 +13011,52 @@ static bool rank2ConeSupported(mlir::Value v, int depth, bool preflight) {
   return false;
 }
 
+// Scalar staging ignores the requested coordinate. A mixed-type leaf in an
+// i32 column fold must therefore be a prior f32 column result, still indexed
+// by column after any transposes or reshapes. Decide this while the graph exists,
+// before conversion can detach it or fail during rollback.
+static bool axis0MixedTypeLeavesSupported(mlir::Value root, int64_t columns) {
+  // Bit 0 tracks transpose parity; bit 1 marks a shape-changing reshape,
+  // through which column identity is no longer proven.
+  llvm::SmallVector<std::pair<mlir::Value, unsigned>, 16> worklist{{root, 0}};
+  llvm::DenseSet<mlir::Value> seen[4];
+  while (!worklist.empty()) {
+    auto [value, mapping] = worklist.pop_back_val();
+    if (!seen[mapping].insert(value).second)
+      continue;
+    auto *def = value.getDefiningOp();
+    if (!def)
+      continue;
+    if (auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+      auto type =
+          mlir::dyn_cast<mlir::RankedTensorType>(expand.getSrc().getType());
+      if (!type || type.getRank() != 1)
+        return false;
+      if (type.getElementType().isF32() &&
+          !rank1ConeSupported(expand.getSrc(), 0)) {
+        bool sawTileLeaf = false;
+        if (expand.getAxis() != 0 || mapping != 0 ||
+            type.getDimSize(0) != columns ||
+            !coneUsesAxis0Reduce(expand.getSrc(), sawTileLeaf, 0) ||
+            sawTileLeaf ||
+            !rank1ConeSupported(expand.getSrc(), 0,
+                                /*deferAggregateLeaves=*/true))
+          return false;
+      }
+      continue;
+    }
+    if (auto transpose = mlir::dyn_cast<mlir::triton::TransOp>(def))
+      mapping ^= transpose.getOrder()[0] != 0;
+    if (auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(def)) {
+      if (reshape.getSrc().getType().getShape() != reshape.getType().getShape())
+        mapping |= 2;
+    }
+    for (mlir::Value operand : def->getOperands())
+      worklist.emplace_back(operand, mapping);
+  }
+  return true;
+}
+
 // Inc 2.5: collect the per-row (expand_dims axis=1) leaves in a reduce cone
 // that are NOT re-emittable (loop-carried / computed values like q0_rope). At
 // M<=tpb these are staged via getRemappedValue during an inline fill;
@@ -15406,14 +15452,17 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
           continue; // the evaluator rebuilds it; nothing to stage
         // Staging is only sound when the value is laid out one element per
         // thread at the SAME column index this reduce uses, i.e. a full [BN]
-        // row of the reduce's own element type.
-        if (vt.getDimSize(0) != BNforStaging || vt.getElementType() != eltTy)
+        // row. A two-pass argmin broadcasts an f32 column minimum into an
+        // i32 index cone, so the leaf retains its own scalar element type.
+        mlir::Type leafTy = vt.getElementType();
+        if (vt.getDimSize(0) != BNforStaging ||
+            (leafTy != eltTy && !(eltTy.isInteger(32) && leafTy.isF32())))
           return rewriter.notifyMatchFailure(
               op,
               "rank-2 axis0 reduce: cone leaf is neither re-emittable nor a "
               "per-column [BN] value");
         mlir::Value scalar = rewriter.getRemappedValue(v);
-        if (!scalar || scalar.getType() != eltTy)
+        if (!scalar || scalar.getType() != leafTy)
           return rewriter.notifyMatchFailure(
               op,
               "rank-2 axis0 reduce: cone leaf not converted to a per-thread "
@@ -15682,6 +15731,14 @@ lowerRank2Axis0Reduce(mlir::triton::ReduceOp op,
               .getResult();
     }
     mlir::Value s = combineScalar(acc, v);
+    if (kind == MaxF || kind == MinF) {
+      // Number-preferring extrema have no non-NaN identity for an all-NaN
+      // column. Seed from its first logical value, including masked `other`,
+      // so the second pass of argmin/argmax can still match NaNs.
+      auto first = mlir::arith::CmpIOp::create(
+          rewriter, loc, mlir::arith::CmpIPredicate::eq, m, cLo.getResult());
+      s = mlir::arith::SelectOp::create(rewriter, loc, first, v, s);
+    }
     mlir::scf::YieldOp::create(rewriter, loc, mlir::ValueRange{s});
   }
   mlir::Value result = forOp.getResult(0);
@@ -43766,6 +43823,15 @@ struct ConvertTritonGPUToMetalPass
       // device reduce. Output must be E==1 (BN <= tpb); larger BN and other
       // combines stay deferred.
       if (rtt.getRank() == 2 && axes == 0) {
+        if (rtt.getElementType().isInteger(32) && !stagedFallback &&
+            !axis0MixedTypeLeavesSupported(red.getSrcs().front(),
+                                          rtt.getDimSize(1))) {
+          red.emitOpError(
+              "Metal backend: axis=0 i32 reduce requires mixed f32 leaves "
+              "to be replayable or untransposed per-column reduction results");
+          reduceOk = false;
+          return;
+        }
         bool fOk =
             (combineName == "arith.addf" || combineName == "arith.mulf" ||
              combineName == "arith.maxnumf" ||

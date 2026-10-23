@@ -683,6 +683,119 @@ def test_reduce_axis0_argmin_computed_kmeans_tile(N, K):
     )
 
 
+@triton.jit
+def _axis0_two_pass_arg_extrema(In, IndexOut, ValueOut, M, N, Iterations, OutStride,
+                               BM: tl.constexpr, BN: tl.constexpr,
+                               IS_MIN: tl.constexpr, COMPUTED: tl.constexpr):
+    rows = tl.arange(0, BM)
+    cols = tl.program_id(0) * BN + tl.arange(0, BN)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    for iteration in range(Iterations):
+        tile = tl.load(In + iteration * M * N + rows[:, None] * N + cols[None, :],
+                       mask=mask, other=float("nan"))
+        if COMPUTED:
+            tile = tile * 2.0
+        if IS_MIN:
+            index = tl.argmin(tile, axis=0)
+            value = tl.min(tile, axis=0)
+        else:
+            index = tl.argmax(tile, axis=0)
+            value = tl.max(tile, axis=0)
+        tl.store(IndexOut + iteration * OutStride + cols, index, mask=cols < N)
+        tl.store(ValueOut + iteration * OutStride + cols, value, mask=cols < N)
+
+
+@pytest.mark.parametrize("is_min", [True, False], ids=["argmin", "argmax"])
+@pytest.mark.parametrize("computed", [False, True], ids=["direct", "computed"])
+@pytest.mark.parametrize("BN, num_warps, iterations", [
+    (32, 1, 1), (128, 4, 1), (128, 1, 3), (32, 4, 2),
+])
+def test_reduce_axis0_two_pass_arg_extrema(BN, num_warps, iterations, computed, is_min):
+    # The integer second pass must replay f32 leaves and read the first pass's
+    # value for its own column, including when one thread owns several columns.
+    M, N, guard = 5, BN + 7, 11
+    patterns = torch.tensor([
+        [3., -4., 3., -4., 1.],             # tied finite extrema
+        [float("nan"), 2., -3., float("nan"), 4.],
+        [float("nan")] * M,
+        [float("inf")] * M,
+        [-float("inf")] * M,
+        [-0., 0., -0., 0., -0.],
+        [0., 1., 2., 3., -9.],
+        [0., -1., -2., -3., 9.],
+    ], dtype=torch.float32).T
+    tile = patterns[:, torch.arange(N) % patterns.shape[1]]
+    # Shift winners between runtime loop iterations to expose stale publication.
+    source = torch.stack([tile.roll(i, dims=0) for i in range(iterations)])
+    stride = N + 2 * guard
+    indices = torch.full((iterations * stride,), -12345, dtype=torch.int32, device="mps")
+    values = torch.full((iterations * stride,), 12345., dtype=torch.float32, device="mps")
+    _axis0_two_pass_arg_extrema[(triton.cdiv(N, BN),)](
+        source.to("mps"), indices[guard:], values[guard:], M, N, iterations, stride,
+        BM=8, BN=BN, IS_MIN=is_min, COMPUTED=computed, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+
+    reference = source * 2.0 if computed else source
+    is_nan = reference.isnan()
+    identity = float("inf") if is_min else -float("inf")
+    finite = reference.masked_fill(is_nan, identity)
+    extrema = finite.amin(dim=1) if is_min else finite.amax(dim=1)
+    all_nan = is_nan.all(dim=1)
+    extrema = extrema.masked_fill(all_nan, float("nan"))
+    matches = torch.where(all_nan[:, None, :], is_nan, reference == extrema[:, None, :])
+    expected_indices = torch.where(matches, torch.arange(M)[None, :, None], 0x7fffffff).amin(dim=1)
+    actual_indices = indices.cpu().reshape(iterations, stride)
+    actual_values = values.cpu().reshape(iterations, stride)
+    torch.testing.assert_close(actual_indices[:, guard:guard + N], expected_indices.to(torch.int32),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(actual_values[:, guard:guard + N], extrema, atol=0, rtol=0, equal_nan=True)
+    for output, canary in ((actual_indices, -12345), (actual_values, 12345.)):
+        assert torch.all(output[:, :guard] == canary)
+        assert torch.all(output[:, guard + N:] == canary)
+
+
+@triton.jit
+def _axis0_arg_transposed_column_leaf(In, Out, B: tl.constexpr, RESHAPE: tl.constexpr):
+    rows = tl.arange(0, B)
+    cols = tl.arange(0, B)
+    tile = tl.load(In + rows[:, None] * B + cols[None, :])
+    minimum = tl.min(tile, axis=0)
+    matches = tile == minimum[None, :]
+    if RESHAPE:
+        # Two transposes have even parity, but the intervening reshape changes
+        # which original column each final coordinate reads.
+        matches = tl.trans(tl.reshape(matches, (B // 2, B * 2)))
+        matches = tl.trans(tl.reshape(matches, (B, B)))
+        # Preserve a blocked consumer so the mixed-leaf guard diagnoses this,
+        # rather than the earlier rejection of linear-encoded reductions.
+        matches = (tile > 0.0) & matches
+    else:
+        matches = tl.trans(matches)
+    candidates = tl.where(matches, rows[:, None], 0x7fffffff)
+    tl.store(Out + cols, tl.min(candidates, axis=0))
+
+
+@pytest.mark.parametrize("reshape", [False, True], ids=["transpose", "reshape_transposes"])
+def test_reduce_axis0_transposed_mixed_column_leaf_is_named(capfd, reshape):
+    # Square dimensions cannot prove that a staged column scalar still belongs
+    # to the requested coordinate: transposition turns it into a row value.
+    block = 8 if reshape else 32
+    inp = torch.randn(block, block, device="mps")
+    out = torch.full((block,), -12345, dtype=torch.int32, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _axis0_arg_transposed_column_leaf[(1,)](inp, out, B=block, RESHAPE=reshape, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "axis=0 i32 reduce requires mixed f32 leaves" in diagnostic.err + diagnostic.out
+    assert "untransposed per-column reduction results" in diagnostic.err + diagnostic.out
+    assert torch.all(out.cpu() == -12345)
+
+    survivor = torch.empty(block, device="mps")
+    _colsum_direct[(1,)](inp, survivor, BM=block, BN=block, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(survivor.cpu(), inp.cpu().sum(0), atol=1e-4, rtol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # More output columns than the threadgroup has threads (output E > 1).
 #
