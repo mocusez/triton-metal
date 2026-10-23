@@ -1358,7 +1358,9 @@ using ReduceOutTileMap = llvm::DenseMap<mlir::Operation *, TileInfo>;
 // one index mapping -- the divisor and the order must come from the same
 // tensor, or the two agree only in kernels with a single layout.
 static std::optional<TileInfo>
-findRank2ReduceOutTile(mlir::triton::ReduceOp op) {
+findRank2ReduceOutTile(
+    mlir::triton::ReduceOp op,
+    const llvm::DenseSet<mlir::Operation *> *replayedUsers = nullptr) {
   auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(
       op.getSrcs().empty() ? mlir::Type{} : op.getSrcs().front().getType());
   if (!srcTy || srcTy.getRank() != 2 || op.getAxis() > 1)
@@ -1396,7 +1398,8 @@ findRank2ReduceOutTile(mlir::triton::ReduceOp op) {
     worklist.push_back(u);
   while (!worklist.empty()) {
     auto *u = worklist.pop_back_val();
-    if (!seen.insert(u).second)
+    if (!seen.insert(u).second ||
+        (replayedUsers && replayedUsers->contains(u)))
       continue;
     if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(u)) {
       consider(store.getValue().getType());
@@ -18094,17 +18097,252 @@ struct ReduceRankNLowering
   }
 };
 
+// Follow row values through loop state as well as ordinary SSA users. Replayed
+// index-cone broadcasts do not materialize a tensor; every other consumer must
+// retain the row-vector geometry used by the producer's scalar readback.
+static bool axis1RowConsumersSupported(
+    mlir::Value root, mlir::Operation *index,
+    const llvm::DenseSet<mlir::Operation *> &replayedUsers) {
+  llvm::SmallVector<mlir::Value> worklist{root};
+  llvm::DenseSet<mlir::Value> seen;
+  while (!worklist.empty()) {
+    auto value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (auto *user : value.getUsers()) {
+      if (user == index)
+        continue;
+      if (!replayedUsers.contains(user)) {
+        if (auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+            type && type.getRank() > 1)
+          return false;
+        for (auto type : user->getResultTypes())
+          if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
+              tensor && tensor.getRank() > 1)
+            return false;
+      }
+      if (auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(user)) {
+        auto loop = mlir::dyn_cast<mlir::scf::ForOp>(yield->getParentOp());
+        if (!loop)
+          return false;
+        for (auto [i, operand] : llvm::enumerate(yield.getOperands()))
+          if (operand == value) {
+            worklist.push_back(loop.getResult(i));
+            worklist.push_back(loop.getRegionIterArgs()[i]);
+          }
+      }
+      if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(user))
+        for (auto [i, initial] : llvm::enumerate(loop.getInitArgs()))
+          if (initial == value)
+            worklist.push_back(loop.getRegionIterArgs()[i]);
+      for (auto result : user->getResults())
+        worklist.push_back(result);
+    }
+  }
+  return true;
+}
+
+// Select the new frontend's integer index pass before conversion destroys its
+// tensor producers. Only prior, replayable f32 row extrema may supply missing
+// rank-1 leaves; their row buffers are published in the same conversion batch.
+static bool planAxis1IndexReduce(
+    mlir::triton::ReduceOp index,
+    llvm::SmallVectorImpl<mlir::triton::ReduceOp> &producers,
+    llvm::DenseSet<mlir::Operation *> &replayedUsers) {
+  if (index.getAxis() != 1 || index.getSrcs().size() != 1 ||
+      index.getNumResults() != 1 || planRankNReduce(index))
+    return false;
+  auto type = mlir::dyn_cast<mlir::RankedTensorType>(index.getSrcs()[0].getType());
+  auto combine = reduceCombineBinaryOp(index);
+  if (!type || type.getRank() != 2 || !type.getElementType().isInteger(32) ||
+      !mlir::isa_and_nonnull<mlir::arith::MinSIOp>(combine))
+    return false;
+  auto blocked = mlir::dyn_cast_or_null<
+      mlir::triton::gpu::BlockedEncodingAttr>(type.getEncoding());
+  if (!blocked)
+    return false;
+  int64_t threads = 1;
+  for (auto n : blocked.getThreadsPerWarp())
+    threads *= n;
+  for (auto n : blocked.getWarpsPerCTA())
+    threads *= n;
+  if (type.getDimSize(0) <= 0 || type.getDimSize(0) > threads ||
+      type.getDimSize(1) <= 1)
+    return false;
+
+  llvm::DenseMap<mlir::Value, mlir::Value> provisional;
+  llvm::SmallVector<std::pair<mlir::Value, bool>, 16> worklist{
+      {index.getSrcs()[0], false}};
+  llvm::DenseSet<mlir::Value> seen[2];
+  while (!worklist.empty()) {
+    auto [value, permuted] = worklist.pop_back_val();
+    if (!seen[permuted].insert(value).second)
+      continue;
+    auto *def = value.getDefiningOp();
+    if (!def)
+      continue;
+    if (auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+      auto leaf = expand.getSrc();
+      if (rank1ConeSupported(leaf, 0))
+        continue;
+      auto producer = leaf.getDefiningOp<mlir::triton::ReduceOp>();
+      if (!producer || permuted || expand.getAxis() != 1 ||
+          producer->getBlock() != index->getBlock() ||
+          !producer->isBeforeInBlock(index) || producer.getAxis() != 1 ||
+          producer.getSrcs().size() != 1 || producer.getNumResults() != 1)
+        return false;
+      auto source = mlir::dyn_cast<mlir::RankedTensorType>(
+          producer.getSrcs()[0].getType());
+      auto extrema = reduceCombineBinaryOp(producer);
+      if (!source || source.getShape() != type.getShape() ||
+          !source.getElementType().isF32() ||
+          !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              source.getEncoding()) ||
+          !mlir::isa_and_nonnull<mlir::arith::MinNumFOp,
+                                mlir::arith::MinimumFOp,
+                                mlir::arith::MaxNumFOp,
+                                mlir::arith::MaximumFOp>(extrema) ||
+          !rank2ConeSupported(producer.getSrcs()[0], 0) ||
+          !findFirstLoadInCone(producer.getSrcs()[0], 0))
+        return false;
+      if (provisional.try_emplace(leaf, leaf).second)
+        producers.push_back(producer);
+      continue;
+    }
+    permuted |= mlir::isa<mlir::triton::TransOp, mlir::triton::ReshapeOp>(def);
+    for (auto operand : def->getOperands())
+      worklist.emplace_back(operand, permuted);
+  }
+  if (producers.empty() ||
+      !axis1RowConsumersSupported(index->getResult(0), nullptr, {}))
+    return false;
+  for (const auto &values : seen)
+    for (auto value : values)
+      if (auto *def = value.getDefiningOp())
+        replayedUsers.insert(def);
+  for (auto producer : producers)
+    if (!axis1RowConsumersSupported(producer->getResult(0), index, replayedUsers))
+      return false;
+  {
+    llvm::SaveAndRestore<const llvm::DenseMap<mlir::Value, mlir::Value> *>
+        restore(g_stagedLeaves, &provisional);
+    if (!rank2ConeSupported(index.getSrcs()[0], 0))
+      return false;
+  }
+
+  // Replay must observe the same device snapshot as the original loads.
+  // Top-level index computations are moved before the first effect below;
+  // their original reads must already precede it. In a user loop reject
+  // preceding writes, and also later writes if an input was loaded outside it.
+  auto readOnly = [](mlir::Operation *op) {
+    return mlir::isMemoryEffectFree(op) ||
+           mlir::isa<mlir::triton::LoadOp, mlir::triton::GetProgramIdOp,
+                     mlir::triton::GetNumProgramsOp, ThreadgroupAllocaOp>(op);
+  };
+  auto loop = mlir::dyn_cast<mlir::scf::ForOp>(index->getParentOp());
+  if (!loop && !mlir::isa<mlir::triton::FuncOp>(index->getParentOp()))
+    return false;
+  if (loop && !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()))
+    return false;
+  llvm::SmallVector<mlir::Value> inputs{index.getSrcs()[0]};
+  llvm::DenseSet<mlir::Value> visited;
+  bool outsideLoad = false;
+  while (!inputs.empty()) {
+    auto value = inputs.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    auto *def = value.getDefiningOp();
+    if (!def)
+      continue;
+    if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+      if (load->getBlock() != index->getBlock())
+        outsideLoad = true;
+      if (!loop || load->getBlock() != loop.getBody()) {
+        if (!mlir::isa<mlir::triton::FuncOp>(load->getParentOp()))
+          return false;
+        for (auto &before : *load->getBlock()) {
+          if (&before == load.getOperation())
+            break;
+          if (!readOnly(&before))
+            return false;
+        }
+      }
+    }
+    for (auto operand : def->getOperands())
+      inputs.push_back(operand);
+  }
+  if (loop) {
+    for (auto &before : *loop->getBlock()) {
+      if (&before == loop.getOperation())
+        break;
+      if (!readOnly(&before))
+        return false;
+    }
+    for (auto &body : *loop.getBody()) {
+      if (&body == index.getOperation() && !outsideLoad)
+        break;
+      if (!readOnly(&body))
+        return false;
+    }
+  }
+  return true;
+}
+
+// Move only pure computations, including reductions over already-loaded SSA
+// tensors. The planner proved every device read predates the first effect.
+// This gives replay a safe snapshot boundary even when no tile loop is emitted.
+static mlir::LogicalResult
+placeAxis1IndexBeforeEffects(mlir::triton::ReduceOp index) {
+  if (!mlir::isa<mlir::triton::FuncOp>(index->getParentOp()))
+    return mlir::success();
+  mlir::Operation *effect = nullptr;
+  for (auto &op : *index->getBlock()) {
+    if (&op == index.getOperation())
+      return mlir::success();
+    if (!mlir::isMemoryEffectFree(&op) &&
+        !mlir::isa<mlir::triton::LoadOp, mlir::triton::GetProgramIdOp,
+                   mlir::triton::GetNumProgramsOp, ThreadgroupAllocaOp>(&op)) {
+      effect = &op;
+      break;
+    }
+  }
+  if (!effect)
+    return mlir::success();
+  llvm::SmallVector<mlir::Operation *> ordered;
+  llvm::DenseSet<mlir::Operation *> seen;
+  std::function<bool(mlir::Operation *)> collect = [&](mlir::Operation *op) {
+    if (!op || op->getBlock() != index->getBlock() ||
+        op->isBeforeInBlock(effect) || !seen.insert(op).second)
+      return true;
+    if (!mlir::isMemoryEffectFree(op))
+      return false;
+    for (auto operand : op->getOperands())
+      if (!collect(operand.getDefiningOp()))
+        return false;
+    ordered.push_back(op);
+    return true;
+  };
+  if (!collect(index))
+    return index.emitOpError("Metal backend: index replay cannot cross an "
+                             "effecting dependency");
+  for (auto *op : ordered)
+    op->moveBefore(effect);
+  return mlir::success();
+}
+
 struct ReduceLowering
     : public mlir::OpConversionPattern<mlir::triton::ReduceOp> {
   ReduceLowering(const mlir::TypeConverter &tc, mlir::MLIRContext *ctx,
                  const LoopCarriedTileMap *tiles,
                  llvm::DenseMap<mlir::Value, mlir::Value> *rowBufs,
-                 const ReduceOutTileMap *outTiles = nullptr)
+                 const ReduceOutTileMap *outTiles = nullptr,
+                 const llvm::DenseSet<mlir::Operation *> *indexPasses = nullptr)
       : OpConversionPattern(tc, ctx), tileMap(tiles), rowBufMap(rowBufs),
-        outTileMap(outTiles) {}
+        outTileMap(outTiles), indexPasses(indexPasses) {}
   const LoopCarriedTileMap *tileMap;
   llvm::DenseMap<mlir::Value, mlir::Value> *rowBufMap;
   const ReduceOutTileMap *outTileMap;
+  const llvm::DenseSet<mlir::Operation *> *indexPasses;
   mlir::LogicalResult
   matchAndRewrite(mlir::triton::ReduceOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
@@ -18264,10 +18502,11 @@ struct ReduceLowering
 
     // The per-row column reduction reads its elements from one of two sources:
     //   * a direct unmasked device `tt.load`  → read device[rowBase + n]; or
-    //   * a COMPUTED cone (Wall 17 Case C, f32 only) → re-derive each element
+    //   * an f32 cone or preselected i32 index cone → re-derive each element
     //     via `evalRank2ConeAt`. We still need ONE representative load to
     //     recover the per-program scalar offset and confirm the cone is
     //     device-rooted (a pure-splat reduce carries no per-row data).
+    const bool indexPass = indexPasses && indexPasses->contains(op);
     bool computedCone = false;
     mlir::Value coneRoot;          // = reduceSrc, fed to the cone evaluator
     mlir::triton::LoadOp reprLoad; // representative load (scalarOff source)
@@ -18290,12 +18529,10 @@ struct ReduceLowering
     if (loadOp && !loadOp.getMask()) {
       reprLoad = loadOp;
     } else {
-      // Half rides the direct-load row scan only. The computed-cone re-emitter
-      // (evalRank2ConeAt) rebuilds arithmetic in the cone's own types, and
-      // nothing exercises it at half precision, so it stays rejected rather
-      // than shipped untested — the half softmax shape (max/sum over a plain
-      // load, broadcast back) goes through the direct-load path.
-      if (!isF32 || isHalf)
+      // Half retains the direct-load path. Computed integer sources are
+      // admitted only by the preselected two-pass index plan; that plan also
+      // owns producer ordering, row geometry and the input snapshot boundary.
+      if ((!isF32 || isHalf) && !indexPass)
         return rewriter.notifyMatchFailure(
             op, "rank-2 reduce: computed-cone src supported for f32 only");
       // Inc 2.5 (M<=tpb): each fill thread reduces its OWN row (r==localTid),
@@ -18746,10 +18983,35 @@ struct ReduceLowering
                   rewriter, loc, mlir::ValueRange{combined.getResult()});
             }
             rowSum = colFor.getResult(0);
+          } else if (indexPass) {
+            // The two-pass index cone returns signless i32. Keep wide rows
+            // bounded in generated code, then bridge once to buffer storage.
+            auto initial = mlir::arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(INT32_MAX));
+            auto columns = mlir::scf::ForOp::create(
+                rewriter, loc, cColLo.getResult(), cN.getResult(),
+                cOne.getResult(), mlir::ValueRange{initial.getResult()});
+            {
+              mlir::OpBuilder::InsertionGuard g3(rewriter);
+              rewriter.setInsertionPointToStart(columns.getBody());
+              auto element = emitColLoad(columns.getInductionVar());
+              if (!element)
+                return rewriter.notifyMatchFailure(
+                    op, "rank-2 index reduce: failed to replay candidate");
+              auto minimum = mlir::arith::MinSIOp::create(
+                  rewriter, loc, columns.getRegionIterArgs()[0],
+                  toSignlessInt(element, rewriter, loc));
+              mlir::scf::YieldOp::create(
+                  rewriter, loc, mlir::ValueRange{minimum.getResult()});
+            }
+            rowSum = mlir::UnrealizedConversionCastOp::create(
+                         rewriter, loc, mlir::TypeRange{ui32},
+                         mlir::ValueRange{columns.getResult(0)})
+                         .getResult(0);
           } else {
-            // i32 (ui32-storage): emit the column scan UNROLLED. The
-            // translator only threads f32 scf.for iter_args (Wall 15); a ui32
-            // iter_arg would hit ModuleTranslation's "Unexpected operation".
+            // i32 (ui32-storage): retain the direct-load unrolled scanner. The
+            // Preserve this established direct-load path; only the new wide
+            // computed index pass above needs a bounded loop.
             // Signed extrema bridge the storage values to signless i32 for
             // cmpi+select, then cast the selected bit pattern back to ui32.
             // metal.binary_exp on ui32 would implement unsigned extrema.
@@ -43571,6 +43833,25 @@ struct ConvertTritonGPUToMetalPass
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanColumnBitwise;
     llvm::SmallVector<mlir::triton::ReduceOp, 4> deferredScanUnsignedExtrema;
     markLinearRank1PhaseReductions(moduleOp);
+    llvm::DenseSet<mlir::Operation *> axis1IndexPasses;
+    llvm::DenseSet<mlir::Operation *> axis1IndexProducers;
+    llvm::DenseSet<mlir::Operation *> axis1ReplayedUsers;
+    moduleOp.walk([&](mlir::triton::ReduceOp red) {
+      llvm::SmallVector<mlir::triton::ReduceOp> producers;
+      llvm::DenseSet<mlir::Operation *> replayedUsers;
+      if (planAxis1IndexReduce(red, producers, replayedUsers)) {
+        axis1IndexPasses.insert(red);
+        axis1ReplayedUsers.insert(replayedUsers.begin(), replayedUsers.end());
+        for (auto producer : producers)
+          axis1IndexProducers.insert(producer);
+      }
+    });
+    for (auto *index : axis1IndexPasses)
+      if (mlir::failed(placeAxis1IndexBeforeEffects(
+              mlir::cast<mlir::triton::ReduceOp>(index)))) {
+        signalPassFailure();
+        return;
+      }
     bool reduceOk = true;
     moduleOp.walk([&](mlir::triton::ReduceOp red) {
       auto axes = red.getAxis();
@@ -44173,11 +44454,10 @@ struct ConvertTritonGPUToMetalPass
           }
         }
       }
-      // Rank-2 axis=1 rides the direct device-load row scanner for every
-      // element type but f32: `evalRank2ConeAt` rebuilds a computed cone in the
-      // cone's own types and only f32 is implemented, so the LOWERING declines
-      // exactly `!isF32 || isHalf`. Ask the same question here, where refusing
-      // is catchable and named.
+      // Computed row cones use f32 unless pre-analysis selected an i32 index
+      // pass with replayable f32 extrema dependencies. Other non-f32 sources
+      // retain their direct-load or scan-publication paths. Keep this gate in
+      // sync with lowering so unsupported cases fail before conversion.
       // ⚠️ This used to be spelled as two lists -- i32's product, extrema and
       // bitwise combines, and f16/bf16 -- which left `arith.addi` out: an
       // ordinary `tl.sum` over an i8 or i16 tile, which Triton promotes to an
@@ -44186,7 +44466,8 @@ struct ConvertTritonGPUToMetalPass
       // every run, occasionally SIGABRT). Mirror the gate instead of listing
       // the combines it covers.
       if (rtt.getRank() == 2 && axes == 1 && combineEltTy &&
-          !combineEltTy.isF32() && !deferredUnsignedExtremum) {
+          !combineEltTy.isF32() && !deferredUnsignedExtremum &&
+          !axis1IndexPasses.contains(red)) {
         mlir::Value src = red.getSrcs().front();
         if (auto cvt = src.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
           src = cvt.getSrc();
@@ -45582,6 +45863,14 @@ struct ConvertTritonGPUToMetalPass
 
     ReduceOutTileMap reduceOutTiles =
         precomputeRank2ReduceOutTiles(moduleOp);
+    for (auto *producer : axis1IndexProducers) {
+      auto rowTile = findRank2ReduceOutTile(
+          mlir::cast<mlir::triton::ReduceOp>(producer), &axis1ReplayedUsers);
+      if (rowTile)
+        reduceOutTiles[producer] = *rowTile;
+      else
+        reduceOutTiles.erase(producer);
+    }
 
     if (mlir::failed(materializeNestedScanPhases(moduleOp))) {
       signalPassFailure();
@@ -45613,6 +45902,10 @@ struct ConvertTritonGPUToMetalPass
       if (!rtt || rtt.getRank() != 2 || red.getAxis() != 1)
         return;
 
+      if (axis1IndexPasses.contains(red) || axis1IndexProducers.contains(red)) {
+        preReduceOps.insert(red);
+        return;
+      }
       bool candidate = isCanonicalRank2Axis1ArgminReduce(red);
       if (!candidate && srcs.size() == 1 && rtt.getElementType().isF32()) {
         mlir::Operation *combine = reduceCombineBinaryOp(red);
@@ -45669,7 +45962,7 @@ struct ConvertTritonGPUToMetalPass
           });
       mlir::RewritePatternSet reducePatterns(ctx);
       reducePatterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles,
-                                         &reduceRowBufs, &reduceOutTiles);
+                                         &reduceRowBufs, &reduceOutTiles, &axis1IndexPasses);
       g_replayOriginalReduceCones = true;
       auto preReduceResult = mlir::applyPartialConversion(
           moduleOp, reduceTarget, std::move(reducePatterns));
@@ -45863,7 +46156,7 @@ struct ConvertTritonGPUToMetalPass
     // ReduceLowering needs the (reduce op)->staged tile mapping that
     // `preprocessLoopCarriedReduceTiles` built above.
     patterns.add<ReduceLowering>(typeConverter, ctx, &loopCarriedTiles,
-                                 &reduceRowBufs, &reduceOutTiles);
+                                 &reduceRowBufs, &reduceOutTiles, &axis1IndexPasses);
     // Higher benefit so the rank >= 3 staged reduce is tried before the
     // rank-1/rank-2 specialisations decline it.
     patterns.add<ReduceRankNLowering>(typeConverter, ctx);

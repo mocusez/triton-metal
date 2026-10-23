@@ -729,6 +729,179 @@ def test_nearest_neighbor_3d_computed_min_argmin(n_points):
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
+@triton.jit
+def _axis1_two_pass_arg_extrema(In, IndexOut, ValueOut, M, N, Iterations, OutStride,
+                               BM: tl.constexpr, BN: tl.constexpr,
+                               IS_MIN: tl.constexpr, COMPUTED: tl.constexpr):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    for iteration in range(Iterations):
+        tile = tl.load(In + iteration * M * N + rows[:, None] * N + cols[None, :],
+                       mask=mask, other=float("nan"))
+        if COMPUTED:
+            tile = tile * 2.0
+        if IS_MIN:
+            index = tl.argmin(tile, axis=1)
+            value = tl.min(tile, axis=1)
+        else:
+            index = tl.argmax(tile, axis=1)
+            value = tl.max(tile, axis=1)
+        tl.store(IndexOut + iteration * OutStride + rows, index, mask=rows < M)
+        tl.store(ValueOut + iteration * OutStride + rows, value, mask=rows < M)
+
+
+@pytest.mark.parametrize("is_min", [True, False], ids=["argmin", "argmax"])
+@pytest.mark.parametrize("computed", [False, True], ids=["direct", "computed"])
+@pytest.mark.parametrize("BN, num_warps, iterations", [
+    (64, 1, 1), (1024, 4, 1), (1024, 1, 3), (64, 4, 2),
+])
+def test_reduce_axis1_two_pass_arg_extrema(BN, num_warps, iterations, computed, is_min):
+    # The i32 index pass must read the f32 extremum for its own row, including
+    # inside a runtime loop whose input and winning column change each trip.
+    BM, guard = 16, 11
+    M, N = BM + 7, BN - 7
+    patterns = torch.tensor([
+        [3., -4., 3., -4., 1.],             # tied finite extrema
+        [float("nan"), 2., -3., float("nan"), 4.],
+        [float("nan")] * 5,
+        [float("inf")] * 5,
+        [-float("inf")] * 5,
+        [-0., 0., -0., 0., -0.],
+        [0.] * 5,
+        [0.] * 5,
+    ], dtype=torch.float32)[:, torch.arange(N) % 5]
+    # Winners near the end also exercise the complete wide-column fold.
+    patterns[6, N - 3], patterns[6, N - 2] = -9., 7.
+    patterns[7, N - 4], patterns[7, N - 1] = -8., 9.
+    tile = patterns[torch.arange(M) % patterns.shape[0]]
+    source = torch.stack([tile.roll(i * (N // 3), dims=1) for i in range(iterations)])
+    stride = M + 2 * guard
+    indices = torch.full((iterations * stride,), -12345, dtype=torch.int32, device="mps")
+    values = torch.full((iterations * stride,), 12345., dtype=torch.float32, device="mps")
+    _axis1_two_pass_arg_extrema[(triton.cdiv(M, BM),)](
+        source.to("mps"), indices[guard:], values[guard:], M, N, iterations, stride,
+        BM=BM, BN=BN, IS_MIN=is_min, COMPUTED=computed, num_warps=num_warps,
+    )
+    torch.mps.synchronize()
+
+    reference = source * 2.0 if computed else source
+    is_nan = reference.isnan()
+    identity = float("inf") if is_min else -float("inf")
+    finite = reference.masked_fill(is_nan, identity)
+    extrema = finite.amin(dim=2) if is_min else finite.amax(dim=2)
+    all_nan = is_nan.all(dim=2)
+    extrema = extrema.masked_fill(all_nan, float("nan"))
+    matches = torch.where(all_nan[:, :, None], is_nan, reference == extrema[:, :, None])
+    expected_indices = torch.where(matches, torch.arange(N)[None, None, :], 0x7fffffff).amin(dim=2)
+    actual_indices = indices.cpu().reshape(iterations, stride)
+    actual_values = values.cpu().reshape(iterations, stride)
+    torch.testing.assert_close(actual_indices[:, guard:guard + M], expected_indices.to(torch.int32),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(actual_values[:, guard:guard + M], extrema, atol=0, rtol=0, equal_nan=True)
+    for output, canary in ((actual_indices, -12345), (actual_values, 12345.)):
+        assert torch.all(output[:, :guard] == canary)
+        assert torch.all(output[:, guard + M:] == canary)
+
+
+@triton.jit
+def _axis1_argmin_source_snapshot(In, IndexOut, ValueOut,
+                                 BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    tile = tl.load(In + rows[:, None] * BN + cols[None, :])
+    value = tl.min(tile, axis=1)
+    # Both reductions use the original SSA tile, even after its backing memory
+    # has changed. Replaying the load after this write would pick another index.
+    tl.store(In + rows * BN, 1000.0)
+    index = tl.argmin(tile, axis=1)
+    tl.store(IndexOut + rows, index)
+    tl.store(ValueOut + rows, value)
+
+
+@triton.jit
+def _axis1_argmin_source_snapshot_loop(In, IndexOut, ValueOut, Iterations,
+                                      BM: tl.constexpr, BN: tl.constexpr):
+    for iteration in range(Iterations):
+        _axis1_argmin_source_snapshot(In, IndexOut, ValueOut, BM=BM, BN=BN)
+
+
+@pytest.mark.parametrize("in_loop", [False, True], ids=["top_level", "loop_rejected"])
+def test_reduce_axis1_argmin_preserves_source_snapshot(capfd, in_loop):
+    BM, BN, guard = 16, 1024, 11
+    original = torch.arange(BM * BN, dtype=torch.float32).reshape(BM, BN) + 1.0
+    original[:, 0] = -10.0
+    source = original.to("mps")
+    indices = torch.full((BM + 2 * guard,), -12345, dtype=torch.int32, device="mps")
+    values = torch.full((BM + 2 * guard,), 12345., dtype=torch.float32, device="mps")
+    if in_loop:
+        with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+            _axis1_argmin_source_snapshot_loop[(1,)](
+                source, indices[guard:], values[guard:], 2, BM=BM, BN=BN, num_warps=4,
+            )
+        diagnostic = capfd.readouterr()
+        assert "rank-2 axis=1 reduce over a computed cone" in diagnostic.err + diagnostic.out
+        torch.testing.assert_close(source.cpu(), original, atol=0, rtol=0)
+        assert torch.all(indices.cpu() == -12345)
+        assert torch.all(values.cpu() == 12345.)
+        return
+
+    _axis1_argmin_source_snapshot[(1,)](
+        source, indices[guard:], values[guard:], BM=BM, BN=BN, num_warps=4,
+    )
+    torch.mps.synchronize()
+    actual_indices, actual_values = indices.cpu(), values.cpu()
+    assert torch.all(actual_indices[guard:guard + BM] == 0)
+    assert torch.all(actual_values[guard:guard + BM] == -10.)
+    for output, canary in ((actual_indices, -12345), (actual_values, 12345.)):
+        assert torch.all(output[:guard] == canary)
+        assert torch.all(output[guard + BM:] == canary)
+    original[:, 0] = 1000.
+    torch.testing.assert_close(source.cpu(), original, atol=0, rtol=0)
+
+
+@triton.jit
+def _axis1_arg_extrema_loop_reexpanded(In, IndexOut, ValueOut, TileOut, Iterations,
+                                      BM: tl.constexpr, BN: tl.constexpr,
+                                      LEAK_INDEX: tl.constexpr):
+    rows = tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    value = tl.zeros((BM,), tl.float32)
+    index = tl.zeros((BM,), tl.int32)
+    for iteration in range(Iterations):
+        tile = tl.load(In + iteration * BM * BN + rows[:, None] * BN + cols[None, :])
+        value = tl.min(tile, axis=1)
+        index = tl.argmin(tile, axis=1)
+    tl.store(IndexOut + rows, index)
+    tl.store(ValueOut + rows, value)
+    if LEAK_INDEX:
+        expanded = index[:, None].to(tl.float32) + tl.zeros((BM, BN), tl.float32)
+    else:
+        expanded = value[:, None] + tl.zeros((BM, BN), tl.float32)
+    tl.store(TileOut + rows[:, None] * BN + cols[None, :], expanded)
+
+
+@pytest.mark.parametrize("leak_index", [False, True], ids=["value", "index"])
+def test_reduce_axis1_loop_carried_reexpanded_result_is_named(capfd, leak_index):
+    # Follow the row value through scf.yield and the parent loop result before
+    # deciding whether the index pass has only row-vector consumers.
+    BM, BN = 16, 1024
+    source = torch.randn(2, BM, BN, device="mps")
+    indices = torch.full((BM,), -12345, dtype=torch.int32, device="mps")
+    values = torch.full((BM,), 12345., dtype=torch.float32, device="mps")
+    expanded = torch.full((BM, BN), 12345., dtype=torch.float32, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _axis1_arg_extrema_loop_reexpanded[(1,)](
+            source, indices, values, expanded, 2,
+            BM=BM, BN=BN, LEAK_INDEX=leak_index, num_warps=4,
+        )
+    diagnostic = capfd.readouterr()
+    assert "rank-2 axis=1 reduce over a computed cone" in diagnostic.err + diagnostic.out
+    assert torch.all(indices.cpu() == -12345)
+    assert torch.all(values.cpu() == 12345.)
+    assert torch.all(expanded.cpu() == 12345.)
+
+
 # --- Bitwise integer combines along axis=1 --------------------------------
 #
 # Same three monoids as the rank-1 case (see

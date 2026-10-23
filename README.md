@@ -692,6 +692,14 @@ The current dependency-ordered priorities are:
    results must still refer to the same column. Scalar-staged dependencies
    reached through a transpose or shape-changing reshape, and reductions over
    an axis of extent 1, remain rejected.
+   Axis-1 f32 arg extrema also support two-pass index folds over wide replayable
+   tiles. Both passes run before tensor producers are scalarized; the index
+   pass reads the preceding row extrema by logical row and uses a bounded i32
+   loop. Other live consumers must remain row vectors, including through loop
+   state. Top-level replay preserves loaded values across later stores; user
+   loops with unsafe intervening writes or externally loaded values that may
+   be overwritten remain rejected. General computed i32 reductions retain
+   their existing direct-load or scan-publication requirements.
 2. Expand layout conversion, including the shared tile mapping needed for
    cross-lane transpose. Top-level single-value rank >= 2 scans now support
    multiple elements per thread. Rank >= 2 tuple scans now support f32/i32
