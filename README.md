@@ -762,9 +762,9 @@ The current dependency-ordered priorities are:
    plain sources too, with unsigned comparisons over unchanged 32-bit values.
    A single-band rank-2 scan whose tile exactly fills its threadgroup also
    supports mixed row-vector stores and original-tile broadcasts of a same-source
-   f32 row sum, product or NaN-propagating min/max, with 2..64 rows and columns.
-   Separate row folds preserve each consumer's result mapping. Sums and
-   NaN-propagating extrema accept replayable masked/computed sources; products
+   f32 row sum, product or min/max under either NaN policy, with 2..64 rows and
+   columns. Separate row folds preserve each consumer's result mapping. Sums and
+   extrema accept replayable masked/computed sources; products
    require a direct unmasked load. These reductions
    require no intervening device writes between source loads and
    the reduction; writes after its outputs are supported. Its complete emitted

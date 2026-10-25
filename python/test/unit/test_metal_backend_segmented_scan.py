@@ -8064,6 +8064,10 @@ def _unsupported_single_band_mixed_row_product_kernel(
         reduced = tl.reduce(x, 1, _mixed_row_minimum_combine)
     elif REDUCTION == "max":
         reduced = tl.reduce(x, 1, _mixed_row_maximum_combine)
+    elif REDUCTION == "minnum":
+        reduced = tl.min(x, 1)
+    elif REDUCTION == "maxnum":
+        reduced = tl.max(x, 1)
     else:
         reduced = tl.reduce(x, 1, _i32_column_product_combine)
     if MODE == 7:
@@ -8121,6 +8125,10 @@ def _single_band_mixed_row_sum_many_results_kernel(
         reduced = tl.reduce(x, 1, _mixed_row_minimum_combine)
     elif REDUCTION == "max":
         reduced = tl.reduce(x, 1, _mixed_row_maximum_combine)
+    elif REDUCTION == "minnum":
+        reduced = tl.min(x, 1)
+    elif REDUCTION == "maxnum":
+        reduced = tl.max(x, 1)
     else:
         reduced = tl.sum(x, 1)
     tl.store(Row + row, reduced)
@@ -8541,7 +8549,7 @@ def test_multiband_scan_shared_input_mixed_row_product_special_values_match_torc
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps", [
     (2, 64, 0, 4), (4, 8, 1, 1), (16, 8, 1, 4),
 ])
@@ -8554,7 +8562,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_baseline_matches_torch
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("tile_first", [False, True], ids=["row_first", "tile_first"])
 @pytest.mark.parametrize(
     "rows,columns,scan_axis,num_warps,reverse,row_masked,full_output,multiple,snapshot_after", [
@@ -8581,7 +8589,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_matches_torch(
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("masked,computed", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,tile_first", [
     (2, 64, 0, 4, False), (4, 16, 1, 2, True),
@@ -8597,7 +8605,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_replays_sources(
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps", [(2, 64, 0, 4), (4, 8, 1, 1)])
 def test_single_band_scan_shared_input_mixed_row_extremum_separates_result_layouts(
         reduction, rows, columns, scan_axis, num_warps):
@@ -8612,7 +8620,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_separates_result_layou
     assert msl.count("threadgroup_barrier(") == 4, msl
 
 
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("masked,computed", [(False, False), (True, False), (False, True), (True, True)])
 def test_single_band_scan_shared_input_mixed_row_extremum_snapshot_before_is_named(reduction, masked, computed):
     result = _compile_rankn_nested_negative_in_child(
@@ -8630,7 +8638,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_snapshot_before_is_nam
             "without intervening writes or input exchanges") in output, output
 
 
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,mode", [
     (8, 8, 0, 2, 3),
     (2, 128, 0, 8, -1),
@@ -8655,7 +8663,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_consumer_is_named(
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 def test_single_band_scan_shared_input_mixed_row_extremum_counts_all_result_scratch(reduction):
     rows, columns, extras = 64, 2, 2
     x = (torch.arange(rows * columns).reshape(rows, columns) % 17).float() / 8
@@ -8684,7 +8692,7 @@ def test_single_band_scan_shared_input_mixed_row_extremum_counts_all_result_scra
     assert (additional.cpu()[extras * rows:] == sentinel).all()
 
 
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 def test_single_band_scan_shared_input_mixed_row_extremum_total_budget_is_named(reduction):
     result = _compile_rankn_nested_negative_in_child(
         "_single_band_mixed_row_sum_many_results_kernel",
@@ -8863,7 +8871,7 @@ def _check_mixed_row_extremum_special_values(reduction, columns, scan_axis, num_
 
 
 @mps_only
-@pytest.mark.parametrize("reduction", ["min", "max"])
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
 @pytest.mark.parametrize("columns,scan_axis,num_warps,reverse", [(2, 1, 1, False), (8, 0, 4, True)])
 def test_single_band_scan_shared_input_mixed_row_extremum_special_values_match_torch(
         reduction, columns, scan_axis, num_warps, reverse):

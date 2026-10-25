@@ -17707,8 +17707,8 @@ static mlir::LogicalResult preprocessSingleBandMixedScanRowReductions(
         reduce.getAxis() != 1 ||
         g_rankNPlannedReduces.count(reduce.getOperation()) ||
         !mlir::isa_and_nonnull<mlir::arith::AddFOp, mlir::arith::MulFOp,
-                              mlir::arith::MaximumFOp,
-                              mlir::arith::MinimumFOp>(
+                              mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
+                              mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(
             reduceCombineBinaryOp(reduce)))
       continue;
     auto type = mlir::dyn_cast<mlir::RankedTensorType>(
