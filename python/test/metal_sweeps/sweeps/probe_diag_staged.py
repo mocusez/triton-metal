@@ -153,6 +153,208 @@ def run(R, C, w):
     check("scanbcast", y, v.cpu().cumsum(0)[None, :] + torch.arange(R).float()[:, None])
 """
 
+# A scalar atomic old value crosses a rank-2 scan's phase boundary.
+SCAN_ATOMIC_OLD = CHECK + """
+@triton.jit
+def k(X, CNT, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    old = tl.atomic_add(CNT, 1.0)
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1) + old)
+
+def run(R, C, w):
+    x = torch.randn(R, C, device="mps"); cnt = torch.zeros(1, device="mps")
+    y = torch.zeros_like(x)
+    k[(1,)](x, cnt, y, R, C, num_warps=w); torch.mps.synchronize()
+    check("scan atomic old", y, x.cpu().cumsum(1))
+"""
+
+# The effecting value is shared by the source cone and the post-scan phase.
+SCAN_EFFECT_SHARED = CHECK + """
+@triton.jit
+def k(X, CNT, BEFORE, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    old = tl.atomic_add(CNT, 1.0)
+    tl.store(BEFORE, old)
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x + old, 1) + old)
+
+def run(R, C, w):
+    x = torch.randn(R, C, device="mps"); cnt = torch.zeros(1, device="mps")
+    before = torch.zeros(1, device="mps"); y = torch.zeros_like(x)
+    k[(1,)](x, cnt, before, y, R, C, num_warps=w); torch.mps.synchronize()
+    check("scan shared effect", y, x.cpu().cumsum(1)); check("scan old store", before, torch.zeros(1))
+"""
+
+# One wide rank-1 scan feeds two rank-2 tiles with different shapes.
+WIDE_TWO_CONSUMERS = CHECK + """
+@triton.jit
+def k(V, Y, Z, R: tl.constexpr, R2: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); r2 = tl.arange(0, R2); c = tl.arange(0, C)
+    s = tl.cumsum(tl.load(V + c), 0)
+    tl.store(Y + r[:, None] * C + c[None, :], s[None, :] + r[:, None].to(tl.float32))
+    tl.store(Z + r2[:, None] * C + c[None, :], s[None, :] + 2.0 * r2[:, None].to(tl.float32))
+
+def run(R, R2, C, w):
+    v = torch.randn(C, device="mps"); y = torch.zeros(R, C, device="mps")
+    z = torch.zeros(R2, C, device="mps")
+    k[(1,)](v, y, z, R, R2, C, num_warps=w); torch.mps.synchronize()
+    s = v.cpu().cumsum(0)
+    check("wide consumer 1", y, s[None, :] + torch.arange(R).float()[:, None])
+    check("wide consumer 2", z, s[None, :] + 2 * torch.arange(R2).float()[:, None])
+"""
+
+# The same wide scan broadcast is consumed through a real transpose.
+WIDE_TRANS_CONSUMER = CHECK + """
+@triton.jit
+def k(V, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    s = tl.cumsum(tl.load(V + c), 0)
+    tile = s[None, :] + r[:, None].to(tl.float32)
+    tl.store(Y + c[:, None] * R + r[None, :], tl.trans(tile))
+
+def run(R, C, w):
+    v = torch.randn(C, device="mps"); y = torch.zeros(C, R, device="mps")
+    k[(1,)](v, y, R, C, num_warps=w); torch.mps.synchronize()
+    want = (v.cpu().cumsum(0)[None, :] + torch.arange(R).float()[:, None]).t()
+    check("wide trans consumer", y, want)
+"""
+
+# Range-only source and consumers exercise every range in a staged phase.
+STAGED_RANGE_ONLY = CHECK + """
+@triton.jit
+def k(Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = (r[:, None] * C + c[None, :]).to(tl.float32)
+    s = tl.cumsum(x, 1)
+    tl.store(Y + r[:, None] * C + c[None, :], s + r[:, None] + c[None, :])
+
+def run(R, C, w):
+    y = torch.zeros(R, C, device="mps")
+    k[(1,)](y, R, C, num_warps=w); torch.mps.synchronize()
+    r = torch.arange(R).float(); c = torch.arange(C).float()
+    x = r[:, None] * C + c[None, :]
+    check("range only", y, x.cumsum(1) + r[:, None] + c[None, :])
+"""
+
+# A staged scan result has a transposed consumer.
+STAGED_TRANS_CONSUMER = CHECK + """
+@triton.jit
+def k(X, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    tl.store(Y + c[:, None] * R + r[None, :], tl.trans(tl.cumsum(x, 1)))
+
+def run(R, C, w):
+    x = torch.randn(R, C, device="mps"); y = torch.zeros(C, R, device="mps")
+    k[(1,)](x, y, R, C, num_warps=w); torch.mps.synchronize()
+    check("staged trans consumer", y, x.cpu().cumsum(1).t())
+"""
+
+# A same-shape tile with transposed addressing gives the scan a different-layout consumer.
+STAGED_DIFFERENT_TILE = CHECK + """
+@triton.jit
+def k(X, Q, Y, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :])
+    q = tl.load(Q + c[None, :] * R + r[:, None])
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1) + q)
+
+def run(R, C, w):
+    x = torch.randn(R, C, device="mps"); q = torch.randn(C, R, device="mps")
+    y = torch.zeros_like(x)
+    k[(1,)](x, q, y, R, C, num_warps=w); torch.mps.synchronize()
+    check("different tile", y, x.cpu().cumsum(1) + q.cpu().t())
+"""
+
+# An effecting value is shared before and after a staged rank-N reduction.
+R3_EFFECT_SHARED = CHECK + """
+@triton.jit
+def k(X, CNT, BEFORE, Y, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A); b = tl.arange(0, B); c = tl.arange(0, C)
+    old = tl.atomic_add(CNT, 1.0)
+    tl.store(BEFORE, old)
+    x = tl.load(X + a[:, None, None] * (B * C) + b[None, :, None] * C + c[None, None, :])
+    tl.store(Y + a[:, None] * B + b[None, :], tl.sum(x, 2) + old)
+
+def run(A, B, C, w):
+    x = torch.randn(A, B, C, device="mps"); cnt = torch.zeros(1, device="mps")
+    before = torch.zeros(1, device="mps"); y = torch.zeros(A, B, device="mps")
+    k[(1,)](x, cnt, before, y, A, B, C, num_warps=w); torch.mps.synchronize()
+    check("r3 shared effect", y, x.cpu().sum(2)); check("r3 old store", before, torch.zeros(1))
+"""
+
+# Valid computed scan/reduce forms exercise the publication planner end-to-end.
+SCAN_INPUT_PRODUCT = CHECK + """
+@triton.jit
+def combine(a, b):
+    return a * b
+
+@triton.jit
+def k(X, Y, Z, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :]) * 0.5 + 1.0
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1))
+    tl.store(Z + c, tl.reduce(x, 0, combine))
+
+def run(R, C, w):
+    x = torch.randn(R, C, device="mps"); y = torch.zeros_like(x)
+    z = torch.zeros(C, device="mps"); xc = x.cpu() * 0.5 + 1.0
+    k[(1,)](x, y, z, R, C, num_warps=w); torch.mps.synchronize()
+    check("scan input product", y, xc.cumsum(1)); check("column product", z, xc.prod(0))
+"""
+
+SCAN_INPUT_BITWISE = CHECK + """
+@triton.jit
+def combine(a, b):
+    return a ^ b
+
+@triton.jit
+def k(X, Y, Z, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :]) * 3 + 1
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1))
+    tl.store(Z + c, tl.reduce(x, 0, combine))
+
+def run(R, C, w):
+    x = torch.randint(0, 100, (R, C), dtype=torch.int32, device="mps")
+    y = torch.zeros_like(x); z = torch.zeros(C, dtype=torch.int32, device="mps")
+    k[(1,)](x, y, z, R, C, num_warps=w); torch.mps.synchronize()
+    xc = x.cpu() * 3 + 1; want = xc[0]
+    for row in range(1, R):
+        want = want ^ xc[row]
+    check("scan input bitwise", y, xc.cumsum(1)); check("column xor", z, want)
+"""
+
+SCAN_INPUT_UNSIGNED = CHECK + """
+@triton.jit
+def k(X, Y, Z, R: tl.constexpr, C: tl.constexpr):
+    r = tl.arange(0, R); c = tl.arange(0, C)
+    x = tl.load(X + r[:, None] * C + c[None, :]).to(tl.uint32, bitcast=True) * 3 + 1
+    tl.store(Y + r[:, None] * C + c[None, :], tl.cumsum(x, 1).to(tl.int32, bitcast=True))
+    tl.store(Z + c, tl.min(x, 0).to(tl.int32, bitcast=True))
+
+def run(R, C, w):
+    x = torch.randint(0, 100, (R, C), dtype=torch.int32, device="mps")
+    y = torch.zeros_like(x); z = torch.zeros(C, dtype=torch.int32, device="mps")
+    k[(1,)](x, y, z, R, C, num_warps=w); torch.mps.synchronize()
+    xc = x.cpu() * 3 + 1
+    check("scan input unsigned", y, xc.cumsum(1)); check("column umin", z, xc.min(0).values)
+"""
+
+for w in (1, 4):
+    P.PROBES[f"scan_atomic_old_8x64_w{w}"] = SCAN_ATOMIC_OLD + f"run(8, 64, {w})\n"
+    P.PROBES[f"scan_effect_shared_8x64_w{w}"] = SCAN_EFFECT_SHARED + f"run(8, 64, {w})\n"
+    P.PROBES[f"wide_two_consumers_4_8x256_w{w}"] = WIDE_TWO_CONSUMERS + f"run(4, 8, 256, {w})\n"
+    P.PROBES[f"wide_trans_consumer_4x256_w{w}"] = WIDE_TRANS_CONSUMER + f"run(4, 256, {w})\n"
+    P.PROBES[f"staged_range_only_8x64_w{w}"] = STAGED_RANGE_ONLY + f"run(8, 64, {w})\n"
+    P.PROBES[f"staged_trans_consumer_8x64_w{w}"] = STAGED_TRANS_CONSUMER + f"run(8, 64, {w})\n"
+    P.PROBES[f"staged_different_tile_8x64_w{w}"] = STAGED_DIFFERENT_TILE + f"run(8, 64, {w})\n"
+    P.PROBES[f"r3_effect_shared_4x8x16_w{w}"] = R3_EFFECT_SHARED + f"run(4, 8, 16, {w})\n"
+    P.PROBES[f"scan_input_product_8x64_w{w}"] = SCAN_INPUT_PRODUCT + f"run(8, 64, {w})\n"
+    P.PROBES[f"scan_input_bitwise_8x64_w{w}"] = SCAN_INPUT_BITWISE + f"run(8, 64, {w})\n"
+    P.PROBES[f"scan_input_unsigned_8x64_w{w}"] = SCAN_INPUT_UNSIGNED + f"run(8, 64, {w})\n"
+
 for ax in (0, 1):
     for (R, C, N) in ((4, 32, 64), (16, 16, 256), (8, 64, 1024), (32, 8, 128)):
         for w in (1, 4):

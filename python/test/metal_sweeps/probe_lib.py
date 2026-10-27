@@ -102,7 +102,7 @@ def classify(rc, out, err):
              if ("Unexpected dtype" in l or "not supported" in l
                  or "AttributeError" in l or "TypeError" in l
                  or "ValueError" in l or "unsupported AST" in l
-                 or "must be" in l)]
+                 or "cannot cast" in l or "must be" in l)]
     if front and "convert-tritongpu-to-metal" not in err:
         return "FRONT", front[-1].strip()[:150]
     tail = [l for l in err.strip().splitlines() if l.strip()]

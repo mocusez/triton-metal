@@ -19,8 +19,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -1317,7 +1317,7 @@ def _rank3_reduce_bcast_flat_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
     tl.store(O + f, tl.reshape(back, (A * B * C,)))
 
 
-def _refusal_child(tmp_path, name, body, timeout=300):
+def _refusal_child(tmp_path, name, body, timeout=300, module_path=None):
     """Run the kernel in a child, through the JIT.
 
     Two reasons, and the second cost a round of red tests. The named reason is
@@ -1339,7 +1339,7 @@ def _refusal_child(tmp_path, name, body, timeout=300):
         import torch
         import triton
         spec = importlib.util.spec_from_file_location(
-            "reduce_consumer_child", {str(Path(__file__).resolve())!r})
+            "reduce_consumer_child", {str(Path(module_path or __file__).resolve())!r})
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     """) + textwrap.dedent(body))
@@ -1550,3 +1550,153 @@ def test_rank2_axis1_argmin_at_one_row_per_thread_matches_torch(num_warps, form)
                                      FORM=form, num_warps=num_warps)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), x.argmin(dim=1).to(torch.int32))
+
+
+# ---------------------------------------------------------------------------
+# Reachable preflight diagnostics must stay named, non-fatal, and recoverable.
+
+
+@triton.jit
+def _rank2_sum_i64_kernel(X, O, M: tl.constexpr, N: tl.constexpr):
+    r = tl.arange(0, M)
+    c = tl.arange(0, N)
+    v = tl.load(X + r[:, None] * N + c[None, :])
+    tl.store(O + r, tl.sum(v, 1))
+
+
+@triton.jit
+def _column_sum_plus_load_broadcast_kernel(X, Y, O, M: tl.constexpr,
+                                           N: tl.constexpr):
+    r = tl.arange(0, M)
+    c = tl.arange(0, N)
+    v = tl.load(X + r[:, None] * N + c[None, :])
+    s = tl.sum(v, 0) + tl.load(Y + c)
+    tl.store(O + r[:, None] * N + c[None, :], s[None, :])
+
+
+@triton.jit
+def _i8_scalar_iter_arg_kernel(X, O, n):
+    acc = tl.load(X)
+    for i in range(1, n):
+        acc += tl.load(X + i)
+    tl.store(O, acc)
+
+
+@triton.jit
+def _rank1_max_beside_tile_kernel(X, Max, Y, O, M: tl.constexpr,
+                                  N: tl.constexpr):
+    r = tl.arange(0, M)
+    c = tl.arange(0, N)
+    v = tl.load(X + c)
+    tl.store(Max, tl.max(v, 0))
+    tile = tl.load(Y + r[:, None] * N + c[None, :])
+    tl.store(O + r[:, None] * N + c[None, :], tile)
+
+
+@triton.jit
+def _first_nonzero_combine(a, b):
+    return tl.where(a != 0, a, b)
+
+
+@triton.jit
+def _rank2_noncommutative_reduce_kernel(X, O, M: tl.constexpr,
+                                        N: tl.constexpr):
+    r = tl.arange(0, M)
+    c = tl.arange(0, N)
+    v = tl.load(X + r[:, None] * N + c[None, :])
+    tl.store(O + r, tl.reduce(v, 1, _first_nonzero_combine))
+
+
+_P0_REFUSALS = {
+    "rank2_noncommutative_combine": (
+        "reduce combine is neither a single binary op",
+        """
+        x = torch.zeros(16, 8, dtype=torch.int32, device="mps")
+        out = torch.zeros(16, dtype=torch.int32, device="mps")
+        try:
+            module._rank2_noncommutative_reduce_kernel[(1,)](
+                x, out, M=16, N=8, num_warps=1)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("rank-2 noncommutative reduce compiled")
+        """,
+    ),
+    "rank2_i64_sum": (
+        "reduce dtype must be f32 or i32 in Session L3",
+        """
+        x = torch.zeros(16, 8, dtype=torch.int64, device="mps")
+        out = torch.zeros(16, dtype=torch.int64, device="mps")
+        try:
+            module._rank2_sum_i64_kernel[(1,)](x, out, M=16, N=8)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("rank-2 i64 sum compiled")
+        """,
+    ),
+    "mixed_column_sum_and_load": (
+        "metal: rank-1 cone mixes a column-reduce result with a device load / "
+        "make_range; one per-thread scalar cannot hold both element conventions",
+        """
+        x = torch.zeros(4, 64, device="mps")
+        y = torch.zeros(64, device="mps")
+        out = torch.zeros(4, 64, device="mps")
+        try:
+            module._column_sum_plus_load_broadcast_kernel[(1,)](
+                x, y, out, M=4, N=64, num_warps=2)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("mixed rank-1 broadcast cone compiled")
+        """,
+    ),
+    "i8_scalar_iter_arg": (
+        "Metal backend: scf.for iter_arg must be a scalar "
+        "f32/f16/bf16/i32/i64/i1 accumulator or simdgroup_matrix after conversion",
+        """
+        x = torch.zeros(8, dtype=torch.int8, device="mps")
+        out = torch.zeros((), dtype=torch.int8, device="mps")
+        try:
+            module._i8_scalar_iter_arg_kernel[(1,)](x, out, 8)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("i8 scalar iter_arg compiled")
+        """,
+    ),
+    "rank1_max_beside_tile": (
+        "Metal backend retained a live tensor from a clone-only rank-1 aggregate cone",
+        """
+        x = torch.zeros(64, device="mps")
+        maximum = torch.zeros((), device="mps")
+        y = torch.zeros(4, 64, device="mps")
+        out = torch.zeros(4, 64, device="mps")
+        try:
+            module._rank1_max_beside_tile_kernel[(1,)](
+                x, maximum, y, out, M=4, N=64, num_warps=2)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("live clone-only rank-1 cone compiled")
+        """,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_P0_REFUSALS))
+def test_p0_diagnostic_is_named_and_compilation_recovers(case, tmp_path):
+    needle, body = _P0_REFUSALS[case]
+    result, output = _refusal_child(tmp_path, case, body + """
+        x = torch.arange(32, dtype=torch.float32, device="mps").reshape(8, 4)
+        out = torch.empty(8, device="mps")
+        module._sum_affine[(1,)](x, out, M=8, N=4)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out.cpu(), (x.cpu() * 2.0 + 1.0).sum(dim=1))
+        print("RECOVERED")
+    """)
+    assert result.returncode == 0, output
+    expected_diagnostics = 4 if case == "rank1_max_beside_tile" else 1
+    assert result.stderr.count(needle) == expected_diagnostics, output
+    assert "RECOVERED" in result.stdout, output
+    assert "failed to legalize" not in output, output

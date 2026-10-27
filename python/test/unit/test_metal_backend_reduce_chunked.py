@@ -19,8 +19,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -197,3 +197,33 @@ def test_reduce_axis1_row_stride_multi_program(base_mode, programs, M, N,
         flat, out, row_stride, prog_stride, BLOCK_M=M, BLOCK_N=N,
         BASE_MODE=base_mode, num_warps=4)
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_reduce_axis1_row_buffer_budget_is_refused_then_recovers(tmp_path):
+    from test_metal_backend_reduce_rank2_computed import _refusal_child
+
+    result, output = _refusal_child(tmp_path, "row_buffer_budget", """
+        x = torch.zeros(16384, 2, device="mps")
+        out = torch.zeros(16384, device="mps")
+        try:
+            module.reduce_sum_axis1_kernel[(1,)](
+                x, out, BLOCK_M=16384, BLOCK_N=2)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("an over-budget row buffer compiled")
+
+        x = torch.arange(
+            8192 * 2, dtype=torch.float32, device="mps").reshape(8192, 2)
+        out = torch.empty(8192, device="mps")
+        module.reduce_sum_axis1_kernel[(1,)](
+            x, out, BLOCK_M=8192, BLOCK_N=2)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out, x.sum(dim=1))
+        print("RECOVERED")
+    """, module_path=__file__)
+    needle = "per-row size exceeds 32 KiB; chunking impossible"
+    assert result.returncode == 0, output
+    assert result.stderr.count(needle) == 1, output
+    assert "RECOVERED" in result.stdout, output
+    assert "failed to legalize" not in output, output

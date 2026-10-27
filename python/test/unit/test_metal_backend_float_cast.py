@@ -284,3 +284,28 @@ def test_fp8_load_decodes_every_bit_pattern(e5):
             assert got[i] != got[i], (i, got[i].item())
         else:
             assert got[i] == want[i], (i, got[i].item(), want[i].item())
+
+
+@triton.jit
+def _fp8_between_formats_kernel(X, Out, N: tl.constexpr):
+    i = tl.arange(0, N)
+    v = tl.load(X + i)
+    tl.store(Out + i, v.to(tl.float8e5))
+
+
+def test_fp8_between_formats_is_named_then_compilation_recovers(capfd):
+    n = 64
+    x = torch.ones(n, dtype=torch.uint8, device="mps").view(torch.float8_e4m3fn)
+    out = torch.zeros(n, dtype=torch.uint8, device="mps").view(torch.float8_e5m2)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _fp8_between_formats_kernel[(1,)](x, out, n, num_warps=1)
+    diagnostic = capfd.readouterr()
+    needle = ("fp8 conversion is implemented with fp8 on exactly one side "
+              "(f32/f16/bf16 on the other)")
+    assert needle in diagnostic.err + diagnostic.out
+
+    survivor = torch.zeros(n, dtype=torch.float8_e4m3fn, device="mps")
+    _fp8_store_kernel[(1,)](torch.ones(n, device="mps"), survivor, n, False,
+                            num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(survivor.cpu().float(), torch.ones(n))

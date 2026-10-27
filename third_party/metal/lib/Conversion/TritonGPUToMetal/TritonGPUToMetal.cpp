@@ -17369,6 +17369,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       [&](mlir::triton::ReduceOp reduce) { inputReduces.push_back(reduce); });
   for (mlir::triton::ReduceOp reduce : inputReduces)
     classifyScanInputReduce(reduce);
+  llvm::DenseMap<mlir::Operation *, std::pair<int64_t, int>>
+      functionScanSignatures;
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
     auto func = scan->getParentOfType<mlir::triton::FuncOp>();
     if (!func || !phaseFunctions.count(func))
@@ -17377,13 +17379,21 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         mlir::cast<mlir::RankedTensorType>(scan.getSrcs().front().getType());
     if (type.getRank() < 2)
       return;
-    // All staged scans in this function share the exact coordinate system,
-    // including replicated one-band tiles beside a multi-band scan.
     scan->setAttr(kStagedScanPhaseAttr,
                   mlir::UnitAttr::get(moduleOp.getContext()));
-    if (phaseLayout(scan))
+    if (auto layout = phaseLayout(scan)) {
       scans.push_back(scan);
-    else {
+      auto [signature, inserted] = functionScanSignatures.try_emplace(
+          func.getOperation(), layout->elemPerThread, type.getRank());
+      auto [bandCount, rank] = signature->second;
+      bool rank2And3 = (rank == 2 && type.getRank() == 3) ||
+                       (rank == 3 && type.getRank() == 2);
+      if (!inserted && bandCount != layout->elemPerThread && rank2And3) {
+        scan.emitOpError("Metal backend: staged scans with different "
+                         "register-band counts cannot share a function phase");
+        valid = false;
+      }
+    } else {
       scan.emitOpError("Metal backend: mixed staged scans require top-level "
                        "exact-layout phases");
       valid = false;
@@ -35469,10 +35479,19 @@ static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value) {
     return std::nullopt;
   std::optional<LayoutIndexPlan> plan = planLayoutIndex(rtt);
   if (auto producer =
-          mlir::dyn_cast_or_null<mlir::triton::ReduceOp>(value.getDefiningOp()))
-    if (auto producerPlan = planRankNReduce(producer);
-        producerPlan && producerPlan->resultLayout.threadsPerBlock() > 1)
+          mlir::dyn_cast_or_null<mlir::triton::ReduceOp>(value.getDefiningOp())) {
+    auto producerPlan = planRankNReduce(producer);
+    if (producerPlan && producerPlan->resultLayout.threadsPerBlock() > 1) {
       plan = producerPlan->resultLayout;
+    } else if (!producerPlan && plan && producer.getAxis() == 0 &&
+               rtt.getRank() == 1) {
+      auto sourceTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          producer.getSrcs().front().getType());
+      if (sourceTy && sourceTy.getRank() == 2 &&
+          rtt.getDimSize(0) <= plan->threadsPerBlock())
+        plan = threadMajorLayoutPlan(rtt.getShape(), plan->threadsPerBlock());
+    }
+  }
   return plan;
 }
 
@@ -44601,59 +44620,20 @@ struct ConvertTritonGPUToMetalPass
         reduceOk = false;
         return;
       }
-      // 5) Per-row size check (L3 budget chunked-reduce).
-      //
-      // The 32 KiB threadgroup-memory budget is enforced ON THE STAGING
-      // BUFFER (`metal.threadgroup_alloca`). For in-budget tiles
-      // (`M*N*sizeof(T) ≤ 32 KiB`), `ReduceLowering` emits the L3a
-      // single-pass body (one alloca sized to `M*N`). For over-budget
-      // tiles, `ReduceLowering` emits the chunked body: one alloca sized
-      // to `M*chunk_size` (where `chunk_size = floor(32 KiB / (M*sizeof(T)))`),
-      // reused across `N_chunks = ceil(N/chunk_size)` unrolled passes via
-      // inter-chunk barriers. See
-      // the implementation notes.
-      //
-      // The only remaining pre-pass reject is when a single row already
-      // exceeds the budget (`M*sizeof(T) > 32 KiB` ⇒ `chunk_size = 0`);
-      // chunking can't help and a per-thread fan-in is out of envelope.
-      int64_t elemBytes = 0;
-      if (combineEltTy.isF32())
-        elemBytes = 4;
-      else if (mlir::isa<mlir::IntegerType>(combineEltTy))
-        elemBytes = 4;
+      // 5) Cooperative rank-2 row scans allocate one result slot per row.
+      // Reject a row buffer that cannot fit before conversion; unlike the old
+      // chunked staging design, the current scanner always uses this buffer,
+      // including when the reduction axis is fully owned by each thread.
+      int64_t elemBytes = (combineEltTy.getIntOrFloatBitWidth() + 7) / 8;
       int64_t perRowBytes = rtt.getDimSize(0) * elemBytes;
-      // L3a-tileloop carve-out: when the reduce axis is fully per-thread-
-      // owned (`threadsPerCTA[axis_dim] == 1`), the new branch in
-      // `ReduceLowering` emits a register-level chain and uses ZERO
-      // threadgroup memory, so the per-row budget reject doesn't apply.
-      // See spec AC.B1 and the per-thread branch comment in
-      // `ReduceLowering`.
-      bool perThreadOwned = false;
-      if (auto srcBlocked =
-              mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
-                  rtt.getEncoding())) {
-        auto tpW = srcBlocked.getThreadsPerWarp();
-        auto wpC = srcBlocked.getWarpsPerCTA();
-        if (tpW.size() == 2 && wpC.size() == 2 && tpW[1] * wpC[1] == 1) {
-          perThreadOwned = true;
-        }
-      }
-      // Wall 14: rank-1 reduce uses the per-thread serial pre-reduce +
-      // tpb-sized butterfly scratch (`metal.threadgroup_alloca : !metal.memref
-      // <256 x f32>`), NEVER the perRowBytes-sized staging buffer. The 32 KiB
-      // budget is irrelevant for rank-1; only rank-2 (which uses the staging
-      // alloca) needs the chunking gate. Without this exemption, the rank-1
-      // BLOCK > 8192 path is rejected here even though `lowerRank1Reduce` can
-      // handle it via bounded unroll.
+      // Rank-1 reduces instead use bounded per-thread folds and tpb-sized
+      // butterfly scratch, so this row-buffer limit does not apply to them.
       bool isRank1 = (rtt.getRank() == 1);
-      if (!isRank1 && !perThreadOwned && perRowBytes > 32 * 1024) {
+      if (!isRank1 && perRowBytes > 32 * 1024) {
         red.emitOpError("per-row size exceeds 32 KiB; chunking impossible");
         reduceOk = false;
         return;
       }
-      // L3a (Phase C) / L3 budget ship axis=1 f32/i32 reduce lowering via
-      // the `ReduceLowering` OpConversionPattern below. In-budget tiles hit
-      // the single-pass branch; over-budget tiles hit the chunked branch.
     });
     if (!reduceOk) {
       signalPassFailure();
@@ -44874,6 +44854,7 @@ struct ConvertTritonGPUToMetalPass
     };
     llvm::SmallVector<mlir::triton::BroadcastOp, 8>
         broadcastsNeedingPhasedExchange;
+    bool broadcastOk = true;
     moduleOp.walk([&](mlir::triton::BroadcastOp broadcast) {
       auto srcTy =
           mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getSrc().getType());
@@ -44893,9 +44874,10 @@ struct ConvertTritonGPUToMetalPass
       if (!srcPlan || !dstPlan)
         return;
       auto readPlan = planBroadcastReadIndex(srcTy, dstTy, *dstPlan);
-      if (!readPlan || layoutFlatIndexPlansEquivalent(*srcPlan, *readPlan))
+      if (!readPlan)
         return;
-      if (underDivergentControlFlow(broadcast) ||
+      if (layoutFlatIndexPlansEquivalent(*srcPlan, *readPlan) ||
+          underDivergentControlFlow(broadcast) ||
           srcPlan->threadsPerBlock() != dstPlan->threadsPerBlock())
         return;
       if (layoutRegisterIndexPlansEquivalent(*srcPlan, *readPlan) &&
@@ -44907,7 +44889,6 @@ struct ConvertTritonGPUToMetalPass
       }
       broadcastsNeedingPhasedExchange.push_back(broadcast);
     });
-    bool broadcastOk = true;
     for (auto broadcast : broadcastsNeedingPhasedExchange) {
       if (planTileExchange(broadcast.getOperation(),
                            /*allowGeneralPhase=*/true))
@@ -46073,6 +46054,45 @@ struct ConvertTritonGPUToMetalPass
         return;
       preReduceOps.insert(red.getOperation());
     });
+
+    bool independentBroadcastOk = true;
+    moduleOp.walk([&](mlir::triton::BroadcastOp broadcast) {
+      auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          broadcast.getSrc().getType());
+      auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getType());
+      if (!srcTy || !dstTy || srcTy.getRank() != 2 || dstTy.getRank() != 2 ||
+          srcTy.getNumElements() == dstTy.getNumElements() ||
+          !dstTy.getElementType().isF32() ||
+          llvm::any_of(broadcast->getUsers(), [](mlir::Operation *user) {
+            return mlir::isa<mlir::triton::AddPtrOp>(user);
+          }) ||
+          broadcastConeContainsReduce(broadcast.getSrc()))
+        return;
+      auto dstPlan = planLayoutIndex(dstTy);
+      if (!dstPlan)
+        return;
+      auto func = broadcast->getParentOfType<mlir::triton::FuncOp>();
+      int64_t dstE = dstTy.getNumElements() / dstPlan->threadsPerBlock();
+      bool hasNarrowerRankNPhase = llvm::any_of(
+          g_rankNReducePublish, [&](const auto &entry) {
+            if (entry.first
+                    ->template getParentOfType<mlir::triton::FuncOp>() != func)
+              return false;
+            auto plan = g_tileExchange.find(entry.second);
+            return plan != g_tileExchange.end() &&
+                   plan->second.src.elemPerThread < dstE;
+          });
+      if (!hasNarrowerRankNPhase)
+        return;
+      broadcast.emitOpError(
+          "Metal backend: this non-local tt.broadcast cannot be scheduled "
+          "as an exact-layout exchange");
+      independentBroadcastOk = false;
+    });
+    if (!independentBroadcastOk) {
+      signalPassFailure();
+      return;
+    }
 
     // Early-replay reductions, phased rank-N reductions, and loop-carried
     // gathers need the function shell converted before full conversion.  For

@@ -1144,3 +1144,23 @@ def test_reduce_axis0_masked_other_i32(op, other):
         num_warps=4)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), ref)
+
+
+@triton.jit
+def _colsum_broadcast_by_row(In, Out, BM: tl.constexpr, BN: tl.constexpr):
+    rows = tl.arange(0, BM)
+    cols = tl.arange(0, BN)
+    tile = tl.load(In + rows[:, None] * BN + cols[None, :])
+    sums = tl.sum(tile, axis=0)
+    tl.store(Out + rows[:, None] * BN + cols[None, :], sums[:, None])
+
+
+def test_reduce_axis0_result_broadcast_by_row_matches_torch():
+    block = 16
+    inp = torch.arange(block * block, dtype=torch.float32).reshape(block, block)
+    out = torch.zeros_like(inp, device="mps")
+    _colsum_broadcast_by_row[(1,)](inp.to("mps"), out, BM=block, BN=block,
+                                   num_warps=1)
+    torch.mps.synchronize()
+    expected = inp.sum(0)[:, None].expand(block, block)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)

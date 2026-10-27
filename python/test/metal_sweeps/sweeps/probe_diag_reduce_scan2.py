@@ -237,6 +237,39 @@ torch.mps.synchronize()
 print(o.cpu()[:4].tolist())
 """
 
+P.PROBES["fp8_cast_between_formats"] = """
+@triton.jit
+def k(X, O, N: tl.constexpr):
+    i = tl.arange(0, N)
+    v = tl.load(X + i).to(tl.float8e4nv, bitcast=False)
+    tl.store(O + i, v.to(tl.float8e5, bitcast=False))
+
+N = 64
+x = torch.ones(N, dtype=torch.float32, device="mps")
+o = torch.zeros(N, dtype=torch.float8_e5m2, device="mps")
+k[(1,)](x, o, N, num_warps=1)
+torch.mps.synchronize()
+if not torch.equal(o.cpu().float(), torch.ones(N)):
+    print("WRONG fp8 format conversion")
+"""
+
+P.PROBES["reduce_flattened_rank1_e256"] = """
+@triton.jit
+def k(X, O, M: tl.constexpr, N: tl.constexpr):
+    f = tl.arange(0, M * N)
+    v = tl.reshape(tl.load(X + f), (M, N))
+    flat = tl.reshape(v, (M * N,))
+    tl.store(O, tl.sum(flat, 0))
+
+M, N = 64, 128
+ref = torch.arange(M * N, dtype=torch.float32)
+o = torch.zeros(1, device="mps")
+k[(1,)](ref.to("mps"), o, M, N, num_warps=1)
+torch.mps.synchronize()
+if not torch.allclose(o.cpu(), ref.sum().reshape(1)):
+    print("WRONG flattened rank1 E256 reduce")
+"""
+
 P.PROBES["extern_elementwise_unknown_symbol"] = """
 @triton.jit
 def k(X, O, N: tl.constexpr):

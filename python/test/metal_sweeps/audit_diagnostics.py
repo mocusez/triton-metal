@@ -102,7 +102,7 @@ def haystack():
     English is enough: "how many elements a thread owns" appears in a comment
     about register bands, and a five-word run of it marked a diagnostic no test
     mentions as pinned. A pin is an assertion, so only Python string constants
-    and the `{{...}}` of an `expected-error`/`CHECK` line count here.
+    and lit match payloads count here.
     """
     out = []
     for pat in ("python/test/unit/**/*.py", "python/test/regression/**/*.py"):
@@ -135,6 +135,8 @@ def haystack():
             continue
         for m in re.finditer(r"\{\{(.*?)\}\}", text, re.S):
             out.append(" ".join(_words(m.group(1))))
+        for m in re.finditer(r"^\s*//\s*CHECK:\s*(.*)$", text, re.M):
+            out.append(" ".join(_words(m.group(1))))
     return "\n".join(out)
 
 
@@ -142,8 +144,16 @@ def pinned(msg, hay):
     """A test pins a diagnostic if it quotes a long enough run of its words.
 
     Whole-string matching does not work: several diagnostics interpolate a
-    runtime value, and tests quote the fixed part.
+    runtime value, and tests quote the fixed part. Empty quotes in the collected
+    message mark a streamed value, such as an extern symbol; its surrounding
+    diagnostic may also stream arities. Match through those values without
+    crossing from one assertion into another.
     """
+    if "''" in msg:
+        pattern = "[0-9A-Za-z ]{0,48}?".join(
+            re.escape(word) for word in _words(msg))
+        if re.search(pattern, hay):
+            return True
     words = _words(msg)
     for n in (8, 6, 5):
         for k in range(len(words) - n + 1):

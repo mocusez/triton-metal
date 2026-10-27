@@ -442,16 +442,17 @@ The current dependency-ordered priorities are:
    The earlier probe correctness work is complete: defined GPU probes use ordinary
    30-run regressions; the three probes without defined numerical behavior
    remain CPU translation checks.
-   A rank >= 3 reduce whose rank-2 result is stored directly now agrees with the
+   A rank >= 3 reduce whose rank-2 result is stored directly agrees with the
    layout conversion that carries it there. The staged reduce may relabel its
-   result so that its fold and its addressing agree, and the exchange behind
-   that conversion used to publish by the result type's slice encoding instead
-   of by the plan the reduce actually used, so each thread's sum landed in
-   another element's slot above one register band. `tl.permute` followed by a
-   rank >= 3 reduce is refused by name, the way a stored `tl.permute` already
-   is: the staged publish addresses each element by its position in the original
-   tile and labels it by the tile's layout, and a permutation between the load
-   and the reduce breaks that pairing.
+   result so that its fold and its addressing agree, and the exchange publishes
+   by the plan the reduce actually used. Stored rank-3 permutations, transposed
+   consumers and loaded dot accumulators use exact layout exchanges; their
+   current numerical matrices have no remaining wrong answers. Rank-4 permute
+   and rank-3 permute followed by a reduction remain named capability boundaries.
+   An independent wide rank-2 broadcast beside a multiband rank-N reduction is
+   also refused before conversion: its tile needs more register bands than the
+   reduction phase, and running the whole phase more often would repeat the
+   reduction. Mask and address broadcasts are not covered by this refusal.
    The `tl.dot_scaled` matcher and the unsupported-op validator have been probed
    as whole families: every refusal they raise for a shape a kernel can express
    is named and raised before conversion, and the supported shapes — e4m3 and
@@ -721,8 +722,11 @@ The current dependency-ordered priorities are:
    loops with unsafe intervening writes or externally loaded values that may
    be overwritten remain rejected. General computed i32 reductions retain
    their existing direct-load or scan-publication requirements.
-2. Expand layout conversion, including the shared tile mapping needed for
-   cross-lane transpose. Top-level single-value rank >= 2 scans now support
+2. Extend aggregate combinations on the refreshed layout/tile baseline. The
+   current permutation, transpose, loaded-accumulator and transposed-store
+   matrices are numerically clean; only the named rank-4 permute and rank-3
+   permute-to-reduce boundaries remain from that audit. Top-level single-value
+   rank >= 2 scans now support
    multiple elements per thread. Rank >= 2 tuple scans now support f32/i32
    carried values, both directions, and axis extents 2..64. Top-level tuples
    support multiple elements per thread, consecutive scans, and mixed
@@ -730,9 +734,15 @@ The current dependency-ordered priorities are:
    prefix reads; grouped buffers use dedicated storage within the combined
    32 KiB threadgroup budget. One-element-per-thread tuples also support
    uniform user loops. Multi-element single-value and tuple scans now support
-   one top-level uniform runtime loop without loop-carried values, including
-   consecutive scans and memory updates across iterations. Deeper control flow,
-   external tensor snapshots, and unsafe cross-phase replay remain rejected.
+   one top-level uniform runtime loop, including consecutive scans, memory
+   updates across iterations, tensor iter_args, and snapshots of tensors
+   computed before the loop. Carried tensors use threadgroup slots and must be
+   integer or floating-point tiles of at least eight bits, have one owner per
+   element, and use the function tile's register count; their slots count
+   against the 32 KiB threadgroup budget. Scalar carries, replicated-owner or
+   mismatched-register-count tiles, a tile-carrying loop containing `tl.dot`,
+   multiple tile-carrying scan loops in one function, deeper control flow, and
+   unsafe cross-phase replay remain rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing

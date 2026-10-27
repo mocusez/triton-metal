@@ -9641,3 +9641,36 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_special_values_match_
     assert (actual_row2[:, 0] == sentinel).all()
     for buffer in (row, row2):
         assert (buffer.cpu()[programs * rows:] == sentinel).all()
+
+
+@triton.jit
+def _mixed_band_scans_kernel(X, O, Q, A: tl.constexpr, B: tl.constexpr,
+                             C: tl.constexpr, INCLUDE_RANK3: tl.constexpr):
+    if INCLUDE_RANK3:
+        f = tl.arange(0, A * B * C)
+        v = tl.reshape(tl.load(X + f), (A, B, C))
+        tl.store(O + f, tl.reshape(tl.cumsum(v, 2), (A * B * C,)))
+    i = tl.arange(0, A)
+    j = tl.arange(0, B)
+    w = tl.load(X + i[:, None] * B + j[None, :])
+    tl.store(Q + i[:, None] * B + j[None, :], tl.cumsum(w, 1))
+
+
+@mps_only
+def test_mixed_staged_scan_band_counts_are_named_then_recover(capfd):
+    a, b, c = 4, 4, 8
+    x = torch.arange(a * b * c, dtype=torch.float32, device="mps")
+    o = torch.zeros(a * b * c, device="mps")
+    q = torch.zeros(a * b, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _mixed_band_scans_kernel[(1,)](x, o, q, a, b, c, True, num_warps=1)
+    diagnostic = capfd.readouterr()
+    needle = ("Metal backend: staged scans with different register-band counts "
+              "cannot share a function phase")
+    assert needle in diagnostic.err + diagnostic.out
+
+    _mixed_band_scans_kernel[(1,)](x, o, q, a, b, c, False, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(q.cpu(), x.cpu()[:a * b].reshape(a, b).cumsum(1).reshape(-1),
+                               atol=0, rtol=0)
+    assert torch.all(o == 0)

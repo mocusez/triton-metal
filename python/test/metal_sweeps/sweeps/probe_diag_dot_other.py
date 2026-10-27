@@ -226,6 +226,57 @@ if not torch.allclose(o.cpu(), want):
     print("WRONG gather with arith")
 """
 
+P.PROBES["gather_recurrence_with_fma"] = """
+@triton.jit
+def k(IDX, X, O, N: tl.constexpr, T: tl.constexpr):
+    i = tl.arange(0, N)
+    idx = tl.load(IDX + i)
+    state = tl.load(X + i)
+    for t in range(0, T):
+        gathered = tl.gather(state, idx, 0)
+        state = tl.fma(gathered, gathered, 1.0)
+    tl.store(O + i, state)
+
+N, T = 32, 2
+perm = torch.randperm(N).to(torch.int32)
+ref = torch.arange(N, dtype=torch.float32)
+o = torch.zeros(N, device="mps")
+k[(1,)](perm.to("mps"), ref.to("mps"), o, N, T, num_warps=1)
+torch.mps.synchronize()
+want = ref.clone()
+for _ in range(T):
+    want = want[perm.long()] * want[perm.long()] + 1.0
+if not torch.allclose(o.cpu(), want):
+    print("WRONG gather with fma")
+"""
+
+P.PROBES["gather_recurrence_with_tensor_if"] = """
+@triton.jit
+def k(IDX, X, O, N: tl.constexpr, T: tl.constexpr, FLAG):
+    i = tl.arange(0, N)
+    idx = tl.load(IDX + i)
+    state = tl.load(X + i)
+    for t in range(0, T):
+        gathered = tl.gather(state, idx, 0)
+        if FLAG > 0:
+            state = gathered + 1.0
+        else:
+            state = gathered - 1.0
+    tl.store(O + i, state)
+
+N, T = 32, 2
+perm = torch.randperm(N).to(torch.int32)
+ref = torch.arange(N, dtype=torch.float32)
+o = torch.zeros(N, device="mps")
+k[(1,)](perm.to("mps"), ref.to("mps"), o, N, T, 1, num_warps=1)
+torch.mps.synchronize()
+want = ref.clone()
+for _ in range(T):
+    want = want[perm.long()] + 1.0
+if not torch.allclose(o.cpu(), want):
+    print("WRONG gather with tensor if")
+"""
+
 # -- scratch bounds and iter_arg envelope -----------------------------------
 
 P.PROBES["reduce_row_past_32kib"] = """
@@ -236,7 +287,7 @@ def k(X, O, M: tl.constexpr, N: tl.constexpr):
     v = tl.load(X + i[:, None] * N + j[None, :])
     tl.store(O + i, tl.sum(v, 1))
 
-M, N = 2, 65536
+M, N = 16384, 2
 ref = torch.ones(M * N, dtype=torch.float32)
 o = torch.zeros(M, device="mps")
 k[(1,)](ref.to("mps"), o, M, N, num_warps=4)

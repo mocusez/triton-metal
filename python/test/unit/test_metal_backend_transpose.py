@@ -37,8 +37,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import triton
-import triton.language as tl
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
 
 libmetal = pytest.importorskip(
     "triton._C.libtriton.metal",
@@ -826,3 +826,45 @@ def test_trans_add_reduce_beyond_thread_major_layouts(M, N, num_warps, axis):
                                    num_warps=num_warps)
     torch.mps.synchronize()
     torch.testing.assert_close(y.cpu(), (x.T + w).sum(axis), atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _rank3_reduce_with_independent_broadcast_kernel(
+        X, Y, S, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+        M: tl.constexpr, N: tl.constexpr, T: tl.constexpr):
+    f = tl.arange(0, A * B * C)
+    v = tl.reshape(tl.load(X + f), (A, B, C))
+    tl.store(S + tl.arange(0, A * C), tl.reshape(tl.sum(v, 1), (A * C,)))
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    for t in range(0, T):
+        r = tl.load(Y + t * N + j)
+        back = r[None, :] + tl.zeros((M, N), tl.float32)
+        tl.store(O + t * M * N + i[:, None] * N + j[None, :], back)
+
+
+@pytest.mark.parametrize("trips", [1, 2])
+def test_rank3_reduce_with_independent_wider_broadcast_is_named_then_recovers(
+        trips, capfd):
+    a, b, c, m, n = 4, 8, 4, 16, 64
+    x = torch.arange(a * b * c, dtype=torch.float32)
+    y = torch.arange(trips * n, dtype=torch.float32)
+    sums = torch.zeros(a * c, device="mps")
+    out = torch.zeros(trips * m * n, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_reduce_with_independent_broadcast_kernel[(1,)](
+            x.to("mps"), y.to("mps"), sums, out, a, b, c, m, n, trips,
+            num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "this non-local tt.broadcast cannot be scheduled" in (
+        diagnostic.err + diagnostic.out)
+    assert torch.all(sums == 0) and torch.all(out == 0)
+
+    survivor_x = torch.randn(m, n)
+    w = torch.randn(n, m)
+    survivor = torch.zeros(m, device="mps")
+    _trans_add_reduce_kernel[(1,)](survivor_x.to("mps"), w.to("mps"), survivor,
+                                   m, n, 0, num_warps=1)
+    torch.mps.synchronize()
+    expected = (survivor_x.T + w).sum(0)
+    torch.testing.assert_close(survivor.cpu(), expected, atol=1e-4, rtol=1e-4)
