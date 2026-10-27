@@ -447,8 +447,9 @@ The current dependency-ordered priorities are:
    result so that its fold and its addressing agree, and the exchange publishes
    by the plan the reduce actually used. Stored rank-3 permutations, transposed
    consumers and loaded dot accumulators use exact layout exchanges; their
-   current numerical matrices have no remaining wrong answers. Rank-4 permute
-   and rank-3 permute followed by a reduction remain named capability boundaries.
+   current numerical matrices have no remaining wrong answers. Load-rooted
+   rank-3/rank-4 permute-to-reduce uses the same exact coordinate mapping;
+   standalone rank-4 permutation and non-load-rooted sources remain boundaries.
    An independent wide rank-2 broadcast beside a multiband rank-N reduction is
    also refused before conversion: its tile needs more register bands than the
    reduction phase, and running the whole phase more often would repeat the
@@ -572,11 +573,11 @@ The current dependency-ordered priorities are:
    `add`: the arithmetic, extremum, bitwise and replayed-region forms over f32,
    i32 and f16, and masked loads whose `other` is deliberately away from the
    combine's identity, so a dropped `other` cannot hide inside it.
-   Tiles of rank >= 4 are refused by name before conversion: their per-axis
-   ranges have no per-element index, so the whole tile is unsupported, not only
-   a reduction over it. A rank-3 reduction over a tile accumulated by an
-   enclosing loop is likewise refused by name; it previously failed the pass
-   with no diagnostic at all.
+   Rank >= 4 tiles outside a planned aggregate phase are refused by name.
+   Within that phase their per-axis ranges use the consumer tile's coordinates,
+   including load-rooted rank-4 permute-to-reduce. A rank-3 reduction over a tile
+   accumulated by an enclosing loop is likewise refused by name; it previously
+   failed the pass with no diagnostic at all.
    The canonical tiled matmul is now exact at every block shape, not only at
    an 8-wide reduction. One `simdgroup_multiply_accumulate` consumes an 8-wide
    slice of K, and the unrolled pointer-advance loop emitted one per K-loop
@@ -724,10 +725,18 @@ The current dependency-ordered priorities are:
    their existing direct-load or scan-publication requirements.
 2. Extend aggregate combinations on the refreshed layout/tile baseline. The
    current permutation, transpose, loaded-accumulator and transposed-store
-   matrices are numerically clean; only the named rank-4 permute and rank-3
-   permute-to-reduce boundaries remain from that audit. Top-level single-value
-   rank >= 2 scans now support
-   multiple elements per thread. Rank >= 2 tuple scans now support f32/i32
+   matrices are numerically clean. Rank-3 and rank-4 permute-to-reduce now map
+   thread-major load-rooted input coordinates through the permutation before
+   exact publication, on every reduction axis and across register bands.
+   Non-load-rooted permuted sources remain named boundaries. One top-level
+   no-iter_arg uniform loop can now stage direct-load rank >= 3 reductions
+   independently on each iteration, with cyclic publish addressing and barriers.
+   Nested or multiple rank-N reduction loops, loop-carried sources and one-band
+   loop reductions remain named boundaries. Top-level single-value rank >= 2
+   scans now support multiple elements per thread. Rank-2 and rank-3 scans with
+   different register-band counts can share a function: each scan's consumers
+   finish in that scan's own phase before the next publication begins. Rank >= 2
+   tuple scans now support f32/i32
    carried values, both directions, and axis extents 2..64. Top-level tuples
    support multiple elements per thread, consecutive scans, and mixed
    tuple/single-value exact phases. All components publish together before
@@ -746,14 +755,23 @@ The current dependency-ordered priorities are:
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing
-   f32/i32 and threadgroup-memory limits. Single-value f32/i32 rank-1 scan
+   f32/i32 and threadgroup-memory limits. Single-value blocked and flattened
+   linear-layout rank-1 reductions replay up to 256 elements per thread;
+   larger bands remain rejected without changing tuple or scan envelopes.
+   Single-value f32/i32 rank-1 scan
    results wider than the threadgroup can now broadcast along either axis of
    a rank-2 tile, including elementwise combinations of scans and subsequent
    reductions. Broadcasts use their own consumer tile coordinates and retain
-   prefix buffers through deferred readers. A single top-level multi-band
-   rank-2 scan can now share its input publication with subsequent reductions
-   of the exact same source. Axis-1 reductions support direct row stores or
-   same-axis broadcasts into the original tile. Shared-source f32 row
+   prefix buffers through deferred readers. A direct f32 row sum of a staged
+   scan's result publishes that result after the scan and reduces the second
+   buffer in the next phase. An independent single-band f32 column sum before
+   such a scan publishes its own small tile and finishes its consumer in that
+   tile's own phase. A single top-level multi-band rank-2 scan can also
+   share its input publication with subsequent reductions of the exact same
+   source. Axis-1 reductions support direct row stores or
+   same-axis broadcasts into the original tile. Shared-source f32 row sums also
+   support cross-axis broadcasts into the original tile and same-axis broadcasts
+   into a wider tile, evaluated at the consumer's projection. Shared-source f32 row
    sum/product/min/max support both consumers together for tiles with 2..64 rows
    and columns, including both NaN-propagating and number-preferring extrema,
    using separate vector and broadcast folds over one input publication.
@@ -768,8 +786,13 @@ The current dependency-ordered priorities are:
    i32 row sum/product, signed or unsigned min/max and AND/OR/XOR, and
    column-vector sum/product, signed or unsigned min/max and AND/OR/XOR also
    accept supported masked or computed sources, preserving mask fill values and
-   computed results. Unsigned min/max use the shared scan publication for
+   computed results. Shared-path unsigned min/max use the scan publication for
    plain sources too, with unsigned comparisons over unchanged 32-bit values.
+   Independently of scans, axis-0 i32 signed/unsigned min/max and AND/OR/XOR
+   support direct and same-kind loop-carried column reductions, including
+   masked or computed sources and outputs wider than the threadgroup. Wide
+   re-expansion remains limited to f32 results; i32 extrema or bitwise
+   re-expansion is rejected by name.
    A single-band rank-2 scan whose tile exactly fills its threadgroup also
    supports mixed row-vector stores and original-tile broadcasts of a same-source
    f32 row sum, product or min/max under either NaN policy, with 2..64 rows and
@@ -799,10 +822,10 @@ The current dependency-ordered priorities are:
    only elementwise consumers followed by stores. Distinct sources obey the same
    pre-scan computation and write-isolation rules above; repeated sources share
    a buffer. The fold reads its own complete input buffer without another column
-   publication. Other column broadcasts
-   (including independent small tiles beside a multi-band scan), reducing the
-   scan result, and other mixed row-store/broadcast or cross-axis/wider broadcast
-   consumers remain rejected in this combination. Mixed device-load cones for
+   publication. Other independent column broadcasts, other reductions of the
+   scan result, and other mixed row-store/broadcast or consumer projections
+   remain rejected in this combination. Mixed device-load
+   cones for
    wide rank-1 scan broadcasts,
    wide tuple scan broadcasts, and ambiguous
    consumer layouts also remain rejected.

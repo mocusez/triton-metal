@@ -212,3 +212,86 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: [[NEGINF:%.*]] = arith.constant 0xFF800000 : f32
 // CHECK: arith.select [[KEEP2]], %{{.*}}, [[NEGINF]] : f32
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, maxOp
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @colxor_more_columns_than_threads(%in: !tt.ptr<i32>, %out: !tt.ptr<i32>) {
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows2 = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %cN = arith.constant dense<64> : tensor<8x1xi32, #blocked>
+    %rowsN = arith.muli %rows2, %cN : tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #slice0>
+    %cols2 = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #slice0> -> tensor<1x64xi32, #blocked>
+    %sp = tt.splat %in : !tt.ptr<i32> -> tensor<8x1x!tt.ptr<i32>, #blocked>
+    %ap0 = tt.addptr %sp, %rowsN : tensor<8x1x!tt.ptr<i32>, #blocked>, tensor<8x1xi32, #blocked>
+    %apb = tt.broadcast %ap0 : tensor<8x1x!tt.ptr<i32>, #blocked> -> tensor<8x64x!tt.ptr<i32>, #blocked>
+    %colsb = tt.broadcast %cols2 : tensor<1x64xi32, #blocked> -> tensor<8x64xi32, #blocked>
+    %ap = tt.addptr %apb, %colsb : tensor<8x64x!tt.ptr<i32>, #blocked>, tensor<8x64xi32, #blocked>
+    %tile = tt.load %ap : tensor<8x64x!tt.ptr<i32>, #blocked>
+    %x = "tt.reduce"(%tile) ({
+    ^bb0(%a: i32, %b: i32):
+      %xor = arith.xori %a, %b : i32
+      tt.reduce.return %xor : i32
+    }) {axis = 0 : i32} : (tensor<8x64xi32, #blocked>) -> tensor<64xi32, #slice0>
+    %ocols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
+    %osp = tt.splat %out : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #blocked1>
+    %oap = tt.addptr %osp, %ocols : tensor<64x!tt.ptr<i32>, #blocked1>, tensor<64xi32, #blocked1>
+    %sc = ttg.convert_layout %x : tensor<64xi32, #slice0> -> tensor<64xi32, #blocked1>
+    tt.store %oap, %sc : tensor<64x!tt.ptr<i32>, #blocked1>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel colxor_more_columns_than_threads
+// CHECK: %[[XOR:[0-9]+]] = scf.for {{.*}} iter_args(%[[ACC:[a-z0-9_]+]] = %{{.*}}) -> (i32)
+// CHECK:   metal.get_element %arg0
+// CHECK:   arith.xori %[[ACC]], %{{.*}} : i32
+// CHECK:   scf.yield
+// CHECK: %[[XORUI:[0-9]+]] = builtin.unrealized_conversion_cast %[[XOR]] : i32 to ui32
+// CHECK: metal.store %[[XORUI]], %arg1
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#slice0 = #ttg.slice<{dim = 0, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @colmax_unsigned_more_columns_than_threads(%in: !tt.ptr<i32>, %out: !tt.ptr<i32>) {
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows2 = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %cN = arith.constant dense<64> : tensor<8x1xi32, #blocked>
+    %rowsN = arith.muli %rows2, %cN : tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #slice0>
+    %cols2 = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #slice0> -> tensor<1x64xi32, #blocked>
+    %sp = tt.splat %in : !tt.ptr<i32> -> tensor<8x1x!tt.ptr<i32>, #blocked>
+    %ap0 = tt.addptr %sp, %rowsN : tensor<8x1x!tt.ptr<i32>, #blocked>, tensor<8x1xi32, #blocked>
+    %apb = tt.broadcast %ap0 : tensor<8x1x!tt.ptr<i32>, #blocked> -> tensor<8x64x!tt.ptr<i32>, #blocked>
+    %colsb = tt.broadcast %cols2 : tensor<1x64xi32, #blocked> -> tensor<8x64xi32, #blocked>
+    %ap = tt.addptr %apb, %colsb : tensor<8x64x!tt.ptr<i32>, #blocked>, tensor<8x64xi32, #blocked>
+    %tile = tt.load %ap : tensor<8x64x!tt.ptr<i32>, #blocked>
+    %x = "tt.reduce"(%tile) ({
+    ^bb0(%a: i32, %b: i32):
+      %max = arith.maxui %a, %b : i32
+      tt.reduce.return %max : i32
+    }) {axis = 0 : i32} : (tensor<8x64xi32, #blocked>) -> tensor<64xi32, #slice0>
+    %ocols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
+    %osp = tt.splat %out : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #blocked1>
+    %oap = tt.addptr %osp, %ocols : tensor<64x!tt.ptr<i32>, #blocked1>, tensor<64xi32, #blocked1>
+    %sc = ttg.convert_layout %x : tensor<64xi32, #slice0> -> tensor<64xi32, #blocked1>
+    tt.store %oap, %sc : tensor<64x!tt.ptr<i32>, #blocked1>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel colmax_unsigned_more_columns_than_threads
+// CHECK: %[[UMAX:[0-9]+]] = scf.for {{.*}} iter_args(%[[UACC:[a-z0-9_]+]] = %{{.*}}) -> (i32)
+// CHECK:   metal.get_element %arg0
+// CHECK:   %[[UCMP:[0-9]+]] = arith.cmpi ugt, %[[UACC]], %{{.*}} : i32
+// CHECK:   arith.select %[[UCMP]], %[[UACC]], %{{.*}} : i32
+// CHECK:   scf.yield
+// CHECK: %[[UMAXUI:[0-9]+]] = builtin.unrealized_conversion_cast %[[UMAX]] : i32 to ui32
+// CHECK: metal.store %[[UMAXUI]], %arg1

@@ -10,6 +10,9 @@ unroll path at three representative shapes:
   (N=12672, BLOCK=16384)   — E=64    autotune endpoint
 
 Both `tl.sum` and `tl.max` combiners are exercised ⇒ 6 sub-tests.
+Single-value blocked and flattened linear-layout replay additionally cover
+E=128/256, with E=512 kept as a named rejection. Tuple and scan envelopes
+are independent.
 
 See the implementation notes AC8.
 """
@@ -420,3 +423,59 @@ def test_reduce_rank1_replayed_float_to_int_cone(form, op, block, num_warps):
     torch.testing.assert_close(
         out[0].item(), expected.item(), atol=2e-3, rtol=2e-3
     )
+
+
+# ---------------------------------------------------------------------------
+# Flattened tiles carry a linear layout and replay at logical positions.
+
+
+@triton.jit
+def _reduce_flattened_linear_rank1_kernel(
+    X,
+    O,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    OP: tl.constexpr,
+):
+    offsets = tl.arange(0, M * N)
+    tile = tl.reshape(tl.load(X + offsets), (M, N))
+    flat = tl.reshape(tile, (M * N,))
+    result = tl.max(flat, axis=0) if OP == "max" else tl.sum(flat, axis=0)
+    tl.store(O, result)
+
+
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("M,N", [(64, 64), (64, 128)], ids=["e128", "e256"])
+def test_reduce_flattened_linear_rank1_wide(M, N, op):
+    torch.manual_seed(M * 41 + N)
+    x = torch.randn(M * N, dtype=torch.float32)
+    out = torch.zeros(1, dtype=torch.float32)
+    _reduce_flattened_linear_rank1_kernel[(1,)](
+        x, out, M=M, N=N, OP=op, num_warps=1,
+    )
+    torch.mps.synchronize()
+    expected = x.max() if op == "max" else x.sum()
+    torch.testing.assert_close(out.cpu(), expected.reshape(1), atol=2e-3,
+                               rtol=2e-3)
+
+
+def test_reduce_flattened_linear_rank1_e512_is_named(capfd):
+    M, N = 64, 256
+    x = torch.randn(M * N, dtype=torch.float32)
+    out = torch.zeros(1, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _reduce_flattened_linear_rank1_kernel[(1,)](
+            x, out, M=M, N=N, OP="sum", num_warps=1,
+        )
+    diagnostic = capfd.readouterr()
+    output = diagnostic.err + diagnostic.out
+    assert ("at most 256 elements per thread" in output or
+            "outside supported envelope [1, 256]" in output)
+
+    survivor = torch.zeros(1, dtype=torch.float32)
+    _reduce_flattened_linear_rank1_kernel[(1,)](
+        x[:64 * 64], survivor, M=64, N=64, OP="sum", num_warps=1,
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(survivor.cpu(), x[:64 * 64].sum().reshape(1),
+                               atol=2e-3, rtol=2e-3)

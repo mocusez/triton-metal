@@ -390,21 +390,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 // Canonical blocked rank-1 single-result reducers keep the direct tree bounded
-// to E=BLOCK/tpb <= 64. E=128 must be rejected before conversion declines and
+// to E=BLOCK/tpb <= 256. E=512 must be rejected before conversion declines and
 // leaves `tt.reduce` behind for failed legalization rollback.
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reduce_rank1_e128_geometry_deferred(%x_ptr: !tt.ptr<f32>) {
-    %offsets = tt.make_range {end = 4096 : i32, start = 0 : i32} : tensor<4096xi32, #blocked>
-    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<4096x!tt.ptr<f32>, #blocked>
-    %x_addr = tt.addptr %x_splat, %offsets : tensor<4096x!tt.ptr<f32>, #blocked>, tensor<4096xi32, #blocked>
-    %x = tt.load %x_addr : tensor<4096x!tt.ptr<f32>, #blocked>
-    // expected-error @+1 {{rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]}}
+  tt.func public @reduce_rank1_e512_geometry_deferred(%x_ptr: !tt.ptr<f32>) {
+    %offsets = tt.make_range {end = 16384 : i32, start = 0 : i32} : tensor<16384xi32, #blocked>
+    %x_splat = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<16384x!tt.ptr<f32>, #blocked>
+    %x_addr = tt.addptr %x_splat, %offsets : tensor<16384x!tt.ptr<f32>, #blocked>, tensor<16384xi32, #blocked>
+    %x = tt.load %x_addr : tensor<16384x!tt.ptr<f32>, #blocked>
+    // expected-error @+1 {{rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 256]}}
     %r = "tt.reduce"(%x) ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32
       tt.reduce.return %s : f32
-    }) {axis = 0 : i32} : (tensor<4096xf32, #blocked>) -> f32
+    }) {axis = 0 : i32} : (tensor<16384xf32, #blocked>) -> f32
     tt.return
   }
 }

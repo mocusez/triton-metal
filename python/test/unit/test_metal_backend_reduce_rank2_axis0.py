@@ -14,14 +14,13 @@ accumulator (`dw += load_tile`, `db += load_tile`) over axis 0;
 load_tile, axis=0))` (per accumulator) so the reduce sees a per-iteration direct
 masked load.
 
-Combines: f32 sum/max and i32 sum/product/max/min. Product is direct-unmasked
-load only;
-the other combines support both direct and loop-carried forms (the
-reassociation reassociates any same-kind loop-carried accumulator whose tensor
-update op has an elementwise scalarizing lowering — arith.add{f,i},
-metal.binary_exp for f32 max, and scalar arith.maxsi/minsi for i32 max/min). Sum
-uses scalar arith; f32 max uses metal.binary_exp; i32 max/min use cmpi+select in
-the reduce body (binary_exp rejects signless i32).
+Combines: f32 sum/max and i32 sum/product/signed/unsigned
+extrema/and/or/xor. Product is direct-unmasked load only; the other combines
+support both direct and loop-carried forms (the reassociation reassociates any
+same-kind loop-carried accumulator whose tensor update op has an elementwise
+scalarizing lowering). Sum and bitwise combines use scalar arith; f32 max uses
+metal.binary_exp; integer extrema use cmpi+select with the appropriate
+signedness in the reduce body.
 
 MORE COLUMNS THAN THREADS (output E>1, BN > tpb). Each thread then owns several
 output columns, one per tile-loop iteration, and which one it owns on a given
@@ -379,6 +378,234 @@ def test_reduce_axis0_minmax_i32_loopcarried(kernel, red, M, N):
     kernel[(triton.cdiv(N, 128),)](inp, out, M, N, BM=32, BN=128)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), red(inp.cpu()))
+
+
+@triton.jit
+def _and_combine(a, b):
+    return a & b
+
+
+@triton.jit
+def _or_combine(a, b):
+    return a | b
+
+
+@triton.jit
+def _xor_combine(a, b):
+    return a ^ b
+
+
+@triton.jit
+def _colbitwise_i32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr,
+                    OP: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+    other = -1 if OP == 0 else 0
+    x = tl.load(In + offs, mask=mask, other=other)
+    if OP == 0:
+        result = tl.reduce(x, axis=0, combine_fn=_and_combine)
+    elif OP == 1:
+        result = tl.reduce(x, axis=0, combine_fn=_or_combine)
+    else:
+        result = tl.reduce(x, axis=0, combine_fn=_xor_combine)
+    tl.store(Out + cols, result, mask=cols < N)
+
+
+@triton.jit
+def _colbitwise_i32_lc(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr,
+                       OP: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    identity = -1 if OP == 0 else 0
+    acc = tl.full((BM, BN), identity, tl.int32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        x = tl.load(In + offs, mask=mask, other=identity)
+        if OP == 0:
+            acc = acc & x
+        elif OP == 1:
+            acc = acc | x
+        else:
+            acc = acc ^ x
+    if OP == 0:
+        result = tl.reduce(acc, axis=0, combine_fn=_and_combine)
+    elif OP == 1:
+        result = tl.reduce(acc, axis=0, combine_fn=_or_combine)
+    else:
+        result = tl.reduce(acc, axis=0, combine_fn=_xor_combine)
+    tl.store(Out + cols, result, mask=cols < N)
+
+
+def _bitwise_reference(inp, op):
+    result = inp[0].clone()
+    for row in inp[1:]:
+        if op == 0:
+            result = result & row
+        elif op == 1:
+            result = result | row
+        else:
+            result = result ^ row
+    return result
+
+
+@pytest.mark.parametrize("op", [0, 1, 2], ids=["and", "or", "xor"])
+@pytest.mark.parametrize("M,N,BM,BN", [(8, 16, 8, 16), (8, 256, 8, 256),
+                                       (5, 37, 8, 64)])
+def test_reduce_axis0_bitwise_i32_direct(M, N, BM, BN, op):
+    torch.manual_seed(M * 29 + N + op)
+    inp = torch.randint(-2147483648, 2147483647, (M, N), dtype=torch.int32)
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colbitwise_i32[(triton.cdiv(N, BN),)](inp.to("mps"), out, M, N, BM=BM,
+                                          BN=BN, OP=op, num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), _bitwise_reference(inp, op))
+
+
+@pytest.mark.parametrize("op", [0, 1, 2], ids=["and", "or", "xor"])
+def test_reduce_axis0_bitwise_i32_loopcarried(op):
+    M, N, BM, BN = 20, 64, 8, 64
+    torch.manual_seed(37 + op)
+    inp = torch.randint(-2147483648, 2147483647, (M, N), dtype=torch.int32)
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colbitwise_i32_lc[(1,)](inp.to("mps"), out, M, N, BM=BM, BN=BN, OP=op,
+                            num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), _bitwise_reference(inp, op))
+
+
+@triton.jit
+def _colbitwise_i32_reexpanded(In, Out, OutTile, BM: tl.constexpr,
+                               BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    reduced = tl.reduce(tile, axis=0, combine_fn=_xor_combine)
+    tl.store(Out + tl.arange(0, BN), reduced)
+    tl.store(OutTile + rows * BN + cols, tile ^ reduced[None, :])
+
+
+def test_reduce_axis0_bitwise_i32_wide_reexpansion_is_named(capfd):
+    BM, BN = 8, 128
+    inp = torch.randint(-1000, 1000, (BM, BN), dtype=torch.int32, device="mps")
+    out = torch.empty(BN, dtype=torch.int32, device="mps")
+    out_tile = torch.empty(BM, BN, dtype=torch.int32, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _colbitwise_i32_reexpanded[(1,)](inp, out, out_tile, BM=BM, BN=BN,
+                                        num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "re-expansion back to a 2-D tile needs an f32 result" in (
+        diagnostic.err + diagnostic.out)
+
+    survivor = torch.empty(BN, dtype=torch.int32, device="mps")
+    _colbitwise_i32[(1,)](inp, survivor, BM, BN, BM=BM, BN=BN, OP=2,
+                         num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(survivor.cpu(), _bitwise_reference(inp.cpu(), 2))
+
+
+@triton.jit
+def _colextremum_u32(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr,
+                     IS_MIN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, BM)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+    other = -1 if IS_MIN else 0
+    x = tl.load(In + offs, mask=mask, other=other)
+    x = x.to(tl.uint32, bitcast=True)
+    if IS_MIN:
+        result = tl.min(x, axis=0)
+    else:
+        result = tl.max(x, axis=0)
+    tl.store(Out + cols, result.to(tl.int32, bitcast=True), mask=cols < N)
+
+
+@triton.jit
+def _colextremum_u32_lc(In, Out, M, N, BM: tl.constexpr, BN: tl.constexpr,
+                        IS_MIN: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    identity = 0xffffffff if IS_MIN else 0
+    acc = tl.full((BM, BN), identity, tl.uint32)
+    for i in range(0, M, BM):
+        rows = i + tl.arange(0, BM)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        other = -1 if IS_MIN else 0
+        x = tl.load(In + offs, mask=mask, other=other)
+        x = x.to(tl.uint32, bitcast=True)
+        if IS_MIN:
+            acc = tl.minimum(acc, x)
+        else:
+            acc = tl.maximum(acc, x)
+    if IS_MIN:
+        result = tl.min(acc, axis=0)
+    else:
+        result = tl.max(acc, axis=0)
+    tl.store(Out + cols, result.to(tl.int32, bitcast=True), mask=cols < N)
+
+
+def _unsigned_extremum_reference(inp, is_min):
+    unsigned = inp.to(torch.int64) & 0xffffffff
+    result = unsigned.amin(0) if is_min else unsigned.amax(0)
+    signed = torch.where(result >= 0x80000000, result - 0x100000000, result)
+    return signed.to(torch.int32)
+
+
+@pytest.mark.parametrize("is_min", [False, True], ids=["umax", "umin"])
+@pytest.mark.parametrize("M,N,BM,BN", [(8, 16, 8, 16), (8, 256, 8, 256),
+                                       (5, 37, 8, 64)])
+def test_reduce_axis0_unsigned_extrema_direct(M, N, BM, BN, is_min):
+    torch.manual_seed(M * 31 + N + is_min)
+    inp = torch.randint(-2147483648, 2147483647, (M, N), dtype=torch.int32)
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colextremum_u32[(triton.cdiv(N, BN),)](inp.to("mps"), out, M, N, BM=BM,
+                                           BN=BN, IS_MIN=is_min, num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), _unsigned_extremum_reference(inp, is_min))
+
+
+@pytest.mark.parametrize("is_min", [False, True], ids=["umax", "umin"])
+def test_reduce_axis0_unsigned_extrema_loopcarried(is_min):
+    M, N, BM, BN = 20, 64, 8, 64
+    torch.manual_seed(43 + is_min)
+    inp = torch.randint(-2147483648, 2147483647, (M, N), dtype=torch.int32)
+    out = torch.empty(N, dtype=torch.int32, device="mps")
+    _colextremum_u32_lc[(1,)](inp.to("mps"), out, M, N, BM=BM, BN=BN,
+                             IS_MIN=is_min, num_warps=1)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), _unsigned_extremum_reference(inp, is_min))
+
+
+@triton.jit
+def _colextremum_u32_reexpanded(In, Out, OutTile, BM: tl.constexpr,
+                                BN: tl.constexpr):
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    tile = tl.load(In + rows * BN + cols)
+    reduced = tl.max(tile.to(tl.uint32, bitcast=True), axis=0)
+    reduced = reduced.to(tl.int32, bitcast=True)
+    tl.store(Out + tl.arange(0, BN), reduced)
+    tl.store(OutTile + rows * BN + cols, tile ^ reduced[None, :])
+
+
+def test_reduce_axis0_unsigned_wide_reexpansion_is_named(capfd):
+    BM, BN = 8, 128
+    inp = torch.randint(-1000, 1000, (BM, BN), dtype=torch.int32, device="mps")
+    out = torch.empty(BN, dtype=torch.int32, device="mps")
+    out_tile = torch.empty(BM, BN, dtype=torch.int32, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _colextremum_u32_reexpanded[(1,)](inp, out, out_tile, BM=BM, BN=BN,
+                                         num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "re-expansion back to a 2-D tile needs an f32 result" in (
+        diagnostic.err + diagnostic.out)
 
 
 # --- Two-level addptr addressing (see the module docstring) ----------------

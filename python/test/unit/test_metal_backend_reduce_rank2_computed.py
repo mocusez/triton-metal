@@ -861,78 +861,229 @@ def test_rank3_reduce_rank2_store_matches_torch(shape, num_warps, axis):
 
 @triton.jit
 def _rank3_permuted_reduce_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
-                                  C: tl.constexpr):
+                                  C: tl.constexpr, P0: tl.constexpr,
+                                  P1: tl.constexpr, P2: tl.constexpr,
+                                  AXIS: tl.constexpr, OUT: tl.constexpr):
     a = tl.arange(0, A)[:, None, None]
     b = tl.arange(0, B)[None, :, None]
     c = tl.arange(0, C)[None, None, :]
     v = tl.load(X + a * (B * C) + b * C + c)
-    s = tl.sum(tl.permute(v, (0, 2, 1)), axis=2)
-    r0 = tl.arange(0, A)[:, None]
-    r1 = tl.arange(0, C)[None, :]
-    tl.store(O + r0 * C + r1, s)
+    s = tl.sum(tl.permute(v, (P0, P1, P2)), axis=AXIS)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
 
 
+def _check_rank3_permuted_reduce(shape, num_warps, perm, axis):
+    a, b, c = shape
+    torch.manual_seed(0xC0DE + axis)
+    x = torch.randn(a * b * c, dtype=torch.float32)
+    expected = x.reshape(shape).permute(*perm).sum(axis).reshape(-1)
+    out = torch.zeros(expected.numel(), dtype=torch.float32)
+    _rank3_permuted_reduce_kernel[(1,)](
+        x, out, A=a, B=b, C=c, P0=perm[0], P1=perm[1], P2=perm[2],
+        AXIS=axis, OUT=expected.numel(), num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize(
     "shape,num_warps",
-    [((4, 8, 8), 1), ((8, 8, 8), 2), ((2, 4, 8), 1)],
-    ids=["4x8x8_w1", "8x8x8_w2", "2x4x8_w1"],
+    [((4, 8, 8), 1), ((8, 8, 8), 2), ((2, 4, 8), 1), ((2, 4, 8), 2)],
+    ids=["4x8x8_w1", "8x8x8_w2", "2x4x8_w1", "2x4x8_w2_one_band"],
 )
-def test_rank3_permuted_reduce_is_rejected_not_wrong(shape, num_warps,
-                                                     tmp_path):
-    # The staged publish addresses each element by its position in the ORIGINAL
-    # tile and labels it by the tile's layout; a `tl.permute` in between breaks
-    # that pairing, and above one register band the fold summed a scattered set
-    # of elements. A stored `tl.permute` at rank >= 3 was already refused by
-    # name, so the reduced form is refused too rather than being right only
-    # where the two labellings happen to coincide.
-    import os
-    import subprocess
-    import sys
-    import textwrap
-    from pathlib import Path
+def test_rank3_permuted_reduce_matches_torch(shape, num_warps, axis):
+    _check_rank3_permuted_reduce(shape, num_warps, (0, 2, 1), axis)
 
-    a, b, c = shape
-    script = tmp_path / "rank3_permuted_reduce.py"
-    script.write_text(textwrap.dedent(f"""
-        import importlib.util
-        import triton
-        from triton.compiler import ASTSource
-        from triton.backends.compiler import GPUTarget
-        spec = importlib.util.spec_from_file_location(
-            "rank2_child", {str(Path(__file__).resolve())!r})
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        target = GPUTarget("metal", 80, 32)
 
-        for attempt in range(3):
-            try:
-                triton.compile(ASTSource(
-                    module._rank3_permuted_reduce_kernel,
-                    signature={{"X": "*fp32", "O": "*fp32"}},
-                    constexprs={{"A": {a}, "B": {b}, "C": {c}}}),
-                    target=target, options={{"num_warps": {num_warps}}})
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("a permuted rank-3 reduce compiled")
-        # The unpermuted neighbour is supported and stays so.
-        triton.compile(ASTSource(
-            module._rank3_reduce_rank2_store_kernel,
-            signature={{"X": "*fp32", "O": "*fp32"}},
-            constexprs={{"A": {a}, "B": {b}, "C": {c}, "AXIS": 1}}),
-            target=target, options={{"num_warps": {num_warps}}})
-        print("RECOVERED")
-    """))
-    result = subprocess.run([sys.executable, str(script)], capture_output=True,
-                            text=True, timeout=180,
-                            env={**os.environ,
-                                 "TRITON_CACHE_DIR": str(tmp_path / "cache")})
-    output = result.stdout + result.stderr
-    needle = "rank >= 3 reduce over a permuted tile is not implemented"
-    assert result.returncode == 0, output
-    assert output.count(needle) == 3, output
-    assert "RECOVERED" in output
-    assert "failed to legalize" not in output
+@pytest.mark.parametrize("perm", [(1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)],
+                         ids=lambda p: "".join(str(d) for d in p))
+def test_rank3_permuted_reduce_permutations_match_torch(perm):
+    _check_rank3_permuted_reduce((4, 8, 8), 1, perm, 1)
+
+
+@triton.jit
+def _rank4_permuted_reduce_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                                  C: tl.constexpr, D: tl.constexpr,
+                                  P0: tl.constexpr, P1: tl.constexpr,
+                                  P2: tl.constexpr, P3: tl.constexpr,
+                                  AXIS: tl.constexpr, OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None, None]
+    b = tl.arange(0, B)[None, :, None, None]
+    c = tl.arange(0, C)[None, None, :, None]
+    d = tl.arange(0, D)[None, None, None, :]
+    v = tl.load(X + a * (B * C * D) + b * (C * D) + c * D + d)
+    s = tl.sum(tl.permute(v, (P0, P1, P2, P3)), axis=AXIS)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+@pytest.mark.parametrize("shape,num_warps,perm,axis", [
+    ((2, 4, 8, 2), 1, (0, 2, 1, 3), 0),
+    ((2, 4, 8, 2), 1, (0, 2, 1, 3), 1),
+    ((2, 4, 8, 2), 1, (0, 2, 1, 3), 2),
+    ((2, 4, 8, 2), 1, (0, 2, 1, 3), 3),
+    ((2, 4, 8, 2), 1, (1, 0, 2, 3), 1),
+    ((2, 4, 8, 2), 1, (1, 2, 0, 3), 1),
+    ((2, 4, 8, 2), 1, (3, 0, 2, 1), 2),
+    ((2, 4, 8, 2), 1, (2, 3, 1, 0), 3),
+    ((4, 4, 8, 2), 2, (0, 2, 1, 3), 2),
+    ((2, 2, 4, 2), 1, (0, 2, 1, 3), 2),
+], ids=lambda p: str(p))
+def test_rank4_permuted_reduce_matches_torch(shape, num_warps, perm, axis):
+    a, b, c, d = shape
+    torch.manual_seed(0xC4DE + axis)
+    x = torch.randn(a * b * c * d, dtype=torch.float32)
+    expected = x.reshape(shape).permute(*perm).sum(axis).reshape(-1)
+    out = torch.zeros(expected.numel(), dtype=torch.float32)
+    _rank4_permuted_reduce_kernel[(1,)](
+        x, out, A=a, B=b, C=c, D=d, P0=perm[0], P1=perm[1], P2=perm[2],
+        P3=perm[3], AXIS=axis, OUT=expected.numel(), num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_permuted_loop_reduce_kernel(X, O, T, A: tl.constexpr,
+                                       B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    acc = tl.zeros((A, B, C), tl.float32)
+    for t in range(T):
+        acc += tl.load(X + t * A * B * C + offsets)
+    s = tl.sum(tl.permute(acc, (0, 2, 1)), axis=2)
+    tl.store(O + tl.arange(0, A * C), tl.reshape(s, (A * C,)))
+
+
+def test_rank3_permuted_loop_reduce_is_named(capfd):
+    a, b, c = 4, 8, 8
+    x = torch.randn(2 * a * b * c, dtype=torch.float32)
+    out = torch.zeros(a * c, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_permuted_loop_reduce_kernel[(1,)](
+            x, out, 2, A=a, B=b, C=c, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "permuted tile requires a thread-major load-rooted source" in (
+        diagnostic.err + diagnostic.out)
+
+
+@triton.jit
+def _rank3_reduce_loop_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
+                              C: tl.constexpr, AXIS: tl.constexpr,
+                              OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        s = tl.sum(v, axis=AXIS)
+        tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_rank3_reduce_direct_load_loop_matches_torch(axis):
+    a, b, c, steps = 4, 4, 4, 3
+    shape = (a, b, c)
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(0xD00D + axis)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    expected = x.reshape(steps, a, b, c).sum(axis + 1).reshape(-1)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    _rank3_reduce_loop_kernel[(1,)](
+        x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements,
+        num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_reduce_loop_direct_store_kernel(X, O, T, A: tl.constexpr,
+                                           B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        s = tl.sum(tl.load(X + t * A * B * C + offsets), 0)
+        tl.store(O + t * B * C + b * C + c, s)
+
+
+def test_rank3_reduce_direct_load_loop_rank2_store():
+    a, b, c, steps = 4, 4, 4, 3
+    torch.manual_seed(0xD00D)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    expected = x.reshape(steps, a, b, c).sum(1)
+    out = torch.zeros(steps * b * c, dtype=torch.float32)
+    _rank3_reduce_loop_direct_store_kernel[(1,)](
+        x, out, steps, A=a, B=b, C=c, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.reshape(steps, b, c), expected, atol=2e-3,
+                               rtol=2e-3)
+
+
+def test_rank3_reduce_direct_load_loop_one_band_is_named(capfd):
+    a, b, c, steps = 2, 4, 8, 2
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    out = torch.zeros(steps * a * b, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_reduce_loop_kernel[(1,)](
+            x, out, steps, A=a, B=b, C=c, AXIS=2, OUT=a * b, num_warps=2)
+    diagnostic = capfd.readouterr()
+    assert "rank >= 3 reduce is implemented" in diagnostic.err + diagnostic.out
+
+
+@triton.jit
+def _rank3_two_reduce_loops_kernel(X, O, T, A: tl.constexpr,
+                                   B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        tl.store(O + t * A * B + tl.arange(0, A * B),
+                 tl.reshape(tl.sum(v, 2), (A * B,)))
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        tl.store(O + (T + t) * A * B + tl.arange(0, A * B),
+                 tl.reshape(tl.sum(v, 2), (A * B,)))
+
+
+def test_rank3_two_reduce_loops_are_named(capfd):
+    a, b, c = 4, 4, 4
+    x = torch.randn(2 * a * b * c, dtype=torch.float32)
+    out = torch.zeros(4 * a * b, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_two_reduce_loops_kernel[(1,)](
+            x, out, 2, A=a, B=b, C=c, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "multiple rank-N reduction loops" in diagnostic.err + diagnostic.out
+
+
+@triton.jit
+def _rank3_nested_reduce_loop_kernel(X, O, T, A: tl.constexpr,
+                                     B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        for u in range(2):
+            v = tl.load(X + (2 * t + u) * A * B * C + offsets)
+            tl.store(O + (2 * t + u) * A * B + tl.arange(0, A * B),
+                     tl.reshape(tl.sum(v, 2), (A * B,)))
+
+
+def test_rank3_nested_reduce_loop_is_named(capfd):
+    a, b, c = 4, 4, 4
+    x = torch.randn(4 * a * b * c, dtype=torch.float32)
+    out = torch.zeros(4 * a * b, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_nested_reduce_loop_kernel[(1,)](
+            x, out, 2, A=a, B=b, C=c, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "rank >= 3 reduce is implemented" in diagnostic.err + diagnostic.out
 
 
 # The rank-3 defect above came from sweeping a producer only through the

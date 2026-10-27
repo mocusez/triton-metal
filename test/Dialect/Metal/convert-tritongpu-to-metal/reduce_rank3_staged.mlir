@@ -387,3 +387,170 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// A load-rooted permutation maps the input's thread-major coordinates into the
+// result axes before publication, so the reduction reads the intended groups.
+// CHECK-LABEL: metal.kernel reduce_permuted_rank3
+// CHECK: metal.threadgroup_alloca : !metal.memref<512 x f32>
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+#perm_input = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 2, 16], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+#perm_companion = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [2, 1, 16], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+#perm_result = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 16, 2], warpsPerCTA = [1, 1, 1], order = [1, 2, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_permuted_rank3(%X: !tt.ptr<f32>) {
+    %c16 = arith.constant dense<16> : tensor<1x8x1xi32, #perm_input>
+    %c128 = arith.constant dense<128> : tensor<4x1x1xi32, #perm_input>
+    %a = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>>
+    %a1 = tt.expand_dims %a {axis = 1 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>> -> tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #perm_input}>>
+    %a2 = tt.expand_dims %a1 {axis = 2 : i32} : tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #perm_input}>> -> tensor<4x1x1xi32, #perm_input>
+    %b = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>>
+    %b1 = tt.expand_dims %b {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #perm_input}>>
+    %b2 = tt.expand_dims %b1 {axis = 2 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #perm_input}>> -> tensor<1x8x1xi32, #perm_input>
+    %c = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #perm_companion}>}>>
+    %c1 = tt.expand_dims %c {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #perm_companion}>}>> -> tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #perm_companion}>>
+    %c2 = tt.expand_dims %c1 {axis = 1 : i32} : tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #perm_companion}>> -> tensor<1x1x16xi32, #perm_companion>
+    %aoff = arith.muli %a2, %c128 : tensor<4x1x1xi32, #perm_input>
+    %xbase = tt.splat %X : !tt.ptr<f32> -> tensor<4x1x1x!tt.ptr<f32>, #perm_input>
+    %xaddr = tt.addptr %xbase, %aoff : tensor<4x1x1x!tt.ptr<f32>, #perm_input>, tensor<4x1x1xi32, #perm_input>
+    %boff = arith.muli %b2, %c16 : tensor<1x8x1xi32, #perm_input>
+    %xaddrb = tt.broadcast %xaddr : tensor<4x1x1x!tt.ptr<f32>, #perm_input> -> tensor<4x8x1x!tt.ptr<f32>, #perm_input>
+    %boffb = tt.broadcast %boff : tensor<1x8x1xi32, #perm_input> -> tensor<4x8x1xi32, #perm_input>
+    %abaddr = tt.addptr %xaddrb, %boffb : tensor<4x8x1x!tt.ptr<f32>, #perm_input>, tensor<4x8x1xi32, #perm_input>
+    %abaddrb = tt.broadcast %abaddr : tensor<4x8x1x!tt.ptr<f32>, #perm_input> -> tensor<4x8x16x!tt.ptr<f32>, #perm_input>
+    %cb = tt.broadcast %c2 : tensor<1x1x16xi32, #perm_companion> -> tensor<4x8x16xi32, #perm_input>
+    %addr = tt.addptr %abaddrb, %cb : tensor<4x8x16x!tt.ptr<f32>, #perm_input>, tensor<4x8x16xi32, #perm_input>
+    %v = tt.load %addr : tensor<4x8x16x!tt.ptr<f32>, #perm_input>
+    %p = tt.trans %v {order = array<i32: 0, 2, 1>} : tensor<4x8x16xf32, #perm_input> -> tensor<4x16x8xf32, #perm_result>
+    %r = "tt.reduce"(%p) <{axis = 2 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %sum = arith.addf %x, %y : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<4x16x8xf32, #perm_result>) -> tensor<4x16xf32, #ttg.slice<{dim = 2, parent = #perm_result}>>
+    tt.return
+  }
+}
+
+// -----
+// A direct-load rank-N reduction inside a uniform user loop. Each publish band
+// adds bandIv * threadsPerBlock to the device address before the exact fold.
+// CHECK-LABEL: metal.kernel reduce_rank3_user_loop
+// CHECK: metal.threadgroup_alloca : !metal.memref<512 x f32>
+// CHECK: scf.for %[[USER:.*]] = %{{.*}} to %c2
+// CHECK: scf.for %[[BAND:.*]] = %{{.*}} to %{{.*}} step
+// CHECK: arith.muli %[[BAND]], %c32
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_rank3_user_loop(%X: !tt.ptr<f32>) {
+    %c16 = arith.constant dense<16> : tensor<1x8x1xi32, #perm_input>
+    %c128 = arith.constant dense<128> : tensor<4x1x1xi32, #perm_input>
+    %a = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>>
+    %a1 = tt.expand_dims %a {axis = 1 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>> -> tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #perm_input}>>
+    %a2 = tt.expand_dims %a1 {axis = 2 : i32} : tensor<4x1xi32, #ttg.slice<{dim = 2, parent = #perm_input}>> -> tensor<4x1x1xi32, #perm_input>
+    %b = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>>
+    %b1 = tt.expand_dims %b {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #perm_input}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #perm_input}>>
+    %b2 = tt.expand_dims %b1 {axis = 2 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 2, parent = #perm_input}>> -> tensor<1x8x1xi32, #perm_input>
+    %c = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #perm_companion}>}>>
+    %c1 = tt.expand_dims %c {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #perm_companion}>}>> -> tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #perm_companion}>>
+    %c2 = tt.expand_dims %c1 {axis = 1 : i32} : tensor<1x16xi32, #ttg.slice<{dim = 1, parent = #perm_companion}>> -> tensor<1x1x16xi32, #perm_companion>
+    %aoff = arith.muli %a2, %c128 : tensor<4x1x1xi32, #perm_input>
+    %xbase = tt.splat %X : !tt.ptr<f32> -> tensor<4x1x1x!tt.ptr<f32>, #perm_input>
+    %xaddr = tt.addptr %xbase, %aoff : tensor<4x1x1x!tt.ptr<f32>, #perm_input>, tensor<4x1x1xi32, #perm_input>
+    %boff = arith.muli %b2, %c16 : tensor<1x8x1xi32, #perm_input>
+    %xaddrb = tt.broadcast %xaddr : tensor<4x1x1x!tt.ptr<f32>, #perm_input> -> tensor<4x8x1x!tt.ptr<f32>, #perm_input>
+    %boffb = tt.broadcast %boff : tensor<1x8x1xi32, #perm_input> -> tensor<4x8x1xi32, #perm_input>
+    %abaddr = tt.addptr %xaddrb, %boffb : tensor<4x8x1x!tt.ptr<f32>, #perm_input>, tensor<4x8x1xi32, #perm_input>
+    %abaddrb = tt.broadcast %abaddr : tensor<4x8x1x!tt.ptr<f32>, #perm_input> -> tensor<4x8x16x!tt.ptr<f32>, #perm_input>
+    %cb = tt.broadcast %c2 : tensor<1x1x16xi32, #perm_companion> -> tensor<4x8x16xi32, #perm_input>
+    %boffc = tt.broadcast %boffb : tensor<4x8x1xi32, #perm_input> -> tensor<4x8x16xi32, #perm_input>
+    %baseoff = arith.addi %boffc, %cb : tensor<4x8x16xi32, #perm_input>
+    %c0 = arith.constant 0 : index
+    %c1i = arith.constant 1 : index
+    %c2i = arith.constant 2 : index
+    %c512 = arith.constant 512 : index
+    scf.for %t = %c0 to %c2i step %c1i {
+      %toi = arith.muli %t, %c512 : index
+      %to = arith.index_cast %toi : index to i32
+      %tos = tt.splat %to : i32 -> tensor<4x8x16xi32, #perm_input>
+      %addrt = arith.addi %baseoff, %tos : tensor<4x8x16xi32, #perm_input>
+      %addrp = tt.addptr %abaddrb, %addrt : tensor<4x8x16x!tt.ptr<f32>, #perm_input>, tensor<4x8x16xi32, #perm_input>
+      %v = tt.load %addrp : tensor<4x8x16x!tt.ptr<f32>, #perm_input>
+      %r = "tt.reduce"(%v) <{axis = 1 : i32}> ({
+      ^bb0(%x: f32, %y: f32):
+        %sum = arith.addf %x, %y : f32
+        tt.reduce.return %sum : f32
+      }) : (tensor<4x8x16xf32, #perm_input>) -> tensor<4x16xf32, #ttg.slice<{dim = 1, parent = #perm_input}>>
+      scf.yield
+    }
+    tt.return
+  }
+}
+
+// -----
+// Rank-4 slice chains resolve their axes from the innermost slice outward.
+// The load-rooted permutation then publishes in thread-major coordinates.
+// CHECK-LABEL: metal.kernel reduce_permuted_rank4
+// CHECK: metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK-COUNT-4: metal.tg_load_indexed
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+#r4 = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [1, 2, 8, 2], warpsPerCTA = [1, 1, 1, 1], order = [3, 2, 1, 0]}>
+#r4a = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [1, 4, 8, 1], warpsPerCTA = [1, 1, 1, 1], order = [3, 2, 1, 0]}>
+#r4d = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [16, 1, 1, 2], warpsPerCTA = [1, 1, 1, 1], order = [3, 2, 1, 0]}>
+#r4p = #ttg.blocked<{sizePerThread = [1, 1, 1, 1], threadsPerWarp = [1, 8, 2, 2], warpsPerCTA = [1, 1, 1, 1], order = [3, 1, 2, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reduce_permuted_rank4(%X: !tt.ptr<f32>) {
+    %c2 = arith.constant dense<2> : tensor<1x1x8x1xi32, #r4>
+    %c16 = arith.constant dense<16> : tensor<1x4x1x1xi32, #r4>
+    %c64 = arith.constant dense<64> : tensor<2x1x1x1xi32, #r4a>
+    %a = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4a}>}>}>>
+    %a1 = tt.expand_dims %a {axis = 1 : i32} : tensor<2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4a}>}>}>> -> tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4a}>}>>
+    %a2 = tt.expand_dims %a1 {axis = 2 : i32} : tensor<2x1xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4a}>}>> -> tensor<2x1x1xi32, #ttg.slice<{dim = 3, parent = #r4a}>>
+    %a3 = tt.expand_dims %a2 {axis = 3 : i32} : tensor<2x1x1xi32, #ttg.slice<{dim = 3, parent = #r4a}>> -> tensor<2x1x1x1xi32, #r4a>
+    %b = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4}>}>}>>
+    %b1 = tt.expand_dims %b {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4}>}>}>> -> tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4}>}>>
+    %b2 = tt.expand_dims %b1 {axis = 2 : i32} : tensor<1x4xi32, #ttg.slice<{dim = 2, parent = #ttg.slice<{dim = 3, parent = #r4}>}>> -> tensor<1x4x1xi32, #ttg.slice<{dim = 3, parent = #r4}>>
+    %b3 = tt.expand_dims %b2 {axis = 3 : i32} : tensor<1x4x1xi32, #ttg.slice<{dim = 3, parent = #r4}>> -> tensor<1x4x1x1xi32, #r4>
+    %c = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 3, parent = #r4}>}>}>>
+    %c1 = tt.expand_dims %c {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 3, parent = #r4}>}>}>> -> tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 3, parent = #r4}>}>>
+    %c2e = tt.expand_dims %c1 {axis = 1 : i32} : tensor<1x8xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 3, parent = #r4}>}>> -> tensor<1x1x8xi32, #ttg.slice<{dim = 3, parent = #r4}>>
+    %c3 = tt.expand_dims %c2e {axis = 3 : i32} : tensor<1x1x8xi32, #ttg.slice<{dim = 3, parent = #r4}>> -> tensor<1x1x8x1xi32, #r4>
+    %d = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #r4d}>}>}>>
+    %d1 = tt.expand_dims %d {axis = 0 : i32} : tensor<2xi32, #ttg.slice<{dim = 0, parent = #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #r4d}>}>}>> -> tensor<1x2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #r4d}>}>>
+    %d2 = tt.expand_dims %d1 {axis = 1 : i32} : tensor<1x2xi32, #ttg.slice<{dim = 1, parent = #ttg.slice<{dim = 2, parent = #r4d}>}>> -> tensor<1x1x2xi32, #ttg.slice<{dim = 2, parent = #r4d}>>
+    %d3 = tt.expand_dims %d2 {axis = 2 : i32} : tensor<1x1x2xi32, #ttg.slice<{dim = 2, parent = #r4d}>> -> tensor<1x1x1x2xi32, #r4d>
+    %aoff = arith.muli %a3, %c64 : tensor<2x1x1x1xi32, #r4a>
+    %xbase = tt.splat %X : !tt.ptr<f32> -> tensor<2x1x1x1x!tt.ptr<f32>, #r4a>
+    %xaddr = tt.addptr %xbase, %aoff : tensor<2x1x1x1x!tt.ptr<f32>, #r4a>, tensor<2x1x1x1xi32, #r4a>
+    %boff = arith.muli %b3, %c16 : tensor<1x4x1x1xi32, #r4>
+    %ab = tt.broadcast %xaddr : tensor<2x1x1x1x!tt.ptr<f32>, #r4a> -> tensor<2x4x1x1x!tt.ptr<f32>, #r4>
+    %bb = tt.broadcast %boff : tensor<1x4x1x1xi32, #r4> -> tensor<2x4x1x1xi32, #r4>
+    %abaddr = tt.addptr %ab, %bb : tensor<2x4x1x1x!tt.ptr<f32>, #r4>, tensor<2x4x1x1xi32, #r4>
+    %coff = arith.muli %c3, %c2 : tensor<1x1x8x1xi32, #r4>
+    %abaddrb = tt.broadcast %abaddr : tensor<2x4x1x1x!tt.ptr<f32>, #r4> -> tensor<2x4x8x1x!tt.ptr<f32>, #r4>
+    %cb = tt.broadcast %coff : tensor<1x1x8x1xi32, #r4> -> tensor<2x4x8x1xi32, #r4>
+    %abcaddr = tt.addptr %abaddrb, %cb : tensor<2x4x8x1x!tt.ptr<f32>, #r4>, tensor<2x4x8x1xi32, #r4>
+    %abcaddrb = tt.broadcast %abcaddr : tensor<2x4x8x1x!tt.ptr<f32>, #r4> -> tensor<2x4x8x2x!tt.ptr<f32>, #r4>
+    %db = tt.broadcast %d3 : tensor<1x1x1x2xi32, #r4d> -> tensor<2x4x8x2xi32, #r4>
+    %addr = tt.addptr %abcaddrb, %db : tensor<2x4x8x2x!tt.ptr<f32>, #r4>, tensor<2x4x8x2xi32, #r4>
+    %v = tt.load %addr : tensor<2x4x8x2x!tt.ptr<f32>, #r4>
+    %p = tt.trans %v {order = array<i32: 0, 2, 1, 3>} : tensor<2x4x8x2xf32, #r4> -> tensor<2x8x4x2xf32, #r4p>
+    %r = "tt.reduce"(%p) <{axis = 2 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %sum = arith.addf %x, %y : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<2x8x4x2xf32, #r4p>) -> tensor<2x8x2xf32, #ttg.slice<{dim = 2, parent = #r4p}>>
+    tt.return
+  }
+}

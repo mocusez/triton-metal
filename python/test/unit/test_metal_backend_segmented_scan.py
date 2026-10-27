@@ -2749,14 +2749,15 @@ def _scan_result_row_reduce_kernel(X, Y, SCAN_AXIS: tl.constexpr):
     tl.store(Y + row, tl.sum(scanned, 1))
 
 
+@mps_only
 @pytest.mark.parametrize("scan_axis", [0, 1])
-def test_multiband_scan_result_row_reduce_is_named(scan_axis):
-    result = _compile_rankn_nested_negative_in_child(
-        "_scan_result_row_reduce_kernel", {"X": "*fp32", "Y": "*fp32"},
-        {"SCAN_AXIS": scan_axis}, num_warps=1)
-    output = result.stdout + result.stderr
-    assert result.returncode > 0, output
-    assert "rank-2 reduce cannot replay its computed source cone across conversion" in output, output
+def test_multiband_scan_result_row_reduce_matches_torch(scan_axis):
+    x = torch.arange(8 * 64, dtype=torch.float32).reshape(8, 64) % 17 - 8
+    y = torch.full((8,), -1, dtype=torch.float32, device="mps")
+    _scan_result_row_reduce_kernel[(1,)](x.to("mps"), y, scan_axis, num_warps=1)
+    torch.mps.synchronize()
+    expected = x.cumsum(scan_axis).sum(1)
+    torch.testing.assert_close(y.cpu(), expected, atol=0, rtol=0)
 
 
 # A rank-3 reduce beside a multi-band scan was wrong whenever its layout was
@@ -2855,19 +2856,24 @@ def _shared_input_row_reduce_consumer_shapes_kernel(
         tl.store(Y + wide_offset, reduced[:, None] + wide_column[None, :])
 
 
+@mps_only
 @pytest.mark.parametrize("scan_axis", [0, 1])
 @pytest.mark.parametrize("mode", [1, 2], ids=["cross_axis", "wider_tile"])
-def test_multiband_scan_shared_input_row_reduce_consumer_shapes_are_named(scan_axis, mode):
+def test_multiband_scan_shared_input_row_reduce_consumer_shapes_match_torch(scan_axis, mode):
     rows, columns = (8, 32) if mode == 2 else (16, 16)
-    result = _compile_rankn_nested_negative_in_child(
-        "_shared_input_row_reduce_consumer_shapes_kernel",
-        {"X": "*fp32", "Y": "*fp32", "Scanned": "*fp32", "Row": "*fp32"},
-        {"R": rows, "C": columns, "SCAN_AXIS": scan_axis, "MODE": mode},
-        num_warps=1)
-    output = result.stdout + result.stderr
-    assert result.returncode > 0, output
-    assert ("a shared scan-input row reduction requires direct row stores or "
-            "same-axis broadcasts into its original tile") in output, output
+    x = torch.arange(rows * columns, dtype=torch.float32).reshape(rows, columns) % 19 - 9
+    y = torch.full((rows, 64 if mode == 2 else columns), -1,
+                   dtype=torch.float32, device="mps")
+    scanned = torch.full((rows, columns), -1, dtype=torch.float32, device="mps")
+    _shared_input_row_reduce_consumer_shapes_kernel[(1,)](
+        x.to("mps"), y, scanned, torch.empty(rows, device="mps"), rows, columns,
+        scan_axis, mode, num_warps=1)
+    torch.mps.synchronize()
+    reduced = x.sum(1)
+    expected = (x.cumsum(scan_axis) + reduced[None, :] if mode == 1 else
+                reduced[:, None] + torch.arange(64, dtype=torch.float32)[None, :])
+    torch.testing.assert_close(y.cpu(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(scanned.cpu(), x.cumsum(scan_axis), atol=0, rtol=0)
 
 
 @triton.jit
@@ -3664,19 +3670,18 @@ def _small_column_broadcast_beside_multiband_scan_kernel(X, W, Y, Z, SCAN_AXIS: 
     tl.store(Y + offset, tl.cumsum(x, SCAN_AXIS))
 
 
+@mps_only
 @pytest.mark.parametrize("scan_axis", [0, 1])
-def test_small_column_broadcast_beside_independent_multiband_scan_is_named(scan_axis):
-    # A one-band expand still shares the function's multi-band scan partition.
-    # Letting this bypass the guard produced wrong values in all four cells of
-    # [[2, 7], [3, 11]] + column_sum, even with separate scan/output pointers.
-    result = _compile_rankn_nested_negative_in_child(
-        "_small_column_broadcast_beside_multiband_scan_kernel",
-        {"X": "*fp32", "W": "*fp32", "Y": "*fp32", "Z": "*fp32"},
-        {"SCAN_AXIS": scan_axis}, num_warps=1)
-    output = result.stdout + result.stderr
-    assert result.returncode > 0, output
-    assert ("a scan-input column broadcast requires same-layout f32/i32 sources "
-            "and direct same-layout consumers in the original tile") in output, output
+def test_small_column_broadcast_beside_independent_multiband_scan_matches_torch(scan_axis):
+    x = torch.arange(16 * 16, dtype=torch.float32).reshape(16, 16) % 19 - 9
+    w = torch.tensor([[1., 2.], [3., 4.]])
+    y = torch.full((16, 16), -1, dtype=torch.float32, device="mps")
+    z = torch.full((2, 2), -1, dtype=torch.float32, device="mps")
+    _small_column_broadcast_beside_multiband_scan_kernel[(1,)](
+        x.to("mps"), w.to("mps"), y, z, scan_axis, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(y.cpu(), x.cumsum(scan_axis), atol=0, rtol=0)
+    torch.testing.assert_close(z.cpu(), w + w.sum(0)[None, :], atol=0, rtol=0)
 
 
 @triton.jit
@@ -5765,12 +5770,11 @@ def test_multiband_scan_unsigned_row_extrema_outside_envelope_is_named(mode, dia
      "without intervening writes or input exchanges"),
     (3, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
-    (4, "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (6, "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (9, "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (12, "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (13, "axis=0 reduce supports f32/i32 sum/product/max/min"),
-], ids=["load_after_scan", "write_after_scan", "transpose", "mixed_store", "no_scan",
+    (4, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (6, "a scan-input column broadcast requires same-layout f32/i32 sources"),
+    (12, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (13, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+], ids=["load_after_scan", "write_after_scan", "transpose", "mixed_store",
         "reduce_before_scan", "cross_axis"])
 def test_multiband_scan_unsigned_column_extrema_outside_envelope_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -5994,7 +5998,7 @@ def _column_boundary_reduce(value, UNSIGNED: tl.constexpr, MONOID: tl.constexpr)
      "without intervening writes or input exchanges"),
     (3, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
-    (4, "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (4, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (5, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
 ], ids=["load_after_scan", "compute_after_scan", "write_before_scan", "write_after_scan",
@@ -6020,7 +6024,9 @@ def test_multiband_scan_unsigned_column_broadcast_consumer_is_named(mode):
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     diagnostic = ("nested scan requires a flat load/compute/store loop body" if mode == 8 else
-                  "axis=0 reduce supports f32/i32 sum/product/max/min")
+                  "a scan-input column broadcast requires same-layout f32/i32 sources"
+                  if mode in (3, 5, 7, 9, 10) else
+                  "a rank-2 tl.reduce cannot share a function with a multi-band staged scan")
     assert diagnostic in output, output
 
 
@@ -6032,12 +6038,12 @@ def test_multiband_scan_unsigned_column_broadcast_phase_is_named(mode):
         {"MODE": mode, "UNSIGNED": True, "MONOID": ""}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    assert "axis=0 reduce supports f32/i32 sum/product/max/min" in output, output
+    assert "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer" in output, output
 
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,diagnostic", [
-    (4, 1024, 0, "*i32", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (128, 16, 1, "*i32", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (4, 1024, 0, "*i32", "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (128, 16, 1, "*i32", "a scan-input column broadcast requires same-layout f32/i32 sources"),
     (16, 16, 1, "*u64", "rank >= 2 scan is implemented for a blocked tile"),
 ], ids=["wide_columns", "tall_tile", "unsigned_i64"])
 def test_multiband_scan_unsigned_column_broadcast_shape_and_type_is_named(
@@ -6210,7 +6216,7 @@ def test_multiband_scan_i32_column_monoid_broadcast_budget_is_named():
      "without intervening writes or input exchanges"),
     (3, "xor", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
-    (4, "and", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (4, "and", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (5, "product", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
 ], ids=["load_after_scan", "compute_after_scan", "write_before_scan", "write_after_scan",
@@ -6237,7 +6243,9 @@ def test_multiband_scan_i32_column_monoid_broadcast_consumer_is_named(mode):
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     diagnostic = ("nested scan requires a flat load/compute/store loop body" if mode == 8 else
-                  "axis=0 reduce supports f32/i32 sum/product/max/min")
+                  "a scan-input column broadcast requires same-layout f32/i32 sources"
+                  if mode in (3, 5, 7, 9, 10) else
+                  "a rank-2 tl.reduce cannot share a function with a multi-band staged scan")
     assert diagnostic in output, output
 
 
@@ -6249,12 +6257,12 @@ def test_multiband_scan_i32_column_monoid_broadcast_phase_is_named(mode):
         {"MODE": mode, "UNSIGNED": False, "MONOID": "and"}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    assert "axis=0 reduce supports f32/i32 sum/product/max/min" in output, output
+    assert "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer" in output, output
 
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,diagnostic", [
-    (4, 1024, 0, "*i32", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (128, 16, 1, "*i32", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (4, 1024, 0, "*i32", "rank-2 axis=0 reduce with more output columns than threads needs a rank-1 consumer"),
+    (128, 16, 1, "*i32", "a scan-input column broadcast requires same-layout f32/i32 sources"),
     (8, 128, 1, "*i32", "rank >= 2 scan is implemented for a blocked tile"),
     (16, 16, 1, "*i64", "rank >= 2 scan is implemented for a blocked tile"),
 ], ids=["wide_columns", "tall_tile", "long_scan_axis", "i64"])
@@ -6433,17 +6441,16 @@ def test_multiband_scan_i32_computed_sources_column_bitwise_vectors_budget_is_na
      "without intervening writes or input exchanges"),
     (3, "and", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
-    (4, "or", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (4, "or", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (5, "xor", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
-    (6, "and", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (9, "or", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (10, "xor", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (11, "and", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (12, "or", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (13, "xor", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (6, "and", "a scan-input column broadcast requires same-layout f32/i32 sources"),
+    (10, "xor", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (11, "and", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (12, "or", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
+    (13, "xor", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
 ], ids=["load_after_scan", "compute_after_scan", "write_before_scan", "write_after_scan",
-        "transpose", "scan_result", "mixed_store", "no_scan", "different_shape",
+        "transpose", "scan_result", "mixed_store", "different_shape",
         "two_scans", "reduce_before_scan", "cross_axis"])
 def test_multiband_scan_i32_bitwise_column_vector_outside_envelope_is_named(mode, reduction, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -6737,8 +6744,8 @@ def test_multiband_scan_f32_column_product_broadcast_consumer_is_named(mode, dia
 @pytest.mark.parametrize("rows,columns,dtype,diagnostic", [
     (4, 1024, "*fp32", "rank-2 axis=0 f32 product requires a direct unmasked tt.load"),
     (128, 16, "*fp32", "rank-2 axis=0 f32 product requires a direct unmasked tt.load"),
-    (16, 16, "*fp16", "axis=0 reduce supports f32/i32 sum/product/max/min"),
-    (16, 16, "*bf16", "axis=0 reduce supports f32/i32 sum/product/max/min"),
+    (16, 16, "*fp16", "tt.reduce axis=0 reduce supports f32 sum/product/max/min and i32 sum/product/signed/unsigned extrema/and/or/xor"),
+    (16, 16, "*bf16", "tt.reduce axis=0 reduce supports f32 sum/product/max/min and i32 sum/product/signed/unsigned extrema/and/or/xor"),
 ], ids=["wide_columns", "long_reduce_axis", "f16", "bf16"])
 def test_multiband_scan_f32_column_product_broadcast_shape_and_type_is_named(rows, columns, dtype, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -7012,7 +7019,7 @@ def test_multiband_scan_f32_nonplain_column_product_vector_other_width_is_named(
          "OTHER": 1., "OUTPUT_MASKED": False}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    assert "axis=0 reduce supports f32/i32 sum/product/max/min" in output, output
+    assert "tt.reduce axis=0 reduce supports f32 sum/product/max/min and i32 sum/product/signed/unsigned extrema/and/or/xor" in output, output
 
 
 def _check_f32_row_product(rows, columns, scan_axis, num_warps, shared, broadcast,
@@ -9645,32 +9652,36 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_special_values_match_
 
 @triton.jit
 def _mixed_band_scans_kernel(X, O, Q, A: tl.constexpr, B: tl.constexpr,
-                             C: tl.constexpr, INCLUDE_RANK3: tl.constexpr):
+                             C: tl.constexpr, INCLUDE_RANK3: tl.constexpr,
+                             REVERSE: tl.constexpr):
     if INCLUDE_RANK3:
         f = tl.arange(0, A * B * C)
         v = tl.reshape(tl.load(X + f), (A, B, C))
-        tl.store(O + f, tl.reshape(tl.cumsum(v, 2), (A * B * C,)))
+        tl.store(O + f, tl.reshape(tl.cumsum(v, 2, reverse=REVERSE),
+                                  (A * B * C,)))
     i = tl.arange(0, A)
     j = tl.arange(0, B)
     w = tl.load(X + i[:, None] * B + j[None, :])
-    tl.store(Q + i[:, None] * B + j[None, :], tl.cumsum(w, 1))
+    tl.store(Q + i[:, None] * B + j[None, :],
+             tl.cumsum(w, 1, reverse=REVERSE))
+
+
+def _reverse_cumsum(x, axis, reverse):
+    if reverse:
+        return x.flip(axis).cumsum(axis).flip(axis)
+    return x.cumsum(axis)
 
 
 @mps_only
-def test_mixed_staged_scan_band_counts_are_named_then_recover(capfd):
-    a, b, c = 4, 4, 8
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("a,b,c", [(4, 4, 8), (4, 4, 16)])
+def test_mixed_staged_scan_band_counts_match_torch(reverse, a, b, c):
     x = torch.arange(a * b * c, dtype=torch.float32, device="mps")
-    o = torch.zeros(a * b * c, device="mps")
-    q = torch.zeros(a * b, device="mps")
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _mixed_band_scans_kernel[(1,)](x, o, q, a, b, c, True, num_warps=1)
-    diagnostic = capfd.readouterr()
-    needle = ("Metal backend: staged scans with different register-band counts "
-              "cannot share a function phase")
-    assert needle in diagnostic.err + diagnostic.out
-
-    _mixed_band_scans_kernel[(1,)](x, o, q, a, b, c, False, num_warps=1)
+    o = torch.full((a * b * c,), -1, dtype=torch.float32, device="mps")
+    q = torch.full((a * b,), -1, dtype=torch.float32, device="mps")
+    _mixed_band_scans_kernel[(1,)](x, o, q, a, b, c, True, reverse, num_warps=1)
     torch.mps.synchronize()
-    torch.testing.assert_close(q.cpu(), x.cpu()[:a * b].reshape(a, b).cumsum(1).reshape(-1),
-                               atol=0, rtol=0)
-    assert torch.all(o == 0)
+    expected3 = _reverse_cumsum(x.cpu().reshape(a, b, c), 2, reverse)
+    expected2 = _reverse_cumsum(x.cpu()[:a * b].reshape(a, b), 1, reverse)
+    torch.testing.assert_close(o.cpu(), expected3.reshape(-1), atol=0, rtol=0)
+    torch.testing.assert_close(q.cpu(), expected2.reshape(-1), atol=0, rtol=0)

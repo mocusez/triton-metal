@@ -485,3 +485,124 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: arith.cmpi sge
 // CHECK: bitXorOp
 // CHECK-NOT: tt.scan
+
+// -----
+// Each scan closes its register-band phase after its own consumers. A later
+// single-band scan must not absorb the first scan's store into an E=1 loop.
+#mixed2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+#mixed1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#mixed3 = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @mixed_staged_scan_bands(%X: !tt.ptr<f32>, %O: !tt.ptr<f32>, %Q: !tt.ptr<f32>) {
+    %c4 = arith.constant dense<4> : tensor<4x1xi32, #mixed2>
+    %f = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #mixed1>
+    %xp = tt.splat %X : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #mixed1>
+    %xa = tt.addptr %xp, %f : tensor<128x!tt.ptr<f32>, #mixed1>, tensor<128xi32, #mixed1>
+    %flat = tt.load %xa : tensor<128x!tt.ptr<f32>, #mixed1>
+    %v = tt.reshape %flat : tensor<128xf32, #mixed1> -> tensor<4x4x8xf32, #mixed3>
+    %op = tt.splat %O : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #mixed1>
+    %oa = tt.addptr %op, %f : tensor<128x!tt.ptr<f32>, #mixed1>, tensor<128xi32, #mixed1>
+    %s3 = "tt.scan"(%v) <{axis = 2 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<4x4x8xf32, #mixed3>) -> tensor<4x4x8xf32, #mixed3>
+    %s3f = tt.reshape %s3 : tensor<4x4x8xf32, #mixed3> -> tensor<128xf32, #mixed1>
+    tt.store %oa, %s3f : tensor<128x!tt.ptr<f32>, #mixed1>
+    %i = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #mixed2}>>
+    %ie = tt.expand_dims %i {axis = 1 : i32} : tensor<4xi32, #ttg.slice<{dim = 1, parent = #mixed2}>> -> tensor<4x1xi32, #mixed2>
+    %io = arith.muli %ie, %c4 : tensor<4x1xi32, #mixed2>
+    %x2p = tt.splat %X : !tt.ptr<f32> -> tensor<4x1x!tt.ptr<f32>, #mixed2>
+    %x2a = tt.addptr %x2p, %io : tensor<4x1x!tt.ptr<f32>, #mixed2>, tensor<4x1xi32, #mixed2>
+    %j = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #mixed2}>>
+    %je = tt.expand_dims %j {axis = 0 : i32} : tensor<4xi32, #ttg.slice<{dim = 0, parent = #mixed2}>> -> tensor<1x4xi32, #mixed2>
+    %x2ab = tt.broadcast %x2a : tensor<4x1x!tt.ptr<f32>, #mixed2> -> tensor<4x4x!tt.ptr<f32>, #mixed2>
+    %jb = tt.broadcast %je : tensor<1x4xi32, #mixed2> -> tensor<4x4xi32, #mixed2>
+    %x2addr = tt.addptr %x2ab, %jb : tensor<4x4x!tt.ptr<f32>, #mixed2>, tensor<4x4xi32, #mixed2>
+    %w = tt.load %x2addr : tensor<4x4x!tt.ptr<f32>, #mixed2>
+    %q2p = tt.splat %Q : !tt.ptr<f32> -> tensor<4x1x!tt.ptr<f32>, #mixed2>
+    %q2a = tt.addptr %q2p, %io : tensor<4x1x!tt.ptr<f32>, #mixed2>, tensor<4x1xi32, #mixed2>
+    %q2ab = tt.broadcast %q2a : tensor<4x1x!tt.ptr<f32>, #mixed2> -> tensor<4x4x!tt.ptr<f32>, #mixed2>
+    %qaddr = tt.addptr %q2ab, %jb : tensor<4x4x!tt.ptr<f32>, #mixed2>, tensor<4x4xi32, #mixed2>
+    %s2 = "tt.scan"(%w) <{axis = 1 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<4x4xf32, #mixed2>) -> tensor<4x4xf32, #mixed2>
+    tt.store %qaddr, %s2 : tensor<4x4x!tt.ptr<f32>, #mixed2>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel mixed_staged_scan_bands
+// CHECK: %[[BUF3:.*]] = metal.threadgroup_alloca : !metal.memref<128 x f32>
+// CHECK: %[[BUF2:.*]] = metal.threadgroup_alloca : !metal.memref<16 x f32>
+// CHECK: %[[C4:.*]] = arith.constant 4 : i32
+// CHECK: scf.for %{{.*}} = %{{.*}} to %[[C4]]
+// CHECK: metal.tg_store_indexed %[[BUF3]]
+// CHECK: metal.barrier
+// CHECK: scf.for %{{.*}} = %{{.*}} to %[[C4]]
+// CHECK: metal.tg_load_indexed %[[BUF3]]
+// CHECK: metal.store
+// CHECK: metal.barrier
+// CHECK: %[[C1:.*]] = arith.constant 1 : i32
+// CHECK: scf.for %{{.*}} = %{{.*}} to %[[C1]]
+// CHECK: metal.tg_store_indexed %[[BUF2]]
+// CHECK: metal.barrier
+// CHECK: %[[READ_C1:.*]] = arith.constant 1 : i32
+// CHECK: scf.for %{{.*}} = %{{.*}} to %[[READ_C1]]
+// CHECK: metal.tg_load_indexed %[[BUF2]]
+// CHECK: metal.store
+// CHECK-NOT: tt.scan
+
+// -----
+// A reduction of the scan result reads a second publication emitted after
+// the scan, rather than replaying the scan's source cone.
+#scan_result_tile = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#scan_result_row = #ttg.slice<{dim = 1, parent = #scan_result_tile}>
+#scan_result_col = #ttg.slice<{dim = 0, parent = #scan_result_tile}>
+#scan_result_flat = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_result_row_reduce(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+    %c64 = arith.constant dense<64> : tensor<8x1xi32, #scan_result_tile>
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_row>
+    %re = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #scan_result_row> -> tensor<8x1xi32, #scan_result_tile>
+    %ro = arith.muli %re, %c64 : tensor<8x1xi32, #scan_result_tile>
+    %col = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32, #scan_result_col>
+    %ce = tt.expand_dims %col {axis = 0 : i32} : tensor<64xi32, #scan_result_col> -> tensor<1x64xi32, #scan_result_tile>
+    %xbase = tt.splat %in : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #scan_result_tile>
+    %xrow = tt.addptr %xbase, %ro : tensor<8x1x!tt.ptr<f32>, #scan_result_tile>, tensor<8x1xi32, #scan_result_tile>
+    %xrowb = tt.broadcast %xrow : tensor<8x1x!tt.ptr<f32>, #scan_result_tile> -> tensor<8x64x!tt.ptr<f32>, #scan_result_tile>
+    %cb = tt.broadcast %ce : tensor<1x64xi32, #scan_result_tile> -> tensor<8x64xi32, #scan_result_tile>
+    %xaddr = tt.addptr %xrowb, %cb : tensor<8x64x!tt.ptr<f32>, #scan_result_tile>, tensor<8x64xi32, #scan_result_tile>
+    %v = tt.load %xaddr : tensor<8x64x!tt.ptr<f32>, #scan_result_tile>
+    %scan = "tt.scan"(%v) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.scan.return %sum : f32
+    }) : (tensor<8x64xf32, #scan_result_tile>) -> tensor<8x64xf32, #scan_result_tile>
+    %r = "tt.reduce"(%scan) <{axis = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<8x64xf32, #scan_result_tile>) -> tensor<8xf32, #scan_result_row>
+    %out_index = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_flat>
+    %base = tt.splat %out : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>, #scan_result_flat>
+    %ptr = tt.addptr %base, %out_index : tensor<8x!tt.ptr<f32>, #scan_result_flat>, tensor<8xi32, #scan_result_flat>
+    %flat = ttg.convert_layout %r : tensor<8xf32, #scan_result_row> -> tensor<8xf32, #scan_result_flat>
+    tt.store %ptr, %flat : tensor<8x!tt.ptr<f32>, #scan_result_flat>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_result_row_reduce
+// CHECK: %[[INPUT:.*]] = metal.threadgroup_alloca : !metal.memref<512 x f32>
+// CHECK: %[[RESULT:.*]] = metal.threadgroup_alloca : !metal.memref<512 x f32>
+// CHECK: metal.tg_store_indexed %[[INPUT]]
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed %[[INPUT]]
+// CHECK: metal.tg_store_indexed %[[RESULT]]
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed %[[RESULT]]
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
+// CHECK-NOT: tt.scan
