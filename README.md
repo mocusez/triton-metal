@@ -762,9 +762,10 @@ The current dependency-ordered priorities are:
    results wider than the threadgroup can now broadcast along either axis of
    a rank-2 tile, including elementwise combinations of scans and subsequent
    reductions. Broadcasts use their own consumer tile coordinates and retain
-   prefix buffers through deferred readers. A direct f32 row sum of a staged
-   scan's result publishes that result after the scan and reduces the second
-   buffer in the next phase. An independent single-band f32 column sum before
+   prefix buffers through deferred readers. A direct f32 row sum, product or
+   min/max of a staged scan's result, with either NaN policy for extrema, publishes that
+   result after the scan and reduces the second buffer in the next phase. An
+   independent single-band f32 column sum before
    such a scan publishes its own small tile and finishes its consumer in that
    tile's own phase. A single top-level multi-band rank-2 scan can also
    share its input publication with subsequent reductions of the exact same

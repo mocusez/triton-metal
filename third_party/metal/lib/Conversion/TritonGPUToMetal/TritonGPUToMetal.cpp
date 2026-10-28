@@ -17217,6 +17217,13 @@ static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
   return sawTileStore;
 }
 
+static bool isScanResultRowReduceCombine(mlir::triton::ReduceOp reduce) {
+  return mlir::isa_and_nonnull<
+      mlir::arith::AddFOp, mlir::arith::MulFOp, mlir::arith::MaximumFOp,
+      mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(
+      reduceCombineBinaryOp(reduce));
+}
+
 // Only postpone legacy reduce gates for a single, matching staged scan. The
 // phase planner remains authoritative about source lifetimes and publication
 // budgets, and the caller must verify that it claimed this reduce.
@@ -17386,8 +17393,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         bool scanResult = scan.getNumResults() == 1 &&
                           reduce.getSrcs().front() == scan->getResult(0);
         if (scanResult && reduce.getAxis() == 1 && type.getElementType().isF32() &&
-            mlir::isa_and_nonnull<mlir::arith::AddFOp>(
-                reduceCombineBinaryOp(reduce)) &&
+            isScanResultRowReduceCombine(reduce) &&
             !reduce->use_empty() &&
             llvm::all_of(reduce->getUsers(), isDirectStore) && scanPlan &&
             scanPlan->layout && scanPlan->layout->elemPerThread > 1 &&
@@ -44510,9 +44516,7 @@ struct ConvertTritonGPUToMetalPass
         red->setAttr(kRankNUserLoopAttr, mlir::UnitAttr::get(&getContext()));
       if (rtt && rtt.getRank() == 2 && red.getAxis() == 1 &&
           rtt.getElementType().isF32() &&
-          mlir::isa_and_nonnull<mlir::arith::AddFOp>(
-              reduceCombineBinaryOp(red)) &&
-          !red->use_empty() &&
+          isScanResultRowReduceCombine(red) && !red->use_empty() &&
           llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer)) {
         auto scan = red.getSrcs().front().getDefiningOp<mlir::triton::ScanOp>();
         if (scan && scan->getBlock() == red->getBlock() &&

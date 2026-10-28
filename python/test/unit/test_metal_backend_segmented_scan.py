@@ -2741,23 +2741,105 @@ def test_multiband_scan_shared_input_outside_envelope_is_named(two_scans, diagno
 
 
 @triton.jit
-def _scan_result_row_reduce_kernel(X, Y, SCAN_AXIS: tl.constexpr):
-    row = tl.arange(0, 8)
+def _scan_result_row_reduce_kernel(X, Y, Scanned, SCAN_AXIS: tl.constexpr,
+                                   REDUCTION: tl.constexpr = "sum",
+                                   REVERSE: tl.constexpr = False):
+    program = tl.program_id(0)
+    row = tl.arange(0, 16)
     column = tl.arange(0, 64)
-    x = tl.load(X + row[:, None] * 64 + column[None, :])
-    scanned = tl.cumsum(x, SCAN_AXIS)
-    tl.store(Y + row, tl.sum(scanned, 1))
+    offset = program * (16 * 64) + row[:, None] * 64 + column[None, :]
+    x = tl.load(X + offset)
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    tl.store(Scanned + offset, scanned)
+    if REDUCTION == "product":
+        reduced = tl.reduce(scanned, 1, _i32_column_product_combine)
+    elif REDUCTION == "min":
+        reduced = tl.reduce(scanned, 1, _mixed_row_minimum_combine)
+    elif REDUCTION == "max":
+        reduced = tl.reduce(scanned, 1, _mixed_row_maximum_combine)
+    elif REDUCTION == "minnum":
+        reduced = tl.min(scanned, 1)
+    elif REDUCTION == "maxnum":
+        reduced = tl.max(scanned, 1)
+    else:
+        reduced = tl.sum(scanned, 1)
+    tl.store(Y + program * 16 + row, reduced)
 
 
 @mps_only
 @pytest.mark.parametrize("scan_axis", [0, 1])
 def test_multiband_scan_result_row_reduce_matches_torch(scan_axis):
-    x = torch.arange(8 * 64, dtype=torch.float32).reshape(8, 64) % 17 - 8
-    y = torch.full((8,), -1, dtype=torch.float32, device="mps")
-    _scan_result_row_reduce_kernel[(1,)](x.to("mps"), y, scan_axis, num_warps=1)
+    x = torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64) % 17 - 8
+    y = torch.full((16,), -1, dtype=torch.float32, device="mps")
+    scanned = torch.empty_like(x, device="mps")
+    _scan_result_row_reduce_kernel[(1,)](x.to("mps"), y, scanned, scan_axis, num_warps=1)
     torch.mps.synchronize()
-    expected = x.cumsum(scan_axis).sum(1)
-    torch.testing.assert_close(y.cpu(), expected, atol=0, rtol=0)
+    expected_scan = x.cumsum(scan_axis)
+    torch.testing.assert_close(scanned.cpu(), expected_scan, atol=0, rtol=0)
+    torch.testing.assert_close(y.cpu(), expected_scan.sum(1), atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
+@pytest.mark.parametrize("scan_axis,reverse,num_warps", [
+    (0, False, 1), (0, True, 4), (1, False, 4), (1, True, 1),
+])
+def test_multiband_scan_result_row_extremum_matches_torch(
+        reduction, scan_axis, reverse, num_warps):
+    programs, rows, columns = 2, 16, 64
+    x = _mixed_row_extremum_special_values(programs, rows, columns)
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    sentinel = -999999.
+    y = torch.full((programs * rows + 7,), sentinel, dtype=torch.float32, device="mps")
+    scanned = torch.full((programs * rows * columns + 7,), sentinel,
+                         dtype=torch.float32, device="mps")
+    _scan_result_row_reduce_kernel[(programs,)](
+        x.to("mps"), y, scanned, scan_axis, reduction, reverse, num_warps=num_warps)
+    torch.mps.synchronize()
+    size = programs * rows * columns
+    actual_scan = scanned.cpu()[:size].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual_scan, expected_scan, atol=0, rtol=0, equal_nan=True)
+    actual = y.cpu()[:programs * rows].reshape(programs, rows)
+    expected = _f32_row_extremum_reference(actual_scan, reduction)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    if reduction in ("min", "max"):
+        zeros = expected == 0
+        assert torch.equal(actual.signbit()[zeros], expected.signbit()[zeros])
+    assert (y.cpu()[programs * rows:] == sentinel).all()
+    assert (scanned.cpu()[size:] == sentinel).all()
+
+
+@mps_only
+@pytest.mark.parametrize("scan_axis,reverse,num_warps", [
+    (0, False, 1), (0, True, 4), (1, False, 4), (1, True, 1),
+])
+def test_multiband_scan_result_row_product_matches_torch(scan_axis, reverse, num_warps):
+    programs, rows, columns = 2, 16, 64
+    x = _mixed_row_extremum_special_values(programs, rows, columns)
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    sentinel = -999999.
+    y = torch.full((programs * rows + 7,), sentinel, dtype=torch.float32, device="mps")
+    scanned = torch.full((programs * rows * columns + 7,), sentinel,
+                         dtype=torch.float32, device="mps")
+    _scan_result_row_reduce_kernel[(programs,)](
+        x.to("mps"), y, scanned, scan_axis, "product", reverse, num_warps=num_warps)
+    torch.mps.synchronize()
+    size = programs * rows * columns
+    actual_scan = scanned.cpu()[:size].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual_scan, expected_scan, atol=0, rtol=0, equal_nan=True)
+    actual = y.cpu()[:programs * rows].reshape(programs, rows)
+    expected = _f32_column_product_reference(actual_scan.transpose(1, 2))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    zeros = expected == 0
+    assert torch.equal(actual.signbit()[zeros], expected.signbit()[zeros])
+    assert (y.cpu()[programs * rows:] == sentinel).all()
+    assert (scanned.cpu()[size:] == sentinel).all()
 
 
 # A rank-3 reduce beside a multi-band scan was wrong whenever its layout was

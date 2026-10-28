@@ -4781,7 +4781,7 @@ def _reduce_rank1_contiguous_masked_chain_kernel(
     ids=["unmasked_sum_nw1", "unmasked_max_nw4",
          "computed_sum_nw1", "computed_max_nw4"],
 )
-def test_reduce_rank1_geometry_over_e64_fails_without_crashing(
+def test_reduce_rank1_geometry_over_e256_fails_without_crashing(
         num_warps, operation, computed, tmp_path):
     import os
     import subprocess
@@ -4789,8 +4789,8 @@ def test_reduce_rank1_geometry_over_e64_fails_without_crashing(
     import textwrap
 
     threads_per_block = num_warps * 32
-    failing_block = threads_per_block * 128
-    supported_block = threads_per_block * 64
+    failing_block = threads_per_block * 512
+    supported_block = threads_per_block * 256
     script = tmp_path / "reduce_geometry.py"
     script.write_text(textwrap.dedent(f"""
         import importlib.util
@@ -4816,7 +4816,7 @@ def test_reduce_rank1_geometry_over_e64_fails_without_crashing(
             except RuntimeError:
                 pass
             else:
-                raise AssertionError("unsupported E>64 rank-1 reduce compiled")
+                raise AssertionError("unsupported E>256 rank-1 reduce compiled")
         compile_case({supported_block}, "sum", False)
         print("RECOVERED")
     """))
@@ -4826,7 +4826,7 @@ def test_reduce_rank1_geometry_over_e64_fails_without_crashing(
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    needle = "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]"
+    needle = "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 256]"
     assert output.count(needle) == 3
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
@@ -4879,14 +4879,34 @@ def test_reduce_rank1_masked_zero_sum_runtime_boundary(
     torch.testing.assert_close(out.cpu(), x[:n].sum(), atol=1e-3, rtol=1e-5)
 
 
+@pytest.mark.parametrize("operation,other", [("sum", 1.0), ("max", 0.0)])
+def test_reduce_rank1_masked_e128_runtime_boundary(operation, other):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    block = 32 * 128
+    n = block - 17
+    x = ((torch.arange(block) % 29).float() + 1.0) / 11.0
+    out = torch.empty((), device="mps")
+    _reduce_rank1_geometry_kernel[(1,)](
+        x.to("mps"), out, N=n, BLOCK=block, OP=operation, MASKED=True,
+        OTHER=other, COMPUTED=False, num_warps=1)
+    torch.mps.synchronize()
+    if operation == "sum":
+        expected = x[:n].sum() + (block - n) * other
+    else:
+        expected = torch.maximum(x[:n].max(), torch.tensor(other))
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "elements_per_thread,operation,other",
     [
-        (128, "sum", 1.0),
-        (128, "max", 0.0),
+        (512, "sum", 1.0),
+        (512, "max", 0.0),
         (2048, "sum", 0.0),
     ],
-    ids=["masked_nonzero_other_e128", "masked_max_e128", "masked_sum_e2048"],
+    ids=["masked_nonzero_other_e512", "masked_max_e512", "masked_sum_e2048"],
 )
 def test_reduce_rank1_masked_geometry_unsupported_caps(
         elements_per_thread, operation, other, tmp_path):
@@ -4925,7 +4945,7 @@ def test_reduce_rank1_masked_geometry_unsupported_caps(
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     err = result.stdout + result.stderr
     assert result.returncode == 0, err
-    assert "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 64]" in err
+    assert "rank-1 reduce E = BLOCK/tpb outside supported envelope [1, 256]" in err
     assert "REJECTED" in err
     assert "failed to legalize" not in err
 
@@ -5857,44 +5877,35 @@ def _reduce_rank3_loop_carried_kernel(X, O, T, PLANE_STRIDE,
     tl.store(O + off, r + 0.0 * acc)
 
 
-@pytest.mark.parametrize(
-    "kernel,constexprs,needle",
-    [
-        ("_reduce_rank4_kernel",
-         '{"D0": 2, "D1": 4, "D2": 4, "D3": 8, "AXIS": 3}',
-         "rank >= 4 tiles are not implemented"),
-        ("_reduce_rank4_kernel",
-         '{"D0": 2, "D1": 4, "D2": 4, "D3": 8, "AXIS": 0}',
-         "rank >= 4 tiles are not implemented"),
-        ("_reduce_rank3_loop_carried_kernel",
-         '{"D0": 4, "D1": 8, "D2": 16, "AXIS": 2}',
-         "cannot hoist its source before the phase boundary"),
-        ("_reduce_rank3_loop_carried_kernel",
-         '{"D0": 4, "D1": 8, "D2": 16, "AXIS": 0}',
-         "cannot hoist its source before the phase boundary"),
-    ],
-    ids=["rank4_axis3", "rank4_axis0", "loop_carried_axis2",
-         "loop_carried_axis0"],
-)
-def test_reduce_rank4_and_loop_carried_fail_without_crashing(
-        kernel, constexprs, needle, tmp_path):
-    """Both shapes are out of envelope; both must SAY so before conversion.
+@pytest.mark.parametrize("axis", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_reduce_rank4_matches_torch(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    shape = (2, 4, 4, 8)
+    x = ((torch.arange(2 * 4 * 4 * 8) % 43).float() - 19.0) / 11.0
+    out = torch.empty(x.numel(), device="mps")
+    _reduce_rank4_kernel[(1,)](
+        x.to("mps"), out, D0=2, D1=4, D2=4, D3=8, AXIS=axis,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    tile = x.reshape(shape)
+    expected = tile.sum(dim=axis, keepdim=True).expand_as(tile).flatten()
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
 
-    A rank >= 4 tile has no per-element range lowering at all — even a plain
-    elementwise copy of one fails — and used to report only `failed to legalize
-    operation 'tt.make_range'`. A rank-3 reduce over a loop-carried accumulator
-    used to fail the pass with NO diagnostic whatsoever, because the phase
-    pre-pass returned failure and its caller only signalled.
-    """
+
+@pytest.mark.parametrize(
+    "axis", [2, 0], ids=["loop_carried_axis2", "loop_carried_axis0"])
+def test_reduce_loop_carried_fails_without_crashing(axis, tmp_path):
+    """A loop-carried source must be refused before conversion, with recovery."""
     import os
     import subprocess
     import sys
     import textwrap
 
-    signature = ('{"X": "*fp32", "O": "*fp32"}' if "rank4" in kernel else
-                 '{"X": "*fp32", "O": "*fp32", "T": "i32", '
-                 '"PLANE_STRIDE": "i32"}')
-    script = tmp_path / "reduce_rank4_loop.py"
+    constexprs = (f'{{"D0": 4, "D1": 8, "D2": 16, "AXIS": {axis}}}')
+    script = tmp_path / "reduce_loop.py"
     script.write_text(textwrap.dedent(f"""
         import importlib.util
         import triton
@@ -5907,8 +5918,9 @@ def test_reduce_rank4_and_loop_carried_fail_without_crashing(
 
         def compile_case():
             triton.compile(ASTSource(
-                getattr(module, {kernel!r}),
-                signature={signature},
+                module._reduce_rank3_loop_carried_kernel,
+                signature={{"X": "*fp32", "O": "*fp32", "T": "i32",
+                            "PLANE_STRIDE": "i32"}},
                 constexprs={constexprs}),
                 target=target, options={{"num_warps": 1}})
 
@@ -5935,7 +5947,7 @@ def test_reduce_rank4_and_loop_carried_fail_without_crashing(
                                  "TRITON_CACHE_DIR": str(tmp_path / "cache")})
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    assert output.count(needle) >= 3, output
+    assert output.count("cannot hoist its source before the phase boundary") >= 3, output
     assert "RECOVERED" in output
     assert "failed to legalize" not in output
 
