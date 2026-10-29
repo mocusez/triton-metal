@@ -17190,7 +17190,7 @@ static bool hasSamePhaseMixedRowConsumers(
     mlir::Operation *consumerUser = user;
     if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
         cvt && cvt->hasOneUse()) {
-      if (!allowCrossAxis ||
+      if ((!allowCrossAxis && !allowWiderSameAxis) ||
           (!cvt->hasAttr(kScalarIdentityAttr) && !isScalarIdentityConvert(cvt)))
         return false;
       consumerUser = *cvt->user_begin();
@@ -17620,8 +17620,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                          /*requireSameLayout=*/true)
                                    : std::nullopt;
             bool customRowConsumer =
-                sameSource && reduce.getAxis() == 1 &&
-                type.getElementType().isF32() &&
+                reduce.getAxis() == 1 && type.getElementType().isF32() &&
                 mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) && expand &&
                 expandTy && consumer &&
                 (expand.getAxis() != reduce.getAxis() ||
@@ -17676,7 +17675,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                   reduce, type,
                   sameSource && type.getElementType().isF32() &&
                       mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine),
-                  sameSource && type.getElementType().isF32() &&
+                  type.getElementType().isF32() &&
                       mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine));
           if (!consumersValid || (sawStore && sawExpand && !splitRowReduction)) {
             reduce.emitOpError(

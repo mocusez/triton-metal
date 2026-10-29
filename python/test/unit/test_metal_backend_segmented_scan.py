@@ -8383,6 +8383,81 @@ def test_multiband_scan_wider_same_axis_mixed_row_sum_matches_torch(
     assert (scanned.cpu()[numel:] == sentinel).all()
 
 
+@triton.jit
+def _distinct_input_wider_scan_mixed_row_sum_kernel(
+        X, W, Y, Scanned, Row, N, R: tl.constexpr, C: tl.constexpr,
+        SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    offset = program * R * C + row[:, None] * C + tl.arange(0, C)[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0.25)
+        w = tl.load(W + offset, offset < N, other=-0.75)
+    else:
+        x = tl.load(X + offset)
+        w = tl.load(W + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+        w = w * 2 - 5
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    reduced = tl.sum(w, 1)
+    tl.store(Row + program * R + row, reduced)
+    wider_column = tl.arange(0, 2 * C)
+    wider_offset = (program * R * (2 * C) + row[:, None] * (2 * C) +
+                    wider_column[None, :])
+    tl.store(Y + wider_offset, reduced[:, None] + wider_column[None, :])
+    tl.store(Scanned + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize("rows,columns,scan_axis,reverse,num_warps,masked,computed", [
+    (16, 16, 0, False, 1, False, False),
+    (16, 16, 0, True, 4, True, True),
+    (8, 64, 1, False, 4, True, False),
+    (64, 8, 1, True, 1, False, True),
+])
+def test_multiband_scan_distinct_input_wider_mixed_row_sum_matches_torch(
+        rows, columns, scan_axis, reverse, num_warps, masked, computed):
+    programs = 2
+    numel = programs * rows * columns
+    wider_numel = 2 * numel
+    valid = numel - columns - 3 if masked else numel
+    index = torch.arange(numel).reshape(programs, rows, columns)
+    x = 1 + (index // columns % rows).float() / 4 + (index % columns % 7).float() / 8
+    w = -2 + (index // columns % rows).float() / 8 + (index % columns % 5).float() / 16
+    x.view(-1)[valid:] = 0.25
+    w.view(-1)[valid:] = -0.75
+    device_x, device_w = x, w
+    if computed:
+        x = x * 2 + 3
+        w = w * 2 - 5
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    reduced = w.sum(2)
+    expected_wider = reduced[:, :, None] + torch.arange(2 * columns)
+    sentinel = -999999.
+    y = torch.full((wider_numel + 7,), sentinel, device="mps")
+    scanned = torch.full((numel + 7,), sentinel, device="mps")
+    row = torch.full((programs * rows + 7,), sentinel, device="mps")
+    _distinct_input_wider_scan_mixed_row_sum_kernel[(programs,)](
+        device_x.to("mps"), device_w.to("mps"), y, scanned, row, valid,
+        rows, columns, scan_axis, reverse, masked, computed, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(row.cpu()[:programs * rows].reshape(programs, rows),
+                               reduced, atol=0, rtol=0)
+    torch.testing.assert_close(
+        y.cpu()[:wider_numel].reshape(programs, rows, 2 * columns),
+        expected_wider, atol=0, rtol=0)
+    torch.testing.assert_close(scanned.cpu()[:numel].reshape(programs, rows, columns),
+                               expected_scan, atol=0, rtol=0)
+    assert (row.cpu()[programs * rows:] == sentinel).all()
+    assert (y.cpu()[wider_numel:] == sentinel).all()
+    assert (scanned.cpu()[numel:] == sentinel).all()
+
+
 @mps_only
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,masked,computed", [
     (16, 16, 0, 1, False, False),
