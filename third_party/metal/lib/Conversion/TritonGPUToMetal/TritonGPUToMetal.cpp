@@ -17217,10 +17217,30 @@ static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
   return sawTileStore;
 }
 
+static bool hasScanResultBroadcastOnlyConsumers(
+    mlir::triton::ReduceOp reduce, mlir::RankedTensorType type) {
+  return !reduce->use_empty() &&
+         llvm::all_of(reduce->getUsers(), [](mlir::Operation *user) {
+           return mlir::isa<mlir::triton::ExpandDimsOp>(user);
+         }) &&
+         hasSamePhaseMixedRowConsumers(reduce, type);
+}
+
+static bool hasScanResultBroadcastConsumers(
+    mlir::triton::ReduceOp reduce, mlir::RankedTensorType type) {
+  return llvm::any_of(reduce->getUsers(), [](mlir::Operation *user) {
+           return mlir::isa<mlir::triton::ExpandDimsOp>(user);
+         }) &&
+         hasSamePhaseMixedRowConsumers(reduce, type);
+}
+
 static bool isScanResultRowReduceCombine(mlir::triton::ReduceOp reduce) {
   return mlir::isa_and_nonnull<
       mlir::arith::AddFOp, mlir::arith::MulFOp, mlir::arith::MaximumFOp,
-      mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(
+      mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp,
+      mlir::arith::AddIOp, mlir::arith::MulIOp, mlir::arith::MaxSIOp,
+      mlir::arith::MinSIOp, mlir::arith::MaxUIOp, mlir::arith::MinUIOp,
+      mlir::arith::AndIOp, mlir::arith::OrIOp, mlir::arith::XOrIOp>(
       reduceCombineBinaryOp(reduce));
 }
 
@@ -17392,16 +17412,52 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         bool sameSource = scan.getSrcs().front() == reduce.getSrcs().front();
         bool scanResult = scan.getNumResults() == 1 &&
                           reduce.getSrcs().front() == scan->getResult(0);
-        if (scanResult && reduce.getAxis() == 1 && type.getElementType().isF32() &&
-            isScanResultRowReduceCombine(reduce) &&
+        bool directRowStore =
             !reduce->use_empty() &&
-            llvm::all_of(reduce->getUsers(), isDirectStore) && scanPlan &&
+            llvm::all_of(reduce->getUsers(), isDirectStore);
+        bool broadcastSum =
+            type.getElementType().isF32() &&
+            mlir::isa_and_nonnull<mlir::arith::AddFOp>(
+                reduceCombineBinaryOp(reduce)) &&
+            hasScanResultBroadcastConsumers(reduce, type);
+        if (scanResult && reduce.getAxis() == 1 &&
+            (type.getElementType().isF32() ||
+             type.getElementType().isInteger(32)) &&
+            isScanResultRowReduceCombine(reduce) &&
+            (directRowStore || broadcastSum) && scanPlan &&
             scanPlan->layout && scanPlan->layout->elemPerThread > 1 &&
             scan->getBlock() == reduce->getBlock() &&
             mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) &&
             scan->isBeforeInBlock(reduce)) {
+          if (broadcastSum)
+            for (mlir::Operation *user : reduce->getUsers())
+              if (mlir::isa<mlir::triton::ExpandDimsOp>(user))
+                user->setAttr(kRankNConsumerProjectionAttr,
+                              mlir::UnitAttr::get(moduleOp.getContext()));
           reduce->setAttr(kScanInputReduceAttr,
                           mlir::UnitAttr::get(moduleOp.getContext()));
+          if (broadcastSum) {
+            llvm::SmallVector<mlir::Operation *, 4> stores;
+            for (mlir::Operation *user : reduce->getUsers())
+              if (isDirectStore(user))
+                stores.push_back(user);
+            if (!stores.empty()) {
+              mlir::OpBuilder builder(reduce);
+              auto vectorReduce = mlir::cast<mlir::triton::ReduceOp>(
+                  builder.clone(*reduce.getOperation()));
+              for (mlir::Operation *store : stores)
+                store->replaceUsesOfWith(reduce->getResult(0),
+                                         vectorReduce->getResult(0));
+              if (!planRankNReduce(vectorReduce)) {
+                reduce.emitOpError(
+                    "Metal backend: mixed scan-result row reduction requires "
+                    "planned vector and broadcast folds");
+                valid = false;
+                return;
+              }
+              scanResultReduces[scan.getOperation()].push_back(vectorReduce);
+            }
+          }
           if (planRankNReduce(reduce)) {
             scanResultReduces[scan.getOperation()].push_back(reduce);
             return;
@@ -17993,6 +18049,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       g_rankNReducePublish[reduce.getOperation()] = publish.getOperation();
       g_rankNPlannedReduces.insert(reduce.getOperation());
     }
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> scanResultPublications;
     for (auto reduce : scanResultReduces[scan.getOperation()]) {
       // Scan results do not exist at the input publication. Publish them after
       // the scan, then let the exact reduction phase read that second buffer.
@@ -18001,9 +18058,17 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           resultBuilder, reduce.getLoc(),
           mlir::DenseElementsAttr::get(
               srcTy, resultBuilder.getZeroAttr(srcTy.getElementType())));
-      auto publish = mlir::triton::gpu::ConvertLayoutOp::create(
-          resultBuilder, reduce.getLoc(), srcTy, scan->getResult(0));
-      publish->setAttr(kExchangeAttr, resultBuilder.getStringAttr("publish"));
+      auto [publishIt, inserted] = scanResultPublications.try_emplace(
+          scan.getOperation(), nullptr);
+      mlir::triton::gpu::ConvertLayoutOp publish;
+      if (inserted) {
+        publish = mlir::triton::gpu::ConvertLayoutOp::create(
+            resultBuilder, reduce.getLoc(), srcTy, scan->getResult(0));
+        publish->setAttr(kExchangeAttr, resultBuilder.getStringAttr("publish"));
+        publishIt->second = publish.getOperation();
+      } else {
+        publish = mlir::cast<mlir::triton::gpu::ConvertLayoutOp>(publishIt->second);
+      }
       reduce->setOperand(0, placeholder.getResult());
       g_tileExchange[publish.getOperation()] = TileExchangePlan{
           *layout, *layout, srcTy.getNumElements(),
@@ -18011,6 +18076,20 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           publish.getOperation()};
       g_rankNReducePublish[reduce.getOperation()] = publish.getOperation();
       g_rankNPlannedReduces.insert(reduce.getOperation());
+      if (hasScanResultBroadcastOnlyConsumers(reduce, srcTy)) {
+        auto read = mlir::triton::gpu::ConvertLayoutOp::create(
+            resultBuilder, reduce.getLoc(), srcTy, placeholder.getResult());
+        read->setAttr(kExchangeAttr, resultBuilder.getStringAttr("read"));
+        g_tileExchange[read.getOperation()] = TileExchangePlan{
+            *layout, *layout, srcTy.getNumElements(),
+            metalStorageElementType(srcTy.getElementType()),
+            publish.getOperation()};
+        scan->getResult(0).replaceUsesWithIf(
+            read.getResult(), [&](mlir::OpOperand &use) {
+              return use.getOwner() != publish.getOperation() &&
+                     use.getOwner() != reduce.getOperation();
+            });
+      }
     }
     if (scanSourceCount > 1)
       g_stagedTupleScanPublishes[scan.getOperation()] =
@@ -44514,10 +44593,19 @@ struct ConvertTritonGPUToMetalPass
       if (rtt && rtt.getRank() >= 3 &&
           mlir::isa<mlir::scf::ForOp>(red->getParentOp()))
         red->setAttr(kRankNUserLoopAttr, mlir::UnitAttr::get(&getContext()));
+      bool directScanResultRowStore =
+          !red->use_empty() &&
+          llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer);
+      bool scanResultBroadcastSum =
+          rtt && rtt.getElementType().isF32() &&
+          mlir::isa_and_nonnull<mlir::arith::AddFOp>(
+              reduceCombineBinaryOp(red)) &&
+          hasScanResultBroadcastConsumers(red, rtt);
       if (rtt && rtt.getRank() == 2 && red.getAxis() == 1 &&
-          rtt.getElementType().isF32() &&
-          isScanResultRowReduceCombine(red) && !red->use_empty() &&
-          llvm::all_of(red->getUsers(), isScanInputReduceStoreConsumer)) {
+          (rtt.getElementType().isF32() ||
+           rtt.getElementType().isInteger(32)) &&
+          isScanResultRowReduceCombine(red) &&
+          (directScanResultRowStore || scanResultBroadcastSum)) {
         auto scan = red.getSrcs().front().getDefiningOp<mlir::triton::ScanOp>();
         if (scan && scan->getBlock() == red->getBlock() &&
             mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()) &&
