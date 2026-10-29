@@ -17151,11 +17151,32 @@ static bool isScanInputReduceStoreConsumer(mlir::Operation *user) {
 
 // A mixed row reduction splits its result mapping, not its execution phase.
 // Check beyond the first full tile so region captures and later exchanges
-// cannot enter through an otherwise valid original-tile broadcast.
+// cannot enter through an otherwise valid broadcast.
 static bool hasSamePhaseMixedRowConsumers(
     mlir::triton::ReduceOp reduce, mlir::RankedTensorType type,
-    bool allowCrossAxis = false) {
-  llvm::SmallVector<mlir::Value, 16> worklist;
+    bool allowCrossAxis = false, bool allowWiderSameAxis = false) {
+  struct ConsumerValue {
+    mlir::Value value;
+    bool crossAxis;
+    mlir::Attribute encoding;
+  };
+  auto validConsumerType = [&](mlir::RankedTensorType resultType,
+                               bool crossAxis, mlir::Attribute encoding) {
+    if (!resultType || resultType.getRank() != 2 ||
+        resultType.getEncoding() != encoding)
+      return false;
+    if (crossAxis)
+      return (resultType.getDimSize(0) == type.getDimSize(0) ||
+              resultType.getDimSize(0) == 1) &&
+             (resultType.getDimSize(1) == 1 ||
+              resultType.getDimSize(1) == type.getDimSize(1));
+    return resultType.getDimSize(0) == type.getDimSize(0) &&
+           (resultType.getDimSize(1) == 1 ||
+            resultType.getDimSize(1) == type.getDimSize(1) ||
+            (allowWiderSameAxis &&
+             resultType.getDimSize(1) > type.getDimSize(1)));
+  };
+  llvm::SmallVector<ConsumerValue, 16> worklist;
   for (mlir::Operation *user : reduce->getUsers()) {
     if (user->getBlock() != reduce->getBlock())
       return false;
@@ -17192,26 +17213,47 @@ static bool hasSamePhaseMixedRowConsumers(
     } else if (!expand || expand.getAxis() != reduce.getAxis() || !expandType ||
                expandType.getRank() != 2 ||
                expandType.getDimSize(0) != type.getDimSize(0) ||
-               expandType.getDimSize(1) != 1 ||
-               expandType.getEncoding() != type.getEncoding()) {
+               expandType.getDimSize(1) != 1) {
       return false;
     }
-    worklist.push_back(expand.getResult());
+    if (expandType.getEncoding() != type.getEncoding() &&
+        (!allowWiderSameAxis || crossAxis ||
+         !expand->hasAttr(kRankNConsumerProjectionAttr) ||
+         !mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
+             expandType.getEncoding()) ||
+         !planLayoutIndex(expandType)))
+      return false;
+    worklist.push_back({expand.getResult(), crossAxis, expandType.getEncoding()});
   }
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
   bool sawTileStore = false;
   while (!worklist.empty()) {
-    auto value = worklist.pop_back_val();
+    auto [value, crossAxis, encoding] = worklist.pop_back_val();
     for (mlir::Operation *user : value.getUsers()) {
       if (user->getBlock() != reduce->getBlock())
         return false;
       if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(user)) {
         auto storedType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-        if (store.getValue() != value || !storedType ||
-            storedType.getShape() != type.getShape() ||
-            storedType.getEncoding() != type.getEncoding())
+        if (store.getValue() != value ||
+            !validConsumerType(storedType, crossAxis, encoding) ||
+            storedType.getDimSize(1) == 1)
           return false;
         sawTileStore = true;
+        continue;
+      }
+      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user)) {
+        auto sourceType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        auto resultType =
+            mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+        if (!allowWiderSameAxis || crossAxis || !cvt->hasOneUse() ||
+            !validConsumerType(sourceType, false, encoding) ||
+            sourceType.getDimSize(1) != 1 || !resultType ||
+            resultType.getShape() != sourceType.getShape() ||
+            !mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
+                resultType.getEncoding()) ||
+            !planLayoutIndex(resultType))
+          return false;
+        worklist.push_back({cvt.getResult(), false, resultType.getEncoding()});
         continue;
       }
       if (!seen.insert(user).second)
@@ -17219,20 +17261,27 @@ static bool hasSamePhaseMixedRowConsumers(
       if (user->getNumRegions() || user->hasAttr(kExchangeAttr) ||
           (!mlir::isa<mlir::triton::BroadcastOp>(user) &&
            !user->hasTrait<mlir::OpTrait::Elementwise>()) ||
-          !mlir::isMemoryEffectFree(user) ||
-          mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user))
+          !mlir::isMemoryEffectFree(user))
         return false;
       for (auto result : user->getResults()) {
         auto resultType =
             mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
-        if (!resultType || resultType.getRank() != 2 ||
-            (resultType.getDimSize(0) != type.getDimSize(0) &&
-             (!allowCrossAxis || resultType.getDimSize(0) != 1)) ||
-            (resultType.getDimSize(1) != 1 &&
-             resultType.getDimSize(1) != type.getDimSize(1)) ||
-            resultType.getEncoding() != type.getEncoding())
+        mlir::Attribute resultEncoding = encoding;
+        if (allowWiderSameAxis && !crossAxis &&
+            mlir::isa<mlir::triton::BroadcastOp>(user)) {
+          auto sourceType =
+              mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+          if (sourceType && sourceType.getDimSize(1) == 1 && resultType &&
+              resultType.getRank() == 2 &&
+              resultType.getDimSize(1) > type.getDimSize(1) &&
+              mlir::isa<mlir::triton::gpu::BlockedEncodingAttr>(
+                  resultType.getEncoding()) &&
+              planLayoutIndex(resultType))
+            resultEncoding = resultType.getEncoding();
+        }
+        if (!validConsumerType(resultType, crossAxis, resultEncoding))
           return false;
-        worklist.push_back(result);
+        worklist.push_back({result, crossAxis, resultEncoding});
       }
     }
   }
@@ -17626,12 +17675,13 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
               hasSamePhaseMixedRowConsumers(
                   reduce, type,
                   sameSource && type.getElementType().isF32() &&
+                      mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine),
+                  sameSource && type.getElementType().isF32() &&
                       mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine));
           if (!consumersValid || (sawStore && sawExpand && !splitRowReduction)) {
             reduce.emitOpError(
                 "Metal backend: a shared scan-input row reduction requires "
-                "direct row stores or same-axis broadcasts into its original "
-                "tile");
+                "direct row stores or supported same-phase broadcasts");
             valid = false;
             return;
           }

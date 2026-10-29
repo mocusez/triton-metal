@@ -5553,9 +5553,9 @@ def _unsupported_i32_nonplain_scan_row_reduce_kernel(X, W, Y, Z, Row, N, MODE: t
     (7, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (8, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (9, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (12, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (15, "other element types require a direct unmasked tt.load"),
@@ -5804,9 +5804,9 @@ def _i32_row_monoid_reduce(value, REDUCTION: tl.constexpr):
     (7, "xor", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (8, "product", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (9, "or", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (12, "and", "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (15, "xor", "other element types require a direct unmasked tt.load"),
@@ -6193,9 +6193,9 @@ def test_multiband_scan_unsigned_extrema_combined_budget_is_named():
     (7, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (8, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (9, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (12, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (15, "reduce combine requires Session L3c (future)"),
@@ -7728,9 +7728,9 @@ def test_multiband_scan_f32_nonplain_row_product_distinct_inputs_budget_is_named
     (6, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
     (7, "reduce cannot replay its computed source cone across conversion"),
     (8, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (9, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (12, "distinct scan/reduce inputs require same-layout sources defined before the scan "
      "without intervening writes or input exchanges"),
     (15, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
@@ -8314,6 +8314,75 @@ def test_multiband_scan_cross_axis_mixed_row_sum_matches_torch(
     assert (scanned.cpu()[numel:] == sentinel).all()
 
 
+@triton.jit
+def _wider_scan_mixed_row_sum_kernel(
+        X, Y, Scanned, Row, N, R: tl.constexpr, C: tl.constexpr,
+        SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    offset = program * R * C + row[:, None] * C + tl.arange(0, C)[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0.25)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    reduced = tl.sum(x, 1)
+    tl.store(Row + program * R + row, reduced)
+    wider_column = tl.arange(0, 2 * C)
+    wider_offset = (program * R * (2 * C) + row[:, None] * (2 * C) +
+                    wider_column[None, :])
+    tl.store(Y + wider_offset, reduced[:, None] + wider_column[None, :])
+    tl.store(Scanned + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize("rows,columns,scan_axis,reverse,num_warps,masked,computed", [
+    (16, 16, 0, False, 1, False, False),
+    (16, 16, 0, True, 4, True, True),
+    (8, 64, 1, False, 4, True, False),
+    (64, 8, 1, True, 1, False, True),
+])
+def test_multiband_scan_wider_same_axis_mixed_row_sum_matches_torch(
+        rows, columns, scan_axis, reverse, num_warps, masked, computed):
+    programs = 2
+    numel = programs * rows * columns
+    wider_numel = 2 * numel
+    valid = numel - columns - 3 if masked else numel
+    index = torch.arange(numel).reshape(programs, rows, columns)
+    x = 1 + (index // columns % rows).float() / 4 + (index % columns % 7).float() / 8
+    x.view(-1)[valid:] = 0.25
+    device_x = x
+    if computed:
+        x = x * 2 + 3
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    reduced = x.sum(2)
+    expected_wider = reduced[:, :, None] + torch.arange(2 * columns)
+    sentinel = -999999.
+    y = torch.full((wider_numel + 7,), sentinel, device="mps")
+    scanned = torch.full((numel + 7,), sentinel, device="mps")
+    row = torch.full((programs * rows + 7,), sentinel, device="mps")
+    _wider_scan_mixed_row_sum_kernel[(programs,)](
+        device_x.to("mps"), y, scanned, row, valid, rows, columns,
+        scan_axis, reverse, masked, computed, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(row.cpu()[:programs * rows].reshape(programs, rows),
+                               reduced, atol=0, rtol=0)
+    torch.testing.assert_close(
+        y.cpu()[:wider_numel].reshape(programs, rows, 2 * columns),
+        expected_wider, atol=0, rtol=0)
+    torch.testing.assert_close(scanned.cpu()[:numel].reshape(programs, rows, columns),
+                               expected_scan, atol=0, rtol=0)
+    assert (row.cpu()[programs * rows:] == sentinel).all()
+    assert (y.cpu()[wider_numel:] == sentinel).all()
+    assert (scanned.cpu()[numel:] == sentinel).all()
+
+
 @mps_only
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,masked,computed", [
     (16, 16, 0, 1, False, False),
@@ -8498,16 +8567,14 @@ def _unsupported_shared_input_mixed_row_sum_kernel(
 @pytest.mark.parametrize("mode,diagnostic", [
     (1, "reduce cannot replay its computed source cone across conversion"),
     (2, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
-    (4, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (8, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
-], ids=["scan_result", "multiple_scans", "wider_tile", "region", "transpose",
+     "supported same-phase broadcasts"),
+], ids=["scan_result", "multiple_scans", "region", "transpose",
         "vector_store_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_sum_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -8522,9 +8589,9 @@ def test_multiband_scan_shared_input_mixed_row_sum_source_and_consumer_is_named(
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,reduction,diagnostic", [
     (128, 16, 1, "*fp32", "sum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*fp32", "sum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*fp16", "sum", "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
 ], ids=["wide_rows", "wide_columns", "f16"])
@@ -9042,20 +9109,20 @@ def test_multiband_scan_shared_input_mixed_row_product_total_budget_is_named(sou
 
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (1, "reduce cannot replay its computed source cone across conversion"),
     (2, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (4, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (8, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "wider_tile", "tile_region", "transpose",
         "vector_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_product_source_and_consumer_is_named(mode, diagnostic):
@@ -9071,9 +9138,9 @@ def test_multiband_scan_shared_input_mixed_row_product_source_and_consumer_is_na
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,diagnostic", [
     (128, 16, 1, "*fp32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*fp32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*fp16", "reduce combine requires Session L3c (future)"),
 ], ids=["wide_rows", "wide_columns", "f16"])
 def test_multiband_scan_shared_input_mixed_row_product_shape_and_type_is_named(
@@ -9358,20 +9425,20 @@ def test_multiband_scan_shared_input_mixed_row_extremum_total_budget_is_named(so
 
 @pytest.mark.parametrize("mode,reduction,diagnostic", [
     (0, "min", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (1, "sub", "reduce cannot replay its computed source cone across conversion"),
     (2, "minnum", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (3, "max", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (4, "min", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "maximum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "minnum", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (7, "max", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (8, "min", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "wider_tile", "tile_region", "transpose",
         "vector_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_extremum_source_and_consumer_is_named(mode, reduction, diagnostic):
@@ -9386,9 +9453,9 @@ def test_multiband_scan_shared_input_mixed_row_extremum_source_and_consumer_is_n
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,reduction,diagnostic", [
     (128, 16, 1, "*fp32", "min", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*fp32", "maximum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*fp16", "max", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
 ], ids=["wide_rows", "wide_columns", "f16"])
 def test_multiband_scan_shared_input_mixed_row_extremum_shape_and_type_is_named(
@@ -9687,17 +9754,17 @@ def test_multiband_scan_shared_input_mixed_i32_row_sum_total_budget_is_named(sou
 
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_sum_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -9711,9 +9778,9 @@ def test_multiband_scan_shared_input_mixed_i32_row_sum_source_and_consumer_is_na
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,reduction,diagnostic", [
     (128, 16, 1, "*i32", "sum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*i32", "sum", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*i64", "sum", "rank >= 2 scan is implemented for a blocked tile"),
     (16, 16, 1, "*fp16", "sum", "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
@@ -9796,17 +9863,17 @@ def test_multiband_scan_shared_input_mixed_i32_row_product_total_budget_is_named
 
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_product_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
@@ -9821,9 +9888,9 @@ def test_multiband_scan_shared_input_mixed_i32_row_product_source_and_consumer_i
 
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,diagnostic", [
     (128, 16, 1, "*i32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*i32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*i64", "rank >= 2 scan is implemented for a blocked tile"),
     (16, 16, 1, "*fp16", "reduce combine requires Session L3c (future)"),
 ], ids=["wide_rows", "wide_columns", "i64", "f16"])
@@ -9954,17 +10021,17 @@ def test_multiband_scan_shared_input_mixed_i32_row_bitwise_total_budget_is_named
 @pytest.mark.parametrize("reduction", ["and", "or", "xor"])
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_bitwise_source_and_consumer_is_named(mode, diagnostic, reduction):
     result = _compile_rankn_nested_negative_in_child(
@@ -9979,9 +10046,9 @@ def test_multiband_scan_shared_input_mixed_i32_row_bitwise_source_and_consumer_i
 @pytest.mark.parametrize("reduction", ["and", "or", "xor"])
 @pytest.mark.parametrize("rows,columns,scan_axis,dtype,diagnostic", [
     (128, 16, 1, "*i32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 128, 0, "*i32", "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (16, 16, 1, "*i64", "rank >= 2 scan is implemented for a blocked tile"),
 ], ids=["wide_rows", "wide_columns", "i64"])
 def test_multiband_scan_shared_input_mixed_i32_row_bitwise_shape_and_type_is_named(
@@ -10114,17 +10181,17 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_total_budget_is_named
 @pytest.mark.parametrize("reduction", ["smin", "smax", "umin", "umax"])
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
+     "supported same-phase broadcasts"),
 ], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_extrema_source_and_consumer_is_named(mode, diagnostic, reduction):
     result = _compile_rankn_nested_negative_in_child(
@@ -10143,9 +10210,9 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_source_and_consumer_i
     for reduction in ("smin", "smax", "umin", "umax")
     for case in (
         (128, 16, 1, "*i32", "a shared scan-input row reduction requires direct row stores or "
-         "same-axis broadcasts into its original tile"),
+         "supported same-phase broadcasts"),
         (16, 128, 0, "*i32", "a shared scan-input row reduction requires direct row stores or "
-         "same-axis broadcasts into its original tile"),
+         "supported same-phase broadcasts"),
         (16, 16, 1, "*i64", "rank >= 2 scan is implemented for a blocked tile"),
     )
 ] + [
