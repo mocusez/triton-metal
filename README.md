@@ -774,10 +774,12 @@ The current dependency-ordered priorities are:
    source. Axis-1 reductions support direct row stores or
    same-axis broadcasts into the original tile. Shared-source f32 row sums also
    support cross-axis broadcasts into the original tile and same-axis broadcasts
-   into a wider tile, evaluated at the consumer's projection. Shared-source f32 row
+   into a wider tile, evaluated at the consumer's projection. Scan-input f32 row
    sum/product/min/max support both consumers together for tiles with 2..64 rows
    and columns, including both NaN-propagating and number-preferring extrema,
-   using separate vector and broadcast folds over one input publication.
+   using separate vector and broadcast folds over one input publication. Row sums
+   also accept a matching distinct reduction source; other combines require the
+   exact scan input.
    Shared-source i32 row sum/product/AND/OR/XOR and signed or unsigned min/max
    also support both consumers together under the same multiband tile limits,
    preserving comparison signedness, 32-bit values and wrapping arithmetic for

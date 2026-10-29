@@ -17583,7 +17583,9 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             sawExpand = true;
           }
           bool splitRowReduction =
-              sawStore && sawExpand && sameSource && reduce.getAxis() == 1 &&
+              sawStore && sawExpand && reduce.getAxis() == 1 &&
+              (sameSource || (type.getElementType().isF32() &&
+                              mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine))) &&
               reduce.getSrcs().size() == 1 && reduce.getNumResults() == 1 &&
               ((type.getElementType().isF32() &&
                 mlir::isa_and_nonnull<
