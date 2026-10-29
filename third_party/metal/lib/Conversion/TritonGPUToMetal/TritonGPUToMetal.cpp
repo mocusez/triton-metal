@@ -17152,8 +17152,9 @@ static bool isScanInputReduceStoreConsumer(mlir::Operation *user) {
 // A mixed row reduction splits its result mapping, not its execution phase.
 // Check beyond the first full tile so region captures and later exchanges
 // cannot enter through an otherwise valid original-tile broadcast.
-static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
-                                         mlir::RankedTensorType type) {
+static bool hasSamePhaseMixedRowConsumers(
+    mlir::triton::ReduceOp reduce, mlir::RankedTensorType type,
+    bool allowCrossAxis = false) {
   llvm::SmallVector<mlir::Value, 16> worklist;
   for (mlir::Operation *user : reduce->getUsers()) {
     if (user->getBlock() != reduce->getBlock())
@@ -17165,16 +17166,36 @@ static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
             return false;
       continue;
     }
-    auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+    mlir::Operation *consumerUser = user;
+    if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
+        cvt && cvt->hasOneUse()) {
+      if (!allowCrossAxis ||
+          (!cvt->hasAttr(kScalarIdentityAttr) && !isScalarIdentityConvert(cvt)))
+        return false;
+      consumerUser = *cvt->user_begin();
+    }
+    auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(consumerUser);
     auto expandType = expand ? mlir::dyn_cast<mlir::RankedTensorType>(
                                    expand.getType())
                              : mlir::RankedTensorType{};
-    if (!expand || expand.getAxis() != reduce.getAxis() || !expandType ||
-        expandType.getRank() != 2 ||
-        expandType.getDimSize(0) != type.getDimSize(0) ||
-        expandType.getDimSize(1) != 1 ||
-        expandType.getEncoding() != type.getEncoding())
+    if (consumerUser->getBlock() != reduce->getBlock())
       return false;
+    bool crossAxis = expand && expand.getAxis() != reduce.getAxis();
+    if (crossAxis) {
+      if (!allowCrossAxis || expand.getAxis() != 0 || !expandType ||
+          expandType.getRank() != 2 ||
+          type.getDimSize(0) != type.getDimSize(1) ||
+          expandType.getDimSize(0) != 1 ||
+          expandType.getDimSize(1) != type.getDimSize(1) ||
+          expandType.getEncoding() != type.getEncoding())
+        return false;
+    } else if (!expand || expand.getAxis() != reduce.getAxis() || !expandType ||
+               expandType.getRank() != 2 ||
+               expandType.getDimSize(0) != type.getDimSize(0) ||
+               expandType.getDimSize(1) != 1 ||
+               expandType.getEncoding() != type.getEncoding()) {
+      return false;
+    }
     worklist.push_back(expand.getResult());
   }
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
@@ -17205,7 +17226,8 @@ static bool hasSamePhaseMixedRowConsumers(mlir::triton::ReduceOp reduce,
         auto resultType =
             mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
         if (!resultType || resultType.getRank() != 2 ||
-            resultType.getDimSize(0) != type.getDimSize(0) ||
+            (resultType.getDimSize(0) != type.getDimSize(0) &&
+             (!allowCrossAxis || resultType.getDimSize(0) != 1)) ||
             (resultType.getDimSize(1) != 1 &&
              resultType.getDimSize(1) != type.getDimSize(1)) ||
             resultType.getEncoding() != type.getEncoding())
@@ -17601,7 +17623,10 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                      mlir::arith::MinUIOp>(combine))) &&
               llvm::all_of(type.getShape(),
                            [](int64_t size) { return size >= 2 && size <= 64; }) &&
-              hasSamePhaseMixedRowConsumers(reduce, type);
+              hasSamePhaseMixedRowConsumers(
+                  reduce, type,
+                  sameSource && type.getElementType().isF32() &&
+                      mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine));
           if (!consumersValid || (sawStore && sawExpand && !splitRowReduction)) {
             reduce.emitOpError(
                 "Metal backend: a shared scan-input row reduction requires "

@@ -8252,6 +8252,68 @@ def test_multiband_scan_distinct_input_mixed_row_sum_matches_torch(
     assert (scanned.cpu()[size:] == sentinel).all()
 
 
+@triton.jit
+def _cross_axis_scan_mixed_row_sum_kernel(
+        X, Y, Scanned, Row, N, R: tl.constexpr, SCAN_AXIS: tl.constexpr,
+        REVERSE: tl.constexpr, MASKED: tl.constexpr, COMPUTED: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    offset = program * R * R + row[:, None] * R + tl.arange(0, R)[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0.25)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    reduced = tl.sum(x, 1)
+    tl.store(Row + program * R + row, reduced)
+    tl.store(Y + offset, scanned + reduced[None, :])
+    tl.store(Scanned + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize("size,scan_axis,reverse,num_warps,masked,computed", [
+    (16, 0, False, 1, False, False),
+    (16, 0, True, 4, True, True),
+    (64, 1, False, 4, True, False),
+    (64, 1, True, 1, False, True),
+])
+def test_multiband_scan_cross_axis_mixed_row_sum_matches_torch(
+        size, scan_axis, reverse, num_warps, masked, computed):
+    programs = 2
+    numel = programs * size * size
+    valid = numel - size - 3 if masked else numel
+    index = torch.arange(numel).reshape(programs, size, size)
+    x = 1 + (index // size % size).float() / 4 + (index % size % 7).float() / 8
+    x.view(-1)[valid:] = 0.25
+    device_x = x
+    if computed:
+        x = x * 2 + 3
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    reduced = x.sum(2)
+    sentinel = -999999.
+    y = torch.full((numel + 7,), sentinel, device="mps")
+    scanned = torch.full((numel + 7,), sentinel, device="mps")
+    row = torch.full((programs * size + 7,), sentinel, device="mps")
+    _cross_axis_scan_mixed_row_sum_kernel[(programs,)](
+        device_x.to("mps"), y, scanned, row, valid, size, scan_axis, reverse,
+        masked, computed, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(row.cpu()[:programs * size].reshape(programs, size),
+                               reduced, atol=0, rtol=0)
+    torch.testing.assert_close(y.cpu()[:numel].reshape(programs, size, size),
+                               expected_scan + reduced[:, None, :], atol=0, rtol=0)
+    torch.testing.assert_close(scanned.cpu()[:numel].reshape(programs, size, size),
+                               expected_scan, atol=0, rtol=0)
+    assert (row.cpu()[programs * size:] == sentinel).all()
+    assert (y.cpu()[numel:] == sentinel).all()
+    assert (scanned.cpu()[numel:] == sentinel).all()
+
+
 @mps_only
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,masked,computed", [
     (16, 16, 0, 1, False, False),
@@ -8436,8 +8498,6 @@ def _unsupported_shared_input_mixed_row_sum_kernel(
 @pytest.mark.parametrize("mode,diagnostic", [
     (1, "reduce cannot replay its computed source cone across conversion"),
     (2, "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
-    (3, "a shared scan-input row reduction requires direct row stores or "
-     "same-axis broadcasts into its original tile"),
     (4, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
     (5, "a shared scan-input row reduction requires direct row stores or "
@@ -8447,7 +8507,7 @@ def _unsupported_shared_input_mixed_row_sum_kernel(
      "same-axis broadcasts into its original tile"),
     (8, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-], ids=["scan_result", "multiple_scans", "cross_axis", "wider_tile", "region", "transpose",
+], ids=["scan_result", "multiple_scans", "wider_tile", "region", "transpose",
         "vector_store_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_sum_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
