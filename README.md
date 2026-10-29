@@ -765,9 +765,9 @@ The current dependency-ordered priorities are:
    prefix buffers through deferred readers. A direct f32/i32 row sum, product,
    min/max or i32 AND/OR/XOR of a staged scan's result, with either NaN policy for
    f32 extrema and signed or unsigned comparisons for i32, publishes that result
-   after the scan and reduces the second buffer in the next phase. An f32 row sum
-   can also expand back into the original tile, including alongside a direct row
-   store. An independent single-band f32 column sum before
+   after the scan and reduces the second buffer in the next phase. Each of these
+   reductions can also expand back into the original tile, including alongside a
+   direct row store. An independent single-band f32 column sum before
    such a scan publishes its own small tile and finishes its consumer in that
    tile's own phase. A single top-level multi-band rank-2 scan can also
    share its input publication with subsequent reductions of the exact same

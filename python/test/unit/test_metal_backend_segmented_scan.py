@@ -3051,45 +3051,159 @@ def test_multiband_scan_result_row_sum_broadcast_matches_torch(
 
 
 @triton.jit
-def _scan_result_row_sum_mixed_kernel(X, Y, Row, SCAN_AXIS: tl.constexpr,
-                                      REVERSE: tl.constexpr):
+def _scan_result_row_reduce_mixed_kernel(X, Y, Row, SCAN_AXIS: tl.constexpr,
+                                         REVERSE: tl.constexpr,
+                                         REDUCTION: tl.constexpr):
     program = tl.program_id(0)
     row = tl.arange(0, 16)
     column = tl.arange(0, 64)
     offset = program * (16 * 64) + row[:, None] * 64 + column[None, :]
     x = tl.load(X + offset)
     scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
-    reduced = tl.sum(scanned, 1)
+    if REDUCTION == "smin":
+        reduced = tl.min(scanned, 1)
+    elif REDUCTION == "smax":
+        reduced = tl.max(scanned, 1)
+    elif REDUCTION == "umin":
+        reduced = tl.min(scanned.to(tl.uint32), 1).to(tl.int32)
+    elif REDUCTION == "umax":
+        reduced = tl.max(scanned.to(tl.uint32), 1).to(tl.int32)
+    elif REDUCTION == "and":
+        reduced = tl.reduce(scanned, 1, _i32_row_and_combine)
+    elif REDUCTION == "or":
+        reduced = tl.reduce(scanned, 1, _i32_row_or_combine)
+    elif REDUCTION == "xor":
+        reduced = tl.reduce(scanned, 1, _i32_row_xor_combine)
+    elif REDUCTION == "product":
+        reduced = tl.reduce(scanned, 1, _i32_column_product_combine)
+    elif REDUCTION == "min":
+        reduced = tl.reduce(scanned, 1, _mixed_row_minimum_combine)
+    elif REDUCTION == "max":
+        reduced = tl.reduce(scanned, 1, _mixed_row_maximum_combine)
+    elif REDUCTION == "minnum":
+        reduced = tl.min(scanned, 1)
+    elif REDUCTION == "maxnum":
+        reduced = tl.max(scanned, 1)
+    else:
+        reduced = tl.sum(scanned, 1)
     tl.store(Row + program * 16 + row, reduced)
-    tl.store(Y + offset, scanned + reduced[:, None])
+    if REDUCTION == "sum":
+        result = scanned + reduced[:, None]
+    else:
+        result = tl.broadcast_to(reduced[:, None], (16, 64))
+    tl.store(Y + offset, result)
+
+
+def _scan_result_row_mixed_reference(scanned, reduction):
+    if reduction == "product" and scanned.dtype == torch.float32:
+        return _f32_column_product_reference(scanned.transpose(1, 2))
+    if reduction in ("min", "max", "minnum", "maxnum"):
+        return _f32_row_extremum_reference(scanned, reduction)
+    if reduction in ("and", "or", "xor"):
+        return _i32_row_monoid_reference(scanned, reduction)
+
+    expected_values = []
+    for program in scanned.tolist():
+        expected_program = []
+        for row in program:
+            if reduction == "sum":
+                value = sum(row)
+            elif reduction == "product":
+                value = 1
+                for element in row:
+                    value = (value * element + 2**31) % 2**32 - 2**31
+            else:
+                compared = [element & 0xffffffff for element in row] \
+                    if reduction.startswith("u") else row
+                value = min(compared) if reduction.endswith("min") else max(compared)
+            expected_program.append(value)
+        expected_values.append(expected_program)
+    return torch.tensor(expected_values, dtype=torch.int64).to(torch.int32)
 
 
 @mps_only
+@pytest.mark.parametrize("dtype,reduction", [
+    (torch.float32, "sum"),
+    (torch.float32, "product"),
+    (torch.float32, "min"),
+    (torch.float32, "max"),
+    (torch.float32, "minnum"),
+    (torch.float32, "maxnum"),
+    (torch.int32, "sum"),
+    (torch.int32, "product"),
+    (torch.int32, "smin"),
+    (torch.int32, "smax"),
+    (torch.int32, "umin"),
+    (torch.int32, "umax"),
+    (torch.int32, "and"),
+    (torch.int32, "or"),
+    (torch.int32, "xor"),
+])
 @pytest.mark.parametrize("scan_axis,reverse,num_warps", [
     (0, False, 1), (0, True, 4), (1, False, 4), (1, True, 1),
 ])
-def test_multiband_scan_result_row_sum_mixed_matches_torch(scan_axis, reverse, num_warps):
+def test_multiband_scan_result_row_reduce_mixed_matches_torch(
+        dtype, reduction, scan_axis, reverse, num_warps):
     programs, rows, columns = 2, 16, 64
-    x = (torch.arange(programs * rows * columns).reshape(programs, rows, columns) % 17 - 8).float()
+    size = programs * rows * columns
+    index = torch.arange(size, dtype=torch.int64).reshape(programs, rows, columns)
+    if dtype == torch.float32:
+        x = _mixed_row_extremum_special_values(programs, rows, columns)
+        if reduction == "sum":
+            x = (index % 17 - 8).float()
+    elif reduction == "product":
+        x = torch.where(index % 3 == 0, 3, -3).to(torch.int32)
+        x[:, 0, 0] = 65537
+        x[:, 1, -1] = 131073
+    elif reduction in ("and", "or", "xor"):
+        x = _i32_row_monoid_values(size, columns, reduction).reshape(
+            programs, rows, columns)
+    else:
+        x = torch.where(index % 2 == 0, 0x7ffffff0, -0x7ffffff0).to(torch.int32)
+        x[:, 0, 0] = -2147483648
+        x[:, 1, -1] = 2147483647
     axis = scan_axis + 1
-    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    source = x.flip(axis) if reverse else x
+    expected_scan = torch.cumsum(
+        source.to(torch.int64) if dtype == torch.int32 else source, axis).to(dtype)
     if reverse:
         expected_scan = expected_scan.flip(axis)
-    sentinel = -999999.
-    y = torch.full((programs * rows * columns + 7,), sentinel,
-                   dtype=torch.float32, device="mps")
-    row_output = torch.full((programs * rows + 7,), sentinel,
-                            dtype=torch.float32, device="mps")
-    _scan_result_row_sum_mixed_kernel[(programs,)](
-        x.to("mps"), y, row_output, scan_axis, reverse, num_warps=num_warps)
+    sentinel = -999999 if dtype == torch.int32 else -999999.
+    source_mps = x.to("mps")
+    y = torch.full((size + 7,), sentinel, dtype=dtype, device="mps")
+    scanned_output = torch.full((size + 7,), sentinel, dtype=dtype, device="mps")
+    reference_row = torch.full((programs * rows + 7,), sentinel, dtype=dtype, device="mps")
+    row_output = torch.full((programs * rows + 7,), sentinel, dtype=dtype, device="mps")
+    _scan_result_row_reduce_kernel[(programs,)](
+        source_mps, reference_row, scanned_output, scan_axis, reduction, reverse,
+        num_warps=num_warps)
+    _scan_result_row_reduce_mixed_kernel[(programs,)](
+        source_mps, y, row_output, scan_axis, reverse, reduction, num_warps=num_warps)
     torch.mps.synchronize()
-    size = programs * rows * columns
-    reduced = expected_scan.sum(2)
-    torch.testing.assert_close(row_output.cpu()[:programs * rows].reshape(programs, rows),
-                               reduced, atol=0, rtol=0)
-    torch.testing.assert_close(y.cpu()[:size].reshape(programs, rows, columns),
-                               expected_scan + reduced[:, :, None], atol=0, rtol=0)
+    actual_scan = scanned_output.cpu()[:size].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual_scan, expected_scan, atol=0, rtol=0, equal_nan=True)
+    reduced = _scan_result_row_mixed_reference(actual_scan, reduction) \
+        if reduction != "sum" or dtype == torch.int32 else actual_scan.sum(2)
+    if reduction == "sum":
+        expected_tile = actual_scan.to(torch.int64) + reduced[:, :, None] \
+            if dtype == torch.int32 else actual_scan + reduced[:, :, None]
+        expected_tile = expected_tile.to(dtype)
+    else:
+        expected_tile = reduced[:, :, None].expand(programs, rows, columns)
+    actual_reference_row = reference_row.cpu()[:programs * rows].reshape(programs, rows)
+    actual_row = row_output.cpu()[:programs * rows].reshape(programs, rows)
+    actual_tile = y.cpu()[:size].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual_reference_row, reduced, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(actual_row, reduced, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(actual_tile, expected_tile, atol=0, rtol=0, equal_nan=True)
+    if dtype == torch.float32 and reduction in ("product", "min", "max"):
+        zeros = reduced == 0
+        assert torch.equal(actual_row.signbit()[zeros], reduced.signbit()[zeros])
+        zeros = expected_tile == 0
+        assert torch.equal(actual_tile.signbit()[zeros], expected_tile.signbit()[zeros])
     assert (y.cpu()[size:] == sentinel).all()
+    assert (scanned_output.cpu()[size:] == sentinel).all()
+    assert (reference_row.cpu()[programs * rows:] == sentinel).all()
     assert (row_output.cpu()[programs * rows:] == sentinel).all()
 
 
@@ -8821,7 +8935,8 @@ def test_multiband_scan_shared_input_mixed_row_product_source_and_consumer_is_na
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_mixed_row_sum_kernel",
         {"X": "*fp32", "W": "*fp32", "Y": "*fp32", "Row": "*fp32", "Scanned": "*fp32", "N": "i32"},
-        {"R": 16, "C": 16, "SCAN_AXIS": 1, "MODE": mode, "REDUCTION": "product"}, num_warps=1)
+        {"R": 16, "C": 16, "SCAN_AXIS": 1, "MODE": mode,
+         "REDUCTION": "sub" if mode == 1 else "product"}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     assert diagnostic in output, output
@@ -9117,7 +9232,7 @@ def test_multiband_scan_shared_input_mixed_row_extremum_total_budget_is_named(so
 @pytest.mark.parametrize("mode,reduction,diagnostic", [
     (0, "min", "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-    (1, "maximum", "reduce cannot replay its computed source cone across conversion"),
+    (1, "sub", "reduce cannot replay its computed source cone across conversion"),
     (2, "minnum", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
     (3, "max", "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
@@ -9446,8 +9561,6 @@ def test_multiband_scan_shared_input_mixed_i32_row_sum_total_budget_is_named(sou
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
-     "without intervening writes or input exchanges"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
@@ -9458,7 +9571,7 @@ def test_multiband_scan_shared_input_mixed_i32_row_sum_total_budget_is_named(sou
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
+], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_sum_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_mixed_row_sum_kernel",
@@ -9557,8 +9670,6 @@ def test_multiband_scan_shared_input_mixed_i32_row_product_total_budget_is_named
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
-     "without intervening writes or input exchanges"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
@@ -9569,7 +9680,7 @@ def test_multiband_scan_shared_input_mixed_i32_row_product_total_budget_is_named
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
+], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_product_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_mixed_row_sum_kernel",
@@ -9717,8 +9828,6 @@ def test_multiband_scan_shared_input_mixed_i32_row_bitwise_total_budget_is_named
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
-     "without intervening writes or input exchanges"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
@@ -9729,7 +9838,7 @@ def test_multiband_scan_shared_input_mixed_i32_row_bitwise_total_budget_is_named
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
+], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_bitwise_source_and_consumer_is_named(mode, diagnostic, reduction):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_mixed_row_sum_kernel",
@@ -9879,8 +9988,6 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_total_budget_is_named
 @pytest.mark.parametrize("mode,diagnostic", [
     (0, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-    (1, "distinct scan/reduce inputs require same-layout sources defined before the scan "
-     "without intervening writes or input exchanges"),
     (2, "rank-2 axis=1 reduce over a computed cone is implemented for f32 only; "
      "other element types require a direct unmasked tt.load"),
     (3, "a shared scan-input row reduction requires direct row stores or "
@@ -9891,7 +9998,7 @@ def test_multiband_scan_shared_input_mixed_i32_row_extrema_total_budget_is_named
      "other element types require a direct unmasked tt.load"),
     (7, "a shared scan-input row reduction requires direct row stores or "
      "same-axis broadcasts into its original tile"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
+], ids=["distinct_source", "multiple_scans", "cross_axis", "tile_region", "transpose", "vector_region"])
 def test_multiband_scan_shared_input_mixed_i32_row_extrema_source_and_consumer_is_named(mode, diagnostic, reduction):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_mixed_row_sum_kernel",

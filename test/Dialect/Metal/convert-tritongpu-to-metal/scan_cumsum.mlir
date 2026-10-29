@@ -1032,3 +1032,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.binary_exp {{.*}}, {{.*}}, addOp
 // CHECK-NOT: tt.scan
 // CHECK-NOT: tt.reduce
+
+// -----
+// Mixed direct-row and broadcast consumers also reuse the published i32 scan.
+#scan_result_tile = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#scan_result_row = #ttg.slice<{dim = 1, parent = #scan_result_tile}>
+#scan_result_col = #ttg.slice<{dim = 0, parent = #scan_result_tile}>
+#scan_result_flat = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @scan_result_row_i32_product_mixed(%in: !tt.ptr<i32>, %out: !tt.ptr<i32>, %rowout: !tt.ptr<i32>) {
+    %c64 = arith.constant dense<64> : tensor<8x1xi32, #scan_result_tile>
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_row>
+    %re = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #scan_result_row> -> tensor<8x1xi32, #scan_result_tile>
+    %ro = arith.muli %re, %c64 : tensor<8x1xi32, #scan_result_tile>
+    %col = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32, #scan_result_col>
+    %ce = tt.expand_dims %col {axis = 0 : i32} : tensor<64xi32, #scan_result_col> -> tensor<1x64xi32, #scan_result_tile>
+    %xbase = tt.splat %in : !tt.ptr<i32> -> tensor<8x1x!tt.ptr<i32>, #scan_result_tile>
+    %xrow = tt.addptr %xbase, %ro : tensor<8x1x!tt.ptr<i32>, #scan_result_tile>, tensor<8x1xi32, #scan_result_tile>
+    %xrowb = tt.broadcast %xrow : tensor<8x1x!tt.ptr<i32>, #scan_result_tile> -> tensor<8x64x!tt.ptr<i32>, #scan_result_tile>
+    %cb = tt.broadcast %ce : tensor<1x64xi32, #scan_result_tile> -> tensor<8x64xi32, #scan_result_tile>
+    %xaddr = tt.addptr %xrowb, %cb : tensor<8x64x!tt.ptr<i32>, #scan_result_tile>, tensor<8x64xi32, #scan_result_tile>
+    %v = tt.load %xaddr : tensor<8x64x!tt.ptr<i32>, #scan_result_tile>
+    %scan = "tt.scan"(%v) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%a: i32, %b: i32):
+      %sum = arith.addi %a, %b : i32
+      tt.scan.return %sum : i32
+    }) : (tensor<8x64xi32, #scan_result_tile>) -> tensor<8x64xi32, #scan_result_tile>
+    %r = "tt.reduce"(%scan) <{axis = 1 : i32}> ({
+    ^bb0(%a: i32, %b: i32):
+      %product = arith.muli %a, %b : i32
+      tt.reduce.return %product : i32
+    }) : (tensor<8x64xi32, #scan_result_tile>) -> tensor<8xi32, #scan_result_row>
+    %e = tt.expand_dims %r {axis = 1 : i32} : tensor<8xi32, #scan_result_row> -> tensor<8x1xi32, #scan_result_tile>
+    %b = tt.broadcast %e : tensor<8x1xi32, #scan_result_tile> -> tensor<8x64xi32, #scan_result_tile>
+    %obase = tt.splat %out : !tt.ptr<i32> -> tensor<8x1x!tt.ptr<i32>, #scan_result_tile>
+    %orow = tt.addptr %obase, %ro : tensor<8x1x!tt.ptr<i32>, #scan_result_tile>, tensor<8x1xi32, #scan_result_tile>
+    %orowb = tt.broadcast %orow : tensor<8x1x!tt.ptr<i32>, #scan_result_tile> -> tensor<8x64x!tt.ptr<i32>, #scan_result_tile>
+    %oaddr = tt.addptr %orowb, %cb : tensor<8x64x!tt.ptr<i32>, #scan_result_tile>, tensor<8x64xi32, #scan_result_tile>
+    tt.store %oaddr, %b : tensor<8x64x!tt.ptr<i32>, #scan_result_tile>
+    %out_index = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_flat>
+    %base = tt.splat %rowout : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>, #scan_result_flat>
+    %ptr = tt.addptr %base, %out_index : tensor<8x!tt.ptr<i32>, #scan_result_flat>, tensor<8xi32, #scan_result_flat>
+    %flat = ttg.convert_layout %r : tensor<8xi32, #scan_result_row> -> tensor<8xi32, #scan_result_flat>
+    tt.store %ptr, %flat : tensor<8x!tt.ptr<i32>, #scan_result_flat>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel scan_result_row_i32_product_mixed
+// CHECK: %[[INPUT_PRODUCT_MIXED:.*]] = metal.threadgroup_alloca : !metal.memref<512 x ui32>
+// CHECK: %[[RESULT_PRODUCT_MIXED:.*]] = metal.threadgroup_alloca : !metal.memref<512 x ui32>
+// CHECK: metal.tg_store_indexed %[[INPUT_PRODUCT_MIXED]]
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed %[[INPUT_PRODUCT_MIXED]]
+// CHECK: metal.tg_store_indexed %[[RESULT_PRODUCT_MIXED]]
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed %[[RESULT_PRODUCT_MIXED]]
+// CHECK: metal.binary_exp {{.*}}, {{.*}}, mulOp
+// CHECK-NOT: tt.scan
+// CHECK-NOT: tt.reduce
