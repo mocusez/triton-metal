@@ -8458,6 +8458,89 @@ def test_multiband_scan_distinct_input_wider_mixed_row_sum_matches_torch(
     assert (scanned.cpu()[numel:] == sentinel).all()
 
 
+@triton.jit
+def _custom_scan_mixed_row_product_kernel(
+        X, Y, Scanned, Row, N, R: tl.constexpr, C: tl.constexpr,
+        SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr, WIDER: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    offset = program * R * C + row[:, None] * C + tl.arange(0, C)[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0.5)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    reduced = tl.reduce(x, 1, _i32_column_product_combine)
+    tl.store(Row + program * R + row, reduced)
+    if WIDER:
+        wider_column = tl.arange(0, 2 * C)
+        wider_offset = (program * R * (2 * C) + row[:, None] * (2 * C) +
+                        wider_column[None, :])
+        tl.store(Y + wider_offset, reduced[:, None] + wider_column[None, :])
+    else:
+        tl.store(Y + offset, reduced[None, :])
+    tl.store(Scanned + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize("rows,columns,scan_axis,reverse,num_warps,masked,computed,wider", [
+    (16, 16, 0, False, 1, False, False, False),
+    (16, 16, 0, True, 4, True, True, False),
+    (64, 64, 1, False, 4, True, False, False),
+    (64, 64, 1, True, 1, False, True, False),
+    (16, 16, 0, False, 1, False, False, True),
+    (16, 16, 0, True, 4, True, True, True),
+    (8, 64, 1, False, 4, True, False, True),
+    (64, 8, 1, True, 1, False, True, True),
+], ids=["cross_plain", "cross_computed", "cross_masked", "cross_reverse",
+        "wider_plain", "wider_computed", "wider_masked", "wider_reverse"])
+def test_multiband_scan_custom_mixed_row_product_matches_torch(
+        rows, columns, scan_axis, reverse, num_warps, masked, computed, wider):
+    programs = 2
+    numel = programs * rows * columns
+    output_numel = 2 * numel if wider else numel
+    valid = numel - columns - 3 if masked else numel
+    index = torch.arange(numel).reshape(programs, rows, columns)
+    factors = torch.tensor([0.5, 1., 2., 1., 0.25])[index % 5]
+    x = torch.where(index // columns % 7 == 0, -factors, factors)
+    x.view(-1)[valid:] = 0.5
+    device_x = x
+    if computed:
+        x = x * 2
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    reduced = _f32_column_product_reference(x.transpose(1, 2))
+    if wider:
+        expected = reduced[:, :, None] + torch.arange(2 * columns)
+    else:
+        expected = reduced[:, None, :].expand_as(x)
+    sentinel = -999999.
+    y = torch.full((output_numel + 7,), sentinel, device="mps")
+    scanned = torch.full((numel + 7,), sentinel, device="mps")
+    row = torch.full((programs * rows + 7,), sentinel, device="mps")
+    _custom_scan_mixed_row_product_kernel[(programs,)](
+        device_x.to("mps"), y, scanned, row, valid, rows, columns,
+        scan_axis, reverse, masked, computed, wider, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(row.cpu()[:programs * rows].reshape(programs, rows),
+                               reduced, atol=0, rtol=0)
+    if wider:
+        actual = y.cpu()[:output_numel].reshape(programs, rows, 2 * columns)
+    else:
+        actual = y.cpu()[:output_numel].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(scanned.cpu()[:numel].reshape(programs, rows, columns),
+                               expected_scan, atol=0, rtol=0)
+    assert (row.cpu()[programs * rows:] == sentinel).all()
+    assert (y.cpu()[output_numel:] == sentinel).all()
+    assert (scanned.cpu()[numel:] == sentinel).all()
+
+
 @mps_only
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,masked,computed", [
     (16, 16, 0, 1, False, False),
@@ -9187,10 +9270,6 @@ def test_multiband_scan_shared_input_mixed_row_product_total_budget_is_named(sou
      "supported same-phase broadcasts"),
     (1, "reduce cannot replay its computed source cone across conversion"),
     (2, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
-    (3, "a shared scan-input row reduction requires direct row stores or "
-     "supported same-phase broadcasts"),
-    (4, "a shared scan-input row reduction requires direct row stores or "
-     "supported same-phase broadcasts"),
     (5, "a shared scan-input row reduction requires direct row stores or "
      "supported same-phase broadcasts"),
     (6, "rank-2 axis=1 f32 product requires a direct unmasked tt.load"),
@@ -9198,7 +9277,7 @@ def test_multiband_scan_shared_input_mixed_row_product_total_budget_is_named(sou
      "supported same-phase broadcasts"),
     (8, "a shared scan-input row reduction requires direct row stores or "
      "supported same-phase broadcasts"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "wider_tile", "tile_region", "transpose",
+], ids=["distinct_source", "scan_result", "multiple_scans", "tile_region", "transpose",
         "vector_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_product_source_and_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(

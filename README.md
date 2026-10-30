@@ -779,10 +779,11 @@ The current dependency-ordered priorities are:
    and columns, including both NaN-propagating and number-preferring extrema,
    using separate vector and broadcast folds over one input publication. Row sums
    also accept a matching distinct reduction source; other combines require the
-   exact scan input. For either matching source, the mixed direct-row/broadcast
-   form accepts a same-axis broadcast into a wider tile, including the consumer's
-   layout conversion. A shared-source square original tile also accepts a
-   cross-axis broadcast.
+   exact scan input. For row sums, the mixed direct-row/broadcast form accepts a
+   same-axis broadcast into a wider tile for either source, including the
+   consumer's layout conversion. Shared-source row products also accept this
+   wider form. Shared-source row sums and products accept a cross-axis broadcast
+   into a square original tile.
    Shared-source i32 row sum/product/AND/OR/XOR and signed or unsigned min/max
    also support both consumers together under the same multiband tile limits,
    preserving comparison signedness, 32-bit values and wrapping arithmetic for
