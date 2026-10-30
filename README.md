@@ -781,9 +781,9 @@ The current dependency-ordered priorities are:
    also accept a matching distinct reduction source; other combines require the
    exact scan input. For row sums, the mixed direct-row/broadcast form accepts a
    same-axis broadcast into a wider tile for either source, including the
-   consumer's layout conversion. Shared-source row products also accept this
-   wider form. Shared-source row sums and products accept a cross-axis broadcast
-   into a square original tile.
+   consumer's layout conversion. Shared-source row products and extrema also
+   accept this wider form. Shared-source row sums, products and extrema accept a
+   cross-axis broadcast into a square original tile.
    Shared-source i32 row sum/product/AND/OR/XOR and signed or unsigned min/max
    also support both consumers together under the same multiband tile limits,
    preserving comparison signedness, 32-bit values and wrapping arithmetic for

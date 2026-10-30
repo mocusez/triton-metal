@@ -17600,6 +17600,20 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           // The exact fold either produces a vector value for a direct store or
           // a value at each consumer coordinate. Cross-axis broadcasts use the
           // slice exchange; a wider same-axis tile uses its own keep-dims plan.
+          bool customRowCombine =
+              type.getElementType().isF32() &&
+              (mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) ||
+               (sameSource &&
+                mlir::isa_and_nonnull<
+                    mlir::arith::MulFOp, mlir::arith::MaximumFOp,
+                    mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp,
+                    mlir::arith::MinNumFOp>(combine)));
+          bool crossAxisRowCombine =
+              sameSource && type.getElementType().isF32() &&
+              mlir::isa_and_nonnull<
+                  mlir::arith::AddFOp, mlir::arith::MulFOp,
+                  mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
+                  mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(combine);
           bool sawStore = false, sawExpand = false, consumersValid = true;
           for (mlir::Operation *user : reduce->getUsers()) {
             if (isDirectStore(user)) {
@@ -17620,11 +17634,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                          /*requireSameLayout=*/true)
                                    : std::nullopt;
             bool customRowConsumer =
-                reduce.getAxis() == 1 && type.getElementType().isF32() &&
-                (mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) ||
-                 (sameSource &&
-                  mlir::isa_and_nonnull<mlir::arith::MulFOp>(combine))) &&
-                expand && expandTy && consumer &&
+                reduce.getAxis() == 1 && customRowCombine && expand && expandTy &&
+                consumer &&
                 (expand.getAxis() != reduce.getAxis() ||
                  consumer->shape != scanPlan->tile.shape);
             if (customRowConsumer) {
@@ -17673,15 +17684,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                      mlir::arith::MinUIOp>(combine))) &&
               llvm::all_of(type.getShape(),
                            [](int64_t size) { return size >= 2 && size <= 64; }) &&
-              hasSamePhaseMixedRowConsumers(
-                  reduce, type,
-                  sameSource && type.getElementType().isF32() &&
-                      mlir::isa_and_nonnull<mlir::arith::AddFOp,
-                                             mlir::arith::MulFOp>(combine),
-                  type.getElementType().isF32() &&
-                      (mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) ||
-                       (sameSource &&
-                        mlir::isa_and_nonnull<mlir::arith::MulFOp>(combine))));
+              hasSamePhaseMixedRowConsumers(reduce, type, crossAxisRowCombine,
+                                            customRowCombine);
           if (!consumersValid || (sawStore && sawExpand && !splitRowReduction)) {
             reduce.emitOpError(
                 "Metal backend: a shared scan-input row reduction requires "

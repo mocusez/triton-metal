@@ -8541,6 +8541,101 @@ def test_multiband_scan_custom_mixed_row_product_matches_torch(
     assert (scanned.cpu()[numel:] == sentinel).all()
 
 
+@triton.jit
+def _custom_scan_mixed_row_extremum_kernel(
+        X, Y, Scanned, Row, N, R: tl.constexpr, C: tl.constexpr,
+        SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr, WIDER: tl.constexpr, REDUCTION: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    offset = program * R * C + row[:, None] * C + tl.arange(0, C)[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0.75)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    if REDUCTION == "min":
+        reduced = tl.reduce(x, 1, _mixed_row_minimum_combine)
+    elif REDUCTION == "max":
+        reduced = tl.reduce(x, 1, _mixed_row_maximum_combine)
+    elif REDUCTION == "minnum":
+        reduced = tl.min(x, 1)
+    else:
+        reduced = tl.max(x, 1)
+    tl.store(Row + program * R + row, reduced)
+    if WIDER:
+        wider_column = tl.arange(0, 2 * C)
+        wider_offset = (program * R * (2 * C) + row[:, None] * (2 * C) +
+                        wider_column[None, :])
+        tl.store(Y + wider_offset, reduced[:, None] + wider_column[None, :])
+    else:
+        tl.store(Y + offset, reduced[None, :])
+    tl.store(Scanned + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize("reduction", ["min", "max", "minnum", "maxnum"])
+@pytest.mark.parametrize("rows,columns,scan_axis,reverse,num_warps,masked,computed,wider", [
+    (16, 16, 0, False, 1, False, False, False),
+    (16, 16, 0, True, 4, True, True, False),
+    (64, 64, 1, False, 4, True, False, False),
+    (64, 64, 1, True, 1, False, True, False),
+    (16, 16, 0, False, 1, False, False, True),
+    (16, 16, 0, True, 4, True, True, True),
+    (8, 64, 1, False, 4, True, False, True),
+    (64, 8, 1, True, 1, False, True, True),
+], ids=["cross_plain", "cross_computed", "cross_masked", "cross_reverse",
+        "wider_plain", "wider_computed", "wider_masked", "wider_reverse"])
+def test_multiband_scan_custom_mixed_row_extremum_matches_torch(
+        rows, columns, scan_axis, reverse, num_warps, masked, computed, wider, reduction):
+    programs = 2
+    numel = programs * rows * columns
+    output_numel = 2 * numel if wider else numel
+    valid = numel - columns - 3 if masked else numel
+    index = torch.arange(numel).reshape(programs, rows, columns)
+    x = 1 + (index // columns % rows).float() / 4 + (index % columns % 7).float() / 8
+    x = torch.where(index // columns % 4 == 0, -x, x)
+    x = torch.where((index // columns % 5 == 0) & (index % columns == 2),
+                    float("nan"), x)
+    zeros = torch.where(index // columns % 2 == 0, -0., 0.)
+    x = torch.where(index % columns == 0, zeros, x)
+    x.view(-1)[valid:] = 0.75
+    device_x = x
+    if computed:
+        x = x * 2 + 3
+    axis = scan_axis + 1
+    expected_scan = (x.flip(axis) if reverse else x).cumsum(axis)
+    if reverse:
+        expected_scan = expected_scan.flip(axis)
+    reduced = _f32_row_extremum_reference(x, reduction)
+    if wider:
+        expected = reduced[:, :, None] + torch.arange(2 * columns)
+    else:
+        expected = reduced[:, None, :].expand_as(x)
+    sentinel = -999999.
+    y = torch.full((output_numel + 7,), sentinel, device="mps")
+    scanned = torch.full((numel + 7,), sentinel, device="mps")
+    row = torch.full((programs * rows + 7,), sentinel, device="mps")
+    _custom_scan_mixed_row_extremum_kernel[(programs,)](
+        device_x.to("mps"), y, scanned, row, valid, rows, columns,
+        scan_axis, reverse, masked, computed, wider, reduction, num_warps=num_warps)
+    torch.mps.synchronize()
+    actual_row = row.cpu()[:programs * rows].reshape(programs, rows)
+    torch.testing.assert_close(actual_row, reduced, atol=0, rtol=0, equal_nan=True)
+    if wider:
+        actual = y.cpu()[:output_numel].reshape(programs, rows, 2 * columns)
+    else:
+        actual = y.cpu()[:output_numel].reshape(programs, rows, columns)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(scanned.cpu()[:numel].reshape(programs, rows, columns),
+                               expected_scan, atol=0, rtol=0, equal_nan=True)
+    assert (row.cpu()[programs * rows:] == sentinel).all()
+    assert (y.cpu()[output_numel:] == sentinel).all()
+    assert (scanned.cpu()[numel:] == sentinel).all()
+
+
 @mps_only
 @pytest.mark.parametrize("rows,columns,scan_axis,num_warps,masked,computed", [
     (16, 16, 0, 1, False, False),
@@ -9582,10 +9677,6 @@ def test_multiband_scan_shared_input_mixed_row_extremum_total_budget_is_named(so
      "supported same-phase broadcasts"),
     (1, "sub", "reduce cannot replay its computed source cone across conversion"),
     (2, "minnum", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
-    (3, "max", "a shared scan-input row reduction requires direct row stores or "
-     "supported same-phase broadcasts"),
-    (4, "min", "a shared scan-input row reduction requires direct row stores or "
-     "supported same-phase broadcasts"),
     (5, "maximum", "a shared scan-input row reduction requires direct row stores or "
      "supported same-phase broadcasts"),
     (6, "minnum", "a rank-2 tl.reduce cannot share a function with a multi-band staged scan"),
@@ -9593,7 +9684,7 @@ def test_multiband_scan_shared_input_mixed_row_extremum_total_budget_is_named(so
      "supported same-phase broadcasts"),
     (8, "min", "a shared scan-input row reduction requires direct row stores or "
      "supported same-phase broadcasts"),
-], ids=["distinct_source", "scan_result", "multiple_scans", "cross_axis", "wider_tile", "tile_region", "transpose",
+], ids=["distinct_source", "scan_result", "multiple_scans", "tile_region", "transpose",
         "vector_region", "late_transpose"])
 def test_multiband_scan_shared_input_mixed_row_extremum_source_and_consumer_is_named(mode, reduction, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
