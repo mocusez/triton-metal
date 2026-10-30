@@ -787,7 +787,8 @@ The current dependency-ordered priorities are:
    Shared-source i32 row sum/product/AND/OR/XOR and signed or unsigned min/max
    also support both consumers together under the same multiband tile limits,
    preserving comparison signedness, 32-bit values and wrapping arithmetic for
-   masked or computed inputs. Axis-0 reductions support
+   masked or computed inputs. Shared-source i32 row sums also accept the
+   cross-axis and wider same-axis mixed forms. Axis-0 reductions support
    direct column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
    supports multiple reductions. f32 row and column-vector sum/product/min/max

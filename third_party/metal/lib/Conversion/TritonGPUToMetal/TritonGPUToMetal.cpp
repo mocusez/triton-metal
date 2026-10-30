@@ -17601,19 +17601,24 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           // a value at each consumer coordinate. Cross-axis broadcasts use the
           // slice exchange; a wider same-axis tile uses its own keep-dims plan.
           bool customRowCombine =
-              type.getElementType().isF32() &&
-              (mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) ||
-               (sameSource &&
-                mlir::isa_and_nonnull<
-                    mlir::arith::MulFOp, mlir::arith::MaximumFOp,
-                    mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp,
-                    mlir::arith::MinNumFOp>(combine)));
+              (type.getElementType().isF32() &&
+               (mlir::isa_and_nonnull<mlir::arith::AddFOp>(combine) ||
+                (sameSource &&
+                 mlir::isa_and_nonnull<
+                     mlir::arith::MulFOp, mlir::arith::MaximumFOp,
+                     mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp,
+                     mlir::arith::MinNumFOp>(combine)))) ||
+              (sameSource && type.getElementType().isInteger(32) &&
+               mlir::isa_and_nonnull<mlir::arith::AddIOp>(combine));
           bool crossAxisRowCombine =
-              sameSource && type.getElementType().isF32() &&
-              mlir::isa_and_nonnull<
-                  mlir::arith::AddFOp, mlir::arith::MulFOp,
-                  mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
-                  mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(combine);
+              sameSource &&
+              ((type.getElementType().isF32() &&
+                mlir::isa_and_nonnull<
+                    mlir::arith::AddFOp, mlir::arith::MulFOp,
+                    mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
+                    mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(combine)) ||
+               (type.getElementType().isInteger(32) &&
+                mlir::isa_and_nonnull<mlir::arith::AddIOp>(combine)));
           bool sawStore = false, sawExpand = false, consumersValid = true;
           for (mlir::Operation *user : reduce->getUsers()) {
             if (isDirectStore(user)) {
