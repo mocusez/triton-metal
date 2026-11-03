@@ -5391,9 +5391,12 @@ static bool scanBroadcastNeedsBuffer(mlir::triton::ExpandDimsOp expand) {
   return tile && srcTy.getNumElements() > tile->threadsPerBlock;
 }
 
-// Only single-value rank-1 scans register their complete result in scanBufs.
-// Check every leaf: a cone may combine several scans, including a tuple scan
-// whose per-thread placeholder cannot be read at another logical coordinate.
+static bool isCanonicalAffineScan(mlir::triton::ScanOp op);
+static bool canonicalTupleScanSourcesReplayable(mlir::triton::ScanOp op);
+
+// Single-value and canonical affine scans register every result in scanBufs.
+// Other tuple scans keep per-thread placeholders that cannot be read at another
+// logical coordinate.
 static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
   if (depth > 24)
     return false;
@@ -5404,7 +5407,11 @@ static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
     return false;
   if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
     auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
-    return scan->getNumResults() == 1 && type.getRank() == 1 &&
+    bool bufferedTuple = scan->getNumResults() == 2 &&
+                         isCanonicalAffineScan(scan) &&
+                         canonicalTupleScanSourcesReplayable(scan);
+    return (scan->getNumResults() == 1 || bufferedTuple) &&
+           type.getRank() == 1 &&
            (type.getElementType().isF32() || type.getElementType().isInteger(32));
   }
   return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
@@ -5455,8 +5462,8 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
            !rank1ConeSupported(ed.getSrc(), 0, /*deferAggregateLeaves=*/true))) {
         ed.emitError(
             "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
-            "tile above one element per thread requires single-value f32/i32 "
-            "scans and a replayable elementwise cone");
+            "tile above one element per thread requires single-value or canonical "
+            "affine f32/i32 scans and a replayable elementwise cone");
         status = mlir::failure();
         return;
       }

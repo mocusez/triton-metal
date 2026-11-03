@@ -2241,6 +2241,137 @@ def test_scan_result_broadcast_beyond_one_pass_matches_torch(
 
 
 @triton.jit
+def _wide_affine_scan_combine(a, x, b, y):
+    return a * b, b * x + y
+
+
+@triton.jit
+def _wide_affine_scan_bcast_kernel(A, X, U, V, Y, Z, N, WIDTH: tl.constexpr,
+                                   ROWS: tl.constexpr, REVERSE: tl.constexpr,
+                                   MASKED: tl.constexpr, COMPUTED: tl.constexpr):
+    program = tl.program_id(0)
+    index = tl.arange(0, WIDTH)
+    other = tl.arange(0, 4)
+    if MASKED:
+        a = tl.load(A + program * WIDTH + index, index < N, other=0)
+        x = tl.load(X + program * WIDTH + index, index < N, other=0)
+    else:
+        a = tl.load(A + program * WIDTH + index)
+        x = tl.load(X + program * WIDTH + index)
+    if COMPUTED:
+        a = a * 0.5 + 0.5
+    u, v = tl.associative_scan((a, x), 0, _wide_affine_scan_combine,
+                               reverse=REVERSE)
+    tl.store(U + program * WIDTH + index, u)
+    tl.store(V + program * WIDTH + index, v)
+    u = u * 2 + 3
+    v = v * 3 - 1
+    if ROWS:
+        out_u = u[:, None] + other[None, :]
+        out_v = v[:, None] - other[None, :]
+        offset = index[:, None] * 4 + other[None, :]
+    else:
+        out_u = u[None, :] + other[:, None]
+        out_v = v[None, :] - other[:, None]
+        offset = other[:, None] * WIDTH + index[None, :]
+    tl.store(Y + program * (4 * WIDTH) + offset, out_u)
+    tl.store(Z + program * (4 * WIDTH) + offset, out_v)
+
+
+def _affine_broadcast_reference(a, x, reverse):
+    a = a.to(torch.float64)
+    x = x.to(torch.float64)
+    u = torch.empty_like(a)
+    v = torch.empty_like(x)
+    carry_a = torch.ones(a.shape[0], dtype=torch.float64)
+    carry_x = torch.zeros(x.shape[0], dtype=torch.float64)
+    for column in (range(a.shape[1] - 1, -1, -1) if reverse else range(a.shape[1])):
+        next_x = a[:, column] * carry_x + x[:, column]
+        carry_a = carry_a * a[:, column]
+        carry_x = next_x
+        u[:, column] = carry_a
+        v[:, column] = carry_x
+    return u.to(torch.float32), v.to(torch.float32)
+
+
+@triton.jit
+def _unsupported_general_tuple_wide_bcast_kernel(X, Value, Count, Out,
+                                                 WIDTH: tl.constexpr):
+    index = tl.arange(0, WIDTH)
+    other = tl.arange(0, 4)
+    x = tl.load(X + index)
+    count = tl.full((WIDTH,), 1, tl.int32)
+    value, count = tl.associative_scan((x, count), 0,
+                                       _tuple_sum_and_count_combine)
+    tl.store(Count + index, count)
+    tl.store(Value + index, value)
+    tl.store(Out + other[:, None] * WIDTH + index[None, :],
+             value[None, :] + other[:, None])
+
+
+def test_general_tuple_scan_wide_broadcast_is_named():
+    result = _compile_rankn_nested_negative_in_child(
+        "_unsupported_general_tuple_wide_bcast_kernel",
+        {"X": "*fp32", "Value": "*fp32", "Count": "*i32", "Out": "*fp32"},
+        {"WIDTH": 64}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "requires single-value or canonical affine f32/i32 scans" in output, output
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [False, True], ids=["columns", "rows"])
+@pytest.mark.parametrize("width,num_warps,reverse,masked,computed", [
+    (64, 1, False, False, False),
+    (128, 2, True, True, True),
+    (256, 4, False, False, True),
+    (256, 1, True, True, False),
+], ids=["forward", "reverse_masked_computed", "four_warps_computed", "reverse_masked"])
+def test_scan_affine_tuple_broadcast_beyond_one_pass_matches_torch(
+        width, num_warps, reverse, masked, computed, rows):
+    programs = 3
+    index = torch.arange(programs * width).reshape(programs, width)
+    a = (index % 3 == 0).float()
+    x = (index % 9 - 4).float() * 0.25
+    valid = width - 7 if masked else width
+    device_a = a.clone()
+    device_x = x.clone()
+    device_a[:, valid:] = 3
+    device_x[:, valid:] = 2
+    a[:, valid:] = 0
+    x[:, valid:] = 0
+    if computed:
+        a = a * 0.5 + 0.5
+    expected_u, expected_v = _affine_broadcast_reference(a, x, reverse)
+    other = torch.arange(4).float()
+    u = expected_u * 2 + 3
+    v = expected_v * 3 - 1
+    if rows:
+        expected_y = u[:, :, None] + other[None, None, :]
+        expected_z = v[:, :, None] - other[None, None, :]
+    else:
+        expected_y = u[:, None, :] + other[None, :, None]
+        expected_z = v[:, None, :] - other[None, :, None]
+    sentinel = -999999
+    direct_u = torch.full((programs * width + 7,), sentinel, dtype=torch.float32, device="mps")
+    direct_v = torch.full_like(direct_u, sentinel)
+    y = torch.full((programs * 4 * width + 7,), sentinel, dtype=torch.float32, device="mps")
+    z = torch.full_like(y, sentinel)
+    _wide_affine_scan_bcast_kernel[(programs,)](
+        device_a.to("mps"), device_x.to("mps"), direct_u, direct_v, y, z,
+        valid, width, rows, reverse, masked, computed, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected in ((direct_u, expected_u), (direct_v, expected_v)):
+        torch.testing.assert_close(actual.cpu()[:programs * width].reshape(programs, width),
+                                   expected, atol=1e-4, rtol=1e-4)
+        assert (actual.cpu()[programs * width:] == sentinel).all()
+    for actual, expected in ((y, expected_y), (z, expected_z)):
+        torch.testing.assert_close(actual.cpu()[:programs * 4 * width].reshape_as(expected),
+                                   expected, atol=1e-4, rtol=1e-4)
+        assert (actual.cpu()[programs * 4 * width:] == sentinel).all()
+
+
+@triton.jit
 def _scan_bcast_lifetime_kernel(X, Y, Z, W, steps, WIDTH: tl.constexpr,
                                  ROWS: tl.constexpr, LOOP: tl.constexpr):
     index = tl.arange(0, WIDTH)
