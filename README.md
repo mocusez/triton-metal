@@ -745,13 +745,15 @@ The current dependency-ordered priorities are:
    uniform user loops. Multi-element single-value and tuple scans now support
    one top-level uniform runtime loop, including consecutive scans, memory
    updates across iterations, tensor iter_args, and snapshots of tensors
-   computed before the loop. Carried tensors use threadgroup slots and must be
-   integer or floating-point tiles of at least eight bits, have one owner per
-   element, and use the function tile's register count; their slots count
-   against the 32 KiB threadgroup budget. Scalar carries, replicated-owner or
-   mismatched-register-count tiles, a tile-carrying loop containing `tl.dot`,
-   multiple tile-carrying scan loops in one function, deeper control flow, and
-   unsafe cross-phase replay remain rejected.
+   computed before the loop. Integer and floating-point scalar iter_args pass
+   through the SSA yield; pure scalar definitions used outside a register band
+   are cloned at its boundary to preserve dominance. Carried tensors use
+   threadgroup slots and must be integer or floating-point tiles of at least
+   eight bits, have one owner per element, and use the function tile's register
+   count; their slots count against the 32 KiB threadgroup budget.
+   Replicated-owner or mismatched-register-count tiles, a tile-carrying loop
+   containing `tl.dot`, multiple tile-carrying scan loops in one function,
+   deeper control flow, and unsafe cross-phase replay remain rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing

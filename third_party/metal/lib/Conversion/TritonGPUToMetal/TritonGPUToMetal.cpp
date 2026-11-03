@@ -42851,8 +42851,11 @@ static llvm::SmallVector<mlir::Type, 4>
 nestedScanCarriedTypes(mlir::scf::ForOp loop,
                        llvm::SmallVectorImpl<mlir::Value> *spilled = nullptr) {
   llvm::SmallVector<mlir::Type, 4> types;
-  for (mlir::Value init : loop.getInitArgs())
+  for (mlir::Value init : loop.getInitArgs()) {
+    if (init.getType().isIntOrFloat())
+      continue;
     types.push_back(init.getType());
+  }
   llvm::DenseMap<mlir::Value, bool> memo;
   llvm::SetVector<mlir::Value> crossing;
   auto consider = [&](mlir::Value value) {
@@ -43414,6 +43417,25 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
                                        segmentEnd);
       segmentBegin = segmentEnd;
       builder.setInsertionPointAfter(phase);
+      // Scalar results used by a later phase or by the loop's own yield must be
+      // defined outside this register band, not inside its nested region.
+      for (mlir::Operation &op : phaseBody) {
+        if (op.getNumRegions() != 0 || !mlir::isMemoryEffectFree(&op))
+          continue;
+        for (auto [index, result] : llvm::enumerate(op.getResults())) {
+          if (mlir::isa<mlir::RankedTensorType>(result.getType()))
+            continue;
+          llvm::SmallVector<mlir::OpOperand *, 4> outsideUses;
+          for (mlir::OpOperand &use : result.getUses())
+            if (!phase->isAncestor(use.getOwner()))
+              outsideUses.push_back(&use);
+          if (outsideUses.empty())
+            continue;
+          auto *clone = builder.clone(op);
+          for (mlir::OpOperand *use : outsideUses)
+            use->set(clone->getResult(index));
+        }
+      }
       BarrierOp::create(builder, loop.getLoc());
     }
     auto limit = constant(finalE);

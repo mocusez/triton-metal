@@ -1590,11 +1590,27 @@ def test_tuple_scan_rankn_outside_envelope_is_named(shape, axis, num_warps, dtyp
     assert reason in result.stdout + result.stderr
 
 
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+def test_tuple_scan_rankn_scalar_iter_arg_matches_torch(rows):
+    x = (torch.arange(max(rows, 1) * 128).reshape(max(rows, 1), 8, 16) % 7 - 3).float()
+    value = torch.full((rows, 8, 16), -999999, dtype=torch.float32, device="mps")
+    count = torch.full((rows, 8, 16), -999999, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_scalar_carry_loop_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=1)
+    torch.mps.synchronize()
+    for row in range(rows):
+        torch.testing.assert_close(value.cpu()[row], (x[row] + row).cumsum(1),
+                                   atol=0, rtol=0)
+        torch.testing.assert_close(
+            count.cpu()[row],
+            torch.ones(8, 16, dtype=torch.int32).cumsum(1, dtype=torch.int32),
+            atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("kernel,reason", [
     ("_rankn_tuple_scan_nested_loop_kernel",
      "nested scan requires one top-level for loop directly around it"),
-    ("_rankn_tuple_scan_scalar_carry_loop_kernel",
-     "nested scan carries only tensors between iterations"),
     ("_rankn_tuple_scan_dot_carry_loop_kernel",
      "nested scan carrying a tile cannot share its loop with a tl.dot"),
     ("_rankn_tuple_scan_hoisted_snapshot_loop_kernel",
