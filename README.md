@@ -789,10 +789,10 @@ The current dependency-ordered priorities are:
    preserving comparison signedness, 32-bit values and wrapping arithmetic for
    masked or computed inputs. All of these shared-source i32 combines also accept
    the cross-axis and wider same-axis mixed forms. Two independent top-level
-   multiband scans of the exact same input also accept a subsequent f32 row sum
-   of that input, with a direct row store or original-tile same-axis
-   broadcast. Reductions of an earlier scan's input, other combines, cross-axis or
-   wider consumers and nested dependencies remain rejected. Axis-0 reductions support
+   multiband scans of the exact same input also accept an f32 row sum after either
+   scan, including one sum after each scan, with direct row stores or original-tile
+   same-axis broadcasts. Other combines, reduction placements, cross-axis or wider
+   consumers and nested dependencies remain rejected. Axis-0 reductions support
    direct column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
    supports multiple reductions. f32 row and column-vector sum/product/min/max

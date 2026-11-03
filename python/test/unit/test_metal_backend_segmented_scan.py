@@ -2815,6 +2815,108 @@ def test_multiband_consecutive_scans_shared_input_row_sum_matches_torch(
 
 
 @triton.jit
+def _consecutive_scans_two_phase_row_sum_kernel(
+        X, First, Scanned, EarlyY, EarlyRow, LateY, LateRow, N,
+        R: tl.constexpr, C: tl.constexpr, FIRST_AXIS: tl.constexpr,
+        SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr, MASKED: tl.constexpr,
+        COMPUTED: tl.constexpr, BROADCAST: tl.constexpr, BOTH: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = program * R * C + row[:, None] * C + column[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    first = tl.cumsum(x, FIRST_AXIS, reverse=REVERSE)
+    early = tl.sum(x, 1)
+    if not BROADCAST:
+        tl.store(EarlyRow + program * R + row, early)
+    scanned = tl.cumsum(x, SCAN_AXIS, reverse=REVERSE)
+    tl.store(First + offset, first)
+    tl.store(Scanned + offset, scanned)
+    if BROADCAST:
+        tl.store(EarlyY + offset, first + early[:, None])
+    else:
+        tl.store(EarlyY + offset, first)
+    if BOTH:
+        late = tl.sum(x, 1)
+        if BROADCAST:
+            tl.store(LateY + offset, scanned + late[:, None])
+        else:
+            tl.store(LateY + offset, scanned)
+            tl.store(LateRow + program * R + row, late)
+    else:
+        tl.store(LateY + offset, scanned)
+
+
+@mps_only
+@pytest.mark.parametrize(
+    "rows,columns,first_axis,scan_axis,reverse,num_warps,masked,computed,broadcast,both", [
+        (16, 16, 0, 0, False, 1, False, False, False, False),
+        (16, 16, 1, 1, True, 4, True, True, False, False),
+        (32, 8, 0, 1, False, 4, True, False, True, False),
+        (8, 32, 1, 0, True, 1, False, True, True, True),
+        (16, 16, 0, 1, True, 4, False, False, False, True),
+        (16, 16, 1, 0, False, 1, True, True, True, True),
+        (64, 8, 0, 0, False, 1, True, False, True, False),
+        (8, 64, 1, 1, True, 4, False, True, False, True),
+    ], ids=["early_direct", "early_reverse_direct", "early_cross_masked",
+            "both_cross_computed", "both_reverse_direct", "both_masked_broadcast",
+            "early_long_rows_broadcast", "both_long_columns_direct"])
+def test_multiband_consecutive_scans_two_phase_row_sum_matches_torch(
+        rows, columns, first_axis, scan_axis, reverse, num_warps, masked, computed,
+        broadcast, both):
+    programs = 2
+    size = programs * rows * columns
+    valid = size - columns - 3 if masked else size
+    index = torch.arange(size).reshape(programs, rows, columns)
+    x = (index % 13 - 6).float()
+    device_x = x.clone()
+    device_x.view(-1)[valid:] = -5
+    x.view(-1)[valid:] = 0
+    if computed:
+        x = x * 2 + 3
+    first_dim = first_axis + 1
+    scan_dim = scan_axis + 1
+    expected_first = (x.flip(first_dim) if reverse else x).cumsum(first_dim)
+    expected_scan = (x.flip(scan_dim) if reverse else x).cumsum(scan_dim)
+    if reverse:
+        expected_first = expected_first.flip(first_dim)
+        expected_scan = expected_scan.flip(scan_dim)
+    reduced = x.sum(2)
+    expected_early_y = expected_first + reduced[:, :, None] if broadcast else expected_first
+    expected_late_y = expected_scan + reduced[:, :, None] if both and broadcast else expected_scan
+    sentinel = -999999
+    first, scanned, early_y, late_y = [
+        torch.full((size + 7,), sentinel, dtype=torch.float32, device="mps")
+        for _ in range(4)
+    ]
+    early_row, late_row = [
+        torch.full((programs * rows + 7,), sentinel, dtype=torch.float32, device="mps")
+        for _ in range(2)
+    ]
+    _consecutive_scans_two_phase_row_sum_kernel[(programs,)](
+        device_x.to("mps"), first, scanned, early_y, early_row, late_y, late_row,
+        valid, rows, columns, first_axis, scan_axis, reverse, masked, computed,
+        broadcast, both, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected in ((first, expected_first), (scanned, expected_scan),
+                             (early_y, expected_early_y), (late_y, expected_late_y)):
+        torch.testing.assert_close(actual.cpu()[:size].reshape_as(x), expected, atol=0, rtol=0)
+        assert (actual.cpu()[size:] == sentinel).all()
+    for actual, active in ((early_row, not broadcast), (late_row, both and not broadcast)):
+        if active:
+            torch.testing.assert_close(actual.cpu()[:programs * rows].reshape(programs, rows),
+                                       reduced, atol=0, rtol=0)
+            assert (actual.cpu()[programs * rows:] == sentinel).all()
+        else:
+            assert (actual.cpu() == sentinel).all()
+
+
+@triton.jit
 def _unsupported_shared_input_row_reduce_kernel(X, Y, Z, Row, TWO_SCANS: tl.constexpr):
     row = tl.arange(0, 8)
     column = tl.arange(0, 64)

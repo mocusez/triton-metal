@@ -1846,7 +1846,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #scan_result_col = #ttg.slice<{dim = 0, parent = #scan_result_tile}>
 #scan_result_flat = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @consecutive_scans_last_input_row_sum(%in: !tt.ptr<f32>, %firstout: !tt.ptr<f32>, %out: !tt.ptr<f32>, %rowout: !tt.ptr<f32>) {
+  tt.func public @consecutive_scans_two_phase_row_sums(%in: !tt.ptr<f32>, %firstout: !tt.ptr<f32>, %earlyout: !tt.ptr<f32>, %out: !tt.ptr<f32>, %rowout: !tt.ptr<f32>) {
     %c8 = arith.constant dense<8> : tensor<8x1xi32, #scan_result_tile>
     %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_row>
     %re = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #scan_result_row> -> tensor<8x1xi32, #scan_result_tile>
@@ -1864,6 +1864,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
       %sum = arith.addf %a, %b : f32
       tt.scan.return %sum : f32
     }) : (tensor<8x8xf32, #scan_result_tile>) -> tensor<8x8xf32, #scan_result_tile>
+    %early = "tt.reduce"(%v) <{axis = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<8x8xf32, #scan_result_tile>) -> tensor<8xf32, #scan_result_row>
+    %early_index = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #scan_result_flat>
+    %early_base = tt.splat %earlyout : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>, #scan_result_flat>
+    %early_ptr = tt.addptr %early_base, %early_index : tensor<8x!tt.ptr<f32>, #scan_result_flat>, tensor<8xi32, #scan_result_flat>
+    %early_flat = ttg.convert_layout %early : tensor<8xf32, #scan_result_row> -> tensor<8xf32, #scan_result_flat>
+    tt.store %early_ptr, %early_flat : tensor<8x!tt.ptr<f32>, #scan_result_flat>
     %scan = "tt.scan"(%v) <{axis = 1 : i32, reverse = true}> ({
     ^bb0(%a: f32, %b: f32):
       %sum = arith.addf %a, %b : f32
@@ -1893,7 +1903,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   }
 }
 
-// CHECK-LABEL: metal.kernel consecutive_scans_last_input_row_sum
+// CHECK-LABEL: metal.kernel consecutive_scans_two_phase_row_sums
 // CHECK: metal.threadgroup_alloca : !metal.memref<64 x f32>
 // CHECK: metal.threadgroup_alloca : !metal.memref<8 x f32>
 // CHECK-NOT: tt.scan

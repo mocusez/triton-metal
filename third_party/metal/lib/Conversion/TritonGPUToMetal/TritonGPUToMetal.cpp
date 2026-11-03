@@ -17463,20 +17463,20 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
     // The legacy row scanner needs a device-rooted source cone, which the
     // scan partition replaces with a scratch read. Use the exact-layout fold
     // over a shared or jointly published input instead. Besides one top-level
-    // scan, accept two independent exact-layout scans when the final scan
-    // shares an f32 sum's input; arbitrary scan/reduce phases still need
+    // scan, accept two independent exact-layout scans of one SSA input when an
+    // f32 sum belongs to either phase; arbitrary scan/reduce phases still need
     // explicit shared-buffer lifetimes.
     if (type.getRank() == 2) {
       llvm::SmallVector<mlir::triton::ScanOp, 2> functionScans;
       func.walk([&](mlir::triton::ScanOp scan) { functionScans.push_back(scan); });
-      bool finalSharedSourceOfTwoScans = false;
+      bool sharedSourceOfTwoScans = false;
       if (functionScans.size() == 2) {
         auto first = functionScans.front();
         auto last = functionScans.back();
         auto firstPlan = planStagedScan(first);
         auto lastPlan = planStagedScan(last);
         auto *sourceDef = reduce.getSrcs().front().getDefiningOp();
-        finalSharedSourceOfTwoScans =
+        sharedSourceOfTwoScans =
             first.getSrcs().size() == 1 && last.getSrcs().size() == 1 &&
             first.getNumResults() == 1 && last.getNumResults() == 1 &&
             first.getSrcs().front().getType() == last.getSrcs().front().getType() &&
@@ -17494,7 +17494,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             last->getBlock() == reduce->getBlock() &&
             mlir::isa<mlir::triton::FuncOp>(first->getParentOp()) &&
             mlir::isa<mlir::triton::FuncOp>(last->getParentOp()) &&
-            first->isBeforeInBlock(last) && last->isBeforeInBlock(reduce);
+            first->isBeforeInBlock(last) && first->isBeforeInBlock(reduce) &&
+            (last->isBeforeInBlock(reduce) || reduce->isBeforeInBlock(last));
       }
       auto isDirectStore = isScanInputReduceStoreConsumer;
       // Column vector stores use the exact result layout. A narrow broadcast
@@ -17503,11 +17504,13 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           reduce.getAxis() == 0 && !reduce->use_empty() &&
           llvm::all_of(reduce->getUsers(), isDirectStore);
       if ((reduce.getAxis() == 1 || reduce.getAxis() == 0) &&
-          (functionScans.size() == 1 || finalSharedSourceOfTwoScans) &&
+          (functionScans.size() == 1 || sharedSourceOfTwoScans) &&
           (type.getElementType().isF32() ||
            type.getElementType().isInteger(32))) {
-        auto scan = finalSharedSourceOfTwoScans ? functionScans.back()
-                                                : functionScans.front();
+        auto scan = sharedSourceOfTwoScans &&
+                            functionScans.back()->isBeforeInBlock(reduce)
+                        ? functionScans.back()
+                        : functionScans.front();
         auto scanPlan = planStagedScan(scan);
         bool sameSource = scan.getSrcs().front() == reduce.getSrcs().front();
         bool scanResult = scan.getNumResults() == 1 &&
@@ -17678,7 +17681,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                          /*requireSameLayout=*/true)
                                    : std::nullopt;
             bool customRowConsumer =
-                !finalSharedSourceOfTwoScans && reduce.getAxis() == 1 &&
+                !sharedSourceOfTwoScans && reduce.getAxis() == 1 &&
                 customRowCombine && expand && expandTy && consumer &&
                 (expand.getAxis() != reduce.getAxis() ||
                  consumer->shape != scanPlan->tile.shape);
