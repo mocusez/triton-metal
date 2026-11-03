@@ -2295,28 +2295,157 @@ def _affine_broadcast_reference(a, x, reverse):
 
 
 @triton.jit
-def _unsupported_general_tuple_wide_bcast_kernel(X, Value, Count, Out,
-                                                 WIDTH: tl.constexpr):
+def _general_tuple_wide_bcast_kernel(X, Value, Count, OutV, OutC, N,
+                                     WIDTH: tl.constexpr, ROWS: tl.constexpr,
+                                     REVERSE: tl.constexpr, MASKED: tl.constexpr,
+                                     COMPUTED: tl.constexpr):
+    program = tl.program_id(0)
     index = tl.arange(0, WIDTH)
     other = tl.arange(0, 4)
-    x = tl.load(X + index)
+    if MASKED:
+        x = tl.load(X + program * WIDTH + index, index < N, other=0)
+    else:
+        x = tl.load(X + program * WIDTH + index)
+    if COMPUTED:
+        x = x * 2 + 1
     count = tl.full((WIDTH,), 1, tl.int32)
     value, count = tl.associative_scan((x, count), 0,
-                                       _tuple_sum_and_count_combine)
-    tl.store(Count + index, count)
-    tl.store(Value + index, value)
-    tl.store(Out + other[:, None] * WIDTH + index[None, :],
-             value[None, :] + other[:, None])
+                                       _tuple_sum_and_count_combine,
+                                       reverse=REVERSE)
+    tl.store(Value + program * WIDTH + index, value)
+    tl.store(Count + program * WIDTH + index, count)
+    value = value * 2 + 3
+    count = count * 3 - 1
+    if ROWS:
+        out_v = value[:, None] + other[None, :]
+        out_c = count[:, None] + other[None, :]
+        offset = index[:, None] * 4 + other[None, :]
+    else:
+        out_v = value[None, :] + other[:, None]
+        out_c = count[None, :] + other[:, None]
+        offset = other[:, None] * WIDTH + index[None, :]
+    tl.store(OutV + program * (4 * WIDTH) + offset, out_v)
+    tl.store(OutC + program * (4 * WIDTH) + offset, out_c)
 
 
-def test_general_tuple_scan_wide_broadcast_is_named():
-    result = _compile_rankn_nested_negative_in_child(
-        "_unsupported_general_tuple_wide_bcast_kernel",
-        {"X": "*fp32", "Value": "*fp32", "Count": "*i32", "Out": "*fp32"},
-        {"WIDTH": 64}, num_warps=1)
-    output = result.stdout + result.stderr
-    assert result.returncode > 0, output
-    assert "requires single-value or canonical affine f32/i32 scans" in output, output
+@mps_only
+@pytest.mark.parametrize("rows", [False, True], ids=["columns", "rows"])
+@pytest.mark.parametrize("width,num_warps,reverse,masked,computed", [
+    (64, 1, False, False, False),
+    (128, 2, True, True, True),
+    (256, 4, False, False, True),
+    (256, 1, True, True, False),
+], ids=["forward", "reverse_masked_computed", "four_warps_computed", "reverse_masked"])
+def test_general_tuple_scan_wide_broadcast_matches_torch(
+        width, num_warps, reverse, masked, computed, rows):
+    programs = 3
+    index = torch.arange(programs * width).reshape(programs, width)
+    x = (index % 11 - 5).float()
+    valid = width - 7 if masked else width
+    device_x = x.clone()
+    device_x[:, valid:] = 3
+    x[:, valid:] = 0
+    if computed:
+        x = x * 2 + 1
+    source = x.flip(1) if reverse else x
+    expected_v = source.cumsum(1)
+    expected_c = torch.ones_like(x, dtype=torch.int32).cumsum(1, dtype=torch.int32)
+    if reverse:
+        expected_v = expected_v.flip(1)
+        expected_c = expected_c.flip(1)
+    other = torch.arange(4, dtype=torch.int32)
+    value = expected_v * 2 + 3
+    count = expected_c * 3 - 1
+    if rows:
+        expected_out_v = value[:, :, None] + other[None, None, :]
+        expected_out_c = count[:, :, None] + other[None, None, :]
+    else:
+        expected_out_v = value[:, None, :] + other[None, :, None]
+        expected_out_c = count[:, None, :] + other[None, :, None]
+    direct_v = torch.full((programs * width + 7,), -999999, dtype=torch.float32, device="mps")
+    direct_c = torch.full((programs * width + 7,), -999999, dtype=torch.int32, device="mps")
+    out_v = torch.full((programs * 4 * width + 7,), -999999, dtype=torch.float32, device="mps")
+    out_c = torch.full((programs * 4 * width + 7,), -999999, dtype=torch.int32, device="mps")
+    _general_tuple_wide_bcast_kernel[(programs,)](
+        device_x.to("mps"), direct_v, direct_c, out_v, out_c, valid, width, rows,
+        reverse, masked, computed, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected in ((direct_v, expected_v), (direct_c, expected_c),
+                             (out_v, expected_out_v), (out_c, expected_out_c)):
+        torch.testing.assert_close(actual.cpu()[:expected.numel()].reshape_as(expected),
+                                   expected, atol=0, rtol=0)
+        assert (actual.cpu()[expected.numel():] == -999999).all()
+
+
+@triton.jit
+def _general_tuple3_wide_bcast_kernel(X, Y, Z, A, B, C, OutA, OutB, OutC,
+                                      WIDTH: tl.constexpr, ROWS: tl.constexpr,
+                                      REVERSE: tl.constexpr):
+    program = tl.program_id(0)
+    index = tl.arange(0, WIDTH)
+    other = tl.arange(0, 4)
+    x = tl.load(X + program * WIDTH + index)
+    y = tl.load(Y + program * WIDTH + index)
+    z = tl.load(Z + program * WIDTH + index)
+    a, b, c = tl.associative_scan((x, y, z), 0, _rankn_tuple_three_same_combine,
+                                  reverse=REVERSE)
+    tl.store(A + program * WIDTH + index, a)
+    tl.store(B + program * WIDTH + index, b)
+    tl.store(C + program * WIDTH + index, c)
+    a = a * 2 + 3
+    b = b * 3 - 1
+    c = c * 5 + 2
+    if ROWS:
+        out_a = a[:, None] + other[None, :]
+        out_b = b[:, None] - other[None, :]
+        out_c = c[:, None] + other[None, :]
+        offset = index[:, None] * 4 + other[None, :]
+    else:
+        out_a = a[None, :] + other[:, None]
+        out_b = b[None, :] - other[:, None]
+        out_c = c[None, :] + other[:, None]
+        offset = other[:, None] * WIDTH + index[None, :]
+    tl.store(OutA + program * (4 * WIDTH) + offset, out_a)
+    tl.store(OutB + program * (4 * WIDTH) + offset, out_b)
+    tl.store(OutC + program * (4 * WIDTH) + offset, out_c)
+
+
+@mps_only
+@pytest.mark.parametrize("width,num_warps,reverse,rows", [
+    (128, 2, False, False),
+    (256, 4, True, True),
+], ids=["forward_columns", "reverse_rows"])
+def test_general_tuple3_scan_wide_broadcast_matches_torch(width, num_warps, reverse, rows):
+    programs = 2
+    index = torch.arange(programs * width).reshape(programs, width)
+    sources = [(index % 11 - 5).float(), (index % 7 - 3).float(),
+               (index % 5 - 2).float()]
+    expected = []
+    for source in sources:
+        value = (source.flip(1) if reverse else source).cumsum(1)
+        expected.append(value.flip(1) if reverse else value)
+    other = torch.arange(4).float()
+    transformed = [expected[0] * 2 + 3, expected[1] * 3 - 1, expected[2] * 5 + 2]
+    if rows:
+        expected_out = [transformed[0][:, :, None] + other[None, None, :],
+                        transformed[1][:, :, None] - other[None, None, :],
+                        transformed[2][:, :, None] + other[None, None, :]]
+    else:
+        expected_out = [transformed[0][:, None, :] + other[None, :, None],
+                        transformed[1][:, None, :] - other[None, :, None],
+                        transformed[2][:, None, :] + other[None, :, None]]
+    direct = [torch.full((programs * width + 7,), -999999, dtype=torch.float32,
+                         device="mps") for _ in range(3)]
+    outputs = [torch.full((programs * 4 * width + 7,), -999999, dtype=torch.float32,
+                          device="mps") for _ in range(3)]
+    _general_tuple3_wide_bcast_kernel[(programs,)](
+        *[source.to("mps") for source in sources], *direct, *outputs,
+        width, rows, reverse, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected_value in zip(direct + outputs, expected + expected_out):
+        torch.testing.assert_close(actual.cpu()[:expected_value.numel()].reshape_as(expected_value),
+                                   expected_value, atol=0, rtol=0)
+        assert (actual.cpu()[expected_value.numel():] == -999999).all()
 
 
 @mps_only
@@ -2575,7 +2704,7 @@ def test_scan_result_broadcast_with_independent_tile_matches_torch():
 
 
 @triton.jit
-def _unsupported_wide_scan_bcast_kernel(V, W, Y, TUPLE: tl.constexpr):
+def _wide_scan_bcast_cone_kernel(V, W, Y, TUPLE: tl.constexpr):
     index = tl.arange(0, 128)
     row = tl.arange(0, 4)
     value = tl.load(V + index)
@@ -2590,15 +2719,28 @@ def _unsupported_wide_scan_bcast_kernel(V, W, Y, TUPLE: tl.constexpr):
              scanned[None, :] + row[:, None])
 
 
-@pytest.mark.parametrize("tuple_scan", [False, True])
-def test_scan_result_broadcast_unsupported_cone_is_named(tuple_scan):
+def test_scan_result_broadcast_unsupported_cone_is_named():
     result = _compile_rankn_nested_negative_in_child(
-        "_unsupported_wide_scan_bcast_kernel",
+        "_wide_scan_bcast_cone_kernel",
         {"V": "*fp32", "W": "*fp32", "Y": "*fp32"},
-        {"TUPLE": tuple_scan}, num_warps=1)
+        {"TUPLE": False}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     assert "a rank-1 tl.scan result broadcast into a rank-2 tile" in output
+
+
+@mps_only
+def test_scan_result_broadcast_general_tuple_cone_matches_torch():
+    values = (torch.arange(128) % 13 - 6).float()
+    output = torch.full((4 * 128 + 7,), -999999, dtype=torch.float32, device="mps")
+    _wide_scan_bcast_cone_kernel[(1,)](
+        values.to("mps"), values.to("mps"), output, True, num_warps=1)
+    torch.mps.synchronize()
+    scanned = values.cumsum(0) + torch.arange(1, 129).float()
+    expected = scanned[None, :] + torch.arange(4).float()[:, None]
+    torch.testing.assert_close(output.cpu()[:4 * 128].reshape(4, 128), expected,
+                               atol=0, rtol=0)
+    assert (output.cpu()[4 * 128:] == -999999).all()
 
 
 @triton.jit

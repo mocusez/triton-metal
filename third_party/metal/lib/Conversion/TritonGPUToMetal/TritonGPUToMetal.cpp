@@ -5393,10 +5393,10 @@ static bool scanBroadcastNeedsBuffer(mlir::triton::ExpandDimsOp expand) {
 
 static bool isCanonicalAffineScan(mlir::triton::ScanOp op);
 static bool canonicalTupleScanSourcesReplayable(mlir::triton::ScanOp op);
+static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
+                                         llvm::StringRef *why);
 
-// Single-value and canonical affine scans register every result in scanBufs.
-// Other tuple scans keep per-thread placeholders that cannot be read at another
-// logical coordinate.
+// Single-value and supported tuple scans register every result in scanBufs.
 static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
   if (depth > 24)
     return false;
@@ -5407,9 +5407,11 @@ static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
     return false;
   if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
     auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
-    bool bufferedTuple = scan->getNumResults() == 2 &&
-                         isCanonicalAffineScan(scan) &&
-                         canonicalTupleScanSourcesReplayable(scan);
+    bool bufferedTuple =
+        scan->getNumResults() >= 2 &&
+        ((isCanonicalAffineScan(scan) &&
+          canonicalTupleScanSourcesReplayable(scan)) ||
+         rank1MultiValueScanSupported(scan, nullptr));
     return (scan->getNumResults() == 1 || bufferedTuple) &&
            type.getRank() == 1 &&
            (type.getElementType().isF32() || type.getElementType().isInteger(32));
@@ -5462,8 +5464,8 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
            !rank1ConeSupported(ed.getSrc(), 0, /*deferAggregateLeaves=*/true))) {
         ed.emitError(
             "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
-            "tile above one element per thread requires single-value or canonical "
-            "affine f32/i32 scans and a replayable elementwise cone");
+            "tile above one element per thread requires single-value or supported "
+            "tuple f32/i32 scans and a replayable elementwise cone");
         status = mlir::failure();
         return;
       }
@@ -14118,6 +14120,7 @@ static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
 static mlir::LogicalResult lowerRank1MultiValueScan(
     mlir::triton::ScanOp op,
     typename mlir::OpConversionPattern<mlir::triton::ScanOp>::OpAdaptor adaptor,
+    llvm::DenseMap<mlir::Value, mlir::Value> *scanBufs,
     mlir::ConversionPatternRewriter &rewriter) {
   llvm::StringRef why;
   if (!rank1MultiValueScanSupported(op, &why))
@@ -14470,6 +14473,7 @@ static mlir::LogicalResult lowerRank1MultiValueScan(
             "blocked result tile to read this iteration's position from");
   }
   for (size_t i = 0; i < n; ++i) {
+    (*scanBufs)[op->getResult(i)] = resBufs[i];
     auto get =
         GetElementOp::create(rewriter, loc, storeTys[i], resBufs[i], idxUI);
     get->setAttr("metal.materialize", rewriter.getUnitAttr());
@@ -14714,7 +14718,7 @@ struct ScanLowering : public mlir::OpConversionPattern<mlir::triton::ScanOp> {
     // same predicate.
     if (op.getSrcs().size() != 1 || op.getNumResults() != 1) {
       if (rank1MultiValueScanSupported(op))
-        return lowerRank1MultiValueScan(op, adaptor, rewriter);
+        return lowerRank1MultiValueScan(op, adaptor, scanBufs, rewriter);
       if (rankNMultiValueScanSupported(op))
         return lowerRankNMultiValueScan(op, adaptor, rewriter);
       return rewriter.notifyMatchFailure(op,

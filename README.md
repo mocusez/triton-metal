@@ -758,7 +758,7 @@ The current dependency-ordered priorities are:
    f32/i32 and threadgroup-memory limits. Single-value blocked and flattened
    linear-layout rank-1 reductions replay up to 256 elements per thread;
    larger bands remain rejected without changing tuple or scan envelopes.
-   Single-value f32/i32 and canonical two-component affine f32 rank-1 scan
+   Single-value and supported general/canonical tuple f32/i32 rank-1 scan
    results wider than the threadgroup can now broadcast along either axis of
    a rank-2 tile, including elementwise combinations of scans and subsequent
    reductions. Broadcasts use their own consumer tile coordinates and retain
@@ -843,7 +843,7 @@ The current dependency-ordered priorities are:
    remain rejected in this combination. Mixed device-load
    cones for
    wide rank-1 scan broadcasts,
-   wide general lockstep tuple scan broadcasts, and ambiguous
+   wide rank >= 2 tuple scan broadcasts, and ambiguous
    consumer layouts also remain rejected.
    Broader descriptor-reduce type/rank and
    `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
