@@ -5395,6 +5395,9 @@ static bool isCanonicalAffineScan(mlir::triton::ScanOp op);
 static bool canonicalTupleScanSourcesReplayable(mlir::triton::ScanOp op);
 static bool rank1MultiValueScanSupported(mlir::triton::ScanOp op,
                                          llvm::StringRef *why);
+static bool rank2Axis0ColumnBufferUsable(mlir::triton::ReduceOp op, int64_t tpb,
+                                         int64_t bn);
+static mlir::Operation *reduceCombineBinaryOp(mlir::triton::ReduceOp reduce);
 
 // Single-value and supported tuple scans register every result in scanBufs.
 static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
@@ -5405,6 +5408,25 @@ static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
   auto *def = value.getDefiningOp();
   if (!def)
     return false;
+  if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(def)) {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+        reduce.getSrcs().front().getType());
+    auto blocked = mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
+        type ? type.getEncoding() : mlir::Attribute{});
+    auto load = reduce.getSrcs().front().getDefiningOp<mlir::triton::LoadOp>();
+    if (!type || type.getRank() != 2 || !blocked ||
+        !type.getElementType().isF32() || reduce.getAxis() != 0 ||
+        !load || load.getMask() ||
+        !mlir::isa_and_nonnull<mlir::arith::AddFOp>(
+            reduceCombineBinaryOp(reduce)))
+      return false;
+    int64_t tpb = 1;
+    for (int64_t threads : blocked.getThreadsPerWarp())
+      tpb *= threads;
+    for (int64_t warps : blocked.getWarpsPerCTA())
+      tpb *= warps;
+    return rank2Axis0ColumnBufferUsable(reduce, tpb, type.getDimSize(1));
+  }
   if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
     auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
     bool bufferedTuple =
@@ -5469,6 +5491,28 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
             resTy.getEncoding());
     if (!resBlocked)
       return;
+    auto useWideBuffer = [&] {
+      auto consumer = valueConsumerTileOfRank(
+          ed.getResult(), 2, /*requireSameLayout=*/true);
+      auto type = consumer ? mlir::RankedTensorType::get(
+                                 consumer->shape, resTy.getElementType(),
+                                 resBlocked)
+                           : mlir::RankedTensorType{};
+      auto tile = type ? tileFromTensor(type) : std::nullopt;
+      if (!tile ||
+          consumer->shape[1 - ed.getAxis()] != srcTy.getNumElements() ||
+          tile->elemPerThread != consumer->elemPerThread ||
+          tile->contiguous != consumer->contiguous ||
+          tile->order != consumer->order) {
+        ed.emitError(
+            "Metal backend: a wide rank-1 tl.scan broadcast requires one "
+            "unambiguous rank-2 consumer tile with the same layout and "
+            "matching scan-axis extent");
+        status = mlir::failure();
+        return;
+      }
+      ed->setAttr("metal.scan_broadcast_tile", mlir::TypeAttr::get(type));
+    };
     bool sawTileLeaf = false;
     // A rank-1 scan result holds the same convention a column reduce does --
     // element `localTid` -- and `expand_dims` / `broadcast` forward it the
@@ -5482,11 +5526,15 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
       bool unsafeLoad =
           sawScanTileLeaf && (!scanBroadcastNeedsBuffer(ed) ||
                               !scanBroadcastLoadOrderSafe(ed.getSrc(), ed));
-      if (unsafeLoad || coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0)) {
+      bool unsupportedReduce =
+          coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0) &&
+          (!scanBroadcastNeedsBuffer(ed) ||
+           !scanBroadcastLeavesHaveBuffers(ed.getSrc()));
+      if (unsafeLoad || unsupportedReduce) {
         ed.emitError(
             "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
-            "tile requires no other reduction and no intervening writes after "
-            "device loads");
+            "tile requires supported reductions and no intervening writes "
+            "after device loads");
         status = mlir::failure();
         return;
       }
@@ -5500,33 +5548,33 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
         status = mlir::failure();
         return;
       }
-      if (scanBroadcastNeedsBuffer(ed)) {
-        auto consumer = valueConsumerTileOfRank(
-            ed.getResult(), 2, /*requireSameLayout=*/true);
-        auto type = consumer ? mlir::RankedTensorType::get(
-                                   consumer->shape, resTy.getElementType(),
-                                   resBlocked)
-                             : mlir::RankedTensorType{};
-        auto tile = type ? tileFromTensor(type) : std::nullopt;
-        if (!tile ||
-            consumer->shape[1 - ed.getAxis()] != srcTy.getNumElements() ||
-            tile->elemPerThread != consumer->elemPerThread ||
-            tile->contiguous != consumer->contiguous ||
-            tile->order != consumer->order) {
-          ed.emitError(
-              "Metal backend: a wide rank-1 tl.scan broadcast requires one "
-              "unambiguous rank-2 consumer tile with the same layout and "
-              "matching scan-axis extent");
-          status = mlir::failure();
-          return;
-        }
-        ed->setAttr("metal.scan_broadcast_tile", mlir::TypeAttr::get(type));
-      }
+      if (scanBroadcastNeedsBuffer(ed))
+        useWideBuffer();
       out.insert(ed.getOperation());
       return;
     }
     if (!coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0))
       return;
+    if (ed.getAxis() == 0 && scanBroadcastNeedsBuffer(ed)) {
+      auto func = ed->getParentOfType<mlir::triton::FuncOp>();
+      bool hasScan = false;
+      if (func)
+        func.walk([&](mlir::triton::ScanOp) { hasScan = true; });
+      if (hasScan) {
+        if (!scanBroadcastLeavesHaveBuffers(ed.getSrc()) ||
+            !rank1ConeSupported(ed.getSrc(), 0,
+                                /*deferAggregateLeaves=*/true)) {
+          ed.emitError(
+              "Metal backend: a wide scan/reduction broadcast requires a "
+              "direct f32 column sum and a replayable elementwise cone");
+          status = mlir::failure();
+          return;
+        }
+        useWideBuffer();
+        out.insert(ed.getOperation());
+        return;
+      }
+    }
     if (ed.getAxis() != 0) {
       // A column reduce yields a per-COLUMN vector; `[:, None]` would index it
       // by row, which is not a reading of the value that means anything.
@@ -12887,7 +12935,7 @@ static bool axis0ReexpansionConeEvaluable(mlir::triton::ReduceOp op) {
     if (!seen.insert(u).second)
       continue;
     if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(u)) {
-      ok = rank1ConeSupported(ed.getSrc(), 0);
+      ok = rank1ConeSupported(ed.getSrc(), 0, /*deferAggregateLeaves=*/true);
       continue;
     }
     for (auto res : u->getResults())
@@ -46266,7 +46314,10 @@ struct ConvertTritonGPUToMetalPass
       // preprocessStagedScanPhases also rejects unsupported direct broadcasts
       // with smaller tiles when another scan makes the function multi-band.
       moduleOp.walk([&](mlir::triton::ExpandDimsOp expand) {
-        if (expand->hasAttr(kScanColumnBroadcastAttr))
+        if (expand->hasAttr(kScanColumnBroadcastAttr) ||
+            expand->hasAttr("metal.scan_broadcast_tile") ||
+            (scanBroadcastNeedsBuffer(expand) &&
+             scanBroadcastLeavesHaveBuffers(expand.getSrc())))
           return;
         auto srcTy =
             mlir::dyn_cast<mlir::RankedTensorType>(expand.getSrc().getType());

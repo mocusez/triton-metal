@@ -2794,6 +2794,85 @@ def test_mixed_load_scan_result_broadcast_matches_torch(
     assert (output.cpu()[programs * 4 * width:] == -999999).all()
 
 
+@triton.jit
+def _mixed_axis0_sum_scan_bcast_kernel(V, X, Scanned, Reduced, Y, ReducedY,
+                                       WIDTH: tl.constexpr, R: tl.constexpr,
+                                       ROWS: tl.constexpr, REVERSE: tl.constexpr):
+    program = tl.program_id(0)
+    index = tl.arange(0, WIDTH)
+    row = tl.arange(0, R)
+    other = tl.arange(0, 4)
+    vector = tl.load(V + program * WIDTH + index)
+    tile = tl.load(X + program * R * WIDTH + row[:, None] * WIDTH + index[None, :])
+    scanned = tl.cumsum(vector, 0, reverse=REVERSE)
+    reduced = tl.sum(tile, 0)
+    if ROWS:
+        scan_out = (scanned * 2 + 3)[:, None] + other[None, :]
+        reduce_out = reduced[:, None] + other[None, :]
+        offset = index[:, None] * 4 + other[None, :]
+    else:
+        scan_out = (scanned * 2 + 3)[None, :] + other[:, None]
+        reduce_out = reduced[None, :] + other[:, None]
+        offset = other[:, None] * WIDTH + index[None, :]
+    tl.store(Y + program * (4 * WIDTH) + offset, scan_out)
+    tl.store(ReducedY + program * (4 * WIDTH) + offset, reduce_out)
+    tl.store(Scanned + program * WIDTH + index, scanned)
+    tl.store(Reduced + program * WIDTH + index, reduced)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [False], ids=["columns"])
+@pytest.mark.parametrize("width,r,num_warps,reverse", [
+    (64, 4, 1, False),
+    (128, 8, 2, True),
+    (256, 4, 4, False),
+    (256, 8, 1, True),
+], ids=["forward", "reverse_eight_rows", "four_warps", "reverse"])
+def test_mixed_axis0_sum_scan_result_broadcast_matches_torch(width, r, num_warps,
+                                                             reverse, rows):
+    programs = 2
+    vector = (torch.arange(programs * width).reshape(programs, width) % 11 - 5).float()
+    tile = (torch.arange(programs * r * width).reshape(programs, r, width) % 7 - 3).float()
+    expected_scan = (vector.flip(1) if reverse else vector).cumsum(1)
+    if reverse:
+        expected_scan = expected_scan.flip(1)
+    reduced = tile.sum(1)
+    other = torch.arange(4).float()
+    scan_values = expected_scan * 2 + 3
+    expected = (scan_values[:, :, None] + other[None, None, :]) if rows else \
+        (scan_values[:, None, :] + other[None, :, None])
+    expected_reduced = (reduced[:, :, None] + other[None, None, :]) if rows else \
+        (reduced[:, None, :] + other[None, :, None])
+    scanned = torch.full((programs * width + 7,), -999999, dtype=torch.float32, device="mps")
+    direct = torch.full_like(scanned, -999999)
+    output = torch.full((programs * 4 * width + 7,), -999999,
+                        dtype=torch.float32, device="mps")
+    reduced_output = torch.full_like(output, -999999)
+    _mixed_axis0_sum_scan_bcast_kernel[(programs,)](
+        vector.to("mps"), tile.to("mps"), scanned, direct, output, reduced_output,
+        width, r, rows, reverse, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected_value, size in ((scanned, expected_scan, programs * width),
+                                        (direct, reduced, programs * width),
+                                        (output, expected, programs * 4 * width),
+                                        (reduced_output, expected_reduced,
+                                         programs * 4 * width)):
+        torch.testing.assert_close(actual.cpu()[:size].reshape_as(expected_value),
+                                   expected_value, atol=0, rtol=0)
+        assert (actual.cpu()[size:] == -999999).all()
+
+
+def test_mixed_axis0_sum_scan_result_row_broadcast_is_named():
+    result = _compile_rankn_nested_negative_in_child(
+        "_mixed_axis0_sum_scan_bcast_kernel",
+        {"V": "*fp32", "X": "*fp32", "Scanned": "*fp32", "Reduced": "*fp32",
+         "Y": "*fp32", "ReducedY": "*fp32"},
+        {"WIDTH": 128, "R": 4, "ROWS": True, "REVERSE": False}, num_warps=1)
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "this slice-to-slice ttg.convert_layout changes how many elements a thread owns" in output, output
+
+
 def test_scan_result_broadcast_unsupported_cone_is_named():
     result = _compile_rankn_nested_negative_in_child(
         "_mixed_load_scan_bcast_kernel",

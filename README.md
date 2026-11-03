@@ -843,8 +843,9 @@ The current dependency-ordered priorities are:
    remain rejected in this combination. Mixed device-load
    cones for wide rank-1 scan broadcasts are accepted when every additional load
    is replayable and has no intervening write before the consumer expansion.
-   Other reductions, snapshot replay across writes, wide rank >= 2 tuple scan
-   broadcasts, and ambiguous consumer layouts remain rejected.
+   A direct unmasked rank-2 axis-0 f32 sum can also share that cone through its
+   complete per-column buffer. Other reductions, snapshot replay across writes,
+   wide rank >= 2 tuple scan broadcasts, and ambiguous consumer layouts remain rejected.
    Broader descriptor-reduce type/rank and
    `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
