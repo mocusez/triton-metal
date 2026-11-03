@@ -42904,12 +42904,10 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
   return {};
 }
 
-// The first local phase envelope keeps all tensor effects of the loop in a
-// single top-level runtime loop. Tensor work before it (loads and pure
-// compute) and after it (loads, compute, stores) runs in its own register-band
-// loop; tiles that cross from one segment or iteration to the next go through
-// slots (see `kCarryWrite`). Scalars outside it are uniform function inputs or
-// pure expressions.
+// A selected loop keeps its tensor effects in one flat body, which the local
+// phase scheduler cuts into register bands. It may be top-level, or nested in
+// uniform scalar-only for loops. The latter cannot use the top-level pre/post
+// tensor bands or carry slots; all their tensor work stays in the selected body.
 static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
   bool valid = true;
@@ -42922,9 +42920,16 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         mlir::isa<mlir::triton::FuncOp>(scan->getParentOp()))
       return;
     auto loop = mlir::dyn_cast<mlir::scf::ForOp>(scan->getParentOp());
-    if (!loop || !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp())) {
-      scan.emitOpError("Metal backend: nested scan requires one top-level for "
-                       "loop directly around it");
+    if (!loop) {
+      scan.emitOpError(
+          "Metal backend: nested scan requires a for loop directly around it");
+      valid = false;
+      return;
+    }
+    if (!mlir::isa<mlir::triton::FuncOp, mlir::scf::ForOp>(
+            loop->getParentOp())) {
+      scan.emitOpError("Metal backend: nested scan outer control flow must "
+                       "contain only uniform scalar for loops");
       valid = false;
       return;
     }
@@ -42938,26 +42943,64 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
     ++loopsPerFunction[loop->getParentOfType<mlir::triton::FuncOp>()];
   for (auto loop : loops) {
     auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+    auto isTensor = [](mlir::Type type) {
+      return mlir::isa<mlir::RankedTensorType>(type);
+    };
+    auto touchesTensor = [&](mlir::Operation &op) {
+      return llvm::any_of(op.getResultTypes(), isTensor) ||
+             llvm::any_of(op.getOperandTypes(), isTensor);
+    };
+    mlir::scf::ForOp topLoop = loop;
+    bool nested = false;
+    while (!mlir::isa<mlir::triton::FuncOp>(topLoop->getParentOp())) {
+      auto parent = mlir::dyn_cast<mlir::scf::ForOp>(topLoop->getParentOp());
+      if (!parent)
+        return topLoop.emitOpError(
+            "Metal backend: nested scan outer control flow must contain only "
+            "uniform scalar for loops");
+      topLoop = parent;
+      nested = true;
+    }
+    for (mlir::scf::ForOp current = loop; current != topLoop;) {
+      auto outer = mlir::cast<mlir::scf::ForOp>(current->getParentOp());
+      if (!outer.getInitArgs().empty() || outer.getNumResults() != 0)
+        return outer.emitOpError("Metal backend: nested scan outer loops "
+                                 "cannot carry values");
+      for (mlir::Operation &op : *outer.getBody()) {
+        if (&op == current.getOperation() ||
+            op.hasTrait<mlir::OpTrait::IsTerminator>())
+          continue;
+        if (op.getNumRegions() || !mlir::isMemoryEffectFree(&op) ||
+            touchesTensor(op))
+          return outer.emitOpError(
+              "Metal backend: nested scan outer loops require regionless, "
+              "memory-effect-free scalar bodies");
+      }
+      current = outer;
+    }
     bool outerTensorWork = false;
     for (mlir::Operation &op : func.getBody().front()) {
-      if (&op == loop || op.hasTrait<mlir::OpTrait::IsTerminator>())
+      if (&op == topLoop.getOperation() ||
+          op.hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
-      bool after = loop->isBeforeInBlock(&op);
+      bool after = topLoop->isBeforeInBlock(&op);
       if (op.getNumRegions() ||
           (!mlir::isMemoryEffectFree(&op) &&
            !mlir::isa<mlir::triton::GetProgramIdOp, mlir::triton::LoadOp>(
                &op) &&
            !(after && mlir::isa<mlir::triton::StoreOp>(&op))))
-        return loop.emitOpError("Metal backend: nested scan cannot replay an "
-                                "external tensor value or move outer effects");
-      auto isTensor = [](mlir::Type type) {
-        return mlir::isa<mlir::RankedTensorType>(type);
-      };
-      // Pure tensor work before the loop is either localized below or
+        return topLoop.emitOpError(
+            "Metal backend: nested scan cannot replay an external tensor "
+            "value or move outer effects");
+      if (nested && (after || !mlir::isMemoryEffectFree(&op)) &&
+          (touchesTensor(op) || !mlir::isMemoryEffectFree(&op)))
+        return topLoop.emitOpError(
+            "Metal backend: nested scan with outer control flow requires all "
+            "tensor work and memory effects inside the innermost loop");
+      // Pure tensor work before a top-level loop is either localized below or
       // feeds a carry; work after it, or any load, runs in a band loop.
-      if (after || !mlir::isMemoryEffectFree(&op))
-        outerTensorWork |= llvm::any_of(op.getResultTypes(), isTensor) ||
-                           llvm::any_of(op.getOperandTypes(), isTensor);
+      if (!nested && (after || !mlir::isMemoryEffectFree(&op)))
+        outerTensorWork |= touchesTensor(op);
     }
     for (mlir::Operation &op : *loop.getBody()) {
       if (mlir::isa<mlir::triton::ScanOp>(&op) ||
@@ -42971,6 +43014,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
                                 "load/compute/store loop body");
     }
     llvm::SmallVector<mlir::Type, 4> carried = nestedScanCarriedTypes(loop);
+    if (nested && !carried.empty())
+      return loop.emitOpError("Metal backend: nested scan beneath outer "
+                              "control flow supports only scalar carries");
     if (!carried.empty() || outerTensorWork) {
       auto tile = findTileInfo(func);
       if (!tile)
@@ -43032,7 +43078,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       for (auto it = func.getBody().front().rbegin();
            it != func.getBody().front().rend();) {
         mlir::Operation &op = *it++;
-        if (&op != loop && op.getNumResults() && mlir::isOpTriviallyDead(&op)) {
+        if (&op != topLoop.getOperation() && op.getNumResults() &&
+            mlir::isOpTriviallyDead(&op)) {
           op.erase();
           changed = true;
         }
@@ -43062,6 +43109,14 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
   llvm::SmallVector<mlir::Value, 4> spilled;
   llvm::SmallVector<mlir::Type, 4> carried =
       nestedScanCarriedTypes(loop, &spilled);
+  if (!mlir::isa<mlir::triton::FuncOp>(loop->getParentOp())) {
+    if (!carried.empty()) {
+      loop.emitOpError("Metal backend: nested scan beneath outer control flow "
+                       "supports only scalar carries");
+      return mlir::failure();
+    }
+    return loop;
+  }
   bool outerTensorWork = false;
   for (mlir::Operation &op : top)
     if (&op != loop && !op.hasTrait<mlir::OpTrait::IsTerminator>() &&

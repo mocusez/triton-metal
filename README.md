@@ -286,10 +286,11 @@ exact i32 XOR, forward or reverse, on blocked tiles with scan-axis extent 2–64
 Top-level scans can stage multiple elements per thread, with up to 8192 logical
 elements and total scratch within 32 KiB. Source ranges and prefix reads use
 the same layout mapping. Single-value and tuple scans also stage multiple
-elements per thread inside one top-level uniform runtime loop without loop-carried
-values, with tensor work confined to its flat body. Each iteration publishes
-complete tiles before prefix reads and synchronizes scratch reuse. Deeper control
-flow, external tensor snapshots, unsafe cross-phase replay, rank-1 XOR, wider
+elements per thread inside a uniform runtime loop, with tensor work confined to
+its flat body. That innermost scan loop may be nested in scalar-only outer
+`scf.for` loops without carries. Each iteration publishes complete tiles before
+prefix reads and synchronizes scratch reuse. Conditional outer control flow,
+outer tensor work or carries, unsafe cross-phase replay, rank-1 XOR, wider
 integers, and compound XOR combines retain named preflight rejection.
 
 Tensor-descriptor reducing stores use Triton's standard
@@ -750,10 +751,14 @@ The current dependency-ordered priorities are:
    are cloned at its boundary to preserve dominance. Carried tensors use
    threadgroup slots and must be integer or floating-point tiles of at least
    eight bits, have one owner per element, and use the function tile's register
-   count; their slots count against the 32 KiB threadgroup budget.
-   Replicated-owner or mismatched-register-count tiles, a tile-carrying loop
-   containing `tl.dot`, multiple tile-carrying scan loops in one function,
-   deeper control flow, and unsafe cross-phase replay remain rejected.
+   count; their slots count against the 32 KiB threadgroup budget. The innermost
+   multiband scan loop may also be nested in uniform scalar-only outer `scf.for`
+   loops without iter_args or results, provided all tensor work and memory
+   effects stay in that innermost flat body. Conditional outer control flow,
+   outer tensor work or carries, sibling scan loops beneath such control flow,
+   replicated-owner or mismatched-register-count tiles, a tile-carrying loop
+   containing `tl.dot`, multiple tile-carrying scan loops in one function, and
+   unsafe cross-phase replay remain rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing

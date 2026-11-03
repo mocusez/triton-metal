@@ -1248,7 +1248,21 @@ def _rankn_tuple_scan_carried_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
 def _rankn_tuple_scan_nested_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
     index = tl.reshape(tl.arange(0, 128), (8, 16))
     for row in range(rows):
-        for _ in range(rows):
+        for col in range(rows):
+            offset = (row * rows + col) * 128 + index
+            x = tl.load(x_ptr + offset)
+            count = tl.full((8, 16), 1, tl.int32)
+            value, count = tl.associative_scan((x, count), 1,
+                                               _tuple_sum_and_count_combine)
+            tl.store(value_ptr + offset, value)
+            tl.store(count_ptr + offset, count)
+
+
+@triton.jit
+def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 128), (8, 16))
+    if rows > 0:
+        for row in range(rows):
             x = tl.load(x_ptr + row * 128 + index)
             count = tl.full((8, 16), 1, tl.int32)
             value, count = tl.associative_scan((x, count), 1,
@@ -1608,9 +1622,29 @@ def test_tuple_scan_rankn_scalar_iter_arg_matches_torch(rows):
             atol=0, rtol=0)
 
 
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+def test_tuple_scan_rankn_nested_loop_matches_torch(rows):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * storage_rows * 128)
+         .reshape(storage_rows, storage_rows, 8, 16) % 7 - 3).float()
+    value = torch.full((rows, rows, 8, 16), -999999,
+                       dtype=torch.float32, device="mps")
+    count = torch.full((rows, rows, 8, 16), -999999,
+                       dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_nested_loop_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(value.cpu(), x[:rows, :rows].cumsum(3),
+                               atol=0, rtol=0)
+    expected_count = torch.ones((rows, rows, 8, 16), dtype=torch.int32)
+    torch.testing.assert_close(
+        count.cpu(), expected_count.cumsum(3, dtype=torch.int32), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("kernel,reason", [
-    ("_rankn_tuple_scan_nested_loop_kernel",
-     "nested scan requires one top-level for loop directly around it"),
+    ("_rankn_tuple_scan_conditional_loop_kernel",
+     "nested scan outer control flow must contain only uniform scalar for loops"),
     ("_rankn_tuple_scan_dot_carry_loop_kernel",
      "nested scan carrying a tile cannot share its loop with a tl.dot"),
     ("_rankn_tuple_scan_hoisted_snapshot_loop_kernel",
