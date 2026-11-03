@@ -17462,12 +17462,40 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       return;
     // The legacy row scanner needs a device-rooted source cone, which the
     // scan partition replaces with a scratch read. Use the exact-layout fold
-    // over a shared or jointly published input instead.
-    // Keep this path to one top-level scan, followed by the reduction;
-    // arbitrary scan/reduce phases need explicit shared-buffer lifetimes.
+    // over a shared or jointly published input instead. Besides one top-level
+    // scan, accept two independent exact-layout scans when the final scan
+    // shares an f32 sum's input; arbitrary scan/reduce phases still need
+    // explicit shared-buffer lifetimes.
     if (type.getRank() == 2) {
       llvm::SmallVector<mlir::triton::ScanOp, 2> functionScans;
       func.walk([&](mlir::triton::ScanOp scan) { functionScans.push_back(scan); });
+      bool finalSharedSourceOfTwoScans = false;
+      if (functionScans.size() == 2) {
+        auto first = functionScans.front();
+        auto last = functionScans.back();
+        auto firstPlan = planStagedScan(first);
+        auto lastPlan = planStagedScan(last);
+        auto *sourceDef = reduce.getSrcs().front().getDefiningOp();
+        finalSharedSourceOfTwoScans =
+            first.getSrcs().size() == 1 && last.getSrcs().size() == 1 &&
+            first.getNumResults() == 1 && last.getNumResults() == 1 &&
+            first.getSrcs().front().getType() == last.getSrcs().front().getType() &&
+            first.getSrcs().front() == reduce.getSrcs().front() &&
+            last.getSrcs().front() == reduce.getSrcs().front() &&
+            type.getElementType().isF32() &&
+            mlir::isa_and_nonnull<mlir::arith::AddFOp>(
+                reduceCombineBinaryOp(reduce)) &&
+            firstPlan && lastPlan && firstPlan->layout && lastPlan->layout &&
+            firstPlan->layout->elemPerThread > 1 &&
+            lastPlan->layout->elemPerThread > 1 && sourceDef &&
+            sourceDef->getBlock() == first->getBlock() &&
+            sourceDef->isBeforeInBlock(first) &&
+            first->getBlock() == last->getBlock() &&
+            last->getBlock() == reduce->getBlock() &&
+            mlir::isa<mlir::triton::FuncOp>(first->getParentOp()) &&
+            mlir::isa<mlir::triton::FuncOp>(last->getParentOp()) &&
+            first->isBeforeInBlock(last) && last->isBeforeInBlock(reduce);
+      }
       auto isDirectStore = isScanInputReduceStoreConsumer;
       // Column vector stores use the exact result layout. A narrow broadcast
       // below instead evaluates the fold at each consuming tile's column.
@@ -17475,10 +17503,11 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           reduce.getAxis() == 0 && !reduce->use_empty() &&
           llvm::all_of(reduce->getUsers(), isDirectStore);
       if ((reduce.getAxis() == 1 || reduce.getAxis() == 0) &&
-          functionScans.size() == 1 &&
+          (functionScans.size() == 1 || finalSharedSourceOfTwoScans) &&
           (type.getElementType().isF32() ||
            type.getElementType().isInteger(32))) {
-        auto scan = functionScans.front();
+        auto scan = finalSharedSourceOfTwoScans ? functionScans.back()
+                                                : functionScans.front();
         auto scanPlan = planStagedScan(scan);
         bool sameSource = scan.getSrcs().front() == reduce.getSrcs().front();
         bool scanResult = scan.getNumResults() == 1 &&
@@ -17649,8 +17678,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                                          /*requireSameLayout=*/true)
                                    : std::nullopt;
             bool customRowConsumer =
-                reduce.getAxis() == 1 && customRowCombine && expand && expandTy &&
-                consumer &&
+                !finalSharedSourceOfTwoScans && reduce.getAxis() == 1 &&
+                customRowCombine && expand && expandTy && consumer &&
                 (expand.getAxis() != reduce.getAxis() ||
                  consumer->shape != scanPlan->tile.shape);
             if (customRowConsumer) {
