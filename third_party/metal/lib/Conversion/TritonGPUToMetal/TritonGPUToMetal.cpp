@@ -5421,6 +5421,34 @@ static bool scanBroadcastLeavesHaveBuffers(mlir::Value value, int depth = 0) {
   });
 }
 
+static bool scanBroadcastLoadOrderSafe(mlir::Value value,
+                                       mlir::triton::ExpandDimsOp expand,
+                                       int depth = 0) {
+  if (depth > 24)
+    return false;
+  if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
+    return true;
+  mlir::Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::triton::ScanOp, mlir::triton::ReduceOp>(def))
+    return true;
+  if (def->getNumRegions() != 0)
+    return false;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    if (load->getBlock() != expand->getBlock())
+      return false;
+    for (auto it = std::next(load->getIterator()); &*it != expand; ++it)
+      if (!mlir::isMemoryEffectFree(&*it) &&
+          !mlir::isa<mlir::triton::LoadOp>(&*it))
+        return false;
+    return true;
+  }
+  return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
+    return scanBroadcastLoadOrderSafe(operand, expand, depth + 1);
+  });
+}
+
 // Pre-conversion pass: record every `tt.expand_dims` that lifts a column-reduce
 // result into a rank-2 tile. Fails the pass on a cone that mixes the two
 // element conventions — that shape has no correct single-scalar answer, and
@@ -5451,11 +5479,14 @@ preprocessAxis0Broadcasts(mlir::ModuleOp moduleOp,
     // scans instead read the complete prefix buffer through the cone evaluator.
     bool sawScanTileLeaf = false;
     if (auto scanTy = coneRank1ScanType(ed.getSrc(), sawScanTileLeaf, 0)) {
-      if (sawScanTileLeaf ||
-          coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0)) {
+      bool unsafeLoad =
+          sawScanTileLeaf && (!scanBroadcastNeedsBuffer(ed) ||
+                              !scanBroadcastLoadOrderSafe(ed.getSrc(), ed));
+      if (unsafeLoad || coneUsesAxis0Reduce(ed.getSrc(), sawTileLeaf, 0)) {
         ed.emitError(
             "Metal backend: a rank-1 tl.scan result broadcast into a rank-2 "
-            "tile requires a cone with no device load or other reduction");
+            "tile requires no other reduction and no intervening writes after "
+            "device loads");
         status = mlir::failure();
         return;
       }

@@ -2719,14 +2719,90 @@ def _wide_scan_bcast_cone_kernel(V, W, Y, TUPLE: tl.constexpr):
              scanned[None, :] + row[:, None])
 
 
+@triton.jit
+def _mixed_load_scan_bcast_kernel(V, W, Scanned, Y, N, WIDTH: tl.constexpr,
+                                  ROWS: tl.constexpr, REVERSE: tl.constexpr,
+                                  MASKED: tl.constexpr, COMPUTED: tl.constexpr,
+                                  MUTATE: tl.constexpr):
+    program = tl.program_id(0)
+    index = tl.arange(0, WIDTH)
+    other = tl.arange(0, 4)
+    if MASKED:
+        value = tl.load(V + program * WIDTH + index, index < N, other=0)
+        extra = tl.load(W + program * WIDTH + index, index < N, other=0)
+    else:
+        value = tl.load(V + program * WIDTH + index)
+        extra = tl.load(W + program * WIDTH + index)
+    if COMPUTED:
+        value = value * 2 + 1
+    prefix = tl.cumsum(value, 0, reverse=REVERSE)
+    scanned = prefix * 2 + 3 + extra
+    if MUTATE:
+        tl.store(W + program * WIDTH + index, extra + 100)
+    if ROWS:
+        out = scanned[:, None] + other[None, :]
+        offset = index[:, None] * 4 + other[None, :]
+    else:
+        out = scanned[None, :] + other[:, None]
+        offset = other[:, None] * WIDTH + index[None, :]
+    tl.store(Y + program * (4 * WIDTH) + offset, out)
+    tl.store(Scanned + program * WIDTH + index, prefix)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [False, True], ids=["columns", "rows"])
+@pytest.mark.parametrize("width,num_warps,reverse,masked,computed", [
+    (64, 1, False, False, False),
+    (128, 2, True, True, True),
+    (256, 4, False, False, True),
+    (256, 1, True, True, False),
+], ids=["forward", "reverse_masked_computed", "four_warps_computed", "reverse_masked"])
+def test_mixed_load_scan_result_broadcast_matches_torch(
+        width, num_warps, reverse, masked, computed, rows):
+    programs = 3
+    index = torch.arange(programs * width).reshape(programs, width)
+    value = (index % 11 - 5).float()
+    extra = (index % 7 - 3).float()
+    valid = width - 7 if masked else width
+    device_value = value.clone()
+    device_extra = extra.clone()
+    device_value[:, valid:] = 3
+    device_extra[:, valid:] = 4
+    value[:, valid:] = 0
+    extra[:, valid:] = 0
+    if computed:
+        value = value * 2 + 1
+    expected_scan = (value.flip(1) if reverse else value).cumsum(1)
+    if reverse:
+        expected_scan = expected_scan.flip(1)
+    combined = expected_scan * 2 + 3 + extra
+    other = torch.arange(4).float()
+    expected = (combined[:, :, None] + other[None, None, :]) if rows else \
+        (combined[:, None, :] + other[None, :, None])
+    direct = torch.full((programs * width + 7,), -999999, dtype=torch.float32, device="mps")
+    output = torch.full((programs * 4 * width + 7,), -999999,
+                        dtype=torch.float32, device="mps")
+    _mixed_load_scan_bcast_kernel[(programs,)](
+        device_value.to("mps"), device_extra.to("mps"), direct, output, valid,
+        width, rows, reverse, masked, computed, False, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(direct.cpu()[:programs * width].reshape(programs, width),
+                               expected_scan, atol=0, rtol=0)
+    assert (direct.cpu()[programs * width:] == -999999).all()
+    torch.testing.assert_close(output.cpu()[:programs * 4 * width].reshape_as(expected),
+                               expected, atol=0, rtol=0)
+    assert (output.cpu()[programs * 4 * width:] == -999999).all()
+
+
 def test_scan_result_broadcast_unsupported_cone_is_named():
     result = _compile_rankn_nested_negative_in_child(
-        "_wide_scan_bcast_cone_kernel",
-        {"V": "*fp32", "W": "*fp32", "Y": "*fp32"},
-        {"TUPLE": False}, num_warps=1)
+        "_mixed_load_scan_bcast_kernel",
+        {"V": "*fp32", "W": "*fp32", "Scanned": "*fp32", "Y": "*fp32", "N": "i32"},
+        {"WIDTH": 128, "ROWS": False, "REVERSE": False, "MASKED": False,
+         "COMPUTED": False, "MUTATE": True}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    assert "a rank-1 tl.scan result broadcast into a rank-2 tile" in output
+    assert "no intervening writes after device loads" in output, output
 
 
 @mps_only

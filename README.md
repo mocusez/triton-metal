@@ -841,10 +841,10 @@ The current dependency-ordered priorities are:
    publication. Other independent column broadcasts, other reductions of the
    scan result, and other mixed row-store/broadcast or consumer projections
    remain rejected in this combination. Mixed device-load
-   cones for
-   wide rank-1 scan broadcasts,
-   wide rank >= 2 tuple scan broadcasts, and ambiguous
-   consumer layouts also remain rejected.
+   cones for wide rank-1 scan broadcasts are accepted when every additional load
+   is replayable and has no intervening write before the consumer expansion.
+   Other reductions, snapshot replay across writes, wide rank >= 2 tuple scan
+   broadcasts, and ambiguous consumer layouts remain rejected.
    Broader descriptor-reduce type/rank and
    `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
