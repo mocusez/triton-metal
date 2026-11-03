@@ -17609,7 +17609,12 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                      mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp,
                      mlir::arith::MinNumFOp>(combine)))) ||
               (sameSource && type.getElementType().isInteger(32) &&
-               mlir::isa_and_nonnull<mlir::arith::AddIOp>(combine));
+               mlir::isa_and_nonnull<
+                   mlir::arith::AddIOp, mlir::arith::MulIOp,
+                   mlir::arith::AndIOp, mlir::arith::OrIOp,
+                   mlir::arith::XOrIOp, mlir::arith::MaxSIOp,
+                   mlir::arith::MinSIOp, mlir::arith::MaxUIOp,
+                   mlir::arith::MinUIOp>(combine));
           bool crossAxisRowCombine =
               sameSource &&
               ((type.getElementType().isF32() &&
@@ -17618,7 +17623,12 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
                     mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
                     mlir::arith::MaxNumFOp, mlir::arith::MinNumFOp>(combine)) ||
                (type.getElementType().isInteger(32) &&
-                mlir::isa_and_nonnull<mlir::arith::AddIOp>(combine)));
+                mlir::isa_and_nonnull<
+                    mlir::arith::AddIOp, mlir::arith::MulIOp,
+                    mlir::arith::AndIOp, mlir::arith::OrIOp,
+                    mlir::arith::XOrIOp, mlir::arith::MaxSIOp,
+                    mlir::arith::MinSIOp, mlir::arith::MaxUIOp,
+                    mlir::arith::MinUIOp>(combine)));
           bool sawStore = false, sawExpand = false, consumersValid = true;
           for (mlir::Operation *user : reduce->getUsers()) {
             if (isDirectStore(user)) {
