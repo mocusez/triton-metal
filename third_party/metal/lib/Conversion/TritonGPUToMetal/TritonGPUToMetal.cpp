@@ -17337,6 +17337,41 @@ static bool hasMatchingScanInputPublication(mlir::triton::ReduceOp reduce) {
   return plan && plan->layout && plan->layout->elemPerThread > 1;
 }
 
+static bool isChainedScanResultRowReduce(mlir::triton::ReduceOp reduce) {
+  auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+      reduce.getSrcs().front().getType());
+  auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
+  if (!type || type.getRank() != 2 || !type.getElementType().isF32() ||
+      reduce.getAxis() != 1 || !func ||
+      !mlir::isa_and_nonnull<mlir::arith::AddFOp>(
+          reduceCombineBinaryOp(reduce)))
+    return false;
+  llvm::SmallVector<mlir::triton::ScanOp, 2> scans;
+  func.walk([&](mlir::triton::ScanOp scan) { scans.push_back(scan); });
+  if (scans.size() != 2)
+    return false;
+  auto first = scans.front();
+  auto last = scans.back();
+  auto firstPlan = planStagedScan(first);
+  auto lastPlan = planStagedScan(last);
+  auto *sourceDef = first.getSrcs().front().getDefiningOp();
+  return first.getSrcs().size() == 1 && last.getSrcs().size() == 1 &&
+         first.getNumResults() == 1 && last.getNumResults() == 1 &&
+         first.getSrcs().front().getType() == last.getSrcs().front().getType() &&
+         last.getSrcs().front() == first->getResult(0) &&
+         reduce.getSrcs().front() == last->getResult(0) && firstPlan && lastPlan &&
+         firstPlan->layout && lastPlan->layout &&
+         firstPlan->layout->elemPerThread > 1 &&
+         lastPlan->layout->elemPerThread > 1 && sourceDef &&
+         sourceDef->getBlock() == first->getBlock() &&
+         sourceDef->isBeforeInBlock(first) &&
+         first->getBlock() == last->getBlock() &&
+         last->getBlock() == reduce->getBlock() &&
+         mlir::isa<mlir::triton::FuncOp>(first->getParentOp()) &&
+         mlir::isa<mlir::triton::FuncOp>(last->getParentOp()) &&
+         first->isBeforeInBlock(last) && last->isBeforeInBlock(reduce);
+}
+
 // A jointly published input or a replayed row fold needs an unchanged
 // device source cone. Check all loads, including masked/computed inputs.
 static bool canGroupScanReduceInputs(mlir::triton::ScanOp scan,
@@ -17464,8 +17499,9 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
     // scan partition replaces with a scratch read. Use the exact-layout fold
     // over a shared or jointly published input instead. Besides one top-level
     // scan, accept two independent exact-layout scans of one SSA input when an
-    // f32 sum belongs to either phase; arbitrary scan/reduce phases still need
-    // explicit shared-buffer lifetimes.
+    // f32 sum belongs to either phase, or two chained scans whose second result
+    // feeds an f32 sum; arbitrary scan/reduce phases still need explicit
+    // shared-buffer lifetimes.
     if (type.getRank() == 2) {
       llvm::SmallVector<mlir::triton::ScanOp, 2> functionScans;
       func.walk([&](mlir::triton::ScanOp scan) { functionScans.push_back(scan); });
@@ -17497,6 +17533,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
             first->isBeforeInBlock(last) && first->isBeforeInBlock(reduce) &&
             (last->isBeforeInBlock(reduce) || reduce->isBeforeInBlock(last));
       }
+      bool chainedScanResultOfTwoScans = isChainedScanResultRowReduce(reduce);
       auto isDirectStore = isScanInputReduceStoreConsumer;
       // Column vector stores use the exact result layout. A narrow broadcast
       // below instead evaluates the fold at each consuming tile's column.
@@ -17504,11 +17541,13 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
           reduce.getAxis() == 0 && !reduce->use_empty() &&
           llvm::all_of(reduce->getUsers(), isDirectStore);
       if ((reduce.getAxis() == 1 || reduce.getAxis() == 0) &&
-          (functionScans.size() == 1 || sharedSourceOfTwoScans) &&
+          (functionScans.size() == 1 || sharedSourceOfTwoScans ||
+           chainedScanResultOfTwoScans) &&
           (type.getElementType().isF32() ||
            type.getElementType().isInteger(32))) {
-        auto scan = sharedSourceOfTwoScans &&
-                            functionScans.back()->isBeforeInBlock(reduce)
+        auto scan = chainedScanResultOfTwoScans ||
+                            (sharedSourceOfTwoScans &&
+                             functionScans.back()->isBeforeInBlock(reduce))
                         ? functionScans.back()
                         : functionScans.front();
         auto scanPlan = planStagedScan(scan);
@@ -18215,7 +18254,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         scan->getResult(0).replaceUsesWithIf(
             read.getResult(), [&](mlir::OpOperand &use) {
               return use.getOwner() != publish.getOperation() &&
-                     use.getOwner() != reduce.getOperation();
+                     use.getOwner() != reduce.getOperation() &&
+                     !mlir::isa<mlir::triton::StoreOp>(use.getOwner());
             });
       }
     }
@@ -44739,8 +44779,9 @@ struct ConvertTritonGPUToMetalPass
           scan->getParentOfType<mlir::triton::FuncOp>().walk(
               [&](mlir::triton::ScanOp) { ++scanCount; });
           auto scanPlan = planStagedScan(scan);
-          if (scanCount == 1 && scanPlan && scanPlan->layout &&
-              scanPlan->layout->elemPerThread > 1)
+          if ((scanCount == 1 && scanPlan && scanPlan->layout &&
+               scanPlan->layout->elemPerThread > 1) ||
+              isChainedScanResultRowReduce(red))
             red->setAttr(kScanInputReduceAttr,
                          mlir::UnitAttr::get(&getContext()));
         }

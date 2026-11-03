@@ -2917,6 +2917,92 @@ def test_multiband_consecutive_scans_two_phase_row_sum_matches_torch(
 
 
 @triton.jit
+def _chained_scans_result_row_sum_kernel(
+        X, First, Scanned, Y, Row, N, R: tl.constexpr, C: tl.constexpr,
+        FIRST_AXIS: tl.constexpr, SCAN_AXIS: tl.constexpr, REVERSE: tl.constexpr,
+        MASKED: tl.constexpr, COMPUTED: tl.constexpr, BROADCAST: tl.constexpr):
+    program = tl.program_id(0)
+    row = tl.arange(0, R)
+    column = tl.arange(0, C)
+    offset = program * R * C + row[:, None] * C + column[None, :]
+    if MASKED:
+        x = tl.load(X + offset, offset < N, other=0)
+    else:
+        x = tl.load(X + offset)
+    if COMPUTED:
+        x = x * 2 + 3
+    first = tl.cumsum(x, FIRST_AXIS, reverse=REVERSE)
+    scanned = tl.cumsum(first, SCAN_AXIS, reverse=REVERSE)
+    tl.store(First + offset, first)
+    tl.store(Scanned + offset, scanned)
+    if BROADCAST:
+        reduced = tl.sum(scanned, 1)
+        tl.store(Y + offset, scanned + reduced[:, None])
+    else:
+        tl.store(Y + offset, scanned)
+        reduced = tl.sum(scanned, 1)
+        tl.store(Row + program * R + row, reduced)
+
+
+@mps_only
+@pytest.mark.parametrize(
+    "rows,columns,first_axis,scan_axis,reverse,num_warps,masked,computed,broadcast", [
+        (16, 16, 0, 0, False, 1, False, False, False),
+        (16, 16, 1, 1, True, 4, True, True, False),
+        (32, 8, 0, 1, False, 4, True, False, True),
+        (8, 32, 1, 0, True, 1, False, True, True),
+        (16, 16, 0, 1, True, 4, False, False, False),
+        (16, 16, 1, 0, False, 1, True, True, True),
+        (64, 8, 0, 0, False, 1, True, False, True),
+        (8, 64, 1, 1, True, 4, False, True, False),
+    ], ids=["same_axis_direct", "same_axis_reverse_direct", "cross_axis_masked",
+            "cross_axis_computed", "cross_axis_reverse_direct", "cross_axis_masked_broadcast",
+            "long_rows_broadcast", "long_columns_direct"])
+def test_multiband_chained_scans_result_row_sum_matches_torch(
+        rows, columns, first_axis, scan_axis, reverse, num_warps, masked, computed,
+        broadcast):
+    programs = 2
+    size = programs * rows * columns
+    valid = size - columns - 3 if masked else size
+    index = torch.arange(size).reshape(programs, rows, columns)
+    x = (index % 13 - 6).float()
+    device_x = x.clone()
+    device_x.view(-1)[valid:] = -5
+    x.view(-1)[valid:] = 0
+    if computed:
+        x = x * 2 + 3
+    first_dim = first_axis + 1
+    scan_dim = scan_axis + 1
+    expected_first = (x.flip(first_dim) if reverse else x).cumsum(first_dim)
+    if reverse:
+        expected_first = expected_first.flip(first_dim)
+    expected_scan = (expected_first.flip(scan_dim) if reverse else expected_first).cumsum(scan_dim)
+    if reverse:
+        expected_scan = expected_scan.flip(scan_dim)
+    reduced = expected_scan.sum(2)
+    expected_y = expected_scan + reduced[:, :, None] if broadcast else expected_scan
+    sentinel = -999999
+    first, scanned, y = [
+        torch.full((size + 7,), sentinel, dtype=torch.float32, device="mps")
+        for _ in range(3)
+    ]
+    row = torch.full((programs * rows + 7,), sentinel, dtype=torch.float32, device="mps")
+    _chained_scans_result_row_sum_kernel[(programs,)](
+        device_x.to("mps"), first, scanned, y, row, valid, rows, columns, first_axis,
+        scan_axis, reverse, masked, computed, broadcast, num_warps=num_warps)
+    torch.mps.synchronize()
+    for actual, expected in ((first, expected_first), (scanned, expected_scan), (y, expected_y)):
+        torch.testing.assert_close(actual.cpu()[:size].reshape_as(x), expected, atol=0, rtol=0)
+        assert (actual.cpu()[size:] == sentinel).all()
+    if broadcast:
+        assert (row.cpu() == sentinel).all()
+    else:
+        torch.testing.assert_close(row.cpu()[:programs * rows].reshape(programs, rows),
+                                   reduced, atol=0, rtol=0)
+        assert (row.cpu()[programs * rows:] == sentinel).all()
+
+
+@triton.jit
 def _unsupported_shared_input_row_reduce_kernel(X, Y, Z, Row, TWO_SCANS: tl.constexpr):
     row = tl.arange(0, 8)
     column = tl.arange(0, 64)

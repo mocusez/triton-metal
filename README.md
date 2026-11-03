@@ -791,8 +791,10 @@ The current dependency-ordered priorities are:
    the cross-axis and wider same-axis mixed forms. Two independent top-level
    multiband scans of the exact same input also accept an f32 row sum after either
    scan, including one sum after each scan, with direct row stores or original-tile
-   same-axis broadcasts. Other combines, reduction placements, cross-axis or wider
-   consumers and nested dependencies remain rejected. Axis-0 reductions support
+   same-axis broadcasts. A chain of two multiband scans whose second input is the
+   first result also accepts an f32 row sum of the second result with the same
+   consumers. Other combines, reduction placements, cross-axis or wider consumers
+   and other nested dependencies remain rejected. Axis-0 reductions support
    direct column-vector stores, including outputs wider than the threadgroup. The
    shared path preserves input snapshots across later device stores and
    supports multiple reductions. f32 row and column-vector sum/product/min/max
