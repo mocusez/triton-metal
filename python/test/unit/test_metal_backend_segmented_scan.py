@@ -1259,6 +1259,18 @@ def _rankn_tuple_scan_nested_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
 
 
 @triton.jit
+def _scan_nested_loop_tensor_carry_kernel(x_ptr, out_ptr, outer, trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    for outer_index in range(outer):
+        acc = tl.zeros((8, 64), tl.float32)
+        for t in range(trips):
+            offset = (outer_index * trips + t) * 512 + off
+            x = tl.load(x_ptr + offset)
+            acc += tl.cumsum(x, 1)
+            tl.store(out_ptr + offset, acc)
+
+
+@triton.jit
 def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
     index = tl.reshape(tl.arange(0, 128), (8, 16))
     if rows > 0:
@@ -1311,12 +1323,27 @@ def _rankn_tuple_scan_scalar_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows
 
 @triton.jit
 def _rankn_tuple_scan_dot_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
-    index = tl.reshape(tl.arange(0, 256), (16, 16))
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    index = row[:, None] * 16 + column[None, :]
     acc = tl.zeros((16, 16), tl.float32)
     for row in range(rows):
         x = tl.load(x_ptr + row * 256 + index)
         acc = tl.dot(x, x, acc)
         tl.store(value_ptr + row * 256 + index, tl.cumsum(acc, 1))
+
+
+@triton.jit
+def _scan_loop_dot_carry_kernel(x_ptr, scan_ptr, acc_ptr, trips):
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    index = row[:, None] * 16 + column[None, :]
+    acc = tl.zeros((16, 16), tl.float32)
+    for t in range(trips):
+        x = tl.load(x_ptr + t * 256 + index)
+        acc = tl.dot(x, x, acc)
+        tl.store(scan_ptr + t * 256 + index, tl.cumsum(x, 1))
+    tl.store(acc_ptr + index, acc)
 
 
 # A multi-band scan inside a runtime loop runs the body as register-band
@@ -1334,6 +1361,21 @@ def _scan_loop_accumulate_kernel(x_ptr, out_ptr, trips, R: tl.constexpr,
     tl.store(out_ptr + off, acc + base)
 
 
+@triton.jit
+def _scan_two_carried_loops_kernel(x_ptr, mid_ptr, out_ptr, trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    acc = tl.zeros((8, 64), tl.float32)
+    for t in range(trips):
+        x = tl.load(x_ptr + t * 512 + off)
+        acc += tl.cumsum(x, 1)
+    tl.store(mid_ptr + off, acc)
+    other = tl.zeros((8, 64), tl.float32)
+    for t in range(trips):
+        x = tl.load(x_ptr + (trips + t) * 512 + off)
+        other += tl.cumsum(x, 1)
+    tl.store(out_ptr + off, other)
+
+
 @mps_only
 @pytest.mark.parametrize("trips", [0, 3])
 @pytest.mark.parametrize("shape,axis,num_warps", [
@@ -1348,6 +1390,20 @@ def test_scan_in_loop_carries_accumulator(trips, shape, axis, num_warps):
     torch.mps.synchronize()
     expected = x[:trips].cumsum(axis + 1).sum(0) + x[0]
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("trips", [0, 3])
+def test_multiband_scan_two_carried_loops_match_torch(trips, num_warps):
+    x = (torch.arange(max(2 * trips, 1) * 512) % 7 - 3).float().reshape(-1, 8, 64)
+    mid = torch.zeros((8, 64), device="mps")
+    out = torch.zeros((8, 64), device="mps")
+    _scan_two_carried_loops_kernel[(1,)](
+        x.to("mps"), mid, out, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(mid.cpu(), x[:trips].cumsum(2).sum(0), atol=0, rtol=0)
+    torch.testing.assert_close(out.cpu(), x[trips:2 * trips].cumsum(2).sum(0), atol=0, rtol=0)
 
 
 @triton.jit
@@ -1374,6 +1430,117 @@ def test_scan_in_loop_reads_its_carried_result(axis, num_warps):
     for t in range(trips):
         s = (s + x[t]).cumsum(axis, dtype=torch.int32)
         assert torch.equal(out[t].cpu(), s), t
+
+
+@mps_only
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("trips", [0, 3, 33])
+def test_multiband_scan_replicated_owner_carry_matches_torch(trips, masked, tmp_path):
+    import types
+    from triton.backends.compiler import GPUTarget
+
+    path = tmp_path / "replicated_carry.ttgir"
+    ir = textwrap.dedent("""\
+        #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+        module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+          tt.func public @replicated_carry(%X: !tt.ptr<f32>, %D: !tt.ptr<f32>, %Y: !tt.ptr<f32>, %Z: !tt.ptr<f32>, %trips: i32) {
+            %c64 = arith.constant dense<64> : tensor<8x1xi32, #blocked>
+            %c32 = arith.constant dense<32> : tensor<8x1xi32, #blocked>
+            %c512 = arith.constant 512 : i32
+            %c256 = arith.constant 256 : i32
+            %c0 = arith.constant 0 : i32
+            %c1 = arith.constant 1 : i32
+            %zero = arith.constant dense<0.0> : tensor<8x32xf32, #blocked>
+            %row = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+            %row2 = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+            %xrow = arith.muli %row2, %c64 : tensor<8x1xi32, #blocked>
+            %arow = arith.muli %row2, %c32 : tensor<8x1xi32, #blocked>
+            %xcol = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+            %xcol2 = tt.expand_dims %xcol {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+            %acol = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+            %acol2 = tt.expand_dims %acol {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+            %xrows = tt.broadcast %xrow : tensor<8x1xi32, #blocked> -> tensor<8x64xi32, #blocked>
+            %xcols = tt.broadcast %xcol2 : tensor<1x64xi32, #blocked> -> tensor<8x64xi32, #blocked>
+            %xoff = arith.addi %xrows, %xcols : tensor<8x64xi32, #blocked>
+            %arows = tt.broadcast %arow : tensor<8x1xi32, #blocked> -> tensor<8x32xi32, #blocked>
+            %acols = tt.broadcast %acol2 : tensor<1x32xi32, #blocked> -> tensor<8x32xi32, #blocked>
+            %aoff = arith.addi %arows, %acols : tensor<8x32xi32, #blocked>
+            %acc = scf.for %t = %c0 to %trips step %c1 iter_args(%state = %zero) -> (tensor<8x32xf32, #blocked>) : i32 {
+              %xbase = arith.muli %t, %c512 : i32
+              %xptr = tt.addptr %X, %xbase : !tt.ptr<f32>, i32
+              %xptrs = tt.splat %xptr : !tt.ptr<f32> -> tensor<8x64x!tt.ptr<f32>, #blocked>
+              %xaddr = tt.addptr %xptrs, %xoff : tensor<8x64x!tt.ptr<f32>, #blocked>, tensor<8x64xi32, #blocked>
+              %x = tt.load %xaddr : tensor<8x64x!tt.ptr<f32>, #blocked>
+              %scanned = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
+              ^bb0(%lhs: f32, %rhs: f32):
+                %sum = arith.addf %lhs, %rhs : f32
+                tt.scan.return %sum : f32
+              }) : (tensor<8x64xf32, #blocked>) -> tensor<8x64xf32, #blocked>
+              %ybase = tt.addptr %Y, %xbase : !tt.ptr<f32>, i32
+              %yptrs = tt.splat %ybase : !tt.ptr<f32> -> tensor<8x64x!tt.ptr<f32>, #blocked>
+              %yaddr = tt.addptr %yptrs, %xoff : tensor<8x64x!tt.ptr<f32>, #blocked>, tensor<8x64xi32, #blocked>
+              tt.store %yaddr, %scanned : tensor<8x64x!tt.ptr<f32>, #blocked>
+              %abase = arith.muli %t, %c256 : i32
+              %dptr = tt.addptr %D, %abase : !tt.ptr<f32>, i32
+              %dptrs = tt.splat %dptr : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+              %daddr = tt.addptr %dptrs, %aoff : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+              %delta = tt.load %daddr : tensor<8x32x!tt.ptr<f32>, #blocked>
+              %next = arith.addf %state, %delta : tensor<8x32xf32, #blocked>
+              scf.yield %next : tensor<8x32xf32, #blocked>
+            }
+            %zptrs = tt.splat %Z : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #blocked>
+            %zaddr = tt.addptr %zptrs, %aoff : tensor<8x32x!tt.ptr<f32>, #blocked>, tensor<8x32xi32, #blocked>
+            %mask_bound = arith.constant dense<16> : tensor<8x32xi32, #blocked>
+            %zmask = arith.cmpi slt, %acols, %mask_bound : tensor<8x32xi32, #blocked>
+            tt.store %zaddr, %acc : tensor<8x32x!tt.ptr<f32>, #blocked>
+            tt.return
+          }
+        }
+        """)
+    if masked:
+        ir = ir.replace(
+            "tt.store %zaddr, %acc : tensor<8x32x!tt.ptr<f32>, #blocked>",
+            "tt.store %zaddr, %acc, %zmask : tensor<8x32x!tt.ptr<f32>, #blocked>")
+    path.write_text(ir)
+    compiled = triton.compile(str(path), target=GPUTarget("metal", 80, 32))
+    names = ["X", "D", "Y", "Z", "trips"]
+    compiled.src.fn = types.SimpleNamespace(arg_names=names, launch_metadata=None)
+    compiled.src.signature = dict(zip(names, compiled.src.signature.values()))
+    msl = compiled.asm["metal"]
+    msl = msl.decode() if isinstance(msl, bytes) else msl
+    synchronized_writes = re.findall(
+        r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\s*if \(.*?\) \{\s*\w+\[",
+        msl)
+    assert len(synchronized_writes) == 2, msl
+
+    x = (torch.arange(max(trips, 1) * 512) % 17 - 8).float().reshape(-1, 8, 64)
+    delta = (torch.arange(max(trips, 1) * 256) % 13 - 6).float().reshape(-1, 8, 32)
+    scanned = torch.empty_like(x, device="mps")
+    acc = torch.zeros((8, 32), device="mps")
+    compiled[(1, 1, 1)](x.to("mps"), delta.to("mps"), scanned, acc, trips)
+    torch.mps.synchronize()
+    torch.testing.assert_close(scanned.cpu()[:trips], x[:trips].cumsum(2), atol=0, rtol=0)
+    expected = delta[:trips].sum(0)
+    if masked:
+        expected[:, 16:] = 0
+    torch.testing.assert_close(acc.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("trips", [0, 3])
+def test_multiband_scan_loop_with_dot_carry_matches_torch(trips, num_warps):
+    x = (torch.arange(max(trips, 1) * 256) % 7 - 3).float().reshape(-1, 16, 16) / 8
+    scanned = torch.empty_like(x, device="mps")
+    acc = torch.zeros((16, 16), device="mps")
+    _scan_loop_dot_carry_kernel[(1,)](
+        x.to("mps"), scanned, acc, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.zeros(16, 16)
+    for t in range(trips):
+        expected += x[t] @ x[t]
+    torch.testing.assert_close(acc.cpu(), expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(scanned.cpu()[:trips], x[:trips].cumsum(2), atol=0, rtol=0)
 
 
 @mps_only
@@ -1642,11 +1809,30 @@ def test_tuple_scan_rankn_nested_loop_matches_torch(rows):
         count.cpu(), expected_count.cumsum(3, dtype=torch.int32), atol=0, rtol=0)
 
 
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("trips", [0, 3])
+def test_nested_scan_loop_tensor_carry_matches_torch(trips, num_warps):
+    outer = 2
+    x = (torch.arange(max(outer * trips, 1) * 512) % 7 - 3).float().reshape(-1, 8, 64)
+    out = torch.zeros((outer, trips, 8, 64), device="mps")
+    _scan_nested_loop_tensor_carry_kernel[(1,)](
+        x.to("mps"), out, outer, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.zeros_like(out, device="cpu")
+    for outer_index in range(outer):
+        acc = torch.zeros(8, 64)
+        for t in range(trips):
+            acc += x[outer_index * trips + t].cumsum(1)
+            expected[outer_index, t] = acc
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("kernel,reason", [
     ("_rankn_tuple_scan_conditional_loop_kernel",
      "nested scan outer control flow must contain only uniform scalar for loops"),
     ("_rankn_tuple_scan_dot_carry_loop_kernel",
-     "nested scan carrying a tile cannot share its loop with a tl.dot"),
+     "a tile-carrying tl.dot result cannot feed the same loop's scan"),
     ("_rankn_tuple_scan_hoisted_snapshot_loop_kernel",
      "staged scan cannot partition surrounding loops"),
 ])

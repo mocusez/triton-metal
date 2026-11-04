@@ -667,8 +667,8 @@ static constexpr llvm::StringLiteral kScanBandLoopAttr = "metal.scan_band_loop";
 // before it that it or the code after it reads, has no register to live in
 // between the phases. Each such tile gets a threadgroup slot: a write and
 // reads marked `kExchangeAttr` = "carry_write" / "carry_read", both indexed by
-// the carried tile's own layout, so a lane reads back the element it wrote.
-// They are not exchange publishes and never end a phase.
+// the carried tile's own layout and logical element. They are not exchange
+// publishes and never end a phase; replicated writes add their own barrier.
 static constexpr llvm::StringLiteral kCarryWrite = "carry_write";
 static constexpr llvm::StringLiteral kCarryRead = "carry_read";
 static constexpr llvm::StringLiteral kCarrySlotAttr = "metal.carry_slot";
@@ -4776,6 +4776,12 @@ struct ConvertLayoutLowering
               rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{idx})
               .getResult(0);
       if (isPublish) {
+        // A replica may read the old carry in the same phase where the
+        // canonical owner writes the next value. Drain all such reads before
+        // the write; existing phase and iteration barriers publish it later.
+        if (tag.getValue() == kCarryWrite &&
+            layoutHasReplicatedOwners(plan.src))
+          BarrierOp::create(rewriter, loc);
         mlir::Value staged = adaptor.getSrc();
         if (staged.getType() != plan.elemTy)
           staged = mlir::UnrealizedConversionCastOp::create(
@@ -21369,8 +21375,12 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
         if (numElements == companion->shape[0])
           needGuard = false;
     }
+    auto layout = planLayoutIndex(
+        mlir::dyn_cast<mlir::RankedTensorType>(storePtr.getType()));
+    const bool replicated = layout && layoutHasReplicatedOwners(*layout);
     mlir::Value iterGuard =
-        emitTileLoopIterGuard(*tile, parentFor, rewriter, loc);
+        replicated ? mlir::Value()
+                   : emitTileLoopIterGuard(*tile, parentFor, rewriter, loc);
     if (!needGuard && !iterGuard) {
       StoreOp::create(rewriter, loc, sval, memref, idx);
       rewriter.eraseOp(op);
@@ -22520,13 +22530,14 @@ struct MaskedStoreLowering
             mlir::arith::AndIOp::create(rewriter, loc, cond, inTile.getResult())
                 .getResult();
       }
-      // ... and the same tile's iterations past its own element count, which a
-      // user mask cannot subsume either: it is a bound on the DATA, not on how
-      // many trips the function's largest tile asked the loop for.
-      if (mlir::Value iterGuard =
-              emitTileLoopIterGuard(*tile, parentFor, rewriter, loc))
-        cond = mlir::arith::AndIOp::create(rewriter, loc, cond, iterGuard)
-                   .getResult();
+      auto layout = planLayoutIndex(
+          mlir::dyn_cast<mlir::RankedTensorType>(op.getPtr().getType()));
+      if (!(layout && layoutHasReplicatedOwners(*layout)))
+        if (mlir::Value iterGuard =
+                emitTileLoopIterGuard(*tile, parentFor, rewriter, loc)) {
+          cond = mlir::arith::AndIOp::create(rewriter, loc, cond, iterGuard)
+                     .getResult();
+        }
     }
 
     // L2b: route the masked-store value/scratch/device path through the memref
@@ -30296,6 +30307,12 @@ static mlir::triton::LoadOp sdPeelToLoad(mlir::Value v) {
       v = cvt.getSrc();
       continue;
     }
+    if (auto staged = v.getDefiningOp();
+        staged && mlir::isa<mlir::triton::gpu::LocalLoadOp,
+                            mlir::triton::gpu::LocalAllocOp>(staged)) {
+      v = staged->getOperand(0);
+      continue;
+    }
     if (auto ext = v.getDefiningOp<mlir::arith::ExtFOp>()) {
       v = ext.getIn();
       continue;
@@ -32284,7 +32301,8 @@ static bool sdDotStoreTileIsColumnMajor(mlir::triton::DotOp dot) {
 static bool sdDotEligible(mlir::triton::DotOp dot) {
   if (!dot)
     return false;
-  if (dot->getParentOfType<mlir::scf::ForOp>())
+  auto loop = dot->getParentOfType<mlir::scf::ForOp>();
+  if (loop && !g_nestedScanLoops.count(loop.getOperation()))
     return false;
   auto rt = mlir::dyn_cast<mlir::RankedTensorType>(dot.getType());
   int64_t M = 0, N = 0;
@@ -32479,12 +32497,11 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
       kBuilder, dot.getLoc(),
       kBuilder.getI32IntegerAttr(
           static_cast<int32_t>(aOperandTy.getShape().back())));
-  if (!sdEmitScalarDot(dot, aLoad, bLoad, cInit, replaceTarget,
-                       resultTensorTy, {}, {}, {},
-                       /*transposeA=*/false,
-                       /*scaleInfo=*/nullptr,
-                       sdConeCrossesTranspose(dot.getB()),
-                       staticK.getResult())) {
+  auto scalarDot = sdEmitScalarDot(
+      dot, aLoad, bLoad, cInit, replaceTarget, resultTensorTy, {}, {}, {},
+      /*transposeA=*/false, /*scaleInfo=*/nullptr,
+      sdConeCrossesTranspose(dot.getB()), staticK.getResult());
+  if (!scalarDot) {
     // The dot stays for another tier; leave no dead constant behind for it.
     staticK.erase();
     if (ownCvt)
@@ -32492,6 +32509,10 @@ static mlir::LogicalResult tryScalarDotFallback(mlir::triton::DotOp dot) {
     return mlir::failure();
   }
 
+  if (auto loop = dot->getParentOfType<mlir::scf::ForOp>();
+      loop && g_nestedScanLoops.count(loop.getOperation()))
+    scalarDot->setAttr("metal.nested_scan",
+                       mlir::UnitAttr::get(dot.getContext()));
   if (resCvt)
     resCvt.erase();
   dot.erase();
@@ -33676,9 +33697,13 @@ struct ScalarDotLowering : public mlir::OpConversionPattern<ScalarDotOp> {
     // Per-thread local-tile linear index (row-major), matching the epilogue.
     auto parentFor = findOutermostScfFor(op);
     mlir::Value linUi32;
-    if (tileInfo->elemPerThread > 1) {
+    if (op->hasAttr("metal.nested_scan"))
+      if (auto layout = planLayoutIndex(resTy))
+        if (mlir::Value exact = emitLayoutElementIndex(op, *layout, rewriter, loc))
+          linUi32 = toUi32(exact);
+    if (!linUi32 && tileInfo->elemPerThread > 1) {
       linUi32 = emitPerIterIndex(*tileInfo, parentFor, rewriter, loc);
-    } else {
+    } else if (!linUi32) {
       linUi32 = emitLocalTidUI32(rewriter, loc, tileInfo->threadsPerBlock);
     }
 
@@ -36247,7 +36272,8 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
                   : mlir::scf::ForOp{};
   const bool simpleLoop =
       loop && mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()) &&
-      loop.getInitArgs().empty();
+      (loop.getInitArgs().empty() ||
+       g_nestedScanLoops.count(loop.getOperation()));
   if (!blk || (!mlir::isa<mlir::triton::FuncOp>(blk->getParentOp()) &&
                !simpleLoop))
     return false;
@@ -42882,10 +42908,8 @@ nestedScanCarriedTypes(mlir::scf::ForOp loop,
 }
 
 // Why a carried tile cannot take a slot, or empty when it can. The slot is
-// indexed by the tile's own layout on both sides, so it needs a layout the
-// band loops walk exactly: the function tile's register count, one owner per
-// element (a replicated owner could read another lane's write of THIS
-// iteration), and a type threadgroup memory holds.
+// indexed by the tile's own layout on both sides, so the band loops must walk
+// its register count exactly and threadgroup memory must hold its element type.
 static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
                                                   const TileInfo &tile) {
   auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
@@ -42897,10 +42921,9 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
            "least eight bits";
   auto plan = planLayoutIndex(rtt);
   if (!plan || plan->elemPerThread != tile.elemPerThread ||
-      plan->threadsPerBlock() != tile.threadsPerBlock ||
-      layoutHasReplicatedOwners(*plan))
-    return "nested scan carries only tiles with one owner per element and "
-           "the function tile's register count";
+      plan->threadsPerBlock() != tile.threadsPerBlock)
+    return "nested scan carries only tiles with the function tile's register "
+           "count and thread count";
   return {};
 }
 
@@ -42938,9 +42961,6 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
   });
   if (!valid)
     return mlir::failure();
-  llvm::DenseMap<mlir::Operation *, int> loopsPerFunction;
-  for (auto loop : loops)
-    ++loopsPerFunction[loop->getParentOfType<mlir::triton::FuncOp>()];
   for (auto loop : loops) {
     auto func = loop->getParentOfType<mlir::triton::FuncOp>();
     auto isTensor = [](mlir::Type type) {
@@ -42978,9 +42998,14 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       }
       current = outer;
     }
+    const bool hasSiblingScanLoop = llvm::any_of(
+        g_nestedScanLoops, [&](mlir::Operation *candidate) {
+          return candidate != topLoop.getOperation() &&
+                 candidate->getParentOfType<mlir::triton::FuncOp>() == func;
+        });
     bool outerTensorWork = false;
     for (mlir::Operation &op : func.getBody().front()) {
-      if (&op == topLoop.getOperation() ||
+      if (&op == topLoop.getOperation() || g_nestedScanLoops.count(&op) ||
           op.hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
       bool after = topLoop->isBeforeInBlock(&op);
@@ -42988,7 +43013,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           (!mlir::isMemoryEffectFree(&op) &&
            !mlir::isa<mlir::triton::GetProgramIdOp, mlir::triton::LoadOp>(
                &op) &&
-           !(after && mlir::isa<mlir::triton::StoreOp>(&op))))
+           !(mlir::isa<mlir::triton::StoreOp>(&op) &&
+             (after || hasSiblingScanLoop))))
         return topLoop.emitOpError(
             "Metal backend: nested scan cannot replay an external tensor "
             "value or move outer effects");
@@ -43014,23 +43040,29 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
                                 "load/compute/store loop body");
     }
     llvm::SmallVector<mlir::Type, 4> carried = nestedScanCarriedTypes(loop);
-    if (nested && !carried.empty())
-      return loop.emitOpError("Metal backend: nested scan beneath outer "
-                              "control flow supports only scalar carries");
+    if (!carried.empty()) {
+      for (mlir::Operation &op : *loop.getBody()) {
+        if (!mlir::isa<mlir::triton::DotOp, mlir::triton::DotScaledOp>(&op))
+          continue;
+        for (mlir::Operation *user : op.getUsers()) {
+          if (mlir::isa<mlir::triton::ScanOp>(user))
+            return op.emitOpError("Metal backend: a tile-carrying tl.dot result "
+                                  "cannot feed the same loop's scan");
+          if (auto cvt =
+                  mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user))
+            for (mlir::Operation *reader : cvt->getUsers())
+              if (mlir::isa<mlir::triton::ScanOp>(reader))
+                return op.emitOpError(
+                    "Metal backend: a tile-carrying tl.dot result cannot feed "
+                    "the same loop's scan");
+        }
+      }
+    }
     if (!carried.empty() || outerTensorWork) {
       auto tile = findTileInfo(func);
       if (!tile)
         return loop.emitOpError(
             "Metal backend: nested scan carrying a tile has no function tile");
-      if (loopsPerFunction.lookup(func) > 1)
-        return loop.emitOpError("Metal backend: nested scan carrying a tile "
-                                "supports one scan loop per function");
-      // The slot read's operand is a placeholder; keep the dot tiers, which
-      // recognise a zero accumulator by its producer, away from it.
-      for (mlir::Operation &op : *loop.getBody())
-        if (mlir::isa<mlir::triton::DotOp, mlir::triton::DotScaledOp>(&op))
-          return loop.emitOpError("Metal backend: nested scan carrying a tile "
-                                  "cannot share its loop with a tl.dot");
       int64_t bytes = 0;
       for (mlir::Type type : carried) {
         llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
@@ -43099,6 +43131,8 @@ static mlir::FailureOr<mlir::scf::ForOp>
 materializeNestedScanCarries(mlir::scf::ForOp loop) {
   auto func = loop->getParentOfType<mlir::triton::FuncOp>();
   mlir::Block &top = func.getBody().front();
+  mlir::Block &scope = *loop->getBlock();
+  const bool nested = !mlir::isa<mlir::triton::FuncOp>(loop->getParentOp());
   auto isTensor = [](mlir::Type type) {
     return mlir::isa<mlir::RankedTensorType>(type);
   };
@@ -43109,20 +43143,16 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
   llvm::SmallVector<mlir::Value, 4> spilled;
   llvm::SmallVector<mlir::Type, 4> carried =
       nestedScanCarriedTypes(loop, &spilled);
-  if (!mlir::isa<mlir::triton::FuncOp>(loop->getParentOp())) {
-    if (!carried.empty()) {
-      loop.emitOpError("Metal backend: nested scan beneath outer control flow "
-                       "supports only scalar carries");
-      return mlir::failure();
-    }
+  if (nested && carried.empty())
     return loop;
-  }
   bool outerTensorWork = false;
-  for (mlir::Operation &op : top)
-    if (&op != loop && !op.hasTrait<mlir::OpTrait::IsTerminator>() &&
-        (loop->isBeforeInBlock(&op) || !mlir::isMemoryEffectFree(&op)) &&
-        touchesTensor(op))
-      outerTensorWork = true;
+  if (!nested)
+    for (mlir::Operation &op : top)
+      if (&op != loop && !g_nestedScanLoops.count(&op) &&
+          !op.hasTrait<mlir::OpTrait::IsTerminator>() &&
+          (loop->isBeforeInBlock(&op) || !mlir::isMemoryEffectFree(&op)) &&
+          touchesTensor(op))
+        outerTensorWork = true;
   if (carried.empty() && !outerTensorWork)
     return loop;
   auto tile = findTileInfo(func);
@@ -43145,9 +43175,10 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
                                                          value.getType(), value);
     op->setAttr(kExchangeAttr, b.getStringAttr(kCarryWrite));
     op->setAttr(kCarrySlotAttr, b.getI64IntegerAttr(slot));
+    return op;
   };
-  auto read = [&](mlir::OpBuilder &b, unsigned slot) -> mlir::Value {
-    mlir::RankedTensorType type = slotTypes[slot];
+  auto read = [&](mlir::OpBuilder &b, unsigned slot,
+                  mlir::RankedTensorType type) -> mlir::Value {
     mlir::Value placeholder =
         mlir::arith::ConstantOp::create(
             b, loc,
@@ -43162,7 +43193,8 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
   };
   // One read, placed before the first use in `block`, serves every use there.
   auto readInBlock = [&](mlir::Value value, unsigned slot, mlir::Block &block,
-                         llvm::function_ref<bool(mlir::Operation *)> inScope) {
+                         llvm::function_ref<bool(mlir::Operation *)> inScope,
+                         mlir::RankedTensorType readType) {
     llvm::SmallVector<mlir::OpOperand *, 8> uses;
     mlir::Operation *first = nullptr;
     for (mlir::OpOperand &use : value.getUses()) {
@@ -43176,7 +43208,7 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
     if (!first)
       return;
     mlir::OpBuilder b(first);
-    mlir::Value loaded = read(b, slot);
+    mlir::Value loaded = read(b, slot, readType);
     for (mlir::OpOperand *use : uses)
       use->set(loaded);
   };
@@ -43190,29 +43222,56 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
   // Tiles computed before the loop that cannot be recomputed where read.
   for (mlir::Value value : spilled) {
     unsigned slot = slotTypes.size();
-    slotTypes.push_back(mlir::cast<mlir::RankedTensorType>(value.getType()));
+    auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
+    slotTypes.push_back(type);
     write(before, slot, value);
-    readInBlock(value, slot, body, everywhere);
-    readInBlock(value, slot, top, afterLoop);
+    readInBlock(value, slot, body, everywhere, type);
+    readInBlock(value, slot, scope, afterLoop, type);
   }
   // Iter_args: every read of this iteration's value precedes the writes of
   // the next, which sit at the very end of the body.
   auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
   unsigned firstIterSlot = slotTypes.size();
-  for (auto [init, arg] :
-       llvm::zip(loop.getInitArgs(), loop.getRegionIterArgs())) {
+  llvm::SmallVector<mlir::Value, 4> storedNext;
+  for (unsigned i = 0; i < loop.getNumRegionIterArgs(); ++i) {
+    mlir::Value init = loop.getInitArgs()[i];
+    mlir::Value arg = loop.getRegionIterArgs()[i];
+    mlir::Value next = yield.getOperand(i);
     unsigned slot = slotTypes.size();
-    slotTypes.push_back(mlir::cast<mlir::RankedTensorType>(init.getType()));
+    slotTypes.push_back(mlir::cast<mlir::RankedTensorType>(next.getType()));
+    storedNext.push_back(next);
     write(before, slot, init);
-    readInBlock(arg, slot, body, everywhere);
+    readInBlock(arg, slot, body, everywhere,
+                mlir::cast<mlir::RankedTensorType>(arg.getType()));
   }
   {
     mlir::OpBuilder atYield(yield);
-    for (auto [i, next] : llvm::enumerate(yield.getOperands()))
-      write(atYield, firstIterSlot + i, next);
+    for (auto [i, next] : llvm::enumerate(storedNext)) {
+      mlir::Operation *def = next.getDefiningOp();
+      bool readBeforeDef = false;
+      if (def && def->getBlock() == &body) {
+        for (mlir::Operation &candidate : body) {
+          auto slot = candidate.getAttrOfType<mlir::IntegerAttr>(kCarrySlotAttr);
+          auto tag = candidate.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+          if (slot && tag && tag.getValue() == kCarryRead &&
+              slot.getInt() == firstIterSlot + i) {
+            readBeforeDef = candidate.isBeforeInBlock(def);
+            break;
+          }
+        }
+      }
+      if (readBeforeDef) {
+        mlir::OpBuilder after(def);
+        after.setInsertionPointAfter(def);
+        write(after, firstIterSlot + i, next);
+      } else {
+        write(atYield, firstIterSlot + i, next);
+      }
+    }
   }
   for (auto [i, result] : llvm::enumerate(loop.getResults()))
-    readInBlock(result, firstIterSlot + i, top, afterLoop);
+    readInBlock(result, firstIterSlot + i, scope, afterLoop,
+                mlir::cast<mlir::RankedTensorType>(result.getType()));
 
   // The same loop without iter_args.
   auto newLoop = mlir::scf::ForOp::create(before, loc, loop.getLowerBound(),
@@ -43259,12 +43318,24 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
           use.set(localize(use.get()));
       });
   };
-  localizeInto(newBody, newBody.begin(), everywhere);
-  localizeInto(top, std::next(newLoop->getIterator()),
-               [&](mlir::Operation *op) {
-                 return newLoop->isBeforeInBlock(op) &&
-                        !op->hasTrait<mlir::OpTrait::IsTerminator>();
-               });
+  if (!nested) {
+    localizeInto(newBody, newBody.begin(), everywhere);
+    localizeInto(top, std::next(newLoop->getIterator()),
+                 [&](mlir::Operation *op) {
+                   return newLoop->isBeforeInBlock(op) &&
+                          !op->hasTrait<mlir::OpTrait::IsTerminator>();
+                 });
+    for (mlir::Operation &op : top) {
+      auto sibling = mlir::dyn_cast<mlir::scf::ForOp>(op);
+      if (&op != newLoop.getOperation() && sibling &&
+          g_nestedScanLoops.count(&op) && newLoop->isBeforeInBlock(&op))
+        localizeInto(*sibling.getBody(), sibling.getBody()->begin(), everywhere);
+      if (&op != newLoop.getOperation() && op.hasAttr(kScanBandLoopAttr))
+        for (mlir::Region &region : op.getRegions())
+          for (mlir::Block &block : region)
+            localizeInto(block, block.begin(), everywhere);
+    }
+  }
   // Drop the originals nothing reads any more; a slot write has no user by
   // construction and must stay.
   for (bool changed = true; changed;) {
@@ -43295,29 +43366,80 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
     phase->setAttr(kScanBandLoopAttr, b.getUnitAttr());
     for (mlir::Operation *op : ops)
       op->moveBefore(phase.getBody()->getTerminator());
+    llvm::SmallVector<mlir::OpOperand *, 16> outsideUses;
     for (mlir::Operation *op : ops)
       for (mlir::Value result : op->getResults())
-        for (mlir::Operation *user : result.getUsers())
-          if (!phase->isAncestor(user)) {
-            op->emitOpError("Metal backend: nested scan cannot carry this "
-                            "value between the loop and the code around it");
-            return mlir::failure();
-          }
+        for (mlir::OpOperand &use : result.getUses())
+          if (!phase->isAncestor(use.getOwner()))
+            outsideUses.push_back(&use);
+    for (mlir::OpOperand *use : outsideUses) {
+      mlir::Operation *user = use->getOwner();
+      mlir::OpBuilder outside(user);
+      if (auto carriedRead =
+              use->get().getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>()) {
+        auto slot = carriedRead->getAttrOfType<mlir::IntegerAttr>(kCarrySlotAttr);
+        auto tag = carriedRead->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+        if (slot && tag && tag.getValue() == kCarryRead) {
+          use->set(read(outside, slot.getInt(),
+                        mlir::cast<mlir::RankedTensorType>(use->get().getType())));
+          continue;
+        }
+      }
+      mlir::IRMapping mapping;
+      bool failed = false;
+      std::function<mlir::Value(mlir::Value)> clone =
+          [&](mlir::Value value) -> mlir::Value {
+        if (auto mapped = mapping.lookupOrNull(value))
+          return mapped;
+        mlir::Operation *def = value.getDefiningOp();
+        if (!def)
+          return value;
+        if (def->getNumRegions() || !mlir::isMemoryEffectFree(def) ||
+            def->hasAttr(kExchangeAttr)) {
+          failed = true;
+          return {};
+        }
+        for (mlir::Value operand : def->getOperands())
+          if (!clone(operand))
+            return {};
+        outside.clone(*def, mapping);
+        return mapping.lookup(value);
+      };
+      mlir::Value cloned = clone(use->get());
+      if (failed || !cloned) {
+        user->emitOpError("Metal backend: nested scan cannot carry this "
+                          "value between the loop and the code around it");
+        return mlir::failure();
+      }
+      use->set(cloned);
+    }
     return mlir::success();
   };
   llvm::SmallVector<mlir::Operation *, 32> preOps, postOps;
-  for (mlir::Operation &op : top) {
-    if (&op == newLoop.getOperation() ||
+  auto hasSiblingBetween = [&](mlir::Operation *first, mlir::Operation *second) {
+    return llvm::any_of(scope, [&](mlir::Operation &candidate) {
+      return g_nestedScanLoops.count(&candidate) &&
+             first->isBeforeInBlock(&candidate) &&
+             candidate.isBeforeInBlock(second);
+    });
+  };
+  for (mlir::Operation &op : scope) {
+    if (&op == newLoop.getOperation() || g_nestedScanLoops.count(&op) ||
         op.hasTrait<mlir::OpTrait::IsTerminator>() || !touchesTensor(op))
       continue;
-    (newLoop->isBeforeInBlock(&op) ? postOps : preOps).push_back(&op);
+    if (newLoop->isBeforeInBlock(&op)) {
+      if (!hasSiblingBetween(newLoop.getOperation(), &op))
+        postOps.push_back(&op);
+    } else if (!hasSiblingBetween(&op, newLoop.getOperation())) {
+      preOps.push_back(&op);
+    }
   }
   b.setInsertionPoint(newLoop);
   if (mlir::failed(band(preOps)))
     return mlir::failure();
   if (!preOps.empty())
     BarrierOp::create(b, loc);
-  b.setInsertionPoint(top.getTerminator());
+  b.setInsertionPoint(scope.getTerminator());
   if (!postOps.empty())
     BarrierOp::create(b, loc);
   if (mlir::failed(band(postOps)))
@@ -43334,12 +43456,18 @@ materializeNestedScanCarries(mlir::scf::ForOp loop) {
                              type.getNumElements())));
   bool registered = true;
   func.walk([&](mlir::triton::gpu::ConvertLayoutOp op) {
+    if (g_tileExchangeBuf.count(op.getOperation()))
+      return;
     auto slot = op->getAttrOfType<mlir::IntegerAttr>(kCarrySlotAttr);
     if (!slot)
       return;
+    if (slot.getInt() >= static_cast<int64_t>(buffers.size())) {
+      registered = false;
+      return;
+    }
     auto type = mlir::cast<mlir::RankedTensorType>(op.getType());
     auto plan = planLayoutIndex(type);
-    if (!plan || slot.getInt() >= static_cast<int64_t>(buffers.size())) {
+    if (!plan) {
       registered = false;
       return;
     }
@@ -46303,10 +46431,13 @@ struct ConvertTritonGPUToMetalPass
                              labels->first, labels->second))
           continue;
       }
+      auto scanLoop = cvt->getParentOfType<mlir::scf::ForOp>();
+      const bool inNestedScan =
+          scanLoop && g_nestedScanLoops.count(scanLoop.getOperation());
       if (planTileExchange(
               cvt.getOperation(),
               /*allowGeneralPhase=*/functionHasRankNPhase(cvt.getOperation()) ||
-                  nonLocalCvtReadIsThreadMajor(cvt)))
+                  inNestedScan || nonLocalCvtReadIsThreadMajor(cvt)))
         continue;
       cvt.emitOpError(
           "ttg.convert_layout: broader staged-transpose deferred to L1d3 "

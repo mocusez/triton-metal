@@ -399,17 +399,15 @@ being approximated with a racy load/modify/store sequence.
 
 ---
 
-## Remaining work
+## Supported shapes and named refusals
 
-The fixed-benchmark generic-performance line is complete: aligned contiguous
-vector transactions, effect-bounded aggregate/cone reuse, and resource-aware
-canonical matrix launch selection now have deterministic IR/MSL coverage and
-physical Apple Silicon MPS evidence.
+These notes record the current envelope of two completed work lines: what each
+supports and which nearby shapes it refuses by name. A named refusal is a
+capability boundary, not planned work. Any further extension needs a positive
+case and an adjacent rejection regression.
 
-The current dependency-ordered priorities are:
-
-1. Finish the remaining lowering-decline portion of the preflight safety
-   matrix. The audited op categories in `validateUnsupportedOpsRejected` have
+1. **Preflight safety matrix.** The audited op categories in
+   `validateUnsupportedOpsRejected` have
    direct CPU-only lit coverage, axes 1/2 `tt.get_num_programs` coverage is in
    place, and live non-splat tensor constants, non-f32 precise math, plus
    unsupported histogram ranks/types/layouts/producer cones and pointer-valued
@@ -724,8 +722,8 @@ The current dependency-ordered priorities are:
    loops with unsafe intervening writes or externally loaded values that may
    be overwritten remain rejected. General computed i32 reductions retain
    their existing direct-load or scan-publication requirements.
-2. Extend aggregate combinations on the refreshed layout/tile baseline. The
-   current permutation, transpose, loaded-accumulator and transposed-store
+2. **Aggregate combinations.** The current permutation, transpose,
+   loaded-accumulator and transposed-store
    matrices are numerically clean. Rank-3 and rank-4 permute-to-reduce now map
    thread-major load-rooted input coordinates through the permutation before
    exact publication, on every reduction axis and across register bands.
@@ -743,22 +741,26 @@ The current dependency-ordered priorities are:
    tuple/single-value exact phases. All components publish together before
    prefix reads; grouped buffers use dedicated storage within the combined
    32 KiB threadgroup budget. One-element-per-thread tuples also support
-   uniform user loops. Multi-element single-value and tuple scans now support
-   one top-level uniform runtime loop, including consecutive scans, memory
-   updates across iterations, tensor iter_args, and snapshots of tensors
-   computed before the loop. Integer and floating-point scalar iter_args pass
-   through the SSA yield; pure scalar definitions used outside a register band
-   are cloned at its boundary to preserve dominance. Carried tensors use
-   threadgroup slots and must be integer or floating-point tiles of at least
-   eight bits, have one owner per element, and use the function tile's register
-   count; their slots count against the 32 KiB threadgroup budget. The innermost
-   multiband scan loop may also be nested in uniform scalar-only outer `scf.for`
-   loops without iter_args or results, provided all tensor work and memory
-   effects stay in that innermost flat body. Conditional outer control flow,
-   outer tensor work or carries, sibling scan loops beneath such control flow,
-   replicated-owner or mismatched-register-count tiles, a tile-carrying loop
-   containing `tl.dot`, multiple tile-carrying scan loops in one function, and
-   unsafe cross-phase replay remain rejected.
+   uniform user loops. Multi-element single-value and tuple scans support
+   top-level uniform runtime loops, including consecutive scans, independent
+   tile-carrying loops in one function, memory updates across iterations, tensor
+   iter_args, and snapshots of tensors computed before the loop. Integer and
+   floating-point scalar iter_args pass through the SSA yield; pure scalar
+   definitions used outside a register band are cloned at its boundary to
+   preserve dominance. Carried tensors use threadgroup slots and must be integer
+   or floating-point tiles of at least eight bits and use the function tile's
+   register and thread counts. Replicated carry layouts use canonical-owner
+   writes with barriers; replicated stores retain their existing replica-write
+   semantics without truncating valid register bands. Carry slots count against
+   the 32 KiB threadgroup budget. The
+   innermost multiband scan loop may also be nested in uniform scalar-only outer
+   `scf.for` loops without iter_args or results, provided all tensor work and
+   memory effects stay in that innermost flat body; its tensor iter_args use the
+   same slots without moving phases to the outer loops. Conditional outer
+   control flow, outer tensor work or carries, sibling scan loops beneath such
+   control flow, mismatched-register-count tiles, a tile-carrying `tl.dot`
+   whose result feeds the same loop's scan, and unsafe cross-phase replay remain
+   rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing
@@ -863,11 +865,19 @@ The current dependency-ordered priorities are:
    preflight rather than half-rewritten. Accumulate and store f32, or apply the
    epilogue in a second kernel. A bias add is fine because Triton folds it into
    the dot's accumulator.
-   Each extension needs a positive case and an adjacent rejection regression.
-3. Run the MPS numerical wheel smoke on a physical macOS 15 machine. CI now
-   builds/audits on macOS 26, then installs and compile-smokes the
-   `macosx_15_0_arm64` artifact on the hosted macOS 15 runner, while physical
-   Apple Silicon remains necessary for GPU numerical validation.
+
+## Remaining work
+
+The fixed-benchmark generic-performance line is complete: aligned contiguous
+vector transactions, effect-bounded aggregate/cone reuse, and resource-aware
+canonical matrix launch selection now have deterministic IR/MSL coverage and
+physical Apple Silicon MPS evidence. The preflight safety matrix and the planned
+aggregate combinations are also complete; see the section above.
+
+One planned item remains: run the MPS numerical wheel smoke on a physical
+macOS 15 machine. CI now builds/audits on macOS 26, then installs and
+compile-smokes the `macosx_15_0_arm64` artifact on the hosted macOS 15 runner,
+while physical Apple Silicon remains necessary for GPU numerical validation.
 
 PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
 and bf16 atomic add are platform/runtime boundaries, not implementation backlog.
