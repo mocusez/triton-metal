@@ -1091,3 +1091,102 @@ def test_atomic_add_bf16_is_rejected_with_a_reason(capfd):
     with pytest.raises(Exception):
         _atomic_add_bf16_rows[(1,)](inp, out, 64)
     assert "bf16 atomic add is unsupported" in capfd.readouterr().err
+
+
+@triton.jit
+def _atomic_add_rank3(
+    Out,
+    I,
+    J,
+    K,
+    S0,
+    S1,
+    BI: tl.constexpr,
+    BJ: tl.constexpr,
+    BK: tl.constexpr,
+):
+    i = tl.arange(0, BI)[:, None, None]
+    j = tl.arange(0, BJ)[None, :, None]
+    k = tl.arange(0, BK)[None, None, :]
+    offsets = i * S0 + j * S1 + k
+    mask = (i < I) & (j < J) & (k < K)
+    tl.atomic_add(Out + offsets, tl.full((BI, BJ, BK), 1, tl.int32), mask=mask)
+
+
+@triton.jit
+def _atomic_add_rank4(Out, S0, S1, S2):
+    i = tl.arange(0, 2)[:, None, None, None]
+    j = tl.arange(0, 4)[None, :, None, None]
+    k = tl.arange(0, 4)[None, None, :, None]
+    l = tl.arange(0, 8)[None, None, None, :]
+    offsets = i * S0 + j * S1 + k * S2 + l
+    tl.atomic_add(Out + offsets, tl.full((2, 4, 4, 8), 1, tl.int32))
+
+
+@triton.jit
+def _atomic_add_rank5(Out, S0, S1, S2, S3):
+    i = tl.arange(0, 2)[:, None, None, None, None]
+    j = tl.arange(0, 2)[None, :, None, None, None]
+    k = tl.arange(0, 4)[None, None, :, None, None]
+    l = tl.arange(0, 4)[None, None, None, :, None]
+    m = tl.arange(0, 8)[None, None, None, None, :]
+    offsets = i * S0 + j * S1 + k * S2 + l * S3 + m
+    tl.atomic_add(Out + offsets, tl.full((2, 2, 4, 4, 8), 1, tl.int32))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize(
+    "shape,block",
+    [((2, 3, 5), (2, 4, 8)), ((4, 8, 16), (4, 8, 16))],
+)
+def test_atomic_add_tensor_rank3_strided_masked(shape, block, num_warps):
+    strides = (shape[1] * shape[2] + 7, shape[2] + 3, 1)
+    storage = sum((size - 1) * stride for size, stride in zip(shape, strides)) + 1
+    programs = 3
+    initial = torch.full((storage,), 77, dtype=torch.int32)
+    out = initial.to("mps")
+
+    _atomic_add_rank3[(programs,)](
+        out,
+        *shape,
+        strides[0],
+        strides[1],
+        BI=block[0],
+        BJ=block[1],
+        BK=block[2],
+        num_warps=num_warps,
+    )
+
+    expected = initial.clone()
+    expected.as_strided(shape, strides)[:] += programs
+    assert torch.equal(out.cpu(), expected)
+
+
+def test_atomic_add_tensor_rank4_strided():
+    shape = (2, 4, 4, 8)
+    strides = (173, 43, 11, 1)
+    storage = sum((size - 1) * stride for size, stride in zip(shape, strides)) + 1
+    programs = 3
+    initial = torch.full((storage,), 91, dtype=torch.int32)
+    out = initial.to("mps")
+
+    _atomic_add_rank4[(programs,)](out, *strides[:3])
+
+    expected = initial.clone()
+    expected.as_strided(shape, strides)[:] += programs
+    assert torch.equal(out.cpu(), expected)
+
+
+def test_atomic_add_tensor_rank5_strided():
+    shape = (2, 2, 4, 4, 8)
+    strides = (401, 197, 53, 11, 1)
+    storage = sum((size - 1) * stride for size, stride in zip(shape, strides)) + 1
+    programs = 3
+    initial = torch.full((storage,), 53, dtype=torch.int32)
+    out = initial.to("mps")
+
+    _atomic_add_rank5[(programs,)](out, *strides[:4])
+
+    expected = initial.clone()
+    expected.as_strided(shape, strides)[:] += programs
+    assert torch.equal(out.cpu(), expected)

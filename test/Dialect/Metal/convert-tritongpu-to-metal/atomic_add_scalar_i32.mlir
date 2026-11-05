@@ -16,6 +16,8 @@
 // void-returning atomic_ulong min/max surface.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 4, 8], warpsPerCTA = [1, 1, 4], order = [2, 1, 0]}>
+#blocked5 = #ttg.blocked<{sizePerThread = [1, 1, 1, 1, 1], threadsPerWarp = [1, 1, 1, 4, 8], warpsPerCTA = [1, 1, 1, 1, 4], order = [4, 3, 2, 1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @atomic_add_scalar_i32(%out_ptr: !tt.ptr<i32>, %v: i32) {
     %r = tt.atomic_rmw add, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i32>, i32) -> i32
@@ -60,6 +62,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %umax = tt.atomic_rmw umax, acq_rel, gpu, %addr, %values : (tensor<16x!tt.ptr<i64>, #blocked>, tensor<16xi64, #blocked>) -> tensor<16xi64, #blocked>
     tt.return
   }
+
+  tt.func public @atomic_add_tensor_rank3(%out_ptr: !tt.ptr<i32>, %v: i32) {
+    %out = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<2x4x8x!tt.ptr<i32>, #blocked3>
+    %offsets = tt.splat %v : i32 -> tensor<2x4x8xi32, #blocked3>
+    %addr = tt.addptr %out, %offsets : tensor<2x4x8x!tt.ptr<i32>, #blocked3>, tensor<2x4x8xi32, #blocked3>
+    %values = tt.splat %v : i32 -> tensor<2x4x8xi32, #blocked3>
+    %old = tt.atomic_rmw add, acq_rel, gpu, %addr, %values : (tensor<2x4x8x!tt.ptr<i32>, #blocked3>, tensor<2x4x8xi32, #blocked3>) -> tensor<2x4x8xi32, #blocked3>
+    tt.return
+  }
+
+  tt.func public @atomic_add_tensor_rank5(%out_ptr: !tt.ptr<i32>, %v: i32) {
+    %out = tt.splat %out_ptr : !tt.ptr<i32> -> tensor<2x2x2x2x2x!tt.ptr<i32>, #blocked5>
+    %offsets = tt.splat %v : i32 -> tensor<2x2x2x2x2xi32, #blocked5>
+    %addr = tt.addptr %out, %offsets : tensor<2x2x2x2x2x!tt.ptr<i32>, #blocked5>, tensor<2x2x2x2x2xi32, #blocked5>
+    %values = tt.splat %v : i32 -> tensor<2x2x2x2x2xi32, #blocked5>
+    %old = tt.atomic_rmw add, acq_rel, gpu, %addr, %values : (tensor<2x2x2x2x2x!tt.ptr<i32>, #blocked5>, tensor<2x2x2x2x2xi32, #blocked5>) -> tensor<2x2x2x2x2xi32, #blocked5>
+    tt.return
+  }
 }
 
 // CHECK-LABEL: metal.kernel atomic_add_scalar_i32
@@ -101,3 +121,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // MSL: atomic_min_explicit((device atomic_ulong*)&
 // MSL: atomic_max_explicit((device atomic_ulong*)&
 // MSL-NOT: atomic_fetch_{{min|max}}_explicit((device atomic_ulong*)&
+
+// CHECK-LABEL: metal.kernel atomic_add_tensor_rank3
+// CHECK: metal.atomic_rmw Add
+// CHECK-NOT: tt.atomic_rmw
+// CHECK-LABEL: metal.kernel atomic_add_tensor_rank5
+// CHECK: metal.atomic_rmw Add
+// CHECK-NOT: tt.atomic_rmw

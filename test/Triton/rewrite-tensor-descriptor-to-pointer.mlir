@@ -250,3 +250,46 @@ module {
 // CHECK: %[[MASK:.*]] = arith.andi
 // CHECK: tt.atomic_rmw add, release, gpu,
 // CHECK-SAME: %[[SRC]], %[[MASK]]
+
+// -----
+
+module {
+  tt.func public @reduce_add_f16_rank3(%base: !tt.ptr<f16>, %src: tensor<2x4x8xf16>) {
+    %c3_i32 = arith.constant 3 : i32
+    %c5_i32 = arith.constant 5 : i32
+    %c9_i32 = arith.constant 9 : i32
+    %c64_i64 = arith.constant 64 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c0_i32 = arith.constant 0 : i32
+    %desc = tt.make_tensor_descriptor %base, [%c3_i32, %c5_i32, %c9_i32], [%c64_i64, %c16_i64, %c1_i64] : <f16>, <2x4x8xf16>
+    tt.descriptor_reduce add, %desc[%c0_i32, %c0_i32, %c0_i32], %src : !tt.tensordesc<2x4x8xf16>, tensor<2x4x8xf16>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: @reduce_add_f16_rank3
+// CHECK: tt.atomic_rmw fadd, release, gpu, %{{.*}}, %arg1, %{{.*}} :
+
+// -----
+
+module {
+  tt.func public @reduce_add_i32_rank5(%base: !tt.ptr<i32>, %src: tensor<2x2x4x4x8xi32>) {
+    %c2_i32 = arith.constant 2 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %c4_i32 = arith.constant 4 : i32
+    %c9_i32 = arith.constant 9 : i32
+    %c304_i64 = arith.constant 304 : i64
+    %c148_i64 = arith.constant 148 : i64
+    %c48_i64 = arith.constant 48 : i64
+    %c12_i64 = arith.constant 12 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c0_i32 = arith.constant 0 : i32
+    %desc = tt.make_tensor_descriptor %base, [%c2_i32, %c2_i32, %c3_i32, %c4_i32, %c9_i32], [%c304_i64, %c148_i64, %c48_i64, %c12_i64, %c1_i64] : <i32>, <2x2x4x4x8xi32>
+    tt.descriptor_reduce add, %desc[%c0_i32, %c0_i32, %c0_i32, %c0_i32, %c0_i32], %src : !tt.tensordesc<2x2x4x4x8xi32>, tensor<2x2x4x4x8xi32>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: @reduce_add_i32_rank5
+// CHECK: tt.atomic_rmw add, release, gpu, %{{.*}}, %arg1, %{{.*}} :

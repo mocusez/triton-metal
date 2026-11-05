@@ -9,6 +9,7 @@ add_mlir_dialect_library(MLIRTritonGPUToMetal
   MLIRPass
   MLIRTransforms
   MLIRArithDialect
+  MLIRControlFlowToSCF
   MLIRFuncDialect
   MLIRMathDialect
   MLIRMemRefDialect

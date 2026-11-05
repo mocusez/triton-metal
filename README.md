@@ -295,11 +295,25 @@ integers, and compound XOR combines retain named preflight rejection.
 
 Tensor-descriptor reducing stores use Triton's standard
 `triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
-The audited Metal envelope includes `i32` add/min/max/and/or/xor and `f32` add;
-the rewrite preserves descriptor-view bounds with an explicit atomic mask and
-supports contended updates. A raw `tt.descriptor_reduce` reaching the Metal
-conversion pass is rejected as a pipeline-order violation rather than reported
-as an unsupported frontend operation.
+Host and device descriptors support static blocked rank-1 through rank-5 tiles:
+add on f32/f16/i32/u32, signed/unsigned min/max on i32/u32/u64, and
+and/or/xor on i32/u32. The same general blocked tensor atomic path is covered
+through rank 5 with explicit multidimensional offsets and strides. The rewrite
+preserves descriptor-view bounds with an explicit atomic mask and supports
+contended updates. A raw `tt.descriptor_reduce` reaching the Metal conversion
+pass is rejected as a pipeline-order violation rather than reported as an
+unsupported frontend operation.
+
+`tl.map_elementwise` supports pack=1 callbacks with structured scalar control
+flow, including if/elif, early returns, and scalar for/while loops. Packed
+callbacks support rank-1/rank-2 blocked tensors with pack sizes that divide the
+per-thread element count, multiple inputs and outputs, and the same control
+flow. Inputs are published before one callback per logical pack, and outputs
+are read after a second uniform phase boundary; all staging counts toward the
+32 KiB threadgroup budget. Callback arguments and results use input-major or
+output-major order with the pack index minor. Packed maps inside loops, nested
+scans, or conditional control flow, rank-3+ tensors, indivisible packs, side
+effects, and oversized staging remain named refusals.
 
 `tl.atomic_cas` supports scalar and blocked rank-1/rank-2 `i32`, `u32`, and
 `f32` storage. The floating-point form compares and exchanges the exact IEEE-754
@@ -855,8 +869,6 @@ case and an adjacent rejection regression.
    A direct unmasked rank-2 axis-0 f32 sum can also share that cone through its
    complete per-column buffer. Other reductions, snapshot replay across writes,
    wide rank >= 2 tuple scan broadcasts, and ambiguous consumer layouts remain rejected.
-   Broader descriptor-reduce type/rank and
-   `tl.map_elementwise` pack/control-flow support remain adjacent extensions.
    The planned scaled-dot slices are complete, including mixed E4M3/E5M2,
    canonical dynamic/masked loops, and masked rank-3 batch tails; more general
    combinations and non-canonical scale addresses remain outside that scope.
@@ -874,8 +886,8 @@ canonical matrix launch selection now have deterministic IR/MSL coverage and
 physical Apple Silicon MPS evidence. The preflight safety matrix and the planned
 aggregate combinations are also complete; see the section above.
 
-One planned item remains: run the MPS numerical wheel smoke on a physical
-macOS 15 machine. CI now builds/audits on macOS 26, then installs and
+One external verification item remains: run the MPS numerical wheel smoke on a
+physical macOS 15 machine. CI now builds/audits on macOS 26, then installs and
 compile-smokes the `macosx_15_0_arm64` artifact on the hosted macOS 15 runner,
 while physical Apple Silicon remains necessary for GPU numerical validation.
 

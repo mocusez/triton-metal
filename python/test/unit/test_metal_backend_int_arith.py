@@ -211,6 +211,157 @@ def _map_pair(a, b):
 
 
 @triton.jit
+def _map_compare(a, b):
+    if a < b:
+        return -1
+    elif a == b:
+        return 0
+    else:
+        return 1
+
+
+@triton.jit
+def _map_early_pair(a, b):
+    if a < 0:
+        return b - a, b + a
+    return a + b, a - b
+
+
+@triton.jit
+def _map_scalar_loops(a, b):
+    sum_value = a
+    for _ in range(4):
+        sum_value = sum_value * 2 + b
+    product = b
+    i = 0
+    while i < 3:
+        product = product + a - i
+        i += 1
+    return sum_value, product
+
+
+@triton.jit
+def _map_pack2_cross(a0, a1, b0, b1):
+    return a0 * b1 + a1, b0 - a0, a1 + b0, b1 - a1
+
+
+@triton.jit
+def _map_pack2_cfg(a0, a1, b0, b1):
+    if a0 * b1 < a1 + b0:
+        return a1 - b0, a0 + b1, b1 - a0, b0 - a1
+    return a0 + b1, a1 - b0, b0 - a1, b1 - a0
+
+
+@triton.jit
+def _map_pack4_cross(a0, a1, a2, a3, b0, b1, b2, b3):
+    return (
+        a0 * b3 + a1,
+        a1 * b2 - a2,
+        a2 + b1,
+        a3 - b0,
+    )
+
+
+@triton.jit
+def _map_elementwise_pack_kernel(
+    a_ptr, b_ptr, out0_ptr, out1_ptr, PACK: tl.constexpr, BLOCK: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    if PACK == 2:
+        out0, out1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+        tl.store(out1_ptr + offsets, out1)
+    else:
+        tl.static_assert(PACK == 4)
+        out0, = tl.map_elementwise(_map_pack4_cross, a, b, pack=4)
+    tl.store(out0_ptr + offsets, out0)
+
+
+@triton.jit
+def _map_elementwise_pack_cfg_kernel(
+    a_ptr, b_ptr, out0_ptr, out1_ptr, BLOCK: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    out0, out1 = tl.map_elementwise(_map_pack2_cfg, a, b, pack=2)
+    tl.store(out0_ptr + offsets, out0)
+    tl.store(out1_ptr + offsets, out1)
+
+
+@triton.jit
+def _map_elementwise_two_pack_kernel(
+    a_ptr, b_ptr, out0_ptr, out1_ptr, BLOCK: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    x0, x1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+    out0, out1 = tl.map_elementwise(_map_pack2_cfg, x0, x1, pack=2)
+    tl.store(out0_ptr + offsets, out0)
+    tl.store(out1_ptr + offsets, out1)
+
+
+@triton.jit
+def _map_elementwise_pack_rank2_kernel(
+    a_ptr,
+    b_ptr,
+    out0_ptr,
+    out1_ptr,
+    M,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, BM)[:, None]
+    cols = tl.arange(0, BN)[None, :]
+    offsets = pid * BM * BN + rows * BN + cols
+    mask = (rows < M) & (cols < N)
+    a = tl.load(a_ptr + offsets, mask=mask, other=1)
+    b = tl.load(b_ptr + offsets, mask=mask, other=2)
+    out0, out1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+    tl.store(out0_ptr + offsets, out0, mask=mask)
+    tl.store(out1_ptr + offsets, out1, mask=mask)
+
+
+@triton.jit
+def _map_elementwise_pack_rank3_kernel(out_ptr):
+    a = tl.full((2, 2, 32), 3, tl.int32)
+    b = tl.full((2, 2, 32), 5, tl.int32)
+    out0, out1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+    offsets = tl.arange(0, 128).reshape(2, 2, 32)
+    tl.store(out_ptr + offsets, out0)
+
+
+@triton.jit
+def _map_elementwise_pack_loop_kernel(a_ptr, b_ptr, out_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    acc = tl.zeros((BLOCK,), tl.int32)
+    for _ in range(2):
+        out0, out1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+        acc += out0
+    tl.store(out_ptr + offsets, acc)
+
+
+@triton.jit
+def _map_elementwise_pack_while_kernel(a_ptr, b_ptr, out_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    acc = tl.zeros((BLOCK,), tl.int32)
+    i = 0
+    while i < 2:
+        out0, out1 = tl.map_elementwise(_map_pack2_cross, a, b, pack=2)
+        acc += out0
+        i += 1
+    tl.store(out_ptr + offsets, acc)
+
+
+@triton.jit
 def _map_elementwise_pack1_kernel(
     a_ptr, b_ptr, out0_ptr, out1_ptr, MULTI: tl.constexpr, BLOCK: tl.constexpr
 ):
@@ -224,6 +375,27 @@ def _map_elementwise_pack1_kernel(
     else:
         out0 = tl.map_elementwise(_map_linear, a, b)
         tl.store(out0_ptr + offsets, out0)
+
+
+@triton.jit
+def _map_elementwise_cfg_kernel(
+    a_ptr, b_ptr, out0_ptr, out1_ptr, MODE: tl.constexpr, BLOCK: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offsets)
+    b = tl.load(b_ptr + offsets)
+    if MODE == "compare":
+        out0 = tl.map_elementwise(_map_compare, a, b)
+        tl.store(out0_ptr + offsets, out0)
+    elif MODE == "early":
+        out0, out1 = tl.map_elementwise(_map_early_pair, a, b)
+        tl.store(out0_ptr + offsets, out0)
+        tl.store(out1_ptr + offsets, out1)
+    else:
+        tl.static_assert(MODE == "loops")
+        out0, out1 = tl.map_elementwise(_map_scalar_loops, a, b)
+        tl.store(out0_ptr + offsets, out0)
+        tl.store(out1_ptr + offsets, out1)
 
 
 _SIGNATURE_1ARG = {"out_ptr": "*fp32", "BLOCK": "constexpr"}
@@ -527,6 +699,220 @@ def test_map_elementwise_pack1_runtime(multi: bool):
         torch.testing.assert_close(out1.cpu(), (a - b).cpu(), atol=0, rtol=0)
     else:
         torch.testing.assert_close(out0.cpu(), (a * 3 + b).cpu(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", ["compare", "early", "loops"])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_map_elementwise_pack1_cfg_runtime(mode, num_warps):
+    block = 128
+    a = torch.arange(-64, 64, dtype=torch.int32, device="mps")
+    b = torch.arange(127, -1, -1, dtype=torch.int32, device="mps")
+    out0 = torch.empty(block, dtype=torch.int32, device="mps")
+    out1 = torch.empty(block, dtype=torch.int32, device="mps")
+
+    _map_elementwise_cfg_kernel[(1,)](
+        a, b, out0, out1, MODE=mode, BLOCK=block, num_warps=num_warps
+    )
+
+    a_cpu = a.cpu()
+    b_cpu = b.cpu()
+    if mode == "compare":
+        expected0 = (a_cpu > b_cpu).to(torch.int32) - (b_cpu > a_cpu).to(torch.int32)
+        torch.testing.assert_close(out0.cpu(), expected0, atol=0, rtol=0)
+    elif mode == "early":
+        negative = a_cpu < 0
+        expected0 = torch.where(negative, b_cpu - a_cpu, a_cpu + b_cpu)
+        expected1 = torch.where(negative, b_cpu + a_cpu, a_cpu - b_cpu)
+        torch.testing.assert_close(out0.cpu(), expected0, atol=0, rtol=0)
+        torch.testing.assert_close(out1.cpu(), expected1, atol=0, rtol=0)
+    else:
+        expected0 = a_cpu * 16 + b_cpu * 15
+        expected1 = b_cpu + a_cpu * 3 - 3
+        torch.testing.assert_close(out0.cpu(), expected0, atol=0, rtol=0)
+        torch.testing.assert_close(out1.cpu(), expected1, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("pack", [2, 4])
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (512, 4)])
+def test_map_elementwise_pack_cross_runtime(pack, block, num_warps):
+    a = torch.arange(block, dtype=torch.int32, device="mps") - block // 2
+    b = torch.arange(block, dtype=torch.int32, device="mps") % 17 - 8
+    out0 = torch.full((block,), -1, dtype=torch.int32, device="mps")
+    out1 = torch.full((block,), -1, dtype=torch.int32, device="mps")
+
+    _map_elementwise_pack_kernel[(1,)](
+        a, b, out0, out1, PACK=pack, BLOCK=block, num_warps=num_warps
+    )
+
+    a_cpu = a.cpu()
+    b_cpu = b.cpu()
+    if pack == 2:
+        a0, a1 = a_cpu.reshape(-1, 2).unbind(dim=1)
+        b0, b1 = b_cpu.reshape(-1, 2).unbind(dim=1)
+        expected0 = torch.stack((a0 * b1 + a1, b0 - a0), dim=1).reshape(-1)
+        expected1 = torch.stack((a1 + b0, b1 - a1), dim=1).reshape(-1)
+        torch.testing.assert_close(out1.cpu(), expected1, atol=0, rtol=0)
+    else:
+        a0, a1, a2, a3 = a_cpu.reshape(-1, 4).unbind(dim=1)
+        b0, b1, b2, b3 = b_cpu.reshape(-1, 4).unbind(dim=1)
+        expected0 = torch.stack(
+            (a0 * b3 + a1, a1 * b2 - a2, a2 + b1, a3 - b0), dim=1
+        ).reshape(-1)
+    torch.testing.assert_close(out0.cpu(), expected0, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (512, 4)])
+def test_map_elementwise_pack_cfg_runtime(block, num_warps):
+    a = torch.arange(block, dtype=torch.int32, device="mps") - block // 2
+    b = torch.arange(block, dtype=torch.int32, device="mps") % 17 - 8
+    out0 = torch.empty(block, dtype=torch.int32, device="mps")
+    out1 = torch.empty(block, dtype=torch.int32, device="mps")
+
+    _map_elementwise_pack_cfg_kernel[(1,)](
+        a, b, out0, out1, BLOCK=block, num_warps=num_warps
+    )
+
+    a0, a1 = a.cpu().reshape(-1, 2).unbind(dim=1)
+    b0, b1 = b.cpu().reshape(-1, 2).unbind(dim=1)
+    cond = a0 * b1 < a1 + b0
+    first0 = torch.where(cond, a1 - b0, a0 + b1)
+    second0 = torch.where(cond, a0 + b1, a1 - b0)
+    first1 = torch.where(cond, b1 - a0, b0 - a1)
+    second1 = torch.where(cond, b0 - a1, b1 - a0)
+    expected0 = torch.stack((first0, second0), dim=1).reshape(-1)
+    expected1 = torch.stack((first1, second1), dim=1).reshape(-1)
+    torch.testing.assert_close(out0.cpu(), expected0, atol=0, rtol=0)
+    torch.testing.assert_close(out1.cpu(), expected1, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("block,num_warps", [(128, 1), (512, 4)])
+def test_map_elementwise_two_pack_runtime(block, num_warps):
+    a = torch.arange(block, dtype=torch.int32, device="mps") - block // 2
+    b = torch.arange(block, dtype=torch.int32, device="mps") % 17 - 8
+    out0 = torch.empty(block, dtype=torch.int32, device="mps")
+    out1 = torch.empty(block, dtype=torch.int32, device="mps")
+
+    _map_elementwise_two_pack_kernel[(1,)](
+        a, b, out0, out1, BLOCK=block, num_warps=num_warps
+    )
+
+    a0, a1 = a.cpu().reshape(-1, 2).unbind(dim=1)
+    b0, b1 = b.cpu().reshape(-1, 2).unbind(dim=1)
+    x00 = a0 * b1 + a1
+    x01 = b0 - a0
+    x10 = a1 + b0
+    x11 = b1 - a1
+    cond = x00 * x11 < x01 + x10
+    expected0 = torch.where(cond, x01 - x10, x00 + x11)
+    expected1 = torch.where(cond, x00 + x11, x01 - x10)
+    other0 = torch.where(cond, x11 - x00, x10 - x01)
+    other1 = torch.where(cond, x10 - x01, x11 - x00)
+    torch.testing.assert_close(
+        out0.cpu(), torch.stack((expected0, expected1), dim=1).reshape(-1), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        out1.cpu(), torch.stack((other0, other1), dim=1).reshape(-1), atol=0, rtol=0
+    )
+
+
+def test_map_elementwise_pack_rank2_multi_program_masked():
+    programs, m, n, bm, bn = 3, 3, 30, 4, 32
+    storage = programs * bm * bn + 16
+    a = torch.arange(storage, dtype=torch.int32, device="mps") - 37
+    b = torch.arange(storage, dtype=torch.int32, device="mps") % 19 - 9
+    out0 = torch.full((storage,), -101, dtype=torch.int32, device="mps")
+    out1 = torch.full((storage,), -101, dtype=torch.int32, device="mps")
+
+    _map_elementwise_pack_rank2_kernel[(programs,)](
+        a, b, out0, out1, m, n, BM=bm, BN=bn, num_warps=1
+    )
+
+    rows = torch.arange(bm)[None, :, None]
+    cols = torch.arange(bn)[None, None, :]
+    mask = (rows < m) & (cols < n)
+    a0, a1 = a.cpu().reshape(-1, 2).unbind(dim=1)
+    b0, b1 = b.cpu().reshape(-1, 2).unbind(dim=1)
+    expected0 = torch.stack((a0 * b1 + a1, b0 - a0), dim=1).reshape(-1)
+    expected1 = torch.stack((a1 + b0, b1 - a1), dim=1).reshape(-1)
+    valid = mask.expand(programs, bm, bn).reshape(-1)
+    valid = torch.cat((valid, torch.zeros(16, dtype=torch.bool)))
+    sentinel = torch.full_like(expected0, -101)
+    torch.testing.assert_close(
+        out0.cpu(), torch.where(valid, expected0, sentinel), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        out1.cpu(), torch.where(valid, expected1, sentinel), atol=0, rtol=0
+    )
+
+
+def _check_map_pack1_recovery():
+    block = 128
+    a = torch.arange(block, dtype=torch.int32, device="mps")
+    b = torch.arange(block, dtype=torch.int32, device="mps") * 2
+    out0 = torch.empty(block, dtype=torch.int32, device="mps")
+    out1 = torch.empty(block, dtype=torch.int32, device="mps")
+    _map_elementwise_pack1_kernel[(1,)](
+        a, b, out0, out1, MULTI=False, BLOCK=block
+    )
+    torch.testing.assert_close(out0.cpu(), (a * 3 + b).cpu(), atol=0, rtol=0)
+
+
+def test_map_elementwise_pack_rejects_indivisible_elements(capfd):
+    block = 128
+    a = torch.ones(block, dtype=torch.int32, device="mps")
+    b = torch.ones(block, dtype=torch.int32, device="mps")
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _map_elementwise_pack_kernel[(1,)](
+            a, b, out0, out1, PACK=2, BLOCK=block, num_warps=4
+        )
+    assert "must divide the 1 unique elements per thread" in capfd.readouterr().err
+    _check_map_pack1_recovery()
+
+
+def test_map_elementwise_pack_rejects_rank3(capfd):
+    out = torch.empty(128, dtype=torch.int32, device="mps")
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _map_elementwise_pack_rank3_kernel[(1,)](out)
+    assert "requires a static rank-1/rank-2 blocked tensor" in capfd.readouterr().err
+    _check_map_pack1_recovery()
+
+
+def test_map_elementwise_pack_rejects_loop(capfd):
+    block = 128
+    a = torch.ones(block, dtype=torch.int32, device="mps")
+    b = torch.ones(block, dtype=torch.int32, device="mps")
+    out = torch.empty_like(a)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _map_elementwise_pack_loop_kernel[(1,)](a, b, out, BLOCK=block)
+    assert "inside a loop, nested scan, or conditional control flow" in capfd.readouterr().err
+    _check_map_pack1_recovery()
+
+
+def test_map_elementwise_pack_rejects_while(capfd):
+    block = 128
+    a = torch.ones(block, dtype=torch.int32, device="mps")
+    b = torch.ones(block, dtype=torch.int32, device="mps")
+    out = torch.empty_like(a)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _map_elementwise_pack_while_kernel[(1,)](a, b, out, BLOCK=block)
+    assert "inside a loop, nested scan, or conditional control flow" in capfd.readouterr().err
+    _check_map_pack1_recovery()
+
+
+def test_map_elementwise_pack_rejects_scratch_overflow(capfd):
+    block = 16384
+    a = torch.ones(block, dtype=torch.int32, device="mps")
+    b = torch.ones(block, dtype=torch.int32, device="mps")
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    with pytest.raises(RuntimeError, match="convert-tritongpu-to-metal failed"):
+        _map_elementwise_pack_kernel[(1,)](
+            a, b, out0, out1, PACK=4, BLOCK=block, num_warps=1
+        )
+    assert "32768-byte budget" in capfd.readouterr().err
+    _check_map_pack1_recovery()
 
 
 @pytest.mark.parametrize("N, R", [(1, 0), (31, 1), (1024, 2), (1025, 3), (2053, 10), (65539, 20)])
