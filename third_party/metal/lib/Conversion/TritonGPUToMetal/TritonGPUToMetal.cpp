@@ -43388,21 +43388,32 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
            !mlir::isa<mlir::triton::LoadOp>(def)))
         return false;
       if (mlir::isa<mlir::triton::LoadOp>(def)) {
-        if (def->getBlock() == branch->getBlock()) {
-          if (!def->isBeforeInBlock(branch))
-            return false;
-          for (mlir::Operation *op = def->getNextNode(); op && op != branch;
-               op = op->getNextNode())
-            if (!mlir::isMemoryEffectFree(op) &&
-                !mlir::isa<mlir::triton::LoadOp>(op))
-              return false;
-        } else if (def->getBlock() == &region.front()) {
+        if (def->getBlock() == &region.front()) {
           for (mlir::Operation &op : *def->getBlock())
             if (&op != def && !mlir::isMemoryEffectFree(&op) &&
                 !mlir::isa<mlir::triton::LoadOp>(&op))
               return false;
         } else {
-          return false;
+          bool foundScope = false;
+          for (mlir::Operation *scope = branch.getOperation(); scope;
+               scope = scope->getParentOp()) {
+            if (def->getBlock() == scope->getBlock()) {
+              if (!def->isBeforeInBlock(scope))
+                return false;
+              for (mlir::Operation *op = def->getNextNode(); op && op != scope;
+                   op = op->getNextNode())
+                if (!mlir::isMemoryEffectFree(op) &&
+                    !mlir::isa<mlir::triton::LoadOp>(op))
+                  return false;
+              foundScope = true;
+              break;
+            }
+            if (!mlir::isa<mlir::scf::IfOp, mlir::scf::ForOp>(
+                    scope->getParentOp()))
+              break;
+          }
+          if (!foundScope)
+            return false;
         }
       }
       llvm::append_range(worklist, def->getOperands());
@@ -43710,48 +43721,76 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       if (!nested && (after || !mlir::isMemoryEffectFree(&op)))
         outerTensorWork |= touchesTensor(op);
     }
+    loop.getBody()->walk([&](mlir::scf::IfOp branch) {
+      if (!valid || branch.getNumResults() == 0)
+        return;
+      for (mlir::Operation *parent = branch->getParentOp(); parent != loop;
+           parent = parent->getParentOp()) {
+        auto outer = mlir::dyn_cast<mlir::scf::IfOp>(parent);
+        if (!outer || outer.getNumResults() != 0) {
+          branch.emitOpError(
+              "Metal backend: nested scan result if requires only no-result "
+              "uniform if ancestors inside the selected loop");
+          valid = false;
+          return;
+        }
+      }
+      if (!nestedScanInternalIfSourcesSafe(branch)) {
+        branch.emitOpError(
+            "Metal backend: nested scan result if cannot replay its result "
+            "sources");
+        valid = false;
+        return;
+      }
+      bool first =
+          g_nestedScanInternalResultIfs.insert(branch.getOperation()).second;
+      auto tile = findTileInfo(func);
+      if (!tile) {
+        branch.emitOpError(
+            "Metal backend: nested scan internal result if has no tile");
+        valid = false;
+        return;
+      }
+      for (mlir::Type type : branch.getResultTypes()) {
+        llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
+        if (!why.empty()) {
+          branch.emitOpError("Metal backend: ") << why;
+          valid = false;
+          return;
+        }
+        if (first) {
+          auto rtt = mlir::cast<mlir::RankedTensorType>(type);
+          g_nestedScanCarryBytes[func.getOperation()] +=
+              rtt.getNumElements() *
+              (metalStorageElementType(rtt.getElementType())
+                   .getIntOrFloatBitWidth() /
+               8);
+        }
+      }
+    });
+    if (!valid)
+      return mlir::failure();
     for (mlir::Operation &op : *loop.getBody()) {
       if (mlir::isa<mlir::triton::ScanOp>(&op) ||
           op.hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
-      if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
-          branch && branch.getNumResults() != 0) {
-        if (!nestedScanInternalIfSourcesSafe(branch))
-          return branch.emitOpError(
-              "Metal backend: nested scan result if cannot replay its result "
-              "sources");
-        bool first = g_nestedScanInternalResultIfs.insert(&op).second;
-        auto tile = findTileInfo(func);
-        if (!tile)
-          return branch.emitOpError(
-              "Metal backend: nested scan internal result if has no tile");
-        for (mlir::Type type : branch.getResultTypes()) {
-          llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
-          if (!why.empty())
-            return branch.emitOpError("Metal backend: ") << why;
-          if (first) {
-            auto rtt = mlir::cast<mlir::RankedTensorType>(type);
-            g_nestedScanCarryBytes[func.getOperation()] +=
-                rtt.getNumElements() *
-                (metalStorageElementType(rtt.getElementType())
-                     .getIntOrFloatBitWidth() /
-                 8);
-          }
-        }
+      if (g_nestedScanInternalResultIfs.count(&op))
         continue;
-      }
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
         bool flat = true;
-        branch->walk([&](mlir::Operation *nestedOp) {
+        branch->walk([&](mlir::Operation *nestedOp) -> mlir::WalkResult {
           if (nestedOp == branch.getOperation() ||
               nestedOp->hasTrait<mlir::OpTrait::IsTerminator>())
-            return;
+            return mlir::WalkResult::advance();
+          if (g_nestedScanInternalResultIfs.count(nestedOp))
+            return mlir::WalkResult::skip();
           if (nestedOp->getNumRegions() ||
               (!mlir::isMemoryEffectFree(nestedOp) &&
                !mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp,
                           mlir::triton::GetProgramIdOp>(nestedOp)))
             flat = false;
+          return mlir::WalkResult::advance();
         });
         if (flat)
           continue;
@@ -43832,8 +43871,10 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
     for (mlir::Operation &op : *loop.getBody())
       bodyOps.push_back(&op);
     for (mlir::Operation *op : bodyOps)
-      for (mlir::OpOperand &use : op->getOpOperands())
-        use.set(localize(use.get()));
+      op->walk([&](mlir::Operation *nested) {
+        for (mlir::OpOperand &use : nested->getOpOperands())
+          use.set(localize(use.get()));
+      });
     // Remove only dead originals so no tensor outside a band loop is
     // accidentally scalarized.
     bool changed = true;
@@ -44669,7 +44710,7 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     bool selected = internalLoop
                         ? g_nestedScanInternalResultIfs.count(
                               op.getOperation()) &&
-                              op->getBlock() == internalLoop.getBody()
+                              internalLoop->isAncestor(op)
                         : g_nestedScanResultIfs.count(op.getOperation());
     if (selected)
       ifs.push_back(op);
