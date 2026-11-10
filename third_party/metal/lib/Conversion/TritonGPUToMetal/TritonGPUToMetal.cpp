@@ -43383,7 +43383,8 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
       mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
       if (!def || !visited.insert(def).second)
         continue;
-      if (def->getNumRegions() ||
+      bool internalResult = g_nestedScanInternalResultIfs.count(def);
+      if ((!internalResult && def->getNumRegions()) ||
           (!mlir::isMemoryEffectFree(def) &&
            !mlir::isa<mlir::triton::LoadOp>(def)))
         return false;
@@ -43419,7 +43420,15 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
             return false;
         }
       }
-      llvm::append_range(worklist, def->getOperands());
+      if (internalResult) {
+        for (mlir::Region &sourceRegion : def->getRegions()) {
+          auto sourceYield = mlir::cast<mlir::scf::YieldOp>(
+              sourceRegion.front().getTerminator());
+          llvm::append_range(worklist, sourceYield.getOperands());
+        }
+      } else {
+        llvm::append_range(worklist, def->getOperands());
+      }
     }
   }
   return true;

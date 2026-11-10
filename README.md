@@ -297,8 +297,9 @@ Sibling scan loops keep independent phase schedules. Result-carrying outer
 loop admits no-result uniform `scf.if` bodies and supported result-carrying
 internal ifs, including local result ifs within nested no-result branch chains.
 Internal results use slots before local phase splitting, with pure or provably
-write-separated load sources. Multiple results may feed independent scans
-without replaying the branch region. Each iteration publishes complete
+write-separated load sources. Multiple results may feed independent scans or
+later result ifs through their slots without replaying the branch region. Each
+iteration publishes complete
 tiles before prefix reads and synchronizes scratch reuse. While snapshots
 crossing writes, unsafe
 cross-phase replay, rank-1 XOR, wider integers, and compound XOR combines retain
@@ -788,9 +789,9 @@ case and an adjacent rejection regression.
    Result-carrying outer `scf.if` values use budgeted branch slots and a uniform
    post-if band. Supported result-carrying internal ifs in the selected loop use
    slots before phase splitting, with pure or write-separated load sources.
-   Multiple internal results can feed independent scans through their own slots.
-   External while snapshots without intervening writes are also
-   materialized once through pre-band slots. A read-only scalar-dot result may
+   Multiple internal results can feed independent scans or chained result ifs
+   through their own slots. External while snapshots without intervening writes
+   are also materialized once through pre-band slots. A read-only scalar-dot result may
    feed either a same-loop or top-level multiband scan using the result layout's
    exact element index. While snapshots crossing writes,
    mismatched-register-count tiles, and unsafe cross-phase replay remain
