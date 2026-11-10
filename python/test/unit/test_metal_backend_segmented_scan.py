@@ -1998,6 +1998,22 @@ def test_multiband_scan_while_tensor_carry_matches_torch(rows, num_warps):
 @mps_only
 @pytest.mark.parametrize("rows", [0, 3])
 @pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_while_snapshot_matches_torch(rows, num_warps):
+    x = (torch.arange(512).reshape(8, 64) % 7 - 3).float()
+    out = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    _rankn_scan_while_snapshot_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.zeros(8, 64)
+    for row in range(rows):
+        for col in range(2):
+            expected += (x + col).cumsum(1)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
 def test_multiband_scan_result_carrying_if_matches_torch(rows, num_warps):
     storage_rows = max(rows, 1)
     x = (torch.arange(storage_rows * 512)
@@ -2603,10 +2619,36 @@ def _rankn_scan_while_snapshot_kernel(x_ptr, out_ptr, rows):
 
 
 @triton.jit
+def _rankn_scan_while_snapshot_write_kernel(x_ptr, out_ptr, scratch_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    snapshot = tl.load(x_ptr + index)
+    tl.store(scratch_ptr + index, 0.0)
+    acc = tl.zeros((8, 64), tl.float32)
+    row = 0
+    while row < rows:
+        for col in range(2):
+            acc += tl.cumsum(snapshot + col, 1)
+        row += 1
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
 def _rankn_scan_internal_result_if_kernel(x_ptr, out_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     for row in range(rows):
         x = tl.load(x_ptr + row * 512 + index)
+        if row == 0:
+            x = x + 1.0
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
+
+
+@triton.jit
+def _rankn_scan_internal_result_if_write_kernel(x_ptr, out_ptr, scratch_ptr,
+                                                rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        tl.store(scratch_ptr + index, 0.0)
         if row == 0:
             x = x + 1.0
         tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
@@ -2643,12 +2685,14 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
 
 
 @pytest.mark.parametrize("kernel,signature,reason", [
-    ("_rankn_scan_while_snapshot_kernel",
-     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
-     "while cannot capture an external tensor snapshot"),
-    ("_rankn_scan_internal_result_if_kernel",
-     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
-     "no-result uniform if"),
+    ("_rankn_scan_while_snapshot_write_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
+      "rows": "i32"},
+     "while snapshot crosses a memory write"),
+    ("_rankn_scan_internal_result_if_write_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
+      "rows": "i32"},
+     "result if cannot replay its result sources"),
     ("_rankn_scan_scalar_store_reorder_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scalar_ptr": "*fp32",
       "rows": "i32"},
@@ -2729,6 +2773,26 @@ def test_tuple_scan_rankn_nested_loop_internal_if_matches_torch(rows,
     torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
     torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
     torch.testing.assert_close(branch.cpu(), expected_branch, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_internal_result_if_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_internal_result_if_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        modified = x.clone()
+        modified[0] += 1.0
+        expected = modified.cumsum(2)
+    else:
+        expected = torch.full_like(x, -999999)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 @mps_only

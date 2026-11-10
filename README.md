@@ -289,15 +289,18 @@ the same layout mapping. Single-value and tuple scans also stage multiple
 elements per thread inside a uniform runtime loop. That innermost scan loop may
 be nested in uniform outer `scf.for`, `scf.if`, and `scf.while` control flow.
 While conditions remain pure scalar computations; mixed scalar/tensor state uses
-the same budgeted slots as outer `for` loops. Outer `for` scopes support flat
-tensor load/compute/store work, mixed carries, and non-replayable snapshots.
+the same budgeted slots as outer `for` loops. External while snapshots without
+intervening writes are materialized through the same pre-band slots. Outer `for`
+scopes support flat tensor load/compute/store work, mixed carries, and snapshots.
 Sibling scan loops keep independent phase schedules. Result-carrying outer
-`scf.if` branches publish tensor results through budgeted slots; the selected
-loop also admits no-result uniform `scf.if` bodies containing flat
-load/compute/store work. Each iteration publishes complete tiles before prefix
-reads and synchronizes scratch reuse. External while snapshots, unsafe cross-
-phase replay, rank-1 XOR, wider integers, and compound XOR combines retain named
-preflight rejection.
+`scf.if` branches publish tensor results through budgeted slots. The selected
+loop admits no-result uniform `scf.if` bodies and supported result-carrying
+internal ifs; internal results use slots before local phase splitting, with pure
+or provably write-separated load sources. Each iteration publishes complete
+tiles before prefix reads and synchronizes scratch reuse. While snapshots
+crossing writes, unsafe
+cross-phase replay, rank-1 XOR, wider integers, and compound XOR combines retain
+named preflight rejection.
 
 Tensor-descriptor reducing stores use Triton's standard
 `triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
@@ -781,10 +784,14 @@ case and an adjacent rejection regression.
    snapshots are materialized once and localized to the consuming bands. Sibling
    scan loops beneath outer control flow retain independent phase schedules.
    Result-carrying outer `scf.if` values use budgeted branch slots and a uniform
-   post-if band. A read-only scalar-dot result may feed either a same-loop or
-   top-level multiband scan using the result layout's exact element index.
-   External while snapshots, mismatched-register-count tiles, and unsafe
-   cross-phase replay remain rejected.
+   post-if band. Supported result-carrying internal ifs in the selected loop use
+   slots before phase splitting, with pure or write-separated load sources.
+   External while snapshots without intervening writes are also
+   materialized once through pre-band slots. A read-only scalar-dot result may
+   feed either a same-loop or top-level multiband scan using the result layout's
+   exact element index. While snapshots crossing writes,
+   mismatched-register-count tiles, and unsafe cross-phase replay remain
+   rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing
