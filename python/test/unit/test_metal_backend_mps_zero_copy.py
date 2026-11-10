@@ -124,6 +124,24 @@ def test_add_cpu_tensor_writeback():
     torch.testing.assert_close(out, x + y)
 
 
+def test_add_mps_tensor_wrapper_noncontiguous_writeback():
+    N, BLOCK = 1024, 1024
+    x = torch.randint(0, 1000, (2 * N,), dtype=torch.int32, device="mps")[::2]
+    y = torch.randint(0, 1000, (2 * N,), dtype=torch.int32, device="mps")[::2]
+    out_storage = torch.full((2 * N,), -1, dtype=torch.int32, device="mps")
+    out = out_storage[::2]
+    x_arg = triton.reinterpret(x, tl.uint32)
+    y_arg = triton.reinterpret(y, tl.uint32)
+    out_arg = triton.reinterpret(out, tl.uint32)
+    assert not x.is_contiguous()
+
+    _add_kernel[(1,)](x_arg, y_arg, out_arg, N, BLOCK=BLOCK)
+
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, x + y)
+    assert torch.all(out_storage[1::2] == -1)
+
+
 # A @triton.jit function's name becomes the MSL entry-point name verbatim, and
 # `kernel` / `device` are reserved MSL keywords -> `kernel void kernel(...)` is a
 # torch.mps.compile_shader SyntaxError. This is exactly what

@@ -1271,16 +1271,71 @@ def _scan_nested_loop_tensor_carry_kernel(x_ptr, out_ptr, outer, trips):
 
 
 @triton.jit
-def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
-    index = tl.reshape(tl.arange(0, 128), (8, 16))
-    if rows > 0:
-        for row in range(rows):
-            x = tl.load(x_ptr + row * 128 + index)
-            count = tl.full((8, 16), 1, tl.int32)
+def _scan_outer_loop_tensor_carry_kernel(x_ptr, out_ptr, outer, trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    acc = tl.zeros((8, 64), tl.float32)
+    for outer_index in range(outer):
+        for t in range(trips):
+            offset = (outer_index * trips + t) * 512 + off
+            x = tl.load(x_ptr + offset)
+            acc += tl.cumsum(x, 1)
+        tl.store(out_ptr + outer_index * 512 + off, acc)
+
+
+@triton.jit
+def _scan_nested_loop_snapshot_kernel(x_ptr, out_ptr, outer, trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    snapshot = tl.load(x_ptr + off)
+    for outer_index in range(outer):
+        for t in range(trips):
+            offset = (outer_index * trips + t) * 512 + off
+            value = tl.cumsum(snapshot + t, 1)
+            tl.store(out_ptr + offset, value)
+
+
+@triton.jit
+def _rankn_tuple_scan_while_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    row = 0
+    while row < rows:
+        for col in range(2):
+            offset = (row * 2 + col) * 512 + index
+            x = tl.load(x_ptr + offset)
+            count = tl.full((8, 64), 1, tl.int32)
             value, count = tl.associative_scan((x, count), 1,
                                                _tuple_sum_and_count_combine)
-            tl.store(value_ptr + row * 128 + index, value)
-            tl.store(count_ptr + row * 128 + index, count)
+            tl.store(value_ptr + offset, value)
+            tl.store(count_ptr + offset, count)
+        row += 1
+
+
+@triton.jit
+def _rankn_scan_result_if_kernel(x_ptr, out_ptr, other_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    acc = tl.zeros((8, 64), tl.float32)
+    if rows > 0:
+        for row in range(rows):
+            x = tl.load(x_ptr + row * 512 + index)
+            acc += tl.cumsum(x, 1)
+        other = acc + 2.0
+    else:
+        acc = acc + 1.0
+        other = acc + 3.0
+    tl.store(out_ptr + index, acc)
+    tl.store(other_ptr + index, other)
+
+
+@triton.jit
+def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    if rows > 0:
+        for row in range(rows):
+            x = tl.load(x_ptr + row * 512 + index)
+            count = tl.full((8, 64), 1, tl.int32)
+            value, count = tl.associative_scan((x, count), 1,
+                                               _tuple_sum_and_count_combine)
+            tl.store(value_ptr + row * 512 + index, value)
+            tl.store(count_ptr + row * 512 + index, count)
 
 
 @triton.jit
@@ -1322,7 +1377,8 @@ def _rankn_tuple_scan_scalar_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows
 
 
 @triton.jit
-def _rankn_tuple_scan_dot_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
+def _rankn_tuple_scan_dot_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows,
+                                            STORE_DOT: tl.constexpr = False):
     row = tl.arange(0, 16)
     column = tl.arange(0, 16)
     index = row[:, None] * 16 + column[None, :]
@@ -1331,6 +1387,8 @@ def _rankn_tuple_scan_dot_carry_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
         x = tl.load(x_ptr + row * 256 + index)
         acc = tl.dot(x, x, acc)
         tl.store(value_ptr + row * 256 + index, tl.cumsum(acc, 1))
+    if STORE_DOT:
+        tl.store(count_ptr + index, acc)
 
 
 @triton.jit
@@ -1404,6 +1462,54 @@ def test_multiband_scan_two_carried_loops_match_torch(trips, num_warps):
     torch.mps.synchronize()
     torch.testing.assert_close(mid.cpu(), x[:trips].cumsum(2).sum(0), atol=0, rtol=0)
     torch.testing.assert_close(out.cpu(), x[trips:2 * trips].cumsum(2).sum(0), atol=0, rtol=0)
+
+
+@triton.jit
+def _scan_outer_two_carried_loops_kernel(x_ptr, first_ptr, other_ptr, outer,
+                                         trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    first = tl.zeros((8, 64), tl.float32)
+    other = tl.zeros((8, 64), tl.float32)
+    for outer_index in range(outer):
+        for t in range(trips):
+            x = tl.load(x_ptr + (outer_index * 2 * trips + t) * 512 + off)
+            first += tl.cumsum(x, 1)
+        for t in range(trips):
+            x = tl.load(x_ptr + (outer_index * 2 * trips + trips + t) * 512 + off)
+            other += tl.cumsum(x + first, 1)
+        tl.store(first_ptr + outer_index * 512 + off, first)
+        tl.store(other_ptr + outer_index * 512 + off, other)
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("trips", [0, 3])
+def test_multiband_scan_outer_two_carried_loops_match_torch(trips, num_warps):
+    outer = 2
+    x = (torch.arange(max(outer * 2 * trips, 1) * 512) % 7 - 3).float().reshape(
+        -1, 8, 64)
+    first_out = torch.full((outer, 8, 64), -999999, dtype=torch.float32,
+                           device="mps")
+    other_out = torch.full((outer, 8, 64), -999999, dtype=torch.float32,
+                           device="mps")
+    _scan_outer_two_carried_loops_kernel[(1,)](
+        x.to("mps"), first_out, other_out, outer, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    first = torch.zeros(8, 64)
+    other = torch.zeros(8, 64)
+    expected_first = []
+    expected_other = []
+    for outer_index in range(outer):
+        for t in range(trips):
+            first += x[outer_index * 2 * trips + t].cumsum(1)
+        for t in range(trips):
+            other += (x[outer_index * 2 * trips + trips + t] + first).cumsum(1)
+        expected_first.append(first.clone())
+        expected_other.append(other.clone())
+    torch.testing.assert_close(first_out.cpu(), torch.stack(expected_first),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(other_out.cpu(), torch.stack(expected_other),
+                               atol=0, rtol=0)
 
 
 @triton.jit
@@ -1828,31 +1934,171 @@ def test_nested_scan_loop_tensor_carry_matches_torch(trips, num_warps):
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("kernel,reason", [
-    ("_rankn_tuple_scan_conditional_loop_kernel",
-     "nested scan outer control flow must contain only uniform scalar for loops"),
-    ("_rankn_tuple_scan_dot_carry_loop_kernel",
-     "a tile-carrying tl.dot result cannot feed the same loop's scan"),
-    ("_rankn_tuple_scan_hoisted_snapshot_loop_kernel",
-     "staged scan cannot partition surrounding loops"),
-])
-def test_tuple_scan_rankn_nested_invalid_loop_is_named(kernel, reason):
-    script = textwrap.dedent(f"""
-        import importlib.util
-        import triton
-        from triton.backends.compiler import GPUTarget
-        from triton.compiler import ASTSource
-        spec = importlib.util.spec_from_file_location("scan_child", {str(Path(__file__).resolve())!r})
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        src = ASTSource(fn=getattr(module, {kernel!r}),
-            signature={{"x_ptr": "*fp32", "value_ptr": "*fp32", "count_ptr": "*i32", "rows": "i32"}},
-            constexprs={{}})
-        triton.compile(src, target=GPUTarget("metal", 80, 32), options={{"num_warps": 1}})
-    """)
-    result = _run_child(script)
-    assert result.returncode > 0, result.stdout + result.stderr
-    assert reason in result.stdout + result.stderr
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_conditional_loop_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    count = torch.full(x.shape, -999999, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_conditional_loop_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        expected_value = x.cumsum(2)
+        expected_count = torch.ones_like(x, dtype=torch.int32).cumsum(
+            2, dtype=torch.int32)
+    else:
+        expected_value = torch.full_like(x, -999999)
+        expected_count = torch.full_like(x, -999999, dtype=torch.int32)
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_while_loop_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 2 * 512)
+         .reshape(storage_rows, 2, 8, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    count = torch.full(x.shape, -999999, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_while_loop_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        expected_value = x.cumsum(3)
+        expected_count = torch.ones_like(x, dtype=torch.int32).cumsum(
+            3, dtype=torch.int32)
+    else:
+        expected_value = torch.full_like(x, -999999)
+        expected_count = torch.full(x.shape, -999999, dtype=torch.int32)
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_result_carrying_if_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    other = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    _rankn_scan_result_if_kernel[(1,)](
+        x.to("mps"), out, other, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = (x.cumsum(2).sum(0) if rows else torch.ones(8, 64))
+    expected_other = expected + (2.0 if rows else 3.0)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(other.cpu(), expected_other, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("trips", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_nested_scan_outer_loop_tensor_carry_matches_torch(trips, num_warps):
+    outer = 2
+    x = (torch.arange(max(outer * trips, 1) * 512) % 7 - 3).float().reshape(
+        -1, 8, 64)
+    out = torch.full((outer, 8, 64), -999999, dtype=torch.float32, device="mps")
+    _scan_outer_loop_tensor_carry_kernel[(1,)](
+        x.to("mps"), out, outer, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    acc = torch.zeros(8, 64)
+    expected = []
+    for outer_index in range(outer):
+        for t in range(trips):
+            acc += x[outer_index * trips + t].cumsum(1)
+        expected.append(acc.clone())
+    torch.testing.assert_close(out.cpu(), torch.stack(expected), atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("trips", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_nested_scan_outer_loop_snapshot_matches_torch(trips, num_warps):
+    outer = 2
+    x = (torch.arange(512) % 7 - 3).float().reshape(8, 64)
+    out = torch.full((max(outer * trips, 1), 8, 64), -999999,
+                     dtype=torch.float32, device="mps")
+    _scan_nested_loop_snapshot_kernel[(1,)](
+        x.to("mps"), out, outer, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    if trips:
+        expected = torch.stack([
+            (x + t).cumsum(1) for outer_index in range(outer)
+            for t in range(trips)
+        ])
+    else:
+        expected = torch.full((1, 8, 64), -999999, dtype=torch.float32)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+def test_tuple_scan_rankn_hoisted_snapshot_loop_matches_torch():
+    rows = 4
+    x = torch.randn(rows, 8, 16)
+    value = torch.empty_like(x, device="mps")
+    count = torch.empty(x.shape, dtype=torch.int32, device="mps")
+    _rankn_tuple_scan_hoisted_snapshot_loop_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=1)
+    torch.mps.synchronize()
+    expected_count = torch.ones(8, 16, dtype=torch.int32).cumsum(
+        1, dtype=torch.int32)
+    for row in range(rows):
+        torch.testing.assert_close(value[row].cpu(), x[0].cumsum(1),
+                                   atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(count[row].cpu(), expected_count,
+                                   atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_loop_dot_result_feeds_scan(rows, num_warps):
+    x = (torch.arange(max(rows, 1) * 256) % 7 - 3).float().reshape(
+        -1, 16, 16) / 8
+    value = torch.full_like(x, -999999, device="mps")
+    final = torch.zeros((16, 16), dtype=torch.float32, device="mps")
+    _rankn_tuple_scan_dot_carry_loop_kernel[(1,)](
+        x.to("mps"), value, final, rows, STORE_DOT=True, num_warps=num_warps)
+    torch.mps.synchronize()
+    acc = torch.zeros(16, 16)
+    expected = []
+    for row in range(rows):
+        acc += x[row] @ x[row]
+        expected.append(acc.cumsum(1))
+    expected_value = (torch.stack(expected) if rows else
+                      torch.full((1, 16, 16), -999999, dtype=torch.float32))
+    torch.testing.assert_close(value.cpu(), expected_value,
+                               atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(final.cpu(), acc, atol=1e-4, rtol=1e-4)
+
+
+@triton.jit
+def _scan_top_level_dot_kernel(x_ptr, out_ptr):
+    row = tl.arange(0, 16)
+    column = tl.arange(0, 16)
+    index = row[:, None] * 16 + column[None, :]
+    x = tl.load(x_ptr + index)
+    value = tl.dot(x, x)
+    tl.store(out_ptr + index, tl.cumsum(value, 1))
+
+
+@mps_only
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_top_level_dot_result_feeds_scan(num_warps):
+    x = ((torch.arange(256) % 7 - 3).float().reshape(16, 16) / 8)
+    out = torch.full((16, 16), -999999, dtype=torch.float32, device="mps")
+    _scan_top_level_dot_kernel[(1,)](x.to("mps"), out, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), (x @ x).cumsum(1),
+                               atol=1e-4, rtol=1e-4)
 
 
 @triton.jit
@@ -2271,18 +2517,83 @@ def _rankn_tuple_nested_loop_outer_store_kernel(x_ptr, value_ptr, count_ptr,
 
 @triton.jit
 def _rankn_tuple_nested_loop_internal_if_kernel(x_ptr, value_ptr, count_ptr,
-                                                rows):
+                                                branch_ptr, rows):
     index = tl.reshape(tl.arange(0, 2048), (32, 64))
     for row in range(rows):
         offset = row * 2048 + index
         value = tl.load(x_ptr + offset)
         if row == 0:
-            tl.store(value_ptr + offset, value)
+            tl.store(branch_ptr + offset, value)
         count = tl.full((32, 64), 1, tl.int32)
         value, count = tl.associative_scan((value, count), 1,
                                            _tuple_sum_and_count_combine)
         tl.store(value_ptr + offset, value)
         tl.store(count_ptr + offset, count)
+
+
+@triton.jit
+def _rankn_tuple_nested_loop_scalar_store_kernel(x_ptr, value_ptr, count_ptr,
+                                                 scalar_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        tl.store(scalar_ptr, 0.0)
+        for col in range(rows):
+            offset = (row * rows + col) * 512 + index
+            value = tl.load(x_ptr + offset)
+            count = tl.full((8, 64), 1, tl.int32)
+            value, count = tl.associative_scan((value, count), 1,
+                                               _tuple_sum_and_count_combine)
+            tl.store(value_ptr + offset, value)
+            tl.store(count_ptr + offset, count)
+
+
+@triton.jit
+def _rankn_tuple_nested_loop_mixed_outer_carry_kernel(x_ptr, value_ptr,
+                                                       count_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    value = tl.zeros((8, 64), tl.float32)
+    total = 0.0
+    for row in range(rows):
+        total += 1.0
+        for col in range(rows):
+            offset = (row * rows + col) * 512 + index
+            value += tl.cumsum(tl.load(x_ptr + offset) + total, 1)
+        tl.store(value_ptr + row * 512 + index, value)
+
+
+@triton.jit
+def _rankn_scan_while_tensor_carry_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    acc = tl.zeros((8, 64), tl.float32)
+    row = 0
+    while row < rows:
+        for col in range(2):
+            offset = (row * 2 + col) * 512 + index
+            acc += tl.cumsum(tl.load(x_ptr + offset), 1)
+        row += 1
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
+def _rankn_scan_internal_result_if_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row == 0:
+            x = x + 1.0
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
+
+
+@triton.jit
+def _rankn_scan_scalar_store_reorder_kernel(x_ptr, out_ptr, scalar_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        tl.store(out_ptr + index, 0.0)
+        tl.store(scalar_ptr, 0.0)
+        for col in range(2):
+            offset = (row * 2 + col) * 512 + index
+            x = tl.load(x_ptr + offset)
+            tl.store(out_ptr + offset, tl.cumsum(x, 1))
 
 
 def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
@@ -2301,6 +2612,26 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
                        options={{"num_warps": {num_warps}}})
     """)
     return _run_child(script)
+
+
+@pytest.mark.parametrize("kernel,signature,reason", [
+    ("_rankn_scan_while_tensor_carry_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
+     "outer whiles cannot carry tensors"),
+    ("_rankn_scan_internal_result_if_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
+     "no-result uniform if"),
+    ("_rankn_scan_scalar_store_reorder_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "scalar_ptr": "*fp32",
+      "rows": "i32"},
+     "cannot move tensor work across a scalar store"),
+])
+def test_multiband_scan_deeper_cfg_remaining_boundaries_are_named(
+        kernel, signature, reason):
+    result = _compile_rankn_nested_negative_in_child(kernel, signature, {})
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert reason in output
 
 
 @pytest.mark.parametrize("shape,axis,repeats,num_warps", [
@@ -2323,22 +2654,105 @@ def test_tuple_scan_rankn_nested_loop_budget_is_named(
     assert "exceeding the 32768-byte budget" in reason
 
 
-@pytest.mark.parametrize("kernel,reason", [
-    ("_rankn_tuple_nested_loop_outer_store_kernel",
-     "nested scan cannot replay an external tensor value or move outer effects"),
-    ("_rankn_tuple_nested_loop_internal_if_kernel",
-     "nested scan requires a flat load/compute/store loop body"),
-])
-def test_tuple_scan_rankn_nested_loop_body_restrictions_are_named(
-        kernel, reason):
-    result = _compile_rankn_nested_negative_in_child(
-        kernel,
-        {"x_ptr": "*fp32", "value_ptr": "*fp32", "count_ptr": "*i32",
-         "rows": "i32"},
-        {})
-    output = result.stdout + result.stderr
-    assert result.returncode > 0, output
-    assert reason in output
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_nested_loop_outer_store_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 2048)
+         .reshape(storage_rows, 32, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    count = torch.full(x.shape, -999999, dtype=torch.int32, device="mps")
+    _rankn_tuple_nested_loop_outer_store_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected_value = x.cumsum(2) if rows else torch.zeros_like(x)
+    expected_count = (torch.ones_like(x, dtype=torch.int32).cumsum(
+        2, dtype=torch.int32) if rows else torch.full_like(
+            x, -999999, dtype=torch.int32))
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_nested_loop_internal_if_matches_torch(rows,
+                                                                num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 2048)
+         .reshape(storage_rows, 32, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    count = torch.full(x.shape, -999999, dtype=torch.int32, device="mps")
+    branch = torch.full_like(x, -999999, device="mps")
+    _rankn_tuple_nested_loop_internal_if_kernel[(1,)](
+        x.to("mps"), value, count, branch, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        expected_value = x.cumsum(2)
+        expected_count = torch.ones_like(x, dtype=torch.int32).cumsum(
+            2, dtype=torch.int32)
+        expected_branch = torch.full_like(x, -999999)
+        expected_branch[0] = x[0]
+    else:
+        expected_value = torch.full_like(x, -999999)
+        expected_count = torch.full(x.shape, -999999, dtype=torch.int32)
+        expected_branch = torch.full_like(x, -999999)
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
+    torch.testing.assert_close(branch.cpu(), expected_branch, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_nested_loop_scalar_store_matches_torch(rows,
+                                                                 num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * storage_rows * 512)
+         .reshape(storage_rows, storage_rows, 8, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    count = torch.full(x.shape, -999999, dtype=torch.int32, device="mps")
+    scalar = torch.full((1,), -999999, dtype=torch.float32, device="mps")
+    _rankn_tuple_nested_loop_scalar_store_kernel[(1,)](
+        x.to("mps"), value, count, scalar, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        expected_value = x.cumsum(3)
+        expected_count = torch.ones_like(x, dtype=torch.int32).cumsum(
+            3, dtype=torch.int32)
+    else:
+        expected_value = torch.full_like(x, -999999)
+        expected_count = torch.full(x.shape, -999999, dtype=torch.int32)
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(count.cpu(), expected_count, atol=0, rtol=0)
+    expected_scalar = 0.0 if rows else -999999.0
+    torch.testing.assert_close(scalar.cpu(), torch.tensor([expected_scalar]))
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tuple_scan_rankn_nested_loop_mixed_outer_carry_matches_torch(rows,
+                                                                      num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * storage_rows * 512)
+         .reshape(storage_rows, storage_rows, 8, 64) % 7 - 3).float()
+    value = torch.full((storage_rows, 8, 64), -999999,
+                       dtype=torch.float32, device="mps")
+    count = torch.zeros(1, dtype=torch.int32, device="mps")
+    _rankn_tuple_nested_loop_mixed_outer_carry_kernel[(1,)](
+        x.to("mps"), value, count, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.full((storage_rows, 8, 64), -999999,
+                          dtype=torch.float32)
+    acc = torch.zeros(8, 64)
+    for row in range(rows):
+        total = float(row + 1)
+        for col in range(rows):
+            acc += (x[row, col] + total).cumsum(1)
+        expected[row] = acc
+    torch.testing.assert_close(value.cpu(), expected, atol=0, rtol=0)
 
 
 @triton.jit

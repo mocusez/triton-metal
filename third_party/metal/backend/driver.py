@@ -419,7 +419,7 @@ class MetalLauncher:
         writeback = []  # (orig, device_tensor) for non-MPS / non-contiguous inputs
         for arg, ty in zip(filtered_args, self._arg_types):
             if _is_pointer_type(ty):
-                t = arg
+                t = arg.base if type(arg).__name__ == "TensorWrapper" else arg
                 dev_t = t if (getattr(t, "device", None) is not None
                               and t.device.type == "mps") else t.to("mps")
                 if not dev_t.is_contiguous():
