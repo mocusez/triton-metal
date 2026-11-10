@@ -558,6 +558,8 @@ exchangePhaseEnds(const ExchangeBufferAssignment &assignment) {
   return ends;
 }
 
+static llvm::DenseSet<mlir::Operation *> g_nestedScanInternalResultIfs;
+
 // One shared answer to "will the phase split break this function?".
 //
 // `FuncOpLowering` splices the body into sibling `scf.for` phases, one per
@@ -603,7 +605,8 @@ static bool tileExchangePhasesCarryable(
       mlir::Operation *def = value.getDefiningOp();
       if (!def || !loopBodyOps.count(def) || phaseSet.count(def))
         return true;
-      if (!settled.insert(def).second)
+      if (!settled.insert(def).second ||
+          g_nestedScanInternalResultIfs.count(def))
         return true;
       // Only a regionless pure cone can be replayed. A load is admitted
       // because its address is re-derived in-tile and it reads memory this
@@ -684,7 +687,6 @@ static llvm::DenseSet<mlir::Operation *> g_nestedScanLoops;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanOuterLoops;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanOuterWhiles;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanResultIfs;
-static llvm::DenseSet<mlir::Operation *> g_nestedScanInternalResultIfs;
 static llvm::DenseSet<mlir::Operation *> g_nestedScanFunctions;
 static constexpr llvm::StringLiteral kScanBandLoopAttr = "metal.scan_band_loop";
 
@@ -18459,19 +18461,39 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         return false;
       return !segmentAnchor || segmentAnchor->isBeforeInBlock(candidate);
     };
+    auto inSourceCone = [&](mlir::Operation *def) {
+      if (!def)
+        return false;
+      if (inCurrentSegment(def))
+        return true;
+      mlir::Operation *ancestor = def->getParentOp();
+      while (ancestor && ancestor->getBlock() != block)
+        ancestor = ancestor->getParentOp();
+      return ancestor && g_nestedScanInternalResultIfs.count(ancestor) &&
+             inCurrentSegment(ancestor);
+    };
     llvm::SmallPtrSet<mlir::Operation *, 32> preSet;
     llvm::SmallVector<mlir::Value, 32> worklist(sources.begin(), sources.end());
     while (!worklist.empty()) {
       mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
-      if (!inCurrentSegment(def) || !preSet.insert(def).second)
+      if (!inSourceCone(def) || !preSet.insert(def).second)
         continue;
-      if (!mlir::isMemoryEffectFree(def) &&
+      bool internalResult = g_nestedScanInternalResultIfs.count(def);
+      if (!internalResult && !mlir::isMemoryEffectFree(def) &&
           !mlir::isa<mlir::triton::LoadOp, ScalarDotOp>(def))
         return scan.emitOpError("Metal backend: staged scan cannot safely "
                                 "partition its source and consumers: "
                                 "side-effecting source cone from ")
                << def->getName();
-      llvm::append_range(worklist, def->getOperands());
+      if (internalResult) {
+        for (mlir::Region &region : def->getRegions()) {
+          auto yield = mlir::cast<mlir::scf::YieldOp>(
+              region.front().getTerminator());
+          llvm::append_range(worklist, yield.getOperands());
+        }
+      } else {
+        llvm::append_range(worklist, def->getOperands());
+      }
     }
     llvm::SmallPtrSet<mlir::Operation *, 32> postSet;
     postSet.insert(scan.getOperation());
@@ -18547,7 +18569,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       if (!inCurrentSegment(&candidate) ||
           candidate.hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
-      if (postSet.count(&candidate))
+      if (postSet.count(&candidate) && !preSet.count(&candidate))
         postOps.push_back(&candidate);
       else
         prePhaseOps.push_back(&candidate);
@@ -18574,6 +18596,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
     mlir::Operation *crossingUser = nullptr;
     std::function<bool(mlir::Value)> canRecompute = [&](mlir::Value value) {
       if (llvm::is_contained(sources, value) ||
+          (value.getDefiningOp() &&
+           g_nestedScanInternalResultIfs.count(value.getDefiningOp())) ||
           !checkedCrossings.insert(value).second)
         return true;
       auto def = value.getDefiningOp();
@@ -18651,7 +18675,8 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       if (mlir::Value mapped = mapping.lookupOrNull(value))
         return mapped;
       mlir::Operation *def = value.getDefiningOp();
-      if (!def || !preSet.count(def))
+      if (!def || !preSet.count(def) ||
+          g_nestedScanInternalResultIfs.count(def))
         return value;
       for (mlir::Value operand : def->getOperands())
         recompute(operand);
@@ -44749,6 +44774,8 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
             def->moveBefore(phaseBody.getTerminator());
             return current;
           }
+          if (!def && !mlir::isa<mlir::RankedTensorType>(current.getType()))
+            return current;
           if (!def || def->getNumRegions() ||
               (!mlir::isMemoryEffectFree(def) &&
                !(internalLoop && mlir::isa<mlir::triton::LoadOp>(def)))) {
@@ -44768,9 +44795,12 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           return mapping.lookup(current);
         };
         mlir::Value local = localize(value);
-        if (failed || !local || !write(phaseBuilder, index, local))
+        if (failed || !local)
           return original.emitOpError(
-              "Metal backend: nested scan cannot materialize an if result");
+              "Metal backend: nested scan cannot localize an if result");
+        if (!write(phaseBuilder, index, local))
+          return original.emitOpError(
+              "Metal backend: nested scan cannot write an if result slot");
       }
     }
 

@@ -2643,6 +2643,22 @@ def _rankn_scan_internal_result_if_kernel(x_ptr, out_ptr, rows):
 
 
 @triton.jit
+def _rankn_scan_internal_multi_result_if_kernel(x_ptr, value_ptr, other_ptr,
+                                                rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row == 0:
+            value = x + 1.0
+            other = x + 2.0
+        else:
+            value = x - 1.0
+            other = x - 2.0
+        tl.store(value_ptr + row * 512 + index, tl.cumsum(value, 1))
+        tl.store(other_ptr + row * 512 + index, tl.cumsum(other, 1))
+
+
+@triton.jit
 def _rankn_scan_internal_result_if_write_kernel(x_ptr, out_ptr, scratch_ptr,
                                                 rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
@@ -2793,6 +2809,30 @@ def test_multiband_scan_internal_result_if_matches_torch(rows, num_warps):
     else:
         expected = torch.full_like(x, -999999)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_internal_multi_result_if_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    value = torch.full_like(x, -999999, device="mps")
+    other = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_internal_multi_result_if_kernel[(1,)](
+        x.to("mps"), value, other, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        delta = torch.where(torch.arange(rows).reshape(rows, 1, 1) == 0, 1, -1)
+        modified = x + delta
+        expected_value = modified.cumsum(2)
+        expected_other = (x + 2 * delta).cumsum(2)
+    else:
+        expected_value = torch.full_like(x, -999999)
+        expected_other = torch.full_like(x, -999999)
+    torch.testing.assert_close(value.cpu(), expected_value, atol=0, rtol=0)
+    torch.testing.assert_close(other.cpu(), expected_other, atol=0, rtol=0)
 
 
 @mps_only

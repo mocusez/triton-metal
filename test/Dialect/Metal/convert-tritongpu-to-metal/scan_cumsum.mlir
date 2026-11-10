@@ -2134,3 +2134,72 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.store
 // CHECK: metal.barrier
 // CHECK-NOT: tt.scan
+
+// -----
+#internal_multi_cfg = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#internal_multi_row = #ttg.slice<{dim = 1, parent = #internal_multi_cfg}>
+#internal_multi_col = #ttg.slice<{dim = 0, parent = #internal_multi_cfg}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @nested_scan_internal_multi_result_if(%x: !tt.ptr<f32>, %out: !tt.ptr<f32>, %other: !tt.ptr<f32>, %trips: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c128 = arith.constant 128 : i32
+    %c16 = arith.constant dense<16> : tensor<8x1xi32, #internal_multi_cfg>
+    %one = arith.constant dense<1.0> : tensor<8x16xf32, #internal_multi_cfg>
+    %two = arith.constant dense<2.0> : tensor<8x16xf32, #internal_multi_cfg>
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #internal_multi_row>
+    %re = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #internal_multi_row> -> tensor<8x1xi32, #internal_multi_cfg>
+    %ro = arith.muli %re, %c16 : tensor<8x1xi32, #internal_multi_cfg>
+    %rb = tt.broadcast %ro : tensor<8x1xi32, #internal_multi_cfg> -> tensor<8x16xi32, #internal_multi_cfg>
+    %col = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #internal_multi_col>
+    %ce = tt.expand_dims %col {axis = 0 : i32} : tensor<16xi32, #internal_multi_col> -> tensor<1x16xi32, #internal_multi_cfg>
+    %cb = tt.broadcast %ce : tensor<1x16xi32, #internal_multi_cfg> -> tensor<8x16xi32, #internal_multi_cfg>
+    %offset = arith.addi %rb, %cb : tensor<8x16xi32, #internal_multi_cfg>
+    scf.for %i = %c0 to %trips step %c1 : i32 {
+      %row_offset = arith.muli %i, %c128 : i32
+      %xbase = tt.addptr %x, %row_offset : !tt.ptr<f32>, i32
+      %xsplat = tt.splat %xbase : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+      %xaddr = tt.addptr %xsplat, %offset : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>, tensor<8x16xi32, #internal_multi_cfg>
+      %v = tt.load %xaddr : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+      %cond = arith.cmpi eq, %i, %c0 : i32
+      %pair:2 = scf.if %cond -> (tensor<8x16xf32, #internal_multi_cfg>, tensor<8x16xf32, #internal_multi_cfg>) {
+        %a = arith.addf %v, %one : tensor<8x16xf32, #internal_multi_cfg>
+        %b = arith.addf %v, %two : tensor<8x16xf32, #internal_multi_cfg>
+        scf.yield %a, %b : tensor<8x16xf32, #internal_multi_cfg>, tensor<8x16xf32, #internal_multi_cfg>
+      } else {
+        %a = arith.subf %v, %one : tensor<8x16xf32, #internal_multi_cfg>
+        %b = arith.subf %v, %two : tensor<8x16xf32, #internal_multi_cfg>
+        scf.yield %a, %b : tensor<8x16xf32, #internal_multi_cfg>, tensor<8x16xf32, #internal_multi_cfg>
+      }
+      %obase = tt.addptr %out, %row_offset : !tt.ptr<f32>, i32
+      %osplat = tt.splat %obase : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+      %oaddr = tt.addptr %osplat, %offset : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>, tensor<8x16xi32, #internal_multi_cfg>
+      %vscan = "tt.scan"(%pair#0) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum = arith.addf %a, %b : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x16xf32, #internal_multi_cfg>) -> tensor<8x16xf32, #internal_multi_cfg>
+      tt.store %oaddr, %vscan : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+      %otherbase = tt.addptr %other, %row_offset : !tt.ptr<f32>, i32
+      %othersplat = tt.splat %otherbase : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+      %otheraddr = tt.addptr %othersplat, %offset : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>, tensor<8x16xi32, #internal_multi_cfg>
+      %oscan = "tt.scan"(%pair#1) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum = arith.addf %a, %b : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x16xf32, #internal_multi_cfg>) -> tensor<8x16xf32, #internal_multi_cfg>
+      tt.store %otheraddr, %oscan : tensor<8x16x!tt.ptr<f32>, #internal_multi_cfg>
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel nested_scan_internal_multi_result_if
+// CHECK: scf.if
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.tg_load_indexed
+// CHECK-NOT: tt.scan
