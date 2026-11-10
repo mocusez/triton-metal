@@ -2674,6 +2674,22 @@ def _rankn_scan_nested_internal_result_if_kernel(x_ptr, out_ptr, branch_ptr,
 
 
 @triton.jit
+def _rankn_scan_deep_internal_result_if_kernel(x_ptr, out_ptr, branch_ptr,
+                                               rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row != 1:
+            if row != 2:
+                if row == 0:
+                    branch = x + 1.0
+                else:
+                    branch = x - 1.0
+                tl.store(branch_ptr + row * 512 + index, branch)
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
+
+
+@triton.jit
 def _rankn_scan_internal_result_if_write_kernel(x_ptr, out_ptr, scratch_ptr,
                                                 rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
@@ -2698,6 +2714,23 @@ def _rankn_scan_nested_internal_result_if_write_kernel(
             else:
                 branch = x - 1.0
             tl.store(branch_ptr + row * 512 + index, branch)
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
+
+
+@triton.jit
+def _rankn_scan_deep_internal_result_if_write_kernel(
+        x_ptr, out_ptr, branch_ptr, scratch_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row != 1:
+            tl.store(scratch_ptr + index, 0.0)
+            if row != 2:
+                if row == 0:
+                    branch = x + 1.0
+                else:
+                    branch = x - 1.0
+                tl.store(branch_ptr + row * 512 + index, branch)
         tl.store(out_ptr + row * 512 + index, tl.cumsum(x, 1))
 
 
@@ -2741,6 +2774,10 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
       "rows": "i32"},
      "result if cannot replay its result sources"),
     ("_rankn_scan_nested_internal_result_if_write_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
+      "scratch_ptr": "*fp32", "rows": "i32"},
+     "result if cannot replay its result sources"),
+    ("_rankn_scan_deep_internal_result_if_write_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
       "scratch_ptr": "*fp32", "rows": "i32"},
      "result if cannot replay its result sources"),
@@ -2888,6 +2925,30 @@ def test_multiband_scan_nested_internal_result_if_matches_torch(rows,
         delta = torch.where(torch.arange(rows).reshape(rows, 1, 1) == 0, 1, -1)
         expected_branch = x + delta
         expected_branch[1] = -999999
+    else:
+        expected = torch.full_like(x, -999999)
+        expected_branch = torch.full_like(x, -999999)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(branch.cpu(), expected_branch, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 4])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_deep_internal_result_if_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    branch = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_deep_internal_result_if_kernel[(1,)](
+        x.to("mps"), out, branch, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        expected = x.cumsum(2)
+        expected_branch = torch.full_like(x, -999999)
+        expected_branch[0] = x[0] + 1.0
+        expected_branch[3] = x[3] - 1.0
     else:
         expected = torch.full_like(x, -999999)
         expected_branch = torch.full_like(x, -999999)

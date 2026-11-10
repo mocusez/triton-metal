@@ -295,7 +295,7 @@ scopes support flat tensor load/compute/store work, mixed carries, and snapshots
 Sibling scan loops keep independent phase schedules. Result-carrying outer
 `scf.if` branches publish tensor results through budgeted slots. The selected
 loop admits no-result uniform `scf.if` bodies and supported result-carrying
-internal ifs, including local result ifs inside those no-result branches.
+internal ifs, including local result ifs within nested no-result branch chains.
 Internal results use slots before local phase splitting, with pure or provably
 write-separated load sources. Multiple results may feed independent scans
 without replaying the branch region. Each iteration publishes complete

@@ -43397,17 +43397,20 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
           bool foundScope = false;
           for (mlir::Operation *scope = branch.getOperation(); scope;
                scope = scope->getParentOp()) {
+            mlir::Operation *first = &scope->getBlock()->front();
             if (def->getBlock() == scope->getBlock()) {
               if (!def->isBeforeInBlock(scope))
                 return false;
-              for (mlir::Operation *op = def->getNextNode(); op && op != scope;
-                   op = op->getNextNode())
-                if (!mlir::isMemoryEffectFree(op) &&
-                    !mlir::isa<mlir::triton::LoadOp>(op))
-                  return false;
+              first = def->getNextNode();
               foundScope = true;
-              break;
             }
+            for (mlir::Operation *op = first; op && op != scope;
+                 op = op->getNextNode())
+              if (!mlir::isMemoryEffectFree(op) &&
+                  !mlir::isa<mlir::triton::LoadOp>(op))
+                return false;
+            if (foundScope)
+              break;
             if (!mlir::isa<mlir::scf::IfOp, mlir::scf::ForOp>(
                     scope->getParentOp()))
               break;
@@ -43785,6 +43788,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
             return mlir::WalkResult::advance();
           if (g_nestedScanInternalResultIfs.count(nestedOp))
             return mlir::WalkResult::skip();
+          if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
+              nestedIf && nestedIf.getNumResults() == 0)
+            return mlir::WalkResult::advance();
           if (nestedOp->getNumRegions() ||
               (!mlir::isMemoryEffectFree(nestedOp) &&
                !mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp,
