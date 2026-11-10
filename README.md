@@ -287,14 +287,15 @@ Top-level scans can stage multiple elements per thread, with up to 8192 logical
 elements and total scratch within 32 KiB. Source ranges and prefix reads use
 the same layout mapping. Single-value and tuple scans also stage multiple
 elements per thread inside a uniform runtime loop. That innermost scan loop may
-be nested in uniform outer `scf.for`, `scf.if`, and scalar-state `scf.while`
-control flow. Outer `for` scopes support flat tensor load/compute/store work,
-mixed scalar/tensor carries, and non-replayable snapshots through the same
-budgeted slots. Sibling scan loops keep independent phase schedules. Result-
-carrying outer `scf.if` branches publish tensor results through budgeted slots;
-the selected loop also admits no-result uniform `scf.if` bodies containing flat
+be nested in uniform outer `scf.for`, `scf.if`, and `scf.while` control flow.
+While conditions remain pure scalar computations; mixed scalar/tensor state uses
+the same budgeted slots as outer `for` loops. Outer `for` scopes support flat
+tensor load/compute/store work, mixed carries, and non-replayable snapshots.
+Sibling scan loops keep independent phase schedules. Result-carrying outer
+`scf.if` branches publish tensor results through budgeted slots; the selected
+loop also admits no-result uniform `scf.if` bodies containing flat
 load/compute/store work. Each iteration publishes complete tiles before prefix
-reads and synchronizes scratch reuse. Outer-while tensor carries, unsafe cross-
+reads and synchronizes scratch reuse. External while snapshots, unsafe cross-
 phase replay, rank-1 XOR, wider integers, and compound XOR combines retain named
 preflight rejection.
 
@@ -772,17 +773,18 @@ case and an adjacent rejection regression.
    writes with barriers; replicated stores retain their existing replica-write
    semantics without truncating valid register bands. Carry slots count against
    the 32 KiB threadgroup budget. The innermost multiband scan loop may also be
-   nested in uniform outer `scf.for`/`scf.if` and scalar-state `scf.while`
-   control flow. Outer `for` scopes can mix scalar and tensor carries and run
-   flat tensor work in their own pre/post bands without moving scan phases to
-   the user loop. Non-replayable snapshots are materialized once and localized
-   to the consuming bands. Sibling scan loops beneath outer control flow retain
-   independent phase schedules. Result-carrying outer `scf.if` values use
-   budgeted branch slots and a uniform post-if band. A read-only scalar-dot
-   result may feed either a same-loop or top-level multiband scan using the
-   result layout's exact element index. Outer-while tensor carries,
-   mismatched-register-count tiles, and unsafe cross-phase replay remain
-   rejected.
+   nested in uniform outer `scf.for`/`scf.if` and `scf.while` control flow.
+   While conditions stay pure scalar computations; tensor state uses budgeted
+   pre/body/post slots without becoming region arguments. Outer `for` scopes
+   can mix scalar and tensor carries and run flat tensor work in their own
+   pre/post bands without moving scan phases to the user loop. Non-replayable
+   snapshots are materialized once and localized to the consuming bands. Sibling
+   scan loops beneath outer control flow retain independent phase schedules.
+   Result-carrying outer `scf.if` values use budgeted branch slots and a uniform
+   post-if band. A read-only scalar-dot result may feed either a same-loop or
+   top-level multiband scan using the result layout's exact element index.
+   External while snapshots, mismatched-register-count tiles, and unsafe
+   cross-phase replay remain rejected.
    General rank-1 tuple combines and axis-0 reductions with multiple output
    elements per thread are implemented. General rank-1 tuple scans support
    both directions with up to 64 elements per thread, within the existing

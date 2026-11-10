@@ -1983,6 +1983,21 @@ def test_tuple_scan_rankn_while_loop_matches_torch(rows, num_warps):
 @mps_only
 @pytest.mark.parametrize("rows", [0, 3])
 @pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_while_tensor_carry_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 2 * 512)
+         .reshape(storage_rows, 2, 8, 64) % 7 - 3).float()
+    out = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    _rankn_scan_while_tensor_carry_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = (x.cumsum(3).sum((0, 1)) if rows else torch.zeros(8, 64))
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
 def test_multiband_scan_result_carrying_if_matches_torch(rows, num_warps):
     storage_rows = max(rows, 1)
     x = (torch.arange(storage_rows * 512)
@@ -2575,6 +2590,19 @@ def _rankn_scan_while_tensor_carry_kernel(x_ptr, out_ptr, rows):
 
 
 @triton.jit
+def _rankn_scan_while_snapshot_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    snapshot = tl.load(x_ptr + index)
+    acc = tl.zeros((8, 64), tl.float32)
+    row = 0
+    while row < rows:
+        for col in range(2):
+            acc += tl.cumsum(snapshot + col, 1)
+        row += 1
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
 def _rankn_scan_internal_result_if_kernel(x_ptr, out_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     for row in range(rows):
@@ -2615,9 +2643,9 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
 
 
 @pytest.mark.parametrize("kernel,signature,reason", [
-    ("_rankn_scan_while_tensor_carry_kernel",
+    ("_rankn_scan_while_snapshot_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
-     "outer whiles cannot carry tensors"),
+     "while cannot capture an external tensor snapshot"),
     ("_rankn_scan_internal_result_if_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
      "no-result uniform if"),
