@@ -2403,3 +2403,65 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.barrier
 // CHECK: metal.tg_load_indexed
 // CHECK-NOT: tt.scan
+
+// -----
+#stacked_internal_cfg = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#stacked_internal_range = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @nested_scan_stacked_internal_result_if(%x: !tt.ptr<f32>, %out: !tt.ptr<f32>, %trips: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c512 = arith.constant 512 : i32
+    %one = arith.constant dense<1.0> : tensor<8x64xf32, #stacked_internal_cfg>
+    %two = arith.constant dense<2.0> : tensor<8x64xf32, #stacked_internal_cfg>
+    %range = tt.make_range {start = 0 : i32, end = 512 : i32} : tensor<512xi32, #stacked_internal_range>
+    %index = tt.reshape %range : tensor<512xi32, #stacked_internal_range> -> tensor<8x64xi32, #stacked_internal_cfg>
+    scf.for %row = %c0 to %trips step %c1 : i32 {
+      %offset = arith.muli %row, %c512 : i32
+      %xbase = tt.addptr %x, %offset : !tt.ptr<f32>, i32
+      %xsplat = tt.splat %xbase : !tt.ptr<f32> -> tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>
+      %xaddr = tt.addptr %xsplat, %index : tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>, tensor<8x64xi32, #stacked_internal_cfg>
+      %value = tt.load %xaddr : tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>
+      %outer_cond = arith.cmpi ne, %row, %c2 : i32
+      %selected = scf.if %outer_cond -> (tensor<8x64xf32, #stacked_internal_cfg>) {
+        %inner_cond = arith.cmpi eq, %row, %c0 : i32
+        %inner = scf.if %inner_cond -> (tensor<8x64xf32, #stacked_internal_cfg>) {
+          %plus = arith.addf %value, %one : tensor<8x64xf32, #stacked_internal_cfg>
+          scf.yield %plus : tensor<8x64xf32, #stacked_internal_cfg>
+        } else {
+          %minus = arith.subf %value, %one : tensor<8x64xf32, #stacked_internal_cfg>
+          scf.yield %minus : tensor<8x64xf32, #stacked_internal_cfg>
+        }
+        %twice = arith.mulf %inner, %two : tensor<8x64xf32, #stacked_internal_cfg>
+        scf.yield %twice : tensor<8x64xf32, #stacked_internal_cfg>
+      } else {
+        scf.yield %value : tensor<8x64xf32, #stacked_internal_cfg>
+      }
+      %outbase = tt.addptr %out, %offset : !tt.ptr<f32>, i32
+      %outsplat = tt.splat %outbase : !tt.ptr<f32> -> tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>
+      %outaddr = tt.addptr %outsplat, %index : tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>, tensor<8x64xi32, #stacked_internal_cfg>
+      %scan = "tt.scan"(%selected) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x64xf32, #stacked_internal_cfg>) -> tensor<8x64xf32, #stacked_internal_cfg>
+      tt.store %outaddr, %scan : tensor<8x64x!tt.ptr<f32>, #stacked_internal_cfg>
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel nested_scan_stacked_internal_result_if
+// CHECK: scf.if
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed
+// CHECK: scf.for
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed
+// CHECK: arith.select
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: metal.tg_load_indexed
+// CHECK-NOT: tt.scan

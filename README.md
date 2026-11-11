@@ -295,10 +295,11 @@ scopes support flat tensor load/compute/store work, mixed carries, and snapshots
 Sibling scan loops keep independent phase schedules. Result-carrying outer
 `scf.if` branches publish tensor results through budgeted slots. The selected
 loop admits no-result uniform `scf.if` bodies and supported result-carrying
-internal ifs, including local result ifs within nested no-result branch chains.
-Internal results use slots before local phase splitting, with pure or provably
-write-separated load sources. Multiple results may feed independent scans or
-later result ifs through their slots without replaying the branch region. Each
+internal ifs, including local result ifs within nested no-result branch chains
+and result ifs nested in another result branch. Internal results use slots
+before local phase splitting, with pure or provably write-separated load
+sources. Multiple results may feed independent scans or later result ifs
+through their slots without replaying the branch region. Each
 iteration publishes complete
 tiles before prefix reads and synchronizes scratch reuse. While snapshots
 crossing writes, unsafe
@@ -790,7 +791,9 @@ case and an adjacent rejection regression.
    post-if band. Supported result-carrying internal ifs in the selected loop use
    slots before phase splitting, with pure or write-separated load sources.
    Multiple internal results can feed independent scans or chained result ifs
-   through their own slots. External while snapshots without intervening writes
+   through their own slots. Result ifs may also nest in another result branch,
+   materializing their slots from the innermost branch outward. External while
+   snapshots without intervening writes
    are also materialized once through pre-band slots. A read-only scalar-dot result may
    feed either a same-loop or top-level multiband scan using the result layout's
    exact element index. While snapshots crossing writes,

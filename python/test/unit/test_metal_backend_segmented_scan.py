@@ -2709,6 +2709,22 @@ def _rankn_scan_chained_internal_result_if_kernel(x_ptr, out_ptr, branch_ptr,
 
 
 @triton.jit
+def _rankn_scan_stacked_internal_result_if_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row != 2:
+            if row == 0:
+                inner = x + 1.0
+            else:
+                inner = x - 1.0
+            selected = inner * 2.0
+        else:
+            selected = x
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(selected, 1))
+
+
+@triton.jit
 def _rankn_scan_internal_result_if_write_kernel(x_ptr, out_ptr, scratch_ptr,
                                                 rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
@@ -2999,6 +3015,29 @@ def test_multiband_scan_chained_internal_result_if_matches_torch(rows,
         expected_branch = torch.full_like(x, -999999)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
     torch.testing.assert_close(branch.cpu(), expected_branch, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 4])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_stacked_internal_result_if_matches_torch(rows,
+                                                                 num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_stacked_internal_result_if_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        selected = x.clone()
+        selected[0] = (x[0] + 1.0) * 2.0
+        selected[1] = (x[1] - 1.0) * 2.0
+        selected[3] = (x[3] - 1.0) * 2.0
+        expected = selected.cumsum(2)
+    else:
+        expected = torch.full_like(x, -999999)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 @mps_only
