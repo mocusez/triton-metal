@@ -44966,7 +44966,13 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
       for (mlir::OpOperand &use : result.getUses()) {
         mlir::Operation *owner =
             scope.findAncestorOpInBlock(*use.getOwner());
-        if (!owner || !postSet.count(owner))
+        auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(use.getOwner());
+        auto parentIf = yield ? mlir::dyn_cast<mlir::scf::IfOp>(
+                                    yield->getParentOp())
+                              : mlir::scf::IfOp();
+        bool forwarded = yield && parentIf &&
+                         g_nestedScanResultIfs.count(parentIf.getOperation());
+        if ((!owner || !postSet.count(owner)) && !forwarded)
           return original.emitOpError(
               "Metal backend: nested scan if result has a nonlocal consumer");
         uses.push_back(&use);
