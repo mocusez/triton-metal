@@ -2832,3 +2832,64 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.tg_load_indexed
 // CHECK: metal.store
 // CHECK-NOT: tt.scan
+
+// -----
+#result_scalar_cfg = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#result_scalar_row = #ttg.slice<{dim = 1, parent = #result_scalar_cfg}>
+#result_scalar_col = #ttg.slice<{dim = 0, parent = #result_scalar_cfg}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @nested_scan_result_if_scalar_for(%x: !tt.ptr<f32>, %out: !tt.ptr<f32>, %trips: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c16 = arith.constant dense<16> : tensor<8x1xi32, #result_scalar_cfg>
+    %rows = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #result_scalar_row>
+    %re = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #result_scalar_row> -> tensor<8x1xi32, #result_scalar_cfg>
+    %ro = arith.muli %re, %c16 : tensor<8x1xi32, #result_scalar_cfg>
+    %cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #result_scalar_col>
+    %ce = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32, #result_scalar_col> -> tensor<1x16xi32, #result_scalar_cfg>
+    %cb = tt.broadcast %ce : tensor<1x16xi32, #result_scalar_cfg> -> tensor<8x16xi32, #result_scalar_cfg>
+    %xbase = tt.splat %x : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>
+    %xaddr = tt.addptr %xbase, %cb : tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>, tensor<8x16xi32, #result_scalar_cfg>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>
+    %outaddr = tt.addptr %obase, %cb : tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>, tensor<8x16xi32, #result_scalar_cfg>
+    scf.for %row = %c0 to %trips step %c1 : i32 {
+      %v = tt.load %xaddr : tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>
+      %cond = arith.cmpi ne, %row, %c1 : i32
+      %selected = scf.if %cond -> (tensor<8x16xf32, #result_scalar_cfg>) {
+        %limit = arith.addi %row, %c1 : i32
+        %delta = scf.for %col = %c0 to %limit step %c1 iter_args(%acc = %c0) -> i32 : i32 {
+          %twice = arith.muli %col, %c2 : i32
+          %next = arith.addi %acc, %twice : i32
+          scf.yield %next : i32
+        }
+        %offset = arith.sitofp %delta : i32 to f32
+        %xoffset = tt.splat %offset : f32 -> tensor<8x16xf32, #result_scalar_cfg>
+        %adjusted = arith.addf %v, %xoffset : tensor<8x16xf32, #result_scalar_cfg>
+        scf.yield %adjusted : tensor<8x16xf32, #result_scalar_cfg>
+      } else {
+        scf.yield %v : tensor<8x16xf32, #result_scalar_cfg>
+      }
+      %scan = "tt.scan"(%selected) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum = arith.addf %a, %b : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x16xf32, #result_scalar_cfg>) -> tensor<8x16xf32, #result_scalar_cfg>
+      tt.store %outaddr, %scan : tensor<8x16x!tt.ptr<f32>, #result_scalar_cfg>
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel nested_scan_result_if_scalar_for
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: arith.addi
+// CHECK: arith.select
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.store
+// CHECK-NOT: tt.scan
