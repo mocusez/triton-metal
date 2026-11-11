@@ -43354,6 +43354,31 @@ static bool nestedScanReplayable(mlir::Value value,
   return ok;
 }
 
+static void localizeNestedScanBranchTensorCones(mlir::scf::IfOp branch) {
+  llvm::DenseMap<mlir::Value, bool> memo;
+  branch->walk([&](mlir::Operation *user) {
+    mlir::OpBuilder builder(user);
+    mlir::IRMapping mapping;
+    std::function<mlir::Value(mlir::Value)> localize =
+        [&](mlir::Value value) -> mlir::Value {
+      if (!mlir::isa<mlir::RankedTensorType>(value.getType()))
+        return value;
+      if (auto mapped = mapping.lookupOrNull(value))
+        return mapped;
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def || branch->isAncestor(def) || def->hasAttr(kExchangeAttr) ||
+          !nestedScanReplayable(value, memo))
+        return value;
+      for (mlir::Value operand : def->getOperands())
+        localize(operand);
+      builder.clone(*def, mapping);
+      return mapping.lookup(value);
+    };
+    for (mlir::OpOperand &use : user->getOpOperands())
+      use.set(localize(use.get()));
+  });
+}
+
 static llvm::SetVector<mlir::Value>
 nestedScanWhileSnapshots(mlir::scf::WhileOp loop) {
   llvm::SetVector<mlir::Value> snapshots;
@@ -43832,12 +43857,6 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
-        bool beforeScan = false;
-        for (mlir::Operation &candidate : *loop.getBody())
-          if (mlir::isa<mlir::triton::ScanOp>(&candidate)) {
-            beforeScan = branch->isBeforeInBlock(&candidate);
-            break;
-          }
         bool flat = true;
         branch->walk([&](mlir::Operation *nestedOp) -> mlir::WalkResult {
           if (nestedOp == branch.getOperation() ||
@@ -43845,8 +43864,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
             return mlir::WalkResult::advance();
           if (g_nestedScanInternalResultIfs.count(nestedOp))
             return mlir::WalkResult::skip();
-          if (beforeScan &&
-              mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(nestedOp) &&
+          if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(nestedOp) &&
               nestedScanPureScalarLoop(nestedOp))
             return mlir::WalkResult::skip();
           if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
@@ -43942,6 +43960,17 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         for (mlir::OpOperand &use : nested->getOpOperands())
           use.set(localize(use.get()));
       });
+    for (mlir::Operation *op : bodyOps) {
+      auto branch = mlir::dyn_cast<mlir::scf::IfOp>(*op);
+      if (!branch || branch.getNumResults() != 0)
+        continue;
+      bool afterScan = llvm::any_of(*loop.getBody(), [&](mlir::Operation &scan) {
+        return mlir::isa<mlir::triton::ScanOp>(&scan) &&
+               scan.isBeforeInBlock(branch);
+      });
+      if (afterScan)
+        localizeNestedScanBranchTensorCones(branch);
+    }
     // Remove only dead originals so no tensor outside a band loop is
     // accidentally scalarized.
     bool changed = true;
