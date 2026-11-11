@@ -2706,3 +2706,63 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.tg_load_indexed
 // CHECK: metal.store
 // CHECK-NOT: tt.scan
+
+// -----
+#internal_while_cfg = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#internal_while_row = #ttg.slice<{dim = 1, parent = #internal_while_cfg}>
+#internal_while_col = #ttg.slice<{dim = 0, parent = #internal_while_cfg}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @nested_scan_internal_scalar_while(%x: f32, %out: !tt.ptr<f32>, %trips: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c16 = arith.constant dense<16> : tensor<8x1xi32, #internal_while_cfg>
+    %rows = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #internal_while_row>
+    %re = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #internal_while_row> -> tensor<8x1xi32, #internal_while_cfg>
+    %ro = arith.muli %re, %c16 : tensor<8x1xi32, #internal_while_cfg>
+    %cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #internal_while_col>
+    %ce = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32, #internal_while_col> -> tensor<1x16xi32, #internal_while_cfg>
+    %cb = tt.broadcast %ce : tensor<1x16xi32, #internal_while_cfg> -> tensor<8x16xi32, #internal_while_cfg>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #internal_while_cfg>
+    %orow = tt.addptr %obase, %ro : tensor<8x1x!tt.ptr<f32>, #internal_while_cfg>, tensor<8x1xi32, #internal_while_cfg>
+    %orowb = tt.broadcast %orow : tensor<8x1x!tt.ptr<f32>, #internal_while_cfg> -> tensor<8x16x!tt.ptr<f32>, #internal_while_cfg>
+    %outaddr = tt.addptr %orowb, %cb : tensor<8x16x!tt.ptr<f32>, #internal_while_cfg>, tensor<8x16xi32, #internal_while_cfg>
+    scf.for %row = %c0 to %trips step %c1 : i32 {
+      %delta, %col = scf.while (%delta_arg = %c0, %col_arg = %c0) : (i32, i32) -> (i32, i32) {
+        %limit = arith.addi %row, %c1 : i32
+        %cond = arith.cmpi slt, %col_arg, %limit : i32
+        scf.condition(%cond) %delta_arg, %col_arg : i32, i32
+      } do {
+      ^bb0(%delta_body: i32, %col_body: i32):
+        %twice = arith.muli %col_body, %c2 : i32
+        %next_delta = arith.addi %delta_body, %twice : i32
+        %next_col = arith.addi %col_body, %c1 : i32
+        scf.yield %next_delta, %next_col : i32, i32
+      }
+      %offset = arith.sitofp %delta : i32 to f32
+      %xoffset = tt.splat %offset : f32 -> tensor<8x16xf32, #internal_while_cfg>
+      %v = tt.splat %x : f32 -> tensor<8x16xf32, #internal_while_cfg>
+      %input = arith.addf %v, %xoffset : tensor<8x16xf32, #internal_while_cfg>
+      %scan = "tt.scan"(%input) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum = arith.addf %a, %b : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x16xf32, #internal_while_cfg>) -> tensor<8x16xf32, #internal_while_cfg>
+      tt.store %outaddr, %scan : tensor<8x16x!tt.ptr<f32>, #internal_while_cfg>
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel nested_scan_internal_scalar_while
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: scf.while
+// CHECK: arith.addi
+// CHECK: scf.condition
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.store
+// CHECK-NOT: tt.scan

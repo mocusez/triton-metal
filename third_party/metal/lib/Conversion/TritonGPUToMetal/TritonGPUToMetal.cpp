@@ -43491,15 +43491,15 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
   return {};
 }
 
-static bool nestedScanPureScalarLoop(mlir::scf::ForOp loop) {
+static bool nestedScanPureScalarLoop(mlir::Operation *loop) {
   auto isTensor = [](mlir::Type type) {
     return mlir::isa<mlir::RankedTensorType>(type);
   };
-  if (llvm::any_of(loop.getResultTypes(), isTensor))
+  if (llvm::any_of(loop->getResultTypes(), isTensor))
     return false;
   bool pure = true;
   loop->walk([&](mlir::Operation *op) -> mlir::WalkResult {
-    if (op == loop.getOperation() ||
+    if (op == loop ||
         op->hasTrait<mlir::OpTrait::IsTerminator>())
       return mlir::WalkResult::advance();
     if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
@@ -43822,8 +43822,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (g_nestedScanInternalResultIfs.count(&op))
         continue;
-      if (auto inner = mlir::dyn_cast<mlir::scf::ForOp>(&op);
-          inner && nestedScanPureScalarLoop(inner))
+      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
+          nestedScanPureScalarLoop(&op))
         continue;
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
@@ -43853,7 +43853,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
                       mlir::triton::GetProgramIdOp>(&op)))
         return loop.emitOpError("Metal backend: nested scan requires a flat "
                                 "load/compute/store loop body, a no-result "
-                                "uniform if, or a pure scalar for");
+                                "uniform if, or a pure scalar loop");
     }
     llvm::SmallVector<mlir::Type, 4> carried = nestedScanCarriedTypes(loop);
     if (!carried.empty() || outerTensorWork) {
