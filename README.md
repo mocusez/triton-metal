@@ -295,8 +295,9 @@ scopes support flat tensor load/compute/store work, mixed carries, and snapshots
 Sibling scan loops keep independent phase schedules. Result-carrying outer
 `scf.if` branches publish tensor results through budgeted slots, and an outer
 result branch may directly forward a nested result if's value or load a result
-when its source is provably write-separated. The selected
-loop admits no-result uniform `scf.if` bodies and supported result-carrying
+when its source is provably write-separated. Such an if may also supply an
+enclosing `scf.for` tensor carry; incoming carry reads use a pre-if band. The
+selected loop admits no-result uniform `scf.if` bodies and supported result-carrying
 internal ifs, including local result ifs within nested no-result branch chains
 and result ifs nested in another result branch. Internal results use slots
 before local phase splitting, with pure or provably write-separated load
@@ -792,8 +793,10 @@ case and an adjacent rejection regression.
    Result-carrying outer `scf.if` values use budgeted branch slots and a uniform
    post-if band. A nested outer result if may directly forward its value to the
    enclosing result branch's yield. Outer result sources may also include loads
-   when replay is separated from intervening writes. Supported result-carrying
-   internal ifs in the selected loop use
+   when replay is separated from intervening writes. An outer result if can feed
+   an enclosing `scf.for` tensor carry, with its incoming read in a pre-if band
+   and its result write in the post-if band. Supported result-carrying internal
+   ifs in the selected loop use
    slots before phase splitting, with pure or write-separated load sources.
    Multiple internal results can feed independent scans or chained result ifs
    through their own slots. Result ifs may also nest in another result branch,

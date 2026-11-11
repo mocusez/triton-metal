@@ -44820,6 +44820,75 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           .getResult();
     };
 
+    llvm::DenseSet<mlir::Operation *> resultSourceOps;
+    for (mlir::Region &region : original->getRegions()) {
+      auto yield = mlir::cast<mlir::scf::YieldOp>(region.front().getTerminator());
+      llvm::SmallVector<mlir::Value, 16> worklist(yield.getOperands());
+      while (!worklist.empty()) {
+        mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+        if (!def || !original->isAncestor(def) ||
+            !resultSourceOps.insert(def).second)
+          continue;
+        llvm::append_range(worklist, def->getOperands());
+      }
+    }
+    llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp, 4> preReads;
+    for (mlir::Operation &op : *original->getBlock()) {
+      if (!op.isBeforeInBlock(original))
+        continue;
+      auto carryRead = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(op);
+      auto tag = op.getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      if (!carryRead || !op.hasAttr(kCarrySlotAttr) || !tag ||
+          tag.getValue() != kCarryRead)
+        continue;
+      bool usedByBranch = false;
+      bool usedOutside = false;
+      for (mlir::OpOperand &use : carryRead.getResult().getUses()) {
+        mlir::Operation *user = use.getOwner();
+        bool inside = original->isAncestor(user);
+        auto band = user->getParentOfType<mlir::scf::ForOp>();
+        usedByBranch |= inside;
+        usedOutside |= !inside || ((!band || !band->hasAttr(kScanBandLoopAttr)) &&
+                                   !resultSourceOps.contains(user));
+      }
+      if (usedByBranch && !usedOutside)
+        preReads.push_back(carryRead);
+    }
+    if (!internalLoop && !preReads.empty()) {
+      mlir::OpBuilder before(original);
+      auto pre = mlir::scf::ForOp::create(
+          before, loc, constant(before, 0),
+          constant(before, tile->elemPerThread), constant(before, 1));
+      pre->setAttr(kScanBandLoopAttr, before.getUnitAttr());
+      for (auto carryRead : preReads) {
+        carryRead->moveBefore(pre.getBody()->getTerminator());
+        llvm::SmallVector<mlir::OpOperand *, 8> bandedUses;
+        for (mlir::OpOperand &use : carryRead.getResult().getUses()) {
+          if (pre->isAncestor(use.getOwner()))
+            continue;
+          auto band = use.getOwner()->getParentOfType<mlir::scf::ForOp>();
+          if (band && band->hasAttr(kScanBandLoopAttr))
+            bandedUses.push_back(&use);
+        }
+        for (mlir::OpOperand *use : bandedUses) {
+          mlir::OpBuilder outside(use->getOwner());
+          auto slot = carryRead->getAttrOfType<mlir::IntegerAttr>(
+              kCarrySlotAttr);
+          auto localRead = mlir::cast<mlir::triton::gpu::ConvertLayoutOp>(
+              read(outside, slot.getInt(),
+                   mlir::cast<mlir::RankedTensorType>(carryRead.getType()))
+                  .getDefiningOp());
+          g_tileExchange[localRead.getOperation()] =
+              g_tileExchange.lookup(carryRead.getOperation());
+          g_tileExchangeBuf[localRead.getOperation()] =
+              g_tileExchangeBuf.lookup(carryRead.getOperation());
+          use->set(localRead.getResult());
+        }
+      }
+      before.setInsertionPointAfter(pre);
+      BarrierOp::create(before, loc);
+    }
+
     for (mlir::Region *region : {&original.getThenRegion(),
                                 &original.getElseRegion()}) {
       if (region->empty())
@@ -45034,6 +45103,19 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     });
     for (auto load : deadSourceLoads)
       load->erase();
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (mlir::Region &region : replacement->getRegions())
+        for (mlir::Block &block : region)
+          for (auto it = block.rbegin(); it != block.rend();) {
+            mlir::Operation &op = *it++;
+            if (op.getNumResults() && !op.hasAttr(kExchangeAttr) &&
+                mlir::isOpTriviallyDead(&op)) {
+              op.erase();
+              changed = true;
+            }
+          }
+    }
     for (bool changed = true; changed;) {
       changed = false;
       for (auto it = scope.rbegin(); it != scope.rend();) {

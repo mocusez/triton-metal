@@ -1372,6 +1372,22 @@ def _rankn_scan_outer_result_if_load_write_kernel(x_ptr, out_ptr, scratch_ptr,
 
 
 @triton.jit
+def _rankn_scan_outer_for_result_if_carry_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    acc = tl.zeros((8, 64), tl.float32)
+    for row in range(rows):
+        if row != 1:
+            value = acc
+            for col in range(2):
+                x = tl.load(x_ptr + (row * 2 + col) * 512 + index)
+                value += tl.cumsum(x, 1)
+        else:
+            value = acc - 1.0
+        acc = value
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
 def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     if rows > 0:
@@ -2109,6 +2125,28 @@ def test_multiband_scan_outer_result_if_load_matches_torch(rows, num_warps):
         x.to("mps"), out, rows, num_warps=num_warps)
     torch.mps.synchronize()
     expected = x.cumsum(2).sum(0) if rows else x[0]
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_outer_for_result_if_carry_matches_torch(rows,
+                                                                num_warps):
+    storage_rows = max(rows * 2, 1)
+    x = ((torch.arange(storage_rows * 512)
+          .reshape(storage_rows, 8, 64) % 7 - 3).float() / 8)
+    out = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    _rankn_scan_outer_for_result_if_carry_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.zeros(8, 64)
+    for row in range(rows):
+        if row != 1:
+            for col in range(2):
+                expected += x[row * 2 + col].cumsum(1)
+        else:
+            expected -= 1.0
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
