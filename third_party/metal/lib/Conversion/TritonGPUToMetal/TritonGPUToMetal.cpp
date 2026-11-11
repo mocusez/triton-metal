@@ -43532,6 +43532,9 @@ static bool nestedScanPureScalarLoop(mlir::Operation *loop) {
     if (op == loop ||
         op->hasTrait<mlir::OpTrait::IsTerminator>())
       return mlir::WalkResult::advance();
+    if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(op) &&
+        nestedScanPureScalarLoop(op))
+      return mlir::WalkResult::skip();
     if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
         llvm::any_of(op->getOperandTypes(), isTensor) ||
         llvm::any_of(op->getResultTypes(), isTensor)) {

@@ -299,8 +299,8 @@ when its source is provably write-separated. Such an if may also supply an
 enclosing `scf.for` tensor carry; incoming carry reads use a pre-if band. The
 selected loop admits no-result uniform `scf.if` bodies and supported result-carrying
 internal ifs. Pure scalar inner `scf.for`/`scf.while` computations stay intact
-within a phase, including in no-result branches around the scan or in a result
-branch's yield cone. Post-scan branches locally replay pure tensor address
+within a phase, including nested pure scalar loops. They may also remain in
+no-result branches around the scan or in a result branch's yield cone. Post-scan branches locally replay pure tensor address
 cones. Internal ifs include local result ifs within nested no-result branch chains
 and result ifs nested in another result branch. Internal results use slots
 before local phase splitting, with pure or provably write-separated load
@@ -800,7 +800,8 @@ case and an adjacent rejection regression.
    an enclosing `scf.for` tensor carry, with its incoming read in a pre-if band
    and its result write in the post-if band. Pure scalar inner
    `scf.for`/`scf.while` computations stay intact within their phase, including
-   in no-result branches around the scan and in result-branch yield cones.
+   nested pure scalar loops, no-result branches around the scan, and
+   result-branch yield cones.
    Post-scan branches clone pure tensor address cones at their consumers without
    replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
    rejected. Supported result-carrying internal ifs use

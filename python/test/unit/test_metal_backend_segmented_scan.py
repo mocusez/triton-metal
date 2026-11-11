@@ -2765,6 +2765,20 @@ def _rankn_scan_internal_scalar_for_kernel(x_ptr, out_ptr, rows):
 
 
 @triton.jit
+def _rankn_scan_internal_nested_scalar_for_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        delta = 0
+        for col in range(row + 1):
+            inner = 0
+            for lane in range(col + 1):
+                inner += lane
+            delta += inner
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x + delta, 1))
+
+
+@triton.jit
 def _rankn_scan_internal_scalar_while_kernel(x_ptr, out_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     for row in range(rows):
@@ -3215,6 +3229,27 @@ def test_multiband_scan_internal_scalar_for_matches_torch(rows, num_warps):
     if rows:
         row = torch.arange(rows).reshape(rows, 1, 1)
         expected = (x + row * (row + 1)).cumsum(2)
+    else:
+        expected = torch.full_like(x, -999999)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_internal_nested_scalar_for_matches_torch(rows,
+                                                                num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_internal_nested_scalar_for_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    if rows:
+        row = torch.arange(rows).reshape(rows, 1, 1)
+        delta = row * (row + 1) * (row + 2) // 6
+        expected = (x + delta).cumsum(2)
     else:
         expected = torch.full_like(x, -999999)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
