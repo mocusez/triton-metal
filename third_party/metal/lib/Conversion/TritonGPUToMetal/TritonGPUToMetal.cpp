@@ -43397,7 +43397,7 @@ nestedScanWhileSnapshots(mlir::scf::WhileOp loop) {
   return snapshots;
 }
 
-static bool nestedScanPureScalarLoop(mlir::Operation *loop);
+static bool nestedScanPureScalarRegion(mlir::Operation *loop);
 
 static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
   for (mlir::Region &region : branch->getRegions()) {
@@ -43411,7 +43411,7 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
       if (!def || !visited.insert(def).second)
         continue;
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(def) &&
-          nestedScanPureScalarLoop(def))
+          nestedScanPureScalarRegion(def))
         continue;
       bool internalResult = g_nestedScanInternalResultIfs.count(def);
       if ((!internalResult && def->getNumRegions()) ||
@@ -43521,19 +43521,19 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
   return {};
 }
 
-static bool nestedScanPureScalarLoop(mlir::Operation *loop) {
+static bool nestedScanPureScalarRegion(mlir::Operation *operation) {
   auto isTensor = [](mlir::Type type) {
     return mlir::isa<mlir::RankedTensorType>(type);
   };
-  if (llvm::any_of(loop->getResultTypes(), isTensor))
+  if (llvm::any_of(operation->getResultTypes(), isTensor))
     return false;
   bool pure = true;
-  loop->walk([&](mlir::Operation *op) -> mlir::WalkResult {
-    if (op == loop ||
+  operation->walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (op == operation ||
         op->hasTrait<mlir::OpTrait::IsTerminator>())
       return mlir::WalkResult::advance();
     if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(op) &&
-        nestedScanPureScalarLoop(op))
+        nestedScanPureScalarRegion(op))
       return mlir::WalkResult::skip();
     if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
         llvm::any_of(op->getOperandTypes(), isTensor) ||
@@ -43547,8 +43547,8 @@ static bool nestedScanPureScalarLoop(mlir::Operation *loop) {
 }
 
 // A selected loop keeps its tensor effects in a flat body or a no-result uniform
-// if. Pure scalar inner loops stay intact within the local phase. The scheduler
-// cuts tensor work into register bands. Uniform outer
+// if. Pure scalar inner loops and result ifs stay intact within the local phase.
+// The scheduler cuts tensor work into register bands. Uniform outer
 // for/if/while ancestors stay intact; outer for loops use the same slots and
 // pre/post bands in their own direct scopes without moving the inner phases.
 static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
@@ -43791,7 +43791,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
     }
     llvm::SmallVector<mlir::scf::IfOp, 4> internalResultIfs;
     loop.getBody()->walk([&](mlir::scf::IfOp branch) {
-      if (branch.getNumResults() != 0)
+      if (branch.getNumResults() != 0 &&
+          !nestedScanPureScalarRegion(branch.getOperation()))
         internalResultIfs.push_back(branch);
     });
     llvm::DenseSet<mlir::Operation *> newInternalResultIfs;
@@ -43855,8 +43856,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (g_nestedScanInternalResultIfs.count(&op))
         continue;
-      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
-          nestedScanPureScalarLoop(&op))
+      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
+                     mlir::scf::IfOp>(&op) &&
+          nestedScanPureScalarRegion(&op))
         continue;
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
@@ -43868,7 +43870,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           if (g_nestedScanInternalResultIfs.count(nestedOp))
             return mlir::WalkResult::skip();
           if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(nestedOp) &&
-              nestedScanPureScalarLoop(nestedOp))
+              nestedScanPureScalarRegion(nestedOp))
             return mlir::WalkResult::skip();
           if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
               nestedIf && nestedIf.getNumResults() == 0)
@@ -45003,7 +45005,7 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
             return current;
           bool pureScalarLoop =
               def && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(def) &&
-              nestedScanPureScalarLoop(def);
+              nestedScanPureScalarRegion(def);
           if (!def || (def->getNumRegions() && !pureScalarLoop) ||
               (!mlir::isMemoryEffectFree(def) &&
                !mlir::isa<mlir::triton::LoadOp>(def))) {
