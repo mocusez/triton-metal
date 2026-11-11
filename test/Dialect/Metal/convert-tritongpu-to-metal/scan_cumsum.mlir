@@ -2528,3 +2528,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: metal.tg_load_indexed
 // CHECK: metal.store
 // CHECK-NOT: tt.scan
+
+// -----
+#outer_load_cfg = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#outer_load_row = #ttg.slice<{dim = 1, parent = #outer_load_cfg}>
+#outer_load_col = #ttg.slice<{dim = 0, parent = #outer_load_cfg}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "metal:0", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @nested_scan_outer_result_if_load(%x: f32, %out: !tt.ptr<f32>, %trips: i32, %condition: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %zero = arith.constant dense<0.0> : tensor<8x16xf32, #outer_load_cfg>
+    %c16 = arith.constant dense<16> : tensor<8x1xi32, #outer_load_cfg>
+    %cond = arith.cmpi sgt, %condition, %c0 : i32
+    %row = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #outer_load_row>
+    %re = tt.expand_dims %row {axis = 1 : i32} : tensor<8xi32, #outer_load_row> -> tensor<8x1xi32, #outer_load_cfg>
+    %ro = arith.muli %re, %c16 : tensor<8x1xi32, #outer_load_cfg>
+    %col = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #outer_load_col>
+    %ce = tt.expand_dims %col {axis = 0 : i32} : tensor<16xi32, #outer_load_col> -> tensor<1x16xi32, #outer_load_cfg>
+    %cb = tt.broadcast %ce : tensor<1x16xi32, #outer_load_cfg> -> tensor<8x16xi32, #outer_load_cfg>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #outer_load_cfg>
+    %orow = tt.addptr %obase, %ro : tensor<8x1x!tt.ptr<f32>, #outer_load_cfg>, tensor<8x1xi32, #outer_load_cfg>
+    %orowb = tt.broadcast %orow : tensor<8x1x!tt.ptr<f32>, #outer_load_cfg> -> tensor<8x16x!tt.ptr<f32>, #outer_load_cfg>
+    %oaddr = tt.addptr %orowb, %cb : tensor<8x16x!tt.ptr<f32>, #outer_load_cfg>, tensor<8x16xi32, #outer_load_cfg>
+    %result = scf.if %cond -> (tensor<8x16xf32, #outer_load_cfg>) {
+      %loop = scf.for %i = %c0 to %trips step %c1 iter_args(%acc = %zero) -> (tensor<8x16xf32, #outer_load_cfg>) : i32 {
+        %v = tt.splat %x : f32 -> tensor<8x16xf32, #outer_load_cfg>
+        %scan = "tt.scan"(%v) <{axis = 1 : i32, reverse = false}> ({
+        ^bb0(%a: f32, %b: f32):
+          %sum = arith.addf %a, %b : f32
+          tt.scan.return %sum : f32
+        }) : (tensor<8x16xf32, #outer_load_cfg>) -> tensor<8x16xf32, #outer_load_cfg>
+        %next = arith.addf %acc, %scan : tensor<8x16xf32, #outer_load_cfg>
+        scf.yield %next : tensor<8x16xf32, #outer_load_cfg>
+      }
+      scf.yield %loop : tensor<8x16xf32, #outer_load_cfg>
+    } else {
+      %loaded = tt.load %oaddr : tensor<8x16x!tt.ptr<f32>, #outer_load_cfg>
+      scf.yield %loaded : tensor<8x16xf32, #outer_load_cfg>
+    }
+    tt.store %oaddr, %result : tensor<8x16x!tt.ptr<f32>, #outer_load_cfg>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: metal.kernel nested_scan_outer_result_if_load
+// CHECK: scf.if
+// CHECK: metal.get_element
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.store
+// CHECK-NOT: tt.scan

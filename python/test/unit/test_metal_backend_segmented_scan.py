@@ -1343,6 +1343,35 @@ def _rankn_scan_forwarded_outer_result_if_kernel(x_ptr, out_ptr, trips,
 
 
 @triton.jit
+def _rankn_scan_outer_result_if_load_kernel(x_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    acc = tl.zeros((8, 64), tl.float32)
+    if rows > 0:
+        for row in range(rows):
+            x = tl.load(x_ptr + row * 512 + index)
+            acc += tl.cumsum(x, 1)
+    else:
+        acc = tl.load(x_ptr + index)
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
+def _rankn_scan_outer_result_if_load_write_kernel(x_ptr, out_ptr, scratch_ptr,
+                                                   rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    snapshot = tl.load(x_ptr + index)
+    tl.store(scratch_ptr + index, 0.0)
+    acc = tl.zeros((8, 64), tl.float32)
+    if rows > 0:
+        for row in range(rows):
+            x = tl.load(x_ptr + row * 512 + index)
+            acc += tl.cumsum(x, 1)
+    else:
+        acc = snapshot
+    tl.store(out_ptr + index, acc)
+
+
+@triton.jit
 def _rankn_tuple_scan_conditional_loop_kernel(x_ptr, value_ptr, count_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     if rows > 0:
@@ -2065,6 +2094,21 @@ def test_multiband_scan_forwarded_outer_result_if_matches_torch(
         expected = x.cumsum(2).sum(0) if trips else torch.zeros(8, 64)
     else:
         expected = torch.full((8, 64), 2.0)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_outer_result_if_load_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full((8, 64), -999999, dtype=torch.float32, device="mps")
+    _rankn_scan_outer_result_if_load_kernel[(1,)](
+        x.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = x.cumsum(2).sum(0) if rows else x[0]
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
@@ -2854,6 +2898,10 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
     ("_rankn_scan_deep_internal_result_if_write_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
       "scratch_ptr": "*fp32", "rows": "i32"},
+     "result if cannot replay its result sources"),
+    ("_rankn_scan_outer_result_if_load_write_kernel",
+     {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
+      "rows": "i32"},
      "result if cannot replay its result sources"),
     ("_rankn_scan_scalar_store_reorder_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scalar_ptr": "*fp32",

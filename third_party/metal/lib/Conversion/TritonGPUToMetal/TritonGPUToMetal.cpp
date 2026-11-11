@@ -44754,6 +44754,10 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     });
   }
   for (auto original : ifs) {
+    if (!internalLoop && !nestedScanInternalIfSourcesSafe(original))
+      return original.emitOpError(
+          "Metal backend: nested scan result if cannot replay its result "
+          "sources");
     auto func = original->getParentOfType<mlir::triton::FuncOp>();
     auto tile = findTileInfo(func);
     if (!tile)
@@ -44857,7 +44861,7 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
             return current;
           if (!def || def->getNumRegions() ||
               (!mlir::isMemoryEffectFree(def) &&
-               !(internalLoop && mlir::isa<mlir::triton::LoadOp>(def)))) {
+               !mlir::isa<mlir::triton::LoadOp>(def))) {
             failed = true;
             return {};
           }
@@ -45023,6 +45027,13 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     BarrierOp::create(afterPost, loc);
     g_nestedScanResultIfs.erase(original.getOperation());
     original->erase();
+    llvm::SmallVector<mlir::triton::LoadOp, 4> deadSourceLoads;
+    replacement.walk([&](mlir::triton::LoadOp load) {
+      if (load->use_empty())
+        deadSourceLoads.push_back(load);
+    });
+    for (auto load : deadSourceLoads)
+      load->erase();
     for (bool changed = true; changed;) {
       changed = false;
       for (auto it = scope.rbegin(); it != scope.rend();) {
