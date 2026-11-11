@@ -43869,7 +43869,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
             return mlir::WalkResult::advance();
           if (g_nestedScanInternalResultIfs.count(nestedOp))
             return mlir::WalkResult::skip();
-          if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(nestedOp) &&
+          if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
+                         mlir::scf::IfOp>(nestedOp) &&
               nestedScanPureScalarRegion(nestedOp))
             return mlir::WalkResult::skip();
           if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
