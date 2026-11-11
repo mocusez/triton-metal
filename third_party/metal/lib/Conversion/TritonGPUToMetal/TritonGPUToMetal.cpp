@@ -43491,8 +43491,31 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
   return {};
 }
 
+static bool nestedScanPureScalarLoop(mlir::scf::ForOp loop) {
+  auto isTensor = [](mlir::Type type) {
+    return mlir::isa<mlir::RankedTensorType>(type);
+  };
+  if (llvm::any_of(loop.getResultTypes(), isTensor))
+    return false;
+  bool pure = true;
+  loop->walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (op == loop.getOperation() ||
+        op->hasTrait<mlir::OpTrait::IsTerminator>())
+      return mlir::WalkResult::advance();
+    if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
+        llvm::any_of(op->getOperandTypes(), isTensor) ||
+        llvm::any_of(op->getResultTypes(), isTensor)) {
+      pure = false;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return pure;
+}
+
 // A selected loop keeps its tensor effects in a flat body or a no-result uniform
-// if, which the local phase scheduler cuts into register bands. Uniform outer
+// if. Pure scalar inner loops stay intact within the local phase. The scheduler
+// cuts tensor work into register bands. Uniform outer
 // for/if/while ancestors stay intact; outer for loops use the same slots and
 // pre/post bands in their own direct scopes without moving the inner phases.
 static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
@@ -43799,6 +43822,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (g_nestedScanInternalResultIfs.count(&op))
         continue;
+      if (auto inner = mlir::dyn_cast<mlir::scf::ForOp>(&op);
+          inner && nestedScanPureScalarLoop(inner))
+        continue;
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
         bool flat = true;
@@ -43826,8 +43852,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
            !mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp,
                       mlir::triton::GetProgramIdOp>(&op)))
         return loop.emitOpError("Metal backend: nested scan requires a flat "
-                                "load/compute/store loop body or a no-result "
-                                "uniform if");
+                                "load/compute/store loop body, a no-result "
+                                "uniform if, or a pure scalar for");
     }
     llvm::SmallVector<mlir::Type, 4> carried = nestedScanCarriedTypes(loop);
     if (!carried.empty() || outerTensorWork) {
