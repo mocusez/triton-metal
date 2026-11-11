@@ -43827,12 +43827,22 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
+        bool beforeScan = false;
+        for (mlir::Operation &candidate : *loop.getBody())
+          if (mlir::isa<mlir::triton::ScanOp>(&candidate)) {
+            beforeScan = branch->isBeforeInBlock(&candidate);
+            break;
+          }
         bool flat = true;
         branch->walk([&](mlir::Operation *nestedOp) -> mlir::WalkResult {
           if (nestedOp == branch.getOperation() ||
               nestedOp->hasTrait<mlir::OpTrait::IsTerminator>())
             return mlir::WalkResult::advance();
           if (g_nestedScanInternalResultIfs.count(nestedOp))
+            return mlir::WalkResult::skip();
+          if (beforeScan &&
+              mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(nestedOp) &&
+              nestedScanPureScalarLoop(nestedOp))
             return mlir::WalkResult::skip();
           if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
               nestedIf && nestedIf.getNumResults() == 0)
