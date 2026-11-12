@@ -43717,7 +43717,11 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (!tile)
           return outerIf.emitOpError(
               "Metal backend: nested scan result if has no function tile");
+        bool hasTensorResult =
+            llvm::any_of(outerIf.getResultTypes(), isTensor);
         for (mlir::Type type : outerIf.getResultTypes()) {
+          if (hasTensorResult && type.isIntOrFloat())
+            continue;
           llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
           if (!why.empty())
             return outerIf.emitOpError("Metal backend: ") << why;
@@ -45114,8 +45118,14 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     mlir::Block &postBody = *post.getBody();
     mlir::OpBuilder postBuilder(postBody.getTerminator());
     llvm::SmallVector<mlir::Value, 4> results;
-    for (auto [index, type] : llvm::enumerate(types)) {
-      mlir::Value result = read(postBuilder, index, type);
+    unsigned tensorResult = 0;
+    unsigned scalarResult = 0;
+    for (mlir::Type type : original.getResultTypes()) {
+      mlir::Value result;
+      if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+        result = read(postBuilder, tensorResult++, tensor);
+      else
+        result = replacement.getResult(scalarResult++);
       if (!result)
         return original.emitOpError(
             "Metal backend: nested scan cannot read an if result");
@@ -45139,6 +45149,10 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
         postSet.insert(&op);
       }
     for (auto [index, result] : llvm::enumerate(original.getResults())) {
+      if (!isTensor(result.getType())) {
+        result.replaceAllUsesWith(results[index]);
+        continue;
+      }
       llvm::SmallVector<mlir::OpOperand *, 8> uses;
       for (mlir::OpOperand &use : result.getUses()) {
         mlir::Operation *owner =
@@ -45165,11 +45179,14 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     bool postFailed = false;
     std::function<mlir::Value(mlir::Value)> localizePost =
         [&](mlir::Value value) -> mlir::Value {
-      if (!isTensor(value.getType()))
+      mlir::Operation *def = value.getDefiningOp();
+      bool localizeScalar =
+          !isTensor(value.getType()) && def && def->getBlock() == &scope &&
+          post->isBeforeInBlock(def);
+      if (!isTensor(value.getType()) && !localizeScalar)
         return value;
       if (auto mapped = postMapping.lookupOrNull(value))
         return mapped;
-      mlir::Operation *def = value.getDefiningOp();
       if (!def || post->isAncestor(def) || def->hasAttr(kCarrySlotAttr))
         return value;
       if (def->getNumRegions() || !mlir::isMemoryEffectFree(def)) {

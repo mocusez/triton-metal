@@ -293,7 +293,8 @@ the same budgeted slots as outer `for` loops. External while snapshots without
 intervening writes are materialized through the same pre-band slots. Outer `for`
 scopes support flat tensor load/compute/store work, mixed carries, and snapshots.
 Sibling scan loops keep independent phase schedules. Result-carrying outer
-`scf.if` branches publish tensor results through budgeted slots, and an outer
+`scf.if` branches publish tensor results through budgeted slots; mixed results
+keep scalar values as ordinary SSA results. An outer
 result branch may directly forward a nested result if's value or load a result
 when its source is provably write-separated. Such an if may also supply an
 enclosing `scf.for` tensor carry; incoming carry reads use a pre-if band. The
@@ -796,8 +797,9 @@ case and an adjacent rejection regression.
    pre/post bands without moving scan phases to the user loop. Non-replayable
    snapshots are materialized once and localized to the consuming bands. Sibling
    scan loops beneath outer control flow retain independent phase schedules.
-   Result-carrying outer `scf.if` values use budgeted branch slots and a uniform
-   post-if band. A nested outer result if may directly forward its value to the
+   Result-carrying outer `scf.if` tensor values use budgeted branch slots and a
+   uniform post-if band; mixed results preserve scalar SSA values outside that
+   band. A nested outer result if may directly forward its value to the
    enclosing result branch's yield. Outer result sources may also include loads
    when replay is separated from intervening writes. An outer result if can feed
    an enclosing `scf.for` tensor carry, with its incoming read in a pre-if band
