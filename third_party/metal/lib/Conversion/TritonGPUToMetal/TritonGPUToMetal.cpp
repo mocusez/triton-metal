@@ -43832,7 +43832,10 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         valid = false;
         break;
       }
+      bool hasTensorResult = llvm::any_of(branch.getResultTypes(), isTensor);
       for (mlir::Type type : branch.getResultTypes()) {
+        if (hasTensorResult && type.isIntOrFloat())
+          continue;
         llvm::StringRef why = nestedScanCarryUnsupported(type, *tile);
         if (!why.empty()) {
           branch.emitOpError("Metal backend: ") << why;
@@ -44842,8 +44845,16 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           "Metal backend: nested scan result if has no function tile");
     auto loc = original.getLoc();
     llvm::SmallVector<mlir::RankedTensorType, 4> types;
-    for (mlir::Type type : original.getResultTypes())
-      types.push_back(mlir::cast<mlir::RankedTensorType>(type));
+    llvm::SmallVector<unsigned, 4> tensorResultIndices;
+    llvm::SmallVector<unsigned, 4> scalarResultIndices;
+    for (auto [index, type] : llvm::enumerate(original.getResultTypes())) {
+      if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
+        types.push_back(tensor);
+        tensorResultIndices.push_back(index);
+      } else {
+        scalarResultIndices.push_back(index);
+      }
+    }
 
     mlir::OpBuilder topBuilder(func.getContext());
     topBuilder.setInsertionPointToStart(&func.getBody().front());
@@ -44982,8 +44993,8 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
       mlir::Block &phaseBody = *phase.getBody();
       mlir::OpBuilder phaseBuilder(phaseBody.getTerminator());
       mlir::IRMapping mapping;
-      for (auto [index, type] : llvm::enumerate(types)) {
-        mlir::Value value = yield.getOperand(index);
+      for (auto [slot, resultIndex] : llvm::enumerate(tensorResultIndices)) {
+        mlir::Value value = yield.getOperand(resultIndex);
         bool failed = false;
         std::function<mlir::Value(mlir::Value)> localize =
             [&](mlir::Value current) -> mlir::Value {
@@ -45031,15 +45042,18 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
         if (failed || !local)
           return original.emitOpError(
               "Metal backend: nested scan cannot localize an if result");
-        if (!write(phaseBuilder, index, local))
+        if (!write(phaseBuilder, slot, local))
           return original.emitOpError(
               "Metal backend: nested scan cannot write an if result slot");
       }
     }
 
+    llvm::SmallVector<mlir::Type, 4> scalarResultTypes;
+    for (unsigned index : scalarResultIndices)
+      scalarResultTypes.push_back(original.getResult(index).getType());
     mlir::OpBuilder before(original);
     auto replacement = mlir::scf::IfOp::create(
-        before, loc, mlir::TypeRange{}, original.getCondition(),
+        before, loc, scalarResultTypes, original.getCondition(),
         /*addThenBlock=*/true, /*addElseBlock=*/true);
     for (auto [oldRegion, newRegion] : llvm::zip(
              original->getRegions(), replacement->getRegions())) {
@@ -45048,8 +45062,11 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
       auto yield = mlir::cast<mlir::scf::YieldOp>(oldBlock.getTerminator());
       newBlock.getOperations().splice(newBlock.end(), oldBlock.getOperations(),
                                       oldBlock.begin(), yield->getIterator());
+      llvm::SmallVector<mlir::Value, 4> scalarResults;
+      for (unsigned index : scalarResultIndices)
+        scalarResults.push_back(yield.getOperand(index));
       mlir::OpBuilder branchBuilder(&newBlock, newBlock.end());
-      mlir::scf::YieldOp::create(branchBuilder, loc);
+      mlir::scf::YieldOp::create(branchBuilder, loc, scalarResults);
     }
 
     if (internalLoop) {
@@ -45057,8 +45074,14 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
       after.setInsertionPointAfter(replacement);
       auto barrier = BarrierOp::create(after, loc);
       after.setInsertionPointAfter(barrier);
-      for (auto [index, type] : llvm::enumerate(types)) {
-        mlir::Value result = read(after, index, type);
+      unsigned tensorResult = 0;
+      unsigned scalarResult = 0;
+      for (auto [index, type] : llvm::enumerate(original.getResultTypes())) {
+        mlir::Value result;
+        if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+          result = read(after, tensorResult++, tensor);
+        else
+          result = replacement.getResult(scalarResult++);
         if (!result)
           return original.emitOpError(
               "Metal backend: nested scan cannot read an internal if result");

@@ -304,9 +304,10 @@ nest and may remain in no-result branches around the scan or in a result
 branch's yield cone. Scalar-result ifs may also nest in those no-result branches,
 in tensor-result branch yield cones, and in pure scalar loops. Post-scan branches
 locally replay pure tensor address cones. Internal ifs include local result ifs within nested no-result branch chains
-and result ifs nested in another result branch. Internal results use slots
+and result ifs nested in another result branch. Internal tensor results use slots
 before local phase splitting, with pure or provably write-separated load
-sources. Multiple results may feed independent scans or later result ifs
+sources; mixed tensor/scalar results keep the scalar values as ordinary SSA
+branch results. Multiple results may feed independent scans or later result ifs
 through their slots without replaying the branch region. Each
 iteration publishes complete
 tiles before prefix reads and synchronizes scratch reuse. While snapshots
@@ -810,7 +811,8 @@ case and an adjacent rejection regression.
    replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
    rejected. Supported result-carrying internal ifs use
    slots before phase splitting, with pure or write-separated load sources.
-   Multiple internal results can feed independent scans or chained result ifs
+   Mixed tensor/scalar results allocate slots only for tensors and preserve scalar
+   SSA results. Multiple internal results can feed independent scans or chained result ifs
    through their own slots. Result ifs may also nest in another result branch,
    materializing their slots from the innermost branch outward. External while
    snapshots without intervening writes
