@@ -303,7 +303,9 @@ internal ifs. Pure scalar inner `scf.for`/`scf.while` computations and pure
 scalar-result `scf.if` operations stay intact within a phase. Scalar loops may
 nest and may remain in no-result branches around the scan or in a result
 branch's yield cone. Scalar-result ifs may also nest in those no-result branches,
-in tensor-result branch yield cones, and in pure scalar loops. Post-scan branches
+in tensor-result branch yield cones, and in pure scalar loops. Local scalar
+loads may appear in those regions when their results stay within one scan phase;
+result-source replay still requires pure scalar computations. Post-scan branches
 locally replay pure tensor address cones. Internal ifs include local result ifs within nested no-result branch chains
 and result ifs nested in another result branch. Internal tensor results use slots
 before local phase splitting, with pure or provably write-separated load
@@ -808,8 +810,9 @@ case and an adjacent rejection regression.
    stay intact within their phase. Scalar loops may nest and may remain in
    no-result branches around the scan or in result-branch yield cones;
    scalar-result ifs may also nest in those no-result branches, in
-   tensor-result branch yield cones, and in pure scalar loops. Post-scan branches
-   clone pure tensor address cones at their consumers without
+   tensor-result branch yield cones, and in pure scalar loops. Local scalar loads
+   must be consumed within the same scan phase and are not replayed as result
+   sources. Post-scan branches clone pure tensor address cones at their consumers without
    replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
    rejected. Supported result-carrying internal ifs use
    slots before phase splitting, with pure or write-separated load sources.

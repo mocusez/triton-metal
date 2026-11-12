@@ -3149,6 +3149,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     }
     tt.return
   }
+  tt.func public @nested_scan_scalar_load_in_for(%x: f32, %scalar: !tt.ptr<i32>, %out: !tt.ptr<f32>, %trips: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %c16 = arith.constant dense<16> : tensor<8x1xi32, #nested_scalar_cfg>
+    %rows = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32, #nested_scalar_row>
+    %re = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #nested_scalar_row> -> tensor<8x1xi32, #nested_scalar_cfg>
+    %ro = arith.muli %re, %c16 : tensor<8x1xi32, #nested_scalar_cfg>
+    %cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #nested_scalar_col>
+    %ce = tt.expand_dims %cols {axis = 0 : i32} : tensor<16xi32, #nested_scalar_col> -> tensor<1x16xi32, #nested_scalar_cfg>
+    %cb = tt.broadcast %ce : tensor<1x16xi32, #nested_scalar_cfg> -> tensor<8x16xi32, #nested_scalar_cfg>
+    %obase = tt.splat %out : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>, #nested_scalar_cfg>
+    %orow = tt.addptr %obase, %ro : tensor<8x1x!tt.ptr<f32>, #nested_scalar_cfg>, tensor<8x1xi32, #nested_scalar_cfg>
+    %orowb = tt.broadcast %orow : tensor<8x1x!tt.ptr<f32>, #nested_scalar_cfg> -> tensor<8x16x!tt.ptr<f32>, #nested_scalar_cfg>
+    %outaddr = tt.addptr %orowb, %cb : tensor<8x16x!tt.ptr<f32>, #nested_scalar_cfg>, tensor<8x16xi32, #nested_scalar_cfg>
+    scf.for %row = %c0 to %trips step %c1 : i32 {
+      %limit = arith.addi %row, %c1 : i32
+      %row_base = arith.muli %row, %c4 : i32
+      %delta = scf.for %col = %c0 to %limit step %c1 iter_args(%acc = %c0) -> i32 : i32 {
+        %col_offset = arith.addi %row_base, %col : i32
+        %addr = tt.addptr %scalar, %col_offset : !tt.ptr<i32>, i32
+        %value = tt.load %addr : !tt.ptr<i32>
+        %next = arith.addi %acc, %value : i32
+        scf.yield %next : i32
+      }
+      %offset = arith.sitofp %delta : i32 to f32
+      %xoffset = tt.splat %offset : f32 -> tensor<8x16xf32, #nested_scalar_cfg>
+      %v = tt.splat %x : f32 -> tensor<8x16xf32, #nested_scalar_cfg>
+      %input = arith.addf %v, %xoffset : tensor<8x16xf32, #nested_scalar_cfg>
+      %scan = "tt.scan"(%input) <{axis = 1 : i32, reverse = false}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum = arith.addf %a, %b : f32
+        tt.scan.return %sum : f32
+      }) : (tensor<8x16xf32, #nested_scalar_cfg>) -> tensor<8x16xf32, #nested_scalar_cfg>
+      tt.store %outaddr, %scan : tensor<8x16x!tt.ptr<f32>, #nested_scalar_cfg>
+    }
+    tt.return
+  }
 }
 
 // CHECK-LABEL: metal.kernel nested_scan_internal_nested_scalar_for
@@ -3171,6 +3209,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // CHECK: arith.muli
 // CHECK: scf.yield
 // CHECK: arith.addi
+// CHECK: metal.tg_store_indexed
+// CHECK: metal.barrier
+// CHECK: scf.for
+// CHECK: metal.tg_load_indexed
+// CHECK: metal.store
+// CHECK-NOT: tt.scan
+
+// CHECK-LABEL: metal.kernel nested_scan_scalar_load_in_for
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: metal.get_element
+// CHECK: arith.addi
+// CHECK: arith.sitofp
 // CHECK: metal.tg_store_indexed
 // CHECK: metal.barrier
 // CHECK: scf.for

@@ -559,6 +559,7 @@ exchangePhaseEnds(const ExchangeBufferAssignment &assignment) {
 }
 
 static llvm::DenseSet<mlir::Operation *> g_nestedScanInternalResultIfs;
+static llvm::DenseSet<mlir::Operation *> g_nestedScanLocalScalarLoadRegions;
 
 // One shared answer to "will the phase split break this function?".
 //
@@ -18480,6 +18481,7 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         continue;
       bool internalResult = g_nestedScanInternalResultIfs.count(def);
       if (!internalResult && !mlir::isMemoryEffectFree(def) &&
+          !g_nestedScanLocalScalarLoadRegions.count(def) &&
           !mlir::isa<mlir::triton::LoadOp, ScalarDotOp>(def))
         return scan.emitOpError("Metal backend: staged scan cannot safely "
                                 "partition its source and consumers: "
@@ -43397,7 +43399,8 @@ nestedScanWhileSnapshots(mlir::scf::WhileOp loop) {
   return snapshots;
 }
 
-static bool nestedScanPureScalarRegion(mlir::Operation *loop);
+static bool nestedScanPureScalarRegion(mlir::Operation *loop,
+                                       bool allowLoads = false);
 
 static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
   for (mlir::Region &region : branch->getRegions()) {
@@ -43522,7 +43525,8 @@ static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
   return {};
 }
 
-static bool nestedScanPureScalarRegion(mlir::Operation *operation) {
+static bool nestedScanPureScalarRegion(mlir::Operation *operation,
+                                       bool allowLoads) {
   auto isTensor = [](mlir::Type type) {
     return mlir::isa<mlir::RankedTensorType>(type);
   };
@@ -43534,9 +43538,11 @@ static bool nestedScanPureScalarRegion(mlir::Operation *operation) {
         op->hasTrait<mlir::OpTrait::IsTerminator>())
       return mlir::WalkResult::advance();
     if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp, mlir::scf::IfOp>(op) &&
-        nestedScanPureScalarRegion(op))
+        nestedScanPureScalarRegion(op, allowLoads))
       return mlir::WalkResult::skip();
-    if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
+    bool localScalarLoad = allowLoads && mlir::isa<mlir::triton::LoadOp>(op);
+    if (op->getNumRegions() ||
+        (!mlir::isMemoryEffectFree(op) && !localScalarLoad) ||
         llvm::any_of(op->getOperandTypes(), isTensor) ||
         llvm::any_of(op->getResultTypes(), isTensor)) {
       pure = false;
@@ -43545,6 +43551,29 @@ static bool nestedScanPureScalarRegion(mlir::Operation *operation) {
     return mlir::WalkResult::advance();
   });
   return pure;
+}
+
+static bool nestedScanLocalScalarRegionSafe(mlir::Operation *operation,
+                                            mlir::scf::ForOp loop) {
+  mlir::Block *body = loop.getBody();
+  mlir::Operation *path = body->findAncestorOpInBlock(*operation);
+  if (!path)
+    return false;
+  for (mlir::Value result : operation->getResults())
+    for (mlir::OpOperand &use : result.getUses()) {
+      if (operation->isAncestor(use.getOwner()))
+        continue;
+      mlir::Operation *userPath = body->findAncestorOpInBlock(*use.getOwner());
+      if (!userPath)
+        return false;
+      for (mlir::Operation &op : *body)
+        if (mlir::isa<mlir::triton::ScanOp>(&op) &&
+            path->isBeforeInBlock(&op) && op.isBeforeInBlock(userPath))
+          return false;
+    }
+  if (!mlir::isMemoryEffectFree(operation))
+    g_nestedScanLocalScalarLoadRegions.insert(operation);
+  return true;
 }
 
 // A selected loop keeps its tensor effects in a flat body or a no-result uniform
@@ -43794,10 +43823,23 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       if (!nested && (after || !mlir::isMemoryEffectFree(&op)))
         outerTensorWork |= touchesTensor(op);
     }
+    loop.getBody()->walk([&](mlir::scf::IfOp branch) {
+      if (branch.getNumResults() != 0 &&
+          nestedScanPureScalarRegion(branch.getOperation(),
+                                     /*allowLoads=*/true) &&
+          !nestedScanLocalScalarRegionSafe(branch.getOperation(), loop)) {
+        branch.emitOpError("Metal backend: nested scan scalar loads cannot "
+                           "cross a scan phase");
+        valid = false;
+      }
+    });
+    if (!valid)
+      return mlir::failure();
     llvm::SmallVector<mlir::scf::IfOp, 4> internalResultIfs;
     loop.getBody()->walk([&](mlir::scf::IfOp branch) {
       if (branch.getNumResults() != 0 &&
-          !nestedScanPureScalarRegion(branch.getOperation()))
+          !nestedScanPureScalarRegion(branch.getOperation(),
+                                      /*allowLoads=*/true))
         internalResultIfs.push_back(branch);
     });
     llvm::DenseSet<mlir::Operation *> newInternalResultIfs;
@@ -43866,8 +43908,12 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
                      mlir::scf::IfOp>(&op) &&
-          nestedScanPureScalarRegion(&op))
+          nestedScanPureScalarRegion(&op, /*allowLoads=*/true)) {
+        if (!nestedScanLocalScalarRegionSafe(&op, loop))
+          return op.emitOpError("Metal backend: nested scan scalar loads "
+                                "cannot cross a scan phase");
         continue;
+      }
       if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(&op);
           branch && branch.getNumResults() == 0) {
         bool flat = true;
@@ -43879,8 +43925,14 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
             return mlir::WalkResult::skip();
           if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
                          mlir::scf::IfOp>(nestedOp) &&
-              nestedScanPureScalarRegion(nestedOp))
+              nestedScanPureScalarRegion(nestedOp, /*allowLoads=*/true)) {
+            if (!nestedScanLocalScalarRegionSafe(nestedOp, loop)) {
+              nestedOp->emitOpError("Metal backend: nested scan scalar loads "
+                                    "cannot cross a scan phase");
+              valid = false;
+            }
             return mlir::WalkResult::skip();
+          }
           if (auto nestedIf = mlir::dyn_cast<mlir::scf::IfOp>(nestedOp);
               nestedIf && nestedIf.getNumResults() == 0)
             return mlir::WalkResult::advance();
@@ -43891,6 +43943,8 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
             flat = false;
           return mlir::WalkResult::advance();
         });
+        if (!valid)
+          return mlir::failure();
         if (flat)
           continue;
       }
@@ -46614,6 +46668,7 @@ struct ConvertTritonGPUToMetalPass
     g_nestedScanOuterWhiles.clear();
     g_nestedScanResultIfs.clear();
     g_nestedScanInternalResultIfs.clear();
+    g_nestedScanLocalScalarLoadRegions.clear();
     g_nestedScanFunctions.clear();
     g_nestedScanCarryBytes.clear();
     g_rankNPlannedReduces.clear();

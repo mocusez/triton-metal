@@ -2813,6 +2813,46 @@ def _rankn_scan_internal_nested_scalar_for_kernel(x_ptr, out_ptr, rows):
 
 
 @triton.jit
+def _rankn_scan_scalar_load_in_for_kernel(x_ptr, scalar_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        delta = 0
+        for col in range(row + 1):
+            delta += tl.load(scalar_ptr + row * 4 + col)
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(x + delta, 1))
+
+
+@triton.jit
+def _rankn_scan_cross_phase_scalar_load_in_for_kernel(
+        x_ptr, scalar_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        delta = 0
+        for col in range(row + 1):
+            delta += tl.load(scalar_ptr + row * 4 + col)
+        scanned = tl.cumsum(x, 1)
+        tl.store(out_ptr + row * 512 + index, scanned + delta)
+
+
+@triton.jit
+def _rankn_scan_result_source_scalar_load_in_for_kernel(
+        x_ptr, scalar_ptr, out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        if row != 1:
+            delta = 0
+            for col in range(row + 1):
+                delta += tl.load(scalar_ptr + row * 4 + col)
+            selected = x + delta
+        else:
+            selected = x - 1.0
+        tl.store(out_ptr + row * 512 + index, tl.cumsum(selected, 1))
+
+
+@triton.jit
 def _rankn_scan_scalar_result_if_in_for_kernel(x_ptr, out_ptr, rows):
     index = tl.reshape(tl.arange(0, 512), (8, 64))
     for row in range(rows):
@@ -3306,6 +3346,14 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
     ("_rankn_scan_internal_tensor_while_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
      "nested scan requires a flat load/compute/store loop body"),
+    ("_rankn_scan_cross_phase_scalar_load_in_for_kernel",
+     {"x_ptr": "*fp32", "scalar_ptr": "*i32", "out_ptr": "*fp32",
+      "rows": "i32"},
+     "scalar loads cannot cross a scan phase"),
+    ("_rankn_scan_result_source_scalar_load_in_for_kernel",
+     {"x_ptr": "*fp32", "scalar_ptr": "*i32", "out_ptr": "*fp32",
+      "rows": "i32"},
+     "result if cannot replay its result sources"),
     ("_rankn_scan_pre_scan_if_tensor_for_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
       "rows": "i32"},
@@ -3459,6 +3507,25 @@ def test_multiband_scan_internal_nested_scalar_for_matches_torch(rows,
         expected = (x + delta).cumsum(2)
     else:
         expected = torch.full_like(x, -999999)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_scalar_load_in_for_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    scalar = torch.arange(12, dtype=torch.int32)
+    out = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_scalar_load_in_for_kernel[(1,)](
+        x.to("mps"), scalar.to("mps"), out, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.full_like(x, -999999)
+    for row in range(rows):
+        delta = scalar[row * 4:row * 4 + row + 1].sum()
+        expected[row] = (x[row] + delta).cumsum(1)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
