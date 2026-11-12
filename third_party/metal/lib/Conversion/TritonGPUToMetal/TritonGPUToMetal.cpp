@@ -43533,7 +43533,7 @@ static bool nestedScanPureScalarRegion(mlir::Operation *operation) {
     if (op == operation ||
         op->hasTrait<mlir::OpTrait::IsTerminator>())
       return mlir::WalkResult::advance();
-    if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(op) &&
+    if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp, mlir::scf::IfOp>(op) &&
         nestedScanPureScalarRegion(op))
       return mlir::WalkResult::skip();
     if (op->getNumRegions() || !mlir::isMemoryEffectFree(op) ||
