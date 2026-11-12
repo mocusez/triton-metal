@@ -43410,7 +43410,8 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
       mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
       if (!def || !visited.insert(def).second)
         continue;
-      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(def) &&
+      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
+                     mlir::scf::IfOp>(def) &&
           nestedScanPureScalarRegion(def))
         continue;
       bool internalResult = g_nestedScanInternalResultIfs.count(def);
@@ -45004,10 +45005,11 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           }
           if (!def && !mlir::isa<mlir::RankedTensorType>(current.getType()))
             return current;
-          bool pureScalarLoop =
-              def && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(def) &&
+          bool pureScalarRegion =
+              def && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
+                               mlir::scf::IfOp>(def) &&
               nestedScanPureScalarRegion(def);
-          if (!def || (def->getNumRegions() && !pureScalarLoop) ||
+          if (!def || (def->getNumRegions() && !pureScalarRegion) ||
               (!mlir::isMemoryEffectFree(def) &&
                !mlir::isa<mlir::triton::LoadOp>(def))) {
             failed = true;
