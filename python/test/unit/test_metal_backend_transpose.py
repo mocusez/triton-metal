@@ -1012,3 +1012,37 @@ def test_unit_axis_rank4_access_through_convert_is_named(capfd):
     diagnostic = capfd.readouterr()
     assert "tl.arange over this rank-4/5 tile has no consumer tile" in (
         diagnostic.err + diagnostic.out)
+
+
+# A permute-to-reduce whose source is computed from its own coordinates (an
+# iota built with tl.arange arithmetic) used to be refused as not load-rooted.
+# Every element is computed in place from the coordinates of the element the
+# thread holds, so its label is the one its ranges are emitted under -- in a
+# rank-N phase function the layout's own, not the thread-major relabel a load
+# needs (that one answered all 5 probes wrong).
+@triton.jit
+def _iota_permute_reduce_kernel(O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                                P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr,
+                                AXIS: tl.constexpr, OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    v = (a * 100 + b * 10 + c).to(tl.float32)
+    s = tl.sum(tl.permute(v, (P0, P1, P2)), axis=AXIS)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+@pytest.mark.parametrize("perm", [(0, 2, 1), (2, 1, 0), (1, 2, 0)])
+@pytest.mark.parametrize("shape, num_warps, axis", [
+    ((4, 8, 8), 1, 1), ((2, 4, 8), 2, 0), ((4, 8, 16), 4, 2), ((8, 8, 8), 1, 2),
+])
+def test_iota_permute_reduce_matches_torch(shape, num_warps, axis, perm):
+    a, b, c = shape
+    t = (torch.arange(a)[:, None, None] * 100 + torch.arange(b)[None, :, None] * 10 +
+         torch.arange(c)[None, None, :]).float()
+    want = t.permute(*perm).sum(axis).reshape(-1)
+    out = torch.zeros(want.numel(), dtype=torch.float32)
+    _iota_permute_reduce_kernel[(1,)](out, a, b, c, *perm, axis, want.numel(),
+                                      num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, want)

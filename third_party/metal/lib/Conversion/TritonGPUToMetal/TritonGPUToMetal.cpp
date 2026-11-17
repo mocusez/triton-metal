@@ -17111,6 +17111,39 @@ lowerRank2Axis1ArgminReduce(mlir::triton::ReduceOp op,
 // Find a `tt.trans` (`tl.permute`) between the reduce and its source. A
 // load-rooted permutation carries the input's thread-major coordinates through
 // the relabel; other coordinate systems cannot share this staged publication.
+// A tile computed only from its own coordinates: `tl.arange`s brought to the
+// tile's rank by expand_dims/broadcast, splats, constants and element-wise
+// arithmetic, no memory. Every element is computed in place from the
+// coordinates of the element the thread holds, so whichever label the ranges
+// are emitted under, the values carry the same one.
+static bool coneIsRangeRooted(mlir::Value v, int depth = 0) {
+  if (depth > 24)
+    return false;
+  mlir::Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (mlir::isa<mlir::triton::MakeRangeOp, mlir::triton::SplatOp>(def))
+    return true;
+  if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    return !dense || dense.isSplat();
+  }
+  const bool coordinateMove =
+      mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp>(def);
+  const bool elementwise =
+      (mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+           def->getDialect()) ||
+       (mlir::isa<mlir::triton::TritonDialect>(def->getDialect()) &&
+        def->hasTrait<mlir::OpTrait::Elementwise>())) &&
+      def->getNumRegions() == 0 && mlir::isMemoryEffectFree(def);
+  if (!coordinateMove && !elementwise)
+    return false;
+  return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
+    return !mlir::isa<mlir::RankedTensorType>(operand.getType()) ||
+           coneIsRangeRooted(operand, depth + 1);
+  });
+}
+
 static mlir::triton::TransOp
 rankNReduceSourcePermutation(mlir::triton::ReduceOp op) {
   mlir::Value src = op.getSrcs().front();
@@ -17288,10 +17321,19 @@ planRankNReduce(mlir::triton::ReduceOp op) {
         permutation.getSrc().getType());
     if (!enc || srcTy.getRank() < 3 || !inputTy ||
         inputTy.getRank() != srcTy.getRank() ||
-        !coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()))
+        (!coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) &&
+         !coneIsRangeRooted(permutation.getSrc())))
       return std::nullopt;
-    auto inputPlan = threadMajorLayoutPlan(
-        inputTy.getShape(), srcIndexPlan->threadsPerBlock());
+    // A tile built from its own coordinates carries the label its ranges are
+    // emitted under, which in a rank-N phase function is the layout's own
+    // (📏 thread-major answered 5 of 5 probes wrong; the layout's plan is
+    // exact on 297 of 297 rank-3/4 permutation, axis and warp cells).
+    const bool rangeRooted =
+        !coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank());
+    auto inputPlan = rangeRooted ? planLayoutIndex(inputTy)
+                                 : threadMajorLayoutPlan(
+                                       inputTy.getShape(),
+                                       srcIndexPlan->threadsPerBlock());
     auto order = permutation.getOrder();
     if (!inputPlan || static_cast<int64_t>(order.size()) != srcTy.getRank())
       return std::nullopt;
@@ -48391,8 +48433,9 @@ struct ConvertTritonGPUToMetalPass
           rankNReduceSourcePermutation(red)) {
         red.emitOpError(
             "rank >= 3 reduce over a permuted tile requires a thread-major "
-            "load-rooted source so publication and reduction coordinates can "
-            "be mapped exactly");
+            "load-rooted source, or one computed from its own coordinates "
+            "(tl.arange arithmetic), so publication and reduction coordinates "
+            "can be mapped exactly");
         reduceOk = false;
         return;
       }
