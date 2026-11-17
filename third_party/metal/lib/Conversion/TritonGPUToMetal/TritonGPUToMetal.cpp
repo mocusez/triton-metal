@@ -5167,6 +5167,29 @@ struct ConvertLayoutLowering
         else
           return rewriter.notifyMatchFailure(
               op, "private carry slot outside a register band");
+        // A phase with more bands than this tile has (a wider tile elsewhere
+        // in the loop) must not index past the slot: writes there are
+        // skipped and reads clamped (those bands hold no element of it).
+        const int64_t slotSize =
+            mlir::cast<MetalMemRefType>(bufIt->second.getType()).getSize();
+        mlir::Value inSlot;
+        if (auto loop = findOutermostScfFor(op)) {
+          auto trips = constantTripCount(loop);
+          if (!trips || *trips > slotSize) {
+            mlir::Value size = mlir::arith::ConstantOp::create(
+                rewriter, loc,
+                rewriter.getI32IntegerAttr(static_cast<int32_t>(slotSize)));
+            inSlot = mlir::arith::CmpIOp::create(
+                         rewriter, loc, mlir::arith::CmpIPredicate::slt, band,
+                         size)
+                         .getResult();
+            band = mlir::arith::SelectOp::create(
+                       rewriter, loc, inSlot, band,
+                       mlir::arith::ConstantOp::create(
+                           rewriter, loc, rewriter.getI32IntegerAttr(0)))
+                       .getResult();
+          }
+        }
         mlir::Value bandU =
             mlir::UnrealizedConversionCastOp::create(
                 rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{band})
@@ -5178,7 +5201,17 @@ struct ConvertLayoutLowering
                          rewriter, loc, mlir::TypeRange{plan.elemTy},
                          mlir::ValueRange{staged})
                          .getResult(0);
-          TgStoreIndexedOp::create(rewriter, loc, bufIt->second, bandU, staged);
+          if (inSlot) {
+            auto guard = mlir::scf::IfOp::create(rewriter, loc, inSlot,
+                                                 /*withElseRegion=*/false);
+            mlir::OpBuilder::InsertionGuard insertion(rewriter);
+            rewriter.setInsertionPointToStart(guard.thenBlock());
+            TgStoreIndexedOp::create(rewriter, loc, bufIt->second, bandU,
+                                     staged);
+          } else {
+            TgStoreIndexedOp::create(rewriter, loc, bufIt->second, bandU,
+                                     staged);
+          }
           rewriter.replaceOp(op, adaptor.getSrc());
           return mlir::success();
         }
@@ -47043,6 +47076,265 @@ static int64_t functionThreadsPerBlock(mlir::Operation *op) {
   return warps && lanes ? warps.getInt() * lanes.getInt() : 0;
 }
 
+// A loop around a rank >= 3 reduce that carries a tile (`v = tl.load(...) +
+// prev; ...; prev = v`) cannot keep it as an SSA iter_arg: the loop's body is
+// split into register-band phases, and the yielded tile is defined inside one
+// of them. Every tile in such a loop is cyclic per band, so the thread that
+// reads element (t, iv) of the carry is the one that wrote it: keep the carry
+// in a thread-private slot of one element per band, written once before the
+// loop, read at the top of the body and written at its end (the phase split
+// replays the cone between). 📏 All 72 loop cells with a tile-carried source
+// were refused before. Only a splat initial value is taken (it has no label to
+// disagree with), and only a carry the code after the loop does not read.
+static constexpr llvm::StringLiteral kRankNCarryInitAttr =
+    "metal.rank_n_carry_init";
+
+static void slotRankNLoopTileCarries(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  moduleOp.walk([&](mlir::scf::ForOp loop) {
+    if (loop.getInitArgs().empty())
+      return;
+    bool rankNReduce = false;
+    for (mlir::Operation &op : *loop.getBody()) {
+      if (mlir::isa<mlir::triton::ScanOp>(op))
+        return;
+      auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(op);
+      auto srcTy = reduce ? mlir::dyn_cast<mlir::RankedTensorType>(
+                                reduce.getSrcs().front().getType())
+                          : nullptr;
+      rankNReduce |= srcTy && srcTy.getRank() >= 3;
+    }
+    if (!rankNReduce)
+      return;
+    for (auto [init, result] :
+         llvm::zip(loop.getInitArgs(), loop->getResults())) {
+      // A scalar running value (`tot += tl.sum(...)`) takes a one-element
+      // slot, and may be read after the loop.
+      if ((init.getType().isF32() || init.getType().isInteger(32)) &&
+          loop.getInductionVar().getType().isInteger(32))
+        continue;
+      auto type = mlir::dyn_cast<mlir::RankedTensorType>(init.getType());
+      auto constant = init.getDefiningOp<mlir::arith::ConstantOp>();
+      auto dense = constant ? mlir::dyn_cast<mlir::DenseElementsAttr>(
+                                  constant.getValue())
+                            : nullptr;
+      if (!type || !dense || !dense.isSplat() || !result.use_empty() ||
+          !type.getElementType().isIntOrFloat() ||
+          type.getElementType().getIntOrFloatBitWidth() < 8)
+        return;
+    }
+    loops.push_back(loop);
+  });
+  for (mlir::scf::ForOp loop : loops) {
+    auto func = loop->getParentOfType<mlir::triton::FuncOp>();
+    auto module = loop->getParentOfType<mlir::ModuleOp>();
+    auto warps = module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
+    auto lanes = module->getAttrOfType<mlir::IntegerAttr>("ttg.threads-per-warp");
+    if (!func || !warps || !lanes)
+      continue;
+    const int64_t threads = warps.getInt() * lanes.getInt();
+    llvm::SmallVector<LayoutIndexPlan, 2> plans;
+    bool ok = true;
+    for (mlir::Value init : loop.getInitArgs()) {
+      if (!mlir::isa<mlir::RankedTensorType>(init.getType())) {
+        plans.emplace_back();
+        continue;
+      }
+      auto plan = cyclicLayoutPlan(
+          mlir::cast<mlir::RankedTensorType>(init.getType()).getShape(),
+          threads);
+      if (!plan) {
+        ok = false;
+        break;
+      }
+      plans.push_back(*plan);
+    }
+    if (!ok)
+      continue;
+    mlir::Location loc = loop.getLoc();
+    mlir::OpBuilder top(func.getContext());
+    top.setInsertionPointToStart(&func.getBody().front());
+    auto zeroTensor = [](mlir::OpBuilder &b, mlir::Location loc,
+                         mlir::RankedTensorType type) {
+      return mlir::arith::ConstantOp::create(
+                 b, loc,
+                 mlir::DenseElementsAttr::get(
+                     type, b.getZeroAttr(type.getElementType())))
+          .getResult();
+    };
+    auto registerSlot = [&](mlir::Operation *op, const LayoutIndexPlan &plan,
+                            mlir::RankedTensorType type, mlir::Value slot) {
+      g_tileExchange[op] = TileExchangePlan{
+          plan, plan, type.getNumElements(),
+          metalStorageElementType(type.getElementType()), nullptr,
+          /*endsPhase=*/false};
+      g_tileExchangeBuf[op] = slot;
+    };
+    auto carryOp = [&](mlir::OpBuilder &b, mlir::Value value,
+                       mlir::RankedTensorType type, llvm::StringRef tag) {
+      auto op = mlir::triton::gpu::ConvertLayoutOp::create(b, loc, type, value);
+      op->setAttr(kExchangeAttr, b.getStringAttr(tag));
+      return op;
+    };
+    mlir::OpBuilder before(loop);
+    llvm::SmallVector<mlir::Value, 2> slots;
+    auto ui32 = mlir::IntegerType::get(func.getContext(), 32,
+                                       mlir::IntegerType::Unsigned);
+    auto slotIndex = [&](mlir::OpBuilder &b, int64_t at = 0) {
+      return ConstantOp::create(b, loc, ui32, b.getIntegerAttr(ui32, at))
+          .getResult();
+    };
+    auto i32Const = [&](mlir::OpBuilder &b, int32_t v) {
+      return mlir::arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(v))
+          .getResult();
+    };
+    auto asIndex = [&](mlir::OpBuilder &b, mlir::Value i32Value) {
+      return mlir::UnrealizedConversionCastOp::create(
+                 b, loc, mlir::TypeRange{ui32}, mlir::ValueRange{i32Value})
+          .getResult(0);
+    };
+    // Scalar slots hold the storage type (i32 is kept as ui32), bridged with a
+    // bit-preserving cast.
+    auto toStorage = [&](mlir::OpBuilder &b, mlir::Value value) {
+      mlir::Type storage = metalStorageElementType(value.getType());
+      if (storage == value.getType())
+        return value;
+      return mlir::UnrealizedConversionCastOp::create(
+                 b, loc, mlir::TypeRange{storage}, mlir::ValueRange{value})
+          .getResult(0);
+    };
+    auto fromStorage = [&](mlir::OpBuilder &b, mlir::Value slot,
+                           mlir::Type type, mlir::Value index) {
+      mlir::Type storage = metalStorageElementType(type);
+      mlir::Value loaded =
+          TgLoadIndexedOp::create(b, loc, storage, slot, index).getResult();
+      if (storage == type)
+        return loaded;
+      return mlir::UnrealizedConversionCastOp::create(
+                 b, loc, mlir::TypeRange{type}, mlir::ValueRange{loaded})
+          .getResult(0);
+    };
+    for (auto [index, init] : llvm::enumerate(loop.getInitArgs())) {
+      if (!mlir::isa<mlir::RankedTensorType>(init.getType())) {
+        // Two entries, by iteration parity: every register band of the
+        // phase that updates the value writes the same new value, which no
+        // band of this iteration reads back. 📏 One shared entry let band 1
+        // re-read band 0's update: `scale = scale * 0.5` decayed once per band.
+        mlir::Value slot =
+            AllocaOp::create(top, loc,
+                             MetalMemRefType::get(
+                                 func.getContext(),
+                                 metalStorageElementType(init.getType()), 2))
+                .getResult();
+        slots.push_back(slot);
+        TgStoreIndexedOp::create(before, loc, slot, slotIndex(before),
+                                 toStorage(before, init));
+        continue;
+      }
+      auto type = mlir::cast<mlir::RankedTensorType>(init.getType());
+      const LayoutIndexPlan &plan = plans[index];
+      mlir::Value slot =
+          AllocaOp::create(top, loc,
+                           MetalMemRefType::get(
+                               func.getContext(),
+                               metalStorageElementType(type.getElementType()),
+                               plan.elemPerThread))
+              .getResult();
+      slots.push_back(slot);
+      // The initial value, once per band before the loop.
+      auto band = mlir::scf::ForOp::create(
+          before, loc,
+          mlir::arith::ConstantOp::create(before, loc,
+                                          before.getI32IntegerAttr(0)),
+          mlir::arith::ConstantOp::create(
+              before, loc,
+              before.getI32IntegerAttr(static_cast<int32_t>(plan.elemPerThread))),
+          mlir::arith::ConstantOp::create(before, loc,
+                                          before.getI32IntegerAttr(1)));
+      band->setAttr(kScanBandLoopAttr, before.getUnitAttr());
+      band->setAttr(kRankNCarryInitAttr, before.getUnitAttr());
+      mlir::OpBuilder inBand(band.getBody()->getTerminator());
+      mlir::Value initClone = inBand.clone(*init.getDefiningOp())->getResult(0);
+      registerSlot(carryOp(inBand, initClone, type, kCarryWrite), plan, type,
+                   slot);
+    }
+    // The body reads the carry at its top and writes the yielded tile last.
+    mlir::Block *body = loop.getBody();
+    auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
+    mlir::OpBuilder head(body, body->begin());
+    mlir::OpBuilder tail(yield);
+    // This iteration's parity: it reads entry `parity`, writes `1 - parity`.
+    mlir::Value readEntry, writeEntry;
+    if (llvm::any_of(loop.getInitArgs(), [](mlir::Value init) {
+          return !mlir::isa<mlir::RankedTensorType>(init.getType());
+        })) {
+      mlir::Value trip = mlir::arith::DivSIOp::create(
+          head, loc,
+          mlir::arith::SubIOp::create(head, loc, body->getArgument(0),
+                                      loop.getLowerBound()),
+          loop.getStep());
+      mlir::Value parity =
+          mlir::arith::AndIOp::create(head, loc, trip, i32Const(head, 1));
+      readEntry = asIndex(head, parity);
+      writeEntry = asIndex(
+          head, mlir::arith::XOrIOp::create(head, loc, parity, i32Const(head, 1)));
+    }
+    for (auto [index, slot] : llvm::enumerate(slots)) {
+      mlir::Type initTy = loop.getInitArgs()[index].getType();
+      if (!mlir::isa<mlir::RankedTensorType>(initTy)) {
+        mlir::Value read = fromStorage(head, slot, initTy, readEntry);
+        body->getArgument(index + 1).replaceAllUsesWith(read);
+        TgStoreIndexedOp::create(tail, loc, slot, writeEntry,
+                                 toStorage(tail, yield.getOperand(index)));
+        continue;
+      }
+      auto type = mlir::cast<mlir::RankedTensorType>(initTy);
+      auto read = carryOp(head, zeroTensor(head, loc, type), type, kCarryRead);
+      registerSlot(read, plans[index], type, slot);
+      body->getArgument(index + 1).replaceAllUsesWith(read.getResult());
+      registerSlot(carryOp(tail, yield.getOperand(index), type, kCarryWrite),
+                   plans[index], type, slot);
+    }
+    // The same loop without the carried tiles.
+    auto newLoop = mlir::scf::ForOp::create(before, loc, loop.getLowerBound(),
+                                            loop.getUpperBound(),
+                                            loop.getStep());
+    mlir::Block *newBody = newLoop.getBody();
+    newBody->getOperations().clear();
+    yield->erase();
+    newBody->getOperations().splice(newBody->end(), body->getOperations());
+    mlir::OpBuilder end(newBody, newBody->end());
+    mlir::scf::YieldOp::create(end, loc);
+    body->getArgument(0).replaceAllUsesWith(newLoop.getInductionVar());
+    // A scalar result is the slot's final value.
+    mlir::OpBuilder after(newLoop->getContext());
+    after.setInsertionPointAfter(newLoop);
+    mlir::Value finalEntry;
+    for (auto [index, result] : llvm::enumerate(loop->getResults())) {
+      if (result.use_empty())
+        continue;
+      if (!finalEntry) {
+        // Trip count max(0, ceil((ub - lb) / step)), and its parity.
+        mlir::Value span = mlir::arith::SubIOp::create(
+            after, loc, newLoop.getUpperBound(), newLoop.getLowerBound());
+        mlir::Value trips = mlir::arith::DivSIOp::create(
+            after, loc,
+            mlir::arith::AddIOp::create(
+                after, loc, span,
+                mlir::arith::SubIOp::create(after, loc, newLoop.getStep(),
+                                            i32Const(after, 1))),
+            newLoop.getStep());
+        trips = mlir::arith::MaxSIOp::create(after, loc, trips, i32Const(after, 0));
+        finalEntry = asIndex(
+            after, mlir::arith::AndIOp::create(after, loc, trips, i32Const(after, 1)));
+      }
+      result.replaceAllUsesWith(
+          fromStorage(after, slots[index], result.getType(), finalEntry));
+    }
+    loop.erase();
+  }
+}
+
 // The loops `materializeRankNLoopPhases` will split, found by their publish.
 static llvm::SmallVector<mlir::scf::ForOp, 4>
 rankNPhaseLoops(mlir::ModuleOp moduleOp) {
@@ -47289,6 +47581,8 @@ materializeRankNLoopPhases(mlir::ModuleOp moduleOp) {
           anyLoop = true;
           return mlir::WalkResult::skip();
         }
+        if (nested->hasAttr(kRankNCarryInitAttr))
+          return mlir::WalkResult::skip();
         if (llvm::any_of(nested->getOperandTypes(), isTensor) ||
             llvm::any_of(nested->getResultTypes(), isTensor))
           tensorOutside = true;
@@ -48400,6 +48694,7 @@ struct ConvertTritonGPUToMetalPass
 
     rewriteHypercubeFlips(moduleOp);
     rewriteScanLoopRowReduces(moduleOp);
+    slotRankNLoopTileCarries(moduleOp);
     if (mlir::failed(selectNestedScanLoops(moduleOp)) ||
         mlir::failed(prepareMapElementwisePacks(moduleOp))) {
       signalPassFailure();
@@ -48744,8 +49039,8 @@ struct ConvertTritonGPUToMetalPass
           red.emitOpError(
               "Metal backend: a rank >= 3 reduce inside a loop can only be "
               "stored, directly, through tt.reshape or after element-wise "
-              "work; move other consumers (a broadcast back into the tile) "
-              "out of the loop");
+              "work; move other consumers (a broadcast back into the tile, a "
+              "further reduction of the result) out of the loop");
           reduceOk = false;
           return;
         }

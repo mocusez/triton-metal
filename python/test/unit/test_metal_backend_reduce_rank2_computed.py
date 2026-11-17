@@ -2189,3 +2189,80 @@ def test_rank3_reduce_of_loop_accumulator_matches_torch(shape, warps, axis, use_
         num_warps=warps)
     torch.mps.synchronize()
     torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+# Loop carries around a rank-N reduce loop. The body is split into register-
+# band phases, so a carry cannot stay an SSA iter_arg: a tile-carried source
+# lives in a thread-private slot of one element per band (every tile in the
+# loop is cyclic), a scalar in a two-entry slot by iteration parity (one shared
+# entry let band 1 re-read band 0's update and decay once per band). A full
+# reduction of the result inside the loop sees only part of the bands and
+# stays refused.
+@triton.jit
+def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
+                                    C: tl.constexpr, AXIS: tl.constexpr,
+                                    OUT: tl.constexpr, MODE: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    if MODE == "tile":
+        prev = tl.zeros((A, B, C), tl.float32)
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets) + prev
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(tl.sum(v, AXIS), (OUT,)))
+            prev = v
+    elif MODE == "scalar":
+        scale = 1.0
+        count = 0
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets)
+            tl.store(O + t * OUT + tl.arange(0, OUT),
+                     tl.reshape(tl.sum(v, AXIS), (OUT,)) * scale)
+            scale = scale * 0.5
+            count += t + 1
+        tl.store(O + T * OUT, scale + count)
+    else:
+        total = 0.0
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets)
+            s = tl.sum(v, AXIS)
+            total += tl.sum(tl.reshape(s, (OUT,)), 0)
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+        tl.store(O + T * OUT, total)
+
+
+@pytest.mark.parametrize("mode", ["tile", "scalar"])
+@pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 2, 2),
+                                                ((2, 4, 4), 4, 1), ((4, 4, 8), 1, 1),
+                                                ((2, 8, 16), 1, 0)])
+def test_rank3_reduce_loop_carries_match_torch(shape, warps, axis, mode):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(a * b * c + axis + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    xs = x.reshape(steps, a, b, c)
+    out = torch.zeros(steps * out_elements + 1, dtype=torch.float32)
+    _rank3_reduce_loop_carry_kernel[(1,)](x, out, steps, A=a, B=b, C=c, AXIS=axis,
+                                          OUT=out_elements, MODE=mode, num_warps=warps)
+    torch.mps.synchronize()
+    if mode == "tile":
+        want = xs.cumsum(0).sum(axis + 1).reshape(-1)
+        torch.testing.assert_close(out[:-1], want, atol=2e-3, rtol=2e-3)
+    else:
+        r = xs.sum(axis + 1).reshape(steps, -1)
+        scales = torch.tensor([0.5 ** t for t in range(steps)])
+        want = torch.cat([(r * scales[:, None]).reshape(-1),
+                          torch.tensor([0.5 ** steps + sum(range(1, steps + 1))])])
+        torch.testing.assert_close(out, want, atol=2e-3, rtol=2e-3)
+
+
+def test_rank3_reduce_loop_further_reduction_is_named(capfd):
+    x = torch.randn(3 * 512, dtype=torch.float32)
+    out = torch.zeros(3 * 64 + 1, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_reduce_loop_carry_kernel[(1,)](x, out, 3, A=8, B=8, C=8, AXIS=0, OUT=64,
+                                              MODE="total", num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "a further reduction of the result" in diagnostic.err + diagnostic.out
