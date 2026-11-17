@@ -4700,21 +4700,36 @@ def _epilogue_matmul_kernel(a_ptr, b_ptr, c_ptr, bias_ptr, rbias_ptr, hbias_ptr,
         acc = acc + tl.load(hbias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)[None, :]
     elif EPI == 9:  # not the element's column: must not be read at it
         acc = acc + tl.load(bias_ptr + offs_n + 1)[None, :]
+    elif EPI == 10:  # computed from the element's row alone
+        acc = tl.where(offs_m[:, None] % 2 == 0, acc, -acc)
+    elif EPI == 11:  # causal: row against column
+        acc = tl.where(offs_m[:, None] >= offs_n[None, :], acc, 0.0)
+    elif EPI == 12:  # integer coordinates converted into the float cone
+        acc = acc * (offs_n[None, :] % 3).to(tl.float32) + offs_m[:, None].to(tl.float32) * 0.5
+    elif EPI == 13:  # a bare range is the LOCAL row, not the element's: not claimed
+        acc = acc + tl.arange(0, BM)[:, None].to(tl.float32)
     tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
 _EPILOGUES = {1: "leaky", 2: "scaleshift", 3: "silu", 4: "clampabs", 5: "bias", 6: "alpha",
-              7: "rowbias", 8: "halfbias", 9: "shiftedbias"}
+              7: "rowbias", 8: "halfbias", 9: "shiftedbias", 10: "rowparity", 11: "causal",
+              12: "coordscale", 13: "localrow"}
 
 
-def _epilogue_ref(r, epi, bias, alpha, rbias, hbias):
-    n = r.shape[1]
+def _epilogue_ref(r, epi, bias, alpha, rbias, hbias, block=64):
+    m, n = r.shape
+    rows = torch.arange(m, dtype=r.dtype)[:, None]
+    cols = torch.arange(n, dtype=r.dtype)[None, :]
     return {0: lambda: r, 1: lambda: torch.where(r >= 0, r, 0.01 * r),
             2: lambda: r * 0.5 + 1.0, 3: lambda: r * torch.sigmoid(r),
             4: lambda: (r.abs() - 1.0).clamp(-2.0, 3.0), 5: lambda: r + bias[None, :n],
             6: lambda: r * alpha, 7: lambda: r + rbias[:, None],
-            8: lambda: r + hbias[None, :], 9: lambda: r + bias[None, 1:n + 1]}[epi]()
+            8: lambda: r + hbias[None, :], 9: lambda: r + bias[None, 1:n + 1],
+            10: lambda: torch.where(rows % 2 == 0, r, -r),
+            11: lambda: torch.where(rows >= cols, r, torch.zeros_like(r)),
+            12: lambda: r * (cols % 3) + rows * 0.5,
+            13: lambda: r + rows % block}[epi]()
 
 
 def _run_epilogue_matmul(loop, epi, m, n, k, dtype, warps, block=64):
@@ -4746,6 +4761,8 @@ def test_matmul_epilogue_matches_torch(loop, epi, dtype, warps):
     m, n, k = (128, 128, 96) if loop == 1 else (100, 72, 88)
     got, ref, _ = _run_epilogue_matmul(loop, epi, m, n, k, dtype, warps)
     tol = 2e-2 if dtype == torch.float16 else 2e-3
+    if epi == 12 and dtype == torch.float16:
+        tol = 5e-2  # |result| reaches ~100 here; a half ulp there is 0.03
     torch.testing.assert_close(got, ref, atol=tol, rtol=tol)
 
 
@@ -4765,6 +4782,26 @@ def test_matmul_bias_epilogue_stays_on_simdgroup_tier(loop, epi):
     """A bias read at the element's own coordinate, or a runtime scalar, too."""
     _, _, msl = _run_epilogue_matmul(loop, epi, 128, 128, 96, torch.float32, 4)
     assert "thread_elements()" in msl
+
+
+@pytest.mark.parametrize("loop", [0, 2], ids=["tutorial", "recompute"])
+@pytest.mark.parametrize("epi", [10, 11, 12], ids=["rowparity", "causal", "coordscale"])
+def test_matmul_coordinate_epilogue_stays_on_simdgroup_tier(loop, epi):
+    """An epilogue computed from the element's own row/column (`offs_m % 2`,
+    `offs_m >= offs_n`, `offs_n.to(f32)`) maps those coordinates to the region's
+    row/column arguments instead of sending the matmul to the scalar tier."""
+    got, ref, msl = _run_epilogue_matmul(loop, epi, 128, 128, 96, torch.float32, 4)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+    assert "thread_elements()" in msl
+
+
+@pytest.mark.parametrize("loop", [0, 2], ids=["tutorial", "recompute"])
+def test_matmul_local_range_epilogue_is_not_claimed(loop):
+    """`tl.arange(0, BM)` is the tile-local row, not the element's global row;
+    the map must not bind it to the row argument."""
+    got, ref, msl = _run_epilogue_matmul(loop, 13, 100, 72, 88, torch.float32, 4)
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+    assert "thread_elements()" not in msl
 
 
 @pytest.mark.parametrize("loop", [0, 2], ids=["tutorial", "recompute"])
@@ -4862,8 +4899,11 @@ def _single_dot_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
         a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
         b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :])
         c = tl.dot(a, b)
-        if ROWSIGN:  # row-dependent: no SIMD-group tier carries it
+        if ROWSIGN == 1:  # the element's own row: the SIMD map carries it
             c = tl.where(offs_m[:, None] % 2 == 0, c, -c)
+        elif ROWSIGN == 2:  # the TILE-LOCAL row (same parity, BM is even): the
+            # map does not bind a bare range, so the scalar dot keeps this one
+            c = tl.where(tl.arange(0, BM)[:, None] % 2 == 0, c, -c)
         tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], c)
 
 
@@ -4893,7 +4933,7 @@ def _run_single_dot(m, n, k, bm, bn, bk, warps, masked, rowsign=0):
     (16, 512, 16, 16, 256, 16, 1),    # short and wide, masked
 ])
 @pytest.mark.parametrize("warps", [1, 4])
-@pytest.mark.parametrize("rowsign", [0, 1], ids=["matmul_tier", "scalar_dot"])
+@pytest.mark.parametrize("rowsign", [0, 1, 2], ids=["matmul_tier", "rowsign_map", "scalar_dot"])
 def test_single_dot_multi_tile_matches_torch(m, n, k, bm, bn, bk, masked, warps, rowsign):
     if rowsign and masked:
         pytest.skip("the row-sign epilogue is written on the unmasked form")
@@ -4903,9 +4943,10 @@ def test_single_dot_multi_tile_matches_torch(m, n, k, bm, bn, bk, masked, warps,
 
 def test_single_dot_stages_each_tile_once_per_step():
     """On the scalar dot: one K loop for the warp's sixteen tiles, not sixteen
-    loops of one MMA. A row-dependent epilogue keeps the dot there."""
+    loops of one MMA. A tile-local row epilogue keeps the dot there (one on the
+    element's global row now stays on the SIMD-group tier)."""
     import re
-    _, _, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0, rowsign=1)
+    _, _, msl = _run_single_dot(128, 128, 32, 64, 64, 32, 4, 0, rowsign=2)
     k_loops = re.findall(r"for \(int v\d+ = 0; v\d+ < [^;]+; v\d+ \+= 8\)", msl)
     assert "[4096]" in msl  # the scalar dot's M x N result scratch
     assert msl.count("simdgroup_multiply_accumulate") == 16

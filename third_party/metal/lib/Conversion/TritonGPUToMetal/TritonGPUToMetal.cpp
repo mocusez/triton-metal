@@ -26308,7 +26308,83 @@ struct SimdValueEpilogue {
     int axis; // the tile axis the vector runs along: 0 = rows, 1 = columns
   };
   llvm::SmallVector<VectorLeaf, 2> vectorLeaves;
+  // A value computed from the element's coordinates alone: integer arithmetic
+  // over `origin + arange` along the rows or columns and constants, e.g. the
+  // `offs_m[:, None] % 2 == 0` of a row-parity epilogue or the
+  // `offs_m[:, None] >= offs_n[None, :]` of a causal one. Held after peeling
+  // broadcasts; `buildSimdValueEpilogueBody` ties each coordinate to the
+  // region's row/column argument or refuses.
+  llvm::SmallVector<mlir::Value, 2> indexLeaves;
 };
+
+// Whether `v` is computed from coordinates and constants only, through ops
+// `emitConeScalar` re-emits. The coordinates themselves (a `make_range`,
+// possibly offset by a splat scalar) are only checked against the store's
+// origin once the tier knows it.
+static bool isSimdEpilogueIndexCone(mlir::Value v) {
+  llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+  llvm::SmallVector<mlir::Value, 8> work{v};
+  while (!work.empty()) {
+    mlir::Value x = work.pop_back_val();
+    mlir::Type elemTy = getElementTypeOrSelf(x.getType());
+    if (!elemTy.isInteger(32) && !elemTy.isInteger(1) && !elemTy.isF32())
+      return false;
+    mlir::Operation *def = x.getDefiningOp();
+    if (!def)
+      return false;
+    if (!seen.insert(def).second)
+      continue;
+    if (seen.size() > 64)
+      return false;
+    if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+      auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+      if (dense ? !dense.isSplat()
+                : !mlir::isa<mlir::IntegerAttr, mlir::FloatAttr>(
+                      cst.getValue()))
+        return false;
+      continue;
+    }
+    if (mlir::isa<mlir::triton::MakeRangeOp>(def))
+      continue;
+    if (auto splat = mlir::dyn_cast<mlir::triton::SplatOp>(def)) {
+      // A constant, or a scalar that may be the store's origin.
+      if (!splat.getSrc().getType().isInteger(32) &&
+          !splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>())
+        return false;
+      if (auto cst = splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>())
+        continue;
+      continue;
+    }
+    if (auto andOp = mlir::dyn_cast<mlir::arith::AndIOp>(def))
+      if (!getElementTypeOrSelf(andOp.getType()).isInteger(1))
+        return false;
+    if (auto orOp = mlir::dyn_cast<mlir::arith::OrIOp>(def))
+      if (!getElementTypeOrSelf(orOp.getType()).isInteger(1))
+        return false;
+    if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
+      using P = mlir::arith::CmpIPredicate;
+      P pred = cmp.getPredicate();
+      if (pred != P::eq && pred != P::ne && pred != P::slt &&
+          pred != P::sle && pred != P::sgt && pred != P::sge)
+        return false;
+    }
+    if (!mlir::isa<mlir::arith::AddIOp, mlir::arith::SubIOp,
+                   mlir::arith::MulIOp, mlir::arith::DivSIOp,
+                   mlir::arith::RemSIOp, mlir::arith::MaxSIOp,
+                   mlir::arith::MinSIOp, mlir::arith::CmpIOp,
+                   mlir::arith::SelectOp, mlir::arith::AndIOp,
+                   mlir::arith::OrIOp, mlir::arith::SIToFPOp,
+                   mlir::arith::AddFOp, mlir::arith::SubFOp,
+                   mlir::arith::MulFOp, mlir::arith::DivFOp,
+                   mlir::arith::NegFOp, mlir::triton::ExpandDimsOp,
+                   mlir::triton::BroadcastOp,
+                   mlir::triton::gpu::ConvertLayoutOp>(def))
+      return false;
+    for (mlir::Value operand : def->getOperands())
+      work.push_back(operand);
+  }
+  return true;
+}
 
 static std::optional<SimdValueEpilogue>
 matchSimdValueEpilogue(mlir::Value acc) {
@@ -26369,6 +26445,30 @@ matchSimdValueEpilogue(mlir::Value acc) {
   auto classifyLeaf = [&](mlir::Value v) -> bool {
     if (isSplatConstant(v))
       return true;
+    {
+      mlir::Value w = v;
+      while (true) {
+        if (auto bc = w.getDefiningOp<mlir::triton::BroadcastOp>())
+          w = bc.getSrc();
+        else if (auto cvt =
+                     w.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+          w = cvt.getSrc();
+        else
+          break;
+      }
+      auto wTy = mlir::dyn_cast<mlir::RankedTensorType>(w.getType());
+      if (wTy && wTy.getRank() == 2 &&
+          (wTy.getDimSize(0) == 1 ||
+           wTy.getDimSize(0) == accTy.getDimSize(0)) &&
+          (wTy.getDimSize(1) == 1 ||
+           wTy.getDimSize(1) == accTy.getDimSize(1)) &&
+          !w.getDefiningOp<mlir::triton::ExpandDimsOp>() &&
+          isSimdEpilogueIndexCone(w)) {
+        if (!llvm::is_contained(ep.indexLeaves, w))
+          ep.indexLeaves.push_back(w);
+        return true;
+      }
+    }
     if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>()) {
       mlir::Value scalar = splat.getSrc();
       if (!scalar.getType().isF32() || !availableBeforeLoop(scalar))
@@ -26476,7 +26576,9 @@ buildSimdValueEpilogueBody(const SimdValueEpilogue &ep, mlir::Value acc,
                            mlir::Type elemTy, mlir::Location loc,
                            const SimdEpilogueCoords *coords) {
   SimdEpilogueBody body;
-  if ((!ep.scalarLeaves.empty() || !ep.vectorLeaves.empty()) && !coords)
+  if ((!ep.scalarLeaves.empty() || !ep.vectorLeaves.empty() ||
+       !ep.indexLeaves.empty()) &&
+      !coords)
     return std::nullopt;
   mlir::MLIRContext *ctx = acc.getContext();
   auto si32 = mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Signed);
@@ -26553,13 +26655,90 @@ buildSimdValueEpilogueBody(const SimdValueEpilogue &ep, mlir::Value acc,
   mlir::Block *block = body.holder->getBody();
   mlir::Value arg = block->addArgument(elemTy, loc);
   mlir::Value row, col;
-  if (!ep.vectorLeaves.empty()) {
+  if (!ep.vectorLeaves.empty() || !ep.indexLeaves.empty()) {
     body.needsCoords = true;
     row = block->addArgument(si32, loc);
     col = block->addArgument(si32, loc);
   }
   llvm::DenseMap<void *, mlir::Value> leafMap, memo;
   leafMap[acc.getAsOpaquePointer()] = arg;
+
+  // Tie every coordinate in an index leaf to the region's row or column
+  // argument. A rank-1 value lies along the axis its `expand_dims` keeps; it
+  // is a coordinate only when it is exactly the store's `origin + arange` on
+  // that axis (or the bare range when the store has no origin), because that
+  // is what the argument holds. Any other range or runtime scalar, or one
+  // value used along both axes, refuses the epilogue.
+  if (!ep.indexLeaves.empty()) {
+    auto peelCvt = [](mlir::Value v) {
+      while (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+        v = cvt.getSrc();
+      return v;
+    };
+    auto isCoordinate = [&](mlir::Value v, int axis) {
+      const int64_t dim = axis == 0 ? coords->tileM : coords->tileN;
+      mlir::Value origin = axis == 0 ? coords->rowOrigin : coords->colOrigin;
+      auto isRange = [&](mlir::Value x) {
+        auto r = peelCvt(x).getDefiningOp<mlir::triton::MakeRangeOp>();
+        return r && r.getStart() == 0 && r.getEnd() == dim;
+      };
+      v = peelCvt(v);
+      if (!origin)
+        return isRange(v);
+      auto add = v.getDefiningOp<mlir::arith::AddIOp>();
+      if (!add)
+        return false;
+      auto isOrigin = [&](mlir::Value x) {
+        auto splat = peelCvt(x).getDefiningOp<mlir::triton::SplatOp>();
+        return splat && splat.getSrc() == origin;
+      };
+      return (isOrigin(add.getLhs()) && isRange(add.getRhs())) ||
+             (isOrigin(add.getRhs()) && isRange(add.getLhs()));
+    };
+    llvm::DenseMap<void *, int> coordAxis;
+    llvm::DenseSet<std::pair<void *, int>> visited;
+    // `axis` is the tile axis a rank-1 value runs along; -1 above that.
+    std::function<bool(mlir::Value, int)> bind = [&](mlir::Value v,
+                                                     int axis) -> bool {
+      v = peelCvt(v);
+      if (!visited.insert({v.getAsOpaquePointer(), axis}).second)
+        return true;
+      auto ty = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+      if (ty && ty.getRank() == 1 && axis >= 0 && isCoordinate(v, axis)) {
+        auto [it, inserted] = coordAxis.try_emplace(v.getAsOpaquePointer(),
+                                                    axis);
+        return inserted || it->second == axis;
+      }
+      mlir::Operation *def = v.getDefiningOp();
+      if (!def)
+        return false;
+      if (mlir::isa<mlir::arith::ConstantOp>(def))
+        return true;
+      if (auto splat = mlir::dyn_cast<mlir::triton::SplatOp>(def))
+        return static_cast<bool>(
+            splat.getSrc().getDefiningOp<mlir::arith::ConstantOp>());
+      if (mlir::isa<mlir::triton::MakeRangeOp>(def))
+        return false; // a range that is not this store's coordinate
+      if (auto ed = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(def)) {
+        auto srcTy =
+            mlir::dyn_cast<mlir::RankedTensorType>(ed.getSrc().getType());
+        if (!srcTy || srcTy.getRank() != 1)
+          return false;
+        return bind(ed.getSrc(), 1 - static_cast<int>(ed.getAxis()));
+      }
+      if (auto bc = mlir::dyn_cast<mlir::triton::BroadcastOp>(def))
+        return bind(bc.getSrc(), axis);
+      for (mlir::Value operand : def->getOperands())
+        if (!bind(operand, ty && ty.getRank() == 1 ? axis : -1))
+          return false;
+      return true;
+    };
+    for (mlir::Value leaf : ep.indexLeaves)
+      if (!bind(leaf, -1))
+        return std::nullopt;
+    for (auto [key, axis] : coordAxis)
+      leafMap[key] = axis == 0 ? row : col;
+  }
   for (mlir::Value scalar : ep.scalarLeaves) {
     leafMap[scalar.getAsOpaquePointer()] = block->addArgument(f32, loc);
     body.captures.push_back({SimdEpilogueBody::Capture::Scalar, scalar, {}});
@@ -38814,6 +38993,9 @@ static mlir::Value emitConeScalar(mlir::OpBuilder &b, mlir::Location loc,
     out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::DivUIOp>(def)) {
     out = bin(BOP::divOp, rec(op.getLhs()), rec(op.getRhs()));
+  } else if (auto op = mlir::dyn_cast<mlir::arith::RemSIOp>(def)) {
+    // MSL `%` on signed operands truncates toward zero, as `arith.remsi` does.
+    out = bin(BOP::remOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::MaxSIOp>(def)) {
     out = bin(BOP::maxOp, rec(op.getLhs()), rec(op.getRhs()));
   } else if (auto op = mlir::dyn_cast<mlir::arith::MinSIOp>(def)) {

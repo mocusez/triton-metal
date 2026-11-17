@@ -378,6 +378,13 @@ boundaries rather than being approximated with a racy load/modify/store.
   `K > min(M, N)` are covered. Layout re-encoding preserves the original
   scalar tile origins, so mixed-layout output broadcasts do not introduce
   use-before-definition errors in short-wide or batched matmuls.
+  A value-only matmul epilogue stays on the SIMD-group tiers and is applied to
+  the accumulator in registers: constant and runtime-scalar operands, bias
+  vectors read at the element's own row or column, and values computed from
+  the element's coordinates alone (`offs_m[:, None] % 2`,
+  `offs_m[:, None] >= offs_n[None, :]`, `offs_n.to(tl.float32)`), where a
+  coordinate is the store's own `origin + arange`. A tile-local
+  `tl.arange(0, BM)` or any other index is left to the scalar tier.
   For singleton batch tiles, combined offsets retain a flat batch base added
   outside a strided matrix-axis contribution; captured bases must dominate
   the replacement operation.
