@@ -1302,15 +1302,22 @@ def _rank3_two_reduce_loops_kernel(X, O, T, A: tl.constexpr,
                  tl.reshape(tl.sum(v, 2), (A * B,)))
 
 
-def test_rank3_two_reduce_loops_are_named(capfd):
-    a, b, c = 4, 4, 4
-    x = torch.randn(2 * a * b * c, dtype=torch.float32)
-    out = torch.zeros(4 * a * b, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _rank3_two_reduce_loops_kernel[(1,)](
-            x, out, 2, A=a, B=b, C=c, num_warps=1)
-    diagnostic = capfd.readouterr()
-    assert "multiple rank-N reduction loops" in diagnostic.err + diagnostic.out
+# Sibling and nested rank-N reduction loops each phase their own body (every
+# tile in such a loop is cyclic per band), and the loops around a nested one
+# just run it again; both used to be refused. A read-modify-write consumer
+# (`tl.load(o) + sum`) keeps that cyclic order too.
+@pytest.mark.parametrize("shape, warps", [((4, 4, 4), 1), ((8, 8, 8), 1), ((4, 8, 16), 2),
+                                          ((2, 4, 8), 4)])
+def test_rank3_two_reduce_loops_match_torch(shape, warps):
+    a, b, c = shape
+    steps = 2
+    torch.manual_seed(a * b * c + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    out = torch.zeros(2 * steps * a * b, dtype=torch.float32)
+    _rank3_two_reduce_loops_kernel[(1,)](x, out, steps, A=a, B=b, C=c, num_warps=warps)
+    torch.mps.synchronize()
+    r = x.reshape(steps, a, b, c).sum(3).reshape(-1)
+    torch.testing.assert_close(out, torch.cat([r, r]), atol=2e-3, rtol=2e-3)
 
 
 @triton.jit
@@ -1327,15 +1334,48 @@ def _rank3_nested_reduce_loop_kernel(X, O, T, A: tl.constexpr,
                      tl.reshape(tl.sum(v, 2), (A * B,)))
 
 
-def test_rank3_nested_reduce_loop_is_named(capfd):
-    a, b, c = 4, 4, 4
+@pytest.mark.parametrize("shape, warps", [((4, 4, 4), 1), ((8, 8, 8), 1), ((4, 8, 16), 2),
+                                          ((2, 4, 8), 4)])
+def test_rank3_nested_reduce_loop_matches_torch(shape, warps):
+    a, b, c = shape
+    torch.manual_seed(a * b * c + warps + 1)
     x = torch.randn(4 * a * b * c, dtype=torch.float32)
     out = torch.zeros(4 * a * b, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _rank3_nested_reduce_loop_kernel[(1,)](
-            x, out, 2, A=a, B=b, C=c, num_warps=1)
-    diagnostic = capfd.readouterr()
-    assert "rank >= 3 reduce is implemented" in diagnostic.err + diagnostic.out
+    _rank3_nested_reduce_loop_kernel[(1,)](x, out, 2, A=a, B=b, C=c, num_warps=warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, x.reshape(4, a, b, c).sum(3).reshape(-1), atol=2e-3,
+                               rtol=2e-3)
+
+
+@triton.jit
+def _rank3_reduce_loop_rmw_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                                  AXIS: tl.constexpr, OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        o = O + tl.arange(0, OUT)
+        tl.store(o, tl.load(o) * 0.5 + tl.reshape(tl.sum(v, AXIS), (OUT,)))
+
+
+@pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 2, 2),
+                                                ((2, 4, 4), 4, 1), ((4, 4, 8), 1, 1)])
+def test_rank3_reduce_loop_read_modify_write_matches_torch(shape, warps, axis):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(a * b * c + axis)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    out = torch.ones(out_elements, dtype=torch.float32)
+    _rank3_reduce_loop_rmw_kernel[(1,)](x, out, steps, A=a, B=b, C=c, AXIS=axis,
+                                        OUT=out_elements, num_warps=warps)
+    torch.mps.synchronize()
+    want = torch.ones(out_elements)
+    for t in range(steps):
+        want = want * 0.5 + x.reshape(steps, a, b, c)[t].sum(axis).reshape(-1)
+    torch.testing.assert_close(out, want, atol=2e-3, rtol=2e-3)
 
 
 # The rank-3 defect above came from sweeping a producer only through the

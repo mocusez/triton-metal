@@ -17454,9 +17454,18 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     const bool alreadyPlanned = g_rankNReducePublish.count(op.getOperation());
     auto loop = block ? mlir::dyn_cast<mlir::scf::ForOp>(block->getParentOp())
                       : mlir::scf::ForOp{};
+    // The loop may itself sit in user loops: it phases its own body, and the
+    // loops around it just run it again. 📏 All 72 nested-loop cells exact.
+    auto underLoops = [&](mlir::Operation *op) {
+      while (op && !mlir::isa<mlir::triton::FuncOp>(op)) {
+        if (!mlir::isa<mlir::scf::ForOp>(op))
+          return false;
+        op = op->getParentOp();
+      }
+      return op != nullptr;
+    };
     const bool simpleLoop =
-        loop && mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()) &&
-        loop.getInitArgs().empty();
+        loop && underLoops(loop->getParentOp()) && loop.getInitArgs().empty();
     if (!block ||
         (!alreadyPlanned &&
          !mlir::isa<mlir::triton::FuncOp>(block->getParentOp()) && !simpleLoop))
@@ -17689,19 +17698,10 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
       if (auto plan = planRankNReduce(reduce); plan && plan->multiBand)
         reduces.push_back(reduce);
     }
-  llvm::DenseMap<mlir::Operation *, mlir::scf::ForOp> rankNLoops;
-  for (mlir::triton::ReduceOp reduce : reduces) {
-    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(reduce->getParentOp());
-    if (!loop)
-      continue;
-    auto func = reduce->getParentOfType<mlir::triton::FuncOp>();
-    auto [previous, inserted] = rankNLoops.try_emplace(func.getOperation(), loop);
-    if (!inserted && previous->second != loop) {
-      reduce.emitOpError("Metal backend: multiple rank-N reduction loops cannot "
-                         "share a function phase");
-      return mlir::failure();
-    }
-  }
+  // Sibling rank-N reduction loops each phase their own body (every tile in
+  // such a loop is cyclic per band; `materializeRankNLoopPhases` splits each
+  // loop on its own). 📏 They used to be refused as sharing a function phase;
+  // all 72 two-loop cells are exact.
   for (mlir::triton::ReduceOp reduce : reduces) {
     std::optional<RankNReducePlan> plan = planRankNReduce(reduce);
     // Every bail below ends the pass, and the caller only calls
@@ -37500,6 +37500,7 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
                   : mlir::scf::ForOp{};
   const bool simpleLoop =
       loop && (g_nestedScanLoops.count(loop.getOperation()) ||
+               (rankNPhaseLoopThreads(exchange) && loop.getInitArgs().empty()) ||
                (mlir::isa<mlir::triton::FuncOp>(loop->getParentOp()) &&
                 loop.getInitArgs().empty()));
   if (!blk || (!mlir::isa<mlir::triton::FuncOp>(blk->getParentOp()) &&
@@ -47257,10 +47258,15 @@ materializeRankNLoopPhases(mlir::ModuleOp moduleOp) {
         anyLoop = true;
         continue;
       }
-      op.walk([&](mlir::Operation *nested) {
+      op.walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *nested) {
+        if (phaseLoops.count(nested)) {
+          anyLoop = true;
+          return mlir::WalkResult::skip();
+        }
         if (llvm::any_of(nested->getOperandTypes(), isTensor) ||
             llvm::any_of(nested->getResultTypes(), isTensor))
           tensorOutside = true;
+        return mlir::WalkResult::advance();
       });
     }
     if (anyLoop && !tensorOutside)
@@ -48692,6 +48698,18 @@ struct ConvertTritonGPUToMetalPass
                           mlir::triton::BroadcastOp>(user) &&
                 sameElements && storedOnly(user->getResult(0)))
               continue;
+            // Element-wise work with other tiles of the loop (a
+            // read-modify-write `tl.load(o) + sum`) keeps the cyclic order
+            // every tile in the loop shares; only a broadcast reorders.
+            // 📏 All 72 read-modify-write cells are exact.
+            const bool elementwise =
+                (mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+                     user->getDialect()) ||
+                 (mlir::isa<mlir::triton::TritonDialect>(user->getDialect()) &&
+                  user->hasTrait<mlir::OpTrait::Elementwise>())) &&
+                user->getNumRegions() == 0 && mlir::isMemoryEffectFree(user);
+            if (elementwise && sameElements && storedOnly(user->getResult(0)))
+              continue;
             return false;
           }
           return true;
@@ -48699,8 +48717,9 @@ struct ConvertTritonGPUToMetalPass
         if (!storedOnly(red->getResult(0))) {
           red.emitOpError(
               "Metal backend: a rank >= 3 reduce inside a loop can only be "
-              "stored, directly or through tt.reshape; move other consumers "
-              "of its result out of the loop");
+              "stored, directly, through tt.reshape or after element-wise "
+              "work; move other consumers (a broadcast back into the tile) "
+              "out of the loop");
           reduceOk = false;
           return;
         }
