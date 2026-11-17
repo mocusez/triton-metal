@@ -3526,7 +3526,8 @@ static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
 // hypercube arrives through exactly such a reshape, which is why it keeps the
 // layout's own plan.
 static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
-                                        int depth = 0) {
+                                        int depth = 0,
+                                        mlir::Operation *carriedLoop = nullptr) {
   if (depth > 16)
     return false;
   auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
@@ -3535,8 +3536,26 @@ static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
   while (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
     v = cvt.getSrc();
   mlir::Operation *def = v.getDefiningOp();
-  if (!def)
-    return false;
+  // A loop-carried tile (`acc += tl.load(...)`) keeps its coordinates when its
+  // initial value and its yielded value both do; inside the yield cone the
+  // loop's own iter_arg is that same recurrence. 📏 Without this a rank-3 sum
+  // of such an accumulator published under the layout's label while its loads
+  // ran thread-major: 16 of 72 cells per combine were wrong.
+  if (!def) {
+    auto arg = mlir::dyn_cast<mlir::BlockArgument>(v);
+    auto loop = arg ? mlir::dyn_cast<mlir::scf::ForOp>(
+                          arg.getOwner()->getParentOp())
+                    : mlir::scf::ForOp{};
+    return loop && loop.getOperation() == carriedLoop &&
+           arg.getArgNumber() > 0;
+  }
+  if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(def)) {
+    unsigned index = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    return coneIsThreadMajorLoadRooted(loop.getInitArgs()[index], rank,
+                                       depth + 1, carriedLoop) &&
+           coneIsThreadMajorLoadRooted(loop.getYieldedValues()[index], rank,
+                                       depth + 1, loop.getOperation());
+  }
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
     auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
     return loadTy && loadTy.getRank() == rank;
@@ -3570,7 +3589,7 @@ static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
     if (auto opTy = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType()))
       if (opTy.getShape() != vTy.getShape())
         return false;
-    if (!coneIsThreadMajorLoadRooted(operand, rank, depth + 1))
+    if (!coneIsThreadMajorLoadRooted(operand, rank, depth + 1, carriedLoop))
       return false;
   }
   return true;
@@ -17618,15 +17637,35 @@ preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
       mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
       if (!inCurrentSegment(def) || !preSet.insert(def).second)
         continue;
+      // A loop that only READS (`acc += tl.load(...)` over a tile the reduce
+      // then folds) runs per register band like any other load, before the
+      // publish; it takes the values its body captures along with it.
+      const bool readOnlyLoop =
+          mlir::isa<mlir::scf::ForOp>(def) &&
+          !def->walk([](mlir::Operation *nested) {
+                 return mlir::isMemoryEffectFree(nested) ||
+                                mlir::isa<mlir::triton::LoadOp,
+                                          mlir::scf::ForOp, mlir::scf::YieldOp>(
+                                    nested)
+                            ? mlir::WalkResult::advance()
+                            : mlir::WalkResult::interrupt();
+               }).wasInterrupted();
       if (!mlir::isMemoryEffectFree(def) &&
-          !mlir::isa<mlir::triton::LoadOp>(def)) {
+          !mlir::isa<mlir::triton::LoadOp>(def) && !readOnlyLoop) {
         reduce.emitOpError(
             "staged rank-N reduce cannot hoist its source before the phase "
             "boundary: the cone contains an operation with side effects (a "
-            "tile accumulated by an enclosing loop is one)");
+            "loop that stores or performs atomics is one)");
         return mlir::failure();
       }
       llvm::append_range(worklist, def->getOperands());
+      if (readOnlyLoop)
+        def->walk([&](mlir::Operation *nested) {
+          for (mlir::Value operand : nested->getOperands())
+            if (mlir::Operation *captured = operand.getDefiningOp();
+                captured && !def->isAncestor(captured))
+              worklist.push_back(operand);
+        });
     }
     // Keep only the current reduction, its consumers, and later reduction
     // cones on the read side. Independent work belongs before this boundary.

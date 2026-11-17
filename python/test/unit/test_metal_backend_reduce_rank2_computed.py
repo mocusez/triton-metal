@@ -1014,16 +1014,20 @@ def _rank3_permuted_loop_reduce_kernel(X, O, T, A: tl.constexpr,
     tl.store(O + tl.arange(0, A * C), tl.reshape(s, (A * C,)))
 
 
-def test_rank3_permuted_loop_reduce_is_named(capfd):
-    a, b, c = 4, 8, 8
-    x = torch.randn(2 * a * b * c, dtype=torch.float32)
+# The permuted tile was refused as not "thread-major load-rooted": the test did
+# not look through the accumulation loop. A loop-carried tile whose initial and
+# yielded values are load-rooted is (see the loop-accumulator test below).
+@pytest.mark.parametrize("shape, warps", [((4, 8, 8), 1), ((4, 8, 16), 2), ((4, 8, 8), 4),
+                                          ((2, 4, 8), 1)])
+def test_rank3_permuted_loop_reduce_matches_torch(shape, warps):
+    a, b, c = shape
+    torch.manual_seed(a * b * c + warps)
+    x = torch.randn(3 * a * b * c, dtype=torch.float32)
     out = torch.zeros(a * c, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _rank3_permuted_loop_reduce_kernel[(1,)](
-            x, out, 2, A=a, B=b, C=c, num_warps=1)
-    diagnostic = capfd.readouterr()
-    assert "permuted tile requires a thread-major load-rooted source" in (
-        diagnostic.err + diagnostic.out)
+    _rank3_permuted_loop_reduce_kernel[(1,)](x, out, 3, A=a, B=b, C=c, num_warps=warps)
+    torch.mps.synchronize()
+    expected = x.reshape(3, a, b, c).sum(0).permute(0, 2, 1).sum(2).reshape(-1)
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
 
 
 @triton.jit
@@ -2099,3 +2103,49 @@ def test_p0_diagnostic_is_named_and_compilation_recovers(case, tmp_path):
     assert result.stderr.count(needle) == expected_diagnostics, output
     assert "RECOVERED" in result.stdout, output
     assert "failed to legalize" not in output, output
+
+
+@triton.jit
+def _rank3_reduce_of_loop_accumulator_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
+                                             C: tl.constexpr, AXIS: tl.constexpr,
+                                             OUT: tl.constexpr, MAX: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    acc = tl.zeros((A, B, C), tl.float32)
+    for t in range(T):
+        if MAX:
+            acc = tl.maximum(acc, tl.load(X + t * A * B * C + offsets))
+        else:
+            acc += tl.load(X + t * A * B * C + offsets)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(tl.sum(acc, AXIS), (OUT,)))
+
+
+# A rank-3 reduce of a tile the kernel accumulated over a loop used to be
+# refused ("cannot hoist its source before the phase boundary"): the loop holds
+# loads, so it was not side-effect free. A loop that only reads runs per band
+# before the publish like any load. Opening it exposed the label question: the
+# accumulator's loads run thread-major, so the publish must too, and the
+# load-rooted test now looks through the loop (16 of 72 cells per combine were
+# silently wrong in between).
+@pytest.mark.parametrize("use_max", [False, True])
+@pytest.mark.parametrize("shape, warps, axis", [
+    ((8, 8, 8), 1, 0), ((8, 8, 8), 2, 2), ((4, 8, 8), 1, 1), ((4, 8, 16), 2, 2),
+    ((4, 8, 16), 4, 0), ((2, 8, 16), 1, 1),
+])
+def test_rank3_reduce_of_loop_accumulator_matches_torch(shape, warps, axis, use_max):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(0xC5C5 + a * b * c + axis + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    xs = x.reshape(steps, a, b, c)
+    acc = xs.amax(0).clamp_min(0.0) if use_max else xs.sum(0)
+    expected = acc.sum(axis).reshape(-1)
+    out = torch.zeros(out_elements, dtype=torch.float32)
+    _rank3_reduce_of_loop_accumulator_kernel[(1,)](
+        x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, MAX=use_max,
+        num_warps=warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)

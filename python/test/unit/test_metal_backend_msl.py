@@ -5895,10 +5895,51 @@ def test_reduce_rank4_matches_torch(axis, num_warps):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
 
 
+@triton.jit
+def _reduce_rank3_loop_carried_store_kernel(X, O, T, PLANE_STRIDE,
+                                            D0: tl.constexpr, D1: tl.constexpr,
+                                            D2: tl.constexpr, AXIS: tl.constexpr):
+    i = tl.arange(0, D0)[:, None, None]
+    j = tl.arange(0, D1)[None, :, None]
+    k = tl.arange(0, D2)[None, None, :]
+    off = i * D1 * D2 + j * D2 + k
+    acc = tl.zeros((D0, D1, D2), dtype=tl.float32)
+    for t in range(0, T):
+        acc += tl.load(X + t * PLANE_STRIDE + off)
+        tl.store(O + off, acc)
+    if AXIS == 2:
+        r = tl.sum(acc, axis=2)[:, :, None]
+    else:
+        r = tl.sum(acc, axis=0)[None, :, :]
+    tl.store(O + off, r + 0.0 * acc)
+
+
+# A rank-3 reduce of a tile accumulated by a loop that only READS runs per band
+# before the publish, like any load (it used to be refused).
+@pytest.mark.parametrize("axis", [2, 0])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+def test_reduce_loop_carried_matches_torch(axis, num_warps):
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("Metal backend requires an MPS-enabled PyTorch")
+    d0, d1, d2, steps = 4, 8, 16, 3
+    torch.manual_seed(axis + num_warps)
+    x = torch.randn(steps * d0 * d1 * d2)
+    out = torch.zeros(d0 * d1 * d2, device="mps")
+    _reduce_rank3_loop_carried_kernel[(1,)](
+        x.to("mps"), out, steps, d0 * d1 * d2, D0=d0, D1=d1, D2=d2, AXIS=axis,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    acc = x.reshape(steps, d0, d1, d2).sum(0)
+    r = acc.sum(2, keepdim=True) if axis == 2 else acc.sum(0, keepdim=True)
+    torch.testing.assert_close(out.cpu(), (r + 0 * acc).flatten(), atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize(
     "axis", [2, 0], ids=["loop_carried_axis2", "loop_carried_axis0"])
-def test_reduce_loop_carried_fails_without_crashing(axis, tmp_path):
-    """A loop-carried source must be refused before conversion, with recovery."""
+def test_reduce_loop_carried_with_store_fails_without_crashing(axis, tmp_path):
+    """A loop that also STORES cannot run before the publish: refused before
+    conversion, and the process recovers."""
     import os
     import subprocess
     import sys
@@ -5918,7 +5959,7 @@ def test_reduce_loop_carried_fails_without_crashing(axis, tmp_path):
 
         def compile_case():
             triton.compile(ASTSource(
-                module._reduce_rank3_loop_carried_kernel,
+                module._reduce_rank3_loop_carried_store_kernel,
                 signature={{"X": "*fp32", "O": "*fp32", "T": "i32",
                             "PLANE_STRIDE": "i32"}},
                 constexprs={constexprs}),
