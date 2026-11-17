@@ -17141,7 +17141,20 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // More than one register band needs a separate publish/read phase. A
   // one-element-per-thread layout can stay in the current phase; finishPlan
   // records whether it nevertheless needs exact logical scratch indexing.
-  const bool multiBand = !enc || numElements > tile->threadsPerBlock;
+  // A rank >= 3 reduce in a user loop always takes the phased path, even when
+  // its source fits one band: the loop's ranges, loads and exchanges are all
+  // planned cyclic per phase band, and the in-place one-band publish has no
+  // such phase to read in. That path was refused in a loop outright.
+  // A USER loop, looking through register-band loops: inside the conversion
+  // the function's own band loop is the parent of every top-level reduce, and
+  // once a rank-N loop is split into phases a reduce in it sits in a phase's.
+  mlir::Operation *enclosing = op->getParentOp();
+  while (enclosing && isRegisterBandLoop(enclosing))
+    enclosing = enclosing->getParentOp();
+  const bool loopPhase = enc && srcTy.getRank() >= 3 &&
+                         mlir::isa_and_nonnull<mlir::scf::ForOp>(enclosing);
+  const bool multiBand =
+      !enc || numElements > tile->threadsPerBlock || loopPhase;
   // Top-level rank-1/2 blocked tiles have dedicated butterfly/row-scanner
   // contracts and diagnostics. Nested slice encodings, however, are the tail
   // of a topk hypercube after repeated rank drops; the row scanner cannot
@@ -19204,7 +19217,12 @@ struct ReduceRankNLowering
       base = mlir::arith::ConstantOp::create(rewriter, loc,
                                              rewriter.getI32IntegerAttr(0))
                  .getResult();
-    } else if (keepDims && (plan->multiBand || plan->exactLayoutScratch)) {
+    } else if (keepDims && !op->hasAttr(kRankNUserLoopAttr) &&
+               (plan->multiBand || plan->exactLayoutScratch)) {
+      // (Not in a rank-N user loop: there a keep-dims result can only be
+      // stored, addressed cyclic in its OWN shape like the result layout, so
+      // the source element's coordinates named another output element once
+      // the source had more elements than the result's owners.)
       // A keep-dims result is consumed only after the removed axis has been
       // reinserted and broadcast. Each physical source element therefore needs
       // the reduction for ITS OWN surviving coordinates. Projecting from the
@@ -46317,7 +46335,6 @@ static void sinkTileConesIntoRankNLoops(mlir::ModuleOp moduleOp) {
   llvm::SetVector<mlir::Operation *> hoisted;
   for (mlir::scf::ForOp loop : rankNPhaseLoops(moduleOp)) {
     mlir::Block *body = loop.getBody();
-    mlir::IRMapping mapping;
     mlir::OpBuilder builder(body, body->begin());
     std::function<bool(mlir::Value)> sinkable = [&](mlir::Value value) {
       mlir::Operation *def = value.getDefiningOp();
@@ -46330,14 +46347,18 @@ static void sinkTileConesIntoRankNLoops(mlir::ModuleOp moduleOp) {
         return !isTensor(operand.getType()) || sinkable(operand);
       });
     };
-    std::function<mlir::Value(mlir::Value)> sink =
-        [&](mlir::Value value) -> mlir::Value {
+    // One copy of the cone PER USE: CSE lets one hoisted range feed tiles of
+    // different shapes (a [2, 4, 4] load and the [2, 1, 4] keep_dims store of
+    // its sum), and a range carries one plan, so a shared copy addressed the
+    // store with the load tile's coordinates.
+    std::function<mlir::Value(mlir::Value, mlir::IRMapping &)> sink =
+        [&](mlir::Value value, mlir::IRMapping &mapping) -> mlir::Value {
       if (mlir::Value mapped = mapping.lookupOrNull(value))
         return mapped;
       mlir::Operation *def = value.getDefiningOp();
       for (mlir::Value operand : def->getOperands())
         if (isTensor(operand.getType()))
-          sink(operand);
+          sink(operand, mapping);
       builder.clone(*def, mapping);
       hoisted.insert(def);
       return mapping.lookup(value);
@@ -46348,8 +46369,10 @@ static void sinkTileConesIntoRankNLoops(mlir::ModuleOp moduleOp) {
         if (isTensor(operand.get().getType()) && sinkable(operand.get()))
           uses.push_back(&operand);
     });
-    for (mlir::OpOperand *use : uses)
-      use->set(sink(use->get()));
+    for (mlir::OpOperand *use : uses) {
+      mlir::IRMapping mapping;
+      use->set(sink(use->get(), mapping));
+    }
   }
   // The hoisted originals are dead once nothing outside the loops reads them.
   // Only those: a pre-pass may keep an op alive by identity alone.

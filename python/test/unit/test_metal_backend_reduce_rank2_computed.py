@@ -1245,15 +1245,40 @@ def test_rank3_reduce_direct_load_loop_rank2_store():
                                rtol=2e-3)
 
 
-def test_rank3_reduce_direct_load_loop_one_band_is_named(capfd):
-    a, b, c, steps = 2, 4, 8, 2
+# A source that fits one register band used to be refused inside a loop: the
+# one-band reduce publishes in place, and a loop has no phase to read it in. It
+# now takes the phased path like a wider source, under the loop's cyclic order.
+# The keep_dims store additionally needed the fold to project from the RESULT
+# layout: the topk-style projection from each source element's own surviving
+# coordinates named another output element once the source had more elements
+# than the result had owners (8 of 72 keep cells, before this was fixed).
+@pytest.mark.parametrize("form", ["reshape", "direct", "keep", "max_atomic"])
+@pytest.mark.parametrize("shape, warps, axis", [
+    ((2, 4, 8), 2, 2), ((2, 4, 4), 1, 0), ((2, 4, 4), 2, 1), ((2, 4, 4), 4, 2),
+    ((4, 4, 4), 4, 1), ((2, 4, 8), 4, 2),
+])
+def test_rank3_reduce_loop_one_band_source_matches_torch(shape, warps, axis, form):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(0xC4C4 + a * b * c + axis + warps)
     x = torch.randn(steps * a * b * c, dtype=torch.float32)
-    out = torch.zeros(steps * a * b, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+    xs = x.reshape(steps, a, b, c)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    count = torch.zeros(1, dtype=torch.float32)
+    if form == "reshape":
         _rank3_reduce_loop_kernel[(1,)](
-            x, out, steps, A=a, B=b, C=c, AXIS=2, OUT=a * b, num_warps=2)
-    diagnostic = capfd.readouterr()
-    assert "rank >= 3 reduce is implemented" in diagnostic.err + diagnostic.out
+            x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
+        expected = xs.sum(axis + 1).reshape(-1)
+    else:
+        _rank3_reduce_loop_forms_kernel[(1,)](
+            x, out, count, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements,
+            FORM="max" if form == "max_atomic" else form, num_warps=warps)
+        expected = (xs.amax(axis + 1) if form == "max_atomic" else xs.sum(axis + 1)).reshape(-1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+    if form == "max_atomic":
+        assert count.item() == steps
 
 
 @triton.jit
