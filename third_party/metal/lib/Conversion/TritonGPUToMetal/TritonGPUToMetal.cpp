@@ -2717,12 +2717,15 @@ valueConsumerTileOfRank(mlir::Value value, int64_t rank,
       // range whose only rank-2 use is such a column found nothing and was
       // decomposed against the kernel's largest tile instead -- a `[4, 1]`
       // store beside a `[4, 4]` one wrote row `tid / 4` of a four-row buffer.
-      // Rank 2 only: the rank-3 walk's every-axis rule is load-bearing.
-      if (rank == 2 &&
+      // Rank 2, and rank 4-5, where a unit axis is how a kernel spells a
+      // degenerate dimension of a real tile (`[4, 8, 1, 4]`) and the access
+      // is the only tile there is: every such range was refused, 0 wrong.
+      // NOT rank 3: its every-axis rule is load-bearing.
+      if ((rank == 2 || rank >= 4) &&
           mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(user) &&
           user->getNumOperands() > 0 && user->getOperand(0) == v) {
         auto info = tileFromTensor(v.getType());
-        if (info && info->rank == 2) {
+        if (info && info->rank == rank) {
           if (!found)
             found = info;
           else if (found->shape != info->shape ||
@@ -43324,10 +43327,39 @@ validateUnsupportedOpsRejected(mlir::ModuleOp moduleOp) {
               mlir::dyn_cast_or_null<mlir::triton::gpu::BlockedEncodingAttr>(
                   root)) {
         const int64_t rank = blocked.getOrder().size();
+        // A tile with a unit axis is taken only as the access a load or store
+        // is given (`valueConsumerTileOfRank`); reached through a layout
+        // conversion, that access is in another layout than the range's
+        // values, and the per-element index it would hand the range belongs to
+        // neither. 📏 Every such cell failed inside the conversion.
+        auto unitAccessThroughConvert = [&] {
+          auto tile = valueConsumerTileOfRank(range.getResult(), rank);
+          if (!tile || llvm::all_of(tile->shape,
+                                    [](int64_t s) { return s > 1; }))
+            return false;
+          llvm::SmallVector<mlir::Value, 16> worklist{range.getResult()};
+          llvm::SmallPtrSet<mlir::Value, 32> seen;
+          while (!worklist.empty()) {
+            mlir::Value value = worklist.pop_back_val();
+            if (!seen.insert(value).second)
+              continue;
+            for (mlir::Operation *user : value.getUsers()) {
+              if (mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user))
+                return true;
+              if (mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(user))
+                continue;
+              for (mlir::Value result : user->getResults())
+                if (mlir::isa<mlir::RankedTensorType>(result.getType()))
+                  worklist.push_back(result);
+            }
+          }
+          return false;
+        };
         if (rank >= 4 && root != enc && rtt.getNumElements() > 2 &&
             !linearRangeHypercubeAxis(range) &&
             !planLinearRange(range, /*allowMixedHypercube=*/true) &&
-            (rank > 5 || !valueConsumerTileOfRank(range.getResult(), rank))) {
+            (rank > 5 || !valueConsumerTileOfRank(range.getResult(), rank) ||
+             unitAccessThroughConvert())) {
           reject(range, "tl.arange over this rank-4/5 tile has no consumer "
                         "tile for its per-element index");
           return;

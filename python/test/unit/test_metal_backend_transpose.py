@@ -916,3 +916,99 @@ def test_permute_rank4_address_cone_matches_torch(shape, num_warps, perm):
                                      *expected.shape, *perm, num_warps=num_warps)
     torch.mps.synchronize()
     torch.testing.assert_close(out.cpu().reshape(expected.shape), expected)
+
+
+# Rank-4/5 tiles that keep a unit axis (`[4, 8, 1, 4]`). Every per-axis range of
+# such a tile was refused ("no consumer tile"): the consumer-tile walk skips a
+# tile with a unit axis, which at rank 3 keeps it off a `[A, B, 1]` broadcast
+# intermediate. At rank 4-5 the access a load or store is given is the tile, unit
+# axis or not, as it already was at rank 2. (A one-band sum of such a tile
+# then also needed the user-loop test of the staged plan to ignore the
+# function's own band loop, which is the parent of every top-level reduce once
+# the conversion has started.)
+@triton.jit
+def _unit_axis_rank4_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                            D: tl.constexpr, MODE: tl.constexpr, AXIS: tl.constexpr,
+                            OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None, None]
+    b = tl.arange(0, B)[None, :, None, None]
+    c = tl.arange(0, C)[None, None, :, None]
+    d = tl.arange(0, D)[None, None, None, :]
+    off = a * (B * C * D) + b * (C * D) + c * D + d
+    v = tl.load(X + off)
+    if MODE == "copy":
+        tl.store(O + off, v * 2.0 + 1.0)
+    elif MODE == "flat":
+        tl.store(O + tl.arange(0, A * B * C * D), tl.reshape(v, (A * B * C * D,)))
+    else:
+        tl.store(O + tl.arange(0, OUT), tl.reshape(tl.sum(v, AXIS), (OUT,)))
+
+
+@triton.jit
+def _unit_axis_rank5_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                            D: tl.constexpr, E: tl.constexpr, AXIS: tl.constexpr,
+                            OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None, None, None]
+    b = tl.arange(0, B)[None, :, None, None, None]
+    c = tl.arange(0, C)[None, None, :, None, None]
+    d = tl.arange(0, D)[None, None, None, :, None]
+    e = tl.arange(0, E)[None, None, None, None, :]
+    v = tl.load(X + a * (B * C * D * E) + b * (C * D * E) + c * (D * E) + d * E + e)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(tl.sum(v, AXIS), (OUT,)))
+
+
+@pytest.mark.parametrize("mode", ["copy", "flat", "sum0", "sumlast"])
+@pytest.mark.parametrize("shape, num_warps", [
+    ((4, 8, 1, 4), 1), ((4, 8, 1, 4), 4), ((1, 4, 8, 4), 2), ((4, 1, 8, 8), 1),
+    ((8, 1, 1, 32), 2), ((1, 1, 16, 16), 4), ((4, 4, 4, 1), 1),
+])
+def test_unit_axis_rank4_tile_matches_torch(shape, num_warps, mode):
+    n = 1
+    for s in shape:
+        n *= s
+    torch.manual_seed(n + num_warps)
+    x = torch.randn(n, dtype=torch.float32)
+    t = x.reshape(shape)
+    if mode.startswith("sum"):
+        axis = next(i for i, s in enumerate(shape) if s > 1)
+        if mode == "sumlast":
+            axis = max(i for i, s in enumerate(shape) if s > 1)
+        want = t.sum(axis).reshape(-1)
+        out_n = n // shape[axis]
+    else:
+        axis, out_n = 0, n
+        want = x * 2 + 1 if mode == "copy" else x
+    out = torch.zeros(want.numel(), dtype=torch.float32)
+    _unit_axis_rank4_kernel[(1,)](x, out, *shape, "sum" if mode.startswith("sum") else mode,
+                                  axis, out_n, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("shape, num_warps, axis", [
+    ((2, 4, 1, 8, 2), 1, 3), ((2, 4, 1, 8, 2), 4, 0), ((1, 2, 4, 4, 8), 2, 4),
+    ((2, 1, 8, 1, 8), 4, 2), ((4, 4, 4, 2, 1), 4, 1),
+])
+def test_unit_axis_rank5_sum_matches_torch(shape, num_warps, axis):
+    n = 1
+    for s in shape:
+        n *= s
+    torch.manual_seed(n + axis)
+    x = torch.randn(n, dtype=torch.float32)
+    want = x.reshape(shape).sum(axis).reshape(-1)
+    out = torch.zeros(want.numel(), dtype=torch.float32)
+    _unit_axis_rank5_kernel[(1,)](x, out, *shape, axis, want.numel(), num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
+
+
+def test_unit_axis_rank4_access_through_convert_is_named(capfd):
+    # A trailing unit axis makes Triton route the access through a third
+    # layout; the access tile is then not the tile the range's values live in.
+    x = torch.randn(128, dtype=torch.float32)
+    out = torch.zeros(128, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _unit_axis_rank4_kernel[(1,)](x, out, 2, 8, 8, 1, "copy", 0, 128, num_warps=4)
+    diagnostic = capfd.readouterr()
+    assert "tl.arange over this rank-4/5 tile has no consumer tile" in (
+        diagnostic.err + diagnostic.out)
