@@ -812,9 +812,11 @@ case and an adjacent rejection regression.
    matrices are numerically clean. Rank-3 and rank-4 permute-to-reduce now map
    thread-major load-rooted input coordinates through the permutation before
    exact publication, on every reduction axis and across register bands.
-   A permuted source computed from its own coordinates (`tl.arange`
-   arithmetic) is exact too, under the layout's own label; broadcast and
-   reshaped sources remain named boundaries. One top-level
+   Other permuted sources are exact too: `tl.arange` arithmetic, reshaped
+   loads and broadcasts carry the layout's own label, and a direct load wider
+   than one register band makes its whole source thread-major; a loaded tile
+   with fewer elements than threads uses the layout's label (the thread-major
+   relabel answered every such tile wrong). One top-level
    no-iter_arg uniform loop can now stage direct-load rank >= 3 reductions
    independently on each iteration, with cyclic publish addressing and barriers.
    The source, the result and every range in the loop share that cyclic order;
@@ -824,9 +826,13 @@ case and an adjacent rejection regression.
    or with an added unit axis); results of several elements per thread and
    one-band sources are exact: the address cones LICM hoisted are cloned back
    into the loop, every tile and exchange there is cyclic, and a function whose
-   tiles all live in such loops is not wrapped in its band loop again. Other
-   consumers, nested or multiple rank-N reduction loops and loop-carried
-   sources remain named boundaries. Top-level single-value rank >= 2
+   tiles all live in such loops is not wrapped in its band loop again.
+   Element-wise consumers (a read-modify-write of the output), sibling and
+   nested reduction loops, and loop-carried tiles and scalars are exact too:
+   carries live in thread-private slots (one element per band for a tile, two
+   entries by iteration parity for a scalar). A broadcast of the result back
+   into the tile and a further reduction of it inside the loop remain named
+   boundaries. Top-level single-value rank >= 2
    scans now support multiple elements per thread. Rank-2 and rank-3 scans with
    different register-band counts can share a function: each scan's consumers
    finish in that scan's own phase before the next publication begins. Rank >= 2
@@ -884,7 +890,11 @@ case and an adjacent rejection regression.
    and works element-wise on the scan's tiles (`v = v * 0.5 + 1` iterated, or
    `acc += tl.load(...)` before a cumsum) runs in each register band like the
    function body's band loop; inner loops that store, perform atomics or move
-   data between elements are refused by name. A result if after the scan may read
+   data between elements are refused by name. A row sum (or i32 xor) along the
+   scan axis inside the loop -- read back over its tile, or carried as a running
+   row total as a chunked cumsum does -- runs as the pair of scans `P + S - x`
+   (`P ^ S ^ x`), the carried total as a tile; other in-loop reductions are
+   refused by name. A result if after the scan may read
    the scan result: it is copied through a slot right after the scan (a scan
    result that a later scan also consumes is refused by name). Supported
    result-carrying internal ifs use
