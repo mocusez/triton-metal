@@ -5150,6 +5150,51 @@ struct ConvertLayoutLowering
       // boundary, which only the phase scheduler cares about.
       const bool isPublish =
           tag.getValue() == "publish" || tag.getValue() == kCarryWrite;
+      // A thread-private slot (`createNestedScanSlot`) holds this thread's
+      // elements, one per register band: index it by the band and nothing
+      // else -- no owner, no barrier.
+      if (bufIt->second.getDefiningOp<AllocaOp>()) {
+        if (tag.getValue() != kCarryWrite && tag.getValue() != kCarryRead)
+          return rewriter.notifyMatchFailure(op, "private slot outside a carry");
+        mlir::Value band;
+        if (auto loop = findOutermostScfFor(op);
+            loop && loop->hasAttr(kScanBandLoopAttr))
+          band = loop.getInductionVar();
+        else if (plan.src.elemPerThread == 1)
+          band = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                 rewriter.getI32IntegerAttr(0))
+                     .getResult();
+        else
+          return rewriter.notifyMatchFailure(
+              op, "private carry slot outside a register band");
+        mlir::Value bandU =
+            mlir::UnrealizedConversionCastOp::create(
+                rewriter, loc, mlir::TypeRange{ui32}, mlir::ValueRange{band})
+                .getResult(0);
+        if (tag.getValue() == kCarryWrite) {
+          mlir::Value staged = adaptor.getSrc();
+          if (staged.getType() != plan.elemTy)
+            staged = mlir::UnrealizedConversionCastOp::create(
+                         rewriter, loc, mlir::TypeRange{plan.elemTy},
+                         mlir::ValueRange{staged})
+                         .getResult(0);
+          TgStoreIndexedOp::create(rewriter, loc, bufIt->second, bandU, staged);
+          rewriter.replaceOp(op, adaptor.getSrc());
+          return mlir::success();
+        }
+        mlir::Value loaded =
+            TgLoadIndexedOp::create(rewriter, loc, plan.elemTy, bufIt->second,
+                                    bandU)
+                .getResult();
+        if (loaded.getType() != adaptor.getSrc().getType())
+          loaded = mlir::UnrealizedConversionCastOp::create(
+                       rewriter, loc,
+                       mlir::TypeRange{adaptor.getSrc().getType()},
+                       mlir::ValueRange{loaded})
+                       .getResult(0);
+        rewriter.replaceOp(op, loaded);
+        return mlir::success();
+      }
       // Each half asks its OWN layout where the lane's element lives; the
       // buffer is indexed by element, so neither needs the other's inverse.
       mlir::Value idx = emitLayoutElementIndex(
@@ -18186,6 +18231,33 @@ static bool canGroupScanReduceInputs(mlir::triton::ScanOp scan,
 
 // Publish every source register band before a staged scan reads any prefix.
 // Keep independent work before the boundary and rematerialize shared indices.
+// A nested-scan slot (a carried tile, a while snapshot, a result if's tile, a
+// spilled scan result) whose every write and read uses ONE layout plan is read
+// at (t, iv) by the thread that wrote (t, iv). Without replicated owners that
+// is thread-private state: an E-element array indexed by the register band,
+// outside the 32 KiB threadgroup budget (`privatizeNestedScanSlots`). 📏 The
+// first realistic shape over budget was a 64x64 cumsum carrying two tiles
+// (49152 bytes); its carries now cost no threadgroup memory. A slot read under
+// ANOTHER layout (a carried `tl.dot` accumulator stored after the loop in the
+// store's layout) is a real exchange and stays shared, and so does a slot with
+// replicated owners, whose replicas read what the canonical owner wrote. The
+// budget is counted on the tile type here and checked again on the result.
+static std::optional<LayoutIndexPlan>
+nestedScanPrivateSlotPlan(mlir::RankedTensorType type) {
+  auto plan = planLayoutIndex(type);
+  if (!plan || layoutHasReplicatedOwners(*plan))
+    return std::nullopt;
+  return plan;
+}
+
+static int64_t nestedScanSlotThreadgroupBytes(mlir::RankedTensorType type) {
+  if (nestedScanPrivateSlotPlan(type))
+    return 0;
+  return type.getNumElements() *
+         (metalStorageElementType(type.getElementType())
+              .getIntOrFloatBitWidth() /
+          8);
+}
 
 static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
                                                   const TileInfo &tile) {
@@ -44510,10 +44582,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           if (first) {
             auto rtt = mlir::cast<mlir::RankedTensorType>(init.getType());
             g_nestedScanCarryBytes[func.getOperation()] +=
-                rtt.getNumElements() *
-                (metalStorageElementType(rtt.getElementType())
-                     .getIntOrFloatBitWidth() /
-                 8);
+                nestedScanSlotThreadgroupBytes(rtt);
           }
         }
         for (mlir::Value snapshot : nestedScanWhileSnapshots(outerWhile)) {
@@ -44535,10 +44604,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           if (first) {
             auto rtt = mlir::cast<mlir::RankedTensorType>(snapshot.getType());
             g_nestedScanCarryBytes[func.getOperation()] +=
-                rtt.getNumElements() *
-                (metalStorageElementType(rtt.getElementType())
-                     .getIntOrFloatBitWidth() /
-                 8);
+                nestedScanSlotThreadgroupBytes(rtt);
           }
         }
         for (mlir::Operation &op : outerWhile.getBefore().front())
@@ -44573,10 +44639,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           if (first) {
             auto rtt = mlir::cast<mlir::RankedTensorType>(type);
             g_nestedScanCarryBytes[func.getOperation()] +=
-                rtt.getNumElements() *
-                (metalStorageElementType(rtt.getElementType())
-                     .getIntOrFloatBitWidth() /
-                 8);
+                nestedScanSlotThreadgroupBytes(rtt);
           }
         }
       }
@@ -44717,10 +44780,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (newInternalResultIfs.count(branch.getOperation())) {
           auto rtt = mlir::cast<mlir::RankedTensorType>(type);
           g_nestedScanCarryBytes[func.getOperation()] +=
-              rtt.getNumElements() *
-              (metalStorageElementType(rtt.getElementType())
-                   .getIntOrFloatBitWidth() /
-               8);
+              nestedScanSlotThreadgroupBytes(rtt);
         }
       }
       // Each scan result the branches read is copied through a slot too.
@@ -44749,10 +44809,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (newInternalResultIfs.count(branch.getOperation())) {
           auto rtt = mlir::cast<mlir::RankedTensorType>(source.getType());
           g_nestedScanCarryBytes[func.getOperation()] +=
-              rtt.getNumElements() *
-              (metalStorageElementType(rtt.getElementType())
-                   .getIntOrFloatBitWidth() /
-               8);
+              nestedScanSlotThreadgroupBytes(rtt);
         }
       }
     }
@@ -44834,10 +44891,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (!why.empty())
           return loop.emitOpError("Metal backend: ") << why;
         auto rtt = mlir::cast<mlir::RankedTensorType>(type);
-        bytes += rtt.getNumElements() *
-                 (metalStorageElementType(rtt.getElementType())
-                      .getIntOrFloatBitWidth() /
-                  8);
+        bytes += nestedScanSlotThreadgroupBytes(rtt);
       }
       g_nestedScanCarryBytes[func.getOperation()] += bytes;
     }
@@ -44860,10 +44914,7 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
           return outer.emitOpError("Metal backend: ") << why;
         auto rtt = mlir::cast<mlir::RankedTensorType>(type);
         g_nestedScanCarryBytes[func.getOperation()] +=
-            rtt.getNumElements() *
-            (metalStorageElementType(rtt.getElementType())
-                 .getIntOrFloatBitWidth() /
-             8);
+            nestedScanSlotThreadgroupBytes(rtt);
       }
     }
     mlir::OpBuilder builder(loop.getContext());
@@ -44930,6 +44981,19 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
 // preflighted by `selectNestedScanLoops`; it runs this late because a slot
 // write is a pure op with no user, which every dead-code sweep before the
 // conversion would erase.
+// Every slot starts as a threadgroup tile; `privatizeNestedScanSlots` moves
+// the ones whose every access shares one plan into thread-private memory.
+static mlir::Value createNestedScanSlot(mlir::OpBuilder &builder,
+                                       mlir::Location loc,
+                                       mlir::RankedTensorType type) {
+  auto *ctx = type.getContext();
+  mlir::Type elemTy = metalStorageElementType(type.getElementType());
+  return ThreadgroupAllocaOp::create(
+             builder, loc,
+             MetalMemRefType::get(ctx, elemTy, type.getNumElements()))
+      .getResult();
+}
+
 static mlir::FailureOr<mlir::scf::ForOp>
 materializeNestedScanCarries(mlir::scf::ForOp loop, bool phaseScheduled = true) {
   auto func = loop->getParentOfType<mlir::triton::FuncOp>();
@@ -45349,11 +45413,7 @@ materializeNestedScanCarries(mlir::scf::ForOp loop, bool phaseScheduled = true) 
   b.setInsertionPointToStart(&top);
   llvm::SmallVector<mlir::Value, 4> buffers;
   for (mlir::RankedTensorType type : slotTypes)
-    buffers.push_back(ThreadgroupAllocaOp::create(
-        b, loc,
-        MetalMemRefType::get(func.getContext(),
-                             metalStorageElementType(type.getElementType()),
-                             type.getNumElements())));
+    buffers.push_back(createNestedScanSlot(b, loc, type));
   bool registered = true;
   func.walk([&](mlir::triton::gpu::ConvertLayoutOp op) {
     if (g_tileExchangeBuf.lookup(op.getOperation()) &&
@@ -45415,19 +45475,11 @@ materializeNestedScanWhileCarries(mlir::scf::WhileOp original) {
   for (unsigned index : carriedIndices) {
     auto type = mlir::cast<mlir::RankedTensorType>(
         original.getInits()[index].getType());
-    buffers.push_back(ThreadgroupAllocaOp::create(
-        topBuilder, loc,
-        MetalMemRefType::get(func.getContext(),
-                             metalStorageElementType(type.getElementType()),
-                             type.getNumElements())));
+    buffers.push_back(createNestedScanSlot(topBuilder, loc, type));
   }
   for (mlir::Value snapshot : snapshots) {
     auto type = mlir::cast<mlir::RankedTensorType>(snapshot.getType());
-    buffers.push_back(ThreadgroupAllocaOp::create(
-        topBuilder, loc,
-        MetalMemRefType::get(func.getContext(),
-                             metalStorageElementType(type.getElementType()),
-                             type.getNumElements())));
+    buffers.push_back(createNestedScanSlot(topBuilder, loc, type));
   }
   auto registerCarry = [&](mlir::triton::gpu::ConvertLayoutOp op,
                            unsigned slot) {
@@ -45784,22 +45836,14 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
     topBuilder.setInsertionPointToStart(&func.getBody().front());
     llvm::SmallVector<mlir::Value, 4> buffers;
     for (auto type : types)
-      buffers.push_back(ThreadgroupAllocaOp::create(
-          topBuilder, loc,
-          MetalMemRefType::get(func.getContext(),
-                               metalStorageElementType(type.getElementType()),
-                               type.getNumElements())));
+      buffers.push_back(createNestedScanSlot(topBuilder, loc, type));
     // Scan results the branches read: one more slot each, after the results.
     llvm::DenseMap<mlir::Value, unsigned> scanSlots;
     if (internalLoop)
       for (mlir::Value source : nestedScanIfScanSources(original)) {
         auto type = mlir::cast<mlir::RankedTensorType>(source.getType());
         scanSlots[source] = buffers.size();
-        buffers.push_back(ThreadgroupAllocaOp::create(
-            topBuilder, loc,
-            MetalMemRefType::get(func.getContext(),
-                                 metalStorageElementType(type.getElementType()),
-                                 type.getNumElements())));
+        buffers.push_back(createNestedScanSlot(topBuilder, loc, type));
       }
     auto registerCarry = [&](mlir::triton::gpu::ConvertLayoutOp op,
                              unsigned slot) {
@@ -46205,6 +46249,74 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
 
 // Commit local band phases while tensor operands and the original user loop
 // are still intact. The same assignments/carry predicate were preflighted.
+static mlir::LogicalResult privatizeNestedScanSlots(mlir::ModuleOp moduleOp) {
+  // Every exchange op that reads or writes each slot buffer.
+  llvm::MapVector<mlir::Value, llvm::SmallVector<mlir::Operation *, 4>> users;
+  for (auto &[op, buffer] : g_tileExchangeBuf)
+    if (buffer && buffer.getDefiningOp<ThreadgroupAllocaOp>())
+      users[buffer].push_back(op);
+  for (auto &[buffer, ops] : users) {
+    std::optional<LayoutIndexPlan> common;
+    bool privateSlot = !ops.empty();
+    for (mlir::Operation *op : ops) {
+      auto tag = op->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+      auto plan = g_tileExchange.find(op);
+      if (!tag || plan == g_tileExchange.end() ||
+          (tag.getValue() != kCarryWrite && tag.getValue() != kCarryRead)) {
+        privateSlot = false;
+        break;
+      }
+      const LayoutIndexPlan &mine = tag.getValue() == kCarryWrite
+                                        ? plan->second.src
+                                        : plan->second.dst;
+      auto loop = findOutermostScfFor(op);
+      if (layoutHasReplicatedOwners(mine) ||
+          !layoutFlatIndexPlansEquivalent(plan->second.src, plan->second.dst) ||
+          (common && !layoutFlatIndexPlansEquivalent(*common, mine)) ||
+          (mine.elemPerThread > 1 &&
+           !(loop && loop->hasAttr(kScanBandLoopAttr)))) {
+        privateSlot = false;
+        break;
+      }
+      common = mine;
+    }
+    if (!privateSlot || !common)
+      continue;
+    auto alloca = buffer.getDefiningOp<ThreadgroupAllocaOp>();
+    auto memref = mlir::cast<MetalMemRefType>(buffer.getType());
+    mlir::OpBuilder builder(alloca);
+    mlir::Value replacement =
+        AllocaOp::create(builder, alloca.getLoc(),
+                         MetalMemRefType::get(alloca.getContext(),
+                                              memref.getType(),
+                                              common->elemPerThread))
+            .getResult();
+    for (mlir::Operation *op : ops)
+      g_tileExchangeBuf[op] = replacement;
+    if (alloca->use_empty())
+      alloca.erase();
+  }
+  // The selection budget assumed every privatizable tile type would be
+  // private; a slot that stayed shared is counted here, on the real total.
+  bool fits = true;
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    if (!g_nestedScanFunctions.count(func.getOperation()))
+      return;
+    int64_t bytes = 0;
+    func.walk([&](ThreadgroupAllocaOp alloca) {
+      auto type = mlir::cast<MetalMemRefType>(alloca.getResult().getType());
+      bytes += type.getSize() *
+               ((type.getType().getIntOrFloatBitWidth() + 7) / 8);
+    });
+    if (bytes > kThreadgroupBudgetBytes) {
+      func.emitOpError() << "Metal backend: nested scan threadgroup state needs "
+                         << bytes << " bytes, exceeding the 32768-byte budget";
+      fits = false;
+    }
+  });
+  return mlir::success(fits);
+}
+
 static mlir::LogicalResult
 materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
@@ -50360,7 +50472,8 @@ struct ConvertTritonGPUToMetalPass
     }
 
     if (mlir::failed(materializeNestedScanPhases(moduleOp)) ||
-        mlir::failed(materializeRankNLoopPhases(moduleOp))) {
+        mlir::failed(materializeRankNLoopPhases(moduleOp)) ||
+        mlir::failed(privatizeNestedScanSlots(moduleOp))) {
       signalPassFailure();
       return;
     }

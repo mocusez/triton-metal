@@ -13548,3 +13548,39 @@ def test_nested_scan_band_local_boundaries_are_named(capfd, mode, diagnostic):
     captured = capfd.readouterr()
     assert diagnostic in captured.err + captured.out
 
+
+# A nested-scan slot is written and read under one layout plan, so the thread
+# that reads an element is the one that wrote it: without replicated owners it
+# is thread-private (E elements per thread, indexed by the register band) and
+# costs no threadgroup memory. The first realistic shape over the 32 KiB budget
+# was a 64x64 cumsum carrying two tiles (49152 bytes); a 128x64 carry needed
+# 65536. Both were refused; they now run.
+@triton.jit
+def _nested_scan_two_carries_kernel(X, O, rows, R: tl.constexpr, C: tl.constexpr):
+    index = tl.reshape(tl.arange(0, R * C), (R, C))
+    h = tl.zeros((R, C), tl.float32)
+    g = tl.zeros((R, C), tl.float32)
+    for row in range(rows):
+        c = tl.cumsum(tl.load(X + row * R * C + index), 1)
+        h = h * 0.5 + c
+        g = g + c * c
+    tl.store(O + index, h + g)
+
+
+@pytest.mark.parametrize("shape, num_warps", [((64, 64), 4), ((64, 64), 1), ((128, 64), 4),
+                                              ((32, 64), 2)])
+def test_nested_scan_carries_are_thread_private(shape, num_warps):
+    rows = 3
+    r, c = shape
+    gen = torch.Generator().manual_seed(r + c + num_warps)
+    x = torch.randn(rows, r, c, generator=gen)
+    out = torch.zeros(r, c, device="mps")
+    _nested_scan_two_carries_kernel[(1,)](x.to("mps"), out, rows, r, c, num_warps=num_warps)
+    torch.mps.synchronize()
+    h = torch.zeros(r, c)
+    g = torch.zeros(r, c)
+    for i in range(rows):
+        cs = x[i].cumsum(1)
+        h = h * 0.5 + cs
+        g = g + cs * cs
+    torch.testing.assert_close(out.cpu(), h + g, atol=1e-2, rtol=1e-3)
