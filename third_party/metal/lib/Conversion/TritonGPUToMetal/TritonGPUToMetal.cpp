@@ -44130,7 +44130,45 @@ nestedScanWhileSnapshots(mlir::scf::WhileOp loop) {
 static bool nestedScanPureScalarRegion(mlir::Operation *loop,
                                        bool allowLoads = false);
 
+// The scan results a nested-scan result `if` reads, through the pure cone its
+// branches yield. A branch cannot replay a scan, so each such result is copied
+// into a carry slot right after the scan and read back inside the branch's
+// band loop (`materializeNestedScanResultIfs`). That is exact because the
+// branch work is element-wise: band `iv` of the branch only ever reads the
+// slot band `iv` of the enclosing phase wrote. 📏 `s = tl.cumsum(x, 1); if c:
+// y = s + 1 else: y = s - 1` was refused in every multi-band shape.
+static llvm::SmallVector<mlir::Value, 2>
+nestedScanIfScanSources(mlir::scf::IfOp branch) {
+  llvm::SmallVector<mlir::Value, 2> sources;
+  llvm::SmallVector<mlir::Value, 16> worklist;
+  for (mlir::Region &region : branch->getRegions())
+    if (!region.empty())
+      llvm::append_range(worklist,
+                         region.front().getTerminator()->getOperands());
+  llvm::DenseSet<mlir::Operation *> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    mlir::Operation *def = value.getDefiningOp();
+    if (!def || !visited.insert(def).second)
+      continue;
+    if (auto scan = mlir::dyn_cast<mlir::triton::ScanOp>(def)) {
+      if (!branch->isAncestor(scan) &&
+          scan->getBlock() == branch->getBlock() &&
+          scan->isBeforeInBlock(branch) &&
+          mlir::isa<mlir::RankedTensorType>(value.getType()) &&
+          !llvm::is_contained(sources, value))
+        sources.push_back(value);
+      continue;
+    }
+    if (def->getNumRegions() || !mlir::isMemoryEffectFree(def))
+      continue;
+    llvm::append_range(worklist, def->getOperands());
+  }
+  return sources;
+}
+
 static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
+  llvm::SmallVector<mlir::Value, 2> scanSources = nestedScanIfScanSources(branch);
   for (mlir::Region &region : branch->getRegions()) {
     if (region.empty())
       continue;
@@ -44138,7 +44176,10 @@ static bool nestedScanInternalIfSourcesSafe(mlir::scf::IfOp branch) {
     llvm::SmallVector<mlir::Value, 16> worklist(yield.getOperands());
     llvm::DenseSet<mlir::Operation *> visited;
     while (!worklist.empty()) {
-      mlir::Operation *def = worklist.pop_back_val().getDefiningOp();
+      mlir::Value current = worklist.pop_back_val();
+      if (llvm::is_contained(scanSources, current))
+        continue;
+      mlir::Operation *def = current.getDefiningOp();
       if (!def || !visited.insert(def).second)
         continue;
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
@@ -44675,6 +44716,38 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         }
         if (newInternalResultIfs.count(branch.getOperation())) {
           auto rtt = mlir::cast<mlir::RankedTensorType>(type);
+          g_nestedScanCarryBytes[func.getOperation()] +=
+              rtt.getNumElements() *
+              (metalStorageElementType(rtt.getElementType())
+                   .getIntOrFloatBitWidth() /
+               8);
+        }
+      }
+      // Each scan result the branches read is copied through a slot too.
+      for (mlir::Value source : nestedScanIfScanSources(branch)) {
+        if (!valid)
+          break;
+        // 📏 A slot copy of a scan result that a later scan also consumes
+        // pulled that scan out of its staged phase (it failed to legalize);
+        // reading the LAST scan of such a chain is exact.
+        if (llvm::any_of(source.getUsers(), [](mlir::Operation *user) {
+              return mlir::isa<mlir::triton::ScanOp>(user);
+            })) {
+          branch.emitOpError(
+              "Metal backend: a nested scan result if cannot read a scan "
+              "result that a later scan also consumes; branch on the last "
+              "scan of the chain");
+          valid = false;
+          break;
+        }
+        llvm::StringRef why = nestedScanCarryUnsupported(source.getType(), *tile);
+        if (!why.empty()) {
+          branch.emitOpError("Metal backend: ") << why;
+          valid = false;
+          break;
+        }
+        if (newInternalResultIfs.count(branch.getOperation())) {
+          auto rtt = mlir::cast<mlir::RankedTensorType>(source.getType());
           g_nestedScanCarryBytes[func.getOperation()] +=
               rtt.getNumElements() *
               (metalStorageElementType(rtt.getElementType())
@@ -45716,6 +45789,18 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           MetalMemRefType::get(func.getContext(),
                                metalStorageElementType(type.getElementType()),
                                type.getNumElements())));
+    // Scan results the branches read: one more slot each, after the results.
+    llvm::DenseMap<mlir::Value, unsigned> scanSlots;
+    if (internalLoop)
+      for (mlir::Value source : nestedScanIfScanSources(original)) {
+        auto type = mlir::cast<mlir::RankedTensorType>(source.getType());
+        scanSlots[source] = buffers.size();
+        buffers.push_back(ThreadgroupAllocaOp::create(
+            topBuilder, loc,
+            MetalMemRefType::get(func.getContext(),
+                                 metalStorageElementType(type.getElementType()),
+                                 type.getNumElements())));
+      }
     auto registerCarry = [&](mlir::triton::gpu::ConvertLayoutOp op,
                              unsigned slot) {
       auto type = mlir::cast<mlir::RankedTensorType>(op.getType());
@@ -45758,6 +45843,14 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
                  builder, loc, builder.getI32IntegerAttr(value))
           .getResult();
     };
+
+    for (auto &[source, slot] : scanSlots) {
+      mlir::OpBuilder afterScan(source.getContext());
+      afterScan.setInsertionPointAfter(source.getDefiningOp());
+      if (!write(afterScan, slot, source))
+        return original.emitOpError(
+            "Metal backend: nested scan cannot write a scan result slot");
+    }
 
     llvm::DenseSet<mlir::Operation *> resultSourceOps;
     for (mlir::Region &region : original->getRegions()) {
@@ -45851,6 +45944,17 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
             [&](mlir::Value current) -> mlir::Value {
           if (auto mapped = mapping.lookupOrNull(current))
             return mapped;
+          if (auto slot = scanSlots.find(current); slot != scanSlots.end()) {
+            mlir::Value local =
+                read(phaseBuilder, slot->second,
+                     mlir::cast<mlir::RankedTensorType>(current.getType()));
+            if (!local) {
+              failed = true;
+              return {};
+            }
+            mapping.map(current, local);
+            return local;
+          }
           mlir::Operation *def = current.getDefiningOp();
           if (def && phase->isAncestor(def))
             return current;

@@ -13407,10 +13407,13 @@ def test_multiband_scan_narrow_load_in_branch_is_named():
 
 
 
-# Inside a selected nested-scan loop, a loop that carries tiles but only loads
-# and does element-wise work on them ("band-local") used to be refused: each
-# register band runs it for its own element, as the function body's band loop
-# already does.
+# Inside a selected nested-scan loop, two forms used to be refused:
+# - a loop that carries tiles but only loads and does element-wise work on
+#   them ("band-local"): each register band runs it for its own element, as
+#   the function body's band loop already does;
+# - a result `if` after the scan whose branches read the scan result: the
+#   branch cannot replay a scan, so the result is copied through a carry slot
+#   right after the scan and read back in the branch's band loop.
 @triton.jit
 def _nested_scan_band_local_kernel(X, Y, O, B, rows, R: tl.constexpr, C: tl.constexpr,
                                    MODE: tl.constexpr):
@@ -13514,7 +13517,7 @@ def _nested_scan_band_local_reference(mode, x, y, rows):
 
 
 @pytest.mark.parametrize("mode", ["inner_for", "inner_for_post", "inner_while", "loadacc",
-                                  "cross"])
+                                  "cross", "post_if", "post_if_chain_last"])
 @pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 16), 1), ((8, 64), 4),
                                               ((4, 32), 4)])
 def test_nested_scan_band_local_loops_and_post_scan_if_match_torch(mode, shape, num_warps):
@@ -13535,6 +13538,7 @@ def test_nested_scan_band_local_loops_and_post_scan_if_match_torch(mode, shape, 
 
 @pytest.mark.parametrize("mode, diagnostic", [
     ("refuse_store", "a loop inside a nested scan that carries tiles may only load"),
+    ("refuse_chain_first", "cannot read a scan result that a later scan also consumes"),
 ])
 def test_nested_scan_band_local_boundaries_are_named(capfd, mode, diagnostic):
     x = torch.randn(3 * 512, device="mps")
@@ -13543,3 +13547,4 @@ def test_nested_scan_band_local_boundaries_are_named(capfd, mode, diagnostic):
         _nested_scan_band_local_kernel[(1,)](x, x, out, out, 3, 8, 64, mode, num_warps=1)
     captured = capfd.readouterr()
     assert diagnostic in captured.err + captured.out
+
