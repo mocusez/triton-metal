@@ -366,12 +366,14 @@ def AtomicRmwOp : Metal_Op<"atomic_rmw"> {
 //===----------------------------------------------------------------------===//
 
 def AtomicCasOp : Metal_Op<"atomic_cas"> {
-  let summary = "Atomic compare-and-swap on a 32-bit device-memory element.";
+  let summary = "Atomic compare-and-swap on a 16- or 32-bit device-memory element.";
   let description = [{
-    Atomically compares the 32-bit object representation at `memref[index]`
-    against `cmp` and stores `value` when equal, yielding the old bits observed
-    at the memory location. Integer storage uses its native representation;
-    f32 storage is accessed through a ui32 atomic view. NOT `Pure`: it has a
+    Atomically compares the object representation at `memref[index]` against
+    `cmp` and stores `value` when equal, yielding the old bits observed at the
+    memory location. 32-bit integer storage uses its native representation;
+    f32 storage is accessed through a ui32 atomic view. 16-bit storage
+    (i16/u16/f16/bf16) takes ui16 bit patterns and is emitted as a
+    compare-exchange loop over the containing 32-bit word. NOT `Pure`: it has a
     device-memory side effect and must be emitted even when its result is
     unused.
   }];

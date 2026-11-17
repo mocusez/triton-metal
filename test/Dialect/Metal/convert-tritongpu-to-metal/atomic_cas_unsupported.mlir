@@ -14,9 +14,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @atomic_cas_scalar_f16(%out_ptr: !tt.ptr<f16>, %cmp: f16, %value: f16) {
-    // expected-error @+1 {{Metal backend: atomic_cas requires matching i32/u32 or f32 compare, value, and storage}}
-    %old = tt.atomic_cas acq_rel, gpu, %out_ptr, %cmp, %value : (!tt.ptr<f16>, f16, f16) -> f16
+  tt.func public @atomic_cas_scalar_i8(%out_ptr: !tt.ptr<i8>, %cmp: i8, %value: i8) {
+    // expected-error @+1 {{Metal backend: atomic_cas requires matching 16-bit, i32/u32 or f32 compare, value, and storage}}
+    %old = tt.atomic_cas acq_rel, gpu, %out_ptr, %cmp, %value : (!tt.ptr<i8>, i8, i8) -> i8
     tt.return
   }
 }

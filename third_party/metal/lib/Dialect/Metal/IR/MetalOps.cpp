@@ -751,20 +751,36 @@ llvm::LogicalResult AtomicRmwOp::verify() {
            (width == 32 && memType.isF32());
   };
 
+  // 64-bit integer add/and/or/xor are emitted as two 32-bit atomics on the
+  // low and high words, which yields the exact final value but no 64-bit
+  // snapshot, so the old value must be unused.
+  auto isSplit64 = [&] {
+    return valueInt && valueInt.getWidth() == 64 && memInt &&
+           memInt.getWidth() == 64;
+  };
+  auto verifySplit64 = [&]() -> llvm::LogicalResult {
+    if (!getResult().use_empty())
+      return emitOpError("64-bit add/and/or/xor does not support a consumed "
+                         "old-value result");
+    return checkIndex(*this, memRef, getIndex());
+  };
+
   switch (getKind()) {
   case AtomicRmwKind::Add:
     if (valueType.isF32() && memType.isF32())
       break;
-    // Half add is emulated with a compare-exchange loop over the containing
-    // 32-bit word (see the emitter's preamble helper), so it takes the same op
-    // with a half value and half storage. bf16 is excluded: Apple's shader
-    // compiler cannot build that loop nested inside a tile loop.
-    if (valueType.isF16() && memType.isF16())
+    if (isSplit64())
+      return verifySplit64();
+    // Half and bf16 add are emulated with a compare-exchange loop over the
+    // containing 32-bit word (see the emitter's preamble helpers), so they
+    // take the same op with a 16-bit float value and matching storage.
+    if ((valueType.isF16() && memType.isF16()) ||
+        (valueType.isBF16() && memType.isBF16()))
       break;
     if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
         memInt.getWidth() != 32)
-      return emitOpError("add requires f32/f16 storage/value or a 32-bit "
-                         "integer storage/value");
+      return emitOpError("add requires f32/f16/bf16 storage/value or a 32- "
+                         "or 64-bit integer storage/value");
     break;
   case AtomicRmwKind::Min:
   case AtomicRmwKind::Max:
@@ -787,8 +803,10 @@ llvm::LogicalResult AtomicRmwOp::verify() {
   case AtomicRmwKind::And:
   case AtomicRmwKind::Or:
   case AtomicRmwKind::Xor:
-    // MSL has no atomic_ulong overload for the bitwise fetch functions, so
-    // these are 32-bit integer only.
+    // MSL has no atomic_ulong overload for the bitwise fetch functions; 64-bit
+    // payloads are split into two 32-bit atomics.
+    if (isSplit64())
+      return verifySplit64();
     if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
         memInt.getWidth() != 32)
       return emitOpError("bitwise and/or/xor require a 32-bit integer "
@@ -822,10 +840,16 @@ llvm::LogicalResult AtomicCasOp::verify() {
 
   auto cmpInt = llvm::dyn_cast<mlir::IntegerType>(cmpType);
   auto memInt = llvm::dyn_cast<mlir::IntegerType>(memType);
+  // 16-bit storage is exchanged through a ui16 bit pattern; the emitter runs a
+  // compare-exchange loop over the containing 32-bit word.
+  bool halfWord = cmpInt && cmpInt.getWidth() == 16 && cmpInt.isUnsigned() &&
+                  ((memInt && memInt.getWidth() == 16) || memType.isF16() ||
+                   memType.isBF16());
   bool validStorage = (memInt && memInt.getWidth() == 32) || memType.isF32();
-  if (!cmpInt || cmpInt.getWidth() != 32 || !validStorage)
+  if (!halfWord && (!cmpInt || cmpInt.getWidth() != 32 || !validStorage))
     return emitOpError("requires 32-bit integer bit-pattern operands and "
-                       "i32/u32 or f32 storage");
+                       "i32/u32 or f32 storage, or ui16 bit-pattern operands "
+                       "and 16-bit storage");
   return checkIndex(*this, memRef, getIndex());
 }
 

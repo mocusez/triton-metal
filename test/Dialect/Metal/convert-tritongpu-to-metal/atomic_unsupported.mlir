@@ -15,9 +15,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @atomic_add_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
-    // expected-error @+1 {{Metal backend: 64-bit integer atomic add is unsupported because MSL has no atomic_ulong fetch-add}}
+  // A 64-bit add is two 32-bit atomics, so it has no 64-bit old value.
+  tt.func public @atomic_add_scalar_i64_old_value(%out_ptr: !tt.ptr<i64>, %old_ptr: !tt.ptr<i64>, %v: i64) {
+    // expected-error @+1 {{Metal backend: 64-bit integer atomic add cannot return its old value: MSL has no 64-bit fetch, so the update is two 32-bit atomics}}
     %old = tt.atomic_rmw add, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    tt.store %old_ptr, %old : !tt.ptr<i64>
     tt.return
   }
 }
@@ -25,9 +27,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @atomic_and_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
-    // expected-error @+1 {{Metal backend: bitwise atomic and/or/xor require a 32-bit integer payload; MSL has no 64-bit bitwise atomic}}
-    %old = tt.atomic_rmw and, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+  // Two different split kinds could interleave their halves on one address.
+  tt.func public @atomic_and_or_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
+    // expected-error @+1 {{Metal backend: 64-bit integer atomic and runs as two 32-bit atomics and cannot share a kernel with a 64-bit atomic or}}
+    %a = tt.atomic_rmw and, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    %o = tt.atomic_rmw or, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // A u64 max between a split add's low word and its carry would compare a
+  // half-updated value.
+  tt.func public @atomic_umax_after_add_scalar_i64(%out_ptr: !tt.ptr<i64>, %v: i64) {
+    // expected-error @+1 {{Metal backend: u64 atomic min/max cannot share a kernel with a 64-bit atomic add, which runs as two 32-bit atomics}}
+    %m = tt.atomic_rmw umax, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
+    %a = tt.atomic_rmw add, acq_rel, gpu, %out_ptr, %v : (!tt.ptr<i64>, i64) -> i64
     tt.return
   }
 }

@@ -319,43 +319,104 @@ llvm::LogicalResult ModuleTranslation::translateModule(mlir::ModuleOp m,
       // MSL has no atomic half. `tl.atomic_add` on an f16/bf16 buffer becomes a
       // compare-exchange loop over the 32-bit word that CONTAINS the element:
       // load the pair, add into this element's lane, swap the pair back, retry
-      // if another thread got there first. The word is 4-byte aligned because
-      // the buffer base is and the index is masked to an even element.
+      // if another thread got there first. The word and the lane come from the
+      // element's ABSOLUTE address, not from its index: a tensor view may start
+      // two bytes into a word (`x[1:]` of an f16 tensor), and masking the index
+      // to an even element then names a misaligned word whose atomic lands one
+      // element early.
       bool hasHalfAtomic = false;
+      bool hasBFloatAtomic = false;
       m.walk([&](mlir::triton::metal::AtomicRmwOp aop) {
-        if (aop.getKind() == mlir::triton::metal::AtomicRmwKind::Add &&
-            aop.getValue().getType().isF16()) {
-          hasHalfAtomic = true;
+        if (aop.getKind() == mlir::triton::metal::AtomicRmwKind::Add) {
+          hasHalfAtomic |= aop.getValue().getType().isF16();
+          hasBFloatAtomic |= aop.getValue().getType().isBF16();
+        }
+        return mlir::WalkResult::advance();
+      });
+      // bf16 uses the same word-level loop, but adds on the f32 bit pattern
+      // and rounds back to nearest-even by hand. Writing it with `bfloat2`
+      // arithmetic, like the half helper, makes Apple's shader compiler
+      // service die (XPC_ERROR_CONNECTION_INTERRUPTED) as soon as the call
+      // sits inside a tile loop; the bit-level form builds and is exact.
+      if (hasBFloatAtomic)
+        output << "static inline bfloat __triton_atomic_add_bfloat(device "
+                  "bfloat* base, uint idx, bfloat val) {\n"
+                  "  ulong addr = reinterpret_cast<ulong>(base + idx);\n"
+                  "  device atomic_uint* word = "
+                  "reinterpret_cast<device atomic_uint*>(addr & ~3ul);\n"
+                  "  uint shift = uint(addr & 2ul) * 8u;\n"
+                  "  float v = as_type<float>(uint(as_type<ushort>(val)) << "
+                  "16);\n"
+                  "  uint old = atomic_load_explicit(word, "
+                  "memory_order_relaxed);\n"
+                  "  uint desired, prev;\n"
+                  "  do {\n"
+                  "    prev = (old >> shift) & 0xffffu;\n"
+                  "    uint u = as_type<uint>(as_type<float>(prev << 16) + v);\n"
+                  "    uint r = (u & 0x7fffffffu) > 0x7f800000u\n"
+                  "                 ? ((u >> 16) | 0x40u)\n"
+                  "                 : ((u + 0x7fffu + ((u >> 16) & 1u)) >> "
+                  "16);\n"
+                  "    desired = (old & ~(0xffffu << shift)) | ((r & 0xffffu) "
+                  "<< shift);\n"
+                  "  } while (!atomic_compare_exchange_weak_explicit("
+                  "word, &old, desired, memory_order_relaxed, "
+                  "memory_order_relaxed));\n"
+                  "  return as_type<bfloat>(ushort(prev));\n"
+                  "}\n\n";
+      if (hasHalfAtomic)
+        output << "static inline half __triton_atomic_add_half(device half* "
+                  "base, uint idx, half v) {\n"
+                  "  ulong addr = reinterpret_cast<ulong>(base + idx);\n"
+                  "  device atomic_uint* word = "
+                  "reinterpret_cast<device atomic_uint*>(addr & ~3ul);\n"
+                  "  uint lane = uint(addr >> 1) & 1u;\n"
+                  "  uint old = atomic_load_explicit(word, "
+                  "memory_order_relaxed);\n"
+                  "  uint desired;\n"
+                  "  half prev;\n"
+                  "  do {\n"
+                  "    half2 pair = as_type<half2>(old);\n"
+                  "    prev = pair[lane];\n"
+                  "    pair[lane] = prev + v;\n"
+                  "    desired = as_type<uint>(pair);\n"
+                  "  } while (!atomic_compare_exchange_weak_explicit("
+                  "word, &old, desired, memory_order_relaxed, "
+                  "memory_order_relaxed));\n"
+                  "  return prev;\n"
+                  "}\n\n";
+      // MSL has no 16-bit atomics at all. A 16-bit compare-and-swap reads the
+      // containing 32-bit word, returns the element's observed bits when they
+      // differ from `cmp`, and otherwise swaps in the word with only this
+      // element replaced; a failed exchange (either half changed) re-reads and
+      // retries, so a concurrent update of the OTHER half is never lost.
+      bool hasHalfWordCas = false;
+      m.walk([&](mlir::triton::metal::AtomicCasOp cop) {
+        if (cop.getValue().getType().getIntOrFloatBitWidth() == 16) {
+          hasHalfWordCas = true;
           return mlir::WalkResult::interrupt();
         }
         return mlir::WalkResult::advance();
       });
-      if (hasHalfAtomic) {
-        for (llvm::StringRef ty : {"half"}) {
-          output << "static inline " << ty << " __triton_atomic_add_"
-                 << (ty == "half" ? "half" : "bfloat") << "(device " << ty
-                 << "* base, uint idx, " << ty << " v) {\n"
-                    "  device atomic_uint* word = (device atomic_uint*)(base + "
-                    "(idx & ~1u));\n"
-                    "  uint lane = idx & 1u;\n"
-                    "  uint old = atomic_load_explicit(word, "
-                    "memory_order_relaxed);\n"
-                    "  uint desired;\n"
-                    "  "
-                 << ty << " prev;\n"
-                    "  do {\n"
-                    "    "
-                 << ty << "2 pair = as_type<" << ty << "2>(old);\n"
-                    "    prev = pair[lane];\n"
-                    "    pair[lane] = prev + v;\n"
-                    "    desired = as_type<uint>(pair);\n"
-                    "  } while (!atomic_compare_exchange_weak_explicit("
-                    "word, &old, desired, memory_order_relaxed, "
-                    "memory_order_relaxed));\n"
-                    "  return prev;\n"
-                    "}\n\n";
-        }
-      }
+      if (hasHalfWordCas)
+        output << "static inline ushort __triton_atomic_cas_16(ulong addr, "
+                  "ushort cmp, ushort val) {\n"
+                  "  device atomic_uint* word = "
+                  "reinterpret_cast<device atomic_uint*>(addr & ~3ul);\n"
+                  "  uint shift = uint(addr & 2ul) * 8u;\n"
+                  "  uint old = atomic_load_explicit(word, "
+                  "memory_order_relaxed);\n"
+                  "  while (true) {\n"
+                  "    ushort cur = ushort((old >> shift) & 0xffffu);\n"
+                  "    if (cur != cmp)\n"
+                  "      return cur;\n"
+                  "    uint desired = (old & ~(0xffffu << shift)) | "
+                  "(uint(val) << shift);\n"
+                  "    if (atomic_compare_exchange_weak_explicit(word, &old, "
+                  "desired, memory_order_relaxed, memory_order_relaxed))\n"
+                  "      return cur;\n"
+                  "  }\n"
+                  "}\n\n";
       // MSL has no 8-bit float type, so `tl.float8e4nv` / `tl.float8e5` casts
       // run in software. Round-to-nearest-even is applied ONCE straight off
       // the f32 bit pattern: rounding through f16 first double-rounds, and 119
@@ -913,6 +974,25 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicCasOp op) {
   // value. Initialize that temp from Triton's cmp operand and expose the same
   // temp as the op result.
   auto valueInt = llvm::cast<mlir::IntegerType>(op.getValue().getType());
+  if (valueInt.getWidth() == 16) {
+    // The preamble's word-level loop already has strong CAS semantics and
+    // returns the observed bits; it takes the element's absolute address.
+    unsigned idx = _varCount++;
+    if (!op.getResult().use_empty())
+      _buffers[op.getResult().getAsOpaquePointer()] = idx;
+    _output << typeToString(op.getResult().getType()) << " v" << idx
+            << " = __triton_atomic_cas_16(reinterpret_cast<ulong>(&";
+    translateVarName(op.getMemref());
+    _output << "[";
+    translateValueOrVarName(op.getIndex());
+    _output << "]), ";
+    translateValueOrVarName(op.getCmp());
+    _output << ", ";
+    translateValueOrVarName(op.getValue());
+    _output << ")";
+    printDelim();
+    return;
+  }
   llvm::StringRef atomicTy = valueInt.isUnsigned() ? "atomic_uint"
                                                    : "atomic_int";
   unsigned expectedIdx = _varCount++;
@@ -1395,6 +1475,56 @@ void ModuleTranslation::translate(mlir::triton::metal::AtomicRmwOp op) {
     _output << ", ";
     translateValueOrVarName(op.getValue());
     _output << ")";
+    printDelim();
+    return;
+  }
+  // MSL's atomic_ulong has only void min/max. A 64-bit add/and/or/xor whose
+  // old value is unused (the verifier enforces it) is two 32-bit atomics on
+  // the little-endian low and high words; add carries from the low word's
+  // fetched value. The final value is exact because additions commute and the
+  // halves of a bitwise op are independent; the pass refuses kernels that mix
+  // such an op with a different 64-bit atomic kind.
+  const auto kind = op.getKind();
+  if (is64 && (kind == mlir::triton::metal::AtomicRmwKind::Add ||
+               kind == mlir::triton::metal::AtomicRmwKind::And ||
+               kind == mlir::triton::metal::AtomicRmwKind::Or ||
+               kind == mlir::triton::metal::AtomicRmwKind::Xor)) {
+    const unsigned id = _varCount++;
+    const std::string word = "__w64_" + std::to_string(id);
+    const std::string bits = "__b64_" + std::to_string(id);
+    const char *fn = kind == mlir::triton::metal::AtomicRmwKind::Add
+                         ? "atomic_fetch_add_explicit"
+                     : kind == mlir::triton::metal::AtomicRmwKind::And
+                         ? "atomic_fetch_and_explicit"
+                     : kind == mlir::triton::metal::AtomicRmwKind::Or
+                         ? "atomic_fetch_or_explicit"
+                         : "atomic_fetch_xor_explicit";
+    _output << "device atomic_uint* " << word
+            << " = reinterpret_cast<device atomic_uint*>(&";
+    translateVarName(op.getMemref());
+    _output << "[";
+    translateValueOrVarName(op.getIndex());
+    _output << "]);\n";
+    indent();
+    _output << "ulong " << bits << " = as_type<ulong>(";
+    translateValueOrVarName(op.getValue());
+    _output << ");\n";
+    indent();
+    if (kind == mlir::triton::metal::AtomicRmwKind::Add) {
+      const std::string low = "__l64_" + std::to_string(id);
+      _output << "uint " << low << " = " << fn << "(" << word << ", uint("
+              << bits << "), memory_order_relaxed);\n";
+      indent();
+      _output << fn << "(" << word << " + 1, uint(" << bits << " >> 32) + ("
+              << low << " + uint(" << bits << ") < " << low
+              << " ? 1u : 0u), memory_order_relaxed)";
+    } else {
+      _output << fn << "(" << word << ", uint(" << bits
+              << "), memory_order_relaxed);\n";
+      indent();
+      _output << fn << "(" << word << " + 1, uint(" << bits
+              << " >> 32), memory_order_relaxed)";
+    }
     printDelim();
     return;
   }

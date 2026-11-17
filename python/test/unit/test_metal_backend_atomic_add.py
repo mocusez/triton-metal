@@ -434,6 +434,144 @@ def test_atomic_minmax_scalar_u64_void_modify(do_max):
     assert out.cpu().item() == (max if do_max else min)(host_values)
 
 
+# --- 64-bit add/and/or/xor ----------------------------------------------------
+#
+# MSL's atomic_ulong has only void min/max. A 64-bit add/and/or/xor whose old
+# value is unused runs as two 32-bit atomics on the low and high words; add
+# carries from the low word's fetched value into the high word. The value after
+# the kernel is exact (additions commute; the halves of a bitwise op are
+# independent). A 64-bit snapshot is not available, so the old value cannot be
+# returned, and mixing kinds in one kernel is refused because a different
+# 64-bit atomic could act on a half-updated value.
+
+_SPLIT64_OPS = ["add", "and", "or", "xor"]
+
+
+@triton.jit
+def _atomic_split64(In, Out, N, CELLS: tl.constexpr, BLOCK: tl.constexpr, OP: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    value = tl.load(In + offsets, mask=mask, other=0)
+    if OP == "add":
+        tl.atomic_add(Out + offsets % CELLS, value, mask=mask)
+    elif OP == "and":
+        tl.atomic_and(Out + offsets % CELLS, value, mask=mask)
+    elif OP == "or":
+        tl.atomic_or(Out + offsets % CELLS, value, mask=mask)
+    else:
+        tl.atomic_xor(Out + offsets % CELLS, value, mask=mask)
+
+
+def _split64_reference(op, initial, values, cells):
+    result = list(initial)
+    for i, value in enumerate(values):
+        cell = i % cells
+        if op == "add":
+            result[cell] = (result[cell] + value) % 2**64
+        elif op == "and":
+            result[cell] &= value
+        elif op == "or":
+            result[cell] |= value
+        else:
+            result[cell] ^= value
+    return result
+
+
+def _random_u64(count, gen):
+    hi = torch.randint(0, 2**32, (count,), generator=gen, dtype=torch.int64)
+    lo = torch.randint(0, 2**32, (count,), generator=gen, dtype=torch.int64)
+    return [(h << 32) | l for h, l in zip(hi.tolist(), lo.tolist())]
+
+
+# BLOCK=1024 at one warp is the tile loop; CELLS=1 puts every lane of every
+# program on one cell, so low-word carries race the high-word adds.
+@pytest.mark.parametrize("BLOCK, num_warps, N, CELLS", [(64, 1, 1024, 64), (256, 4, 1000, 7), (1024, 1, 4096, 1)])
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+@pytest.mark.parametrize("op", _SPLIT64_OPS)
+def test_atomic_64bit_split_ops_are_exact(op, dtype, BLOCK, num_warps, N, CELLS):
+    gen = torch.Generator().manual_seed(N + CELLS)
+    values = _random_u64(N, gen)
+    if op == "add":
+        initial = [2**32 - 1] * CELLS  # the first add of any odd low word carries
+    elif op == "and":
+        initial = [2**64 - 1] * CELLS
+        values = [v | w for v, w in zip(values, _random_u64(N, gen))]
+    else:
+        initial = _random_u64(CELLS, gen)
+
+    def to_dtype(seq):
+        if dtype == torch.uint64:
+            return torch.tensor(seq, dtype=torch.uint64)
+        return torch.tensor([v - 2**64 if v >= 2**63 else v for v in seq], dtype=torch.int64)
+
+    out = to_dtype(initial).to("mps")
+    _atomic_split64[(triton.cdiv(N, BLOCK),)](
+        to_dtype(values).to("mps"), out, N, CELLS=CELLS, BLOCK=BLOCK, OP=op, num_warps=num_warps
+    )
+    torch.mps.synchronize()
+    got = [v % 2**64 for v in out.cpu().tolist()]
+    assert got == _split64_reference(op, initial, values, CELLS)
+
+
+@triton.jit
+def _atomic_split64_scalar(In, Out, OP: tl.constexpr):
+    value = tl.load(In + tl.program_id(0))
+    if OP == "add":
+        tl.atomic_add(Out, value)
+    else:
+        tl.atomic_xor(Out, value)
+
+
+@pytest.mark.parametrize("op", ["add", "xor"])
+def test_atomic_64bit_split_scalar_contention(op):
+    gen = torch.Generator().manual_seed(1)
+    values = _random_u64(64, gen)
+    out = torch.tensor([2**32 - 1], dtype=torch.uint64, device="mps")
+    _atomic_split64_scalar[(64,)](torch.tensor(values, dtype=torch.uint64).to("mps"), out, OP=op)
+    torch.mps.synchronize()
+    assert out.cpu().item() % 2**64 == _split64_reference(op, [2**32 - 1], values, 1)[0]
+
+
+@triton.jit
+def _atomic_split64_old_value(Out, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Old + offsets, tl.atomic_add(Out + offsets, tl.full((BLOCK,), 1, tl.int64)))
+
+
+def test_atomic_64bit_split_old_value_is_refused_by_name(capfd):
+    out = torch.zeros(32, dtype=torch.int64, device="mps")
+    old = torch.zeros(32, dtype=torch.int64, device="mps")
+    with pytest.raises(Exception):
+        _atomic_split64_old_value[(1,)](out, old, BLOCK=32)
+    assert "64-bit integer atomic add cannot return its old value" in capfd.readouterr().err
+    # The process is still usable after the refusal.
+    _atomic_split64[(1,)](torch.ones(32, dtype=torch.int64, device="mps"), out, 32, CELLS=32, BLOCK=32, OP="add")
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.ones(32, dtype=torch.int64))
+
+
+@triton.jit
+def _atomic_split64_mixed(Out, BLOCK: tl.constexpr, OTHER: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.atomic_add(Out + offsets, tl.full((BLOCK,), 1, tl.int64))
+    if OTHER == "xor":
+        tl.atomic_xor(Out + offsets, tl.full((BLOCK,), 1, tl.int64))
+    else:
+        tl.atomic_max(Out + offsets, tl.full((BLOCK,), 1, tl.uint64))
+
+
+@pytest.mark.parametrize("other, message", [
+    ("xor", "64-bit integer atomic add runs as two 32-bit atomics and cannot share a kernel with a 64-bit atomic xor"),
+    ("umax", "64-bit integer atomic add runs as two 32-bit atomics and cannot share a kernel with a 64-bit atomic umax"),
+])
+def test_atomic_64bit_split_mixed_kinds_are_refused_by_name(capfd, other, message):
+    dtype = torch.int64 if other == "xor" else torch.uint64
+    out = torch.tensor([0] * 32, dtype=dtype, device="mps")
+    with pytest.raises(Exception):
+        _atomic_split64_mixed[(1,)](out, BLOCK=32, OTHER=other)
+    assert message in capfd.readouterr().err
+
+
 def test_atomic_ulong_compile_error_has_capability_context(monkeypatch):
     from triton.backends.metal import driver as metal_driver
 
@@ -1014,6 +1152,113 @@ def test_atomic_cas_f32_scalar_contention_and_old_value_broadcast():
     assert torch.all((tickets == 0.0) | (tickets == final))
 
 
+# --- 16-bit atomic_cas -------------------------------------------------------
+#
+# MSL has no 16-bit atomics. A 16-bit compare-and-swap reads the 32-bit word
+# that contains the element, returns the element's observed bits when they
+# differ from `cmp`, and otherwise swaps in the word with only that element
+# replaced. A failed exchange re-reads and retries, so an update of the OTHER
+# half of the word is never lost and never mistaken for a mismatch.
+
+_CAS16_DTYPES = [torch.float16, torch.bfloat16, torch.int16]
+
+
+@triton.jit
+def _atomic_cas_16bit_tensor(Target, Expected, Desired, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    old = tl.atomic_cas(Target + offsets, tl.load(Expected + offsets), tl.load(Desired + offsets))
+    tl.store(Old + offsets, old)
+
+
+@pytest.mark.parametrize("dtype", _CAS16_DTYPES)
+def test_atomic_cas_16bit_compares_bits_and_returns_old_value(dtype):
+    # For the float types this includes the two cases a numeric `==` gets
+    # wrong: -0.0 against +0.0 must NOT swap, and two equal NaN payloads must.
+    target_bits = torch.tensor([0, -0x8000, 0x7E01, 0x7E01, 0x3C00, 0x4000, 0x4400, 0x4500], dtype=torch.int16)
+    expected_bits = torch.tensor([0, 0, 0x7E01, 0x7E02, 0x3C00, 0x4200, 0x4400, 0x4600], dtype=torch.int16)
+    desired_bits = torch.arange(0x4900, 0x4908, dtype=torch.int16)
+    target = target_bits.view(dtype).to("mps")
+    old = torch.empty_like(target)
+    _atomic_cas_16bit_tensor[(1,)](
+        target, expected_bits.view(dtype).to("mps"), desired_bits.view(dtype).to("mps"), old, BLOCK=8
+    )
+    torch.mps.synchronize()
+    final_bits = torch.where(target_bits == expected_bits, desired_bits, target_bits)
+    assert torch.equal(old.cpu().view(torch.int16), target_bits)
+    assert torch.equal(target.cpu().view(torch.int16), final_bits)
+
+
+@triton.jit
+def _atomic_cas_16bit_race(Target, Old, Values, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    old = tl.atomic_cas(Target + offsets, tl.load(Values + offsets * 0), tl.load(Values + 1 + pid + offsets * 0))
+    tl.store(Old + pid * BLOCK + offsets, old)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("dtype", _CAS16_DTYPES)
+def test_atomic_cas_16bit_adjacent_cells_race(dtype, num_warps):
+    # Four programs race on every cell, and neighbouring cells share a word, so
+    # most failed exchanges are caused by the OTHER half. Exactly one program
+    # per cell must win; the rest must see the winner's value.
+    programs, block = 4, 64
+    values = torch.arange(0, programs + 1, dtype=torch.float32).to(dtype).to("mps")
+    target = torch.zeros(block, dtype=dtype, device="mps")
+    old = torch.full((programs, block), -7, dtype=dtype, device="mps")
+    _atomic_cas_16bit_race[(programs,)](target, old, values, BLOCK=block, num_warps=num_warps)
+    torch.mps.synchronize()
+    final = target.cpu().float()
+    seen = old.cpu().float()
+    for cell in range(block):
+        winner = int(final[cell].item())
+        assert winner in range(1, programs + 1)
+        assert seen[winner - 1, cell].item() == 0.0
+        assert torch.count_nonzero(seen[:, cell] == 0.0).item() == 1
+        assert torch.count_nonzero(seen[:, cell] == float(winner)).item() == programs - 1
+
+
+@triton.jit
+def _atomic_cas_16bit_scalar(Target, Seen, Values, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    old = tl.atomic_cas(Target, tl.load(Values), tl.load(Values + 1 + pid))
+    tl.store(Seen + pid * BLOCK + tl.arange(0, BLOCK), old)
+
+
+@pytest.mark.parametrize("dtype", _CAS16_DTYPES)
+def test_atomic_cas_16bit_scalar_contention_and_old_value_broadcast(dtype):
+    programs, block = 4, 32
+    values = torch.arange(0, programs + 1, dtype=torch.float32).to(dtype).to("mps")
+    target = torch.zeros(1, dtype=dtype, device="mps")
+    seen = torch.full((programs * block,), -1, dtype=dtype, device="mps")
+    _atomic_cas_16bit_scalar[(programs,)](target, seen, values, BLOCK=block, num_warps=2)
+    torch.mps.synchronize()
+    final = target.cpu().float().item()
+    assert final in {1.0, 2.0, 3.0, 4.0}
+    rows = seen.cpu().float().reshape(programs, block)
+    for row in rows:
+        assert torch.equal(row, torch.full_like(row, row[0]))
+    tickets = rows[:, 0]
+    assert torch.count_nonzero(tickets == 0.0).item() == 1
+    assert torch.all((tickets == 0.0) | (tickets == final))
+
+
+@pytest.mark.parametrize("dtype", _CAS16_DTYPES)
+def test_atomic_cas_16bit_on_a_view_that_starts_mid_word(dtype):
+    base = torch.full((20,), 3, dtype=dtype, device="mps")
+    view = base[1:17]
+    expected = torch.full((16,), 3, dtype=dtype, device="mps")
+    expected[1::2] = 5  # every other compare misses
+    desired = torch.arange(10, 26, dtype=torch.float32).to(dtype).to("mps")
+    old = torch.empty(16, dtype=dtype, device="mps")
+    _atomic_cas_16bit_tensor[(1,)](view, expected, desired, old, BLOCK=16)
+    torch.mps.synchronize()
+    want = torch.full((20,), 3.0)
+    want[1:17] = torch.where(torch.arange(16) % 2 == 0, torch.arange(10, 26).float(), torch.tensor(3.0))
+    assert torch.equal(base.cpu().float(), want)
+    assert torch.equal(old.cpu().float(), torch.full((16,), 3.0))
+
+
 # --- f16 atomic add ---------------------------------------------------------
 #
 # MSL has no atomic half, so `tl.atomic_add` on an f16 buffer was rejected. It
@@ -1022,11 +1267,11 @@ def test_atomic_cas_f32_scalar_contention_and_old_value_broadcast():
 # retry if another thread got there first. The word is 4-byte aligned because
 # the buffer base is and the index is masked down to an even element.
 #
-# bf16 is deliberately still refused. The identical helper works on its own, but
-# putting that loop inside another loop — which is what a BLOCK > tpb tile does
-# — makes Apple's shader compiler service die with
-# XPC_ERROR_CONNECTION_INTERRUPTED while building the pipeline state.
-# Reproducible in raw MSL with no Triton involved, and only for bfloat.
+# bf16 uses the same word-level loop, but its helper adds on the f32 bit
+# pattern and rounds back to nearest-even by hand. The `bfloat2` form of the
+# half helper makes Apple's shader compiler service die with
+# XPC_ERROR_CONNECTION_INTERRUPTED once the call sits inside another loop, which
+# is what a BLOCK > tpb tile does; the bit-level form builds.
 
 
 @triton.jit
@@ -1080,17 +1325,104 @@ def test_atomic_add_f16_returns_the_old_value():
 
 
 @triton.jit
+def _atomic_add_16bit_view_old(In, Out, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Old + offsets, tl.atomic_add(Out + offsets, tl.load(In + offsets)))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("start", [1, 2, 3])
+def test_atomic_add_16bit_on_a_view_that_starts_mid_word(dtype, start):
+    # `base[1:]` starts two bytes into a 32-bit word. The compare-exchange has to
+    # find the word from the element's address: masking the INDEX to an even
+    # element named a misaligned word and every add landed one element early,
+    # writing base[0] and leaving the view's last element untouched.
+    BLOCK = 64
+    base = torch.full((BLOCK + 4,), 5.0, dtype=dtype, device="mps")
+    view = base[start:start + BLOCK]
+    old = torch.zeros(BLOCK, dtype=dtype, device="mps")
+    values = torch.arange(1, BLOCK + 1, dtype=torch.float32).to(dtype)
+    for _ in range(3):
+        _atomic_add_16bit_view_old[(1,)](values.to("mps"), view, old, BLOCK)
+    torch.mps.synchronize()
+    expected = torch.full((BLOCK + 4,), 5.0)
+    expected[start:start + BLOCK] += 3 * torch.arange(1, BLOCK + 1, dtype=torch.float32)
+    assert torch.equal(base.cpu().float(), expected.to(dtype).float())
+    assert torch.equal(old.cpu().float(), (5.0 + 2 * torch.arange(1, BLOCK + 1, dtype=torch.float32)).to(dtype).float())
+
+
+@triton.jit
 def _atomic_add_bf16_rows(In, Out, BLOCK: tl.constexpr):
     offsets = tl.arange(0, BLOCK)
     tl.atomic_add(Out + offsets, tl.load(In + offsets))
 
 
-def test_atomic_add_bf16_is_rejected_with_a_reason(capfd):
-    inp = torch.ones(64, dtype=torch.bfloat16, device="mps")
-    out = torch.zeros(64, dtype=torch.bfloat16, device="mps")
-    with pytest.raises(Exception):
-        _atomic_add_bf16_rows[(1,)](inp, out, 64)
-    assert "bf16 atomic add is unsupported" in capfd.readouterr().err
+# BLOCK=1024 at one warp is 32 elements per thread: the tile loop that used to
+# kill Apple's shader compiler service.
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("BLOCK", [8, 64, 256, 1024])
+def test_atomic_add_bf16_accumulates_across_programs(BLOCK, num_warps):
+    inp = torch.ones(BLOCK, dtype=torch.bfloat16, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.bfloat16, device="mps")
+    _atomic_add_bf16_rows[(4,)](inp, out, BLOCK, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.full((BLOCK,), 4.0, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("BLOCK", [64, 256])
+def test_atomic_add_bf16_contended_single_cell_returns_every_old_value(BLOCK, num_warps):
+    # Every lane adds 1 to the same bf16 cell, so the old values must be exactly
+    # 0..BLOCK-1 in some order (256 is still an exact bf16 integer).
+    inp = torch.ones(BLOCK, dtype=torch.bfloat16, device="mps")
+    out = torch.zeros(BLOCK, dtype=torch.bfloat16, device="mps")
+    old = torch.full((BLOCK,), -1.0, dtype=torch.bfloat16, device="mps")
+    _atomic_add_bf16_one_cell_old[(1,)](inp, out, old, BLOCK, num_warps=num_warps)
+    torch.mps.synchronize()
+    assert out.cpu()[0].item() == float(BLOCK)
+    assert torch.equal(old.cpu().float().sort().values, torch.arange(BLOCK, dtype=torch.float32))
+
+
+@triton.jit
+def _atomic_add_bf16_one_cell_old(In, Out, Old, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Old + offsets, tl.atomic_add(Out + offsets * 0, tl.load(In + offsets)))
+
+
+@triton.jit
+def _atomic_add_bf16_cells_old(In, Out, Old, N, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    old = tl.atomic_add(Out + offsets, tl.load(In + offsets, mask=mask), mask=mask)
+    tl.store(Old + offsets, old, mask=mask)
+
+
+def test_atomic_add_bf16_rounds_like_torch():
+    # One uncontended add per cell, so the result must be torch's own bf16 sum:
+    # f32 add, round to nearest even. Ties (256 + 1, 256 + 3), carries into the
+    # exponent, overflow to inf, inf - inf, NaN and signed zero are all covered.
+    special = torch.tensor(
+        [256.0, 256.0, 255.0, 3.0e38, float("inf"), float("nan"), -0.0, 0.0, -1.5, 1.0e-30],
+        dtype=torch.bfloat16,
+    )
+    addend = torch.tensor(
+        [1.0, 3.0, 1.0, 3.0e38, float("-inf"), 1.0, -0.0, -0.0, 1.5, 1.0e-30],
+        dtype=torch.bfloat16,
+    )
+    gen = torch.Generator().manual_seed(0)
+    base = torch.cat([special, (torch.randn(1000, generator=gen) * 100).to(torch.bfloat16)])
+    vals = torch.cat([addend, (torch.randn(1000, generator=gen) * 100).to(torch.bfloat16)])
+    n = base.numel()
+    out = base.to("mps")
+    old = torch.zeros(n, dtype=torch.bfloat16, device="mps")
+    _atomic_add_bf16_cells_old[(triton.cdiv(n, 256),)](vals.to("mps"), out, old, n, BLOCK=256)
+    torch.mps.synchronize()
+    expected = (base.float() + vals.float()).to(torch.bfloat16)
+    got = out.cpu()
+    nan = expected.isnan()
+    assert torch.equal(got.isnan(), nan)
+    assert torch.equal(got[~nan].view(torch.int16), expected[~nan].view(torch.int16))
+    assert torch.equal(old.cpu().view(torch.int16), base.view(torch.int16))
 
 
 @triton.jit

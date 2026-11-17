@@ -321,8 +321,8 @@ named preflight rejection.
 Tensor-descriptor reducing stores use Triton's standard
 `triton-rewrite-tensor-descriptor-to-pointer` pass before Metal conversion.
 Host and device descriptors support static blocked rank-1 through rank-5 tiles:
-add on f32/f16/i32/u32, signed/unsigned min/max on i32/u32/u64, and
-and/or/xor on i32/u32. The same general blocked tensor atomic path is covered
+add on f32/f16/bf16/i32/u32/u64, signed/unsigned min/max on i32/u32/u64, and
+and/or/xor on i32/u32/i64/u64. The same general blocked tensor atomic path is covered
 through rank 5 with explicit multidimensional offsets and strides. The rewrite
 preserves descriptor-view bounds with an explicit atomic mask and supports
 contended updates. A raw `tt.descriptor_reduce` reaching the Metal conversion
@@ -340,16 +340,31 @@ output-major order with the pack index minor. Packed maps inside loops, nested
 scans, or conditional control flow, rank-3+ tensors, indivisible packs, side
 effects, and oversized staging remain named refusals.
 
-`tl.atomic_cas` supports scalar and blocked rank-1/rank-2 `i32`, `u32`, and
-`f32` storage. The floating-point form compares and exchanges the exact IEEE-754
-object representation through a `ui32` atomic view, so signed zero and NaN
-payloads follow compare-exchange bit semantics rather than floating `==`.
-Old-value results and contended multi-program scalar CAS are covered on physical
-MPS. `f16`, `bf16`, and 64-bit CAS remain fail-closed with a named diagnostic.
-On the audited Apple M4 toolchain, `atomic_ulong` supports the existing void
-u64 min/max path but rejects fetch-add, bitwise, exchange, and compare-exchange
-overloads; those operations therefore remain platform boundaries rather than
-being approximated with a racy load/modify/store sequence.
+`tl.atomic_cas` supports scalar and blocked rank-1/rank-2 `i16`, `f16`, `bf16`,
+`i32`, `u32`, and `f32` storage. The floating-point forms compare and exchange
+the exact IEEE-754 object representation, so signed zero and NaN payloads follow
+compare-exchange bit semantics rather than floating `==`. MSL has no 16-bit
+atomics, so a 16-bit CAS (and `f16`/`bf16` `tl.atomic_add`) runs as a
+compare-exchange loop over the 32-bit word that contains the element, located
+from the element's absolute address so views that start mid-word are exact; a
+concurrent update of the other half only causes a retry. The `bf16` add helper
+works on the f32 bit pattern and rounds to nearest-even by hand, because the
+same loop written with `bfloat` arithmetic crashes Apple's shader compiler
+service inside a tile loop. Old-value results and contended multi-program CAS
+are covered on physical MPS.
+
+On the audited Apple M4 toolchain, `atomic_ulong` supports only void
+`atomic_min/max_explicit`; fetch-add, fetch-and/or/xor, exchange,
+compare-exchange, fetch-min/max and atomic load are all rejected, and there is
+no `atomic_long`. A 64-bit `add`/`and`/`or`/`xor` whose old value is unused
+therefore runs as two 32-bit atomics on the low and high words, with the add
+carrying from the low word's fetched value. The value after the kernel is exact
+(additions commute and the halves of a bitwise op are independent), but no
+64-bit snapshot exists: a consumed old value is refused by name, and so is a
+kernel that mixes such an op with a different 64-bit atomic kind, which could
+otherwise act on a half-updated value. 64-bit exchange and compare-exchange,
+i64 signed min/max, and old-value results of 64-bit atomics remain platform
+boundaries rather than being approximated with a racy load/modify/store.
 
 ---
 
@@ -943,7 +958,8 @@ compile-smokes the `macosx_15_0_arm64` artifact on the hosted macOS 15 runner,
 while physical Apple Silicon remains necessary for GPU numerical validation.
 
 PTX inline assembly, integer-to-pointer device addresses, `tl.atomic_poll`,
-and bf16 atomic add are platform/runtime boundaries, not implementation backlog.
+64-bit atomic exchange/compare-exchange and i64 signed atomic min/max are
+platform/runtime boundaries, not implementation backlog.
 
 ---
 

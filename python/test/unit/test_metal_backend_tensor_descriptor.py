@@ -293,7 +293,9 @@ def test_tensor_descriptor_atomic_add_contended():
     assert torch.equal(dst.cpu(), torch.full((block,), programs, dtype=torch.int32))
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32, torch.uint32])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.uint32]
+)
 def test_tensor_descriptor_atomic_add_dtypes(dtype):
     logical_size = 17
     block = 32
@@ -352,6 +354,41 @@ def test_tensor_descriptor_atomic_minmax_dtypes(kind, dtype):
     operation = min if kind == "min" else max
     expected = [operation(a, b) for a, b in zip(initial_values, value_items)]
     assert dst.cpu().tolist() == expected
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+@pytest.mark.parametrize("kind", ["add", "and", "or", "xor"])
+def test_tensor_descriptor_atomic_64bit_split(kind, dtype):
+    # 64-bit add/and/or/xor run as two 32-bit atomics; the descriptor rewrite
+    # leaves the old value unused, so it takes the same path. Four programs
+    # race on each element and the adds carry across the low word.
+    if kind == "add" and dtype == torch.int64:
+        pytest.skip("the Triton frontend rejects descriptor atomic_add on int64")
+    block, programs = 16, 4
+    initial_items = [2**32 - 1 + 7 * i for i in range(block)]
+    value_items = [(2**40 + 2**32 - 3 * i) % 2**63 for i in range(block)]
+    initial = torch.tensor(initial_items, dtype=dtype)
+    dst = initial.to("mps")
+    desc_atomic_i32[(programs,)](
+        TensorDescriptor.from_tensor(dst, [block]),
+        torch.tensor(value_items, dtype=dtype).to("mps"),
+        0,
+        KIND=kind,
+        B=block,
+    )
+    expected = []
+    for a, b in zip(initial_items, value_items):
+        for _ in range(programs):
+            if kind == "add":
+                a = (a + b) % 2**64
+            elif kind == "and":
+                a &= b
+            elif kind == "or":
+                a |= b
+            else:
+                a ^= b
+        expected.append(a)
+    assert [v % 2**64 for v in dst.cpu().tolist()] == expected
 
 
 def test_tensor_descriptor_atomic_bitwise_u32():

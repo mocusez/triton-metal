@@ -21941,11 +21941,15 @@ static void preprocessScalarAtomicScratch(mlir::ModuleOp moduleOp,
     funcOp.walk([&](mlir::triton::AtomicCASOp cas) {
       if (!mlir::isa<mlir::RankedTensorType>(cas.getCmp().getType()) &&
           !cas.getResult().use_empty()) {
+        mlir::Type cmpTy = cas.getCmp().getType();
         mlir::Type slotTy =
-            cas.getCmp().getType().isF32()
+            cmpTy.isF32()
                 ? mlir::IntegerType::get(funcOp.getContext(), 32,
                                          mlir::IntegerType::Unsigned)
-                : metalStorageElementType(cas.getCmp().getType());
+            : cmpTy.getIntOrFloatBitWidth() == 16
+                ? mlir::IntegerType::get(funcOp.getContext(), 16,
+                                         mlir::IntegerType::Unsigned)
+                : metalStorageElementType(cmpTy);
         scalarAtomics.emplace_back(cas.getOperation(), slotTy);
       }
     });
@@ -22031,23 +22035,33 @@ struct AtomicRmwLowering
       };
 
       if (isFAdd) {
-        // Half has no atomic instruction; the emitter expands it into a
-        // compare-exchange loop over the containing 32-bit word. bf16 is
-        // deliberately NOT admitted — see the pre-pass for the Apple compiler
-        // bug that rules it out.
-        const bool halfPair = value.getType().isF16() && memTy.isF16();
+        // Half and bf16 have no atomic instruction; the emitter expands them
+        // into a compare-exchange loop over the containing 32-bit word.
+        const bool halfPair =
+            (value.getType().isF16() && memTy.isF16()) ||
+            (value.getType().isBF16() && memTy.isBF16());
         if (!(value.getType().isF32() && memTy.isF32()) && !halfPair) {
           payloadError =
-              "atomic_rmw: fadd requires an f32 or f16 value and matching "
-              "storage";
+              "atomic_rmw: fadd requires an f32, f16 or bf16 value and "
+              "matching storage";
           return std::nullopt;
         }
         return AtomicPayload{value, AtomicRmwKind::Add};
       }
+      // 64-bit add/and/or/xor are emitted as two 32-bit atomics; the
+      // pre-pass guarantees their old value is unused.
+      const bool split64 = valueInt && valueInt.getWidth() == 64 && memInt &&
+                           memInt.getWidth() == 64 && (isIntAdd || isBitwise);
+      if (split64 && !op.getResult().use_empty()) {
+        payloadError = "atomic_rmw: 64-bit add/and/or/xor cannot return the "
+                       "old value";
+        return std::nullopt;
+      }
       if (isIntAdd) {
-        if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
-            memInt.getWidth() != 32) {
-          payloadError = "atomic_rmw: 64-bit integer add is unsupported";
+        if (!split64 && (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+                         memInt.getWidth() != 32)) {
+          payloadError = "atomic_rmw: integer add requires a 32-bit or 64-bit "
+                         "payload and matching storage";
           return std::nullopt;
         }
         return AtomicPayload{castToMemrefStorage(value, memref, rewriter, loc),
@@ -22060,8 +22074,8 @@ struct AtomicRmwLowering
         // atomic_float one.
         if (isXchg && value.getType().isF32() && memTy.isF32())
           return AtomicPayload{value, AtomicRmwKind::Xchg};
-        if (!valueInt || valueInt.getWidth() != 32 || !memInt ||
-            memInt.getWidth() != 32) {
+        if (!split64 && (!valueInt || valueInt.getWidth() != 32 || !memInt ||
+                         memInt.getWidth() != 32)) {
           payloadError =
               isXchg ? "atomic_rmw: exchange requires an f32 or 32-bit integer "
                        "payload with matching storage"
@@ -22398,7 +22412,7 @@ struct AtomicRmwLowering
 };
 
 //===----------------------------------------------------------------------===//
-// tt.atomic_cas i32/u32/f32 -> metal.atomic_cas
+// tt.atomic_cas i16/f16/bf16/i32/u32/f32 -> metal.atomic_cas
 //===----------------------------------------------------------------------===//
 struct AtomicCasLowering
     : public mlir::OpConversionPattern<mlir::triton::AtomicCASOp> {
@@ -22424,16 +22438,28 @@ struct AtomicCasLowering
     auto storageInt = mlir::dyn_cast<mlir::IntegerType>(storageTy);
     const bool isIntegerStorage = storageInt && storageInt.getWidth() == 32;
     const bool isFloatStorage = storageTy.isF32();
-    if (!isIntegerStorage && !isFloatStorage)
+    // 16-bit storage (i16/u16/f16/bf16) is exchanged as a ui16 bit pattern by
+    // a compare-exchange loop over the containing 32-bit word.
+    const bool isHalfWordStorage = (storageInt && storageInt.getWidth() == 16) ||
+                                   storageTy.isF16() || storageTy.isBF16();
+    if (!isIntegerStorage && !isFloatStorage && !isHalfWordStorage)
       return rewriter.notifyMatchFailure(
-          op, "atomic_cas: requires i32/u32 or f32 storage");
+          op, "atomic_cas: requires 16-bit, i32/u32 or f32 storage");
 
-    mlir::Type casTy = isFloatStorage ? mlir::Type(ui32) : storageTy;
+    auto ui16 = rewriter.getIntegerType(16, /*isSigned=*/false);
+    mlir::Type casTy = isHalfWordStorage ? mlir::Type(ui16)
+                       : isFloatStorage  ? mlir::Type(ui32)
+                                         : storageTy;
     auto castToCasBits = [&](mlir::Value operand) {
-      if (isFloatStorage)
+      // Integer operands reach the pattern signless; give them the storage's
+      // signedness first, since the bit-pattern cast needs a signed or
+      // unsigned integer.
+      if (storageInt)
+        operand = castToMemrefStorage(operand, memref, rewriter, loc);
+      if ((isFloatStorage || isHalfWordStorage) && operand.getType() != casTy)
         return mlir::Value(mlir::triton::metal::BitcastOp::create(
-            rewriter, loc, ui32, operand));
-      return castToMemrefStorage(operand, memref, rewriter, loc);
+            rewriter, loc, casTy, operand));
+      return operand;
     };
     mlir::Value cmp = castToCasBits(adaptor.getCmp());
     mlir::Value value = castToCasBits(adaptor.getVal());
@@ -22444,7 +22470,8 @@ struct AtomicCasLowering
     };
     auto bridgeResult = [&](mlir::Value oldValue) {
       mlir::Type expectedTy = adaptor.getCmp().getType();
-      if (isFloatStorage)
+      if ((isFloatStorage || isHalfWordStorage) &&
+          oldValue.getType() != storageTy)
         oldValue = mlir::triton::metal::BitcastOp::create(rewriter, loc,
                                                           storageTy, oldValue);
       if (oldValue.getType() == expectedTy)
@@ -41917,6 +41944,41 @@ static mlir::Type getAtomicBasePointeeType(mlir::Value pointer) {
 // preprocessors mutate the module. Letting dialect conversion discover these
 // cases after partial legalization used to leave moved regions behind and
 // could crash while the failed conversion was being torn down.
+// MSL's atomic_ulong has only void min/max, so a 64-bit integer add/and/or/xor
+// is emitted as two 32-bit atomics on the low and high words (add carries from
+// the low word's fetched value into the high word). After the kernel the value
+// is exact: additions commute, and each half of a bitwise op is independent.
+// What it cannot give is a 64-bit snapshot, so the old value must be unused,
+// and a different 64-bit atomic kind in the same function could act on a torn
+// intermediate (e.g. a u64 max between the low add and its carry). Names the
+// first conflicting kind, or returns nullopt when no pair in the function
+// involves a split kind with a different kind (u64 min and max are both
+// native and may share a kernel).
+static bool isSplit64AtomicKind(mlir::triton::RMWOp kind) {
+  return kind == mlir::triton::RMWOp::ADD || kind == mlir::triton::RMWOp::AND ||
+         kind == mlir::triton::RMWOp::OR || kind == mlir::triton::RMWOp::XOR;
+}
+
+static std::optional<llvm::StringRef>
+conflictingSplit64AtomicKind(mlir::triton::AtomicRMWOp op) {
+  auto func = op->getParentOfType<mlir::triton::FuncOp>();
+  if (!func)
+    return std::nullopt;
+  const bool split = isSplit64AtomicKind(op.getAtomicRmwOp());
+  std::optional<llvm::StringRef> conflict;
+  func.walk([&](mlir::triton::AtomicRMWOp other) {
+    auto otherInt = mlir::dyn_cast<mlir::IntegerType>(
+        getAtomicScalarType(other.getVal().getType()));
+    if (!otherInt || otherInt.getWidth() != 64 ||
+        other.getAtomicRmwOp() == op.getAtomicRmwOp() ||
+        (!split && !isSplit64AtomicKind(other.getAtomicRmwOp())))
+      return mlir::WalkResult::advance();
+    conflict = mlir::triton::stringifyRMWOp(other.getAtomicRmwOp());
+    return mlir::WalkResult::interrupt();
+  });
+  return conflict;
+}
+
 static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::AtomicRMWOp op) {
@@ -41978,38 +42040,49 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
     auto valueInt = mlir::dyn_cast<mlir::IntegerType>(valueType);
 
     if (isFAdd) {
-      // f16 is emulated with a compare-exchange loop over the containing
-      // 32-bit word. bf16 would be the same code, and the helper does work on
-      // its own — but placing that loop inside ANOTHER loop, which is what a
-      // BLOCK > tpb tile does, makes Apple's shader compiler service die with
-      // XPC_ERROR_CONNECTION_INTERRUPTED while building the pipeline state.
-      // Reproducible in raw MSL with no Triton involved, and only for bfloat;
-      // the identical half kernel builds. So bf16 atomics are refused here
-      // rather than shipped to fail at load time in shapes we cannot predict.
-      if (valueType.isBF16()) {
-        reject("bf16 atomic add is unsupported: Apple's shader compiler fails "
-               "to build the compare-exchange loop it needs (use f16 or f32)");
-        return;
-      }
-      const bool halfPair = valueType.isF16() && storageType.isF16();
+      // f16 and bf16 are emulated with a compare-exchange loop over the
+      // containing 32-bit word. The bf16 helper does its arithmetic on the
+      // f32 bit pattern instead of `bfloat` values: a loop that adds `bfloat`
+      // values inside ANOTHER loop, which is what a BLOCK > tpb tile does,
+      // makes Apple's shader compiler service die with
+      // XPC_ERROR_CONNECTION_INTERRUPTED, while the bit-level form builds.
+      const bool halfPair = (valueType.isF16() && storageType.isF16()) ||
+                            (valueType.isBF16() && storageType.isBF16());
       if (!(valueType.isF32() && storageType.isF32()) && !halfPair)
-        reject(
-            "atomic fadd requires an f32 or f16 value with matching storage");
+        reject("atomic fadd requires an f32, f16 or bf16 value with matching "
+               "storage");
       return;
     }
+    auto validateSplit64 = [&](llvm::StringRef what) {
+      if (!op.getResult().use_empty()) {
+        reject((llvm::Twine("64-bit integer atomic ") + what +
+                " cannot return its old value: MSL has no 64-bit fetch, so "
+                "the update is two 32-bit atomics")
+                   .str());
+        return;
+      }
+      if (auto other = conflictingSplit64AtomicKind(op))
+        reject((llvm::Twine("64-bit integer atomic ") + what +
+                " runs as two 32-bit atomics and cannot share a kernel with "
+                "a 64-bit atomic " + *other)
+                   .str());
+    };
     if (isIntAdd) {
       if (valueInt && valueInt.getWidth() == 64 && storageType.isInteger(64))
-        reject("64-bit integer atomic add is unsupported because MSL has no "
-               "atomic_ulong fetch-add");
+        validateSplit64("add");
       else if (!valueInt || valueInt.getWidth() != 32 ||
                !storageType.isInteger(32))
-        reject("integer atomic add requires a 32-bit payload and storage");
+        reject("integer atomic add requires a 32-bit or 64-bit payload and "
+               "matching storage");
       return;
     }
     if (isAnd || isOr || isXor) {
-      if (!valueInt || valueInt.getWidth() != 32 || !storageType.isInteger(32))
-        reject("bitwise atomic and/or/xor require a 32-bit integer payload; "
-               "MSL has no 64-bit bitwise atomic");
+      if (valueInt && valueInt.getWidth() == 64 && storageType.isInteger(64))
+        validateSplit64(isAnd ? "and" : isOr ? "or" : "xor");
+      else if (!valueInt || valueInt.getWidth() != 32 ||
+               !storageType.isInteger(32))
+        reject("bitwise atomic and/or/xor require a 32-bit or 64-bit integer "
+               "payload and matching storage");
       return;
     }
     if (isXchg) {
@@ -42048,16 +42121,24 @@ static mlir::LogicalResult validateAtomicRmwSupport(mlir::ModuleOp moduleOp) {
       reject("u64 atomic min/max requires 64-bit integer storage");
       return;
     }
-    if (!op.getResult().use_empty())
+    if (!op.getResult().use_empty()) {
       reject("u64 atomic min/max does not support an old-value result");
+      return;
+    }
+    if (auto other = conflictingSplit64AtomicKind(op))
+      reject((llvm::Twine("u64 atomic min/max cannot share a kernel with a "
+                          "64-bit atomic ") +
+              *other + ", which runs as two 32-bit atomics")
+                 .str());
   });
   return mlir::success(valid);
 }
 
-// Keep unsupported CAS forms out of dialect-conversion teardown. The initial
-// exact Metal implementation uses the native 32-bit compare-exchange surface.
-// f32 is compared through its ui32 object representation; wider integers and
-// 16-bit floating-point packing stay explicit future work.
+// Keep unsupported CAS forms out of dialect-conversion teardown. 32-bit forms
+// use the native compare-exchange surface, f32 through its ui32 object
+// representation; 16-bit forms run a compare-exchange loop over the containing
+// 32-bit word. 64-bit CAS has no MSL surface at all (no atomic_ulong
+// compare-exchange) and stays a platform boundary.
 static mlir::LogicalResult validateAtomicCasSupport(mlir::ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](mlir::triton::AtomicCASOp op) {
@@ -42074,15 +42155,20 @@ static mlir::LogicalResult validateAtomicCasSupport(mlir::ModuleOp moduleOp) {
     bool integerForm = cmpType.isInteger(32) && valType.isInteger(32) &&
                        storageType.isInteger(32);
     bool f32Form = cmpType.isF32() && valType.isF32() && storageType.isF32();
-    if (!integerForm && !f32Form) {
+    // 16-bit CAS runs as a compare-exchange loop over the containing 32-bit
+    // word, comparing the element's object representation.
+    bool halfWordForm = cmpType == valType && cmpType == storageType &&
+                        (cmpType.isInteger(16) || cmpType.isF16() ||
+                         cmpType.isBF16());
+    if (!integerForm && !f32Form && !halfWordForm) {
       bool i64Form = cmpType.isInteger(64) && valType.isInteger(64) &&
                      storageType.isInteger(64);
       if (i64Form)
         reject("64-bit atomic_cas is unsupported because MSL has no "
                "atomic_ulong compare-exchange");
       else
-        reject("atomic_cas requires matching i32/u32 or f32 compare, value, "
-               "and storage");
+        reject("atomic_cas requires matching 16-bit, i32/u32 or f32 "
+               "compare, value, and storage");
       return;
     }
 
