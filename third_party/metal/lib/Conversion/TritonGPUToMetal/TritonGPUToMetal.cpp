@@ -45958,11 +45958,19 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
       branch->walk([&](mlir::Operation *op) {
         if (!mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(op))
           return;
+        // A store of a tile with FEWER registers than the band is guarded per
+        // band iteration (`emitTileLoopIterGuard`, as the same store outside
+        // the if already is), so the extra iterations write nothing. A load
+        // has no such guard, and a wider tile would lose its upper bands.
+        const bool guardedStore = mlir::isa<mlir::triton::StoreOp>(op);
         for (mlir::Type type : op->getOperandTypes()) {
           auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
           if (!rtt)
             continue;
           auto plan = planLayoutIndex(rtt);
+          if (plan && limitAttr && guardedStore &&
+              plan->elemPerThread <= limitAttr.getInt())
+            continue;
           if (!plan || !limitAttr || plan->elemPerThread != limitAttr.getInt())
             bandsFit = op->emitOpError(
                 "Metal backend: nested scan if memory operations require the "

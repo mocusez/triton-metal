@@ -13348,3 +13348,65 @@ def test_multiband_scan_cross_phase_region_refusals_are_named(
     assert result.returncode > 0, output
     assert reason in output, output
 
+
+# --- A narrower store inside a branch of the selected loop --------------------
+#
+# A store of a tile with fewer registers than the scan's band (a rank-1 row of
+# flags beside an 8x64 scan) was refused inside an `if`, though the same store
+# outside it is guarded per band iteration and exact. The guard applies inside
+# the branch too; a load there, which has no such guard, stays refused.
+@triton.jit
+def _rankn_scan_narrow_store_in_branch_kernel(x_ptr, out_ptr, flag_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        s = tl.cumsum(x, 1)
+        if row != 1:
+            tl.store(flag_ptr + row * 64 + tl.arange(0, 64),
+                     tl.full((64,), 1.0, tl.float32) * (row + 1))
+        tl.store(out_ptr + row * 512 + index, s)
+
+
+@mps_only
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_narrow_store_in_branch_matches_torch(rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    sentinel = -7.0
+    flags = torch.full((storage_rows * 64 + 64,), sentinel, device="mps")
+    _rankn_scan_narrow_store_in_branch_kernel[(1,)](
+        x.to("mps"), out, flags, rows, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.full_like(x, -999999)
+    expected_flags = torch.full((storage_rows * 64 + 64,), sentinel)
+    for row in range(rows):
+        expected[row] = x[row].cumsum(1)
+        if row != 1:
+            expected_flags[row * 64:(row + 1) * 64] = row + 1.0
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+    torch.testing.assert_close(flags.cpu(), expected_flags, atol=0, rtol=0)
+
+
+@triton.jit
+def _rankn_scan_narrow_load_in_branch_kernel(x_ptr, out_ptr, flag_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        s = tl.cumsum(x, 1)
+        if row != 1:
+            v = tl.load(flag_ptr + row * 64 + tl.arange(0, 64))
+            tl.store(flag_ptr + row * 64 + tl.arange(0, 64), v + 1.0)
+        tl.store(out_ptr + row * 512 + index, s)
+
+
+def test_multiband_scan_narrow_load_in_branch_is_named():
+    result = _compile_rankn_nested_negative_in_child(
+        "_rankn_scan_narrow_load_in_branch_kernel",
+        {"x_ptr": "*fp32", "out_ptr": "*fp32", "flag_ptr": "*fp32",
+         "rows": "i32"}, {})
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert "nested scan if memory operations require the band's register count" in output, output

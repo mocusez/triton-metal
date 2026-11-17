@@ -857,7 +857,9 @@ case and an adjacent rejection regression.
    later). Local scalar loads
    must be consumed within the same scan phase and are not replayed as result
    sources; a scalar-result if with a store or atomic in it is refused by that
-   name.
+   name. A store inside a branch of the selected loop may write a tile with
+   fewer registers than the scan's band (it is guarded per band iteration, as
+   outside the branch); a narrower load there stays refused.
    Post-scan branches clone pure tensor address cones at their consumers without
    replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
    rejected. Supported result-carrying internal ifs use
