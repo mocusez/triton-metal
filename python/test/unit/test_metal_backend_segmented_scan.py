@@ -3340,12 +3340,6 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
       "scratch_ptr": "*fp32", "rows": "i32"},
      "whose results are all scalars may hold only pure scalar work"),
-    ("_rankn_scan_internal_tensor_for_kernel",
-     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
-     "nested scan requires a flat load/compute/store loop body"),
-    ("_rankn_scan_internal_tensor_while_kernel",
-     {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
-     "nested scan requires a flat load/compute/store loop body"),
     ("_rankn_scan_cross_phase_scalar_load_in_for_kernel",
      {"x_ptr": "*fp32", "scalar_ptr": "*i32", "out_ptr": "*fp32",
       "rows": "i32"},
@@ -13410,3 +13404,142 @@ def test_multiband_scan_narrow_load_in_branch_is_named():
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
     assert "nested scan if memory operations require the band's register count" in output, output
+
+
+
+# Inside a selected nested-scan loop, a loop that carries tiles but only loads
+# and does element-wise work on them ("band-local") used to be refused: each
+# register band runs it for its own element, as the function body's band loop
+# already does.
+@triton.jit
+def _nested_scan_band_local_kernel(X, Y, O, B, rows, R: tl.constexpr, C: tl.constexpr,
+                                   MODE: tl.constexpr):
+    index = tl.reshape(tl.arange(0, R * C), (R, C))
+    for row in range(rows):
+        base = row * R * C
+        if MODE == "inner_for":
+            v = tl.load(X + base + index)
+            for col in range(row + 1):
+                v = v * 0.5 + 1.0
+            tl.store(O + base + index, tl.cumsum(v, 1))
+        elif MODE == "inner_for_post":
+            s = tl.cumsum(tl.load(X + base + index), 1)
+            for col in range(row + 1):
+                s = s * 0.5 + 1.0
+            tl.store(O + base + index, s)
+        elif MODE == "inner_while":
+            v = tl.load(X + base + index)
+            col = 0
+            while col < row + 1:
+                v = tl.where(v > 0, v * 0.5, v + 1.0)
+                col += 1
+            tl.store(O + base + index, tl.cumsum(v, 1))
+        elif MODE == "loadacc":
+            acc = tl.zeros((R, C), tl.float32)
+            for kk in range(3):
+                acc += tl.load(Y + (row * 3 + kk) * R * C + index)
+            tl.store(O + base + index, tl.cumsum(acc, 1))
+        elif MODE == "cross":
+            v = tl.load(X + base + index)
+            for col in range(2):
+                v = tl.maximum(v, 0.0) + col
+            tl.store(O + base + index, v + tl.cumsum(v, 1))
+        elif MODE == "post_if":
+            x = tl.load(X + base + index)
+            s = tl.cumsum(x, 1)
+            if row % 2 == 0:
+                tl.store(B + base + index, s * 3.0)
+                sel = s * x
+            else:
+                sel = x - s
+            tl.store(O + base + index, sel)
+        elif MODE == "post_if_chain_last":
+            t = tl.cumsum(tl.cumsum(tl.load(X + base + index), 1), 1)
+            if row != 1:
+                sel = t + 1.0
+            else:
+                sel = t - 1.0
+            tl.store(O + base + index, sel)
+        elif MODE == "refuse_store":
+            v = tl.load(X + base + index)
+            for col in range(2):
+                v = v + 1.0
+                tl.store(B + base + index, v)
+            tl.store(O + base + index, tl.cumsum(v, 1))
+        elif MODE == "refuse_chain_first":
+            s = tl.cumsum(tl.load(X + base + index), 1)
+            t = tl.cumsum(s, 1)
+            if row != 1:
+                sel = s + t
+            else:
+                sel = s - t
+            tl.store(O + base + index, sel)
+
+
+def _nested_scan_band_local_reference(mode, x, y, rows):
+    out = torch.zeros_like(x)
+    branch = torch.zeros_like(x)
+    for r in range(rows):
+        if mode == "inner_for":
+            v = x[r].clone()
+            for _ in range(r + 1):
+                v = v * 0.5 + 1.0
+            out[r] = v.cumsum(1)
+        elif mode == "inner_for_post":
+            s = x[r].cumsum(1)
+            for _ in range(r + 1):
+                s = s * 0.5 + 1.0
+            out[r] = s
+        elif mode == "inner_while":
+            v = x[r].clone()
+            for _ in range(r + 1):
+                v = torch.where(v > 0, v * 0.5, v + 1.0)
+            out[r] = v.cumsum(1)
+        elif mode == "loadacc":
+            out[r] = (y[3 * r] + y[3 * r + 1] + y[3 * r + 2]).cumsum(1)
+        elif mode == "cross":
+            v = x[r].clone()
+            for c in range(2):
+                v = v.clamp_min(0.0) + c
+            out[r] = v + v.cumsum(1)
+        elif mode == "post_if":
+            s = x[r].cumsum(1)
+            out[r] = s * x[r] if r % 2 == 0 else x[r] - s
+            if r % 2 == 0:
+                branch[r] = s * 3.0
+        elif mode == "post_if_chain_last":
+            t = x[r].cumsum(1).cumsum(1)
+            out[r] = t + 1.0 if r != 1 else t - 1.0
+    return out, branch
+
+
+@pytest.mark.parametrize("mode", ["inner_for", "inner_for_post", "inner_while", "loadacc",
+                                  "cross"])
+@pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 16), 1), ((8, 64), 4),
+                                              ((4, 32), 4)])
+def test_nested_scan_band_local_loops_and_post_scan_if_match_torch(mode, shape, num_warps):
+    rows = 3
+    r, c = shape
+    gen = torch.Generator().manual_seed(r * c + num_warps)
+    x = torch.randn(rows, r, c, generator=gen)
+    y = torch.randn(3 * rows, r, c, generator=gen)
+    out = torch.zeros(rows, r, c, device="mps")
+    branch = torch.zeros(rows, r, c, device="mps")
+    _nested_scan_band_local_kernel[(1,)](x.to("mps"), y.to("mps"), out, branch, rows, r, c,
+                                         mode, num_warps=num_warps)
+    torch.mps.synchronize()
+    want, want_branch = _nested_scan_band_local_reference(mode, x, y, rows)
+    torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(branch.cpu(), want_branch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("mode, diagnostic", [
+    ("refuse_store", "a loop inside a nested scan that carries tiles may only load"),
+])
+def test_nested_scan_band_local_boundaries_are_named(capfd, mode, diagnostic):
+    x = torch.randn(3 * 512, device="mps")
+    out = torch.zeros(3 * 512, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _nested_scan_band_local_kernel[(1,)](x, x, out, out, 3, 8, 64, mode, num_warps=1)
+    captured = capfd.readouterr()
+    assert diagnostic in captured.err + captured.out

@@ -18186,6 +18186,86 @@ static bool canGroupScanReduceInputs(mlir::triton::ScanOp scan,
 
 // Publish every source register band before a staged scan reads any prefix.
 // Keep independent work before the boundary and rematerialize shared indices.
+
+static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
+                                                  const TileInfo &tile) {
+  auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
+  if (!rtt)
+    return "nested scan carries only tensors between iterations";
+  mlir::Type elem = rtt.getElementType();
+  if (!elem.isIntOrFloat() || elem.getIntOrFloatBitWidth() < 8)
+    return "nested scan carries only integer or floating-point tiles of at "
+           "least eight bits";
+  auto plan = planLayoutIndex(rtt);
+  if (!plan || plan->elemPerThread != tile.elemPerThread ||
+      plan->threadsPerBlock() != tile.threadsPerBlock)
+    return "nested scan carries only tiles with the function tile's register "
+           "count and thread count";
+  return {};
+}
+
+// A loop inside a selected nested-scan loop that carries tiles but only ever
+// combines each tile's elements with the SAME element of other tiles: loads,
+// element-wise arith/math, and splats of scalars, with every tile in the
+// function tile's register layout. Each register band then runs it for its own
+// element exactly as the function body's band loop runs such a loop, so it
+// needs no phase of its own. Anything that moves data between elements (a
+// reduce, a scan, a layout change, a reshape or broadcast), a store, or an
+// atomic would observe the other bands and is refused. 📏 Every probe of this
+// family (an iterated `v = v * 0.5 + 1` or a windowed `acc += tl.load(...)`
+// before a cumsum) was refused before.
+static bool nestedScanBandLocalLoop(mlir::Operation *region,
+                                    const TileInfo &tile) {
+  if (!mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(region))
+    return false;
+  auto inBand = [&](mlir::Type type) {
+    auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
+    if (!rtt)
+      return true;
+    auto plan = planLayoutIndex(rtt);
+    return plan && plan->elemPerThread == tile.elemPerThread &&
+           plan->threadsPerBlock() == tile.threadsPerBlock &&
+           !layoutHasReplicatedOwners(*plan);
+  };
+  bool anyTensor = false;
+  for (mlir::Type type : region->getResultTypes()) {
+    if (!mlir::isa<mlir::RankedTensorType>(type))
+      continue;
+    anyTensor = true;
+    if (!nestedScanCarryUnsupported(type, tile).empty())
+      return false;
+  }
+  if (!anyTensor)
+    return false;
+  bool local = true;
+  region->walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (op == region)
+      return mlir::WalkResult::advance();
+    if (!llvm::all_of(op->getResultTypes(), inBand) ||
+        !llvm::all_of(op->getOperandTypes(), inBand)) {
+      local = false;
+      return mlir::WalkResult::interrupt();
+    }
+    if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp, mlir::scf::IfOp,
+                  mlir::scf::YieldOp, mlir::scf::ConditionOp,
+                  mlir::triton::LoadOp, mlir::triton::SplatOp>(op))
+      return mlir::WalkResult::advance();
+    const bool elementwise =
+        (mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+             op->getDialect()) ||
+         (mlir::isa<mlir::triton::TritonDialect>(op->getDialect()) &&
+          op->hasTrait<mlir::OpTrait::Elementwise>())) &&
+        op->getNumRegions() == 0 && mlir::isMemoryEffectFree(op);
+    if (!elementwise) {
+      local = false;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return local;
+}
+
+
 static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
   auto phaseLayout =
       [](mlir::triton::ScanOp scan) -> std::optional<LayoutIndexPlan> {
@@ -18671,7 +18751,12 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
         mlir::Operation *region = user;
         while (region && region->getBlock() != block)
           region = region->getParentOp();
-        if (region && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(region))
+        // A band-local loop (element-wise work on the scan's own tile) is
+        // banded with the rest of the phase it lands in; the phase split
+        // replays the values its body captures.
+        auto bandTile = findTileInfo(scan->getParentOfType<mlir::triton::FuncOp>());
+        if (region && mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(region) &&
+            !(bandTile && nestedScanBandLocalLoop(region, *bandTile)))
           return scan.emitOpError(
               "Metal backend: staged scan cannot partition surrounding loops");
         if (user->getBlock() == block)
@@ -18724,13 +18809,24 @@ static mlir::LogicalResult preprocessStagedScanPhases(mlir::ModuleOp moduleOp) {
       if (!inSourceCone(def) || !preSet.insert(def).second)
         continue;
       bool internalResult = g_nestedScanInternalResultIfs.count(def);
-      if (!internalResult && !mlir::isMemoryEffectFree(def) &&
+      auto bandTile =
+          findTileInfo(scan->getParentOfType<mlir::triton::FuncOp>());
+      const bool bandLocalLoop =
+          bandTile && nestedScanBandLocalLoop(def, *bandTile);
+      if (!internalResult && !bandLocalLoop && !mlir::isMemoryEffectFree(def) &&
           !g_nestedScanLocalScalarLoadRegions.count(def) &&
           !mlir::isa<mlir::triton::LoadOp, ScalarDotOp>(def))
         return scan.emitOpError("Metal backend: staged scan cannot safely "
                                 "partition its source and consumers: "
                                 "side-effecting source cone from ")
                << def->getName();
+      if (bandLocalLoop)
+        def->walk([&](mlir::Operation *nested) {
+          for (mlir::Value operand : nested->getOperands())
+            if (mlir::Operation *captured = operand.getDefiningOp();
+                captured && !def->isAncestor(captured))
+              worklist.push_back(operand);
+        });
       if (internalResult) {
         for (mlir::Region &region : def->getRegions()) {
           auto yield = mlir::cast<mlir::scf::YieldOp>(
@@ -44140,23 +44236,6 @@ nestedScanCarriedTypes(mlir::scf::ForOp loop,
 // Why a carried tile cannot take a slot, or empty when it can. The slot is
 // indexed by the tile's own layout on both sides, so the band loops must walk
 // its register count exactly and threadgroup memory must hold its element type.
-static llvm::StringRef nestedScanCarryUnsupported(mlir::Type type,
-                                                  const TileInfo &tile) {
-  auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(type);
-  if (!rtt)
-    return "nested scan carries only tensors between iterations";
-  mlir::Type elem = rtt.getElementType();
-  if (!elem.isIntOrFloat() || elem.getIntOrFloatBitWidth() < 8)
-    return "nested scan carries only integer or floating-point tiles of at "
-           "least eight bits";
-  auto plan = planLayoutIndex(rtt);
-  if (!plan || plan->elemPerThread != tile.elemPerThread ||
-      plan->threadsPerBlock() != tile.threadsPerBlock)
-    return "nested scan carries only tiles with the function tile's register "
-           "count and thread count";
-  return {};
-}
-
 static bool nestedScanPureScalarRegion(mlir::Operation *operation,
                                        bool allowLoads) {
   auto isTensor = [](mlir::Type type) {
@@ -44612,6 +44691,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         continue;
       if (g_nestedScanInternalResultIfs.count(&op))
         continue;
+      if (auto tile = findTileInfo(func);
+          tile && nestedScanBandLocalLoop(&op, *tile))
+        continue;
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
                      mlir::scf::IfOp>(&op) &&
           nestedScanPureScalarRegion(&op, /*allowLoads=*/true)) {
@@ -44653,6 +44735,12 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (flat)
           continue;
       }
+      if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
+          llvm::any_of(op.getResultTypes(), isTensor))
+        return op.emitOpError(
+            "Metal backend: a loop inside a nested scan that carries tiles may "
+            "only load and do element-wise work on tiles of the scan's layout; "
+            "move stores, atomics, reductions and layout changes out of it");
       if (op.getNumRegions() ||
           (!mlir::isMemoryEffectFree(&op) &&
            !mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp,
@@ -46116,9 +46204,28 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
         }
         return mapping.lookup(value);
       };
-      for (mlir::Operation *op : phaseOps)
+      // TILES a region's body captures from an earlier phase are uses too (a
+      // band-local loop's loads, a result if's constant tiles): pure work and
+      // loads replay like any operand. Captured SCALARS keep their own
+      // treatment: they are re-created once after the earlier band loop below.
+      for (mlir::Operation *op : phaseOps) {
         for (mlir::OpOperand &operand : op->getOpOperands())
           operand.set(replay(operand.get()));
+        op->walk([&](mlir::Operation *nested) {
+          if (nested == op)
+            return;
+          for (mlir::OpOperand &operand : nested->getOpOperands()) {
+            mlir::Operation *def = operand.get().getDefiningOp();
+            if (!def || op->isAncestor(def) ||
+                !mlir::isa<mlir::RankedTensorType>(operand.get().getType()) ||
+                def->getNumRegions() ||
+                (!mlir::isMemoryEffectFree(def) &&
+                 !mlir::isa<mlir::triton::LoadOp>(def)))
+              continue;
+            operand.set(replay(operand.get()));
+          }
+        });
+      }
     }
 
     auto tile = findTileInfo(func);
