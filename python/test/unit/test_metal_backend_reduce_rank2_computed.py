@@ -442,6 +442,65 @@ def test_categorical_cross_entropy(n_rows, n_classes):
 
 # --- Leet token embedding + LayerNorm -------------------------------------
 #
+# The embedding gather `emb + ids[:, None] * D + cols[None, :]` reaches the
+# backend with a `ttg.convert_layout` of the POINTER tile between two
+# `tt.addptr`s when the row count equals the threads per CTA (128 rows at four
+# warps, 256 at eight). That cvt exchanged the addresses as integers, the load
+# then had no buffer to read and declined inside the conversion, and the
+# rollback read a block `FuncOpLowering` had already freed: a bare "failed to
+# legalize" on most runs, SIGSEGV/SIGABRT under MallocScribble (and ~50% of
+# runs on the 2026-08 toolchain). The pass now converts the OFFSETS instead.
+@triton.jit
+def _gathered_rows_kernel(tid_ptr, emb_ptr, o_ptr, N, D, BLOCK_T: tl.constexpr,
+                          BLOCK_D: tl.constexpr, NORM: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    cols = tl.arange(0, BLOCK_D)
+    rmask = rows < N
+    mask = rmask[:, None] & (cols < D)[None, :]
+    ids = tl.load(tid_ptr + rows, mask=rmask, other=0).to(tl.int64)
+    x = tl.load(emb_ptr + ids[:, None] * D + cols[None, :], mask=mask, other=0.0)
+    if NORM:
+        x = x - (tl.sum(x, axis=1) / D)[:, None]
+    tl.store(o_ptr + rows[:, None] * D + cols[None, :], x, mask=mask)
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("block_t, warps", [(128, 4), (256, 8), (64, 4), (128, 8)])
+def test_gathered_rows_with_rows_equal_to_threads_match_torch(block_t, warps, norm):
+    n, d, vocab = 300, 32, 300
+    torch.manual_seed(block_t + warps)
+    ids = torch.randint(0, vocab, (n,), dtype=torch.int32)
+    emb = torch.randn(vocab, d)
+    out = torch.empty(n, d, device="mps")
+    _gathered_rows_kernel[(triton.cdiv(n, block_t),)](
+        ids.to("mps"), emb.to("mps"), out, n, d, BLOCK_T=block_t, BLOCK_D=32,
+        NORM=norm, num_warps=warps)
+    torch.mps.synchronize()
+    x = emb[ids.long()]
+    expected = x - x.mean(1, keepdim=True) if norm else x
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+
+
+@triton.jit
+def _rank3_unit_axis_copy_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    tl.store(O + offsets, tl.load(X + offsets) * 2.0)
+
+
+def test_rank3_unit_axis_copy_matches_torch():
+    # A (4, 8, 1) tile at one warp converts its POINTER tiles between two
+    # blocked orders that differ only around the unit axis. The same
+    # exchanged-address decline killed the process (exit 139) every run.
+    x = torch.randn(32)
+    out = torch.zeros(32, device="mps")
+    _rank3_unit_axis_copy_kernel[(1,)](x.to("mps"), out, A=4, B=8, C=1, num_warps=1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu(), x * 2.0)
+
+
 # Verbatim kernel shape from `python/test/unit/fixtures/metal_leet/medium-token_embedding_layer.py`.
 # It combines two rank-1 integer gathers, two rank-2 embedding gathers, and two
 # chained axis=1 reductions whose results are broadcast back into a tiled 2D

@@ -507,9 +507,19 @@ case and an adjacent rejection regression.
    result so that its fold and its addressing agree, and the exchange publishes
    by the plan the reduce actually used. Stored rank-3 permutations, transposed
    consumers and loaded dot accumulators use exact layout exchanges; their
-   current numerical matrices have no remaining wrong answers. Load-rooted
-   rank-3/rank-4 permute-to-reduce uses the same exact coordinate mapping;
-   standalone rank-4 permutation and non-load-rooted sources remain boundaries.
+   current numerical matrices have no remaining wrong answers. Stored rank-4
+   and rank-5 permutations use the same thread-major exchange labels as rank 3
+   (all 24 rank-4 orders on wrapped and unwrapped layouts match torch; they had
+   returned wrong data whenever the load layout wrapped into a second register
+   band), and a permutation those labels cannot describe is refused rather than
+   published under the transposed tile's own plan. Load-rooted rank-3/rank-4
+   permute-to-reduce uses the same exact coordinate mapping; non-load-rooted
+   sources remain boundaries.
+   A `ttg.convert_layout` of a rank >= 2 POINTER tile is rewritten to convert
+   the offsets beneath it instead, so an address keeps its kernel-argument root:
+   the embedding gather `emb + ids[:, None] * D + cols[None, :]` with as many
+   rows as threads, and a `(4, 8, 1)` tile at one warp, used to decline inside
+   the conversion and crash during its rollback.
    An independent wide rank-2 broadcast beside a multiband rank-N reduction is
    also refused before conversion: its tile needs more register bands than the
    reduction phase, and running the whole phase more often would repeat the

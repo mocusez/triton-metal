@@ -46907,6 +46907,102 @@ static void preprocessApproximateDivision(mlir::ModuleOp moduleOp) {
   });
 }
 
+// A `ttg.convert_layout` of a rank >= 2 POINTER tensor moves addresses between
+// threads. Every access pattern finds its buffer by walking the address back
+// to a kernel argument, and an exchanged pointer has no such root: the
+// exchange carries it as an integer. The gathered-row embedding load
+// (`emb + ids[:, None] * D + cols[None, :]`) reaches the backend that way when
+// the row count equals the threads per CTA, and its load then declined INSIDE
+// the conversion, where the rollback of `FuncOpLowering`'s block surgery reads
+// freed memory (a SIGSEGV/SIGABRT under MallocScribble, otherwise a bare
+// "failed to legalize").
+//
+// Pointer arithmetic commutes with a layout change, so convert the OFFSETS
+// instead: `cvt(addptr(splat(p), off))` becomes `addptr(splat(p), cvt(off))`.
+// Only chains that bottom out in a splat of a scalar pointer are rewritten;
+// anything else (a loop-carried pointer tile, a load of pointers) is left as it
+// was. Rank-1 pointer converts are left alone too: the store patterns re-read a
+// rank-1 store through the convert's source layout on purpose.
+static mlir::Value convertPointerTileLayout(mlir::OpBuilder &b,
+                                            mlir::Location loc, mlir::Value v,
+                                            mlir::RankedTensorType dstTy,
+                                            int depth = 0) {
+  if (v.getType() == dstTy)
+    return v;
+  if (depth > 16)
+    return {};
+  if (auto cvt = v.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+    return convertPointerTileLayout(b, loc, cvt.getSrc(), dstTy, depth + 1);
+  if (auto splat = v.getDefiningOp<mlir::triton::SplatOp>())
+    return mlir::triton::SplatOp::create(b, loc, dstTy, splat.getSrc());
+  auto addptr = v.getDefiningOp<mlir::triton::AddPtrOp>();
+  if (!addptr)
+    return {};
+  auto offTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(addptr.getOffset().getType());
+  if (!offTy || offTy.getShape() != dstTy.getShape())
+    return {};
+  mlir::Value base =
+      convertPointerTileLayout(b, loc, addptr.getPtr(), dstTy, depth + 1);
+  if (!base)
+    return {};
+  auto newOffTy = offTy.cloneWithEncoding(dstTy.getEncoding());
+  mlir::Value offset = mlir::triton::gpu::ConvertLayoutOp::create(
+      b, loc, newOffTy, addptr.getOffset());
+  return mlir::triton::AddPtrOp::create(b, loc, dstTy, base, offset);
+}
+
+static void sinkPointerConvertLayouts(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::gpu::ConvertLayoutOp> work;
+  moduleOp.walk([&](mlir::triton::gpu::ConvertLayoutOp cvt) {
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
+    if (ty && ty.getRank() >= 2 &&
+        mlir::isa<mlir::triton::PointerType>(ty.getElementType()))
+      work.push_back(cvt);
+  });
+  for (auto cvt : work) {
+    mlir::OpBuilder b(cvt);
+    auto dstTy = mlir::cast<mlir::RankedTensorType>(cvt.getType());
+    // Build into a scratch region first so a chain that does not resolve
+    // leaves no half-built ops behind.
+    llvm::SmallVector<mlir::Operation *> created;
+    struct Listener : mlir::OpBuilder::Listener {
+      llvm::SmallVector<mlir::Operation *> *created;
+      void notifyOperationInserted(mlir::Operation *op,
+                                   mlir::OpBuilder::InsertPoint) override {
+        created->push_back(op);
+      }
+    } listener;
+    listener.created = &created;
+    b.setListener(&listener);
+    mlir::Value replacement =
+        convertPointerTileLayout(b, cvt.getLoc(), cvt.getSrc(), dstTy);
+    if (!replacement || replacement == cvt.getSrc()) {
+      for (mlir::Operation *op : llvm::reverse(created))
+        op->erase();
+      continue;
+    }
+    mlir::Value src = cvt.getSrc();
+    cvt.getResult().replaceAllUsesWith(replacement);
+    cvt.erase();
+    // Drop the now-unused original address chain.
+    llvm::SmallVector<mlir::Operation *> dead;
+    if (mlir::Operation *def = src.getDefiningOp())
+      dead.push_back(def);
+    while (!dead.empty()) {
+      mlir::Operation *op = dead.pop_back_val();
+      if (!op->use_empty() || !mlir::isOpTriviallyDead(op))
+        continue;
+      llvm::SmallVector<mlir::Operation *> operands;
+      for (mlir::Value operand : op->getOperands())
+        if (mlir::Operation *d = operand.getDefiningOp())
+          operands.push_back(d);
+      op->erase();
+      dead.append(operands.begin(), operands.end());
+    }
+  }
+}
+
 struct ConvertTritonGPUToMetalPass
     : public impl::ConvertTritonGPUToMetalBase<ConvertTritonGPUToMetalPass> {
   using ConvertTritonGPUToMetalBase::ConvertTritonGPUToMetalBase;
@@ -46922,6 +47018,7 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+    sinkPointerConvertLayouts(moduleOp);
     if (mlir::failed(preprocessLoopCarriedAffineRanges(moduleOp))) {
       signalPassFailure();
       return;
