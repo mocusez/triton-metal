@@ -44534,6 +44534,234 @@ static llvm::StringRef nestedScanLocalScalarRegionRefusal(
 // The scheduler cuts tensor work into register bands. Uniform outer
 // for/if/while ancestors stay intact; outer for loops use the same slots and
 // pre/post bands in their own direct scopes without moving the inner phases.
+// A row reduce in a loop that also scans, read back over its own tile
+// (`tl.max(x, 1)[:, None]`) or carried across iterations as a running row
+// total (`carry += tl.sum(x, 1)`, used as `carry[:, None]` -- the chunked
+// cumsum), has no staged lowering inside a nested-scan loop: the row reduce
+// replays its source from device addresses, which a loop-dependent address
+// defeats. Along the reduced axis the broadcast value IS two scans: with P the
+// inclusive prefix and S the inclusive suffix, every element of the row holds
+// P + S - x for a sum and P ^ S ^ x for xor (the combines a staged scan has;
+// an extremum would be max(P, S) but there is no max scan). Rewrite the broadcast into those scans, which a
+// nested-scan loop phases like any other, and promote a carried row total to
+// the tile it is broadcast over. 📏 Before this, every such loop was refused
+// ("flat load/compute/store loop body" / "carries only tiles with the
+// function tile's register count").
+static mlir::triton::ScanOp scanFromReduce(mlir::OpBuilder &builder,
+                                           mlir::triton::ReduceOp reduce,
+                                           bool reverse) {
+  auto scan = mlir::triton::ScanOp::create(
+      builder, reduce.getLoc(), mlir::ValueRange{reduce.getSrcs().front()},
+      reduce.getAxis(), reverse);
+  mlir::IRMapping mapping;
+  reduce.getCombineOp().cloneInto(&scan.getCombineOp(), mapping);
+  mlir::Block &block = scan.getCombineOp().front();
+  auto ret = mlir::cast<mlir::triton::ReduceReturnOp>(block.getTerminator());
+  mlir::OpBuilder retBuilder(ret);
+  mlir::triton::ScanReturnOp::create(retBuilder, ret.getLoc(),
+                                     ret.getResult());
+  ret.erase();
+  return scan;
+}
+
+static mlir::Value cloneCombine(mlir::OpBuilder &builder,
+                                mlir::Operation *combine, mlir::Value lhs,
+                                mlir::Value rhs) {
+  mlir::OperationState state(combine->getLoc(), combine->getName());
+  state.addOperands({lhs, rhs});
+  state.addTypes(lhs.getType());
+  state.addAttributes(combine->getAttrs());
+  return builder.create(state)->getResult(0);
+}
+
+// The broadcasts `expand_dims(value, axis)` -> `broadcast` to `tileTy` that
+// read `value` back over its tile, or nullopt if any use is something else
+// (`except` excluded).
+static std::optional<llvm::SmallVector<mlir::triton::BroadcastOp, 2>>
+rowBroadcastsOf(mlir::Value value, unsigned axis, mlir::Type tileTy,
+                mlir::Operation *except = nullptr) {
+  llvm::SmallVector<mlir::triton::BroadcastOp, 2> broadcasts;
+  for (mlir::Operation *user : value.getUsers()) {
+    if (user == except)
+      continue;
+    auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+    if (!expand || expand.getAxis() != axis)
+      return std::nullopt;
+    for (mlir::Operation *expandUser : expand->getUsers()) {
+      auto broadcast = mlir::dyn_cast<mlir::triton::BroadcastOp>(expandUser);
+      if (!broadcast || broadcast.getType() != tileTy)
+        return std::nullopt;
+      broadcasts.push_back(broadcast);
+    }
+  }
+  return broadcasts;
+}
+
+static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp, 4> reduces;
+  moduleOp.walk([&](mlir::triton::ReduceOp reduce) {
+    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(reduce->getParentOp());
+    if (!loop || reduce.getSrcs().size() != 1 || reduce.getNumResults() != 1 ||
+        llvm::none_of(*loop.getBody(), [](mlir::Operation &op) {
+          return mlir::isa<mlir::triton::ScanOp>(op);
+        }))
+      return;
+    auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(
+        reduce.getSrcs().front().getType());
+    if (!srcTy || srcTy.getRank() != 2 ||
+        !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+            srcTy.getEncoding()))
+      return;
+    mlir::Operation *combine = reduceCombineBinaryOp(reduce);
+    // The combines a staged rank-2 scan lowers (`scanCombineKind`): a sum,
+    // and an i32 xor. An extremum would need max/min scans, which it has not.
+    const bool i32 = srcTy.getElementType().isInteger(32);
+    if (!combine ||
+        !(mlir::isa<mlir::arith::AddFOp>(combine) ||
+          (i32 && mlir::isa<mlir::arith::AddIOp, mlir::arith::XOrIOp>(combine))))
+      return;
+    reduces.push_back(reduce);
+  });
+  for (mlir::triton::ReduceOp reduce : reduces) {
+    auto loop = mlir::cast<mlir::scf::ForOp>(reduce->getParentOp());
+    mlir::Value result = reduce->getResult(0);
+    mlir::Type tileTy = reduce.getSrcs().front().getType();
+    const unsigned axis = reduce.getAxis();
+    mlir::Operation *combine = reduceCombineBinaryOp(reduce);
+    // At most one carried running total: `carry = combine(carry, result)`
+    // yielded back, every other read of the carry a broadcast over the tile.
+    mlir::Operation *update = nullptr;
+    mlir::BlockArgument carry;
+    for (mlir::Operation *user : result.getUsers()) {
+      if (user->getName() != combine->getName() || user->getNumOperands() != 2)
+        continue;
+      mlir::Value other = user->getOperand(0) == result ? user->getOperand(1)
+                                                        : user->getOperand(0);
+      auto arg = mlir::dyn_cast<mlir::BlockArgument>(other);
+      if (!arg || arg.getOwner() != loop.getBody() || arg.getArgNumber() == 0 ||
+          !user->hasOneUse() ||
+          !mlir::isa<mlir::scf::YieldOp>(*user->user_begin()))
+        continue;
+      unsigned index = arg.getArgNumber() - 1;
+      if (user->user_begin()->getOperand(index) != user->getResult(0))
+        continue;
+      update = user;
+      carry = arg;
+    }
+    auto broadcasts = rowBroadcastsOf(result, axis, tileTy, update);
+    if (!broadcasts)
+      continue;
+    std::optional<llvm::SmallVector<mlir::triton::BroadcastOp, 2>> carryReads;
+    std::optional<llvm::SmallVector<mlir::triton::BroadcastOp, 2>> afterReads;
+    mlir::Value init;
+    if (update) {
+      unsigned index = carry.getArgNumber() - 1;
+      carryReads = rowBroadcastsOf(carry, axis, tileTy, update);
+      afterReads = rowBroadcastsOf(loop->getResult(index), axis, tileTy);
+      init = loop.getInitArgs()[index];
+      if (!carryReads || !afterReads)
+        continue;
+    }
+    if (broadcasts->empty() && !update)
+      continue;
+
+    mlir::OpBuilder builder(reduce->getContext());
+    builder.setInsertionPointAfter(reduce);
+    auto forward = scanFromReduce(builder, reduce, /*reverse=*/false);
+    auto backward = scanFromReduce(builder, reduce, /*reverse=*/true);
+    mlir::Value x = reduce.getSrcs().front();
+    mlir::Value total = cloneCombine(builder, combine, forward->getResult(0),
+                                     backward->getResult(0));
+    if (mlir::isa<mlir::arith::AddFOp>(combine))
+      total = mlir::arith::SubFOp::create(builder, reduce.getLoc(), total, x);
+    else if (mlir::isa<mlir::arith::AddIOp>(combine))
+      total = mlir::arith::SubIOp::create(builder, reduce.getLoc(), total, x);
+    else if (mlir::isa<mlir::arith::XOrIOp>(combine))
+      total = mlir::arith::XOrIOp::create(builder, reduce.getLoc(), total, x);
+    for (mlir::triton::BroadcastOp broadcast : *broadcasts)
+      broadcast.getResult().replaceAllUsesWith(total);
+
+    if (update) {
+      unsigned index = carry.getArgNumber() - 1;
+      // The carried total as the tile it is read as.
+      mlir::OpBuilder before(loop);
+      mlir::Value tileInit;
+      auto constant = init.getDefiningOp<mlir::arith::ConstantOp>();
+      auto dense = constant ? mlir::dyn_cast<mlir::DenseElementsAttr>(
+                                  constant.getValue())
+                            : nullptr;
+      if (dense && dense.isSplat())
+        tileInit = mlir::arith::ConstantOp::create(
+            before, loop.getLoc(),
+            mlir::DenseElementsAttr::get(
+                mlir::cast<mlir::ShapedType>(tileTy),
+                dense.getSplatValue<mlir::Attribute>()));
+      else {
+        auto expandTy = carryReads->empty()
+                            ? mlir::Type()
+                            : (*carryReads)[0].getSrc().getType();
+        if (!expandTy)
+          continue;
+        auto expand = mlir::triton::ExpandDimsOp::create(before, loop.getLoc(),
+                                                         init, axis);
+        tileInit = mlir::triton::BroadcastOp::create(before, loop.getLoc(),
+                                                     tileTy, expand.getResult());
+      }
+      llvm::SmallVector<mlir::Value, 4> inits(loop.getInitArgs());
+      inits[index] = tileInit;
+      auto newLoop = mlir::scf::ForOp::create(
+          before, loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(),
+          loop.getStep(), inits);
+      mlir::Block *newBody = newLoop.getBody();
+      if (!newBody->empty())
+        newBody->getOperations().clear();
+      newBody->getOperations().splice(newBody->end(),
+                                      loop.getBody()->getOperations());
+      // Promoted reads see the tile carry; the update combines tiles.
+      mlir::Value tileCarry = newBody->getArgument(carry.getArgNumber());
+      for (mlir::triton::BroadcastOp read : *carryReads)
+        read.getResult().replaceAllUsesWith(tileCarry);
+      mlir::OpBuilder updateBuilder(update);
+      mlir::Value tileUpdate =
+          cloneCombine(updateBuilder, combine, tileCarry, total);
+      update->getResult(0).replaceAllUsesWith(tileUpdate);
+      update->erase();
+      for (auto [oldArg, newArg] : llvm::zip(loop.getBody()->getArguments(),
+                                             newBody->getArguments()))
+        if (oldArg != carry)
+          oldArg.replaceAllUsesWith(newArg);
+      for (mlir::triton::BroadcastOp read : *afterReads)
+        read.getResult().replaceAllUsesWith(newLoop->getResult(index));
+      for (auto [oldResult, newResult] :
+           llvm::zip(loop->getResults(), newLoop->getResults()))
+        if (oldResult.getResultNumber() != index)
+          oldResult.replaceAllUsesWith(newResult);
+      // What only fed the old carry and its broadcasts is dead now.
+      llvm::SmallVector<mlir::Operation *, 8> dead;
+      for (mlir::triton::BroadcastOp read : *carryReads)
+        dead.push_back(read);
+      for (mlir::triton::BroadcastOp read : *afterReads)
+        dead.push_back(read);
+      for (mlir::Operation *op : dead) {
+        mlir::Operation *expand = op->getOperand(0).getDefiningOp();
+        op->erase();
+        if (expand && expand->use_empty())
+          expand->erase();
+      }
+      loop->dropAllUses();
+      loop.erase();
+    }
+    for (mlir::triton::BroadcastOp broadcast : *broadcasts) {
+      mlir::Operation *expand = broadcast.getSrc().getDefiningOp();
+      broadcast.erase();
+      if (expand && expand->use_empty())
+        expand->erase();
+    }
+    if (reduce->use_empty())
+      reduce.erase();
+  }
+}
+
 static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::ScanOp, 4> hoisted;
   moduleOp.walk([&](mlir::triton::ScanOp scan) {
@@ -44930,6 +45158,12 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
         if (flat)
           continue;
       }
+      if (mlir::isa<mlir::triton::ReduceOp>(&op))
+        return op.emitOpError(
+            "Metal backend: a reduce inside a nested scan loop is supported as "
+            "a sum (or i32 xor) along a 2-D tile's axis that is only read back "
+            "over that tile or carried as a running row total; move other "
+            "reductions out of the loop");
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
           llvm::any_of(op.getResultTypes(), isTensor))
         return op.emitOpError(
@@ -48133,6 +48367,7 @@ struct ConvertTritonGPUToMetalPass
     g_broadcastExchange.clear();
 
     rewriteHypercubeFlips(moduleOp);
+    rewriteScanLoopRowReduces(moduleOp);
     if (mlir::failed(selectNestedScanLoops(moduleOp)) ||
         mlir::failed(prepareMapElementwisePacks(moduleOp))) {
       signalPassFailure();

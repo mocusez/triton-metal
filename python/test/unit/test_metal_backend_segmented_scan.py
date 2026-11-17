@@ -6650,12 +6650,11 @@ def _unsupported_shared_input_column_broadcast_kernel(
     (6, "a rank-2 tl.reduce cannot share a function"),
     (7, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
-    (8, "nested scan requires a flat load/compute/store loop body"),
     (9, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
     (10, "rank-2 reduce cannot replay its computed source cone across conversion"),
 ], ids=["late_nonplain_i32_source", "load_after_scan", "wide_columns", "mixed_store", "cross_axis",
-        "wider_tile", "pre_expand_arithmetic", "multiple_scans", "nested_scan",
+        "wider_tile", "pre_expand_arithmetic", "multiple_scans",
         "region_capture", "downstream_reduce"])
 def test_multiband_scan_shared_input_column_broadcast_outside_envelope_is_named(mode, diagnostic):
     dtype = "*i32" if mode == 0 else "*fp32"
@@ -9037,7 +9036,7 @@ def test_multiband_scan_unsigned_column_broadcast_consumer_is_named(mode):
         {"R": 16, "C": 16, "MODE": mode, "UNSIGNED": True, "MONOID": ""}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    diagnostic = ("nested scan requires a flat load/compute/store loop body" if mode == 8 else
+    diagnostic = ("a reduce inside a nested scan loop is supported as a sum" if mode == 8 else
                   "a scan-input column broadcast requires same-layout f32/i32 sources"
                   if mode in (3, 5, 7, 9, 10) else
                   "a rank-2 tl.reduce cannot share a function with a multi-band staged scan")
@@ -9245,9 +9244,9 @@ def test_multiband_scan_i32_column_monoid_broadcast_source_is_named(mode, reduct
     assert diagnostic in output, output
 
 
-@pytest.mark.parametrize("mode", [3, 4, 5, 6, 7, 8, 9, 10],
+@pytest.mark.parametrize("mode", [3, 4, 5, 6, 7, 9, 10],
                          ids=["mixed_store", "cross_axis", "wider_tile", "pre_expand_arithmetic",
-                              "multiple_scans", "nested_scan", "region_capture", "downstream_reduce"])
+                              "multiple_scans", "region_capture", "downstream_reduce"])
 def test_multiband_scan_i32_column_monoid_broadcast_consumer_is_named(mode):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_column_broadcast_kernel",
@@ -9256,7 +9255,7 @@ def test_multiband_scan_i32_column_monoid_broadcast_consumer_is_named(mode):
         {"R": 16, "C": 16, "MODE": mode, "UNSIGNED": False, "MONOID": "xor"}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    diagnostic = ("nested scan requires a flat load/compute/store loop body" if mode == 8 else
+    diagnostic = ("a reduce inside a nested scan loop is supported as a sum" if mode == 8 else
                   "a scan-input column broadcast requires same-layout f32/i32 sources"
                   if mode in (3, 5, 7, 9, 10) else
                   "a rank-2 tl.reduce cannot share a function with a multi-band staged scan")
@@ -9740,7 +9739,7 @@ def test_multiband_scan_f32_column_product_broadcast_source_is_named(mode, diagn
      "direct same-layout consumers in the original tile"),
     (7, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
-    (8, "nested scan requires a flat load/compute/store loop body"),
+    (8, "a reduce inside a nested scan loop is supported as a sum"),
     (9, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
 ], ids=["mixed_store", "cross_axis", "wider_tile", "multiple_scans", "nested_scan", "region_capture"])
@@ -13631,3 +13630,115 @@ def test_nested_scan_outer_carries_initialize_every_inner_slot(trips, num_warps)
         expected_other.append(other.clone())
     torch.testing.assert_close(first_out.cpu(), torch.stack(expected_first))
     torch.testing.assert_close(other_out.cpu(), torch.stack(expected_other))
+
+
+# A row sum inside a nested-scan loop -- read back over its tile beside the
+# scan, or carried as a running row total (the chunked cumsum) -- was refused:
+# the row reduce replays its source from device addresses, which the loop
+# defeats. Along the scan axis the broadcast total is P + S - x (P, S the
+# inclusive forward and reverse scans; P ^ S ^ x for an i32 xor), and a carried
+# row total read only as `carry[:, None]` becomes a tile carry.
+@triton.jit
+def _nested_scan_row_reduce_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexpr,
+                                   MODE: tl.constexpr):
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, C)[None, :]
+    if MODE == "chunked":
+        carry = tl.full((R,), 3, X.dtype.element_ty)
+        for chunk in range(chunks):
+            off = r * (chunks * C) + chunk * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) + carry[:, None])
+            carry += tl.sum(x, 1)
+    elif MODE == "beside":
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) - tl.sum(x, 1)[:, None])
+    elif MODE == "xor":
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) + tl.xor_sum(x, 1)[:, None])
+    else:
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) - tl.max(x, 1)[:, None])
+
+
+@pytest.mark.parametrize("mode, dtype", [("chunked", torch.float32), ("chunked", torch.int32),
+                                         ("beside", torch.float32), ("beside", torch.int32),
+                                         ("xor", torch.int32)])
+@pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 2), ((32, 32), 4),
+                                              ((4, 64), 1)])
+def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
+    chunks = 3
+    rows, cols = shape
+    n = chunks * rows * cols
+    torch.manual_seed(rows * cols + num_warps)
+    x = (torch.randint(-50, 50, (n,), dtype=torch.int32) if dtype == torch.int32 else
+         torch.randn(n))
+    out = torch.zeros(n, dtype=dtype, device="mps")
+    _nested_scan_row_reduce_kernel[(1,)](x.to("mps"), out, chunks, rows, cols, mode,
+                                         num_warps=num_warps)
+    torch.mps.synchronize()
+    if mode == "chunked":
+        want = (x.reshape(rows, chunks * cols).cumsum(1) + 3).reshape(-1)
+    else:
+        xs = x.reshape(chunks, rows, cols)
+        if mode == "beside":
+            want = (xs.cumsum(2) - xs.sum(2, keepdim=True)).reshape(-1)
+        else:
+            acc = xs[..., 0].clone()
+            for j in range(1, cols):
+                acc ^= xs[..., j]
+            want = (xs.cumsum(2) + acc[..., None]).reshape(-1)
+    if dtype == torch.int32:
+        assert torch.equal(out.cpu(), want.to(torch.int32))
+    else:
+        torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-4)
+
+
+def test_nested_scan_row_max_is_named(capfd):
+    x = torch.randn(3 * 512, device="mps")
+    out = torch.zeros_like(x)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _nested_scan_row_reduce_kernel[(1,)](x, out, 3, 8, 64, "max", num_warps=1)
+    captured = capfd.readouterr()
+    assert "a reduce inside a nested scan loop is supported as a sum" in (
+        captured.err + captured.out)
+
+
+
+# The nested-loop mode of the shared-input column broadcast above: a column sum
+# (or i32 xor) read back over the tile beside a row scan. It is now the pair of
+# column scans `P + S - x` (`P ^ S ^ x`) and exact.
+@pytest.mark.parametrize("monoid", ["", "xor"])
+@pytest.mark.parametrize("shape, num_warps", [((16, 16), 1), ((16, 16), 4), ((8, 64), 1),
+                                              ((32, 32), 2)])
+def test_nested_scan_column_reduce_beside_row_scan_matches_torch(monoid, shape, num_warps):
+    rows, cols = shape
+    steps = 3
+    dtype = torch.int32 if monoid else torch.float32
+    torch.manual_seed(rows * cols + num_warps)
+    x = (torch.randint(-50, 50, (steps * rows * cols,), dtype=torch.int32) if monoid else
+         torch.randn(steps * rows * cols))
+    y = torch.zeros(steps * rows * cols, dtype=dtype, device="mps")
+    unused = torch.zeros(1, dtype=dtype, device="mps")
+    _unsupported_shared_input_column_broadcast_kernel[(1,)](
+        x.to("mps"), unused, y, unused, unused, steps, rows, cols, 8, False, monoid,
+        num_warps=num_warps)
+    torch.mps.synchronize()
+    xs = x.reshape(steps, rows, cols)
+    if monoid:
+        reduced = xs[:, 0, :].clone()
+        for i in range(1, rows):
+            reduced ^= xs[:, i, :]
+    else:
+        reduced = xs.sum(1)
+    want = (xs.cumsum(2) + reduced[:, None, :]).reshape(-1)
+    if monoid:
+        assert torch.equal(y.cpu(), want)
+    else:
+        torch.testing.assert_close(y.cpu(), want, atol=1e-3, rtol=1e-4)
