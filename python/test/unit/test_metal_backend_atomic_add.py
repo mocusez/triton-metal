@@ -1522,3 +1522,92 @@ def test_atomic_add_tensor_rank5_strided():
     expected = initial.clone()
     expected.as_strided(shape, strides)[:] += programs
     assert torch.equal(out.cpu(), expected)
+
+
+# A scalar store or atomic is one effect per program, but every register band
+# of a tile runs the kernel body again. With more elements than threads the
+# function's band loop repeated each scalar effect once per band: a counter
+# beside a 256-element tile at one warp went up by 8, not 1, at top level and
+# inside a user loop alike, and `tl.store(p, tl.load(p) + 1)` did the same.
+@triton.jit
+def _scalar_effect_beside_tile(X, O, C, T, N: tl.constexpr, FORM: tl.constexpr):
+    i = tl.arange(0, N)
+    x = tl.load(X + i)
+    if FORM == "top":
+        tl.atomic_add(C, 1.0)
+        tl.store(O + i, x)
+    elif FORM == "loop":
+        for t in range(T):
+            tl.atomic_add(C, 1.0)
+            tl.store(O + t * N + i, x)
+    elif FORM == "while":
+        t = 0
+        while t < T:
+            tl.atomic_add(C, 2.0)
+            tl.store(O + t * N + i, x)
+            t += 1
+    elif FORM == "xchg":
+        for t in range(T):
+            tl.atomic_xchg(C, t * 1.0)
+            tl.store(O + t * N + i, x)
+    elif FORM == "rmw":
+        for t in range(T):
+            tl.store(C, tl.load(C) + tl.sum(x * (t + 1), 0))
+            tl.store(O + t * N + i, x)
+    elif FORM == "old":
+        old = tl.atomic_add(C, 1.0)
+        tl.store(O + i, x + old)
+
+
+@pytest.mark.parametrize("form", ["top", "loop", "while", "xchg", "rmw", "old"])
+@pytest.mark.parametrize("N, num_warps", [(64, 1), (256, 1), (256, 2), (1024, 4), (64, 2)])
+def test_scalar_effect_runs_once_per_program_across_bands(form, N, num_warps):
+    steps = 3
+    torch.manual_seed(N + num_warps)
+    x = torch.randn(N)
+    counter = torch.full((1,), 5.0, device="mps")
+    out = torch.zeros(steps * N, device="mps")
+    _scalar_effect_beside_tile[(1,)](x.to("mps"), out, counter, steps, N, form,
+                                     num_warps=num_warps)
+    torch.mps.synchronize()
+    stored = 1 if form in ("top", "old") else steps
+    want_out = torch.cat([x] * stored)
+    if form == "old":
+        want_out = want_out + 5.0
+    torch.testing.assert_close(out.cpu()[:stored * N], want_out, atol=1e-4, rtol=1e-4)
+    want_counter = {
+        "top": 6.0, "old": 6.0, "loop": 5.0 + steps, "while": 5.0 + 2 * steps,
+        "xchg": float(steps - 1), "rmw": 5.0 + x.sum().item() * sum(range(1, steps + 1)),
+    }[form]
+    assert counter.item() == pytest.approx(want_counter, rel=1e-4, abs=1e-3)
+
+
+@triton.jit
+def _scalar_old_value_in_banded_loop(X, O, C, T, N: tl.constexpr):
+    i = tl.arange(0, N)
+    x = tl.load(X + i)
+    for t in range(T):
+        old = tl.atomic_add(C, 1.0)
+        tl.store(O + t * N + i, x + old)
+
+
+def test_scalar_atomic_old_value_in_banded_loop_is_named(capfd):
+    # Band 0 runs every iteration of the user loop the band loop encloses, so a
+    # fetched value published once per band cannot reach the later bands.
+    x = torch.randn(256, device="mps")
+    out = torch.zeros(3 * 256, device="mps")
+    counter = torch.zeros(1, device="mps")
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _scalar_old_value_in_banded_loop[(1,)](x, out, counter, 3, 256, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "a scalar atomic whose old value is used cannot sit in a loop" in (
+        diagnostic.err + diagnostic.out)
+    # At one element per thread there is no band loop, and it is exact.
+    out = torch.zeros(3 * 64, device="mps")
+    counter = torch.zeros(1, device="mps")
+    _scalar_old_value_in_banded_loop[(1,)](x[:64].contiguous(), out, counter, 3, 64,
+                                           num_warps=2)
+    torch.mps.synchronize()
+    want = torch.cat([x[:64].cpu() + t for t in range(3)])
+    torch.testing.assert_close(out.cpu(), want)
+    assert counter.item() == 3.0

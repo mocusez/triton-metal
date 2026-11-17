@@ -367,6 +367,9 @@ static mlir::Value coneReplaySource(mlir::Operation *def) {
 static constexpr llvm::StringLiteral kStagedScanPhaseAttr =
     "metal.staged_scan_phase";
 static constexpr llvm::StringLiteral kRankNPhaseAttr = "metal.rank_n_phase";
+// The register-band loops `FuncOpLowering` wraps the function body in.
+static constexpr llvm::StringLiteral kFunctionBandLoopAttr =
+    "metal.function_band";
 static constexpr llvm::StringLiteral kExactPhaseSourceAttr =
     "metal.exact_phase_source";
 // A reduction consumes a complete input publication grouped with a scan.
@@ -1686,6 +1689,90 @@ static mlir::Value emitLocalTidUI32(mlir::OpBuilder &rewriter,
       .getResult(0);
 }
 
+// A scalar store or atomic is ONE per-program effect, but every register band
+// of a tile runs the kernel body again: the function's band loop and a staged
+// phase's band loop both repeat whatever they hold. 📏 `tl.atomic_add(cnt, 1)`
+// beside a 256-element tile at one warp added 8, not 1, at top level and in a
+// user loop alike; `tl.store(p, tl.load(p) + 1)` did the same. Returns the
+// predicate that keeps the effect to one band of every enclosing band loop --
+// the LAST, which has seen everything the band loops compute -- or null when
+// no band loop of more than one trip encloses `op`. With `firstBand`, band 0
+// instead, for an atomic whose fetched value the later bands read back.
+static bool isRegisterBandLoop(mlir::Operation *op) {
+  return mlir::isa<mlir::scf::ForOp>(op) &&
+         (op->hasAttr(kFunctionBandLoopAttr) || op->hasAttr(kScanBandLoopAttr));
+}
+
+static std::optional<int64_t> constantTripCount(mlir::scf::ForOp loop) {
+  auto constantOf = [](mlir::Value v) -> std::optional<int64_t> {
+    if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()))
+        return ia.getInt();
+    return std::nullopt;
+  };
+  auto lb = constantOf(loop.getLowerBound());
+  auto ub = constantOf(loop.getUpperBound());
+  auto step = constantOf(loop.getStep());
+  if (!lb || !ub || !step || *step <= 0)
+    return std::nullopt;
+  return std::max<int64_t>(0, (*ub - *lb + *step - 1) / *step);
+}
+
+static mlir::Value emitBandLeaderGuard(mlir::Operation *op,
+                                       mlir::OpBuilder &rewriter,
+                                       mlir::Location loc,
+                                       bool firstBand = false) {
+  mlir::Value guard;
+  for (mlir::Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (!isRegisterBandLoop(parent))
+      continue;
+    auto loop = mlir::cast<mlir::scf::ForOp>(parent);
+    if (auto trips = constantTripCount(loop); trips && *trips <= 1)
+      continue;
+    mlir::Value target = loop.getLowerBound();
+    if (!firstBand)
+      target = mlir::arith::SubIOp::create(rewriter, loc,
+                                           loop.getUpperBound(),
+                                           loop.getStep())
+                   .getResult();
+    mlir::Value leader =
+        mlir::arith::CmpIOp::create(rewriter, loc,
+                                    mlir::arith::CmpIPredicate::eq,
+                                    loop.getInductionVar(), target)
+            .getResult();
+    guard = guard ? mlir::arith::AndIOp::create(rewriter, loc, guard, leader)
+                        .getResult()
+                  : leader;
+  }
+  return guard;
+}
+
+// A fetched old value is published once, at band 0, and read back by every
+// band. That holds only while nothing between the atomic and the band loop
+// repeats it: a user loop the band loop encloses runs all its iterations in
+// band 0 and leaves the LAST one's value for the bands after it.
+static constexpr llvm::StringLiteral kScalarAtomicResultBandsMessage =
+    "Metal backend: a scalar atomic whose old value is used cannot sit in a "
+    "loop that the tile's register bands repeat (more elements than threads); "
+    "raise num_warps, or move the atomic out of the loop";
+
+static bool scalarAtomicResultCrossesBands(mlir::Operation *op) {
+  bool userLoop = false;
+  for (mlir::Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isRegisterBandLoop(parent)) {
+      auto trips = constantTripCount(mlir::cast<mlir::scf::ForOp>(parent));
+      if (userLoop && (!trips || *trips > 1))
+        return true;
+      continue;
+    }
+    if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(parent))
+      userLoop = true;
+  }
+  return false;
+}
+
 static mlir::Value emitPerIterIndex(const TileInfo &tile,
                                     mlir::scf::ForOp parentFor,
                                     mlir::ConversionPatternRewriter &rewriter,
@@ -2182,6 +2269,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           auto phase =
               mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
                                        cPhaseE.getResult(), cStep.getResult());
+          phase->setAttr(kFunctionBandLoopAttr, rewriter.getUnitAttr());
           auto &phaseBody = phase.getRegion().front();
           phaseBody.getOperations().splice(std::prev(phaseBody.end()),
                                            emptyBlock.getOperations(),
@@ -2213,6 +2301,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
         auto finalPhase =
             mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
                                      cFinalE.getResult(), cStep.getResult());
+        finalPhase->setAttr(kFunctionBandLoopAttr, rewriter.getUnitAttr());
         auto &finalBody = finalPhase.getRegion().front();
         finalBody.getOperations().splice(std::prev(finalBody.end()),
                                          emptyBlock.getOperations(),
@@ -2223,6 +2312,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
         auto forOp =
             mlir::scf::ForOp::create(rewriter, loc, cZero.getResult(),
                                      cE.getResult(), cStep.getResult());
+        forOp->setAttr(kFunctionBandLoopAttr, rewriter.getUnitAttr());
         auto &forBlock = forOp.getRegion().front();
         auto forYieldIt = std::prev(forBlock.end());
         forBlock.getOperations().splice(forYieldIt, emptyBlock.getOperations(),
@@ -21654,6 +21744,23 @@ struct MaskedLoadLowering
 // tt.store → metal.store
 //===----------------------------------------------------------------------===//
 
+// A scalar store, kept to one register band (`emitBandLeaderGuard`).
+static void emitBandLeaderScalarStore(mlir::Operation *op, mlir::Value value,
+                                      mlir::Value memref, mlir::Value index,
+                                      mlir::ConversionPatternRewriter &rewriter,
+                                      mlir::Location loc) {
+  mlir::Value band = emitBandLeaderGuard(op, rewriter, loc);
+  if (!band) {
+    StoreOp::create(rewriter, loc, value, memref, index);
+    return;
+  }
+  auto branch = mlir::scf::IfOp::create(rewriter, loc, band,
+                                        /*withElseRegion=*/false);
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(branch.thenBlock());
+  StoreOp::create(rewriter, loc, value, memref, index);
+}
+
 struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
   using OpConversionPattern::OpConversionPattern;
   mlir::LogicalResult
@@ -21699,6 +21806,10 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
                                         mlir::arith::CmpIPredicate::eq,
                                         localTid, cZero.getResult())
                 .getResult();
+        if (mlir::Value band = emitBandLeaderGuard(op, rewriter, loc))
+          isLaneZero =
+              mlir::arith::AndIOp::create(rewriter, loc, isLaneZero, band)
+                  .getResult();
         auto ifOp = mlir::scf::IfOp::create(rewriter, loc, isLaneZero,
                                             /*withElseRegion=*/false);
         {
@@ -21732,7 +21843,7 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
                                 .getResult(0);
       mlir::Value sval =
           castToMemrefStorage(adaptor.getValue(), memref, rewriter, loc);
-      StoreOp::create(rewriter, loc, sval, memref, idxUi32);
+      emitBandLeaderScalarStore(op, sval, memref, idxUi32, rewriter, loc);
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -21763,7 +21874,7 @@ struct StoreLowering : public mlir::OpConversionPattern<mlir::triton::StoreOp> {
               .getResult(0);
       mlir::Value sval =
           castToMemrefStorage(adaptor.getValue(), memref, rewriter, loc);
-      StoreOp::create(rewriter, loc, sval, memref, idxUi32);
+      emitBandLeaderScalarStore(op, sval, memref, idxUi32, rewriter, loc);
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -22376,6 +22487,10 @@ struct AtomicRmwLowering
     }
 
     const bool scalarResultUsed = !op.getResult().use_empty();
+    if (scalarResultUsed && scalarAtomicResultCrossesBands(op)) {
+      op.emitOpError(kScalarAtomicResultBandsMessage);
+      return mlir::failure();
+    }
     mlir::Value val = adaptor.getVal();
 
     // Add keeps its historical constant-true restriction. Min/max/umin/umax
@@ -22446,6 +22561,9 @@ struct AtomicRmwLowering
         rewriter, loc, mlir::arith::CmpIPredicate::eq, localTid.getResult(),
         cZero.getResult());
     mlir::Value guard = isFirst.getResult();
+    if (mlir::Value band = emitBandLeaderGuard(op, rewriter, loc,
+                                               /*firstBand=*/scalarResultUsed))
+      guard = mlir::arith::AndIOp::create(rewriter, loc, guard, band).getResult();
     if (!isAdd && op.getMask())
       guard =
           mlir::arith::AndIOp::create(rewriter, loc, guard, adaptor.getMask())
@@ -22696,6 +22814,10 @@ struct AtomicCasLowering
                                           rewriter.getIntegerAttr(ui32, 0))
                            .getResult();
 
+    if (resultUsed && scalarAtomicResultCrossesBands(op)) {
+      op.emitOpError(kScalarAtomicResultBandsMessage);
+      return mlir::failure();
+    }
     mlir::Operation *kernel = op->getParentOp();
     while (kernel && !kernel->hasAttr("ttg.num-warps"))
       kernel = kernel->getParentOp();
@@ -22716,6 +22838,11 @@ struct AtomicCasLowering
                                  rewriter, loc, mlir::arith::CmpIPredicate::eq,
                                  localTid, zeroI32.getResult())
                                  .getResult();
+    if (mlir::Value band = emitBandLeaderGuard(op, rewriter, loc,
+                                               /*firstBand=*/resultUsed))
+      isLaneZero =
+          mlir::arith::AndIOp::create(rewriter, loc, isLaneZero, band)
+              .getResult();
 
     auto ifOp = mlir::scf::IfOp::create(rewriter, loc, isLaneZero,
                                         /*withElseRegion=*/false);
