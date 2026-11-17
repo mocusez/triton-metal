@@ -37171,7 +37171,7 @@ emitterTileLabel(mlir::RankedTensorType ty, int64_t tpb) {
                       ty.getEncoding())
                 : nullptr;
   const int64_t rank = ty ? ty.getRank() : 0;
-  if (!enc || rank < 1 || rank > 3 ||
+  if (!enc || rank < 1 || rank > 5 ||
       static_cast<int64_t>(enc.getOrder().size()) != rank)
     return std::nullopt;
   // Plan the row-major decoding of the shape permuted so the fastest axis is
@@ -37358,7 +37358,9 @@ threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
     auto enc = ty ? mlir::dyn_cast_or_null<
                         mlir::triton::gpu::BlockedEncodingAttr>(ty.getEncoding())
                   : nullptr;
-    return enc && (ty.getRank() == 2 || ty.getRank() == 3) &&
+    // Rank 4 and 5 decompose through the same `emitTileCoordByOrder` the
+    // emitter uses for rank 3, so their labels are the same thread-major plan.
+    return enc && ty.getRank() >= 2 && ty.getRank() <= 5 &&
            isRowMajor(enc, ty.getRank());
   };
   auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
@@ -37495,8 +37497,26 @@ threadMajorCvtLabels(mlir::triton::gpu::ConvertLayoutOp cvt) {
 // publish half writes the slot its own layout names and the value it holds came
 // from a load addressed under the same tile, so any source layout publishes
 // correctly. Only the read has a second reader to agree with.
+//
+// A `tt.trans` source is the exception. The value it holds came from a load
+// addressed under the OPERAND's tile and carries that label, permuted; the
+// trans result's own layout plan, which this path publishes under, names a
+// different element order once the operand's layout wraps into a second
+// register band. `threadMajorCvtLabels` publishes under the permuted operand
+// label and is tried first; a trans it cannot label is refused rather than
+// published under the wrong one. 📏 Before rank 4 reached that path, 30 of 138
+// rank-4 permute-and-store cells came back wrong here (2x4x8x2 at one warp,
+// 4x4x8x2 at two), all of them silently.
 static bool
 nonLocalCvtReadIsThreadMajor(mlir::triton::gpu::ConvertLayoutOp cvt) {
+  {
+    mlir::Value source = cvt.getSrc();
+    while (auto inner =
+               source.getDefiningOp<mlir::triton::gpu::ConvertLayoutOp>())
+      source = inner.getSrc();
+    if (source.getDefiningOp<mlir::triton::TransOp>())
+      return false;
+  }
   auto srcRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getSrc().getType());
   auto dstRtt = mlir::dyn_cast<mlir::RankedTensorType>(cvt.getType());
   if (!srcRtt || !dstRtt || srcRtt.getRank() < 2 ||

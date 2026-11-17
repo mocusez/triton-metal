@@ -633,7 +633,9 @@ case and an adjacent rejection regression.
    `add`: the arithmetic, extremum, bitwise and replayed-region forms over f32,
    i32 and f16, and masked loads whose `other` is deliberately away from the
    combine's identity, so a dropped `other` cannot hide inside it.
-   Rank >= 4 tiles outside a planned aggregate phase are refused by name.
+   Rank-4 and rank-5 tiles outside a planned aggregate phase load, store,
+   broadcast and reduce like rank 3; a rank-4/5 tile with a unit axis whose
+   ranges have no consumer tile is still refused by name.
    Within that phase their per-axis ranges use the consumer tile's coordinates,
    including load-rooted rank-4 permute-to-reduce. A rank-3 reduction over a tile
    accumulated by an enclosing loop is likewise refused by name; it previously

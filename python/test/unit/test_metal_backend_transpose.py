@@ -33,6 +33,8 @@ not silently work around):
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -868,3 +870,49 @@ def test_rank3_reduce_with_independent_wider_broadcast_is_named_then_recovers(
     torch.mps.synchronize()
     expected = (survivor_x.T + w).sum(0)
     torch.testing.assert_close(survivor.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+# --- Rank-4 permute, loaded and stored through address cones ----------------
+#
+# A rank-4 `tl.permute` used to fall past the thread-major convert labels
+# (rank 2 and 3 only) into the generic exchange, which published the source
+# under the transposed tile's OWN layout plan while the value carried the
+# load's label, permuted. The two agree only while the load layout fits one
+# register band: 30 of 138 cells came back silently wrong (2x4x8x2 at one warp,
+# 4x4x8x2 at two) and 22 more were refused. The labels now cover rank 4 and 5,
+# and a `tt.trans` the labels cannot describe is refused rather than published
+# under the wrong plan.
+@triton.jit
+def _permute_rank4_addr_kernel(X, O, A: tl.constexpr, B: tl.constexpr,
+                               C: tl.constexpr, D: tl.constexpr,
+                               S0: tl.constexpr, S1: tl.constexpr,
+                               S2: tl.constexpr, S3: tl.constexpr,
+                               P0: tl.constexpr, P1: tl.constexpr,
+                               P2: tl.constexpr, P3: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None, None]
+    b = tl.arange(0, B)[None, :, None, None]
+    c = tl.arange(0, C)[None, None, :, None]
+    d = tl.arange(0, D)[None, None, None, :]
+    v = tl.load(X + a * (B * C * D) + b * (C * D) + c * D + d)
+    p = tl.permute(v, (P0, P1, P2, P3))
+    i0 = tl.arange(0, S0)[:, None, None, None]
+    i1 = tl.arange(0, S1)[None, :, None, None]
+    i2 = tl.arange(0, S2)[None, None, :, None]
+    i3 = tl.arange(0, S3)[None, None, None, :]
+    tl.store(O + i0 * (S1 * S2 * S3) + i1 * (S2 * S3) + i2 * S3 + i3, p)
+
+
+_RANK4_PERMS = list(itertools.permutations(range(4)))
+
+
+@pytest.mark.parametrize("perm", _RANK4_PERMS, ids=["".join(map(str, p)) for p in _RANK4_PERMS])
+@pytest.mark.parametrize("shape, num_warps", [((2, 4, 8, 2), 1), ((4, 4, 8, 2), 2),
+                                              ((2, 4, 8, 4), 4), ((2, 2, 4, 8), 1)])
+def test_permute_rank4_address_cone_matches_torch(shape, num_warps, perm):
+    x = torch.randn(*shape)
+    expected = x.permute(*perm).contiguous()
+    out = torch.zeros(expected.numel(), device="mps")
+    _permute_rank4_addr_kernel[(1,)](x.reshape(-1).to("mps"), out, *shape,
+                                     *expected.shape, *perm, num_warps=num_warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out.cpu().reshape(expected.shape), expected)
