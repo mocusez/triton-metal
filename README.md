@@ -850,9 +850,15 @@ case and an adjacent rejection regression.
    stay intact within their phase. Scalar loops may nest and may remain in
    no-result branches around the scan or in result-branch yield cones;
    scalar-result ifs may also nest in those no-result branches, in
-   tensor-result branch yield cones, and in pure scalar loops. Local scalar loads
+   tensor-result branch yield cones, and in pure scalar loops. A load-free
+   scalar loop or result if directly in the selected loop may also be read in
+   a later scan phase: it is replayed after its phase together with the pure
+   scalar values it reads from that phase (as are plain scalar values read
+   later). Local scalar loads
    must be consumed within the same scan phase and are not replayed as result
-   sources. Post-scan branches clone pure tensor address cones at their consumers without
+   sources; a scalar-result if with a store or atomic in it is refused by that
+   name.
+   Post-scan branches clone pure tensor address cones at their consumers without
    replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
    rejected. Supported result-carrying internal ifs use
    slots before phase splitting, with pure or write-separated load sources.

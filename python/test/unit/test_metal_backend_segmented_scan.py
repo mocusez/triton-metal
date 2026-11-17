@@ -3331,7 +3331,7 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
     ("_rankn_scan_internal_effecting_scalar_result_if_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
       "rows": "i32"},
-     "nested scan carries only tensors between iterations"),
+     "whose results are all scalars may hold only pure scalar work"),
     ("_rankn_scan_effecting_scalar_result_if_in_for_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
       "rows": "i32"},
@@ -3339,7 +3339,7 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
     ("_rankn_scan_branch_effecting_scalar_result_if_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "branch_ptr": "*fp32",
       "scratch_ptr": "*fp32", "rows": "i32"},
-     "nested scan carries only tensors between iterations"),
+     "whose results are all scalars may hold only pure scalar work"),
     ("_rankn_scan_internal_tensor_for_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "rows": "i32"},
      "nested scan requires a flat load/compute/store loop body"),
@@ -3367,7 +3367,7 @@ def _compile_rankn_nested_negative_in_child(kernel, signature, constexprs,
     ("_rankn_scan_result_if_effecting_scalar_result_if_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
       "rows": "i32"},
-     "nested scan carries only tensors between iterations"),
+     "whose results are all scalars may hold only pure scalar work"),
     ("_rankn_scan_internal_result_if_write_kernel",
      {"x_ptr": "*fp32", "out_ptr": "*fp32", "scratch_ptr": "*fp32",
       "rows": "i32"},
@@ -13256,3 +13256,95 @@ def test_mixed_staged_scan_band_counts_match_torch(reverse, a, b, c):
     expected2 = _reverse_cumsum(x.cpu()[:a * b].reshape(a, b), 1, reverse)
     torch.testing.assert_close(o.cpu(), expected3.reshape(-1), atol=0, rtol=0)
     torch.testing.assert_close(q.cpu(), expected2.reshape(-1), atol=0, rtol=0)
+
+
+# --- Load-free scalar regions read after the scan ----------------------------
+#
+# A pure scalar for/while/if directly in the selected loop whose result is read
+# in a LATER scan phase was refused as "scalar loads cannot cross a scan phase"
+# even with no load in it. The phase materializer now replays such a region,
+# with the pure scalar cone it reads, once after its phase. A region that loads
+# keeps the refusal (the phase may have written what it reads), and so does a
+# region reading a value that cannot be recomputed after the phase.
+@triton.jit
+def _rankn_scan_cross_phase_pure_region_kernel(x_ptr, out_ptr, rows,
+                                               KIND: tl.constexpr):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        bias = row * 3 + 1
+        delta = 0
+        if KIND == "for":
+            for col in range(row + 1):
+                delta += col * 2 + bias
+        elif KIND == "while":
+            col = 0
+            while col <= row:
+                delta += col * 2 + bias
+                col += 1
+        else:
+            if row % 2 == 1:
+                delta = bias * 5
+            else:
+                delta = -bias
+        scanned = tl.cumsum(x, 1)
+        tl.store(out_ptr + row * 512 + index, scanned + delta)
+
+
+def _cross_phase_delta(row, kind):
+    bias = row * 3 + 1
+    if kind in ("for", "while"):
+        return sum(col * 2 + bias for col in range(row + 1))
+    return bias * 5 if row % 2 == 1 else -bias
+
+
+@mps_only
+@pytest.mark.parametrize("kind", ["for", "while", "if"])
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_multiband_scan_cross_phase_pure_scalar_region_matches_torch(
+        kind, rows, num_warps):
+    storage_rows = max(rows, 1)
+    x = (torch.arange(storage_rows * 512)
+         .reshape(storage_rows, 8, 64) % 7 - 3).float()
+    out = torch.full_like(x, -999999, device="mps")
+    _rankn_scan_cross_phase_pure_region_kernel[(1,)](
+        x.to("mps"), out, rows, KIND=kind, num_warps=num_warps)
+    torch.mps.synchronize()
+    expected = torch.full_like(x, -999999)
+    for row in range(rows):
+        expected[row] = x[row].cumsum(1) + _cross_phase_delta(row, kind)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@triton.jit
+def _rankn_scan_cross_phase_region_reads_load_kernel(x_ptr, scalar_ptr,
+                                                     out_ptr, rows):
+    index = tl.reshape(tl.arange(0, 512), (8, 64))
+    for row in range(rows):
+        x = tl.load(x_ptr + row * 512 + index)
+        base = tl.load(scalar_ptr + row)
+        delta = 0
+        for col in range(row + 1):
+            delta += base * col
+        scanned = tl.cumsum(x, 1)
+        tl.store(out_ptr + row * 512 + index, scanned + delta)
+
+
+@pytest.mark.parametrize("kernel,signature,reason", [
+    ("_rankn_scan_cross_phase_scalar_load_in_for_kernel",
+     {"x_ptr": "*fp32", "scalar_ptr": "*i32", "out_ptr": "*fp32",
+      "rows": "i32"},
+     "nested scan scalar loads cannot cross a scan phase"),
+    ("_rankn_scan_cross_phase_region_reads_load_kernel",
+     {"x_ptr": "*fp32", "scalar_ptr": "*i32", "out_ptr": "*fp32",
+      "rows": "i32"},
+     "nested scan scalar region results cannot cross a scan phase"),
+])
+def test_multiband_scan_cross_phase_region_refusals_are_named(
+        kernel, signature, reason):
+    result = _compile_rankn_nested_negative_in_child(kernel, signature, {})
+    output = result.stdout + result.stderr
+    assert result.returncode > 0, output
+    assert reason in output, output
+
