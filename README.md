@@ -519,7 +519,16 @@ case and an adjacent rejection regression.
    the offsets beneath it instead, so an address keeps its kernel-argument root:
    the embedding gather `emb + ids[:, None] * D + cols[None, :]` with as many
    rows as threads, and a `(4, 8, 1)` tile at one warp, used to decline inside
-   the conversion and crash during its rollback.
+   the conversion and crash during its rollback. The main conversion no longer
+   rolls back at all: the first op no lowering accepts is reported as the
+   driver reports it ("failed to legalize operation"), the rest of the
+   conversion is drained without further diagnostics, and the pass fails, so a
+   decline nobody has named yet is an error rather than a crash.
+   Scalar stores and scalar atomics run once per program: with more elements
+   than threads the function's register-band loop used to repeat them, so a
+   `tl.atomic_add(cnt, 1)` beside a 256-element tile at one warp added 8. A
+   scalar atomic whose old value is used inside a loop that the bands repeat is
+   refused by name.
    An independent wide rank-2 broadcast beside a multiband rank-N reduction is
    also refused before conversion: its tile needs more register bands than the
    reduction phase, and running the whole phase more often would repeat the
@@ -644,12 +653,15 @@ case and an adjacent rejection regression.
    i32 and f16, and masked loads whose `other` is deliberately away from the
    combine's identity, so a dropped `other` cannot hide inside it.
    Rank-4 and rank-5 tiles outside a planned aggregate phase load, store,
-   broadcast and reduce like rank 3; a rank-4/5 tile with a unit axis whose
-   ranges have no consumer tile is still refused by name.
+   broadcast and reduce like rank 3, including tiles that keep a unit axis
+   (`[4, 8, 1, 4]`): the access a load or store is given is their tile. A
+   unit-axis access reached only through a layout conversion is refused by
+   name.
    Within that phase their per-axis ranges use the consumer tile's coordinates,
    including load-rooted rank-4 permute-to-reduce. A rank-3 reduction over a tile
-   accumulated by an enclosing loop is likewise refused by name; it previously
-   failed the pass with no diagnostic at all.
+   accumulated by a loop that only reads (`acc += tl.load(...)`) runs with the
+   accumulation before its publication; the accumulator counts as load-rooted,
+   so it is also published thread-major. A loop that stores is refused by name.
    The canonical tiled matmul is now exact at every block shape, not only at
    an 8-wide reduction. One `simdgroup_multiply_accumulate` consumes an 8-wide
    slice of K, and the unrolled pointer-advance loop emitted one per K-loop
@@ -800,17 +812,21 @@ case and an adjacent rejection regression.
    matrices are numerically clean. Rank-3 and rank-4 permute-to-reduce now map
    thread-major load-rooted input coordinates through the permutation before
    exact publication, on every reduction axis and across register bands.
-   Non-load-rooted permuted sources remain named boundaries. One top-level
+   A permuted source computed from its own coordinates (`tl.arange`
+   arithmetic) is exact too, under the layout's own label; broadcast and
+   reshaped sources remain named boundaries. One top-level
    no-iter_arg uniform loop can now stage direct-load rank >= 3 reductions
    independently on each iteration, with cyclic publish addressing and barriers.
    The source, the result and every range in the loop share that cyclic order;
    a wrapped load layout used to be published thread-major instead, and 17 of
    48 rank-3 loop cells (plus rank-4 and broadcast-back forms) were silently
    wrong. In a loop the result must be stored (directly, through `tl.reshape`
-   or with an added unit axis) and fit one element per thread; other consumers
-   and wider results are refused by name. Nested or multiple rank-N reduction
-   loops, loop-carried sources and one-band loop reductions remain named
-   boundaries. Top-level single-value rank >= 2
+   or with an added unit axis); results of several elements per thread and
+   one-band sources are exact: the address cones LICM hoisted are cloned back
+   into the loop, every tile and exchange there is cyclic, and a function whose
+   tiles all live in such loops is not wrapped in its band loop again. Other
+   consumers, nested or multiple rank-N reduction loops and loop-carried
+   sources remain named boundaries. Top-level single-value rank >= 2
    scans now support multiple elements per thread. Rank-2 and rank-3 scans with
    different register-band counts can share a function: each scan's consumers
    finish in that scan's own phase before the next publication begins. Rank >= 2
@@ -826,12 +842,15 @@ case and an adjacent rejection regression.
    iter_args, and snapshots of tensors computed before the loop. Integer and
    floating-point scalar iter_args pass through the SSA yield; pure scalar
    definitions used outside a register band are cloned at its boundary to
-   preserve dominance. Carried tensors use threadgroup slots and must be integer
-   or floating-point tiles of at least eight bits and use the function tile's
-   register and thread counts. Replicated carry layouts use canonical-owner
+   preserve dominance. Carried tensors must be integer or floating-point tiles of
+   at least eight bits and use the function tile's register and thread counts.
+   A slot whose every access uses one layout plan without replicated owners is
+   thread-private (one element per register band) and costs no threadgroup
+   memory, so a 64x64 cumsum carrying two tiles fits; other slots are
+   threadgroup tiles. Replicated carry layouts use canonical-owner
    writes with barriers; replicated stores retain their existing replica-write
-   semantics without truncating valid register bands. Carry slots count against
-   the 32 KiB threadgroup budget. The innermost multiband scan loop may also be
+   semantics without truncating valid register bands. Threadgroup carry slots
+   count against the 32 KiB budget. The innermost multiband scan loop may also be
    nested in uniform outer `scf.for`/`scf.if` and `scf.while` control flow.
    While conditions stay pure scalar computations; tensor state uses budgeted
    pre/body/post slots without becoming region arguments. Outer `for` scopes
@@ -861,8 +880,14 @@ case and an adjacent rejection regression.
    fewer registers than the scan's band (it is guarded per band iteration, as
    outside the branch); a narrower load there stays refused.
    Post-scan branches clone pure tensor address cones at their consumers without
-   replaying loads or slot reads. Tensor-carrying or effecting inner loops remain
-   rejected. Supported result-carrying internal ifs use
+   replaying loads or slot reads. An inner loop that carries tiles but only loads
+   and works element-wise on the scan's tiles (`v = v * 0.5 + 1` iterated, or
+   `acc += tl.load(...)` before a cumsum) runs in each register band like the
+   function body's band loop; inner loops that store, perform atomics or move
+   data between elements are refused by name. A result if after the scan may read
+   the scan result: it is copied through a slot right after the scan (a scan
+   result that a later scan also consumes is refused by name). Supported
+   result-carrying internal ifs use
    slots before phase splitting, with pure or write-separated load sources.
    Mixed tensor/scalar results allocate slots only for tensors and preserve scalar
    SSA results. Multiple internal results can feed independent scans or chained result ifs
