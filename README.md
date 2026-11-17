@@ -803,8 +803,14 @@ case and an adjacent rejection regression.
    Non-load-rooted permuted sources remain named boundaries. One top-level
    no-iter_arg uniform loop can now stage direct-load rank >= 3 reductions
    independently on each iteration, with cyclic publish addressing and barriers.
-   Nested or multiple rank-N reduction loops, loop-carried sources and one-band
-   loop reductions remain named boundaries. Top-level single-value rank >= 2
+   The source, the result and every range in the loop share that cyclic order;
+   a wrapped load layout used to be published thread-major instead, and 17 of
+   48 rank-3 loop cells (plus rank-4 and broadcast-back forms) were silently
+   wrong. In a loop the result must be stored (directly, through `tl.reshape`
+   or with an added unit axis) and fit one element per thread; other consumers
+   and wider results are refused by name. Nested or multiple rank-N reduction
+   loops, loop-carried sources and one-band loop reductions remain named
+   boundaries. Top-level single-value rank >= 2
    scans now support multiple elements per thread. Rank-2 and rank-3 scans with
    different register-band counts can share a function: each scan's consumers
    finish in that scan's own phase before the next publication begins. Rank >= 2

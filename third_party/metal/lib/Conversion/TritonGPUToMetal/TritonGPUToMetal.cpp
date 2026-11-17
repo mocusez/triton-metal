@@ -16920,6 +16920,21 @@ static bool rankNReduceHasKeepDimsUsers(mlir::triton::ReduceOp op) {
   });
 }
 
+// A loop's reduce result with more than one element per thread is consumed
+// (through the reshape that flattens it for its store) under a different
+// element order than the cyclic one the loop publishes it in. 📏 Every one of
+// the 9 such cells in the 48-cell loop sweep was wrong (rank-3 sums at
+// 8x8x8/4x8x16/2x8x16 and their neighbours, results of 64-128 elements over
+// 32-64 threads); every cell whose result fits one element per thread is exact.
+// A result nothing reads cannot be read in the wrong order.
+static bool rankNLoopReduceResultWrapsThreads(mlir::triton::ReduceOp op,
+                                              int64_t threadsPerBlock) {
+  auto resultTy =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  return resultTy && !op->getResult(0).use_empty() &&
+         resultTy.getNumElements() > threadsPerBlock;
+}
+
 static std::optional<RankNReducePlan>
 planRankNReduce(mlir::triton::ReduceOp op) {
   if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
@@ -17009,7 +17024,26 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // A hypercube stage reduces a RESHAPE of a rank-1 blocked tile whose range
   // DID reach that emission, so it keeps the layout's own plan.
   bool threadMajorRelabel = false;
-  if (auto permutation = rankNReduceSourcePermutation(op)) {
+  // Inside a user loop the loads, the stores and every range between them are
+  // planned CYCLIC (`localTid + iv * T`) by the loop's own range pass, so the
+  // staged source and result must use that order too. Asking the thread-major
+  // question first published a wrapped load layout under `localTid * E + iv`
+  // while its addresses ran cyclic: 21 of 52 measured loop cells answered a
+  // different program, silently (rank-3/4 sums over every axis from
+  // 4x8x8 at one warp, and `v - tl.sum(v, 2)[:, :, None]` from E = 2).
+  const bool cyclicUserLoop =
+      enc && srcTy.getRank() >= 3 && op->hasAttr(kRankNUserLoopAttr);
+  if (cyclicUserLoop) {
+    if (rankNReduceSourcePermutation(op) ||
+        rankNLoopReduceResultWrapsThreads(op, srcIndexPlan->threadsPerBlock()))
+      return std::nullopt;
+    auto relabel = cyclicLayoutPlan(srcTy.getShape(),
+                                    srcIndexPlan->threadsPerBlock());
+    if (!relabel)
+      return std::nullopt;
+    srcIndexPlan = std::move(relabel);
+    threadMajorRelabel = true;
+  } else if (auto permutation = rankNReduceSourcePermutation(op)) {
     auto inputTy = mlir::dyn_cast<mlir::RankedTensorType>(
         permutation.getSrc().getType());
     if (!enc || srcTy.getRank() < 3 || !inputTy ||
@@ -17050,14 +17084,6 @@ planRankNReduce(mlir::triton::ReduceOp op) {
       srcIndexPlan = std::move(relabel);
       threadMajorRelabel = true;
     }
-  } else if (enc && srcTy.getRank() >= 3 &&
-             op->hasAttr(kRankNUserLoopAttr)) {
-    auto relabel = cyclicLayoutPlan(srcTy.getShape(),
-                                    srcIndexPlan->threadsPerBlock());
-    if (!relabel)
-      return std::nullopt;
-    srcIndexPlan = std::move(relabel);
-    threadMajorRelabel = true;
   }
   const int axis = static_cast<int>(op.getAxis());
   if (axis < 0 || axis >= srcTy.getRank())
@@ -17097,7 +17123,10 @@ planRankNReduce(mlir::triton::ReduceOp op) {
         // The result is consumed by ops that address it thread-major too, so a
         // relabelled source needs a relabelled result: one labeling per kernel.
         resultLayout =
-            threadMajorRelabel
+            cyclicUserLoop
+                ? cyclicLayoutPlan(resultTy.getShape(),
+                                   srcIndexPlan->threadsPerBlock())
+            : threadMajorRelabel
                 ? threadMajorLayoutPlan(resultTy.getShape(),
                                         srcIndexPlan->threadsPerBlock())
                 : planLayoutIndex(resultTy);
@@ -47357,6 +47386,72 @@ struct ConvertTritonGPUToMetalPass
       }
       const bool stagedFallback = planRankNReduce(red).has_value();
       if (rtt && rtt.getRank() >= 3 && !stagedFallback &&
+          red->hasAttr(kRankNUserLoopAttr) &&
+          mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+              rtt.getEncoding())) {
+        auto func = red->getParentOfType<mlir::triton::FuncOp>();
+        auto mod = func ? func->getParentOfType<mlir::ModuleOp>() : nullptr;
+        int64_t tpb = 0;
+        if (mod)
+          if (auto nw = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
+            if (auto tpw = mod->getAttrOfType<mlir::IntegerAttr>(
+                    "ttg.threads-per-warp"))
+              tpb = nw.getInt() * tpw.getInt();
+        if (tpb > 0 && rankNLoopReduceResultWrapsThreads(red, tpb)) {
+          red.emitOpError(
+              "Metal backend: a rank >= 3 reduce inside a loop needs a result "
+              "of at most one element per thread (")
+              << mlir::cast<mlir::RankedTensorType>(
+                     red->getResult(0).getType())
+                     .getNumElements()
+              << " elements over " << tpb
+              << " threads); raise num_warps or reduce outside the loop";
+          reduceOk = false;
+          return;
+        }
+      }
+      if (rtt && rtt.getRank() >= 3 && stagedFallback &&
+          red->hasAttr(kRankNUserLoopAttr)) {
+        // In a loop the result is published cyclic, and only a store (or a
+        // reshape the store flattens it through) addresses it that way. A
+        // broadcast back into the tile (`v - tl.sum(v, 2)[:, :, None]`) read
+        // it in another order and was wrong from two elements per thread.
+        // Adding a unit axis for a store of the same elements is not a
+        // broadcast and stays allowed.
+        const int64_t resultElements =
+            mlir::cast<mlir::RankedTensorType>(red->getResult(0).getType())
+                .getNumElements();
+        std::function<bool(mlir::Value)> storedOnly =
+            [&](mlir::Value v) -> bool {
+          for (mlir::Operation *user : v.getUsers()) {
+            if (mlir::isa<mlir::triton::StoreOp>(user) &&
+                user->getOperand(1) == v)
+              continue;
+            auto userTy = mlir::dyn_cast<mlir::RankedTensorType>(
+                user->getNumResults() == 1 ? user->getResult(0).getType()
+                                           : mlir::Type());
+            const bool sameElements =
+                userTy && userTy.getNumElements() == resultElements;
+            if (mlir::isa<mlir::triton::ReshapeOp,
+                          mlir::triton::gpu::ConvertLayoutOp,
+                          mlir::triton::ExpandDimsOp,
+                          mlir::triton::BroadcastOp>(user) &&
+                sameElements && storedOnly(user->getResult(0)))
+              continue;
+            return false;
+          }
+          return true;
+        };
+        if (!storedOnly(red->getResult(0))) {
+          red.emitOpError(
+              "Metal backend: a rank >= 3 reduce inside a loop can only be "
+              "stored, directly or through tt.reshape; move other consumers "
+              "of its result out of the loop");
+          reduceOk = false;
+          return;
+        }
+      }
+      if (rtt && rtt.getRank() >= 3 && !stagedFallback &&
           rankNReduceSourcePermutation(red)) {
         red.emitOpError(
             "rank >= 3 reduce over a permuted tile requires a thread-major "
@@ -48176,10 +48271,16 @@ struct ConvertTritonGPUToMetalPass
             return entry.second->getBlock() == loop.getBody();
           });
       if (rankNLoop) {
+        // Cyclic in the coordinates of the tile the range addresses, at that
+        // tile's own rank (a rank-4 source, or the rank-2 tile a stored
+        // result is written through), matching the reduce's plans.
         std::optional<LayoutIndexPlan> plan;
-        if (auto tile = valueConsumerTileOfRank(range.getResult(), 3))
-          plan = cyclicLayoutPlan(tile->shape, tile->threadsPerBlock);
-        else
+        for (int64_t rank : {3, 4, 5, 2})
+          if (auto tile = valueConsumerTileOfRank(range.getResult(), rank)) {
+            plan = cyclicLayoutPlan(tile->shape, tile->threadsPerBlock);
+            break;
+          }
+        if (!plan)
           plan = planLinearRange(range, /*allowMixedHypercube=*/true);
         if (!plan) {
           range.emitOpError(

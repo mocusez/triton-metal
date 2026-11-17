@@ -1068,6 +1068,116 @@ def _rank3_reduce_loop_direct_store_kernel(X, O, T, A: tl.constexpr,
         tl.store(O + t * B * C + b * C + c, s)
 
 
+# Inside a loop the loads, the stores and every range between them are planned
+# cyclic, and the staged reduce has to publish and read in that order too. It
+# used to ask the thread-major question first, so a load layout that wrapped
+# into a second register band was published `localTid * E + iv` while its
+# addresses ran cyclic: 17 of these 48 cells were silently wrong. The cells
+# whose RESULT exceeds one element per thread are refused by name (below).
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize("shape, warps", [
+    ((2, 4, 8), 1), ((4, 4, 8), 2), ((4, 8, 8), 2), ((8, 8, 8), 2), ((8, 8, 8), 4),
+    ((2, 8, 16), 4), ((4, 8, 16), 4),
+])
+def test_rank3_reduce_loop_wrapped_layout_matches_torch(shape, warps, axis):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(0xC1C1 + a * b * c + axis + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    expected = x.reshape(steps, a, b, c).sum(axis + 1).reshape(-1)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    _rank3_reduce_loop_kernel[(1,)](
+        x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("shape, warps, axis", [((4, 8, 8), 1, 1), ((4, 8, 16), 1, 2), ((2, 8, 16), 2, 1)])
+def test_rank3_reduce_loop_single_band_result_matches_torch(shape, warps, axis):
+    a, b, c = shape
+    steps = 2
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(0xC2C2 + a * b * c + axis)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    expected = x.reshape(steps, a, b, c).sum(axis + 1).reshape(-1)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    _rank3_reduce_loop_kernel[(1,)](
+        x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 1, 1), ((2, 8, 16), 2, 0)])
+def test_rank3_reduce_loop_wrapped_result_is_named(capfd, shape, warps, axis):
+    # A result of more than one element per thread is flattened for its store
+    # in another order than the loop publishes it in; all 9 such cells of the
+    # sweep were wrong, so they are refused by name.
+    a, b, c = shape
+    out_elements = a * b * c // shape[axis]
+    x = torch.randn(2 * a * b * c, dtype=torch.float32)
+    out = torch.zeros(2 * out_elements, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_reduce_loop_kernel[(1,)](
+            x, out, 2, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
+    diagnostic = capfd.readouterr()
+    assert "inside a loop needs a result of at most one element per thread" in (
+        diagnostic.err + diagnostic.out)
+
+
+@triton.jit
+def _rank4_reduce_loop_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                              D: tl.constexpr, AXIS: tl.constexpr, OUT: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None, None]
+    b = tl.arange(0, B)[None, :, None, None]
+    c = tl.arange(0, C)[None, None, :, None]
+    d = tl.arange(0, D)[None, None, None, :]
+    offsets = a * (B * C * D) + b * (C * D) + c * D + d
+    for t in range(T):
+        s = tl.sum(tl.load(X + t * A * B * C * D + offsets), AXIS)
+        tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, 3])
+def test_rank4_reduce_loop_wrapped_layout_matches_torch(axis):
+    shape = (2, 4, 8, 2)
+    steps = 2
+    numel = 2 * 4 * 8 * 2
+    out_elements = numel // shape[axis]
+    torch.manual_seed(0xC4C4 + axis)
+    x = torch.randn(steps * numel, dtype=torch.float32)
+    expected = x.reshape(steps, *shape).sum(axis + 1).reshape(-1)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    _rank4_reduce_loop_kernel[(1,)](
+        x, out, steps, *shape, AXIS=axis, OUT=out_elements, num_warps=2)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@triton.jit
+def _rank3_loop_reduce_broadcast_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
+                                        C: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        tl.store(O + t * A * B * C + offsets, v - tl.sum(v, axis=2)[:, :, None])
+
+
+def test_rank3_loop_reduce_broadcast_consumer_is_named(capfd):
+    # Read back through a broadcast the loop's reduce result was wrong from two
+    # elements per thread (the same broadcast outside a loop is exact).
+    a, b, c = 4, 4, 4
+    x = torch.randn(2 * a * b * c, dtype=torch.float32)
+    out = torch.zeros(2 * a * b * c, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _rank3_loop_reduce_broadcast_kernel[(1,)](x, out, 2, A=a, B=b, C=c, num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "inside a loop can only be stored" in diagnostic.err + diagnostic.out
+
+
 def test_rank3_reduce_direct_load_loop_rank2_store():
     a, b, c, steps = 4, 4, 4, 3
     torch.manual_seed(0xD00D)
