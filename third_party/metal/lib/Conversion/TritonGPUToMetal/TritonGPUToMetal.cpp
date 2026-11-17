@@ -565,6 +565,27 @@ static llvm::DenseSet<mlir::Operation *> g_nestedScanLocalScalarLoadRegions;
 // replays each one, with the pure scalar cone it reads, after its phase.
 static llvm::DenseSet<mlir::Operation *> g_nestedScanCrossPhaseRegions;
 
+// Rollback safety of the main conversion.
+//
+// `FuncOpLowering` moves the function body with a tracked `inlineRegionBefore`
+// and then splices, erases and RAUWs by hand, so the conversion driver cannot
+// undo it: unwinding the inline walks the block it already freed. Any
+// `applyFullConversion` that fails after `FuncOpLowering` ran therefore used to
+// read freed memory, and so did `FuncOpLowering` failing after its splice.
+// Pre-conversion checks name every known refusal, but a new decline inside the
+// conversion would bring the use-after-free back.
+//
+// So the main conversion never rolls back. The first op no lowering accepts is
+// reported the way the driver reports it and POISONS the conversion
+// (`ConversionPoisonFallback`); from then on every Triton, arith, math and
+// unknown op is legal, later diagnostics are dropped, and the driver finishes
+// without undoing anything. The pass then fails on the poison flag.
+// Eligible ops are the ones present before the conversion and the ones in a
+// kernel `FuncOpLowering` built; ops other patterns generate keep the
+// driver's per-pattern backtracking.
+static bool g_conversionPoisoned = false;
+static llvm::DenseSet<mlir::Operation *> g_poisonEligibleOps;
+
 // One shared answer to "will the phase split break this function?".
 //
 // `FuncOpLowering` splices the body into sibling `scf.for` phases, one per
@@ -1819,6 +1840,16 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
 
     rewriter.inlineRegionBefore(op.getBody(), kernel.getBodyRegion(),
                                 kernel.getBodyRegion().end());
+    // From here on the body is moved and spliced by hand, which the driver
+    // cannot undo, so a failure poisons the conversion instead of declining
+    // (see `g_conversionPoisoned`).
+    auto poisonFunction = [&]() -> mlir::LogicalResult {
+      op.emitError() << "failed to legalize operation '" << op->getName()
+                     << "'";
+      g_conversionPoisoned = true;
+      rewriter.eraseOp(op);
+      return mlir::success();
+    };
     auto &kernelRegion2 = kernel.getBodyRegion();
     auto &emptyBlock = kernelRegion2.front();
     auto &origBlock = *(std::next(kernelRegion2.begin()));
@@ -1877,14 +1908,14 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // remaining scalarized body.
     if (mlir::failed(materializeLoopCarriedGathers(emptyBlock, lastProloguePtr,
                                                    rewriter)))
-      return mlir::failure();
+      return poisonFunction();
 
     // A block-uniform scalar recurrence that internally consumes complete
     // rank-1 tiles must run once per CTA.  Materialize it before the synthetic
     // output-band loop; its scalar results may safely dominate that loop.
     if (mlir::failed(materializeTileInvariantReduceLoops(
             emptyBlock, lastProloguePtr, rewriter)))
-      return mlir::failure();
+      return poisonFunction();
 
     // Straight-line rank-1 aggregates (softmax max/sum) are likewise complete
     // CTA computations.  Clone their replay cones and commit their scalar
@@ -1892,7 +1923,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // executed once rather than once per output register band.
     if (mlir::failed(materializeTileInvariantRank1Reduces(
             emptyBlock, lastProloguePtr, rewriter)))
-      return mlir::failure();
+      return poisonFunction();
 
     // BLOCK_SIZE > threads_per_block: wrap the spliced body in an outer
     // `scf.for(0, E, 1)`. Load/store lowerings detect the parent for and
@@ -1942,7 +1973,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
       op.emitOpError() << "Metal backend: full-tile exchange scratch needs "
                        << exchangeScratchBytes
                        << " bytes, exceeding the 32768-byte budget";
-      return mlir::failure();
+      return poisonFunction();
     }
     for (auto [idx, publish] : llvm::enumerate(exch.publishes)) {
       mlir::Value buf = exchangeBuffers[exch.publishBuffer[idx]];
@@ -1986,7 +2017,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
                                          returnIt, bufferOf)) {
           op.emitOpError() << "Metal backend cannot carry a value across "
                               "full-tile exchange phases";
-          return mlir::failure();
+          return poisonFunction();
         }
       }
 
@@ -2123,7 +2154,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
           op.emitOpError()
               << "Metal backend cannot carry a value across full-tile "
                  "exchange phases";
-          return mlir::failure();
+          return poisonFunction();
         }
       }
 
@@ -2199,7 +2230,49 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
       }
     }
 
+    // The driver legalizes the ops this pattern cloned right after it returns,
+    // and a failure there would unwind this pattern; let them poison instead.
+    kernel.walk([](mlir::Operation *nested) {
+      g_poisonEligibleOps.insert(nested);
+    });
     rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+// The last resort of the main conversion: see `g_conversionPoisoned`. Matches
+// any op, at the lowest benefit, so it only sees what every lowering declined.
+struct ConversionPoisonFallback : public mlir::ConversionPattern {
+  ConversionPoisonFallback(const mlir::TypeConverter &typeConverter,
+                           mlir::MLIRContext *ctx)
+      : ConversionPattern(typeConverter, mlir::Pattern::MatchAnyOpTypeTag(),
+                          /*benefit=*/0, ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::Operation *op, llvm::ArrayRef<mlir::Value>,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    if (!g_conversionPoisoned) {
+      if (!g_poisonEligibleOps.contains(op))
+        return mlir::failure();
+      op->emitError() << "failed to legalize operation '" << op->getName()
+                      << "'";
+      g_conversionPoisoned = true;
+    }
+    // Keep blocks terminated for any pattern still walking them: a terminator
+    // only loses its operands, which every terminator's legality accepts once
+    // the conversion is poisoned.
+    if (op->hasTrait<mlir::OpTrait::IsTerminator>()) {
+      rewriter.modifyOpInPlace(op,
+                               [&] { op->eraseOperands(0, op->getNumOperands()); });
+      return mlir::success();
+    }
+    if (op->getNumResults() == 0) {
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+    auto poison = mlir::UnrealizedConversionCastOp::create(
+        rewriter, op->getLoc(), op->getResultTypes(), mlir::ValueRange{});
+    rewriter.replaceOp(op, poison.getResults());
     return mlir::success();
   }
 };
@@ -49898,11 +49971,22 @@ struct ConvertTritonGPUToMetalPass
     mlir::ConversionTarget target(*ctx);
     target.addLegalDialect<MetalDialect>();
     target.addLegalDialect<mlir::BuiltinDialect>();
-    target.addIllegalDialect<mlir::triton::TritonDialect>();
-    target.addIllegalDialect<mlir::triton::gpu::TritonGPUDialect>();
+    // Every op that has to be converted turns legal once the conversion is
+    // poisoned, so the driver finishes without unwinding `FuncOpLowering`
+    // (see `g_conversionPoisoned`).
+    auto legalOncePoisoned = [](mlir::Operation *) {
+      return g_conversionPoisoned;
+    };
+    target.addDynamicallyLegalDialect<mlir::triton::TritonDialect>(
+        legalOncePoisoned);
+    target.addDynamicallyLegalDialect<mlir::triton::gpu::TritonGPUDialect>(
+        legalOncePoisoned);
+    target.markUnknownOpDynamicallyLegal(legalOncePoisoned);
     // arith and func ops are legal only on scalar types (post-conversion).
     target.addDynamicallyLegalDialect<mlir::arith::ArithDialect>(
         [&](mlir::Operation *op) {
+          if (g_conversionPoisoned)
+            return true;
           return llvm::all_of(op->getResultTypes(), [](mlir::Type t) {
             return !mlir::isa<mlir::RankedTensorType>(t);
           });
@@ -49912,6 +49996,8 @@ struct ConvertTritonGPUToMetalPass
     // legal so a later validation/emission stage can diagnose them explicitly.
     target.addDynamicallyLegalDialect<
         mlir::math::MathDialect>([&](mlir::Operation *op) {
+      if (g_conversionPoisoned)
+        return true;
       // All admitted abs widths have an explicit lowering, including the
       // bit-preserving f16/bf16 path. Do not leave those ops for MSL emission.
       if (mlir::isa<mlir::math::AbsFOp>(op))
@@ -49941,11 +50027,11 @@ struct ConvertTritonGPUToMetalPass
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
     // Scalar remainder needs the same explicit precise fmod spelling as a
     // tensor remainder; do not let scalar arith legality bypass the pattern.
-    target.addIllegalOp<mlir::arith::RemFOp>();
+    target.addDynamicallyLegalOp<mlir::arith::RemFOp>(legalOncePoisoned);
     // `metal.scalar_dot` (the GEMM correctness fallback) is a transient op that
     // MUST be lowered to a per-thread scalar reduction; mark it illegal so
     // `ScalarDotLowering` fires despite the Metal dialect being legal above.
-    target.addIllegalOp<ScalarDotOp>();
+    target.addDynamicallyLegalOp<ScalarDotOp>(legalOncePoisoned);
 
     mlir::RewritePatternSet patterns(ctx);
     patterns.add<
@@ -50019,16 +50105,34 @@ struct ConvertTritonGPUToMetalPass
     // iter_arg path).
     mlir::scf::populateSCFStructuralTypeConversionsAndLegality(
         typeConverter, patterns, target);
+    // Last, so it sees only what every lowering above declined.
+    patterns.add<ConversionPoisonFallback>(typeConverter, ctx);
 
-    auto conversionResult =
-        mlir::applyFullConversion(moduleOp, target, std::move(patterns));
+    g_conversionPoisoned = false;
+    g_poisonEligibleOps.clear();
+    moduleOp.walk(
+        [](mlir::Operation *nested) { g_poisonEligibleOps.insert(nested); });
+    mlir::LogicalResult conversionResult = mlir::failure();
+    {
+      // After the first failure the driver only runs on so that it never
+      // unwinds; what it reports from then on is noise.
+      mlir::ScopedDiagnosticHandler quietOncePoisoned(
+          ctx, [](mlir::Diagnostic &) {
+            return mlir::success(g_conversionPoisoned);
+          });
+      conversionResult =
+          mlir::applyFullConversion(moduleOp, target, std::move(patterns));
+    }
+    bool conversionPoisoned = g_conversionPoisoned;
+    g_conversionPoisoned = false;
+    g_poisonEligibleOps.clear();
     g_loopGatherBuffers = nullptr;
     g_loopGatherStoreBuffers = nullptr;
     g_loopCarriedGathers = nullptr;
     g_scanBuffers = nullptr; // scanBufMap goes out of scope below
     g_reduceRowBufs = nullptr;
     g_axis0BroadcastExpands = nullptr;
-    if (mlir::failed(conversionResult)) {
+    if (mlir::failed(conversionResult) || conversionPoisoned) {
       signalPassFailure();
       return;
     }
