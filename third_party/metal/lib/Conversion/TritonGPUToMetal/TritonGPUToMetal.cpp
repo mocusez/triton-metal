@@ -17111,19 +17111,26 @@ lowerRank2Axis1ArgminReduce(mlir::triton::ReduceOp op,
 // Find a `tt.trans` (`tl.permute`) between the reduce and its source. A
 // load-rooted permutation carries the input's thread-major coordinates through
 // the relabel; other coordinate systems cannot share this staged publication.
-// A permute source whose every element carries the LAYOUT's own label in a
-// rank-N phase function: `tl.arange` arithmetic (ranges are emitted in layout
-// space there), loads reached through a `tt.reshape` (a planned reshape reads
-// back in its destination layout), and broadcasts/expand_dims/element-wise
-// work over those. A load at the tile's own rank reached directly is
-// addressed thread-major; it agrees with the layout only while its tile fits
-// one register band. 📏 Broadcasting a [1, B, C] load over [A, B, C] next to
-// a range: exact under the layout label in every cell where that load fits
-// one band, wrong in every cell where it does not (and the other way round
-// under the thread-major label), so a wider one stays refused.
-static bool coneCarriesLayoutLabel(mlir::Value v, int64_t rank,
-                                   int64_t threadsPerBlock,
-                                   bool behindReshape = false, int depth = 0) {
+// The label a permute source's elements carry in a rank-N phase function, or
+// nullopt when it has none. Ranges are emitted in layout space there, a
+// planned reshape reads back in its destination layout, and broadcasts,
+// expand_dims and element-wise work keep the label of what they combine -- the
+// layout's own. A load at the tile's own rank reached directly is addressed
+// thread-major instead, which agrees with the layout while it fits one
+// register band; spanning several, it makes the whole cone thread-major.
+// 📏 Broadcasting a [1, B, C] load over [A, B, C] next to a range: exact
+// under the layout label in every cell where that load fits one band and under
+// the thread-major label in every cell where it does not (each label wrong on
+// the other cells). A wide direct load beside a reshaped one was never
+// measured and has no label.
+struct PermuteSourceLabel {
+  bool threadMajor = false;
+};
+
+static bool walkPermuteSource(mlir::Value v, int64_t rank,
+                              int64_t threadsPerBlock, bool behindReshape,
+                              bool &wideDirectLoad, bool &reshapedLoad,
+                              int depth = 0) {
   if (depth > 24)
     return false;
   mlir::Operation *def = v.getDefiningOp();
@@ -17135,8 +17142,11 @@ static bool coneCarriesLayoutLabel(mlir::Value v, int64_t rank,
     auto type = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
     if (!type)
       return false;
-    return behindReshape || type.getRank() != rank ||
-           type.getNumElements() <= threadsPerBlock;
+    if (behindReshape || type.getRank() != rank)
+      reshapedLoad = true;
+    else if (type.getNumElements() > threadsPerBlock)
+      wideDirectLoad = true;
+    return true;
   }
   if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
@@ -17156,9 +17166,21 @@ static bool coneCarriesLayoutLabel(mlir::Value v, int64_t rank,
     return false;
   return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
     return !mlir::isa<mlir::RankedTensorType>(operand.getType()) ||
-           coneCarriesLayoutLabel(operand, rank, threadsPerBlock,
-                                  behindReshape || reshape, depth + 1);
+           walkPermuteSource(operand, rank, threadsPerBlock,
+                             behindReshape || reshape, wideDirectLoad,
+                             reshapedLoad, depth + 1);
   });
+}
+
+static std::optional<PermuteSourceLabel>
+permuteSourceLabel(mlir::Value v, int64_t rank, int64_t threadsPerBlock) {
+  bool wideDirectLoad = false;
+  bool reshapedLoad = false;
+  if (!walkPermuteSource(v, rank, threadsPerBlock, /*behindReshape=*/false,
+                         wideDirectLoad, reshapedLoad) ||
+      (wideDirectLoad && reshapedLoad))
+    return std::nullopt;
+  return PermuteSourceLabel{wideDirectLoad};
 }
 
 static mlir::triton::TransOp
@@ -17339,19 +17361,23 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     if (!enc || srcTy.getRank() < 3 || !inputTy ||
         inputTy.getRank() != srcTy.getRank() ||
         (!coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) &&
-         !coneCarriesLayoutLabel(permutation.getSrc(), inputTy.getRank(),
-                                 srcIndexPlan->threadsPerBlock())))
+         !permuteSourceLabel(permutation.getSrc(), inputTy.getRank(),
+                             srcIndexPlan->threadsPerBlock())))
       return std::nullopt;
     // A source built from ranges, reshaped loads and one-band loads carries
-    // the layout's own label (`coneCarriesLayoutLabel`): 📏 thread-major
+    // the layout's own label (`permuteSourceLabel`): 📏 thread-major
     // answered 5 of 5 iota probes wrong, the layout's plan is exact on 297 of
     // 297 iota and 223 of 223 accepted reshape cells. So does a LOADED source
     // with fewer elements than threads (replicated owners), which the
     // unpermuted relabel below already leaves alone: 📏 the thread-major
     // relabel answered every 64-element tile at four warps wrong (30 of 225
     // cells per load-rooted form, every permutation and axis).
+    const bool loadRooted =
+        coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank());
+    auto sourceLabel = permuteSourceLabel(
+        permutation.getSrc(), inputTy.getRank(), srcIndexPlan->threadsPerBlock());
     const bool layoutLabelled =
-        !coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) ||
+        (!loadRooted && sourceLabel && !sourceLabel->threadMajor) ||
         inputTy.getNumElements() < srcIndexPlan->threadsPerBlock();
     auto inputPlan = layoutLabelled ? planLayoutIndex(inputTy)
                                  : threadMajorLayoutPlan(
@@ -48727,10 +48753,10 @@ struct ConvertTritonGPUToMetalPass
       if (rtt && rtt.getRank() >= 3 && !stagedFallback &&
           rankNReduceSourcePermutation(red)) {
         red.emitOpError(
-            "rank >= 3 reduce over a permuted tile requires a thread-major "
-            "load-rooted source, or one built from tl.arange arithmetic, "
-            "reshaped loads and loads of at most one element per thread, so "
-            "publication and reduction coordinates can be mapped exactly");
+            "rank >= 3 reduce over a permuted tile requires a source built from "
+            "loads, tl.arange arithmetic, reshapes and broadcasts, not a wide "
+            "direct load beside a reshaped one, so publication and reduction "
+            "coordinates can be mapped exactly");
         reduceOk = false;
         return;
       }

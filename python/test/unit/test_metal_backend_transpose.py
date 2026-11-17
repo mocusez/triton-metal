@@ -1052,8 +1052,7 @@ def test_iota_permute_reduce_matches_torch(shape, num_warps, axis, perm):
 # broadcast load that fits one register band carry the layout's own label too;
 # a loaded tile with fewer elements than threads (replicated owners) needs that
 # label as well -- the thread-major relabel answered every 64-element tile at
-# four warps wrong. A broadcast load spanning several bands next to a range has
-# two labels at once and stays refused.
+# four warps wrong.
 @triton.jit
 def _permute_reduce_source_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
                                   P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr,
@@ -1101,11 +1100,19 @@ def test_permute_reduce_sources_match_torch(mode, shape, num_warps, perm):
         torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
 
 
-def test_permute_reduce_wide_broadcast_source_is_named(capfd):
-    x = torch.randn(256, dtype=torch.float32)
-    out = torch.zeros(32, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _permute_reduce_source_kernel[(1,)](x, out, 4, 8, 8, 0, 2, 1, 1, 32, "bcast",
-                                            num_warps=1)
-    diagnostic = capfd.readouterr()
-    assert "loads of at most one element per thread" in diagnostic.err + diagnostic.out
+# A broadcast load spanning several register bands is addressed thread-major,
+# and makes the whole source thread-major: the label is chosen from the cone.
+@pytest.mark.parametrize("perm", [(0, 2, 1), (2, 1, 0)])
+@pytest.mark.parametrize("shape, num_warps", [((4, 8, 8), 1), ((4, 8, 16), 1),
+                                              ((4, 8, 16), 2), ((8, 8, 8), 1)])
+def test_permute_reduce_wide_broadcast_source_matches_torch(shape, num_warps, perm):
+    a, b, c = shape
+    for axis in range(3):
+        torch.manual_seed(a * b * c + axis + num_warps)
+        x = torch.randn(a * b * c, dtype=torch.float32)
+        want = _permute_reduce_source_reference("bcast", x, shape, perm, axis)
+        out = torch.zeros(want.numel(), dtype=torch.float32)
+        _permute_reduce_source_kernel[(1,)](x, out, a, b, c, *perm, axis, want.numel(),
+                                            "bcast", num_warps=num_warps)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
