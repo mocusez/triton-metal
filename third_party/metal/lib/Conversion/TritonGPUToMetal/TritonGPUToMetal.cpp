@@ -589,6 +589,13 @@ static llvm::DenseSet<mlir::Operation *> g_nestedScanCrossPhaseRegions;
 static bool g_conversionPoisoned = false;
 static llvm::DenseSet<mlir::Operation *> g_poisonEligibleOps;
 
+// Functions whose every tile lives in a rank-N reduce loop, which bands its
+// own phases. `FuncOpLowering` must not wrap them in the function's band loop
+// too: that ran the whole user loop once per function band (twice for a
+// stored result of two elements per thread), which an idempotent store hides
+// and an atomic or a read-modify-write of other memory does not.
+static llvm::DenseSet<mlir::Operation *> g_rankNLoopOnlyFunctions;
+
 // One shared answer to "will the phase split break this function?".
 //
 // `FuncOpLowering` splices the body into sibling `scf.for` phases, one per
@@ -1891,7 +1898,9 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
     // Compute the tile shape from the ORIGINAL body (before any region
     // inlining empties it).
     auto tileInfo = findTileInfo(op);
-    bool hasNestedScanPhases = g_nestedScanFunctions.count(op.getOperation());
+    bool phasesBandThemselves =
+        g_nestedScanFunctions.count(op.getOperation()) ||
+                               g_rankNLoopOnlyFunctions.count(op.getOperation());
     llvm::SmallVector<mlir::Type> kernelArgTypes;
     llvm::SmallVector<bool> isAddressSpaceDevice;
     // For arg i, holds the original scalar type if it was wrapped, else null.
@@ -2069,7 +2078,7 @@ struct FuncOpLowering : public mlir::OpConversionPattern<mlir::triton::FuncOp> {
         if (entry.second.publishOp == publish)
           g_tileExchangeBuf[entry.first] = buf;
     }
-    if (!hasNestedScanPhases &&
+    if (!phasesBandThemselves &&
         (!exchangePublishes.empty() ||
          (tileInfo && tileInfo->elemPerThread > 1)) &&
         !emptyBlock.empty()) {
@@ -17087,21 +17096,6 @@ static bool rankNReduceHasKeepDimsUsers(mlir::triton::ReduceOp op) {
   });
 }
 
-// A loop's reduce result with more than one element per thread is consumed
-// (through the reshape that flattens it for its store) under a different
-// element order than the cyclic one the loop publishes it in. 📏 Every one of
-// the 9 such cells in the 48-cell loop sweep was wrong (rank-3 sums at
-// 8x8x8/4x8x16/2x8x16 and their neighbours, results of 64-128 elements over
-// 32-64 threads); every cell whose result fits one element per thread is exact.
-// A result nothing reads cannot be read in the wrong order.
-static bool rankNLoopReduceResultWrapsThreads(mlir::triton::ReduceOp op,
-                                              int64_t threadsPerBlock) {
-  auto resultTy =
-      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
-  return resultTy && !op->getResult(0).use_empty() &&
-         resultTy.getNumElements() > threadsPerBlock;
-}
-
 static std::optional<RankNReducePlan>
 planRankNReduce(mlir::triton::ReduceOp op) {
   if (op.getSrcs().size() != 1 || op.getNumResults() != 1)
@@ -17201,8 +17195,7 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   const bool cyclicUserLoop =
       enc && srcTy.getRank() >= 3 && op->hasAttr(kRankNUserLoopAttr);
   if (cyclicUserLoop) {
-    if (rankNReduceSourcePermutation(op) ||
-        rankNLoopReduceResultWrapsThreads(op, srcIndexPlan->threadsPerBlock()))
+    if (rankNReduceSourcePermutation(op))
       return std::nullopt;
     auto relabel = cyclicLayoutPlan(srcTy.getShape(),
                                     srcIndexPlan->threadsPerBlock());
@@ -37121,6 +37114,29 @@ static std::optional<LayoutIndexPlan> exchangeSourcePlan(mlir::Value value) {
   return plan;
 }
 
+// The CTA's thread count when `op` sits directly in a loop that holds a staged
+// rank-N reduce publish, else 0. Inside such a loop every tile is CYCLIC: at
+// thread `t`, band `iv`, it holds the element of flat index `t + iv * T`. The
+// loop's loads, its reduce plans and its range plans all say so, and an
+// exchange there must too, or a value converted on its way to a store is read
+// under one order and addressed under another.
+static int64_t rankNPhaseLoopThreads(mlir::Operation *op) {
+  mlir::Block *block = op->getBlock();
+  auto loop = block ? mlir::dyn_cast<mlir::scf::ForOp>(block->getParentOp())
+                    : mlir::scf::ForOp{};
+  if (!loop || llvm::none_of(g_rankNReducePublish, [&](const auto &entry) {
+        return entry.second->getBlock() == block;
+      }))
+    return 0;
+  auto module = op->getParentOfType<mlir::ModuleOp>();
+  auto warps = module ? module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps")
+                      : nullptr;
+  auto lanes = module ? module->getAttrOfType<mlir::IntegerAttr>(
+                            "ttg.threads-per-warp")
+                      : nullptr;
+  return warps && lanes ? warps.getInt() * lanes.getInt() : 0;
+}
+
 // `srcLabel` / `dstLabel` replace the plan a side would otherwise be asked for
 // when the caller knows the VALUE carries a different label than its type
 // names -- a rank >= 2 tile rooted at a thread-major load, or one a thread-major
@@ -37156,6 +37172,12 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
   if ((!isReshape && !isBroadcast && srcRtt.getShape() != dstRtt.getShape()) ||
       (isReshape && srcRtt.getNumElements() != dstRtt.getNumElements()))
     return false;
+  if (int64_t threads = rankNPhaseLoopThreads(exchange); threads && !isBroadcast) {
+    srcLabel = cyclicLayoutPlan(srcRtt.getShape(), threads);
+    dstLabel = cyclicLayoutPlan(dstRtt.getShape(), threads);
+    if (!srcLabel || !dstLabel)
+      return false;
+  }
   std::optional<LayoutIndexPlan> srcPlan =
       srcLabel ? srcLabel : exchangeSourcePlan(source);
   std::optional<LayoutIndexPlan> dstPlan =
@@ -46184,6 +46206,166 @@ materializeNestedScanPhases(mlir::ModuleOp moduleOp) {
   return mlir::success();
 }
 
+// The shape of the rank >= 2 tile a range addresses through a load or store,
+// unit axes included, when every such access agrees on it.
+static std::optional<llvm::SmallVector<int64_t, 4>>
+rankNLoopAccessShape(mlir::Value range) {
+  std::optional<llvm::SmallVector<int64_t, 4>> shape;
+  llvm::SmallVector<mlir::Value, 16> worklist{range};
+  llvm::SmallPtrSet<mlir::Value, 32> seen;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (mlir::Operation *user : value.getUsers()) {
+      if (mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(user)) {
+        if (user->getOperand(0) != value)
+          continue;
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (!type || type.getRank() < 2)
+          return std::nullopt;
+        llvm::SmallVector<int64_t, 4> current(type.getShape());
+        if (shape && *shape != current)
+          return std::nullopt;
+        shape = current;
+        continue;
+      }
+      if (user->getNumRegions() || !mlir::isMemoryEffectFree(user))
+        continue;
+      for (mlir::Value result : user->getResults())
+        if (mlir::isa<mlir::RankedTensorType>(result.getType()))
+          worklist.push_back(result);
+    }
+  }
+  return shape;
+}
+
+// A tile plan answers with the tile's flat row-major index; a range is ONE
+// axis of that tile. Its slice encodings name which: every slice removed a
+// dimension at or below the range's surviving axis.
+static std::optional<LayoutIndexPlan>
+projectTilePlanToRange(const LayoutIndexPlan &tilePlan,
+                       mlir::triton::MakeRangeOp range) {
+  auto rangeTy = mlir::cast<mlir::RankedTensorType>(range.getType());
+  const int64_t rank = tilePlan.dimTerms.size();
+  if (rank == 1)
+    return tilePlan;
+  mlir::Attribute encoding = rangeTy.getEncoding();
+  // Only the outermost `rank - 1` slices lead to the tile's own encoding,
+  // which may itself be a slice (a reduce result's tile).
+  llvm::SmallVector<unsigned, 4> removed;
+  while (static_cast<int64_t>(removed.size()) + 1 < rank) {
+    auto slice =
+        mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(encoding);
+    if (!slice)
+      return std::nullopt;
+    removed.push_back(slice.getDim());
+    encoding = slice.getParent();
+  }
+  // Innermost slice first: map the surviving axis outwards through each.
+  unsigned axis = 0;
+  for (unsigned dim : removed)
+    if (axis >= dim)
+      ++axis;
+  if (axis >= static_cast<unsigned>(rank))
+    return std::nullopt;
+  LayoutIndexPlan plan = tilePlan;
+  plan.dimTerms = {tilePlan.dimTerms[axis]};
+  plan.rowMajorStride = {1};
+  plan.dimXor.clear();
+  if (int32_t flip = tilePlan.xorOf(axis))
+    plan.dimXor.push_back(flip);
+  return plan;
+}
+
+static int64_t functionThreadsPerBlock(mlir::Operation *op) {
+  auto module = op->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return 0;
+  auto warps = module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
+  auto lanes = module->getAttrOfType<mlir::IntegerAttr>("ttg.threads-per-warp");
+  return warps && lanes ? warps.getInt() * lanes.getInt() : 0;
+}
+
+// The loops `materializeRankNLoopPhases` will split, found by their publish.
+static llvm::SmallVector<mlir::scf::ForOp, 4>
+rankNPhaseLoops(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  moduleOp.walk([&](mlir::scf::ForOp loop) {
+    if (llvm::any_of(g_rankNReducePublish, [&](const auto &entry) {
+          return entry.second->getBlock() == loop.getBody();
+        }))
+      loops.push_back(loop);
+  });
+  return loops;
+}
+
+// Inside a rank-N reduce loop every tile is addressed CYCLIC, per band of the
+// phase it sits in: the loop's range pass plans the ranges it finds there, and
+// each phase is its own register-band loop. A tile cone LICM hoisted out of
+// the loop escapes both. It is evaluated once, in the FUNCTION's band loop,
+// and when that loop runs more than once -- a stored result of more than one
+// element per thread gives the function a second band -- the hoisted address
+// reads `localTid * E + iv` with the function's `iv` while the value in hand
+// belongs to the phase's: 📏 every one of the 9 such loop cells stored
+// another element than it computed. Clone the pure cones back into the loop
+// so they are planned and banded with everything else in it.
+static void sinkTileConesIntoRankNLoops(mlir::ModuleOp moduleOp) {
+  auto isTensor = [](mlir::Type type) {
+    return mlir::isa<mlir::RankedTensorType>(type);
+  };
+  llvm::SetVector<mlir::Operation *> hoisted;
+  for (mlir::scf::ForOp loop : rankNPhaseLoops(moduleOp)) {
+    mlir::Block *body = loop.getBody();
+    mlir::IRMapping mapping;
+    mlir::OpBuilder builder(body, body->begin());
+    std::function<bool(mlir::Value)> sinkable = [&](mlir::Value value) {
+      mlir::Operation *def = value.getDefiningOp();
+      if (!def || loop->isAncestor(def))
+        return false;
+      if (def->getNumRegions() || !mlir::isMemoryEffectFree(def) ||
+          def->getNumResults() != 1 || !isTensor(value.getType()))
+        return false;
+      return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
+        return !isTensor(operand.getType()) || sinkable(operand);
+      });
+    };
+    std::function<mlir::Value(mlir::Value)> sink =
+        [&](mlir::Value value) -> mlir::Value {
+      if (mlir::Value mapped = mapping.lookupOrNull(value))
+        return mapped;
+      mlir::Operation *def = value.getDefiningOp();
+      for (mlir::Value operand : def->getOperands())
+        if (isTensor(operand.getType()))
+          sink(operand);
+      builder.clone(*def, mapping);
+      hoisted.insert(def);
+      return mapping.lookup(value);
+    };
+    llvm::SmallVector<mlir::OpOperand *, 16> uses;
+    loop.getBody()->walk([&](mlir::Operation *op) {
+      for (mlir::OpOperand &operand : op->getOpOperands())
+        if (isTensor(operand.get().getType()) && sinkable(operand.get()))
+          uses.push_back(&operand);
+    });
+    for (mlir::OpOperand *use : uses)
+      use->set(sink(use->get()));
+  }
+  // The hoisted originals are dead once nothing outside the loops reads them.
+  // Only those: a pre-pass may keep an op alive by identity alone.
+  for (bool changed = true; changed;) {
+    llvm::SmallVector<mlir::Operation *, 16> dead;
+    for (mlir::Operation *op : hoisted)
+      if (op->use_empty())
+        dead.push_back(op);
+    changed = !dead.empty();
+    for (mlir::Operation *op : dead) {
+      hoisted.remove(op);
+      op->erase();
+    }
+  }
+}
+
 static mlir::LogicalResult
 materializeRankNLoopPhases(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
@@ -46297,6 +46479,11 @@ materializeRankNLoopPhases(mlir::ModuleOp moduleOp) {
         auto add = load.getPtr().getDefiningOp<mlir::triton::AddPtrOp>();
         if (!add || !phase->isAncestor(add))
           return;
+        // An offset computed inside the loop is already banded by its own
+        // range plan (`sinkTileConesIntoRankNLoops`).
+        if (mlir::Operation *offsetDef = add.getOffset().getDefiningOp();
+            offsetDef && loop->isAncestor(offsetDef))
+          return;
         auto offsetTy = mlir::dyn_cast<mlir::RankedTensorType>(
             add.getOffset().getType());
         if (!offsetTy)
@@ -46322,6 +46509,29 @@ materializeRankNLoopPhases(mlir::ModuleOp moduleOp) {
                                      body.getOperations(), segmentBegin,
                                      terminator);
   }
+  llvm::SmallPtrSet<mlir::Operation *, 4> phaseLoops;
+  for (auto loop : loops)
+    phaseLoops.insert(loop.getOperation());
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    bool anyLoop = false;
+    bool tensorOutside = false;
+    auto isTensor = [](mlir::Type type) {
+      return mlir::isa<mlir::RankedTensorType>(type);
+    };
+    for (mlir::Operation &op : func.getBody().front()) {
+      if (phaseLoops.count(&op)) {
+        anyLoop = true;
+        continue;
+      }
+      op.walk([&](mlir::Operation *nested) {
+        if (llvm::any_of(nested->getOperandTypes(), isTensor) ||
+            llvm::any_of(nested->getResultTypes(), isTensor))
+          tensorOutside = true;
+      });
+    }
+    if (anyLoop && !tensorOutside)
+      g_rankNLoopOnlyFunctions.insert(func.getOperation());
+  });
   return mlir::success();
 }
 
@@ -47417,6 +47627,7 @@ struct ConvertTritonGPUToMetalPass
     g_nestedScanLocalScalarLoadRegions.clear();
     g_nestedScanCrossPhaseRegions.clear();
     g_nestedScanFunctions.clear();
+    g_rankNLoopOnlyFunctions.clear();
     g_nestedScanCarryBytes.clear();
     g_rankNPlannedReduces.clear();
     g_broadcastExchange.clear();
@@ -47718,31 +47929,6 @@ struct ConvertTritonGPUToMetalPass
         }
       }
       const bool stagedFallback = planRankNReduce(red).has_value();
-      if (rtt && rtt.getRank() >= 3 && !stagedFallback &&
-          red->hasAttr(kRankNUserLoopAttr) &&
-          mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
-              rtt.getEncoding())) {
-        auto func = red->getParentOfType<mlir::triton::FuncOp>();
-        auto mod = func ? func->getParentOfType<mlir::ModuleOp>() : nullptr;
-        int64_t tpb = 0;
-        if (mod)
-          if (auto nw = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
-            if (auto tpw = mod->getAttrOfType<mlir::IntegerAttr>(
-                    "ttg.threads-per-warp"))
-              tpb = nw.getInt() * tpw.getInt();
-        if (tpb > 0 && rankNLoopReduceResultWrapsThreads(red, tpb)) {
-          red.emitOpError(
-              "Metal backend: a rank >= 3 reduce inside a loop needs a result "
-              "of at most one element per thread (")
-              << mlir::cast<mlir::RankedTensorType>(
-                     red->getResult(0).getType())
-                     .getNumElements()
-              << " elements over " << tpb
-              << " threads); raise num_warps or reduce outside the loop";
-          reduceOk = false;
-          return;
-        }
-      }
       if (rtt && rtt.getRank() >= 3 && stagedFallback &&
           red->hasAttr(kRankNUserLoopAttr)) {
         // In a loop the result is published cyclic, and only a store (or a
@@ -48496,6 +48682,7 @@ struct ConvertTritonGPUToMetalPass
       signalPassFailure();
       return;
     }
+    sinkTileConesIntoRankNLoops(moduleOp);
 
     if (mlir::failed(preprocessStagedScanPhases(moduleOp))) {
       signalPassFailure();
@@ -48610,9 +48797,23 @@ struct ConvertTritonGPUToMetalPass
         std::optional<LayoutIndexPlan> plan;
         for (int64_t rank : {3, 4, 5, 2})
           if (auto tile = valueConsumerTileOfRank(range.getResult(), rank)) {
-            plan = cyclicLayoutPlan(tile->shape, tile->threadsPerBlock);
+            if (auto tilePlan =
+                    cyclicLayoutPlan(tile->shape, tile->threadsPerBlock))
+              plan = projectTilePlanToRange(*tilePlan, range);
             break;
           }
+        // An access whose tile keeps a unit axis (a keep_dims result stored
+        // as is) is still cyclic over the same flat index, and so is a rank-1
+        // tile: everything in this loop is (`rankNPhaseLoopThreads`).
+        if (!plan)
+          if (auto access = rankNLoopAccessShape(range.getResult()))
+            if (auto tilePlan =
+                    cyclicLayoutPlan(*access, functionThreadsPerBlock(range)))
+              plan = projectTilePlanToRange(*tilePlan, range);
+        if (!plan && !valueConsumerTileOfRank(range.getResult(), 2) &&
+            !valueConsumerTileOfRank(range.getResult(), 3))
+          plan = cyclicLayoutPlan(range.getType().getShape(),
+                                  functionThreadsPerBlock(range));
         if (!plan)
           plan = planLinearRange(range, /*allowMixedHypercube=*/true);
         if (!plan) {

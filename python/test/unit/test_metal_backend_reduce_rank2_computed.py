@@ -1073,7 +1073,7 @@ def _rank3_reduce_loop_direct_store_kernel(X, O, T, A: tl.constexpr,
 # used to ask the thread-major question first, so a load layout that wrapped
 # into a second register band was published `localTid * E + iv` while its
 # addresses ran cyclic: 17 of these 48 cells were silently wrong. The cells
-# whose RESULT exceeds one element per thread are refused by name (below).
+# whose RESULT exceeds one element per thread are covered below.
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("shape, warps", [
     ((2, 4, 8), 1), ((4, 4, 8), 2), ((4, 8, 8), 2), ((8, 8, 8), 2), ((8, 8, 8), 4),
@@ -1108,21 +1108,75 @@ def test_rank3_reduce_loop_single_band_result_matches_torch(shape, warps, axis):
     torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
 
 
-@pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 1, 1), ((2, 8, 16), 2, 0)])
-def test_rank3_reduce_loop_wrapped_result_is_named(capfd, shape, warps, axis):
-    # A result of more than one element per thread is flattened for its store
-    # in another order than the loop publishes it in; all 9 such cells of the
-    # sweep were wrong, so they are refused by name.
+@triton.jit
+def _rank3_reduce_loop_forms_kernel(X, O, CNT, T, A: tl.constexpr, B: tl.constexpr,
+                                    C: tl.constexpr, AXIS: tl.constexpr,
+                                    OUT: tl.constexpr, FORM: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    for t in range(T):
+        v = tl.load(X + t * A * B * C + offsets)
+        if FORM == "direct":
+            s = tl.sum(v, AXIS)
+            if AXIS == 0:
+                i = tl.arange(0, B)[:, None] * C + tl.arange(0, C)[None, :]
+            elif AXIS == 1:
+                i = tl.arange(0, A)[:, None] * C + tl.arange(0, C)[None, :]
+            else:
+                i = tl.arange(0, A)[:, None] * B + tl.arange(0, B)[None, :]
+            tl.store(O + t * OUT + i, s)
+        elif FORM == "keep":
+            s = tl.sum(v, AXIS, keep_dims=True)
+            if AXIS == 0:
+                i = tl.arange(0, B)[None, :, None] * C + tl.arange(0, C)[None, None, :]
+            elif AXIS == 1:
+                i = tl.arange(0, A)[:, None, None] * C + tl.arange(0, C)[None, None, :]
+            else:
+                i = tl.arange(0, A)[:, None, None] * B + tl.arange(0, B)[None, :, None]
+            tl.store(O + t * OUT + i, s)
+        else:
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(tl.max(v, AXIS), (OUT,)))
+            tl.atomic_add(CNT, 1.0)
+
+
+# A result of more than one element per thread used to be wrong in all 9 cells
+# of the loop sweep, then refused by name. Two things disagreed: LICM hoists the
+# store's address ranges out of the loop, where the function's own band loop --
+# which a two-element result gives the function -- evaluated them under ITS band
+# index while the value came from the phase's; and a value converted on its way
+# to the store was read back in its layout's order while the address ran cyclic.
+# The ranges are now cloned back into the loop and every tile and exchange there
+# is cyclic, and a function whose every tile lives in such a loop no longer runs
+# the whole loop once per function band (the atomic below counted twice).
+@pytest.mark.parametrize("form", ["reshape", "direct", "keep", "max_atomic"])
+@pytest.mark.parametrize("shape, warps, axis", [
+    ((8, 8, 8), 1, 0), ((8, 8, 8), 1, 2), ((4, 8, 16), 1, 1), ((2, 8, 16), 2, 0),
+    ((4, 8, 8), 1, 0),
+])
+def test_rank3_reduce_loop_wrapped_result_matches_torch(shape, warps, axis, form):
     a, b, c = shape
+    steps = 3
     out_elements = a * b * c // shape[axis]
-    x = torch.randn(2 * a * b * c, dtype=torch.float32)
-    out = torch.zeros(2 * out_elements, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+    torch.manual_seed(0xC3C3 + a * b * c + axis + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    xs = x.reshape(steps, a, b, c)
+    out = torch.zeros(steps * out_elements, dtype=torch.float32)
+    count = torch.zeros(1, dtype=torch.float32)
+    if form == "reshape":
         _rank3_reduce_loop_kernel[(1,)](
-            x, out, 2, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
-    diagnostic = capfd.readouterr()
-    assert "inside a loop needs a result of at most one element per thread" in (
-        diagnostic.err + diagnostic.out)
+            x, out, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements, num_warps=warps)
+        expected = xs.sum(axis + 1).reshape(-1)
+    else:
+        _rank3_reduce_loop_forms_kernel[(1,)](
+            x, out, count, steps, A=a, B=b, C=c, AXIS=axis, OUT=out_elements,
+            FORM="max" if form == "max_atomic" else form, num_warps=warps)
+        expected = (xs.amax(axis + 1) if form == "max_atomic" else xs.sum(axis + 1)).reshape(-1)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+    if form == "max_atomic":
+        assert count.item() == steps
 
 
 @triton.jit

@@ -437,13 +437,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
-// A direct-load rank-N reduction inside a uniform user loop. Each publish band
-// adds bandIv * threadsPerBlock to the device address before the exact fold.
+// A direct-load rank-N reduction inside a uniform user loop. The address cone
+// LICM hoisted is cloned back into the loop, so each publish band computes its
+// own cyclic coordinates from the band index before the exact fold, and the
+// function's band loop does not wrap (and repeat) the user loop.
 // CHECK-LABEL: metal.kernel reduce_rank3_user_loop
 // CHECK: metal.threadgroup_alloca : !metal.memref<512 x f32>
+// CHECK-NOT: scf.for
 // CHECK: scf.for %[[USER:.*]] = %{{.*}} to %c2
 // CHECK: scf.for %[[BAND:.*]] = %{{.*}} to %{{.*}} step
-// CHECK: arith.muli %[[BAND]], %c32
+// CHECK: arith.shrsi %[[BAND]]
 // CHECK: metal.tg_store_indexed
 // CHECK: metal.barrier
 // CHECK: scf.for
