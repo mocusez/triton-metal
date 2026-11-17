@@ -45025,6 +45025,18 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
 // conversion would erase.
 // Every slot starts as a threadgroup tile; `privatizeNestedScanSlots` moves
 // the ones whose every access shares one plan into thread-private memory.
+// The exchange maps are keyed by operation identity and outlive the ops they
+// describe; a new op allocated where an erased one lived would inherit its
+// plan and buffer, and registration skips an op that already has one. 📏 A
+// nested scan's second inner loop under an outer loop copied the outer carry
+// onto ITSELF and never initialized its own slot: masked while that slot was
+// threadgroup memory (zero at launch, the right initial value there), random
+// once it was thread-private.
+static void forgetStaleExchange(mlir::Operation *op) {
+  g_tileExchange.erase(op);
+  g_tileExchangeBuf.erase(op);
+}
+
 static mlir::Value createNestedScanSlot(mlir::OpBuilder &builder,
                                        mlir::Location loc,
                                        mlir::RankedTensorType type) {
@@ -45090,6 +45102,7 @@ materializeNestedScanCarries(mlir::scf::ForOp loop, bool phaseScheduled = true) 
                                                          value.getType(), value);
     op->setAttr(kExchangeAttr, b.getStringAttr(kCarryWrite));
     op->setAttr(kCarrySlotAttr, b.getI64IntegerAttr(slot));
+    forgetStaleExchange(op.getOperation());
     return op;
   };
   auto read = [&](mlir::OpBuilder &b, unsigned slot,
@@ -45104,6 +45117,7 @@ materializeNestedScanCarries(mlir::scf::ForOp loop, bool phaseScheduled = true) 
                                                          placeholder);
     op->setAttr(kExchangeAttr, b.getStringAttr(kCarryRead));
     op->setAttr(kCarrySlotAttr, b.getI64IntegerAttr(slot));
+    forgetStaleExchange(op.getOperation());
     return op.getResult();
   };
   // One read, placed before the first use in `block`, serves every use there.
@@ -45542,6 +45556,7 @@ materializeNestedScanWhileCarries(mlir::scf::WhileOp original) {
         builder, loc, value.getType(), value);
     op->setAttr(kExchangeAttr, builder.getStringAttr(kCarryWrite));
     op->setAttr(kCarrySlotAttr, builder.getI64IntegerAttr(slot));
+    forgetStaleExchange(op.getOperation());
     return registerCarry(op, slot);
   };
   auto read = [&](mlir::OpBuilder &builder, unsigned slot,
@@ -45556,6 +45571,7 @@ materializeNestedScanWhileCarries(mlir::scf::WhileOp original) {
                                                          placeholder);
     op->setAttr(kExchangeAttr, builder.getStringAttr(kCarryRead));
     op->setAttr(kCarrySlotAttr, builder.getI64IntegerAttr(slot));
+    forgetStaleExchange(op.getOperation());
     if (!registerCarry(op, slot))
       return {};
     return op.getResult();
@@ -45906,6 +45922,7 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
           builder, loc, value.getType(), value);
       op->setAttr(kExchangeAttr, builder.getStringAttr(kCarryWrite));
       op->setAttr(kCarrySlotAttr, builder.getI64IntegerAttr(slot));
+      forgetStaleExchange(op.getOperation());
       return registerCarry(op, slot);
     };
     auto read = [&](mlir::OpBuilder &builder, unsigned slot,
@@ -45920,6 +45937,7 @@ materializeNestedScanResultIfs(mlir::ModuleOp moduleOp,
                                                            placeholder);
       op->setAttr(kExchangeAttr, builder.getStringAttr(kCarryRead));
       op->setAttr(kCarrySlotAttr, builder.getI64IntegerAttr(slot));
+      forgetStaleExchange(op.getOperation());
       if (!registerCarry(op, slot))
         return {};
       return op.getResult();

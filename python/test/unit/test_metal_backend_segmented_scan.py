@@ -13584,3 +13584,50 @@ def test_nested_scan_carries_are_thread_private(shape, num_warps):
         h = h * 0.5 + cs
         g = g + cs * cs
     torch.testing.assert_close(out.cpu(), h + g, atol=1e-2, rtol=1e-3)
+
+
+# Two nested-scan loops under an outer loop, with NON-zero initial carries. The
+# second inner loop's pre-band copied the outer carry onto itself and never
+# initialized its own slot: a carry op created where an erased one had lived
+# inherited that op's exchange buffer. With zero initial carries this hid behind
+# threadgroup memory being zero at launch; with thread-private slots it read
+# whatever the stack held.
+@triton.jit
+def _scan_outer_two_carried_loops_init_kernel(x_ptr, first_ptr, other_ptr, outer,
+                                              trips):
+    off = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    first = tl.full((8, 64), 0.5, tl.float32)
+    other = tl.full((8, 64), 2.0, tl.float32)
+    for outer_index in range(outer):
+        for t in range(trips):
+            x = tl.load(x_ptr + (outer_index * 2 * trips + t) * 512 + off)
+            first += tl.cumsum(x, 1)
+        for t in range(trips):
+            x = tl.load(x_ptr + (outer_index * 2 * trips + trips + t) * 512 + off)
+            other += tl.cumsum(x + first, 1)
+        tl.store(first_ptr + outer_index * 512 + off, first)
+        tl.store(other_ptr + outer_index * 512 + off, other)
+
+
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("trips", [2, 3])
+def test_nested_scan_outer_carries_initialize_every_inner_slot(trips, num_warps):
+    outer = 2
+    x = (torch.arange(outer * 2 * trips * 512) % 7 - 3).float().reshape(-1, 8, 64)
+    first_out = torch.zeros((outer, 8, 64), device="mps")
+    other_out = torch.zeros((outer, 8, 64), device="mps")
+    _scan_outer_two_carried_loops_init_kernel[(1,)](
+        x.to("mps"), first_out, other_out, outer, trips, num_warps=num_warps)
+    torch.mps.synchronize()
+    first = torch.full((8, 64), 0.5)
+    other = torch.full((8, 64), 2.0)
+    expected_first, expected_other = [], []
+    for outer_index in range(outer):
+        for t in range(trips):
+            first += x[outer_index * 2 * trips + t].cumsum(1)
+        for t in range(trips):
+            other += (x[outer_index * 2 * trips + trips + t] + first).cumsum(1)
+        expected_first.append(first.clone())
+        expected_other.append(other.clone())
+    torch.testing.assert_close(first_out.cpu(), torch.stack(expected_first))
+    torch.testing.assert_close(other_out.cpu(), torch.stack(expected_other))
