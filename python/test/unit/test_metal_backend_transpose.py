@@ -1014,8 +1014,8 @@ def test_unit_axis_rank4_access_through_convert_is_named(capfd):
         diagnostic.err + diagnostic.out)
 
 
-# A permute-to-reduce whose source is computed from its own coordinates (an
-# iota built with tl.arange arithmetic) used to be refused as not load-rooted.
+# A permute-to-reduce whose source is built from tl.arange arithmetic (an
+# iota) used to be refused as not load-rooted.
 # Every element is computed in place from the coordinates of the element the
 # thread holds, so its label is the one its ranges are emitted under -- in a
 # rank-N phase function the layout's own, not the thread-major relabel a load
@@ -1046,3 +1046,66 @@ def test_iota_permute_reduce_matches_torch(shape, num_warps, axis, perm):
                                       num_warps=num_warps)
     torch.mps.synchronize()
     torch.testing.assert_close(out, want)
+
+
+# More permute-to-reduce sources. A load reached through `tt.reshape` and a
+# broadcast load that fits one register band carry the layout's own label too;
+# a loaded tile with fewer elements than threads (replicated owners) needs that
+# label as well -- the thread-major relabel answered every 64-element tile at
+# four warps wrong. A broadcast load spanning several bands next to a range has
+# two labels at once and stays refused.
+@triton.jit
+def _permute_reduce_source_kernel(X, O, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                                  P0: tl.constexpr, P1: tl.constexpr, P2: tl.constexpr,
+                                  AXIS: tl.constexpr, OUT: tl.constexpr, MODE: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    if MODE == "reshape":
+        v = tl.reshape(tl.load(X + tl.arange(0, A * B * C)), (A, B, C))
+    elif MODE == "bcast":
+        v = tl.broadcast_to(tl.load(X + b * C + c), (A, B, C)) + a.to(tl.float32)
+    else:
+        v = tl.load(X + a * (B * C) + b * C + c) * 2.0 + 1.0
+    s = tl.sum(tl.permute(v, (P0, P1, P2)), axis=AXIS)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+def _permute_reduce_source_reference(mode, x, shape, perm, axis):
+    a, b, c = shape
+    if mode == "reshape":
+        t = x.reshape(shape)
+    elif mode == "bcast":
+        t = x[: b * c].reshape(1, b, c).expand(a, b, c) + torch.arange(a).float()[:, None, None]
+    else:
+        t = x.reshape(shape) * 2 + 1
+    return t.permute(*perm).sum(axis).reshape(-1)
+
+
+@pytest.mark.parametrize("perm", [(0, 2, 1), (2, 1, 0), (1, 2, 0)])
+@pytest.mark.parametrize("mode, shape, num_warps", [
+    ("reshape", (8, 8, 8), 1), ("reshape", (4, 8, 16), 2), ("reshape", (2, 4, 8), 4),
+    ("bcast", (2, 4, 8), 1), ("bcast", (8, 8, 8), 2), ("bcast", (4, 8, 16), 4),
+    ("cone", (2, 4, 8), 4), ("cone", (2, 8, 4), 4), ("cone", (4, 8, 8), 1),
+])
+def test_permute_reduce_sources_match_torch(mode, shape, num_warps, perm):
+    a, b, c = shape
+    for axis in range(3):
+        torch.manual_seed(a * b * c + axis)
+        x = torch.randn(a * b * c, dtype=torch.float32)
+        want = _permute_reduce_source_reference(mode, x, shape, perm, axis)
+        out = torch.zeros(want.numel(), dtype=torch.float32)
+        _permute_reduce_source_kernel[(1,)](x, out, a, b, c, *perm, axis, want.numel(), mode,
+                                            num_warps=num_warps)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
+
+
+def test_permute_reduce_wide_broadcast_source_is_named(capfd):
+    x = torch.randn(256, dtype=torch.float32)
+    out = torch.zeros(32, dtype=torch.float32)
+    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
+        _permute_reduce_source_kernel[(1,)](x, out, 4, 8, 8, 0, 2, 1, 1, 32, "bcast",
+                                            num_warps=1)
+    diagnostic = capfd.readouterr()
+    assert "loads of at most one element per thread" in diagnostic.err + diagnostic.out

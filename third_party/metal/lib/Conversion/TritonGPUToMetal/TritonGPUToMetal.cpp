@@ -17111,12 +17111,19 @@ lowerRank2Axis1ArgminReduce(mlir::triton::ReduceOp op,
 // Find a `tt.trans` (`tl.permute`) between the reduce and its source. A
 // load-rooted permutation carries the input's thread-major coordinates through
 // the relabel; other coordinate systems cannot share this staged publication.
-// A tile computed only from its own coordinates: `tl.arange`s brought to the
-// tile's rank by expand_dims/broadcast, splats, constants and element-wise
-// arithmetic, no memory. Every element is computed in place from the
-// coordinates of the element the thread holds, so whichever label the ranges
-// are emitted under, the values carry the same one.
-static bool coneIsRangeRooted(mlir::Value v, int depth = 0) {
+// A permute source whose every element carries the LAYOUT's own label in a
+// rank-N phase function: `tl.arange` arithmetic (ranges are emitted in layout
+// space there), loads reached through a `tt.reshape` (a planned reshape reads
+// back in its destination layout), and broadcasts/expand_dims/element-wise
+// work over those. A load at the tile's own rank reached directly is
+// addressed thread-major; it agrees with the layout only while its tile fits
+// one register band. 📏 Broadcasting a [1, B, C] load over [A, B, C] next to
+// a range: exact under the layout label in every cell where that load fits
+// one band, wrong in every cell where it does not (and the other way round
+// under the thread-major label), so a wider one stays refused.
+static bool coneCarriesLayoutLabel(mlir::Value v, int64_t rank,
+                                   int64_t threadsPerBlock,
+                                   bool behindReshape = false, int depth = 0) {
   if (depth > 24)
     return false;
   mlir::Operation *def = v.getDefiningOp();
@@ -17124,23 +17131,33 @@ static bool coneIsRangeRooted(mlir::Value v, int depth = 0) {
     return false;
   if (mlir::isa<mlir::triton::MakeRangeOp, mlir::triton::SplatOp>(def))
     return true;
+  if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
+    if (!type)
+      return false;
+    return behindReshape || type.getRank() != rank ||
+           type.getNumElements() <= threadsPerBlock;
+  }
   if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
     return !dense || dense.isSplat();
   }
-  const bool coordinateMove =
-      mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp>(def);
+  const bool reshape = mlir::isa<mlir::triton::ReshapeOp>(def);
+  const bool move =
+      reshape || mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                           mlir::triton::gpu::ConvertLayoutOp>(def);
   const bool elementwise =
       (mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
            def->getDialect()) ||
        (mlir::isa<mlir::triton::TritonDialect>(def->getDialect()) &&
         def->hasTrait<mlir::OpTrait::Elementwise>())) &&
       def->getNumRegions() == 0 && mlir::isMemoryEffectFree(def);
-  if (!coordinateMove && !elementwise)
+  if (!move && !elementwise)
     return false;
   return llvm::all_of(def->getOperands(), [&](mlir::Value operand) {
     return !mlir::isa<mlir::RankedTensorType>(operand.getType()) ||
-           coneIsRangeRooted(operand, depth + 1);
+           coneCarriesLayoutLabel(operand, rank, threadsPerBlock,
+                                  behindReshape || reshape, depth + 1);
   });
 }
 
@@ -17322,15 +17339,21 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     if (!enc || srcTy.getRank() < 3 || !inputTy ||
         inputTy.getRank() != srcTy.getRank() ||
         (!coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) &&
-         !coneIsRangeRooted(permutation.getSrc())))
+         !coneCarriesLayoutLabel(permutation.getSrc(), inputTy.getRank(),
+                                 srcIndexPlan->threadsPerBlock())))
       return std::nullopt;
-    // A tile built from its own coordinates carries the label its ranges are
-    // emitted under, which in a rank-N phase function is the layout's own
-    // (📏 thread-major answered 5 of 5 probes wrong; the layout's plan is
-    // exact on 297 of 297 rank-3/4 permutation, axis and warp cells).
-    const bool rangeRooted =
-        !coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank());
-    auto inputPlan = rangeRooted ? planLayoutIndex(inputTy)
+    // A source built from ranges, reshaped loads and one-band loads carries
+    // the layout's own label (`coneCarriesLayoutLabel`): 📏 thread-major
+    // answered 5 of 5 iota probes wrong, the layout's plan is exact on 297 of
+    // 297 iota and 223 of 223 accepted reshape cells. So does a LOADED source
+    // with fewer elements than threads (replicated owners), which the
+    // unpermuted relabel below already leaves alone: 📏 the thread-major
+    // relabel answered every 64-element tile at four warps wrong (30 of 225
+    // cells per load-rooted form, every permutation and axis).
+    const bool layoutLabelled =
+        !coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) ||
+        inputTy.getNumElements() < srcIndexPlan->threadsPerBlock();
+    auto inputPlan = layoutLabelled ? planLayoutIndex(inputTy)
                                  : threadMajorLayoutPlan(
                                        inputTy.getShape(),
                                        srcIndexPlan->threadsPerBlock());
@@ -48451,9 +48474,9 @@ struct ConvertTritonGPUToMetalPass
           rankNReduceSourcePermutation(red)) {
         red.emitOpError(
             "rank >= 3 reduce over a permuted tile requires a thread-major "
-            "load-rooted source, or one computed from its own coordinates "
-            "(tl.arange arithmetic), so publication and reduction coordinates "
-            "can be mapped exactly");
+            "load-rooted source, or one built from tl.arange arithmetic, "
+            "reshaped loads and loads of at most one element per thread, so "
+            "publication and reduction coordinates can be mapped exactly");
         reduceOk = false;
         return;
       }
