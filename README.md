@@ -897,10 +897,11 @@ case and an adjacent rejection regression.
    and works element-wise on the scan's tiles (`v = v * 0.5 + 1` iterated, or
    `acc += tl.load(...)` before a cumsum) runs in each register band like the
    function body's band loop; inner loops that store, perform atomics or move
-   data between elements are refused by name. A row sum, max or min (or i32
-   xor) along the scan axis inside the loop -- read back over its tile, or
+   data between elements are refused by name. A row sum, product, max or min
+   (or i32 xor) along the scan axis inside the loop -- read back over its tile, or
    carried as a running row total as a chunked cumsum or running max does --
-   runs as the pair of scans `P + S - x` (`max(P, S)`, `P ^ S ^ x`), the
+   runs as the pair of scans `P + S - x` (`max(P, S)`, `P ^ S ^ x`, and the
+   exclusive prefix times the inclusive suffix for a product), the
    carried total as a tile; other in-loop reductions are refused by name.
    Staged rank >= 2 scans take max/min combines (`tl.associative_scan` with
    `tl.maximum` / `tl.minimum`, either NaN policy, i32 signed or unsigned). A result if after the scan may read
