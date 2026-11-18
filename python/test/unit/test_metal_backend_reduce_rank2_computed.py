@@ -2231,6 +2231,14 @@ def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
             total += tl.sum(tl.reshape(s, (OUT,)), 0)
             tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
         tl.store(O + T * OUT, total)
+    elif MODE == "min":
+        low = 1.0e30
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets)
+            s = tl.sum(v, AXIS)
+            low = tl.minimum(low, tl.min(s))
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+        tl.store(O + T * OUT, low)
     elif MODE == "peak":
         peak = -1.0e30
         for t in range(T):
@@ -2291,7 +2299,7 @@ def test_rank3_reduce_loop_full_reduction_matches_torch(shape, warps, axis, mode
         torch.testing.assert_close(out[:-1], (r / r.sum(1, keepdim=True)).reshape(-1),
                                    atol=2e-3, rtol=2e-3)
         return
-    tail = r.sum() if mode == "total" else r.max()
+    tail = r.sum() if mode == "total" else r.max() if mode == "peak" else r.min()
     torch.testing.assert_close(out, torch.cat([r.reshape(-1), tail.reshape(1)]), atol=2e-3, rtol=2e-3)
 
 
@@ -2349,8 +2357,9 @@ def test_rank3_reduce_mixed_sources_match_torch(mode, shape, warps):
 # the flattening is only reduced and stored (element-wise work on it beside
 # the reduction, `s / tl.sum(s)`, still reads it across that phase and is
 # refused by name).
-@pytest.mark.parametrize("mode", ["total", "peak", "normalize"])
+@pytest.mark.parametrize("mode", ["total", "peak", "normalize", "min"])
 @pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 1, 1),
+                                                ((2, 8, 16), 1, 0), ((4, 8, 16), 1, 0),
                                                 ((8, 8, 8), 2, 1), ((4, 8, 8), 1, 2),
                                                 ((4, 4, 4), 2, 0), ((2, 4, 8), 2, 0),
                                                 ((4, 4, 8), 4, 0), ((2, 4, 4), 1, 0)])

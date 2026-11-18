@@ -17583,7 +17583,26 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // The rank-1 butterfly stays the fast path for blocked monoids. A general
   // combine already used this fallback, and topk also needs it for the final
   // nested-slice xor reduction whose scalar result has no distributed layout.
-  const bool rank1Fallback = srcTy.getRank() == 1 && (!combine || !enc);
+  // So does a flat reduction inside a rank-N reduce loop (planned cyclic
+  // below), blocked or not: 📏 `tl.min(s)` over a wide blocked flattening was
+  // refused (2 of 72 cells).
+  const bool inRankNLoopEarly = [&] {
+    mlir::Operation *enclosing = op->getParentOp();
+    while (enclosing && isRegisterBandLoop(enclosing))
+      enclosing = enclosing->getParentOp();
+    auto loop = mlir::dyn_cast_or_null<mlir::scf::ForOp>(enclosing);
+    if (!loop)
+      return false;
+    bool found = false;
+    loop->walk([&](mlir::triton::ReduceOp other) {
+      auto otherTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          other.getSrcs().front().getType());
+      found |= other != op && otherTy && otherTy.getRank() >= 3;
+    });
+    return found;
+  }();
+  const bool rank1Fallback =
+      srcTy.getRank() == 1 && (!combine || !enc || inRankNLoopEarly);
   if (srcTy.getRank() < 2 && !rank1Fallback)
     return std::nullopt;
   std::optional<LayoutIndexPlan> srcIndexPlan = planLayoutIndex(srcTy);
@@ -47620,9 +47639,39 @@ static void reduceRankNLoopFlattenedCopies(mlir::ModuleOp moduleOp) {
       return;
     reduces.push_back(reduce);
   });
+  auto rebuildOn = [](mlir::triton::ReduceOp reduce, mlir::Value source) {
+    mlir::OpBuilder builder(reduce);
+    auto replacement = mlir::triton::ReduceOp::create(
+        builder, reduce.getLoc(), mlir::ValueRange{source}, reduce.getAxis());
+    mlir::IRMapping mapping;
+    reduce.getCombineOp().cloneInto(&replacement.getCombineOp(), mapping);
+    reduce->getResult(0).replaceAllUsesWith(replacement->getResult(0));
+    reduce.erase();
+    return replacement;
+  };
   for (mlir::triton::ReduceOp reduce : reduces) {
     auto flatten =
         reduce.getSrcs().front().getDefiningOp<mlir::triton::ReshapeOp>();
+    // A no-axis reduction's own `allow_reorder` flattening in another
+    // encoding than the plain one beside it reads the plain one instead, so
+    // one flattening is phased (`mergeRankNLoopReshapes` folds equal types).
+    // 📏 `tl.min(s)` over a wide result: 2 of 72 cells refused.
+    if (flatten && flatten.getAllowReorder() &&
+        flatten->getBlock() == reduce->getBlock())
+      for (mlir::Operation *use : flatten.getSrc().getUsers()) {
+        auto sibling = mlir::dyn_cast<mlir::triton::ReshapeOp>(use);
+        if (!sibling || sibling == flatten || sibling.getAllowReorder() ||
+            sibling->getBlock() != reduce->getBlock() ||
+            sibling.getType().getShape() != flatten.getType().getShape())
+          continue;
+        if (reduce->isBeforeInBlock(sibling))
+          sibling->moveAfter(flatten);
+        reduce = rebuildOn(reduce, sibling.getResult());
+        if (flatten->use_empty())
+          flatten.erase();
+        flatten = sibling;
+        break;
+      }
     auto module = reduce->getParentOfType<mlir::ModuleOp>();
     auto warps = module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
     auto lanes =
@@ -47653,14 +47702,7 @@ static void reduceRankNLoopFlattenedCopies(mlir::ModuleOp moduleOp) {
     if (copied != flatten)
       copied->moveAfter(flatten);
     copy->moveAfter(copied);
-    mlir::OpBuilder builder(reduce);
-    auto replacement = mlir::triton::ReduceOp::create(
-        builder, reduce.getLoc(), mlir::ValueRange{copy.getResult()},
-        reduce.getAxis());
-    mlir::IRMapping mapping;
-    reduce.getCombineOp().cloneInto(&replacement.getCombineOp(), mapping);
-    reduce->getResult(0).replaceAllUsesWith(replacement->getResult(0));
-    reduce.erase();
+    rebuildOn(reduce, copy.getResult());
   }
 }
 
