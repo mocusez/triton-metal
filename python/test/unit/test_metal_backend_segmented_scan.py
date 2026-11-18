@@ -9025,9 +9025,9 @@ def test_multiband_scan_unsigned_column_broadcast_source_is_named(mode, diagnost
     assert diagnostic in output, output
 
 
-@pytest.mark.parametrize("mode", [3, 4, 5, 6, 7, 8, 9, 10],
+@pytest.mark.parametrize("mode", [3, 4, 5, 6, 7, 9, 10],
                          ids=["mixed_store", "cross_axis", "wider_tile", "pre_expand_arithmetic",
-                              "multiple_scans", "nested_scan", "region_capture", "downstream_reduce"])
+                              "multiple_scans", "region_capture", "downstream_reduce"])
 def test_multiband_scan_unsigned_column_broadcast_consumer_is_named(mode):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_column_broadcast_kernel",
@@ -9036,8 +9036,7 @@ def test_multiband_scan_unsigned_column_broadcast_consumer_is_named(mode):
         {"R": 16, "C": 16, "MODE": mode, "UNSIGNED": True, "MONOID": ""}, num_warps=1)
     output = result.stdout + result.stderr
     assert result.returncode > 0, output
-    diagnostic = ("a reduce inside a nested scan loop is supported as a sum" if mode == 8 else
-                  "a scan-input column broadcast requires same-layout f32/i32 sources"
+    diagnostic = ("a scan-input column broadcast requires same-layout f32/i32 sources"
                   if mode in (3, 5, 7, 9, 10) else
                   "a rank-2 tl.reduce cannot share a function with a multi-band staged scan")
     assert diagnostic in output, output
@@ -13639,6 +13638,11 @@ def test_nested_scan_outer_carries_initialize_every_inner_slot(trips, num_warps)
 # inclusive forward and reverse scans; P ^ S ^ x for an i32 xor), and a carried
 # row total read only as `carry[:, None]` becomes a tile carry.
 @triton.jit
+def _row_product_combine(a, b):
+    return a * b
+
+
+@triton.jit
 def _nested_scan_row_reduce_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexpr,
                                    MODE: tl.constexpr):
     r = tl.arange(0, R)[:, None]
@@ -13660,16 +13664,22 @@ def _nested_scan_row_reduce_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexp
             off = chunk * R * C + r * C + c
             x = tl.load(X + off)
             tl.store(O + off, tl.cumsum(x, 1) + tl.xor_sum(x, 1)[:, None])
-    else:
+    elif MODE == "max":
         for chunk in range(chunks):
             off = chunk * R * C + r * C + c
             x = tl.load(X + off)
             tl.store(O + off, tl.cumsum(x, 1) - tl.max(x, 1)[:, None])
+    else:
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) - tl.reduce(x, 1, _row_product_combine)[:, None])
 
 
 @pytest.mark.parametrize("mode, dtype", [("chunked", torch.float32), ("chunked", torch.int32),
                                          ("beside", torch.float32), ("beside", torch.int32),
-                                         ("xor", torch.int32)])
+                                         ("xor", torch.int32), ("max", torch.float32),
+                                         ("max", torch.int32)])
 @pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 2), ((32, 32), 4),
                                               ((4, 64), 1)])
 def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
@@ -13689,6 +13699,8 @@ def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
         xs = x.reshape(chunks, rows, cols)
         if mode == "beside":
             want = (xs.cumsum(2) - xs.sum(2, keepdim=True)).reshape(-1)
+        elif mode == "max":
+            want = (xs.cumsum(2) - xs.amax(2, keepdim=True)).reshape(-1)
         else:
             acc = xs[..., 0].clone()
             for j in range(1, cols):
@@ -13700,21 +13712,21 @@ def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
         torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-4)
 
 
-def test_nested_scan_row_max_is_named(capfd):
+def test_nested_scan_row_product_is_named(capfd):
     x = torch.randn(3 * 512, device="mps")
     out = torch.zeros_like(x)
     with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _nested_scan_row_reduce_kernel[(1,)](x, out, 3, 8, 64, "max", num_warps=1)
+        _nested_scan_row_reduce_kernel[(1,)](x, out, 3, 8, 64, "product", num_warps=1)
     captured = capfd.readouterr()
-    assert "a reduce inside a nested scan loop is supported as a sum" in (
+    assert "a reduce inside a nested scan loop is supported as a sum, a max or min" in (
         captured.err + captured.out)
 
 
 
 # The nested-loop mode of the shared-input column broadcast above: a column sum
-# (or i32 xor) read back over the tile beside a row scan. It is now the pair of
-# column scans `P + S - x` (`P ^ S ^ x`) and exact.
-@pytest.mark.parametrize("monoid", ["", "xor"])
+# (or i32 xor, or unsigned min) read back over the tile beside a row scan. It is
+# now the pair of column scans `P + S - x` (`P ^ S ^ x`, `min(P, S)`) and exact.
+@pytest.mark.parametrize("monoid", ["", "xor", "umin"])
 @pytest.mark.parametrize("shape, num_warps", [((16, 16), 1), ((16, 16), 4), ((8, 64), 1),
                                               ((32, 32), 2)])
 def test_nested_scan_column_reduce_beside_row_scan_matches_torch(monoid, shape, num_warps):
@@ -13727,10 +13739,16 @@ def test_nested_scan_column_reduce_beside_row_scan_matches_torch(monoid, shape, 
     y = torch.zeros(steps * rows * cols, dtype=dtype, device="mps")
     unused = torch.zeros(1, dtype=dtype, device="mps")
     _unsupported_shared_input_column_broadcast_kernel[(1,)](
-        x.to("mps"), unused, y, unused, unused, steps, rows, cols, 8, False, monoid,
-        num_warps=num_warps)
+        x.to("mps"), unused, y, unused, unused, steps, rows, cols, 8, monoid == "umin",
+        "" if monoid == "umin" else monoid, num_warps=num_warps)
     torch.mps.synchronize()
     xs = x.reshape(steps, rows, cols)
+    if monoid == "umin":
+        wide = xs.to(torch.int64)
+        want = (wide.cumsum(2) + (wide & 0xFFFFFFFF).amin(1)[:, None, :]) & 0xFFFFFFFF
+        want = torch.where(want >= 2**31, want - 2**32, want).to(torch.int32).reshape(-1)
+        assert torch.equal(y.cpu(), want)
+        return
     if monoid:
         reduced = xs[:, 0, :].clone()
         for i in range(1, rows):
@@ -13742,3 +13760,122 @@ def test_nested_scan_column_reduce_beside_row_scan_matches_torch(monoid, shape, 
         assert torch.equal(y.cpu(), want)
     else:
         torch.testing.assert_close(y.cpu(), want, atol=1e-3, rtol=1e-4)
+
+
+# Extremum scans. A staged rank >= 2 scan takes max/min combines (float
+# maxnumf/minnumf and the NaN-propagating maximumf/minimumf, i32 signed and
+# unsigned), with the far end of the order as the identity.
+@triton.jit
+def _scan_max_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _scan_min_combine(a, b):
+    return tl.minimum(a, b)
+
+
+@triton.jit
+def _rank2_extremum_scan_kernel(X, O, R: tl.constexpr, C: tl.constexpr, AXIS: tl.constexpr,
+                                REVERSE: tl.constexpr, MAXIMUM: tl.constexpr,
+                                UNSIGNED: tl.constexpr):
+    off = tl.arange(0, R)[:, None] * C + tl.arange(0, C)[None, :]
+    x = tl.load(X + off)
+    if UNSIGNED:
+        x = x.to(tl.uint32, bitcast=True)
+    if MAXIMUM:
+        y = tl.associative_scan(x, AXIS, _scan_max_combine, reverse=REVERSE)
+    else:
+        y = tl.associative_scan(x, AXIS, _scan_min_combine, reverse=REVERSE)
+    if UNSIGNED:
+        y = y.to(tl.int32, bitcast=True)
+    tl.store(O + off, y)
+
+
+def _running_extremum(t, dim, maximum, reverse):
+    if reverse:
+        t = t.flip(dim)
+    out = (torch.cummax if maximum else torch.cummin)(t, dim).values
+    return out.flip(dim) if reverse else out
+
+
+@pytest.mark.parametrize("dtype", ["f32", "i32", "u32"])
+@pytest.mark.parametrize("maximum", [True, False])
+@pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 4), ((32, 32), 2), ((2, 8), 1)])
+def test_rank2_extremum_scan_matches_torch(dtype, maximum, shape, num_warps):
+    rows, cols = shape
+    torch.manual_seed(rows * cols + num_warps)
+    if dtype == "f32":
+        x = torch.randn(rows * cols)
+    else:
+        x = torch.randint(-1000, 1000, (rows * cols,), dtype=torch.int32)
+    for axis in (0, 1):
+        for reverse in (False, True):
+            out = torch.zeros_like(x, device="mps")
+            _rank2_extremum_scan_kernel[(1,)](x.to("mps"), out, rows, cols, axis, reverse, maximum,
+                                              dtype == "u32", num_warps=num_warps)
+            torch.mps.synchronize()
+            t = x.reshape(rows, cols)
+            if dtype == "u32":
+                t = t.to(torch.int64) & 0xFFFFFFFF
+            want = _running_extremum(t, axis, maximum, reverse)
+            if dtype == "u32":
+                want = torch.where(want >= 2**31, want - 2**32, want).to(torch.int32)
+            assert torch.equal(out.cpu().reshape(rows, cols), want.to(out.dtype)), (axis, reverse)
+
+
+# The same extremum along the scan axis inside a nested-scan loop -- read back
+# over its tile, or carried as a running row maximum (the chunked running max)
+# -- is the pair of extremum scans max(P, S), which needs no correction.
+@triton.jit
+def _nested_scan_row_extremum_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexpr,
+                                     MODE: tl.constexpr):
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, C)[None, :]
+    if MODE == "beside":
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) - tl.max(x, 1)[:, None] + tl.min(x, 1)[:, None])
+    elif MODE == "chunked_max":
+        m = tl.full((R,), -1000, X.dtype.element_ty)
+        for chunk in range(chunks):
+            off = r * (chunks * C) + chunk * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.maximum(tl.associative_scan(x, 1, _scan_max_combine), m[:, None]))
+            m = tl.maximum(m, tl.max(x, 1))
+    else:
+        m = tl.full((R,), 1000, X.dtype.element_ty)
+        for chunk in range(chunks):
+            off = r * (chunks * C) + chunk * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.minimum(tl.associative_scan(x, 1, _scan_min_combine), m[:, None]))
+            m = tl.minimum(m, tl.min(x, 1))
+
+
+@pytest.mark.parametrize("mode", ["beside", "chunked_max", "chunked_min"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+@pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 2), ((32, 32), 4), ((4, 64), 1)])
+def test_nested_scan_row_extremum_matches_torch(mode, dtype, shape, num_warps):
+    chunks = 3
+    rows, cols = shape
+    n = chunks * rows * cols
+    torch.manual_seed(rows * cols + num_warps)
+    x = (torch.randint(-50, 50, (n,), dtype=torch.int32) if dtype == torch.int32 else torch.randn(n))
+    out = torch.zeros(n, dtype=dtype, device="mps")
+    _nested_scan_row_extremum_kernel[(1,)](x.to("mps"), out, chunks, rows, cols, mode,
+                                           num_warps=num_warps)
+    torch.mps.synchronize()
+    if mode == "beside":
+        xs = x.reshape(chunks, rows, cols)
+        want = (xs.cumsum(2) - xs.amax(2, keepdim=True) + xs.amin(2, keepdim=True)).reshape(-1)
+    elif mode == "chunked_max":
+        flat = x.reshape(rows, chunks * cols)
+        want = torch.cummax(flat, 1).values.clamp_min(-1000).reshape(-1)
+    else:
+        flat = x.reshape(rows, chunks * cols)
+        want = torch.cummin(flat, 1).values.clamp_max(1000).reshape(-1)
+    if dtype == torch.int32:
+        assert torch.equal(out.cpu(), want.to(torch.int32))
+    else:
+        torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-4)

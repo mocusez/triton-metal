@@ -14704,9 +14704,44 @@ lowerCanonicalAffineScan(mlir::triton::ScanOp op,
 // `combine(l, r) = l * 2 + r` as a cumprod — both silently wrong answers, with
 // no diagnostic anywhere. All supported combines are commutative,
 // so the two operand orders are equivalent.
-static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
-                                                      bool isI32,
-                                                      bool allowXor = false) {
+static std::optional<BinaryExpOperator>
+floatExtremumOperator(mlir::Operation *op);
+
+// The single op of a scan's combine region, applied to its two arguments, or
+// null (`scanCombineKind`'s structural match).
+static mlir::Operation *scanCombineOp(mlir::triton::ScanOp op) {
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return nullptr;
+  mlir::Block &body = op->getRegion(0).front();
+  if (body.getNumArguments() != 2)
+    return nullptr;
+  mlir::Operation *combine = nullptr;
+  for (mlir::Operation &nested : body) {
+    if (mlir::isa<mlir::triton::ScanReturnOp>(nested))
+      continue;
+    if (combine)
+      return nullptr;
+    combine = &nested;
+  }
+  auto ret = mlir::dyn_cast<mlir::triton::ScanReturnOp>(body.back());
+  if (!combine || !ret || ret->getNumOperands() != 1 ||
+      combine->getNumResults() != 1 ||
+      ret->getOperand(0) != combine->getResult(0) ||
+      combine->getNumOperands() != 2)
+    return nullptr;
+  mlir::Value lhs = body.getArgument(0), rhs = body.getArgument(1);
+  if (!((combine->getOperand(0) == lhs && combine->getOperand(1) == rhs) ||
+        (combine->getOperand(0) == rhs && combine->getOperand(1) == lhs)))
+    return nullptr;
+  return combine;
+}
+
+// `allowExtrema` (the staged path): float maxnumf/minnumf (maxOp/minOp),
+// maximumf/minimumf (maxNanOp/minNanOp), and i32 signed or unsigned max/min
+// (maxOp/minOp; the staged lowering keeps the arith op for its signedness).
+static std::optional<BinaryExpOperator>
+scanCombineKind(mlir::triton::ScanOp op, bool isI32, bool allowXor = false,
+                bool allowExtrema = false) {
   if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
     return std::nullopt;
   mlir::Block &body = op->getRegion(0).front();
@@ -14741,6 +14776,15 @@ static std::optional<BinaryExpOperator> scanCombineKind(mlir::triton::ScanOp op,
     return BinaryExpOperator::mulOp;
   if (allowXor && isI32 && mlir::isa<mlir::arith::XOrIOp>(combine))
     return BinaryExpOperator::bitXorOp;
+  if (allowExtrema && !isI32)
+    if (auto extremum = floatExtremumOperator(combine))
+      return *extremum;
+  if (allowExtrema && isI32 &&
+      mlir::isa<mlir::arith::MaxSIOp, mlir::arith::MaxUIOp>(combine))
+    return BinaryExpOperator::maxOp;
+  if (allowExtrema && isI32 &&
+      mlir::isa<mlir::arith::MinSIOp, mlir::arith::MinUIOp>(combine))
+    return BinaryExpOperator::minOp;
   return std::nullopt;
 }
 
@@ -14787,6 +14831,9 @@ struct StagedScanPlan {
   bool reverse;
   int64_t numElements;
   std::optional<LayoutIndexPlan> layout;
+  // An i32 extremum's own arith op (maxsi/maxui/minsi/minui), applied in the
+  // signless type so its signedness survives.
+  std::optional<mlir::OperationName> intExtremum = std::nullopt;
 };
 
 static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
@@ -14834,9 +14881,13 @@ static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
   if (!isI32 && !elemTy.isF32() && !elemTy.isF16() && !elemTy.isBF16())
     return std::nullopt;
   std::optional<BinaryExpOperator> kind =
-      scanCombineKind(op, isI32, /*allowXor=*/true);
+      scanCombineKind(op, isI32, /*allowXor=*/true, /*allowExtrema=*/true);
   if (!kind)
     return std::nullopt;
+  std::optional<mlir::OperationName> intExtremum;
+  if (isI32 &&
+      (*kind == BinaryExpOperator::maxOp || *kind == BinaryExpOperator::minOp))
+    intExtremum = scanCombineOp(op)->getName();
 
   llvm::SmallVector<int64_t, 4> strides(tile->shape.size(), 1);
   int64_t acc = 1;
@@ -14856,7 +14907,8 @@ static std::optional<StagedScanPlan> planStagedScan(mlir::triton::ScanOp op) {
                         *kind,
                         op.getReverse(),
                         numElements,
-                        layout};
+                        layout,
+                        intExtremum};
 }
 
 struct StagedScanLowering
@@ -14933,14 +14985,34 @@ struct StagedScanLowering
     // folded in without changing the answer. Selecting in the SIGNLESS element
     // type keeps `arith.select` legal (it rejects the signed/unsigned Metal
     // storage types); the casts around it are no-ops in MSL.
-    mlir::TypedAttr identityAttr =
-        mlir::isa<mlir::FloatType>(elemTy)
-            ? mlir::cast<mlir::TypedAttr>(rewriter.getFloatAttr(
-                  elemTy,
-                  plan->combineKind == BinaryExpOperator::mulOp ? 1.0 : 0.0))
-            : mlir::cast<mlir::TypedAttr>(rewriter.getIntegerAttr(
-                  elemTy,
-                  plan->combineKind == BinaryExpOperator::mulOp ? 1 : 0));
+    // An extremum's identity is the far end of its order: -inf / +inf, and
+    // INT32_MIN / INT32_MAX signed or 0 / UINT32_MAX unsigned.
+    const BinaryExpOperator kindOp = plan->combineKind;
+    const bool isMax = kindOp == BinaryExpOperator::maxOp ||
+                       kindOp == BinaryExpOperator::maxNanOp;
+    const bool isMin = kindOp == BinaryExpOperator::minOp ||
+                       kindOp == BinaryExpOperator::minNanOp;
+    mlir::TypedAttr identityAttr;
+    if (mlir::isa<mlir::FloatType>(elemTy)) {
+      double value = kindOp == BinaryExpOperator::mulOp ? 1.0 : 0.0;
+      if (isMax)
+        value = -std::numeric_limits<double>::infinity();
+      else if (isMin)
+        value = std::numeric_limits<double>::infinity();
+      identityAttr = rewriter.getFloatAttr(elemTy, value);
+    } else {
+      int64_t value = kindOp == BinaryExpOperator::mulOp ? 1 : 0;
+      if (plan->intExtremum) {
+        llvm::StringRef name = plan->intExtremum->getStringRef();
+        if (name == mlir::arith::MaxSIOp::getOperationName())
+          value = std::numeric_limits<int32_t>::min();
+        else if (name == mlir::arith::MinSIOp::getOperationName())
+          value = std::numeric_limits<int32_t>::max();
+        else if (name == mlir::arith::MinUIOp::getOperationName())
+          value = -1;
+      }
+      identityAttr = rewriter.getIntegerAttr(elemTy, value);
+    }
     mlir::Value identity =
         mlir::arith::ConstantOp::create(rewriter, loc, identityAttr)
             .getResult();
@@ -14973,6 +15045,17 @@ struct StagedScanLowering
               .getResult();
       v = mlir::arith::SelectOp::create(rewriter, loc, inPrefix, v, identity)
               .getResult();
+      if (plan->intExtremum) {
+        if (!result) {
+          result = v;
+          continue;
+        }
+        mlir::OperationState state(loc, *plan->intExtremum);
+        state.addOperands({result, v});
+        state.addTypes(elemTy);
+        result = rewriter.create(state)->getResult(0);
+        continue;
+      }
       mlir::Value staged = bridge(v, plan->stageTy);
       result = result ? BinaryExpOp::create(rewriter, loc, plan->stageTy,
                                             opEnum, result, staged)
@@ -44910,22 +44993,23 @@ static llvm::StringRef nestedScanLocalScalarRegionRefusal(
          "reads a value that cannot be recomputed after the phase";
 }
 
-// A selected loop keeps its tensor effects in a flat body or a no-result uniform
-// if. Pure scalar inner loops and result ifs stay intact within the local phase.
-// The scheduler cuts tensor work into register bands. Uniform outer
-// for/if/while ancestors stay intact; outer for loops use the same slots and
-// pre/post bands in their own direct scopes without moving the inner phases.
-// A row reduce in a loop that also scans, read back over its own tile
+// A selected loop keeps its tensor effects in a flat body or a no-result
+// uniform if. Pure scalar inner loops and result ifs stay intact within the
+// local phase. The scheduler cuts tensor work into register bands. Uniform
+// outer for/if/while ancestors stay intact; outer for loops use the same slots
+// and pre/post bands in their own direct scopes without moving the inner
+// phases. A row reduce in a loop that also scans, read back over its own tile
 // (`tl.max(x, 1)[:, None]`) or carried across iterations as a running row
 // total (`carry += tl.sum(x, 1)`, used as `carry[:, None]` -- the chunked
 // cumsum), has no staged lowering inside a nested-scan loop: the row reduce
 // replays its source from device addresses, which a loop-dependent address
 // defeats. Along the reduced axis the broadcast value IS two scans: with P the
 // inclusive prefix and S the inclusive suffix, every element of the row holds
-// P + S - x for a sum and P ^ S ^ x for xor (the combines a staged scan has;
-// an extremum would be max(P, S) but there is no max scan). Rewrite the broadcast into those scans, which a
-// nested-scan loop phases like any other, and promote a carried row total to
-// the tile it is broadcast over. 📏 Before this, every such loop was refused
+// P + S - x for a sum, P ^ S ^ x for xor, and max(P, S) / min(P, S) for an
+// extremum, which needs no correction because it is idempotent. Rewrite the
+// broadcast into those scans, which a nested-scan loop phases like any other,
+// and promote a carried row total (or running row maximum) to the tile it is
+// broadcast over. 📏 Before this, every such loop was refused
 // ("flat load/compute/store loop body" / "carries only tiles with the
 // function tile's register count").
 static mlir::triton::ScanOp scanFromReduce(mlir::OpBuilder &builder,
@@ -44995,11 +45079,15 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
       return;
     mlir::Operation *combine = reduceCombineBinaryOp(reduce);
     // The combines a staged rank-2 scan lowers (`scanCombineKind`): a sum,
-    // and an i32 xor. An extremum would need max/min scans, which it has not.
+    // a float or i32 extremum, and an i32 xor.
     const bool i32 = srcTy.getElementType().isInteger(32);
     if (!combine ||
         !(mlir::isa<mlir::arith::AddFOp>(combine) ||
-          (i32 && mlir::isa<mlir::arith::AddIOp, mlir::arith::XOrIOp>(combine))))
+          (!i32 && floatExtremumOperator(combine)) ||
+          (i32 &&
+           mlir::isa<mlir::arith::AddIOp, mlir::arith::XOrIOp,
+                     mlir::arith::MaxSIOp, mlir::arith::MinSIOp,
+                     mlir::arith::MaxUIOp, mlir::arith::MinUIOp>(combine))))
       return;
     reduces.push_back(reduce);
   });
@@ -45542,9 +45630,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       if (mlir::isa<mlir::triton::ReduceOp>(&op))
         return op.emitOpError(
             "Metal backend: a reduce inside a nested scan loop is supported as "
-            "a sum (or i32 xor) along a 2-D tile's axis that is only read back "
-            "over that tile or carried as a running row total; move other "
-            "reductions out of the loop");
+            "a sum, a max or min (or an i32 xor) along a 2-D tile's axis that "
+            "is only read back over that tile or carried as a running row "
+            "total; move other reductions out of the loop");
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
           llvm::any_of(op.getResultTypes(), isTensor))
         return op.emitOpError(
@@ -47955,10 +48043,11 @@ static mlir::LogicalResult validateScanSupport(mlir::ModuleOp moduleOp) {
         return;
       reject("rank >= 2 scan is implemented for a blocked tile whose element "
              "count fits the "
-             "threadgroup budget, along an axis of extent 2..64, with an add "
-             "or mul combine (tl.cumsum / tl.cumprod) on f32, f16, bf16 or "
-             "i32, or an xor combine on i32, outside divergent control flow; "
-             "multi-element scans require a top-level function phase");
+             "threadgroup budget, along an axis of extent 2..64, with an add, "
+             "mul, max or min combine (tl.cumsum / tl.cumprod / a running "
+             "extremum) on f32, f16, bf16 or i32, or an xor combine on i32, "
+             "outside divergent control flow; multi-element scans require a "
+             "top-level function phase");
       return;
     }
     if (op.getAxis() != 0) {
