@@ -836,9 +836,11 @@ case and an adjacent rejection regression.
    carries live in thread-private slots (one element per band for a tile, two
    entries by iteration parity for a scalar). A full reduction of the result
    inside the loop (`tot += tl.sum(tl.reshape(s, (n,)))`, a running max,
-   `s / tl.sum(s)`) is planned cyclic like the loop's tiles while the flattened
-   result fits one register band; a wider one and a broadcast of the result
-   back into the tile remain named boundaries. Top-level single-value rank >= 2
+   `s / tl.sum(s)`, `tl.min(s)`) is planned cyclic like the loop's tiles, and
+   phased like the rank-N reduce when the flattened result spans several
+   register bands; element-wise work on such a wide flattened result beside
+   its reduction and a broadcast of the result back into the tile remain
+   named boundaries. Top-level single-value rank >= 2
    scans now support multiple elements per thread. Rank-2 and rank-3 scans with
    different register-band counts can share a function: each scan's consumers
    finish in that scan's own phase before the next publication begins. Rank >= 2
