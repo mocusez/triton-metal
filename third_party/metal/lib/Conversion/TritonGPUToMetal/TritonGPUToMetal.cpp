@@ -47600,6 +47600,70 @@ static void mergeRankNLoopReshapes(mlir::ModuleOp moduleOp) {
   });
 }
 
+// A full reduction of a flattened rank-N loop result narrower than the CTA,
+// whose flattening a store converts to a blocked layout too, reads that
+// blocked copy instead: a single-operand reduce does not care about order, and
+// a blocked tile of one band reduces in place, without the phase split that
+// left the store's conversion unschedulable (📏 4 of 72 cells per form).
+static void reduceRankNLoopFlattenedCopies(mlir::ModuleOp moduleOp) {
+  llvm::SmallVector<mlir::triton::ReduceOp, 4> reduces;
+  moduleOp.walk([&](mlir::triton::ReduceOp reduce) {
+    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(reduce->getParentOp());
+    if (!loop || reduce.getSrcs().size() != 1 ||
+        mlir::isa<mlir::RankedTensorType>(reduce->getResult(0).getType()) ||
+        llvm::none_of(loop.getBody()->getOps<mlir::triton::ReduceOp>(),
+                      [](mlir::triton::ReduceOp other) {
+                        auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+                            other.getSrcs().front().getType());
+                        return type && type.getRank() >= 3;
+                      }))
+      return;
+    reduces.push_back(reduce);
+  });
+  for (mlir::triton::ReduceOp reduce : reduces) {
+    auto flatten =
+        reduce.getSrcs().front().getDefiningOp<mlir::triton::ReshapeOp>();
+    auto module = reduce->getParentOfType<mlir::ModuleOp>();
+    auto warps = module->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps");
+    auto lanes =
+        module->getAttrOfType<mlir::IntegerAttr>("ttg.threads-per-warp");
+    if (!flatten || !warps || !lanes ||
+        flatten.getType().getNumElements() > warps.getInt() * lanes.getInt())
+      continue;
+    // This flattening's blocked copy, or a sibling flattening's (`tl.min(s)`
+    // keeps its own `allow_reorder` reshape beside the store's).
+    mlir::triton::gpu::ConvertLayoutOp copy;
+    mlir::triton::ReshapeOp copied;
+    for (mlir::Operation *use : flatten.getSrc().getUsers()) {
+      auto sibling = mlir::dyn_cast<mlir::triton::ReshapeOp>(use);
+      if (!sibling || sibling->getBlock() != reduce->getBlock() ||
+          sibling.getType().getShape() != flatten.getType().getShape())
+        continue;
+      for (mlir::Operation *user : sibling->getUsers())
+        if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user);
+            cvt && cvt->getBlock() == reduce->getBlock() &&
+            mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+                cvt.getType().getEncoding())) {
+          copy = cvt;
+          copied = sibling;
+        }
+    }
+    if (!copy)
+      continue;
+    if (copied != flatten)
+      copied->moveAfter(flatten);
+    copy->moveAfter(copied);
+    mlir::OpBuilder builder(reduce);
+    auto replacement = mlir::triton::ReduceOp::create(
+        builder, reduce.getLoc(), mlir::ValueRange{copy.getResult()},
+        reduce.getAxis());
+    mlir::IRMapping mapping;
+    reduce.getCombineOp().cloneInto(&replacement.getCombineOp(), mapping);
+    reduce->getResult(0).replaceAllUsesWith(replacement->getResult(0));
+    reduce.erase();
+  }
+}
+
 static void slotRankNLoopTileCarries(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
   moduleOp.walk([&](mlir::scf::ForOp loop) {
@@ -49207,6 +49271,7 @@ struct ConvertTritonGPUToMetalPass
     rewriteHypercubeFlips(moduleOp);
     rewriteScanLoopRowReduces(moduleOp);
     mergeRankNLoopReshapes(moduleOp);
+    reduceRankNLoopFlattenedCopies(moduleOp);
     slotRankNLoopTileCarries(moduleOp);
     if (mlir::failed(markThreadMajorPhaseReshapes(moduleOp)) ||
         mlir::failed(selectNestedScanLoops(moduleOp)) ||
