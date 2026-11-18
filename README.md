@@ -812,11 +812,15 @@ case and an adjacent rejection regression.
    matrices are numerically clean. Rank-3 and rank-4 permute-to-reduce now map
    thread-major load-rooted input coordinates through the permutation before
    exact publication, on every reduction axis and across register bands.
-   Other permuted sources are exact too: `tl.arange` arithmetic, reshaped
-   loads and broadcasts carry the layout's own label, and a direct load wider
-   than one register band makes its whole source thread-major; a loaded tile
-   with fewer elements than threads uses the layout's label (the thread-major
-   relabel answered every such tile wrong). One top-level
+   Other permuted sources are exact too. In a function with a rank-N
+   reduction a tile's element order is read off its address ranges: expanded
+   (`[:, None]`) ranges are thread-major, a flat range reshaped into the tile
+   keeps its layout's order, and a tile mixing the two reads its flat-to-tile
+   reshape thread-major through an exchange -- a direct load beside a reshaped
+   flat load, a load addressed by a reshaped range, a reshaped rank-2 load and
+   a reshaped load stored through expanded addresses are all exact (each was
+   silently wrong from eight elements per thread before); a loaded tile with
+   fewer elements than threads uses the layout's label. One top-level
    no-iter_arg uniform loop can now stage direct-load rank >= 3 reductions
    independently on each iteration, with cyclic publish addressing and barriers.
    The source, the result and every range in the loop share that cyclic order;
@@ -830,9 +834,11 @@ case and an adjacent rejection regression.
    Element-wise consumers (a read-modify-write of the output), sibling and
    nested reduction loops, and loop-carried tiles and scalars are exact too:
    carries live in thread-private slots (one element per band for a tile, two
-   entries by iteration parity for a scalar). A broadcast of the result back
-   into the tile and a further reduction of it inside the loop remain named
-   boundaries. Top-level single-value rank >= 2
+   entries by iteration parity for a scalar). A full reduction of the result
+   inside the loop (`tot += tl.sum(tl.reshape(s, (n,)))`, a running max,
+   `s / tl.sum(s)`) is planned cyclic like the loop's tiles while the flattened
+   result fits one register band; a wider one and a broadcast of the result
+   back into the tile remain named boundaries. Top-level single-value rank >= 2
    scans now support multiple elements per thread. Rank-2 and rank-3 scans with
    different register-band counts can share a function: each scan's consumers
    finish in that scan's own phase before the next publication begins. Rank >= 2
@@ -890,11 +896,13 @@ case and an adjacent rejection regression.
    and works element-wise on the scan's tiles (`v = v * 0.5 + 1` iterated, or
    `acc += tl.load(...)` before a cumsum) runs in each register band like the
    function body's band loop; inner loops that store, perform atomics or move
-   data between elements are refused by name. A row sum (or i32 xor) along the
-   scan axis inside the loop -- read back over its tile, or carried as a running
-   row total as a chunked cumsum does -- runs as the pair of scans `P + S - x`
-   (`P ^ S ^ x`), the carried total as a tile; other in-loop reductions are
-   refused by name. A result if after the scan may read
+   data between elements are refused by name. A row sum, max or min (or i32
+   xor) along the scan axis inside the loop -- read back over its tile, or
+   carried as a running row total as a chunked cumsum or running max does --
+   runs as the pair of scans `P + S - x` (`max(P, S)`, `P ^ S ^ x`), the
+   carried total as a tile; other in-loop reductions are refused by name.
+   Staged rank >= 2 scans take max/min combines (`tl.associative_scan` with
+   `tl.maximum` / `tl.minimum`, either NaN policy, i32 signed or unsigned). A result if after the scan may read
    the scan result: it is copied through a slot right after the scan (a scan
    result that a later scan also consumes is refused by name). Supported
    result-carrying internal ifs use
