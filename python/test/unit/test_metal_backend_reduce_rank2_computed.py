@@ -2266,3 +2266,53 @@ def test_rank3_reduce_loop_further_reduction_is_named(capfd):
                                               MODE="total", num_warps=1)
     diagnostic = capfd.readouterr()
     assert "a further reduction of the result" in diagnostic.err + diagnostic.out
+
+
+# The same label question without a permute. A rank-3 sum of a direct load
+# beside a reshaped flat load, of a load addressed by a reshaped range, or of a
+# reshaped rank-2 load, and a reshaped flat load stored through expanded
+# addresses beside its sum: each was wrong from E = 8 (14 or 15 of 45 cells),
+# and a narrow [16, 4] load reshaped to [2, 8, 4] stored its axis-2 sum through
+# the load's row coordinate.
+@triton.jit
+def _rank3_reduce_mixed_source_kernel(X, Y, O, A: tl.constexpr, B: tl.constexpr,
+                                      C: tl.constexpr, AXIS: tl.constexpr, OUT: tl.constexpr,
+                                      MODE: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    offsets = a * (B * C) + b * C + c
+    flat = tl.arange(0, A * B * C)
+    rows = tl.arange(0, A * B)[:, None] * C + tl.arange(0, C)[None, :]
+    if MODE == "mix":
+        v = tl.load(X + offsets) + tl.reshape(tl.load(Y + flat), (A, B, C))
+    elif MODE == "mixra":
+        v = tl.load(X + offsets) + tl.load(Y + tl.reshape(flat, (A, B, C)))
+    elif MODE == "mix2":
+        v = tl.load(X + offsets) + tl.reshape(tl.load(Y + rows), (A, B, C))
+    elif MODE == "ra":
+        v = tl.load(Y + tl.reshape(flat, (A, B, C)))
+    else:
+        v = tl.reshape(tl.load(Y + flat), (A, B, C))
+        tl.store(O + OUT + offsets, v)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(tl.sum(v, AXIS), (OUT,)))
+
+
+@pytest.mark.parametrize("mode", ["mix", "mixra", "mix2", "ra", "store"])
+@pytest.mark.parametrize("shape, warps", [((8, 8, 8), 1), ((4, 8, 16), 2), ((4, 8, 8), 1),
+                                          ((8, 8, 8), 4), ((2, 8, 4), 4)])
+def test_rank3_reduce_mixed_sources_match_torch(mode, shape, warps):
+    a, b, c = shape
+    for axis in range(3):
+        torch.manual_seed(a * b * c + axis + warps)
+        x = torch.randn(a * b * c, dtype=torch.float32)
+        y = torch.randn(a * b * c, dtype=torch.float32)
+        t = (x + y if mode.startswith("mix") else y).reshape(shape)
+        out_elements = a * b * c // shape[axis]
+        out = torch.zeros(out_elements + (a * b * c if mode == "store" else 0), dtype=torch.float32)
+        _rank3_reduce_mixed_source_kernel[(1,)](x, y, out, a, b, c, axis, out_elements, mode,
+                                                num_warps=warps)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out[:out_elements], t.sum(axis).reshape(-1), atol=1e-4, rtol=1e-4)
+        if mode == "store":
+            torch.testing.assert_close(out[out_elements:], t.reshape(-1))

@@ -902,10 +902,8 @@ static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
   // does not survive.
   if (auto lin = mlir::dyn_cast_or_null<mlir::triton::gpu::LinearEncodingAttr>(
           rt.getEncoding())) {
-    if (rt.getRank() != 1)
-      return std::nullopt;
     const mlir::triton::LinearLayout &ll = lin.getLinearLayout();
-    if (ll.getNumOutDims() != 1)
+    if (static_cast<int64_t>(ll.getNumOutDims()) != rt.getRank())
       return std::nullopt;
     int64_t tpb = 1;
     auto *ctx = rt.getContext();
@@ -923,8 +921,15 @@ static std::optional<TileInfo> tileFromLoadPtrTensor(mlir::Type t) {
                   rt.getRank(),
                   {},
                   {}};
-    info.shape.push_back(total);
-    info.order.push_back(0);
+    if (rt.getRank() == 1) {
+      info.shape.push_back(total);
+      info.order.push_back(0);
+    } else {
+      for (int64_t extent : rt.getShape())
+        info.shape.push_back(extent);
+      for (int64_t d = rt.getRank() - 1; d >= 0; --d)
+        info.order.push_back(d);
+    }
     return info;
   }
   auto slice = mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
@@ -3513,6 +3518,129 @@ static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
   return true;
 }
 
+// The label the elements of an address (or of a value computed from ranges)
+// carry in a rank-N phase function, read off its range leaves. A range that
+// reaches the tile through `tt.expand_dims` (a slice-encoded range) is
+// decomposed thread-major, `localTid * E + iv`; a flat blocked or linear range
+// is emitted in its layout's own space there, and a free `tt.reshape` hands
+// that order on to the tile it is reshaped into. 📏 A rank-3 load addressed by
+// `tl.reshape(tl.arange(0, n), shape)` was published thread-major and summed
+// wrong from E = 8 (14 of 45 cells), as was the permuted form (73 of 225); a
+// rank-2 load addressed by expanded ranges and reshaped to rank 3 is
+// thread-major and was published under the layout's label (15 of 45, permuted
+// 73 of 225).
+// `Mixed` is a real conflict between the two; `Unknown` a leaf this walk does
+// not label at all.
+enum class PhaseLabel { None, ThreadMajor, Layout, Mixed, Unknown };
+
+static PhaseLabel joinPhaseLabels(PhaseLabel a, PhaseLabel b) {
+  if (a == PhaseLabel::Unknown || b == PhaseLabel::Unknown)
+    return PhaseLabel::Unknown;
+  if (a == PhaseLabel::None)
+    return b;
+  if (b == PhaseLabel::None || a == b)
+    return a;
+  return PhaseLabel::Mixed;
+}
+
+// A flat-to-tile `tt.reshape` the phase function turns into an exchange from
+// the flat source's layout order into the tile's thread-major one, because
+// the tile meets thread-major elements (`markThreadMajorPhaseReshapes`).
+static constexpr llvm::StringLiteral kThreadMajorReshapeAttr =
+    "metal.thread_major_reshape";
+
+static bool isBinaryHypercubeTensor(mlir::RankedTensorType type) {
+  return type.getRank() >= 2 &&
+         llvm::all_of(type.getShape(), [](int64_t e) { return e == 2; });
+}
+
+// Memoized: address cones share their ranges and offsets many times over, and
+// an unmemoized walk is exponential in their depth (a full-suite compile hung).
+static PhaseLabel
+phaseRangeLabelImpl(mlir::Value v,
+                    llvm::DenseMap<mlir::Value, PhaseLabel> &memo, int depth) {
+  if (auto it = memo.find(v); it != memo.end())
+    return it->second;
+  PhaseLabel label = [&]() -> PhaseLabel {
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+    if (!type)
+      return PhaseLabel::None;
+    if (depth > 64)
+      return PhaseLabel::Unknown;
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def)
+      return PhaseLabel::Unknown;
+    if (def->hasAttr(kThreadMajorReshapeAttr))
+      return PhaseLabel::ThreadMajor;
+    if (auto range = mlir::dyn_cast<mlir::triton::MakeRangeOp>(def)) {
+      mlir::Attribute root = type.getEncoding();
+      bool sliced = false;
+      while (auto slice =
+                 mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                     root)) {
+        sliced = true;
+        root = slice.getParent();
+      }
+      // A slice of a blocked tile is decomposed thread-major; a slice of a
+      // linear tile, like a flat range, in that layout's own space.
+      return sliced && mlir::isa_and_nonnull<
+                           mlir::triton::gpu::BlockedEncodingAttr>(root)
+                 ? PhaseLabel::ThreadMajor
+                 : PhaseLabel::Layout;
+    }
+    if (mlir::isa<mlir::triton::SplatOp>(def))
+      return PhaseLabel::None;
+    if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+      auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+      return dense && dense.isSplat() ? PhaseLabel::None : PhaseLabel::Unknown;
+    }
+    if (auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(def)) {
+      auto srcTy =
+          mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+      if (isBinaryHypercubeTensor(srcTy) || isBinaryHypercubeTensor(type))
+        return PhaseLabel::Unknown;
+      PhaseLabel src = phaseRangeLabelImpl(reshape.getSrc(), memo, depth + 1);
+      // A flat source is emitted in its layout's space whatever its leaves.
+      if (srcTy.getRank() == 1 && src != PhaseLabel::None)
+        return src == PhaseLabel::Mixed || src == PhaseLabel::Unknown
+                   ? src
+                   : PhaseLabel::Layout;
+      return src;
+    }
+    if (mlir::isa<mlir::triton::ExpandDimsOp, mlir::triton::BroadcastOp,
+                  mlir::triton::AddPtrOp>(def) ||
+        ((mlir::isa<mlir::arith::ArithDialect, mlir::math::MathDialect>(
+              def->getDialect()) ||
+          (mlir::isa<mlir::triton::TritonDialect>(def->getDialect()) &&
+           def->hasTrait<mlir::OpTrait::Elementwise>())) &&
+         def->getNumRegions() == 0 && mlir::isMemoryEffectFree(def))) {
+      PhaseLabel label = PhaseLabel::None;
+      for (mlir::Value operand : def->getOperands())
+        label = joinPhaseLabels(label,
+                                phaseRangeLabelImpl(operand, memo, depth + 1));
+      return label;
+    }
+    if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
+      PhaseLabel label = phaseRangeLabelImpl(load.getPtr(), memo, depth + 1);
+      if (load.getMask())
+        label = joinPhaseLabels(
+            label, phaseRangeLabelImpl(load.getMask(), memo, depth + 1));
+      if (load.getOther())
+        label = joinPhaseLabels(
+            label, phaseRangeLabelImpl(load.getOther(), memo, depth + 1));
+      return label;
+    }
+    return PhaseLabel::Unknown;
+  }();
+  memo[v] = label;
+  return label;
+}
+
+static PhaseLabel phaseRangeLabel(mlir::Value v) {
+  llvm::DenseMap<mlir::Value, PhaseLabel> memo;
+  return phaseRangeLabelImpl(v, memo, 0);
+}
+
 // True when every per-element leaf of `v` is a `tt.load` of a tile with THIS
 // rank, reached only through ops that are elementwise in the tile's own
 // coordinates. Such a cone carries the addresses the loads were given, which
@@ -3525,9 +3653,15 @@ static bool layoutFlatIndexIsLocalTid(const LayoutIndexPlan &plan) {
 // from some other tile whose own labeling is a separate question. `tl.sort`'s
 // hypercube arrives through exactly such a reshape, which is why it keeps the
 // layout's own plan.
+//
+// `phase` asks the question for a rank-N phase function, where an address
+// built from a reshaped flat range carries its layout's label instead
+// (`phaseRangeLabel`), and a free reshape between two tiles of rank >= 2
+// keeps the thread-major order of what it reshapes.
 static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
                                         int depth = 0,
-                                        mlir::Operation *carriedLoop = nullptr) {
+                                        mlir::Operation *carriedLoop = nullptr,
+                                        bool phase = false) {
   if (depth > 16)
     return false;
   auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
@@ -3552,13 +3686,26 @@ static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
   if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(def)) {
     unsigned index = mlir::cast<mlir::OpResult>(v).getResultNumber();
     return coneIsThreadMajorLoadRooted(loop.getInitArgs()[index], rank,
-                                       depth + 1, carriedLoop) &&
+                                       depth + 1, carriedLoop, phase) &&
            coneIsThreadMajorLoadRooted(loop.getYieldedValues()[index], rank,
-                                       depth + 1, loop.getOperation());
+                                       depth + 1, loop.getOperation(), phase);
   }
   if (auto load = mlir::dyn_cast<mlir::triton::LoadOp>(def)) {
     auto loadTy = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
+    if (phase)
+      return loadTy && loadTy.getRank() >= 2 && loadTy.getRank() == rank &&
+             phaseRangeLabel(load.getPtr()) == PhaseLabel::ThreadMajor;
     return loadTy && loadTy.getRank() == rank;
+  }
+  if (phase && def->hasAttr(kThreadMajorReshapeAttr))
+    return true;
+  if (auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(def);
+      reshape && phase) {
+    auto srcTy = mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+    return srcTy.getRank() >= 2 && vTy.getRank() >= 2 &&
+           !isBinaryHypercubeTensor(srcTy) && !isBinaryHypercubeTensor(vTy) &&
+           coneIsThreadMajorLoadRooted(reshape.getSrc(), srcTy.getRank(),
+                                       depth + 1, carriedLoop, phase);
   }
   if (mlir::isa<mlir::triton::SplatOp>(def))
     return true;
@@ -3589,7 +3736,8 @@ static bool coneIsThreadMajorLoadRooted(mlir::Value v, int64_t rank,
     if (auto opTy = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType()))
       if (opTy.getShape() != vTy.getShape())
         return false;
-    if (!coneIsThreadMajorLoadRooted(operand, rank, depth + 1, carriedLoop))
+    if (!coneIsThreadMajorLoadRooted(operand, rank, depth + 1, carriedLoop,
+                                     phase))
       return false;
   }
   return true;
@@ -4324,6 +4472,46 @@ struct MakeRangeLowering
       rewriter.replaceOp(op, idx);
       return mlir::success();
     }
+    // A range sliced out of a `#ttg.linear` tile -- Triton gives one to a
+    // narrow load it reshapes into a permuted rank-3 tile -- takes its axis of
+    // the full consumer tile's own layout, as a staged scan's range does. 📏
+    // The generic paths below decomposed it against some other rank-2 tile
+    // (`tid % 2` for an eight-wide column beside a [4, 2] result), and the
+    // load could not lower at all before rank-2 linear load tiles were read.
+    if (auto slice =
+            mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                resTy.getEncoding())) {
+      mlir::Attribute root = slice;
+      while (auto inner =
+                 mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
+                     root))
+        root = inner.getParent();
+      if (mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(root)) {
+        std::optional<LayoutIndexPlan> plan = planStagedScanRange(op);
+        if (!plan)
+          return rewriter.notifyMatchFailure(op, "linear slice range plan");
+        mlir::Value band0;
+        if (plan->registerBits > 0 && !findOutermostScfFor(op))
+          band0 = mlir::arith::ConstantOp::create(rewriter, loc,
+                                                  rewriter.getI32IntegerAttr(0))
+                      .getResult();
+        mlir::Value idx =
+            emitLayoutElementIndex(op, *plan, rewriter, loc, band0);
+        if (!idx)
+          return rewriter.notifyMatchFailure(op, "linear slice range index");
+        if (op.getStart() != 0)
+          idx = mlir::arith::AddIOp::create(
+                    rewriter, loc, idx,
+                    mlir::arith::ConstantOp::create(
+                        rewriter, loc,
+                        rewriter.getI32IntegerAttr(
+                            static_cast<int32_t>(op.getStart())))
+                        .getResult())
+                    .getResult();
+        rewriter.replaceOp(op, idx);
+        return mlir::success();
+      }
+    }
     if (auto slice =
             mlir::dyn_cast_or_null<mlir::triton::gpu::SliceEncodingAttr>(
                 resTy.getEncoding())) {
@@ -4614,7 +4802,12 @@ struct MakeRangeLowering
     // 1D path, sub-tpb companion case FIRST: hand back the companion tile's ROW
     // coordinate so a rank-1 range and the 2-D cone are the same mapping. See
     // findSubTpbRank2Companion for why all four sites move together.
-    if (auto info = tileFromTensor(resTy)) {
+    // Not in a rank-N phase function: its rank-1 ranges index the flattened
+    // reduce results they are stored beside, and a narrow rank-2 load of the
+    // same row count is no companion of theirs. 📏 A [16, 4] load reshaped
+    // to [2, 8, 4] at four warps stored its axis-2 sum through the load's row
+    // coordinate, 15 of 16 elements wrong.
+    if (auto info = tileFromTensor(resTy); info && !rankNPhase) {
       if (info->rank == 1) {
         mlir::triton::gpu::BlockedEncodingAttr companionEnc;
         auto companion = findSubTpbRank2Companion(op, &companionEnc);
@@ -17148,14 +17341,16 @@ lowerRank2Axis1ArgminReduce(mlir::triton::ReduceOp op,
 // nullopt when it has none. Ranges are emitted in layout space there, a
 // planned reshape reads back in its destination layout, and broadcasts,
 // expand_dims and element-wise work keep the label of what they combine -- the
-// layout's own. A load at the tile's own rank reached directly is addressed
-// thread-major instead, which agrees with the layout while it fits one
-// register band; spanning several, it makes the whole cone thread-major.
-// 📏 Broadcasting a [1, B, C] load over [A, B, C] next to a range: exact
-// under the layout label in every cell where that load fits one band and under
-// the thread-major label in every cell where it does not (each label wrong on
-// the other cells). A wide direct load beside a reshaped one was never
-// measured and has no label.
+// layout's own. A load takes its address's label (`phaseRangeLabel`): one
+// addressed through expanded ranges is thread-major, which agrees with the
+// layout while it fits one register band; spanning several, it makes the
+// whole cone thread-major. One addressed through a reshaped flat range is in
+// that layout's order. 📏 Broadcasting a [1, B, C] load over [A, B, C] next
+// to a range: exact under the layout label in every cell where that load fits
+// one band and under the thread-major label in every cell where it does not
+// (each label wrong on the other cells). A wide load beside a reshaped flat
+// one is thread-major once `markThreadMajorPhaseReshapes` reads the reshape
+// that way (223 of 225 cells exact, the rest the flatten's named refusal).
 struct PermuteSourceLabel {
   bool threadMajor = false;
 };
@@ -17175,9 +17370,30 @@ static bool walkPermuteSource(mlir::Value v, int64_t rank,
     auto type = mlir::dyn_cast<mlir::RankedTensorType>(load.getType());
     if (!type)
       return false;
-    if (behindReshape || type.getRank() != rank)
+    // The load's label is its address's (`phaseRangeLabel`): a reshaped flat
+    // range is in its layout's space, expanded ranges are thread-major, and a
+    // thread-major tile keeps that order through a free reshape.
+    switch (phaseRangeLabel(load.getPtr())) {
+    case PhaseLabel::Layout:
       reshapedLoad = true;
-    else if (type.getNumElements() > threadsPerBlock)
+      return true;
+    case PhaseLabel::ThreadMajor:
+      if (type.getRank() < 2)
+        return false;
+      if (type.getNumElements() > threadsPerBlock)
+        wideDirectLoad = true;
+      return true;
+    case PhaseLabel::None:
+      return true;
+    case PhaseLabel::Mixed:
+    case PhaseLabel::Unknown:
+      return false;
+    }
+    return false;
+  }
+  if (def->hasAttr(kThreadMajorReshapeAttr)) {
+    if (mlir::cast<mlir::RankedTensorType>(v.getType()).getNumElements() >
+        threadsPerBlock)
       wideDirectLoad = true;
     return true;
   }
@@ -17210,9 +17426,11 @@ permuteSourceLabel(mlir::Value v, int64_t rank, int64_t threadsPerBlock) {
   bool wideDirectLoad = false;
   bool reshapedLoad = false;
   if (!walkPermuteSource(v, rank, threadsPerBlock, /*behindReshape=*/false,
-                         wideDirectLoad, reshapedLoad) ||
-      (wideDirectLoad && reshapedLoad))
+                         wideDirectLoad, reshapedLoad))
     return std::nullopt;
+  // Both kinds left in one cone: `markThreadMajorPhaseReshapes` turned every
+  // flat-to-tile reshape into a thread-major exchange where the two orders
+  // differ on the tile, so here they coincide.
   return PermuteSourceLabel{wideDirectLoad};
 }
 
@@ -17393,7 +17611,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
         permutation.getSrc().getType());
     if (!enc || srcTy.getRank() < 3 || !inputTy ||
         inputTy.getRank() != srcTy.getRank() ||
-        (!coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank()) &&
+        (!coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank(),
+                                      0, nullptr, /*phase=*/true) &&
          !permuteSourceLabel(permutation.getSrc(), inputTy.getRank(),
                              srcIndexPlan->threadsPerBlock())))
       return std::nullopt;
@@ -17405,8 +17624,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     // unpermuted relabel below already leaves alone: 📏 the thread-major
     // relabel answered every 64-element tile at four warps wrong (30 of 225
     // cells per load-rooted form, every permutation and axis).
-    const bool loadRooted =
-        coneIsThreadMajorLoadRooted(permutation.getSrc(), inputTy.getRank());
+    const bool loadRooted = coneIsThreadMajorLoadRooted(
+        permutation.getSrc(), inputTy.getRank(), 0, nullptr, /*phase=*/true);
     auto sourceLabel = permuteSourceLabel(
         permutation.getSrc(), inputTy.getRank(), srcIndexPlan->threadsPerBlock());
     const bool layoutLabelled =
@@ -17439,7 +17658,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
     bool loadedAtThisRank =
         !binaryHypercube &&
         (op->hasAttr(kRankNThreadMajorAttr) ||
-         coneIsThreadMajorLoadRooted(op.getSrcs().front(), srcTy.getRank()));
+         coneIsThreadMajorLoadRooted(op.getSrcs().front(), srcTy.getRank(), 0,
+                                     nullptr, /*phase=*/true));
     if (loadedAtThisRank) {
       std::optional<LayoutIndexPlan> relabel = threadMajorLayoutPlan(
           srcTy.getShape(), srcIndexPlan->threadsPerBlock());
@@ -17707,6 +17927,107 @@ static void markLinearRank1PhaseReductions(mlir::ModuleOp moduleOp) {
 // The reduce receives a zero tensor placeholder so no SSA value defined inside
 // the publish phase escapes its scf.for.  ReduceRankNLowering ignores that
 // scalarized placeholder and consumes the publish buffer recorded here.
+// A rank-N phase function emits a tile's expanded ranges thread-major and a
+// flat range in its layout's own space (`phaseRangeLabel`), so a tile built
+// from both -- `tl.load(X + offs3) + tl.reshape(tl.load(Y + flat), shape)`, or
+// a reshaped flat load stored through expanded addresses -- pairs elements the
+// kernel never paired once the two orders differ. Read every flat-to-tile
+// reshape in such a tile thread-major instead: the reshape becomes an exchange
+// out of the flat source's layout order (`kThreadMajorReshapeAttr`), and the
+// whole tile is then thread-major. 📏 Before this the mixed forms were wrong
+// from E = 8 in every measured cell (a sum, a permuted sum, a store beside a
+// sum: 14 of 45 each) or refused.
+static mlir::LogicalResult
+markThreadMajorPhaseReshapes(mlir::ModuleOp moduleOp) {
+  bool ok = true;
+  moduleOp.walk([&](mlir::triton::FuncOp func) {
+    bool rankN = false;
+    func.walk([&](mlir::triton::ReduceOp reduce) {
+      auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+          reduce.getSrcs().front().getType());
+      if (type && type.getRank() >= 3)
+        rankN = true;
+    });
+    if (!rankN)
+      return;
+    struct Sink {
+      mlir::Operation *op;
+      llvm::SmallVector<mlir::Value, 3> roots;
+    };
+    llvm::SmallVector<Sink, 8> sinks;
+    for (mlir::Operation &op : func.getBody().front()) {
+      auto rankOf = [](mlir::Value v) {
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+        return type ? type.getRank() : 0;
+      };
+      if (auto reduce = mlir::dyn_cast<mlir::triton::ReduceOp>(op)) {
+        if (reduce.getSrcs().size() == 1 &&
+            rankOf(reduce.getSrcs().front()) >= 3)
+          sinks.push_back({&op, {reduce.getSrcs().front()}});
+      } else if (auto trans = mlir::dyn_cast<mlir::triton::TransOp>(op)) {
+        if (rankOf(trans.getSrc()) >= 3)
+          sinks.push_back({&op, {trans.getSrc()}});
+      } else if (auto store = mlir::dyn_cast<mlir::triton::StoreOp>(op)) {
+        if (rankOf(store.getPtr()) >= 2) {
+          Sink sink{&op, {store.getPtr(), store.getValue()}};
+          if (store.getMask())
+            sink.roots.push_back(store.getMask());
+          sinks.push_back(sink);
+        }
+      }
+    }
+    auto labelOf = [](const Sink &sink) {
+      PhaseLabel label = PhaseLabel::None;
+      for (mlir::Value root : sink.roots)
+        label = joinPhaseLabels(label, phaseRangeLabel(root));
+      return label;
+    };
+    for (const Sink &sink : sinks) {
+      if (labelOf(sink) != PhaseLabel::Mixed)
+        continue;
+      auto type =
+          mlir::cast<mlir::RankedTensorType>(sink.roots.front().getType());
+      auto plan = planLayoutIndex(type);
+      if (!plan || layoutFlatIndexIsThreadMajor(*plan) ||
+          layoutHasReplicatedOwners(*plan))
+        continue; // the two orders coincide on this tile
+      // Mark the flat-to-tile reshapes in the cone.
+      llvm::SmallVector<mlir::Value, 16> work(sink.roots.begin(),
+                                              sink.roots.end());
+      llvm::SmallPtrSet<mlir::Operation *, 32> seen;
+      while (!work.empty()) {
+        mlir::Operation *def = work.pop_back_val().getDefiningOp();
+        if (!def || !seen.insert(def).second)
+          continue;
+        if (auto reshape = mlir::dyn_cast<mlir::triton::ReshapeOp>(def)) {
+          auto srcTy =
+              mlir::cast<mlir::RankedTensorType>(reshape.getSrc().getType());
+          auto dstTy = mlir::cast<mlir::RankedTensorType>(reshape.getType());
+          if (srcTy.getRank() == 1 && dstTy.getRank() >= 2 &&
+              !isBinaryHypercubeTensor(dstTy) &&
+              phaseRangeLabel(reshape.getResult()) == PhaseLabel::Layout) {
+            reshape->setAttr(kThreadMajorReshapeAttr,
+                             mlir::UnitAttr::get(reshape.getContext()));
+            continue;
+          }
+        }
+        for (mlir::Value operand : def->getOperands())
+          if (mlir::isa<mlir::RankedTensorType>(operand.getType()))
+            work.push_back(operand);
+      }
+      if (labelOf(sink) != PhaseLabel::ThreadMajor) {
+        sink.op->emitOpError(
+            "Metal backend: this tile combines elements addressed thread-major "
+            "(through expanded tl.arange ranges) with elements in a flat "
+            "range's layout order, and no flat-to-tile tl.reshape between "
+            "them can be read thread-major");
+        ok = false;
+      }
+    }
+  });
+  return mlir::success(ok);
+}
+
 static mlir::LogicalResult
 preprocessRankNReducePhases(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::triton::ReduceOp, 16> reduces;
@@ -48695,7 +49016,8 @@ struct ConvertTritonGPUToMetalPass
     rewriteHypercubeFlips(moduleOp);
     rewriteScanLoopRowReduces(moduleOp);
     slotRankNLoopTileCarries(moduleOp);
-    if (mlir::failed(selectNestedScanLoops(moduleOp)) ||
+    if (mlir::failed(markThreadMajorPhaseReshapes(moduleOp)) ||
+        mlir::failed(selectNestedScanLoops(moduleOp)) ||
         mlir::failed(prepareMapElementwisePacks(moduleOp))) {
       signalPassFailure();
       return;
@@ -49048,10 +49370,14 @@ struct ConvertTritonGPUToMetalPass
       if (rtt && rtt.getRank() >= 3 && !stagedFallback &&
           rankNReduceSourcePermutation(red)) {
         red.emitOpError(
-            "rank >= 3 reduce over a permuted tile requires a source built from "
-            "loads, tl.arange arithmetic, reshapes and broadcasts, not a wide "
-            "direct load beside a reshaped one, so publication and reduction "
-            "coordinates can be mapped exactly");
+            "rank >= 3 reduce over a permuted tile requires a source built "
+            "from "
+            "loads, tl.arange arithmetic, reshapes and broadcasts whose "
+            "element "
+            "order can be named: each load addressed through expanded "
+            "tl.arange "
+            "ranges or through a reshaped flat range, not both in one address, "
+            "so publication and reduction coordinates can be mapped exactly");
         reduceOk = false;
         return;
       }
@@ -50115,6 +50441,19 @@ struct ConvertTritonGPUToMetalPass
         srcLabel = threadMajorLabel(srcTy);
         if (!srcLabel)
           return;
+      }
+      // A flat-to-tile reshape read thread-major
+      // (`markThreadMajorPhaseReshapes`): out of the flat source's layout
+      // order into the tile's thread-major one.
+      if (reshape->hasAttr(kThreadMajorReshapeAttr)) {
+        srcLabel = planLayoutIndex(srcTy);
+        dstLabel = threadMajorLabel(dstTy);
+        if (!srcLabel || !dstLabel) {
+          reshape.emitOpError("Metal backend: this tl.reshape must be read "
+                              "thread-major and has no exact layout plan");
+          reshapeOk = false;
+          return;
+        }
       }
       if (!touchesSlice && !srcLabel && !dstLabel)
         return;

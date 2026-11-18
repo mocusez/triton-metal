@@ -1116,3 +1116,50 @@ def test_permute_reduce_wide_broadcast_source_matches_torch(shape, num_warps, pe
                                             "bcast", num_warps=num_warps)
         torch.mps.synchronize()
         torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
+
+
+# A rank-N phase function emits expanded ranges thread-major and a reshaped
+# flat range in its layout's order; a load takes its address's label. Sources
+# that mix the two (a direct load beside a reshaped flat load, or beside a load
+# addressed by a reshaped range) read the flat-to-tile reshape thread-major, an
+# exchange. A rank-2 load reshaped to rank 3 stays thread-major, and a narrow
+# one Triton gives a `#ttg.linear` layout lowers too.
+@triton.jit
+def _permute_reduce_mixed_source_kernel(X, Y, O, A: tl.constexpr, B: tl.constexpr,
+                                        C: tl.constexpr, P0: tl.constexpr, P1: tl.constexpr,
+                                        P2: tl.constexpr, AXIS: tl.constexpr, OUT: tl.constexpr,
+                                        MODE: tl.constexpr):
+    a = tl.arange(0, A)[:, None, None]
+    b = tl.arange(0, B)[None, :, None]
+    c = tl.arange(0, C)[None, None, :]
+    flat = tl.arange(0, A * B * C)
+    if MODE == "mix":
+        v = tl.load(X + a * (B * C) + b * C + c) + tl.reshape(tl.load(Y + flat), (A, B, C))
+    elif MODE == "mixra":
+        v = tl.load(X + a * (B * C) + b * C + c) + tl.load(Y + tl.reshape(flat, (A, B, C)))
+    elif MODE == "ra":
+        v = tl.load(Y + tl.reshape(flat, (A, B, C)))
+    else:
+        rows = tl.arange(0, A * B)[:, None] * C + tl.arange(0, C)[None, :]
+        v = tl.reshape(tl.load(Y + rows), (A, B, C))
+    s = tl.sum(tl.permute(v, (P0, P1, P2)), axis=AXIS)
+    tl.store(O + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+
+
+@pytest.mark.parametrize("mode", ["mix", "mixra", "ra", "rs2"])
+@pytest.mark.parametrize("shape, num_warps, perm", [((8, 8, 8), 1, (0, 2, 1)), ((4, 8, 16), 2, (2, 1, 0)),
+                                                    ((4, 8, 8), 1, (1, 2, 0)), ((8, 8, 8), 2, (2, 0, 1)),
+                                                    ((2, 8, 4), 4, (0, 2, 1)), ((2, 4, 8), 4, (2, 1, 0))])
+def test_permute_reduce_mixed_sources_match_torch(mode, shape, num_warps, perm):
+    a, b, c = shape
+    for axis in range(3):
+        torch.manual_seed(a * b * c + axis + num_warps)
+        x = torch.randn(a * b * c, dtype=torch.float32)
+        y = torch.randn(a * b * c, dtype=torch.float32)
+        t = (x + y if mode.startswith("mix") else y).reshape(shape)
+        want = t.permute(*perm).sum(axis).reshape(-1)
+        out = torch.zeros(want.numel(), dtype=torch.float32)
+        _permute_reduce_mixed_source_kernel[(1,)](x, y, out, a, b, c, *perm, axis, want.numel(),
+                                                  mode, num_warps=num_warps)
+        torch.mps.synchronize()
+        torch.testing.assert_close(out, want, atol=1e-4, rtol=1e-4)
