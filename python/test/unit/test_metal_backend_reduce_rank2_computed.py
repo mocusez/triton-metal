@@ -2173,6 +2173,7 @@ def _rank3_reduce_of_loop_accumulator_kernel(X, O, T, A: tl.constexpr, B: tl.con
 @pytest.mark.parametrize("shape, warps, axis", [
     ((8, 8, 8), 1, 0), ((8, 8, 8), 2, 2), ((4, 8, 8), 1, 1), ((4, 8, 16), 2, 2),
     ((4, 8, 16), 4, 0), ((2, 8, 16), 1, 1),
+    ((2, 4, 4), 1, 0), ((4, 4, 4), 2, 1), ((2, 4, 8), 4, 2), ((4, 4, 8), 4, 0),
 ])
 def test_rank3_reduce_of_loop_accumulator_matches_torch(shape, warps, axis, use_max):
     a, b, c = shape

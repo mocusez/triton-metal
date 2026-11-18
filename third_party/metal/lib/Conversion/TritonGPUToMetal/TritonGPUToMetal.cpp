@@ -38091,10 +38091,32 @@ planTileExchange(mlir::Operation *exchange, bool allowGeneralPhase = false,
       mlir::Operation *d = v.getDefiningOp();
       if (!inCurrentSegment(d) || !preSet.insert(d).second)
         continue;
-      if (!mlir::isMemoryEffectFree(d) && !mlir::isa<mlir::triton::LoadOp>(d))
+      // A loop that only reads (`acc += tl.load(...)`, then reduced) runs
+      // before the publish like a load. 📏 A narrow accumulator's flattened
+      // result left its store's conversion unscheduled (20 of 72 cells per
+      // combine).
+      const bool readOnlyLoop =
+          mlir::isa<mlir::scf::ForOp>(d) &&
+          !d->walk([](mlir::Operation *nested) {
+              return mlir::isMemoryEffectFree(nested) ||
+                             mlir::isa<mlir::triton::LoadOp, mlir::scf::ForOp,
+                                       mlir::scf::YieldOp>(nested)
+                         ? mlir::WalkResult::advance()
+                         : mlir::WalkResult::interrupt();
+            }).wasInterrupted();
+      if (!mlir::isMemoryEffectFree(d) && !mlir::isa<mlir::triton::LoadOp>(d) &&
+          !readOnlyLoop)
         return false;
       for (mlir::Value o : d->getOperands())
         wl.push_back(o);
+      // ... taking along the values its body captures.
+      if (readOnlyLoop)
+        d->walk([&](mlir::Operation *nested) {
+          for (mlir::Value o : nested->getOperands())
+            if (mlir::Operation *def = o.getDefiningOp();
+                def && !d->isAncestor(def))
+              wl.push_back(o);
+        });
     }
   }
 
