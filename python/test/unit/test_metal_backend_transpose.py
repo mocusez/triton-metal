@@ -1149,7 +1149,9 @@ def _permute_reduce_mixed_source_kernel(X, Y, O, A: tl.constexpr, B: tl.constexp
 @pytest.mark.parametrize("mode", ["mix", "mixra", "ra", "rs2"])
 @pytest.mark.parametrize("shape, num_warps, perm", [((8, 8, 8), 1, (0, 2, 1)), ((4, 8, 16), 2, (2, 1, 0)),
                                                     ((4, 8, 8), 1, (1, 2, 0)), ((8, 8, 8), 2, (2, 0, 1)),
-                                                    ((2, 8, 4), 4, (0, 2, 1)), ((2, 4, 8), 4, (2, 1, 0))])
+                                                    ((2, 8, 4), 4, (0, 2, 1)), ((2, 4, 8), 4, (2, 1, 0)),
+                                                    ((2, 4, 8), 4, (1, 0, 2)), ((2, 8, 4), 4, (1, 0, 2)),
+                                                    ((4, 8, 16), 1, (1, 0, 2)), ((4, 8, 16), 1, (1, 2, 0))])
 def test_permute_reduce_mixed_sources_match_torch(mode, shape, num_warps, perm):
     a, b, c = shape
     for axis in range(3):

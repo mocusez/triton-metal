@@ -51256,6 +51256,13 @@ struct ConvertTritonGPUToMetalPass
           return;
         if (!coneReduce(reshape.getSrc(), 0))
           return;
+        // The flattening needs no exchange when the value's own label and
+        // the flattened type's put every element in the same slot (the
+        // reshape walk left it alone for exactly that reason).
+        if (auto valuePlan = exchangeSourcePlan(reshape.getSrc()))
+          if (auto typePlan = planLayoutIndex(dstTy);
+              typePlan && layoutFlatIndexPlansEquivalent(*valuePlan, *typePlan))
+            return;
         reshape.emitOpError(
             "Metal backend: this tl.reshape flattens a tile built from a "
             "rank-N reduce that published its result under a thread-major "
