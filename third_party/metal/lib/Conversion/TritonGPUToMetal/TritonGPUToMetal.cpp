@@ -2729,7 +2729,10 @@ valueConsumerTileOfRank(mlir::Value value, int64_t rank,
       if ((rank == 2 || rank >= 4) &&
           mlir::isa<mlir::triton::LoadOp, mlir::triton::StoreOp>(user) &&
           user->getNumOperands() > 0 && user->getOperand(0) == v) {
+        // A `#ttg.linear` access tile too (a narrow load Triton gives one).
         auto info = tileFromTensor(v.getType());
+        if (!info)
+          info = tileFromLoadPtrTensor(v.getType());
         if (info && info->rank == rank) {
           if (!found)
             found = info;
@@ -17469,6 +17472,10 @@ static bool walkPermuteSource(mlir::Value v, int64_t rank,
     case PhaseLabel::None:
       return true;
     case PhaseLabel::Mixed:
+      // A load narrower than the CTA holds one element per thread; its
+      // expanded and linear ranges, decomposed against the load's own tile,
+      // then name the same coordinates on the axes they share.
+      return type.getNumElements() <= threadsPerBlock;
     case PhaseLabel::Unknown:
       return false;
     }
