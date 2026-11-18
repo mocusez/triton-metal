@@ -2197,8 +2197,8 @@ def test_rank3_reduce_of_loop_accumulator_matches_torch(shape, warps, axis, use_
 # loop is cyclic), a scalar in a two-entry slot by iteration parity (one shared
 # entry let band 1 re-read band 0's update and decay once per band). A full
 # reduction of the result inside the loop sees only part of the bands and
-# is planned cyclic like the rest of the loop, while the flattened result fits
-# one register band (a wider one is refused by name).
+# is planned cyclic like the rest of the loop, across register bands too (a
+# wide flattened result was refused at first).
 @triton.jit
 def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
                                     C: tl.constexpr, AXIS: tl.constexpr,
@@ -2295,16 +2295,6 @@ def test_rank3_reduce_loop_full_reduction_matches_torch(shape, warps, axis, mode
     torch.testing.assert_close(out, torch.cat([r.reshape(-1), tail.reshape(1)]), atol=2e-3, rtol=2e-3)
 
 
-def test_rank3_reduce_loop_wide_full_reduction_is_named(capfd):
-    x = torch.randn(3 * 512, dtype=torch.float32)
-    out = torch.zeros(3 * 64 + 1, dtype=torch.float32)
-    with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _rank3_reduce_loop_carry_kernel[(1,)](x, out, 3, A=8, B=8, C=8, AXIS=0, OUT=64,
-                                              MODE="total", num_warps=1)
-    diagnostic = capfd.readouterr()
-    assert "fits one register band of the CTA" in diagnostic.err + diagnostic.out
-
-
 # The same label question without a permute. A rank-3 sum of a direct load
 # beside a reshaped flat load, of a load addressed by a reshaped range, or of a
 # reshaped rank-2 load, and a reshaped flat load stored through expanded
@@ -2353,3 +2343,14 @@ def test_rank3_reduce_mixed_sources_match_torch(mode, shape, warps):
         torch.testing.assert_close(out[:out_elements], t.sum(axis).reshape(-1), atol=1e-4, rtol=1e-4)
         if mode == "store":
             torch.testing.assert_close(out[out_elements:], t.reshape(-1))
+
+
+# A flattened result wider than the CTA is phased for the reduction too, when
+# the flattening is only reduced and stored (element-wise work on it beside
+# the reduction, `s / tl.sum(s)`, still reads it across that phase and is
+# refused by name).
+@pytest.mark.parametrize("mode", ["total", "peak"])
+@pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 1, 1),
+                                                ((8, 8, 8), 2, 1), ((4, 8, 8), 1, 2)])
+def test_rank3_reduce_loop_wide_full_reduction_matches_torch(shape, warps, axis, mode):
+    test_rank3_reduce_loop_full_reduction_matches_torch(shape, warps, axis, mode)

@@ -17617,24 +17617,58 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // Published under its flattened
   // `#ttg.linear` layout instead, `tl.sum(tl.reshape(s, (n,)))` of a rank-3
   // sum was wrong in 38 of 72 cells.
+  // A flattening only reduced and stored (not element-wise work beside it),
+  // asked of every flattening of the same result: Triton keeps separate
+  // copies for separate uses.
+  const bool flatStoredOnly = [&] {
+    auto flatten =
+        op.getSrcs().front().getDefiningOp<mlir::triton::ReshapeOp>();
+    if (!flatten)
+      return true;
+    return llvm::all_of(flatten.getSrc().getUsers(), [](mlir::Operation *use) {
+      return !mlir::isa<mlir::triton::ReshapeOp>(use) ||
+             llvm::all_of(use->getUsers(), [](mlir::Operation *user) {
+               return mlir::isa<mlir::triton::ReduceOp,
+                                mlir::triton::gpu::ConvertLayoutOp,
+                                mlir::triton::StoreOp>(user);
+             });
+    });
+  }();
   auto inRankNUserLoop = [&] {
-    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(op->getParentOp());
-    return loop &&
-           llvm::any_of(loop.getBody()->getOps<mlir::triton::ReduceOp>(),
-                        [&](mlir::triton::ReduceOp other) {
-                          if (other == op)
-                            return false;
-                          if (other->hasAttr(kRankNUserLoopAttr))
-                            return true;
-                          // Asked before the attribute is set too.
-                          auto otherTy = mlir::dyn_cast<mlir::RankedTensorType>(
-                              other.getSrcs().front().getType());
-                          return otherTy && otherTy.getRank() >= 3 &&
-                                 otherTy.getNumElements() >
-                                     srcIndexPlan->threadsPerBlock();
-                        });
+    // The user loop -- for a flattening that is only reduced and stored,
+    // looking through the register-band loops a phased body is split into,
+    // so the conversion asks the same question as the pre-pass.
+    auto userLoopOf = [&](mlir::Operation *inner) -> mlir::Operation * {
+      mlir::Operation *enclosing = inner->getParentOp();
+      while (flatStoredOnly && enclosing && isRegisterBandLoop(enclosing))
+        enclosing = enclosing->getParentOp();
+      return mlir::isa_and_nonnull<mlir::scf::ForOp>(enclosing) ? enclosing
+                                                                : nullptr;
+    };
+    mlir::Operation *loop = userLoopOf(op);
+    if (!loop)
+      return false;
+    bool found = false;
+    loop->walk([&](mlir::triton::ReduceOp other) {
+      if (found || other == op || userLoopOf(other) != loop)
+        return;
+      if (other->hasAttr(kRankNUserLoopAttr)) {
+        found = true;
+        return;
+      }
+      // Asked before the attribute is set too.
+      auto otherTy = mlir::dyn_cast<mlir::RankedTensorType>(
+          other.getSrcs().front().getType());
+      found = otherTy && otherTy.getRank() >= 3 &&
+              otherTy.getNumElements() > srcIndexPlan->threadsPerBlock();
+    });
+    return found;
   };
   const bool loopFlatReduce = srcTy.getRank() < 3 && inRankNUserLoop();
+  // A wide flattened result phased for the reduction may also be stored, but
+  // element-wise work on it (`s / tl.sum(s)`) then reads it across the new
+  // phase boundary, which the flattening cannot schedule.
+  const bool loopFlatPhased = loopFlatReduce && flatStoredOnly;
   // More than one register band needs a separate publish/read phase. A
   // one-element-per-thread layout can stay in the current phase; finishPlan
   // records whether it nevertheless needs exact logical scratch indexing.
@@ -17665,8 +17699,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
       srcIndexPlan->elemPerThread <= 64 &&
       mlir::isa_and_nonnull<mlir::triton::gpu::LinearEncodingAttr>(
           srcTy.getEncoding());
-  if (multiBand && srcTy.getRank() < 3 &&
-      !op->hasAttr(kScanInputReduceAttr) && !linearPhaseResult &&
+  if (multiBand && srcTy.getRank() < 3 && !op->hasAttr(kScanInputReduceAttr) &&
+      !linearPhaseResult && !loopFlatPhased &&
       (!mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
            srcTy.getEncoding()) ||
        !layoutHasReplicatedOwners(*srcIndexPlan) || !binaryHypercube))
@@ -47523,6 +47557,49 @@ static int64_t functionThreadsPerBlock(mlir::Operation *op) {
 static constexpr llvm::StringLiteral kRankNCarryInitAttr =
     "metal.rank_n_carry_init";
 
+// `tl.min(s)` flattens through its own `allow_reorder` reshape while the store
+// beside it reshapes `s` the plain way after it; the plain reshape then sits
+// past the reduction's exchange and cannot be scheduled. Inside a rank-N
+// reduce loop, fold reshapes of one value to one type into the plain one, at
+// the first's place (`allow_reorder` only permits what the plain one does).
+// 📏 54 of 72 `tl.min(s)` cells were refused.
+static void mergeRankNLoopReshapes(mlir::ModuleOp moduleOp) {
+  moduleOp.walk([&](mlir::scf::ForOp loop) {
+    if (llvm::none_of(loop.getBody()->getOps<mlir::triton::ReduceOp>(),
+                      [](mlir::triton::ReduceOp reduce) {
+                        auto type = mlir::dyn_cast<mlir::RankedTensorType>(
+                            reduce.getSrcs().front().getType());
+                        return type && type.getRank() >= 3;
+                      }))
+      return;
+    llvm::SmallVector<mlir::triton::ReshapeOp, 4> reshapes(
+        loop.getBody()->getOps<mlir::triton::ReshapeOp>());
+    for (auto [i, first] : llvm::enumerate(reshapes)) {
+      if (!first)
+        continue;
+      for (auto &other : llvm::drop_begin(reshapes, i + 1)) {
+        // Only an `allow_reorder` copy beside a plain one: two plain copies
+        // are the separate flattenings an element-wise use keeps apart.
+        if (!other || other.getSrc() != first.getSrc() ||
+            other.getType() != first.getType() ||
+            other.getAllowReorder() == first.getAllowReorder())
+          continue;
+        // Keep the plain one, at the first one's place.
+        if (first.getAllowReorder() && !other.getAllowReorder()) {
+          other->moveBefore(first);
+          first.getResult().replaceAllUsesWith(other.getResult());
+          first.erase();
+          first = other;
+        } else {
+          other.getResult().replaceAllUsesWith(first.getResult());
+          other.erase();
+        }
+        other = {};
+      }
+    }
+  });
+}
+
 static void slotRankNLoopTileCarries(mlir::ModuleOp moduleOp) {
   llvm::SmallVector<mlir::scf::ForOp, 4> loops;
   moduleOp.walk([&](mlir::scf::ForOp loop) {
@@ -49129,6 +49206,7 @@ struct ConvertTritonGPUToMetalPass
 
     rewriteHypercubeFlips(moduleOp);
     rewriteScanLoopRowReduces(moduleOp);
+    mergeRankNLoopReshapes(moduleOp);
     slotRankNLoopTileCarries(moduleOp);
     if (mlir::failed(markThreadMajorPhaseReshapes(moduleOp)) ||
         mlir::failed(selectNestedScanLoops(moduleOp)) ||
@@ -50002,9 +50080,8 @@ struct ConvertTritonGPUToMetalPass
                          })) {
           red.emitOpError(
               "Metal backend: a full reduction of a rank >= 3 reduce's result "
-              "inside the loop is implemented while the flattened result fits "
-              "one register band of the CTA; reduce a wider result after the "
-              "loop");
+              "inside the loop needs a flattened result the loop's cyclic plan "
+              "can fold; reduce it after the loop");
           reduceOk = false;
           return;
         }
@@ -50550,6 +50627,20 @@ struct ConvertTritonGPUToMetalPass
           srcTy.getNumElements() != dstTy.getNumElements() ||
           srcTy.getElementType() != dstTy.getElementType())
         return;
+      // In a rank-N reduce loop both sides are cyclic over the flat index a
+      // reshape keeps: an `allow_reorder` one (a no-axis reduction's own
+      // flattening) that only a staged reduce's publish reads (it takes the
+      // reduce's own cyclic source plan) needs no exchange. 📏 The
+      // `allow_reorder` reshape `tl.min(s)` flattens through failed to
+      // schedule as one (54 of 72 cells).
+      if (rankNPhaseLoopThreads(reshape.getOperation()) &&
+          reshape.getAllowReorder() && !reshape->use_empty() &&
+          llvm::all_of(reshape->getUsers(), [&](mlir::Operation *user) {
+            auto tag = user->getAttrOfType<mlir::StringAttr>(kExchangeAttr);
+            return mlir::isa<mlir::triton::gpu::ConvertLayoutOp>(user) && tag &&
+                   tag.getValue() == "publish";
+          }))
+        return;
       const bool touchesSlice =
           mlir::isa_and_nonnull<mlir::triton::gpu::SliceEncodingAttr>(
               srcTy.getEncoding()) ||
@@ -50818,6 +50909,7 @@ struct ConvertTritonGPUToMetalPass
     // publish then read, which is the only way to move more than one element
     // per thread across lanes. Anything it declines keeps the refusal.
     for (auto cvt : outOfEnvelope) {
+
       // A slice-to-slice pair needs the FULL-TILE phase, not the local
       // publish/read: the two encodings can move an element between register
       // bands, and a local exchange runs both halves inside one band loop, so
