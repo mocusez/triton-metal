@@ -899,7 +899,8 @@ case and an adjacent rejection regression.
    function body's band loop; inner loops that store, perform atomics or move
    data between elements are refused by name. A row sum, product, max or min
    (or i32 xor) along the scan axis inside the loop -- read back over its tile, or
-   carried as a running row total as a chunked cumsum or running max does --
+   carried as a running row total as a chunked cumsum or running max does, or
+   stored as a vector (the tile's first column, a masked store) --
    runs as the pair of scans `P + S - x` (`max(P, S)`, `P ^ S ^ x`, and the
    exclusive prefix times the inclusive suffix for a product), the
    carried total as a tile; other in-loop reductions are refused by name.
