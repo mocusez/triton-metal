@@ -17625,8 +17625,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
         op.getSrcs().front().getDefiningOp<mlir::triton::ReshapeOp>();
     if (!flatten)
       return true;
-    return llvm::all_of(flatten.getSrc().getUsers(), [](mlir::Operation *use) {
-      return !mlir::isa<mlir::triton::ReshapeOp>(use) ||
+    return llvm::all_of(flatten.getSrc().getUsers(), [&](mlir::Operation *use) {
+      return !mlir::isa<mlir::triton::ReshapeOp>(use) || use == flatten ||
              llvm::all_of(use->getUsers(), [](mlir::Operation *user) {
                return mlir::isa<mlir::triton::ReduceOp,
                                 mlir::triton::gpu::ConvertLayoutOp,
@@ -47578,11 +47578,11 @@ static void mergeRankNLoopReshapes(mlir::ModuleOp moduleOp) {
       if (!first)
         continue;
       for (auto &other : llvm::drop_begin(reshapes, i + 1)) {
-        // Only an `allow_reorder` copy beside a plain one: two plain copies
-        // are the separate flattenings an element-wise use keeps apart.
+        // One flattening: the phase split for a reduction of it then hands
+        // its other users (element-wise work, `s / tl.sum(s)`) the exchange's
+        // read instead of a copy that would cross the boundary.
         if (!other || other.getSrc() != first.getSrc() ||
-            other.getType() != first.getType() ||
-            other.getAllowReorder() == first.getAllowReorder())
+            other.getType() != first.getType())
           continue;
         // Keep the plain one, at the first one's place.
         if (first.getAllowReorder() && !other.getAllowReorder()) {

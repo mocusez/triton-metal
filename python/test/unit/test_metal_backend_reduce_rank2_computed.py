@@ -2349,7 +2349,7 @@ def test_rank3_reduce_mixed_sources_match_torch(mode, shape, warps):
 # the flattening is only reduced and stored (element-wise work on it beside
 # the reduction, `s / tl.sum(s)`, still reads it across that phase and is
 # refused by name).
-@pytest.mark.parametrize("mode", ["total", "peak"])
+@pytest.mark.parametrize("mode", ["total", "peak", "normalize"])
 @pytest.mark.parametrize("shape, warps, axis", [((8, 8, 8), 1, 0), ((4, 8, 16), 1, 1),
                                                 ((8, 8, 8), 2, 1), ((4, 8, 8), 1, 2),
                                                 ((4, 4, 4), 2, 0), ((2, 4, 8), 2, 0),
