@@ -2197,7 +2197,8 @@ def test_rank3_reduce_of_loop_accumulator_matches_torch(shape, warps, axis, use_
 # loop is cyclic), a scalar in a two-entry slot by iteration parity (one shared
 # entry let band 1 re-read band 0's update and decay once per band). A full
 # reduction of the result inside the loop sees only part of the bands and
-# stays refused.
+# is planned cyclic like the rest of the loop, while the flattened result fits
+# one register band (a wider one is refused by name).
 @triton.jit
 def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
                                     C: tl.constexpr, AXIS: tl.constexpr,
@@ -2222,7 +2223,7 @@ def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
             scale = scale * 0.5
             count += t + 1
         tl.store(O + T * OUT, scale + count)
-    else:
+    elif MODE == "total":
         total = 0.0
         for t in range(T):
             v = tl.load(X + t * A * B * C + offsets)
@@ -2230,6 +2231,19 @@ def _rank3_reduce_loop_carry_kernel(X, O, T, A: tl.constexpr, B: tl.constexpr,
             total += tl.sum(tl.reshape(s, (OUT,)), 0)
             tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
         tl.store(O + T * OUT, total)
+    elif MODE == "peak":
+        peak = -1.0e30
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets)
+            s = tl.sum(v, AXIS)
+            peak = tl.maximum(peak, tl.max(tl.reshape(s, (OUT,)), 0))
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)))
+        tl.store(O + T * OUT, peak)
+    else:
+        for t in range(T):
+            v = tl.load(X + t * A * B * C + offsets)
+            s = tl.sum(v, AXIS)
+            tl.store(O + t * OUT + tl.arange(0, OUT), tl.reshape(s, (OUT,)) / tl.sum(tl.reshape(s, (OUT,)), 0))
 
 
 @pytest.mark.parametrize("mode", ["tile", "scalar"])
@@ -2258,14 +2272,37 @@ def test_rank3_reduce_loop_carries_match_torch(shape, warps, axis, mode):
         torch.testing.assert_close(out, want, atol=2e-3, rtol=2e-3)
 
 
-def test_rank3_reduce_loop_further_reduction_is_named(capfd):
+@pytest.mark.parametrize("mode", ["total", "peak", "normalize"])
+@pytest.mark.parametrize("shape, warps, axis", [((2, 4, 4), 2, 0), ((2, 4, 8), 4, 1), ((8, 8, 8), 4, 2),
+                                                ((4, 8, 8), 4, 0), ((4, 4, 8), 1, 2),
+                                                ((2, 8, 16), 4, 0)])
+def test_rank3_reduce_loop_full_reduction_matches_torch(shape, warps, axis, mode):
+    a, b, c = shape
+    steps = 3
+    out_elements = a * b * c // shape[axis]
+    torch.manual_seed(a * b * c + axis + warps)
+    x = torch.randn(steps * a * b * c, dtype=torch.float32)
+    r = x.reshape(steps, a, b, c).sum(axis + 1).reshape(steps, -1)
+    out = torch.zeros(steps * out_elements + 1, dtype=torch.float32)
+    _rank3_reduce_loop_carry_kernel[(1,)](x, out, steps, A=a, B=b, C=c, AXIS=axis,
+                                          OUT=out_elements, MODE=mode, num_warps=warps)
+    torch.mps.synchronize()
+    if mode == "normalize":
+        torch.testing.assert_close(out[:-1], (r / r.sum(1, keepdim=True)).reshape(-1),
+                                   atol=2e-3, rtol=2e-3)
+        return
+    tail = r.sum() if mode == "total" else r.max()
+    torch.testing.assert_close(out, torch.cat([r.reshape(-1), tail.reshape(1)]), atol=2e-3, rtol=2e-3)
+
+
+def test_rank3_reduce_loop_wide_full_reduction_is_named(capfd):
     x = torch.randn(3 * 512, dtype=torch.float32)
     out = torch.zeros(3 * 64 + 1, dtype=torch.float32)
     with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
         _rank3_reduce_loop_carry_kernel[(1,)](x, out, 3, A=8, B=8, C=8, AXIS=0, OUT=64,
                                               MODE="total", num_warps=1)
     diagnostic = capfd.readouterr()
-    assert "a further reduction of the result" in diagnostic.err + diagnostic.out
+    assert "fits one register band of the CTA" in diagnostic.err + diagnostic.out
 
 
 # The same label question without a permute. A rank-3 sum of a direct load

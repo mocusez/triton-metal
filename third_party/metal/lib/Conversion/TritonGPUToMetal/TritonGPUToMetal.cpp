@@ -17611,6 +17611,30 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   int64_t numElements = 1;
   for (auto s : tile->shape)
     numElements *= s;
+  // A further (full) reduction of a rank-N loop reduce's result in the same
+  // loop: its source is a cyclic tile of the loop too, and is phased and
+  // published cyclic like the rank-N reduce (see `cyclicUserLoop` below). 📏
+  // Published under its flattened
+  // `#ttg.linear` layout instead, `tl.sum(tl.reshape(s, (n,)))` of a rank-3
+  // sum was wrong in 38 of 72 cells.
+  auto inRankNUserLoop = [&] {
+    auto loop = mlir::dyn_cast<mlir::scf::ForOp>(op->getParentOp());
+    return loop &&
+           llvm::any_of(loop.getBody()->getOps<mlir::triton::ReduceOp>(),
+                        [&](mlir::triton::ReduceOp other) {
+                          if (other == op)
+                            return false;
+                          if (other->hasAttr(kRankNUserLoopAttr))
+                            return true;
+                          // Asked before the attribute is set too.
+                          auto otherTy = mlir::dyn_cast<mlir::RankedTensorType>(
+                              other.getSrcs().front().getType());
+                          return otherTy && otherTy.getRank() >= 3 &&
+                                 otherTy.getNumElements() >
+                                     srcIndexPlan->threadsPerBlock();
+                        });
+  };
+  const bool loopFlatReduce = srcTy.getRank() < 3 && inRankNUserLoop();
   // More than one register band needs a separate publish/read phase. A
   // one-element-per-thread layout can stay in the current phase; finishPlan
   // records whether it nevertheless needs exact logical scratch indexing.
@@ -17679,7 +17703,8 @@ planRankNReduce(mlir::triton::ReduceOp op) {
   // different program, silently (rank-3/4 sums over every axis from
   // 4x8x8 at one warp, and `v - tl.sum(v, 2)[:, :, None]` from E = 2).
   const bool cyclicUserLoop =
-      enc && srcTy.getRank() >= 3 && op->hasAttr(kRankNUserLoopAttr);
+      (enc && srcTy.getRank() >= 3 && op->hasAttr(kRankNUserLoopAttr)) ||
+      loopFlatReduce;
   if (cyclicUserLoop) {
     if (rankNReduceSourcePermutation(op))
       return std::nullopt;
@@ -49419,6 +49444,14 @@ struct ConvertTritonGPUToMetalPass
             if (mlir::isa<mlir::triton::StoreOp>(user) &&
                 user->getOperand(1) == v)
               continue;
+            // A full reduction of the result (`tl.sum(tl.reshape(s, (n,)))`)
+            // is planned cyclic like every tile of the loop
+            // (`planRankNReduce`), and its scalar is uniform.
+            if (auto further = mlir::dyn_cast<mlir::triton::ReduceOp>(user);
+                further && further->getNumResults() == 1 &&
+                !mlir::isa<mlir::RankedTensorType>(
+                    further->getResult(0).getType()))
+              continue;
             auto userTy = mlir::dyn_cast<mlir::RankedTensorType>(
                 user->getNumResults() == 1 ? user->getResult(0).getType()
                                            : mlir::Type());
@@ -49949,6 +49982,31 @@ struct ConvertTritonGPUToMetalPass
             reduceOk = false;
             return;
           }
+        }
+        // A full reduction of a rank-N loop reduce's result is planned
+        // cyclic while the flattened result fits one register band.
+        auto flatPlan = planLayoutIndex(rtt);
+        const bool flatWide =
+            !mlir::isa_and_nonnull<mlir::triton::gpu::BlockedEncodingAttr>(
+                rtt.getEncoding()) ||
+            !flatPlan || rtt.getNumElements() > flatPlan->threadsPerBlock();
+        if (!stagedFallback && flatWide &&
+            mlir::isa<mlir::scf::ForOp>(red->getParentOp()) &&
+            llvm::any_of(red->getBlock()->getOps<mlir::triton::ReduceOp>(),
+                         [&](mlir::triton::ReduceOp other) {
+                           auto otherTy =
+                               mlir::dyn_cast<mlir::RankedTensorType>(
+                                   other.getSrcs().front().getType());
+                           return other != red && otherTy &&
+                                  otherTy.getRank() >= 3;
+                         })) {
+          red.emitOpError(
+              "Metal backend: a full reduction of a rank >= 3 reduce's result "
+              "inside the loop is implemented while the flattened result fits "
+              "one register band of the CTA; reduce a wider result after the "
+              "loop");
+          reduceOk = false;
+          return;
         }
         // A linear source outside an exact phase uses logical-position
         // replay, which needs the whole cone and at most 256 per thread.
