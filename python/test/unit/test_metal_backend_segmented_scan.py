@@ -9738,10 +9738,9 @@ def test_multiband_scan_f32_column_product_broadcast_source_is_named(mode, diagn
      "direct same-layout consumers in the original tile"),
     (7, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
-    (8, "a reduce inside a nested scan loop is supported as a sum"),
     (9, "a scan-input column broadcast requires same-layout f32/i32 sources and "
      "direct same-layout consumers in the original tile"),
-], ids=["mixed_store", "cross_axis", "wider_tile", "multiple_scans", "nested_scan", "region_capture"])
+], ids=["mixed_store", "cross_axis", "wider_tile", "multiple_scans", "region_capture"])
 def test_multiband_scan_f32_column_product_broadcast_consumer_is_named(mode, diagnostic):
     result = _compile_rankn_nested_negative_in_child(
         "_unsupported_shared_input_column_broadcast_kernel",
@@ -13643,6 +13642,11 @@ def _row_product_combine(a, b):
 
 
 @triton.jit
+def _row_general_combine(a, b):
+    return a + b * 2
+
+
+@triton.jit
 def _nested_scan_row_reduce_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexpr,
                                    MODE: tl.constexpr):
     r = tl.arange(0, R)[:, None]
@@ -13669,17 +13673,23 @@ def _nested_scan_row_reduce_kernel(X, O, chunks, R: tl.constexpr, C: tl.constexp
             off = chunk * R * C + r * C + c
             x = tl.load(X + off)
             tl.store(O + off, tl.cumsum(x, 1) - tl.max(x, 1)[:, None])
-    else:
+    elif MODE == "product":
         for chunk in range(chunks):
             off = chunk * R * C + r * C + c
             x = tl.load(X + off)
             tl.store(O + off, tl.cumsum(x, 1) - tl.reduce(x, 1, _row_product_combine)[:, None])
+    else:
+        for chunk in range(chunks):
+            off = chunk * R * C + r * C + c
+            x = tl.load(X + off)
+            tl.store(O + off, tl.cumsum(x, 1) - tl.reduce(x, 1, _row_general_combine)[:, None])
 
 
 @pytest.mark.parametrize("mode, dtype", [("chunked", torch.float32), ("chunked", torch.int32),
                                          ("beside", torch.float32), ("beside", torch.int32),
                                          ("xor", torch.int32), ("max", torch.float32),
-                                         ("max", torch.int32)])
+                                         ("max", torch.int32), ("product", torch.float32),
+                                         ("product", torch.int32)])
 @pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 2), ((32, 32), 4),
                                               ((4, 64), 1)])
 def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
@@ -13689,6 +13699,8 @@ def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
     torch.manual_seed(rows * cols + num_warps)
     x = (torch.randint(-50, 50, (n,), dtype=torch.int32) if dtype == torch.int32 else
          torch.randn(n))
+    if mode == "product" and dtype == torch.float32:
+        x = 1 + 0.1 * x  # a product of 64 values that neither under- nor overflows
     out = torch.zeros(n, dtype=dtype, device="mps")
     _nested_scan_row_reduce_kernel[(1,)](x.to("mps"), out, chunks, rows, cols, mode,
                                          num_warps=num_warps)
@@ -13701,6 +13713,15 @@ def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
             want = (xs.cumsum(2) - xs.sum(2, keepdim=True)).reshape(-1)
         elif mode == "max":
             want = (xs.cumsum(2) - xs.amax(2, keepdim=True)).reshape(-1)
+        elif mode == "product" and dtype == torch.int32:
+            wide = xs.to(torch.int64)
+            prod = torch.ones_like(wide[..., :1])
+            for j in range(cols):
+                prod = (prod * wide[..., j:j + 1]) & 0xFFFFFFFF
+            want = (wide.cumsum(2) - prod) & 0xFFFFFFFF
+            want = torch.where(want >= 2**31, want - 2**32, want).reshape(-1)
+        elif mode == "product":
+            want = (xs.cumsum(2) - xs.prod(2, keepdim=True)).reshape(-1)
         else:
             acc = xs[..., 0].clone()
             for j in range(1, cols):
@@ -13712,13 +13733,13 @@ def test_nested_scan_row_reduce_matches_torch(mode, dtype, shape, num_warps):
         torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-4)
 
 
-def test_nested_scan_row_product_is_named(capfd):
+def test_nested_scan_row_general_combine_is_named(capfd):
     x = torch.randn(3 * 512, device="mps")
     out = torch.zeros_like(x)
     with pytest.raises(Exception, match="convert-tritongpu-to-metal failed"):
-        _nested_scan_row_reduce_kernel[(1,)](x, out, 3, 8, 64, "product", num_warps=1)
+        _nested_scan_row_reduce_kernel[(1,)](x, out, 3, 8, 64, "general", num_warps=1)
     captured = capfd.readouterr()
-    assert "a reduce inside a nested scan loop is supported as a sum, a max or min" in (
+    assert "a reduce inside a nested scan loop is supported as a sum, a product" in (
         captured.err + captured.out)
 
 
@@ -13726,23 +13747,38 @@ def test_nested_scan_row_product_is_named(capfd):
 # The nested-loop mode of the shared-input column broadcast above: a column sum
 # (or i32 xor, or unsigned min) read back over the tile beside a row scan. It is
 # now the pair of column scans `P + S - x` (`P ^ S ^ x`, `min(P, S)`) and exact.
-@pytest.mark.parametrize("monoid", ["", "xor", "umin"])
+@pytest.mark.parametrize("monoid", ["", "xor", "umin", "product", "fproduct"])
 @pytest.mark.parametrize("shape, num_warps", [((16, 16), 1), ((16, 16), 4), ((8, 64), 1),
                                               ((32, 32), 2)])
 def test_nested_scan_column_reduce_beside_row_scan_matches_torch(monoid, shape, num_warps):
     rows, cols = shape
     steps = 3
-    dtype = torch.int32 if monoid else torch.float32
+    dtype = torch.int32 if monoid and monoid != "fproduct" else torch.float32
     torch.manual_seed(rows * cols + num_warps)
-    x = (torch.randint(-50, 50, (steps * rows * cols,), dtype=torch.int32) if monoid else
-         torch.randn(steps * rows * cols))
+    x = (torch.randint(-50, 50, (steps * rows * cols,), dtype=torch.int32) if dtype == torch.int32
+         else torch.randn(steps * rows * cols))
+    if monoid == "fproduct":
+        x = 1 + 0.1 * x  # a product of 16-32 values that neither under- nor overflows
     y = torch.zeros(steps * rows * cols, dtype=dtype, device="mps")
     unused = torch.zeros(1, dtype=dtype, device="mps")
     _unsupported_shared_input_column_broadcast_kernel[(1,)](
         x.to("mps"), unused, y, unused, unused, steps, rows, cols, 8, monoid == "umin",
-        "" if monoid == "umin" else monoid, num_warps=num_warps)
+        {"umin": "", "fproduct": "product"}.get(monoid, monoid), num_warps=num_warps)
     torch.mps.synchronize()
     xs = x.reshape(steps, rows, cols)
+    if monoid == "fproduct":
+        torch.testing.assert_close(y.cpu(), (xs.cumsum(2) + xs.prod(1, keepdim=True)).reshape(-1),
+                                   atol=1e-3, rtol=1e-3)
+        return
+    if monoid == "product":
+        wide = xs.to(torch.int64)
+        prod = torch.ones_like(wide[:, :1, :])
+        for i in range(rows):
+            prod = (prod * wide[:, i:i + 1, :]) & 0xFFFFFFFF
+        want = (wide.cumsum(2) + prod) & 0xFFFFFFFF
+        want = torch.where(want >= 2**31, want - 2**32, want).to(torch.int32).reshape(-1)
+        assert torch.equal(y.cpu(), want)
+        return
     if monoid == "umin":
         wide = xs.to(torch.int64)
         want = (wide.cumsum(2) + (wide & 0xFFFFFFFF).amin(1)[:, None, :]) & 0xFFFFFFFF

@@ -14823,6 +14823,10 @@ scanCombineKind(mlir::triton::ScanOp op, bool isI32, bool allowXor = false,
 // the SAME shape as its source, so the value this lane owes is the prefix at
 // this lane's own coordinates.
 //===----------------------------------------------------------------------===//
+// A staged scan that leaves each lane's own element out (an exclusive prefix).
+static constexpr llvm::StringLiteral kExclusiveScanAttr =
+    "metal.exclusive_scan";
+
 struct StagedScanPlan {
   TileInfo tile;
   mlir::triton::gpu::BlockedEncodingAttr enc;
@@ -15039,12 +15043,17 @@ struct StagedScanLowering
       // for a reverse scan) contribute; the rest fold in as the identity.
       auto cK = mlir::arith::ConstantOp::create(
           rewriter, loc, rewriter.getI32IntegerAttr(static_cast<int32_t>(k)));
+      // An exclusive scan (`kExclusiveScanAttr`, the row-product rewrite
+      // below) leaves the lane's own position out.
+      const bool exclusive = op->hasAttr(kExclusiveScanAttr);
       mlir::Value inPrefix =
-          mlir::arith::CmpIOp::create(rewriter, loc,
-                                      plan->reverse
-                                          ? mlir::arith::CmpIPredicate::sge
-                                          : mlir::arith::CmpIPredicate::sle,
-                                      cK.getResult(), coord)
+          mlir::arith::CmpIOp::create(
+              rewriter, loc,
+              plan->reverse ? (exclusive ? mlir::arith::CmpIPredicate::sgt
+                                         : mlir::arith::CmpIPredicate::sge)
+                            : (exclusive ? mlir::arith::CmpIPredicate::slt
+                                         : mlir::arith::CmpIPredicate::sle),
+              cK.getResult(), coord)
               .getResult();
       v = mlir::arith::SelectOp::create(rewriter, loc, inPrefix, v, identity)
               .getResult();
@@ -45167,7 +45176,8 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
     // a float or i32 extremum, and an i32 xor.
     const bool i32 = srcTy.getElementType().isInteger(32);
     if (!combine ||
-        !(mlir::isa<mlir::arith::AddFOp>(combine) ||
+        !(mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp>(combine) ||
+          (i32 && mlir::isa<mlir::arith::MulIOp>(combine)) ||
           (!i32 && floatExtremumOperator(combine)) ||
           (i32 &&
            mlir::isa<mlir::arith::AddIOp, mlir::arith::XOrIOp,
@@ -45223,6 +45233,10 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
     builder.setInsertionPointAfter(reduce);
     auto forward = scanFromReduce(builder, reduce, /*reverse=*/false);
     auto backward = scanFromReduce(builder, reduce, /*reverse=*/true);
+    // A product has no inverse to correct with (a zero would divide): the
+    // exclusive prefix times the inclusive suffix is the row product.
+    if (mlir::isa<mlir::arith::MulFOp, mlir::arith::MulIOp>(combine))
+      forward->setAttr(kExclusiveScanAttr, builder.getUnitAttr());
     mlir::Value x = reduce.getSrcs().front();
     mlir::Value total = cloneCombine(builder, combine, forward->getResult(0),
                                      backward->getResult(0));
@@ -45715,9 +45729,9 @@ static mlir::LogicalResult selectNestedScanLoops(mlir::ModuleOp moduleOp) {
       if (mlir::isa<mlir::triton::ReduceOp>(&op))
         return op.emitOpError(
             "Metal backend: a reduce inside a nested scan loop is supported as "
-            "a sum, a max or min (or an i32 xor) along a 2-D tile's axis that "
-            "is only read back over that tile or carried as a running row "
-            "total; move other reductions out of the loop");
+            "a sum, a product, a max or min (or an i32 xor) along a 2-D tile's "
+            "axis that is only read back over that tile or carried as a "
+            "running row total; move other reductions out of the loop");
       if (mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp>(&op) &&
           llvm::any_of(op.getResultTypes(), isTensor))
         return op.emitOpError(
