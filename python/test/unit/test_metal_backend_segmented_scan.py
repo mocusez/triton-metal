@@ -13915,3 +13915,46 @@ def test_nested_scan_row_extremum_matches_torch(mode, dtype, shape, num_warps):
         assert torch.equal(out.cpu(), want.to(torch.int32))
     else:
         torch.testing.assert_close(out.cpu(), want, atol=1e-3, rtol=1e-4)
+
+
+# A row reduction inside a nested-scan loop stored as a vector: the rewritten
+# tile holds the reduction in every element of its row, so the store writes
+# that tile's first column (a masked tile store through the vector's own
+# addresses).
+@triton.jit
+def _nested_scan_row_vector_kernel(X, O, V, chunks, R: tl.constexpr, C: tl.constexpr,
+                                   MAXIMUM: tl.constexpr):
+    r = tl.arange(0, R)[:, None]
+    c = tl.arange(0, C)[None, :]
+    for chunk in range(chunks):
+        off = chunk * R * C + r * C + c
+        x = tl.load(X + off)
+        tl.store(O + off, tl.cumsum(x, 1))
+        if MAXIMUM:
+            tl.store(V + chunk * R + tl.arange(0, R), tl.max(x, 1))
+        else:
+            tl.store(V + chunk * R + tl.arange(0, R), tl.sum(x, 1))
+
+
+@pytest.mark.parametrize("maximum", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+@pytest.mark.parametrize("shape, num_warps", [((8, 64), 1), ((16, 32), 2), ((32, 32), 4), ((8, 16), 1)])
+def test_nested_scan_row_vector_store_matches_torch(maximum, dtype, shape, num_warps):
+    chunks = 3
+    rows, cols = shape
+    torch.manual_seed(rows * cols + num_warps)
+    x = (torch.randint(-50, 50, (chunks * rows * cols,), dtype=torch.int32) if dtype == torch.int32
+         else torch.randn(chunks * rows * cols))
+    out = torch.zeros_like(x, device="mps")
+    vec = torch.zeros(chunks * rows, dtype=dtype, device="mps")
+    _nested_scan_row_vector_kernel[(1,)](x.to("mps"), out, vec, chunks, rows, cols, maximum,
+                                         num_warps=num_warps)
+    torch.mps.synchronize()
+    xs = x.reshape(chunks, rows, cols)
+    want_vec = (xs.amax(2) if maximum else xs.sum(2)).reshape(-1)
+    if dtype == torch.int32:
+        assert torch.equal(out.cpu(), xs.cumsum(2).to(torch.int32).reshape(-1))
+        assert torch.equal(vec.cpu(), want_vec.to(torch.int32))
+    else:
+        torch.testing.assert_close(out.cpu(), xs.cumsum(2).reshape(-1), atol=1e-3, rtol=1e-4)
+        torch.testing.assert_close(vec.cpu(), want_vec, atol=1e-3, rtol=1e-4)

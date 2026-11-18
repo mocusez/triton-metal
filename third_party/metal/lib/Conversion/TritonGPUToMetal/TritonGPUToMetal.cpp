@@ -45234,7 +45234,51 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
       update = user;
       carry = arg;
     }
-    auto broadcasts = rowBroadcastsOf(result, axis, tileTy, update);
+    // Stores of the reduced vector (directly or through a convert_layout):
+    // they become masked stores of the rewritten tile, one column writing.
+    llvm::SmallVector<mlir::triton::StoreOp, 2> vectorStores;
+    llvm::SmallVector<mlir::Operation *, 2> vectorStoreCvts;
+    for (mlir::Operation *user : result.getUsers()) {
+      mlir::Operation *storeUser = user;
+      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(user)) {
+        if (!cvt->hasOneUse())
+          continue;
+        storeUser = *cvt->user_begin();
+      }
+      auto store = mlir::dyn_cast<mlir::triton::StoreOp>(storeUser);
+      if (store && store.getValue() == storeUser->getOperand(1) &&
+          storeUser->getOperand(1) ==
+              (user == storeUser ? result : user->getResult(0))) {
+        vectorStores.push_back(store);
+        if (user != storeUser)
+          vectorStoreCvts.push_back(user);
+      }
+    }
+    mlir::Operation *skipUser = update;
+    auto broadcasts = [&]() {
+      llvm::SmallVector<mlir::triton::BroadcastOp, 2> found;
+      for (mlir::Operation *user : result.getUsers()) {
+        if (user == skipUser || llvm::is_contained(vectorStoreCvts, user) ||
+            llvm::any_of(vectorStores, [&](mlir::triton::StoreOp store) {
+              return store.getOperation() == user;
+            }))
+          continue;
+        auto expand = mlir::dyn_cast<mlir::triton::ExpandDimsOp>(user);
+        if (!expand || expand.getAxis() != axis)
+          return std::optional<
+              llvm::SmallVector<mlir::triton::BroadcastOp, 2>>();
+        for (mlir::Operation *expandUser : expand->getUsers()) {
+          auto broadcast =
+              mlir::dyn_cast<mlir::triton::BroadcastOp>(expandUser);
+          if (!broadcast || broadcast.getType() != tileTy)
+            return std::optional<
+                llvm::SmallVector<mlir::triton::BroadcastOp, 2>>();
+          found.push_back(broadcast);
+        }
+      }
+      return std::optional<llvm::SmallVector<mlir::triton::BroadcastOp, 2>>(
+          found);
+    }();
     if (!broadcasts)
       continue;
     std::optional<llvm::SmallVector<mlir::triton::BroadcastOp, 2>> carryReads;
@@ -45248,7 +45292,70 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
       if (!carryReads || !afterReads)
         continue;
     }
-    if (broadcasts->empty() && !update)
+    if (broadcasts->empty() && !update && vectorStores.empty())
+      continue;
+    // The vector stores' addresses (and masks) rebuilt in the reduced
+    // vector's own encoding, so they can be expanded over the tile.
+    auto vecTy = mlir::cast<mlir::RankedTensorType>(result.getType());
+    auto srcTileTy = mlir::cast<mlir::RankedTensorType>(tileTy);
+    std::function<mlir::Value(mlir::OpBuilder &, mlir::Value,
+                              mlir::IRMapping &)>
+        reencode = [&](mlir::OpBuilder &b, mlir::Value v,
+                       mlir::IRMapping &map) -> mlir::Value {
+      auto ty = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+      if (!ty)
+        return v;
+      if (mlir::Value mapped = map.lookupOrNull(v))
+        return mapped;
+      mlir::Operation *def = v.getDefiningOp();
+      if (!def || ty.getRank() != 1 || ty.getShape() != vecTy.getShape())
+        return {};
+      if (auto cvt = mlir::dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(def))
+        return reencode(b, cvt.getSrc(), map);
+      auto newTy = mlir::RankedTensorType::get(
+          ty.getShape(), ty.getElementType(), vecTy.getEncoding());
+      if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+        auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+        if (!dense || !dense.isSplat())
+          return {};
+        mlir::Value made = mlir::arith::ConstantOp::create(
+            b, cst.getLoc(),
+            mlir::DenseElementsAttr::get(
+                newTy, dense.getSplatValue<mlir::Attribute>()));
+        map.map(v, made);
+        return made;
+      }
+      if (!mlir::isa<mlir::triton::MakeRangeOp, mlir::triton::SplatOp,
+                     mlir::triton::AddPtrOp>(def) &&
+          !(mlir::isa<mlir::arith::ArithDialect>(def->getDialect()) &&
+            def->getNumRegions() == 0 && def->getNumResults() == 1))
+        return {};
+      for (mlir::Value operand : def->getOperands())
+        if (!reencode(b, operand, map))
+          return {};
+      mlir::Operation *clone = b.clone(*def, map);
+      clone->getResult(0).setType(newTy);
+      return clone->getResult(0);
+    };
+    bool vectorsOk = true;
+    for (mlir::triton::StoreOp store : vectorStores) {
+      mlir::OpBuilder probe(store);
+      mlir::IRMapping scratch;
+      // Probe on a throwaway builder region is not available; check the
+      // cone's shape instead by rebuilding and erasing.
+      mlir::Value rebuilt = reencode(probe, store.getPtr(), scratch);
+      mlir::Value rebuiltMask = store.getMask()
+                                    ? reencode(probe, store.getMask(), scratch)
+                                    : mlir::Value();
+      for (auto &entry : llvm::make_early_inc_range(
+               llvm::reverse(llvm::to_vector(scratch.getValueMap()))))
+        if (mlir::Operation *op = entry.second.getDefiningOp();
+            op && op->use_empty())
+          op->erase();
+      if (!rebuilt || (store.getMask() && !rebuiltMask))
+        vectorsOk = false;
+    }
+    if (!vectorsOk)
       continue;
 
     mlir::OpBuilder builder(reduce->getContext());
@@ -45270,6 +45377,71 @@ static void rewriteScanLoopRowReduces(mlir::ModuleOp moduleOp) {
       total = mlir::arith::XOrIOp::create(builder, reduce.getLoc(), total, x);
     for (mlir::triton::BroadcastOp broadcast : *broadcasts)
       broadcast.getResult().replaceAllUsesWith(total);
+    // Each vector store writes the tile's first column along the reduced
+    // axis: every element of a row of `total` holds that row's reduction.
+    for (mlir::triton::StoreOp store : vectorStores) {
+      mlir::OpBuilder b(store);
+      mlir::Location loc = store.getLoc();
+      mlir::IRMapping map;
+      auto widen = [&](mlir::Value vec) {
+        auto expanded =
+            mlir::triton::ExpandDimsOp::create(b, loc, vec, axis).getResult();
+        auto elemTy =
+            mlir::cast<mlir::RankedTensorType>(vec.getType()).getElementType();
+        return mlir::triton::BroadcastOp::create(
+                   b, loc,
+                   mlir::RankedTensorType::get(srcTileTy.getShape(), elemTy,
+                                               srcTileTy.getEncoding()),
+                   expanded)
+            .getResult();
+      };
+      // A store addresses through `tt.addptr` (or a splat pointer): widen
+      // the offsets, and splat the base straight to the tile.
+      std::function<mlir::Value(mlir::Value)> widenPtr =
+          [&](mlir::Value ptr) -> mlir::Value {
+        auto ptrTy = mlir::cast<mlir::RankedTensorType>(ptr.getType());
+        auto tilePtrTy = mlir::RankedTensorType::get(srcTileTy.getShape(),
+                                                     ptrTy.getElementType(),
+                                                     srcTileTy.getEncoding());
+        if (auto add = ptr.getDefiningOp<mlir::triton::AddPtrOp>())
+          return mlir::triton::AddPtrOp::create(b, loc, tilePtrTy,
+                                                widenPtr(add.getPtr()),
+                                                widen(add.getOffset()))
+              .getResult();
+        if (auto splat = ptr.getDefiningOp<mlir::triton::SplatOp>())
+          return mlir::triton::SplatOp::create(b, loc, tilePtrTy,
+                                               splat.getSrc())
+              .getResult();
+        return widen(ptr);
+      };
+      mlir::Value ptrTile = widenPtr(reencode(b, store.getPtr(), map));
+      // The index along the reduced axis, and `== 0`.
+      auto rangeTy = mlir::RankedTensorType::get(
+          {srcTileTy.getDimSize(axis)}, b.getI32Type(),
+          mlir::triton::gpu::SliceEncodingAttr::get(
+              b.getContext(), 1 - axis,
+              mlir::cast<mlir::triton::gpu::DistributedEncodingTrait>(
+                  srcTileTy.getEncoding())));
+      mlir::Value index = mlir::triton::MakeRangeOp::create(
+          b, loc, rangeTy, 0, srcTileTy.getDimSize(axis));
+      index = mlir::triton::ExpandDimsOp::create(b, loc, index, 1 - axis);
+      auto indexTileTy = mlir::RankedTensorType::get(
+          srcTileTy.getShape(), b.getI32Type(), srcTileTy.getEncoding());
+      index = mlir::triton::BroadcastOp::create(b, loc, indexTileTy, index);
+      mlir::Value zero = mlir::arith::ConstantOp::create(
+          b, loc,
+          mlir::DenseElementsAttr::get(indexTileTy, b.getI32IntegerAttr(0)));
+      mlir::Value mask = mlir::arith::CmpIOp::create(
+          b, loc, mlir::arith::CmpIPredicate::eq, index, zero);
+      if (store.getMask())
+        mask = mlir::arith::AndIOp::create(
+            b, loc, mask, widen(reencode(b, store.getMask(), map)));
+      mlir::triton::StoreOp::create(b, loc, ptrTile, total, mask);
+      store.erase();
+    }
+    for (mlir::Operation *cvt : vectorStoreCvts)
+      if (cvt->use_empty())
+        cvt->erase();
 
     if (update) {
       unsigned index = carry.getArgNumber() - 1;
