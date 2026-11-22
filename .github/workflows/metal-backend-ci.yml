@@ -87,7 +87,9 @@ jobs:
           python3.12 -m venv ~/.venv
           source ~/.venv/bin/activate
           python3 -m pip install --upgrade pip
-          python3 -m pip install pytest numpy torch
+          # Match TileLang's pin: PyTorch 2.15 rejects the hosted Apple Paravirtual GPU.
+          # https://github.com/tile-ai/tilelang/pull/3706
+          python3 -m pip install pytest numpy "torch==2.14.1"
 
       - name: Build Triton (Metal backend enabled)
         env:
