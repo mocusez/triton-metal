@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
 import re
 import subprocess
+import sys
 import sysconfig
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -116,6 +120,58 @@ def test_metal_wheel_preserves_explicit_architecture_overrides(monkeypatch):
     configure_macos_build_architecture(["metal"], "15.0", system="Darwin")
     assert os.environ["_PYTHON_HOST_PLATFORM"] == "macosx-15.0-universal2"
     assert os.environ["ARCHFLAGS"] == "-arch arm64 -arch x86_64"
+
+
+@pytest.fixture
+def metal_wheel_smoke(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("triton.backends.metal.driver")
+    path = Path(__file__).parents[1] / "packaging" / "metal_wheel_smoke.py"
+    spec = importlib.util.spec_from_file_location("metal_wheel_smoke", path)
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    monkeypatch.setattr(
+        smoke, "triton",
+        SimpleNamespace(
+            __file__=str(Path(sysconfig.get_path("purelib")) / "triton" / "__init__.py"),
+            compile=Mock(return_value=SimpleNamespace(asm={"metal": "test kernel"})),
+        ))
+    monkeypatch.setattr(smoke, "backends", {"metal": None})
+    monkeypatch.setattr(smoke, "MetalDriver", lambda: SimpleNamespace(get_current_target=lambda: "metal"))
+    return smoke
+
+
+@pytest.mark.parametrize("require_mps", [False, True], ids=["compile-only", "require-mps"])
+@pytest.mark.parametrize("allocation_fails", [False, True], ids=["unavailable", "allocation-fails"])
+def test_metal_wheel_smoke_without_usable_mps(metal_wheel_smoke, monkeypatch, capsys, require_mps, allocation_fails):
+    smoke = metal_wheel_smoke
+    allocation_error = RuntimeError("MPS allocation failed")
+    monkeypatch.setattr(
+        smoke, "torch",
+        SimpleNamespace(
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: allocation_fails)),
+            empty=Mock(side_effect=allocation_error),
+        ))
+    monkeypatch.setattr(sys, "argv", ["metal_wheel_smoke.py"] + (["--require-mps"] if require_mps else []))
+
+    if require_mps:
+        with pytest.raises(RuntimeError, match="MPS is required") as error:
+            smoke.main()
+        assert error.value.__cause__ is (allocation_error if allocation_fails else None)
+        assert "numeric smoke skipped" not in capsys.readouterr().out
+    else:
+        smoke.main()
+        smoke.triton.compile.assert_called_once()
+        assert "MPS numeric smoke skipped" in capsys.readouterr().out
+
+
+def test_metal_wheel_smoke_rejects_source_tree_import(metal_wheel_smoke, monkeypatch):
+    smoke = metal_wheel_smoke
+    monkeypatch.setattr(smoke.triton, "__file__", str(Path(__file__).parents[2] / "triton" / "__init__.py"))
+    monkeypatch.setattr(sys, "argv", ["metal_wheel_smoke.py", "--require-mps"])
+    with pytest.raises(AssertionError, match="must be imported from this environment's site-packages"):
+        smoke.main()
+    smoke.triton.compile.assert_not_called()
 
 
 @pytest.fixture(scope="module")

@@ -18,10 +18,14 @@ jobs:
     name: Build and test Metal backend (macOS latest arm64)
     # Apple Silicon runner is required for the Metal backend.
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
     env:
       TRITON_BUILD_WITH_CLANG_LLD: "TRUE"
       RUNNER_TYPE: macos-latest
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -32,6 +36,40 @@ jobs:
         run: |
           brew update
           brew install ccache llvm@19 lld coreutils
+
+      - name: Configure shared build toolchain
+        id: toolchain
+        run: |
+          llvm_prefix="$(brew --prefix llvm@19)"
+          lld_prefix="$(brew --prefix lld)"
+          sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          export PATH="${llvm_prefix}/bin:${lld_prefix}/bin:$HOME/.local/bin:$PATH"
+          # GITHUB_PATH prepends entries in reverse file order.
+          {
+            echo "$HOME/.local/bin"
+            echo "${lld_prefix}/bin"
+            echo "${llvm_prefix}/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "CC=${llvm_prefix}/bin/clang"
+            echo "CXX=${llvm_prefix}/bin/clang++"
+            echo "CXXFLAGS=-stdlib=libc++"
+            echo "LDFLAGS=-L${llvm_prefix}/lib"
+            echo "METAL_MACHO_LINKER=${lld_prefix}/bin/ld64.lld"
+            # Pin CMake to the same Mach-O linker selected by clang.
+            echo "TRITON_APPEND_CMAKE_ARGS=-DCMAKE_LINKER=${lld_prefix}/bin/ld64.lld"
+            echo "SDKROOT=${sdk_path}"
+          } >> "$GITHUB_ENV"
+          test "$(clang -print-prog-name=ld64.lld)" -ef "${lld_prefix}/bin/ld64.lld"
+          {
+            clang --version
+            clang++ --version
+            "${lld_prefix}/bin/ld64.lld" --version
+            echo "SDKROOT=${sdk_path}"
+            xcrun --sdk macosx --show-sdk-build-version
+            xcodebuild -version
+          } | tee "${RUNNER_TEMP}/metal-toolchain.txt"
+          echo "fingerprint=$(shasum -a 256 "${RUNNER_TEMP}/metal-toolchain.txt" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - name: Compute cache keys
         id: cache-key
@@ -46,10 +84,9 @@ jobs:
             exit 1
           fi
 
-          echo "llvm=$(sha256sum $llvm_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
-          echo "nvidia=$(sha256sum $nvidia_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
-          echo "json=$(cat $json_file)" >> $GITHUB_OUTPUT
-          echo "datetime=$(date -u -Iseconds)" >> $GITHUB_OUTPUT
+          echo "llvm=$(sha256sum "$llvm_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "nvidia=$(sha256sum "$nvidia_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "json=$(cat "$json_file")" >> "$GITHUB_OUTPUT"
 
       - name: Cache build dependencies
         uses: actions/cache@v4
@@ -61,26 +98,24 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-metal-llvm-${{ steps.cache-key.outputs.llvm }}-nvidia-${{ steps.cache-key.outputs.nvidia }}-json-${{ steps.cache-key.outputs.json }}
 
       - name: Restore ccache
-        if: github.ref != 'refs/heads/metal-develop'
+        id: ccache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ~/.ccache
+          path: ${{ env.CCACHE_DIR }}
           restore-keys: |
-            metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-
-            metal-artifacts-${{ runner.os }}-${{ runner.arch }}-
-          key: metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ steps.cache-key.outputs.datetime }}
+            metal-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-llvm-${{ steps.cache-key.outputs.llvm }}-
+          key: metal-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Inspect cache directories
+        env:
+          CCACHE_MATCHED_KEY: ${{ steps.ccache.outputs.cache-matched-key }}
         run: |
-          mkdir -p ~/.triton ~/.ccache
+          echo "Restored ccache key: ${CCACHE_MATCHED_KEY:-none}"
+          mkdir -p ~/.triton "$CCACHE_DIR"
+          ccache --show-config
+          ccache --zero-stats
           du -h -d 1 ~/.triton || true
-          du -h -d 1 ~/.ccache || true
-
-      - name: Update PATH
-        run: |
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
+          du -h -d 1 "$CCACHE_DIR" || true
 
       - name: Create venv
         run: |
@@ -91,23 +126,36 @@ jobs:
           # https://github.com/tile-ai/tilelang/pull/3706
           python3 -m pip install pytest numpy "torch==2.14.1"
 
+      - name: Require usable MPS before building
+        run: |
+          source ~/.venv/bin/activate
+          python3 - <<'PY'
+          import platform
+          import sys
+          import torch
+
+          print(f"Python: {sys.version}; torch: {torch.__version__}", flush=True)
+          print(f"macOS: {platform.mac_ver()[0]}; arch: {platform.machine()}", flush=True)
+          assert torch.backends.mps.is_available(), "Metal CI requires an available MPS device"
+          tensor = torch.ones(1, device="mps")
+          torch.mps.synchronize()
+          assert tensor.cpu().item() == 1
+          print("MPS allocation and synchronization passed")
+          PY
+
       - name: Build Triton (Metal backend enabled)
+        id: dev-build
         env:
           TRITON_BUILD_WITH_O1: "true"
           MAX_JOBS: 3
           NINJA_STATUS: "[%f/%t, %es elapsed] "
         run: |
           source ~/.venv/bin/activate
-          ccache --zero-stats
-          export PATH="/opt/homebrew/opt/llvm@19/bin:$PATH"
-          export CC="/opt/homebrew/opt/llvm@19/bin/clang"
-          export CXX="/opt/homebrew/opt/llvm@19/bin/clang++"
-          export CXXFLAGS="-stdlib=libc++"
-          export LDFLAGS="-L/opt/homebrew/opt/llvm@19/lib"
-          clang++ --version
           make dev-install
+          echo "METAL_DEV_BUILD_DIR=$(PYTHONPATH=./python python3 -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')" >> "$GITHUB_ENV"
 
-      - name: CCache stats
+      - name: Development build ccache stats
+        if: ${{ !cancelled() && steps.dev-build.outcome != 'skipped' }}
         run: ccache --print-stats
 
       - name: Verify Metal backend is registered
@@ -124,6 +172,8 @@ jobs:
             python/test/unit/test_metal_backend_2d_elementwise_add.py \
             python/test/unit/test_metal_backend_dot_f32_8x8.py \
             python/test/unit/test_metal_backend_vector_add_matrix.py \
+            python/test/unit/test_metal_backend_mps_zero_copy.py \
+            python/test/unit/test_metal_backend_gpu_launch.py \
             python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_exact_kernel_compiles_to_msl \
             python/test/unit/test_metal_backend_msl.py::test_fused_residual_rmsnorm_exact_kernels_compile_to_msl \
             python/test/unit/test_metal_backend_msl.py::test_bfs_shortest_path_host_contract_rejects_invalid_metadata \
@@ -134,12 +184,12 @@ jobs:
         run: |
           source ~/.venv/bin/activate
           python3 -m pip show lit >/dev/null 2>&1 || python3 -m pip install lit
-          export BUILD_DIR=$(PYTHONPATH=./python python3 -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
-          cd "$BUILD_DIR"
+          cd "$METAL_DEV_BUILD_DIR"
           ninja triton-metal-opt triton-metal-translate
           lit -v test/Dialect/Metal/
 
-      - name: Build and inspect macOS 15 Metal wheel
+      - name: Build macOS 15 Metal wheel
+        id: wheel-build
         env:
           TRITON_BUILD_DIR: ${{ runner.temp }}/triton-metal-wheel-build
           TRITON_WHEEL_BACKENDS: metal
@@ -150,10 +200,72 @@ jobs:
         run: |
           source ~/.venv/bin/activate
           python3 setup.py bdist_wheel --dist-dir wheelhouse
+
+      - name: Wheel build ccache stats
+        if: ${{ !cancelled() && steps.wheel-build.outcome != 'skipped' }}
+        run: ccache --print-stats
+
+      - name: Verify both builds used the shared toolchain
+        run: |
+          source ~/.venv/bin/activate
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          expected = {"CMAKE_C_COMPILER": "CC", "CMAKE_CXX_COMPILER": "CXX", "CMAKE_LINKER": "METAL_MACHO_LINKER"}
+          for directory in (Path(os.environ["METAL_DEV_BUILD_DIR"]), Path(os.environ["RUNNER_TEMP"]) / "triton-metal-wheel-build"):
+              cache = (directory / "CMakeCache.txt").read_text()
+              print(f"Toolchain for {directory}:")
+              for key, variable in expected.items():
+                  match = re.search(rf"^{key}:[^=]+=(.+)$", cache, re.MULTILINE)
+                  assert match, f"{key} missing from {directory}"
+                  actual = Path(match[1]).resolve()
+                  print(f"{key}={actual}")
+                  assert actual == Path(os.environ[variable]).resolve(), (key, actual, os.environ[variable])
+              for language in ("C", "CXX"):
+                  configs = list((directory / "CMakeFiles").glob(f"*/CMake{language}Compiler.cmake"))
+                  assert len(configs) == 1, configs
+                  version = re.search(rf'set\(CMAKE_{language}_COMPILER_VERSION "([^"]+)"\)', configs[0].read_text())
+                  assert version and version[1].startswith("19."), (configs[0], version)
+                  print(f"{language} compiler version: {version[1]}")
+              for kind in ("EXE", "MODULE", "SHARED"):
+                  assert re.search(rf"^CMAKE_{kind}_LINKER_FLAGS:STRING=.*-fuse-ld=lld", cache, re.MULTILINE)
+          for compiler in ("CC", "CXX"):
+              linker = subprocess.check_output([os.environ[compiler], "-print-prog-name=ld64.lld"], text=True).strip()
+              assert Path(linker).resolve() == Path(os.environ["METAL_MACHO_LINKER"]).resolve(), linker
+              print(f"{compiler} Mach-O linker: {linker}")
+          subprocess.run([os.environ["METAL_MACHO_LINKER"], "--version"], check=True)
+          PY
+
+      - name: Inspect Metal wheel compatibility and payload
+        run: |
+          source ~/.venv/bin/activate
           wheels=(wheelhouse/*.whl)
           test "${#wheels[@]}" -eq 1
           TRITON_TEST_METAL_WHEEL="${wheels[0]}" \
             pytest -s --tb=short python/test/unit/test_metal_wheel.py
+
+      - name: Audit wheel stable ABI
+        id: abi-audit
+        run: |
+          python3.12 -m venv "${RUNNER_TEMP}/abi3audit-venv"
+          "${RUNNER_TEMP}/abi3audit-venv/bin/pip" install "abi3audit==0.0.26"
+          mkdir -p abi3audit-report
+          wheels=(wheelhouse/*.whl)
+          test "${#wheels[@]}" -eq 1
+          "${RUNNER_TEMP}/abi3audit-venv/bin/abi3audit" \
+            --strict --summary --verbose --report --output abi3audit-report/report.json \
+            "${wheels[0]}" 2>&1 | tee abi3audit-report/audit.log
+
+      - name: Upload ABI diagnostics
+        if: ${{ !cancelled() && steps.abi-audit.outcome != 'skipped' && hashFiles('abi3audit-report/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-metal-abi3audit
+          path: abi3audit-report/
+          if-no-files-found: error
 
       - name: Upload Metal wheel
         uses: actions/upload-artifact@v4
@@ -163,12 +275,11 @@ jobs:
           if-no-files-found: error
 
       - name: Save ccache
-        if: github.ref == 'refs/heads/metal-develop'
+        if: ${{ !cancelled() && github.ref == 'refs/heads/metal-develop' && steps.dev-build.outcome == 'success' && steps.ccache.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            ~/.ccache
-          key: metal-artifacts-${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-${{ steps.cache-key.outputs.datetime }}
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
   metal-wheel-install:
     name: Install Metal wheel (macOS 15 arm64)
@@ -190,11 +301,11 @@ jobs:
           name: triton-metal-macos15-arm64
           path: wheelhouse
 
-      - name: Install and compile smoke test
+      - name: Install wheel and require MPS numeric smoke
         run: |
           python3 -m venv "${RUNNER_TEMP}/triton-wheel-smoke"
           "${RUNNER_TEMP}/triton-wheel-smoke/bin/pip" install torch==2.10.0
           "${RUNNER_TEMP}/triton-wheel-smoke/bin/pip" install --no-deps wheelhouse/*.whl
           cd "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/triton-wheel-smoke/bin/python" \
-            "${GITHUB_WORKSPACE}/python/test/packaging/metal_wheel_smoke.py"
+            "${GITHUB_WORKSPACE}/python/test/packaging/metal_wheel_smoke.py" --require-mps

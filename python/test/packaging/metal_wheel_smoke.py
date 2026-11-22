@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import sysconfig
+from pathlib import Path
 
 import torch
 import triton
@@ -27,6 +29,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    triton_path = Path(triton.__file__).resolve()
+    site_packages = {Path(sysconfig.get_path(kind)).resolve() for kind in ("purelib", "platlib")}
+    print(f"installed Triton import: {triton_path}")
+    assert any(triton_path.is_relative_to(path) for path in site_packages), (
+        f"Triton must be imported from this environment's site-packages {site_packages}, got {triton_path}")
     assert set(backends) == {"metal"}, f"unexpected backend payload: {sorted(backends)}"
     target = MetalDriver().get_current_target()
     source = ASTSource(
