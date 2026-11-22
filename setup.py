@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from python.build_helpers import (
     check_env_flag,
+    configure_macos_build_architecture,
     find_therock_rocm_include_dir,
     get_base_dir,
     get_cmake_dir,
@@ -318,6 +319,8 @@ class CMakeBuild(build_ext):
         cmake_args += [f"-DCMAKE_BUILD_TYPE={cfg}"]
         if macos_deployment_target is not None:
             cmake_args += [f"-DCMAKE_OSX_DEPLOYMENT_TARGET={macos_deployment_target}"]
+        if macos_architecture is not None:
+            cmake_args += [f"-DCMAKE_OSX_ARCHITECTURES={macos_architecture}"]
         if platform.system() == "Windows":
             cmake_args += [f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_{cfg.upper()}={extdir}"]
         # This tests for "--jobserver-auth=fifo:" rather than "--jobserver-auth" because ninja
@@ -437,6 +440,8 @@ if macos_deployment_target is not None:
     # CMake owns the actual minimum OS load command. Keep both tools on the
     # same explicit value, including when reusing an existing CMake cache.
     os.environ["MACOSX_DEPLOYMENT_TARGET"] = macos_deployment_target
+
+macos_architecture = configure_macos_build_architecture(wheel_backend_names, macos_deployment_target)
 
 backends = [*BackendInstaller.copy(wheel_backend_names), *BackendInstaller.copy_externals()]
 

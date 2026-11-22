@@ -63,6 +63,23 @@ def resolve_macos_deployment_target(
     return target
 
 
+def configure_macos_build_architecture(
+    wheel_backends: list[str],
+    deployment_target: Optional[str],
+    system: Optional[str] = None,
+) -> Optional[str]:
+    """Select the Python packaging and CMake architecture for a Metal wheel."""
+    if (system or platform.system()) != "Darwin" or wheel_backends != ["metal"]:
+        return None
+
+    # Match cibuildwheel: universal2 CPython otherwise gives an arm64 build a
+    # universal2 wheel tag. ARCHFLAGS alone does not override sysconfig's tag.
+    # Keep explicit caller overrides subject to the final wheel validation.
+    os.environ.setdefault("_PYTHON_HOST_PLATFORM", f"macosx-{deployment_target}-arm64")
+    os.environ.setdefault("ARCHFLAGS", "-arch arm64")
+    return "arm64"
+
+
 def validate_metal_wheel_platform_tag(platform_tag: str, deployment_target: str) -> None:
     """Reject a Metal wheel if its tag does not reflect the requested floor."""
     major, minor = _parse_macos_deployment_target(deployment_target)
